@@ -1,5 +1,10 @@
-# Projecspecific contents go here
+# Project-specific contents go here
+# Output directory for workflow results
+output/
 
+# Python virtual environment
+venv/
+env/
 
 # Local environment
 .env
