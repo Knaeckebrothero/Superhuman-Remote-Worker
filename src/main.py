@@ -14,26 +14,35 @@ from dotenv import load_dotenv
 from src.neo4j_utils import create_neo4j_connection
 from src.csv_processor import RequirementProcessor
 from src.requirement_agent import create_requirement_agent
+from src.requirement_agent_graph import create_graph_agent
 
 
 class RequirementWorkflow:
     """
     Main workflow orchestrator for processing requirements against Neo4j database.
+    Supports both simple chain and iterative agent approaches.
     """
 
-    def __init__(self, csv_path: str, output_dir: str = "output"):
+    def __init__(self, csv_path: str, output_dir: str = "output", mode: str = "chain"):
         """
         Initialize the workflow.
 
         Args:
             csv_path: Path to CSV file containing requirements
             output_dir: Directory for output files
+            mode: Processing mode - "chain" for simple LangChain or "agent" for LangGraph agent
         """
         self.csv_path = csv_path
         self.output_dir = output_dir
+        self.mode = mode
         self.neo4j = None
         self.agent = None
+        self.graph_agent = None
         self.processor = None
+
+        # Validate mode
+        if mode not in ["chain", "agent"]:
+            raise ValueError(f"Invalid mode: {mode}. Must be 'chain' or 'agent'")
 
         # Create output directory
         Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -72,11 +81,15 @@ class RequirementWorkflow:
             print(f"✗ Error loading requirements: {str(e)}")
             return False
 
-        # Step 3: Initialize LangChain agent
-        print("\nStep 3: Initializing LangChain agent...")
+        # Step 3: Initialize agent (chain or graph)
+        print(f"\nStep 3: Initializing agent (mode: {self.mode})...")
         try:
-            self.agent = create_requirement_agent(self.neo4j)
-            print("✓ LangChain agent initialized successfully")
+            if self.mode == "chain":
+                self.agent = create_requirement_agent(self.neo4j)
+                print("✓ LangChain simple chain agent initialized successfully")
+            else:  # agent mode
+                self.graph_agent = create_graph_agent(self.neo4j)
+                print("✓ LangGraph iterative agent initialized successfully")
         except Exception as e:
             print(f"✗ Error initializing agent: {str(e)}")
             return False
@@ -114,11 +127,17 @@ class RequirementWorkflow:
             # Get requirement text
             req_text = self.processor.format_requirement_with_metadata(requirement)
 
-            # Process the requirement
+            # Process the requirement based on mode
             try:
-                result = self.agent.process_requirement(req_text, refine=refine)
+                if self.mode == "chain":
+                    result = self.agent.process_requirement(req_text, refine=refine)
+                else:  # agent mode
+                    max_iterations = int(os.getenv('AGENT_MAX_ITERATIONS', '5'))
+                    result = self.graph_agent.process_requirement(req_text, max_iterations=max_iterations)
+
                 result['requirement_id'] = idx
                 result['metadata'] = self.processor.get_requirement_metadata(requirement)
+                result['mode'] = self.mode
                 results.append(result)
 
                 print(f"✓ Requirement {idx} processed successfully\n")
@@ -129,7 +148,8 @@ class RequirementWorkflow:
                     'requirement_id': idx,
                     'original_requirement': req_text,
                     'error': str(e),
-                    'metadata': self.processor.get_requirement_metadata(requirement)
+                    'metadata': self.processor.get_requirement_metadata(requirement),
+                    'mode': self.mode
                 })
 
         return results
@@ -155,8 +175,9 @@ class RequirementWorkflow:
         elif format == "txt":
             output_file = os.path.join(self.output_dir, f"results_{timestamp}.txt")
             with open(output_file, 'w', encoding='utf-8') as f:
+                mode = results[0].get('mode', 'unknown') if results else 'unknown'
                 f.write("="*80 + "\n")
-                f.write("NEO4J REQUIREMENT CHECK RESULTS\n")
+                f.write(f"NEO4J REQUIREMENT CHECK RESULTS ({mode.upper()} mode)\n")
                 f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("="*80 + "\n\n")
 
@@ -167,7 +188,13 @@ class RequirementWorkflow:
 
                     if 'error' in result:
                         f.write(f"ERROR: {result['error']}\n")
+                    elif result.get('mode') == 'agent':
+                        # LangGraph agent format
+                        f.write(f"Plan:\n{result.get('plan', 'N/A')}\n\n")
+                        f.write(f"Iterations: {result.get('iterations', 0)}\n\n")
+                        f.write(f"Analysis:\n{result.get('analysis', 'N/A')}\n")
                     else:
+                        # LangChain format
                         f.write(f"Refined: {result.get('refined_requirement', 'N/A')}\n\n")
                         f.write(f"Cypher Query:\n{result.get('cypher_query', 'N/A')}\n\n")
                         f.write(f"Results Found: {result.get('result_count', 0)}\n\n")
@@ -235,9 +262,27 @@ def main():
         print("Error: CSV_FILE_PATH not set in environment variables")
         sys.exit(1)
 
+    # Get mode from environment or command line args
+    mode = os.getenv('WORKFLOW_MODE', 'chain')  # default to chain
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+
+    # Validate mode
+    if mode not in ['chain', 'agent']:
+        print(f"Error: Invalid mode '{mode}'. Use 'chain' or 'agent'")
+        sys.exit(1)
+
+    print(f"\n{'='*80}")
+    print(f"Running in {mode.upper()} mode")
+    if mode == 'chain':
+        print("Using simple LangChain workflow (linear: refine -> query -> analyze)")
+    else:
+        print("Using LangGraph agent workflow (iterative: plan -> query -> reason -> repeat)")
+    print(f"{'='*80}\n")
+
     # Create and run workflow
-    workflow = RequirementWorkflow(csv_path=csv_path)
-    results = workflow.run(refine=True, save_format="both")
+    workflow = RequirementWorkflow(csv_path=csv_path, mode=mode)
+    results = workflow.run(refine=(mode == "chain"), save_format="both")
 
     # Exit with appropriate code
     sys.exit(0 if results else 1)

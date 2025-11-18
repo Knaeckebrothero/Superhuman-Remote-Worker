@@ -11,6 +11,10 @@ langchain-community>=0.0.16
 langchain-openai>=0.0.5
 langchain-experimental>=0.0.49
 
+# LangGraph for agent-based workflows
+langgraph>=0.0.20
+langchain-core>=0.1.0
+
 # LLM providers (OpenAI as default, can be swapped for other providers)
 openai>=1.10.0
 
