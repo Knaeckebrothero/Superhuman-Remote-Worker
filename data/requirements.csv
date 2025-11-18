@@ -1,0 +1,11 @@
+requirement,category,priority,compliance_standard
+"All products in the Electronics category must have a compliance certification for RoHS",compliance,high,RoHS
+"Identify all suppliers that provide materials for products sold in the EU market",impact_analysis,medium,GDPR
+"Check if all products with lithium batteries have proper safety documentation",compliance,high,UN38.3
+"What departments would be affected by implementing a digital twin for our manufacturing process?",impact_analysis,high,
+"Verify that all automotive parts suppliers have ISO 9001 certification",compliance,critical,ISO 9001
+"Identify all products that are nearing end-of-life status (manufactured more than 5 years ago)",planning,medium,
+"Check compliance of all medical devices with FDA regulations",compliance,critical,FDA 21 CFR Part 820
+"What is the impact of discontinuing Product X on our supply chain?",impact_analysis,high,
+"Identify all customers who purchased products that are now subject to a safety recall",compliance,critical,
+"List all products that depend on Component Y in their bill of materials",impact_analysis,medium,
