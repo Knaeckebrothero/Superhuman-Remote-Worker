@@ -44,9 +44,14 @@ The workflow leverages LangChain and a metamodel-based approach:
 
 ## Features
 
+- **Dual Workflow Modes**:
+  - **Chain Mode**: Fast linear workflow for straightforward analysis
+  - **Agent Mode**: Iterative reasoning agent with LangGraph for complex requirements
 - **Metamodel-Based Analysis**: Built on a structured metamodel for requirement traceability (Requirement, BusinessObject, Message nodes)
 - **GoBD Compliance Focus**: Specialized support for German accounting compliance requirements
 - **Intelligent Query Generation**: Automatically generates Cypher queries from natural language requirements using LLM
+- **Iterative Reasoning** (Agent Mode): Agent can plan, query, analyze, and decide to investigate further
+- **Tool-Based Architecture** (Agent Mode): Agent uses tools to execute queries, inspect schema, and gather information
 - **Impact Assessment**: Analyzes how requirements affect business objects and system messages
 - **Requirement Traceability**: Tracks dependencies, refinements, and relationships between requirements
 - **Batch Processing**: Process multiple requirements from CSV files (supports both semicolon and comma delimiters)
@@ -54,6 +59,7 @@ The workflow leverages LangChain and a metamodel-based approach:
 - **Multiple Output Formats**: Results available in both JSON (structured) and TXT (human-readable) formats
 - **Flexible LLM Support**: Works with OpenAI (default), Anthropic Claude, Cohere, and other LangChain-compatible providers
 - **Error Handling**: Robust error handling with detailed logging
+- **Comparison Tools**: Built-in script to compare chain vs agent approaches side-by-side
 
 ## Database Metamodel
 
@@ -249,19 +255,60 @@ You should see: `✓ Successfully connected to Neo4j at bolt://localhost:7687`
 
 ## Usage
 
+The system supports two approaches for analyzing requirements:
+
+1. **Chain Mode** (default): Simple linear workflow - fast and predictable
+2. **Agent Mode**: Iterative reasoning agent - thorough and exploratory
+
 ### Basic Usage
 
-Run the workflow with the default configuration:
-
+**Chain Mode** (Linear: Refine -> Query -> Analyze):
 ```bash
-python run_workflow.py
+python run_workflow.py chain
+```
+
+**Agent Mode** (Iterative: Plan -> Query -> Reason -> Repeat):
+```bash
+python run_workflow.py agent
 ```
 
 Or use the main module directly:
 
 ```bash
-python -m src.main
+python -m src.main chain   # for chain mode
+python -m src.main agent   # for agent mode
 ```
+
+You can also set the mode in your `.env` file:
+```bash
+WORKFLOW_MODE=agent
+python run_workflow.py
+```
+
+### Comparing Chain vs Agent Approaches
+
+To see both approaches in action side-by-side:
+
+```bash
+python compare_approaches.py "Which requirements are GoBD-relevant?"
+```
+
+This will run the same requirement through both workflows and show the differences.
+
+### Choosing Between Chain and Agent
+
+**Use Chain Mode when:**
+- You want fast, predictable results
+- Requirements are straightforward
+- You need single-query answers
+- Processing many requirements in batch
+
+**Use Agent Mode when:**
+- Dealing with complex, multi-faceted requirements
+- Need deep exploratory analysis
+- Want the system to investigate multiple angles
+- Compliance analysis requiring thorough investigation
+- Impact analysis across multiple relationship types
 
 ### Programmatic Usage
 
@@ -274,15 +321,16 @@ from src.main import RequirementWorkflow
 # Load environment variables
 load_dotenv()
 
-# Create workflow instance
+# Create workflow instance (chain mode)
 workflow = RequirementWorkflow(
     csv_path="data/requirements.csv",
-    output_dir="output"
+    output_dir="output",
+    mode="chain"  # or "agent"
 )
 
 # Run the workflow
 results = workflow.run(
-    refine=True,          # Refine requirements before processing
+    refine=True,          # Refine requirements before processing (chain mode)
     save_format="both"    # Save as both JSON and TXT
 )
 
@@ -290,6 +338,9 @@ results = workflow.run(
 for result in results:
     print(f"Requirement: {result['original_requirement']}")
     print(f"Analysis: {result['analysis']}")
+    if result.get('mode') == 'agent':
+        print(f"Iterations: {result.get('iterations', 0)}")
+        print(f"Plan: {result.get('plan', '')}")
 ```
 
 ## CSV Format
