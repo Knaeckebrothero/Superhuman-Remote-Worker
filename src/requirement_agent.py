@@ -54,20 +54,46 @@ class RequirementAgent:
         """
         template = """You are an expert in Neo4j Cypher query language. Given a requirement and database schema, generate an appropriate Cypher query.
 
-Database Schema:
+Database Metamodel:
+The database follows a specific metamodel for requirement traceability and impact analysis:
+
+Node Types:
+1. Requirement - Represents business/system requirements
+   - Properties: rid (unique ID), name, text, type, priority, status, source, valueStream, goBDRelevant
+
+2. BusinessObject - Represents business domain objects
+   - Properties: boid (unique ID), name, description, domain, owner
+
+3. Message - Represents system messages/communications
+   - Properties: mid (unique ID), name, description, direction, format, protocol, version
+
+Relationship Types:
+- (Requirement)-[:REFINES]->(Requirement) - Requirement refinement hierarchy
+- (Requirement)-[:DEPENDS_ON]->(Requirement) - Requirement dependencies
+- (Requirement)-[:TRACES_TO]->(Requirement) - Traceability links
+- (Requirement)-[:RELATES_TO_OBJECT]->(BusinessObject) - Requirement references an object
+- (Requirement)-[:IMPACTS_OBJECT]->(BusinessObject) - Requirement impacts an object
+- (Requirement)-[:RELATES_TO_MESSAGE]->(Message) - Requirement references a message
+- (Requirement)-[:IMPACTS_MESSAGE]->(Message) - Requirement impacts a message
+- (Message)-[:USES_OBJECT]->(BusinessObject) - Message uses object data
+- (Message)-[:PRODUCES_OBJECT]->(BusinessObject) - Message produces/creates object
+
+Current Database Schema:
 - Node Labels: {node_labels}
 - Relationship Types: {relationship_types}
 - Property Keys: {property_keys}
 
-Requirement: {requirement}
+Requirement to Analyze: {requirement}
 
 Generate a Cypher query to check this requirement against the database. The query should:
-1. Be syntactically correct
-2. Return relevant data to answer the requirement
-3. Include appropriate MATCH, WHERE, and RETURN clauses
-4. Use LIMIT if appropriate to avoid overwhelming results
+1. Be syntactically correct Neo4j Cypher
+2. Leverage the metamodel structure (Requirement, BusinessObject, Message nodes and their relationships)
+3. Return relevant data to answer the requirement
+4. Include appropriate MATCH, WHERE, and RETURN clauses
+5. Use LIMIT 100 if the query might return many results
+6. Consider using pattern matching to explore relationships when analyzing impacts or dependencies
 
-Important: Only output the Cypher query, nothing else.
+Important: Only output the Cypher query, nothing else. No explanations or markdown formatting.
 
 Cypher Query:"""
 
@@ -85,7 +111,10 @@ Cypher Query:"""
         Returns:
             LLMChain for result analysis
         """
-        template = """You are an expert analyst. Given a requirement, a Cypher query, and the query results, provide a comprehensive analysis.
+        template = """You are an expert analyst for requirement traceability and compliance checking in a car rental business system.
+
+Context: The database contains Requirements, BusinessObjects, and Messages with their relationships,
+supporting impact analysis, compliance checking, and requirement traceability (especially for GoBD - German accounting compliance).
 
 Original Requirement: {requirement}
 
@@ -93,11 +122,16 @@ Cypher Query Executed: {query}
 
 Query Results: {results}
 
-Based on the query results, provide:
-1. A clear answer to whether the requirement is met or not
-2. Supporting evidence from the data
-3. Any compliance issues or areas of concern
-4. Recommendations if applicable
+Based on the query results, provide a comprehensive analysis that includes:
+
+1. **Summary**: A clear, concise answer to the requirement question
+2. **Findings**: Key data points and evidence from the query results
+3. **Compliance Status**: Whether the requirement is met, partially met, or not met
+4. **Impact Assessment**: If applicable, which business objects, messages, or other requirements are affected
+5. **Recommendations**: Specific actions or considerations, especially for compliance requirements (GoBD, etc.)
+6. **Risk Level**: Assessment of any risks or concerns identified
+
+Format your analysis in clear sections with these headers. Be specific and reference actual data from the results.
 
 Analysis:"""
 
