@@ -1,19 +1,28 @@
 # Core dependencies
-python-dotenv==1.0.0
-pandas==2.2.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
 
-# Neo4j
-neo4j==5.16.0
+# Neo4j database driver
+neo4j>=5.16.0
 
-# LangChain
-langchain==0.1.4
-langchain-community==0.0.16
-langchain-openai==0.0.5
-langchain-experimental==0.0.49
+# LangChain framework for LLM orchestration
+langchain>=0.1.0
+langchain-community>=0.0.16
+langchain-openai>=0.0.5
+langchain-experimental>=0.0.49
 
-# LLM providers (OpenAI as default, can be swapped)
-openai==1.10.0
+# LangGraph for agent-based workflows
+langgraph>=0.0.20
+langchain-core>=0.1.0
+
+# LLM providers (OpenAI as default, can be swapped for other providers)
+openai>=1.10.0
 
 # Utilities
-pydantic==2.5.3
-tiktoken==0.5.2
+pydantic>=2.5.0
+tiktoken>=0.5.0
+
+# Optional: Additional LLM providers (uncomment if needed)
+# anthropic>=0.18.0  # For Claude models
+# langchain-anthropic>=0.1.0
+# cohere>=4.0.0  # For Cohere models

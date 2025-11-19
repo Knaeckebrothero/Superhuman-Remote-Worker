@@ -28,6 +28,7 @@ class RequirementProcessor:
     def load_requirements(self) -> List[Dict[str, Any]]:
         """
         Load requirements from CSV file.
+        Supports both semicolon-delimited (Name;Description) and comma-delimited formats.
 
         Returns:
             List of requirement dictionaries
@@ -40,14 +41,29 @@ class RequirementProcessor:
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
 
         try:
-            df = pd.read_csv(self.csv_path)
+            # Try loading with semicolon delimiter first
+            df = pd.read_csv(self.csv_path, sep=';', on_bad_lines='skip')
 
-            # Validate required columns
-            if 'requirement' not in df.columns:
-                raise ValueError(
-                    "CSV must contain a 'requirement' column. "
-                    f"Found columns: {', '.join(df.columns)}"
-                )
+            # Check if we got valid columns (explicit check for non-empty strings)
+            if len(df.columns) >= 2 and df.columns[0].strip() != '' and df.columns[1].strip() != '':
+                # Rename columns to standard format
+                # First column is name, second is requirement text
+                df.columns = ['name', 'requirement'] + list(df.columns[2:])
+            else:
+                # Fall back to comma delimiter
+                df = pd.read_csv(self.csv_path)
+
+                # Check for 'requirement' column
+                if 'requirement' not in df.columns:
+                    # If no 'requirement' column but has other text columns, try to use the first text column
+                    text_columns = [col for col in df.columns if df[col].dtype == 'object']
+                    if text_columns:
+                        df = df.rename(columns={text_columns[0]: 'requirement'})
+                    else:
+                        raise ValueError(
+                            "CSV must contain a 'requirement' column or text column. "
+                            f"Found columns: {', '.join(df.columns)}"
+                        )
 
             # Convert to list of dictionaries
             self.requirements = df.to_dict('records')
