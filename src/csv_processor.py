@@ -44,8 +44,8 @@ class RequirementProcessor:
             # Try loading with semicolon delimiter first
             df = pd.read_csv(self.csv_path, sep=';', on_bad_lines='skip')
 
-            # Check if we got valid columns
-            if len(df.columns) >= 2 and df.columns[0].strip() and df.columns[1].strip():
+            # Check if we got valid columns (explicit check for non-empty strings)
+            if len(df.columns) >= 2 and df.columns[0].strip() != '' and df.columns[1].strip() != '':
                 # Rename columns to standard format
                 # First column is name, second is requirement text
                 df.columns = ['name', 'requirement'] + list(df.columns[2:])
