@@ -7,7 +7,6 @@ Run both approaches on a sample requirement to compare their behavior.
 import os
 import sys
 from dotenv import load_dotenv
-from src.main import RequirementWorkflow
 
 def compare_approaches(requirement_text: str):
     """
@@ -43,21 +42,24 @@ def compare_approaches(requirement_text: str):
         from src.requirement_agent import create_requirement_agent
 
         neo4j = create_neo4j_connection()
-        if not neo4j.connect():
-            print("Failed to connect to Neo4j")
-            return
+        try:
+            if not neo4j.connect():
+                print("Failed to connect to Neo4j")
+                results['chain'] = {'error': 'Failed to connect to Neo4j'}
+                return results
 
-        agent = create_requirement_agent(neo4j)
-        result_chain = agent.process_requirement(requirement_text, refine=True)
-        results['chain'] = result_chain
+            agent = create_requirement_agent(neo4j)
+            result_chain = agent.process_requirement(requirement_text, refine=True)
+            results['chain'] = result_chain
 
-        print("\nChain Result Summary:")
-        print(f"- Refined requirement: {result_chain.get('refined_requirement', 'N/A')[:80]}...")
-        print(f"- Query executed: {result_chain.get('cypher_query', 'N/A')[:80]}...")
-        print(f"- Results found: {result_chain.get('result_count', 0)}")
-        print(f"- Analysis length: {len(result_chain.get('analysis', ''))} characters")
+            print("\nChain Result Summary:")
+            print(f"- Refined requirement: {result_chain.get('refined_requirement', 'N/A')[:80]}...")
+            print(f"- Query executed: {result_chain.get('cypher_query', 'N/A')[:80]}...")
+            print(f"- Results found: {result_chain.get('result_count', 0)}")
+            print(f"- Analysis length: {len(result_chain.get('analysis', ''))} characters")
 
-        neo4j.close()
+        finally:
+            neo4j.close()
 
     except Exception as e:
         print(f"Error in chain approach: {str(e)}")
@@ -76,22 +78,25 @@ def compare_approaches(requirement_text: str):
         from src.requirement_agent_graph import create_graph_agent
 
         neo4j = create_neo4j_connection()
-        if not neo4j.connect():
-            print("Failed to connect to Neo4j")
-            return
+        try:
+            if not neo4j.connect():
+                print("Failed to connect to Neo4j")
+                results['agent'] = {'error': 'Failed to connect to Neo4j'}
+                return results
 
-        graph_agent = create_graph_agent(neo4j)
-        max_iterations = int(os.getenv('AGENT_MAX_ITERATIONS', '5'))
-        result_agent = graph_agent.process_requirement(requirement_text, max_iterations=max_iterations)
-        results['agent'] = result_agent
+            graph_agent = create_graph_agent(neo4j)
+            max_iterations = int(os.getenv('AGENT_MAX_ITERATIONS', '5'))
+            result_agent = graph_agent.process_requirement(requirement_text, max_iterations=max_iterations)
+            results['agent'] = result_agent
 
-        print("\nAgent Result Summary:")
-        print(f"- Plan: {result_agent.get('plan', 'N/A')[:80]}...")
-        print(f"- Iterations used: {result_agent.get('iterations', 0)}/{max_iterations}")
-        print(f"- Queries executed: {len(result_agent.get('queries_executed', []))}")
-        print(f"- Analysis length: {len(result_agent.get('analysis', ''))} characters")
+            print("\nAgent Result Summary:")
+            print(f"- Plan: {result_agent.get('plan', 'N/A')[:80]}...")
+            print(f"- Iterations used: {result_agent.get('iterations', 0)}/{max_iterations}")
+            print(f"- Queries executed: {len(result_agent.get('queries_executed', []))}")
+            print(f"- Analysis length: {len(result_agent.get('analysis', ''))} characters")
 
-        neo4j.close()
+        finally:
+            neo4j.close()
 
     except Exception as e:
         print(f"Error in agent approach: {str(e)}")

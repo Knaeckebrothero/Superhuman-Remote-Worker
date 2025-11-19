@@ -148,6 +148,10 @@ class Neo4jTools:
             Use this to understand the scale of data before executing more complex queries.
             """
             try:
+                # Validate label to prevent Cypher injection
+                if not label.replace('_', '').isalnum():
+                    return f"Error: Invalid label name '{label}'. Label must contain only alphanumeric characters and underscores."
+
                 query = f"MATCH (n:{label}) RETURN count(n) as count"
                 results = self.neo4j.execute_query(query)
                 if results:
@@ -171,6 +175,10 @@ class Neo4jTools:
             Use this to understand the data structure before writing complex queries.
             """
             try:
+                # Validate label to prevent Cypher injection
+                if not label.replace('_', '').isalnum():
+                    return f"Error: Invalid label name '{label}'. Label must contain only alphanumeric characters and underscores."
+
                 limit = min(limit, 10)  # Cap at 10
                 query = f"MATCH (n:{label}) RETURN n LIMIT {limit}"
                 results = self.neo4j.execute_query(query)
@@ -331,7 +339,6 @@ Create a step-by-step plan (3-5 steps) that you'll execute using the available t
         Generate final comprehensive analysis report.
         """
         requirement = state["requirement"]
-        plan = state.get("plan", "No plan created")
         queries = state.get("queries_executed", [])
 
         system_message = """You are an expert analyst for requirement traceability and compliance checking in a car rental business system.
