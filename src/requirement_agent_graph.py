@@ -78,9 +78,10 @@ class Neo4jTools:
             - Count nodes or relationships
             - Investigate impacts and dependencies
 
-            Example queries:
-            - MATCH (r:Requirement {goBDRelevant: true}) RETURN r.name, r.text LIMIT 10
+            Example queries (use elementId() not id()):
+            - MATCH (r:Requirement {goBDRelevant: true}) RETURN elementId(r) AS nodeId, r.name, r.text LIMIT 10
             - MATCH (r:Requirement)-[:IMPACTS_OBJECT]->(bo:BusinessObject) RETURN r.name, bo.name LIMIT 20
+            - MATCH (r:Requirement) WHERE r.element_id = 'some_id' RETURN r  // Use property-based matching
             """
             try:
                 results = self.neo4j.execute_query(query)
@@ -244,6 +245,11 @@ class RequirementGraphAgent:
 
         system_message = """You are an expert analyst for Neo4j graph database requirements.
 
+IMPORTANT Neo4j Query Guidelines:
+- Use elementId(node) instead of id(node) - the id() function is deprecated
+- Use element_id property when available instead of internal IDs
+- For node matching, prefer property-based queries over ID-based queries
+
 Database Metamodel:
 - Requirement nodes: Business requirements with properties (rid, name, text, type, goBDRelevant, etc.)
 - BusinessObject nodes: Business domain entities (boid, name, description, domain, owner)
@@ -324,6 +330,14 @@ Create a step-by-step plan (3-5 steps) that you'll execute using the available t
         if state.get("is_complete", False):
             return "report"
 
+        # If we have executed queries, move to report after a few iterations
+        if state.get("iteration", 0) >= 2 and len(state.get("queries_executed", [])) > 0:
+            return "report"
+
+        # If no tool calls and multiple iterations without progress, generate report
+        if state.get("iteration", 0) >= 3:
+            return "report"
+
         # Continue the agent loop
         return "continue"
 
@@ -332,6 +346,25 @@ Create a step-by-step plan (3-5 steps) that you'll execute using the available t
         Increment iteration counter after tool execution.
         """
         state["iteration"] = state.get("iteration", 0) + 1
+
+        # Track queries executed - extract from the last tool call message
+        messages = state["messages"]
+        if len(messages) >= 2:
+            # Check the message before the tool result (should be the AIMessage with tool calls)
+            for msg in reversed(messages[-3:]):
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    for tool_call in msg.tool_calls:
+                        if tool_call['name'] == 'execute_cypher_query':
+                            query_info = {
+                                'iteration': state["iteration"],
+                                'query': tool_call.get('args', {}).get('query', 'Unknown'),
+                                'tool': 'execute_cypher_query',
+                                'result_count': 'See results'  # Would need to parse from tool result
+                            }
+                            state["queries_executed"].append(query_info)
+                            break
+                    break
+
         return state
 
     def report_generator_node(self, state: AgentState) -> AgentState:
@@ -404,6 +437,7 @@ You executed {len(queries)} queries during your investigation. Now synthesize al
         workflow.add_edge("increment", "agent")
         workflow.add_edge("report", END)
 
+        # Compile the workflow
         return workflow.compile()
 
     def process_requirement(self, requirement: str, max_iterations: int = 5) -> Dict[str, Any]:
@@ -434,9 +468,12 @@ You executed {len(queries)} queries during your investigation. Now synthesize al
             is_complete=False
         )
 
-        # Run the graph
+        # Run the graph with recursion limit configuration
         print("Starting agent workflow...\n")
-        final_state = self.graph.invoke(initial_state)
+        final_state = self.graph.invoke(
+            initial_state,
+            config={"recursion_limit": 50}
+        )
 
         print("\n✓ Agent workflow complete\n")
 
