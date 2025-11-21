@@ -5,13 +5,8 @@ Handles the analysis of requirements against the Neo4j database using LLM.
 
 import os
 from typing import Dict, Any, List, Optional
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import Tool
-from langchain.prompts import PromptTemplate
-from langchain.schema import AgentAction, AgentFinish
 
 from src.neo4j_utils import Neo4jConnection
 
@@ -45,12 +40,12 @@ class RequirementAgent:
         # Get database schema for context
         self.schema = self.neo4j.get_database_schema()
 
-    def create_cypher_query_chain(self) -> LLMChain:
+    def create_cypher_query_chain(self):
         """
         Create a chain for generating Cypher queries from requirements.
 
         Returns:
-            LLMChain for Cypher query generation
+            Runnable chain for Cypher query generation
         """
         template = """You are an expert in Neo4j Cypher query language. Given a requirement and database schema, generate an appropriate Cypher query.
 
@@ -102,14 +97,14 @@ Cypher Query:"""
             template=template
         )
 
-        return LLMChain(llm=self.llm, prompt=prompt)
+        return prompt | self.llm
 
-    def create_analysis_chain(self) -> LLMChain:
+    def create_analysis_chain(self):
         """
         Create a chain for analyzing query results against requirements.
 
         Returns:
-            LLMChain for result analysis
+            Runnable chain for result analysis
         """
         template = """You are an expert analyst for requirement traceability and compliance checking in a car rental business system.
 
@@ -140,7 +135,7 @@ Analysis:"""
             template=template
         )
 
-        return LLMChain(llm=self.llm, prompt=prompt)
+        return prompt | self.llm
 
     def refine_requirement(self, requirement: str) -> str:
         """
@@ -164,10 +159,10 @@ Provide a refined version that clearly states what needs to be verified in the d
 Refined Requirement:"""
 
         prompt = PromptTemplate(input_variables=["requirement"], template=template)
-        chain = LLMChain(llm=self.llm, prompt=prompt)
+        chain = prompt | self.llm
 
-        result = chain.run(requirement=requirement)
-        return result.strip()
+        result = chain.invoke({"requirement": requirement})
+        return result.content.strip()
 
     def generate_cypher_query(self, requirement: str) -> str:
         """
@@ -181,14 +176,14 @@ Refined Requirement:"""
         """
         chain = self.create_cypher_query_chain()
 
-        query = chain.run(
-            requirement=requirement,
-            node_labels=", ".join(self.schema['node_labels']) if self.schema['node_labels'] else "No labels found",
-            relationship_types=", ".join(self.schema['relationship_types']) if self.schema['relationship_types'] else "No relationships found",
-            property_keys=", ".join(self.schema['property_keys']) if self.schema['property_keys'] else "No properties found"
-        )
+        result = chain.invoke({
+            "requirement": requirement,
+            "node_labels": ", ".join(self.schema['node_labels']) if self.schema['node_labels'] else "No labels found",
+            "relationship_types": ", ".join(self.schema['relationship_types']) if self.schema['relationship_types'] else "No relationships found",
+            "property_keys": ", ".join(self.schema['property_keys']) if self.schema['property_keys'] else "No properties found"
+        })
 
-        return query.strip()
+        return result.content.strip()
 
     def analyze_results(self, requirement: str, query: str, results: List[Dict[str, Any]]) -> str:
         """
@@ -212,13 +207,13 @@ Refined Requirement:"""
             if len(results) > 20:
                 results_str += f"\n... and {len(results) - 20} more results"
 
-        analysis = chain.run(
-            requirement=requirement,
-            query=query,
-            results=results_str
-        )
+        result = chain.invoke({
+            "requirement": requirement,
+            "query": query,
+            "results": results_str
+        })
 
-        return analysis.strip()
+        return result.content.strip()
 
     def process_requirement(self, requirement: str, refine: bool = True) -> Dict[str, Any]:
         """
