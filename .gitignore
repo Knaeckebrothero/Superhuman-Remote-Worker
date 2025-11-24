@@ -1,4 +1,6 @@
 # Project-specific contents go here
+.mcp.json
+
 # Output directory for workflow results
 output/
 
