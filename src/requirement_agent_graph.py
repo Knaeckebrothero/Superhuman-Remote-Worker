@@ -12,6 +12,7 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
+from langchain_core.runnables import RunnableConfig
 
 from src.neo4j_utils import Neo4jConnection
 
@@ -207,7 +208,7 @@ class Neo4jTools:
 class RequirementGraphAgent:
     """LangGraph-based agent for iterative requirement analysis."""
 
-    def __init__(self, neo4j_connection: Neo4jConnection, llm_model: str = None, temperature: float = 0.0):
+    def __init__(self, neo4j_connection: Neo4jConnection, llm_model: str = None, temperature: float = 0.0, system_prompt: str = None):
         """
         Initialize the graph agent.
 
@@ -215,10 +216,12 @@ class RequirementGraphAgent:
             neo4j_connection: Active Neo4j connection
             llm_model: LLM model to use (defaults to env variable)
             temperature: LLM temperature setting
+            system_prompt: Optional custom system prompt
         """
         self.neo4j = neo4j_connection
         self.llm_model = llm_model or os.getenv('LLM_MODEL', 'gpt-4-turbo-preview')
         self.temperature = temperature
+        self.system_prompt = system_prompt
 
         # Initialize LLM
         self.llm = ChatOpenAI(
@@ -243,7 +246,10 @@ class RequirementGraphAgent:
         """
         requirement = state["requirement"]
 
-        system_message = """You are an expert analyst for Neo4j graph database requirements.
+        if self.system_prompt:
+            system_message = self.system_prompt
+        else:
+            system_message = """You are an expert analyst for Neo4j graph database requirements.
 
 IMPORTANT Neo4j Query Guidelines:
 - Use elementId(node) instead of id(node) - the id() function is deprecated
@@ -486,6 +492,35 @@ You executed {len(queries)} queries during your investigation. Now synthesize al
             'analysis': final_state.get('analysis', ''),
             'messages': [msg.content if hasattr(msg, 'content') else str(msg) for msg in final_state.get('messages', [])]
         }
+
+    def process_requirement_stream(self, requirement: str, max_iterations: int = 5):
+        """
+        Process a requirement and yield state updates for streaming.
+
+        Args:
+            requirement: Requirement text to analyze
+            max_iterations: Maximum number of query iterations
+
+        Yields:
+            Dictionary containing the current state of the workflow
+        """
+        # Initialize state
+        initial_state = AgentState(
+            messages=[],
+            requirement=requirement,
+            plan="",
+            queries_executed=[],
+            iteration=0,
+            max_iterations=max_iterations,
+            analysis="",
+            is_complete=False
+        )
+
+        # Stream the graph
+        return self.graph.stream(
+            initial_state,
+            config={"recursion_limit": 50}
+        )
 
 
 def create_graph_agent(neo4j_connection: Neo4jConnection) -> RequirementGraphAgent:
