@@ -1,0 +1,66 @@
+{
+  "1_identification": {
+    "description": "Clear identification and mirroring of the user input/requirement for transparency.",
+    "data": {
+      "requirement_text": "[String] The verbatim text of the requirement to be analyzed (e.g., 'The system MUST...').",
+      "metadata": {
+        "entity_name": "[String] The internal model name for this requirement.",
+        "requirement_type": "[String] Classification (e.g., Business Requirement, Technical Constraint).",
+        "status": "[String] Current status in the system (e.g., valid, draft).",
+        "source_origin": "[String] Origin system of the data (e.g., Neo4J, XMI-Import)."
+      }
+    }
+  },
+  "2_knowledge_retrieval": {
+    "description": "Strict separation of facts found in the knowledge graph versus missing information.",
+    "data": {
+      "found_facts": [
+        "[String] List of specific nodes or documentation found in the database (e.g., 'Requirement X exists').",
+        "[String] Existing assessments or linked documents."
+      ],
+      "missing_elements": [
+        "[String] Explicitly state what was searched for but NOT found (e.g., 'No SATISFIES relationship found').",
+        "[String] Missing implementations or modeled components."
+      ]
+    }
+  },
+  "3_analysis": {
+    "description": "Logic and reasoning layer where the model interprets the facts. Separation of fact vs. conclusion.",
+    "data": {
+      "compliance_matrix": [
+        {
+          "criteria": "[String] The specific aspect being checked (e.g., 'Technical component modeled?').",
+          "result": "[Boolean/String] Result of the check (e.g., Yes/No, Met/Not Met).",
+          "observation": "[String] Detailed observation explaining the result."
+        }
+      ],
+      "risk_assessment": {
+        "level": "[String] Risk level (e.g., High, Medium, Low).",
+        "justification": "[String] Explanation of the risk (e.g., 'Mandatory requirement without implementation')."
+      }
+    }
+  },
+  "4_evaluation": {
+    "description": "The final verdict on whether the requirement is currently satisfied.",
+    "data": {
+      "verdict": "[Enum] 'Satisfied', 'Not Satisfied', or 'Partially Satisfied'.",
+      "summary_reasoning": "[String] A synthesis of why this verdict was reached based on the analysis (e.g., 'Requirement exists but lacks implementation proof')."
+    }
+  },
+  "5_recommendations": {
+    "description": "Concrete, actionable next steps for the user to resolve issues.",
+    "data": {
+      "action_items": [
+        "[String] Specific modeling tasks (e.g., 'Define a BusinessService for X').",
+        "[String] Relationships to create (e.g., 'Create SATISFIES relation').",
+        "[String] Missing attributes or compliance elements to add."
+      ]
+    }
+  },
+  "6_conversational_summary": {
+    "description": "A short, catchy conclusion suitable for a chat interface.",
+    "data": {
+      "message": "[String] A natural language summary of the result intended for the end user."
+    }
+  }
+}

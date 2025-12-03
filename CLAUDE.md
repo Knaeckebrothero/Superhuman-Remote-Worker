@@ -4,55 +4,49 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Graph-RAG (Retrieval-Augmented Generation) system** for **requirement traceability and compliance checking** in a car rental business context. The system uses LangChain and LLMs to automatically analyze business requirements against a Neo4j graph database, with focus on GoBD compliance (German accounting principles) and impact analysis.
+This is a **Graph-RAG (Retrieval-Augmented Generation) system** for **requirement traceability and compliance checking** in a car rental business context. The system uses LangGraph and LLMs to analyze business requirements against a Neo4j graph database, with focus on GoBD compliance (German accounting principles) and impact analysis.
 
-### Core Workflow
+## Quick Start
 
-The system supports **two distinct processing modes**:
+```bash
+# Install dependencies
+pip install -r requirements.txt
 
-1. **Chain Mode** (Default): Linear workflow using LangChain `Runnable` pattern
-   - Refine requirement → Generate Cypher query → Execute query → Analyze results
-   - Fast, predictable, single-pass processing
-   - Best for straightforward requirements and batch processing
+# Copy and configure environment
+cp .env.example .env  # Edit with your credentials
 
-2. **Agent Mode**: Iterative reasoning agent using LangGraph
-   - Plan → Query → Reason → Repeat (up to max iterations)
-   - Can explore multiple angles and perform deep investigation
-   - Best for complex, multi-faceted requirements requiring thorough analysis
+# Run the Streamlit application
+streamlit run main.py
 
-The pipeline reads requirements from semicolon-delimited CSV files, uses LLM to generate and execute Cypher queries, and produces compliance reports in both JSON and TXT formats.
+# Or run the batch workflow
+python -m src.workflow
+```
 
 ## Development Commands
 
-### Running the Workflow
+### Interactive Application
 
 ```bash
-# Chain mode (default) - fast linear workflow
-python run_workflow.py chain
-# or
-python -m src.main chain
-
-# Agent mode - iterative reasoning agent
-python run_workflow.py agent
-# or
-python -m src.main agent
-
-# Mode can also be set via .env file (WORKFLOW_MODE=chain or agent)
-python run_workflow.py
+streamlit run main.py
 ```
 
-### Comparing Approaches
+The Streamlit application (`main.py`) provides a multi-page interface:
+- **Home**: Database connection settings (defaults from .env)
+- **Agent**: Iterative LangGraph agent with streaming progress display
+- **Chain**: Simple one-shot chain with step-by-step progress
+
+### Batch Workflow
 
 ```bash
-# Compare chain vs agent on a single requirement
-python compare_approaches_unified.py "Which requirements are GoBD-relevant?"
+# Run the LangGraph agent workflow on CSV requirements
+python -m src.workflow
+```
 
-# With options
-python compare_approaches_unified.py "Your requirement" --max-iterations 5 --debug
+### Testing
 
-# Other comparison scripts available:
-# - compare_approaches.py - basic comparison
-# - compare_approaches_verbose.py - detailed output
+```bash
+# Test database connection
+python -c "from src.core.neo4j_utils import create_neo4j_connection; conn = create_neo4j_connection(); conn.connect()"
 ```
 
 ### Database Setup
@@ -60,245 +54,178 @@ python compare_approaches_unified.py "Your requirement" --max-iterations 5 --deb
 ```bash
 # Import database dump (requires Neo4j stopped)
 neo4j stop
-neo4j-admin database load --from-path=database/ <database-name> --overwrite-destination=true
+neo4j-admin database load --from-path=data/ <database-name> --overwrite-destination=true
 neo4j start
-
-# Test database connection
-python -c "from src.neo4j_utils import create_neo4j_connection; conn = create_neo4j_connection(); conn.connect()"
 ```
 
-### Environment Configuration
+Schema file: `data/metamodell.cql`
+Database dump: `data/neo4j.dump`
 
-Create `.env` from `.env.example` with:
+## Environment Configuration
+
+Create `.env` from `.env.example`:
 - `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` - Database connection
 - `CSV_FILE_PATH` - Path to requirements CSV (default: `data/requirements.csv`)
 - `OPENAI_API_KEY`, `LLM_MODEL`, `LLM_TEMPERATURE` - LLM configuration
-- `WORKFLOW_MODE` - "chain" or "agent" (default: "chain")
-- `AGENT_MAX_ITERATIONS` - Max iterations for agent mode (default: 5)
+- `AGENT_MAX_ITERATIONS` - Max iterations for agent (default: 5)
 
-### Dependencies
+## Architecture
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
+### Project Structure
 
-# Core packages: python-dotenv, pandas, neo4j, langchain, langchain-openai,
-# langgraph (for agent mode), openai
+```
+project/
+├── main.py                    # Streamlit entry point
+├── config/                    # Configuration files
+│   ├── agent_config.json      # Agent settings (model, temperature, iterations)
+│   ├── chain_config.json      # Chain settings (model, temperature)
+│   └── prompts/
+│       ├── agent_system.txt   # Agent system prompt
+│       └── chain_domain.txt   # Chain domain context
+├── src/
+│   ├── chain_example.py       # Simple chain demo (for comparison)
+│   ├── workflow.py            # Batch workflow orchestrator
+│   ├── __init__.py            # Package exports
+│   ├── agents/
+│   │   └── graph_agent.py     # LangGraph iterative agent
+│   ├── core/
+│   │   ├── neo4j_utils.py     # Neo4j connection layer
+│   │   └── csv_processor.py   # CSV requirement parser
+│   └── ui/
+│       ├── __init__.py        # UI helper functions
+│       ├── home.py            # Home page (connection settings)
+│       ├── agent.py           # Agent analysis page
+│       └── chain.py           # Chain analysis page
+├── data/
+│   ├── metamodell.cql         # Neo4j schema
+│   ├── neo4j.dump             # Database dump
+│   ├── output_schema.json     # Structured output schema
+│   └── requirements.csv       # Input requirements
+└── output/                    # Analysis results
 ```
 
-## Architecture & Code Structure
+### Two Approaches
 
-### Core Modules (src/)
+| Approach | File | Purpose |
+|----------|------|---------|
+| **Agent** (Main) | `src/agents/graph_agent.py` | LangGraph iterative agent with tools |
+| **Chain** (Demo) | `src/chain_example.py` | Simple one-shot chain for comparison |
 
-1. **`main.py`** - Workflow Orchestrator
-   - `RequirementWorkflow` class manages the complete pipeline
-   - Supports both "chain" and "agent" modes via constructor parameter
-   - Coordinates CSV processor, Neo4j connection, and appropriate agent type
-   - Handles setup, processing loop, output generation, and cleanup
-   - Entry point: `main()` function loads env, determines mode, and runs workflow
-   - Mode selection priority: command line args > env variable > default ("chain")
+The **Agent** is the main implementation - it iteratively queries the database, reasons about results, and can refine its approach. The **Chain** is a simple demonstration to show why the agent approach is superior.
 
-2. **`requirement_agent.py`** - LangChain Simple Chain Agent (Chain Mode)
-   - `RequirementAgent` class wraps OpenAI LLM with LangChain **Runnable pattern**
-   - **IMPORTANT**: Recently refactored from `LLMChain` to `Runnable` (prompt | llm) pattern
-   - Creates three specialized chains using `PromptTemplate | ChatOpenAI`:
-     - **Cypher Query Chain**: Generates Neo4j queries from natural language (includes full metamodel context)
-     - **Analysis Chain**: Interprets query results for compliance/impact assessment
-     - **Refinement method**: Clarifies ambiguous requirements (optional step)
-   - Linear processing: single pass through refine → query → analyze
-   - Key method: `process_requirement()` - end-to-end processing of single requirement
-   - Returns: `Dict` with `refined_requirement`, `cypher_query`, `results`, `analysis`, `result_count`
+### Core Modules
 
-3. **`requirement_agent_graph.py`** - LangGraph Iterative Agent (Agent Mode)
-   - `RequirementGraphAgent` class implements LangGraph state machine
-   - Uses **tool-based architecture** with LangChain tools for Neo4j queries
-   - Defines `AgentState` (TypedDict) with messages, plan, queries_executed, iteration, etc.
-   - State graph: plan → query → reason → decide (continue or finish)
-   - Agent can execute multiple queries and investigate different angles
-   - Includes tools: `execute_cypher_query`, `get_database_schema`
-   - Key method: `process_requirement()` - iterative processing with max_iterations limit
-   - Returns: `Dict` with `plan`, `analysis`, `iterations`, `queries_executed`, etc.
+1. **`src/workflow.py`** - Workflow orchestrator
+   - `RequirementWorkflow` class manages the pipeline
+   - Coordinates CSV processor, Neo4j connection, and agent
+   - Entry point: `python -m src.workflow`
 
-4. **`neo4j_utils.py`** - Database Connection Layer
-   - `Neo4jConnection` class handles connection lifecycle
-   - Methods: `connect()`, `execute_query()`, `get_database_schema()`, `close()`
-   - Factory function: `create_neo4j_connection()` reads from environment
-   - Includes error handling for auth failures and service unavailable scenarios
+2. **`src/agents/graph_agent.py`** - LangGraph Agent
+   - `RequirementGraphAgent` with `AgentState` TypedDict
+   - Tools: `execute_cypher_query`, `get_database_schema`, `count_nodes_by_label`, `find_sample_nodes`
+   - State graph: planner → agent → tools → increment → report
+   - Key method: `process_requirement()` → returns `{plan, queries_executed, iterations, analysis}`
+   - Streaming: `process_requirement_stream()` for dashboard integration
 
-5. **`csv_processor.py`** - Requirement Input Handler
-   - `RequirementProcessor` class reads CSV files
-   - Auto-detects semicolon vs comma delimiters
-   - Current format: `Name;Description` (semicolon-delimited)
-   - Methods: `load_requirements()`, `format_requirement_with_metadata()`, `get_requirement_metadata()`
+3. **`src/chain_example.py`** - Simple Chain Demo
+   - `SimpleChain` class with 4-step linear flow
+   - Uses Pydantic models for structured output (based on `data/output_schema.json`)
+   - No iteration, no tool calling - demonstrates limitations
 
-### Database Metamodel (Critical for Query Generation)
+4. **`src/core/neo4j_utils.py`** - Database connection layer
+   - `Neo4jConnection` class: `connect()`, `execute_query()`, `get_database_schema()`, `close()`
+   - Factory: `create_neo4j_connection()` reads from environment
 
-The Neo4j database uses a **strict metamodel** for requirement traceability:
+5. **`src/core/csv_processor.py`** - Requirement input handler
+   - `RequirementProcessor` class reads semicolon-delimited CSV (auto-detects delimiter)
+   - Format: `Name;Description` (82 requirements in current dataset)
+
+### Database Metamodel
 
 **Node Types:**
-- `Requirement` - Properties: `rid` (unique), `name`, `text`, `type`, `priority`, `status`, `source`, `valueStream`, `goBDRelevant`
-- `BusinessObject` - Properties: `boid` (unique), `name`, `description`, `domain`, `owner`
-- `Message` - Properties: `mid` (unique), `name`, `description`, `direction`, `format`, `protocol`, `version`
+- `Requirement` - `rid`, `name`, `text`, `type`, `priority`, `status`, `source`, `valueStream`, `goBDRelevant`
+- `BusinessObject` - `boid`, `name`, `description`, `domain`, `owner`
+- `Message` - `mid`, `name`, `description`, `direction`, `format`, `protocol`, `version`
 
-**Relationship Types:**
-- Requirement → Requirement: `REFINES`, `DEPENDS_ON`, `TRACES_TO`
-- Requirement → BusinessObject: `RELATES_TO_OBJECT`, `IMPACTS_OBJECT`
-- Requirement → Message: `RELATES_TO_MESSAGE`, `IMPACTS_MESSAGE`
-- Message → BusinessObject: `USES_OBJECT`, `PRODUCES_OBJECT`
-
-**Schema File:** `database/metamodell.cql` contains constraints, indexes, and template queries.
-
-### LLM Chain Architecture (IMPORTANT: Recently Updated)
-
-**Current Implementation** (post-refactoring):
-- Uses LangChain **Runnable pattern**: `PromptTemplate | ChatOpenAI`
-- Chain composition via pipe operator (`|`) instead of explicit `LLMChain` objects
-- Invocation: `chain.invoke(inputs)` returns `AIMessage` with `.content` attribute
-- Three separate chains for different tasks (query generation, analysis, refinement)
-
-**Previous Implementation** (deprecated):
-- Used `LLMChain` class from `langchain.chains`
-- Called via `chain.run()` or `chain(inputs)`
-
-**When modifying chains:**
-1. Use `PromptTemplate` with `input_variables` and `template`
-2. Compose with `ChatOpenAI` using pipe operator: `prompt | llm`
-3. Invoke with `.invoke(dict)` and access result via `.content`
-4. See `requirement_agent.py` lines 43-100 (cypher chain) and 102-138 (analysis chain) for examples
-
-### Output Structure
-
-Results are saved to `output/` directory:
-- **JSON format**: Structured data with `original_requirement`, `refined_requirement` (chain) or `plan` (agent), `cypher_query` (chain) or `queries_executed` (agent), `result_count`, `results`, `analysis`, `metadata`, `mode`, `iterations` (agent only)
-- **TXT format**: Human-readable report with formatted sections, adapts to chain vs agent mode
+**Relationships:**
+- `Requirement → Requirement`: `REFINES`, `DEPENDS_ON`, `TRACES_TO`
+- `Requirement → BusinessObject`: `RELATES_TO_OBJECT`, `IMPACTS_OBJECT`
+- `Requirement → Message`: `RELATES_TO_MESSAGE`, `IMPACTS_MESSAGE`
+- `Message → BusinessObject`: `USES_OBJECT`, `PRODUCES_OBJECT`
 
 ## Key Implementation Details
 
-### Dual Mode Architecture
+### Agent vs Chain Comparison
 
-The workflow system supports two distinct processing modes, selected via:
-1. Command line argument: `python run_workflow.py chain` or `agent`
-2. Environment variable: `WORKFLOW_MODE=chain` or `agent` in `.env`
-3. Default: "chain" if not specified
+| Aspect | Simple Chain | LangGraph Agent |
+|--------|--------------|-----------------|
+| Query Refinement | None - one shot | Iterative refinement |
+| Error Recovery | None - fails silently | Retries with different approach |
+| Schema Exploration | Static dump | Dynamic tool calls |
+| Reasoning | Linear 3-step | Multi-step with loops |
+| Missing Data | Reports as-is | Explores alternatives |
 
-**Mode affects:**
-- Which agent class is instantiated (`RequirementAgent` vs `RequirementGraphAgent`)
-- Processing strategy (single-pass vs iterative)
-- Output format (refined requirement vs plan, single query vs multiple queries)
-- Whether refinement step is used (chain mode only)
+### Prompt Templates
 
-### CSV Format Support
+LLM prompts are stored in `config/prompts/` and are **tightly coupled to the metamodel**. When modifying the database schema:
+1. Update `data/metamodell.cql`
+2. Update `config/prompts/agent_system.txt` (agent system prompt)
+3. Update `config/prompts/chain_domain.txt` (chain domain context)
+4. Update prompts in `src/agents/graph_agent.py` if needed
 
-The system handles **semicolon-delimited** CSV files as primary format (car rental dataset uses this). The processor in `csv_processor.py:44-55` tries semicolon first, then falls back to comma-delimited. For the current dataset:
-- First column = `Name` (requirement title)
-- Second column = `Description` (analyzed by LLM)
-- 82 requirements total in `data/requirements.csv`
+### Neo4j Query Guidelines
 
-### LangGraph Agent State Machine
+- Use `elementId(node)` instead of deprecated `id(node)`
+- Prefer property-based queries over ID-based queries
+- Always use `LIMIT` for potentially large result sets
 
-The agent mode (`requirement_agent_graph.py`) uses LangGraph's `StateGraph` with:
-- **State**: `AgentState` TypedDict with messages, plan, queries, iteration count, completion flag
-- **Nodes**: `plan_requirement`, `query_database`, `reason_about_results`, `finish`
-- **Edges**: Conditional routing based on iteration count and agent decision
-- **Tools**: `execute_cypher_query`, `get_database_schema` (decorated with `@tool`)
-- **Tool node**: `ToolNode` handles tool execution automatically
+### Output Structure
+
+Results saved to `output/` directory:
+- **JSON**: `{original_requirement, plan, queries_executed, iterations, analysis}`
+- **TXT**: Human-readable report with formatted sections
+
+### Structured Output Schema
+
+The chain example uses Pydantic models based on `data/output_schema.json`:
+- `Identification` - Requirement text and metadata (entity_name, requirement_type, status, source_origin)
+- `KnowledgeRetrieval` - found_facts (what was found) and missing_elements (what was not found)
+- `Analysis` - compliance_matrix (criteria, result, observation) and risk_assessment (level, justification)
+- `Evaluation` - verdict (Satisfied/Not Satisfied/Partially Satisfied) and summary_reasoning
+- `Recommendations` - action_items list
+- `ConversationalSummary` - user-friendly message
 
 ### Error Handling
 
-- Database connection failures are caught early in `setup()` (src/main.py:54-71)
-- Query execution errors are logged but don't crash the workflow
-- Failed requirements are saved to output with `error` field for debugging
-- Agent mode catches iteration limit and gracefully terminates
+- Database connection failures caught early in `setup()`
+- Query execution errors logged but don't crash workflow
+- Failed requirements saved with `error` field
+- Agent catches iteration limit and gracefully terminates
 
-### Alternative LLM Providers
-
-To use Anthropic Claude or Cohere instead of OpenAI:
-1. Install additional packages: `anthropic`, `langchain-anthropic`, or `cohere`
-2. Update `.env` with provider API key and model name
-3. Modify agent initialization in both `requirement_agent.py:34-38` and `requirement_agent_graph.py` to use appropriate LangChain chat model class (e.g., `ChatAnthropic`)
-
-## Common Development Workflows
-
-### Choosing Between Chain and Agent Modes
-
-**Use Chain Mode when:**
-- Processing multiple requirements in batch from CSV
-- Need fast, predictable results
-- Requirements are straightforward queries
-- Single Cypher query is sufficient
-
-**Use Agent Mode when:**
-- Analyzing complex, multi-faceted requirements
-- Need thorough investigation across multiple queries
-- Performing deep compliance analysis
-- Exploring impacts across multiple relationship types
-- Investigating requirements where initial query might not be sufficient
-
-### Testing a Single Requirement
-
-Use comparison scripts to test both approaches side-by-side:
-```bash
-python compare_approaches_unified.py "Find GoBD-relevant requirements and their impacts"
-```
+## Common Tasks
 
 ### Adding New Metamodel Nodes/Relationships
 
-1. Update Neo4j schema in `database/metamodell.cql` (add constraints/indexes)
-2. Execute changes in Neo4j Browser or via cypher-shell
-3. Update prompt template in **both** agent implementations:
-   - `requirement_agent.py:50-93` (chain mode metamodel description)
-   - `requirement_agent_graph.py` tool descriptions and system prompts
-4. Update README.md metamodel documentation section
+1. Update Neo4j schema in `data/metamodell.cql`
+2. Execute changes in Neo4j Browser
+3. Update prompts in `src/agents/graph_agent.py` and `src/chain_example.py`
 
 ### Processing a New Requirements CSV
 
-1. Place CSV file in `data/` directory
-2. Update `CSV_FILE_PATH` in `.env` to point to new file
-3. Ensure CSV has either:
-   - Semicolon format: `Name;Description` (preferred)
-   - Comma format with `requirement` or text column
-4. Run `python run_workflow.py chain` (or `agent` for thorough analysis)
+1. Place CSV in `data/` directory
+2. Update `CSV_FILE_PATH` in `.env`
+3. Ensure format: `Name;Description` (semicolon-delimited) or comma-delimited with `requirement` column
+4. Run `python -m src.workflow`
 
-### Debugging Query Generation Issues
+### Debugging Query Generation
 
 1. Check `output/results_*.txt` for generated Cypher queries
 2. Test queries manually in Neo4j Browser (http://localhost:7474)
-3. For chain mode: Examine `requirement_agent.py` prompt templates (lines 50-93) for metamodel accuracy
-4. For agent mode: Check `requirement_agent_graph.py` tool descriptions and system messages
-5. Verify database schema: `CALL db.schema.visualization()` in Neo4j Browser
+3. Verify schema: `CALL db.schema.visualization()` in Neo4j
 
-### Testing Database Connectivity
+### Alternative LLM Providers
 
-The `neo4j_utils.py` module provides a standalone test:
-```python
-from src.neo4j_utils import create_neo4j_connection
-conn = create_neo4j_connection()
-if conn.connect():
-    schema = conn.get_database_schema()
-    print(f"Labels: {schema['node_labels']}")
-    conn.close()
-```
-
-### Modifying LLM Chains (Post-Refactoring Pattern)
-
-When adding or modifying chains in `requirement_agent.py`:
-```python
-# Create chain using Runnable pattern
-template = """Your prompt template here with {variables}"""
-prompt = PromptTemplate(input_variables=["var1", "var2"], template=template)
-chain = prompt | self.llm  # Pipe operator for composition
-
-# Invoke chain
-result = chain.invoke({"var1": "value1", "var2": "value2"})
-output = result.content.strip()  # Access content attribute
-```
-
-## Important Notes
-
-- The LLM prompts in both `requirement_agent.py` and `requirement_agent_graph.py` are **tightly coupled to the metamodel** - changes to one require changes to the other
-- The system assumes Neo4j 5.x with APOC procedures available
-- Temperature is set to 0.0 for deterministic query generation
-- The semicolon CSV format is required for the current car rental dataset (82 requirements)
-- **Recent refactoring**: `requirement_agent.py` now uses `Runnable` pattern (prompt | llm) instead of `LLMChain`
-- There are TWO separate agent implementations: `requirement_agent.py` (chain mode) and `requirement_agent_graph.py` (agent mode)
-- Comparison scripts in root directory allow side-by-side testing of both approaches
+To use Anthropic Claude or other providers:
+1. Install: `pip install anthropic langchain-anthropic`
+2. Update `.env` with provider API key
+3. Modify agent initialization in `src/agents/graph_agent.py` to use `ChatAnthropic`

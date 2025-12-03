@@ -14,7 +14,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 
-from src.neo4j_utils import Neo4jConnection
+from src.core.neo4j_utils import Neo4jConnection
 
 
 # ============================================================================
