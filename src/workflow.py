@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from src.core.neo4j_utils import create_neo4j_connection
 from src.core.csv_processor import RequirementProcessor
+from src.core.config import load_config
 from src.agents.graph_agent import create_graph_agent
 
 
@@ -102,7 +103,8 @@ class RequirementWorkflow:
         """
         requirements = self.processor.requirements
         results = []
-        max_iterations = int(os.getenv('AGENT_MAX_ITERATIONS', '5'))
+        config = load_config("llm_config.json")["agent"]
+        max_iterations = config.get("max_iterations", 5)
 
         print(f"\n{'='*80}")
         print(f"Processing {len(requirements)} requirements...")

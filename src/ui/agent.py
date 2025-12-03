@@ -44,7 +44,7 @@ def render():
 
     # Load config
     try:
-        config = load_config("agent_config.json")
+        config = load_config("llm_config.json")["agent"]
         system_prompt = load_prompt("agent_system.txt")
     except FileNotFoundError as e:
         st.error(f"Configuration file not found: {e}")
