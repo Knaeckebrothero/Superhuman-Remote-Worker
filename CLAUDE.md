@@ -66,8 +66,10 @@ Database dump: `data/neo4j.dump`
 Create `.env` from `.env.example`:
 - `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` - Database connection
 - `CSV_FILE_PATH` - Path to requirements CSV (default: `data/requirements.csv`)
-- `OPENAI_API_KEY`, `LLM_MODEL`, `LLM_TEMPERATURE` - LLM configuration
-- `AGENT_MAX_ITERATIONS` - Max iterations for agent (default: 5)
+- `OPENAI_API_KEY` - LLM API key (only credentials in .env)
+- `WORKFLOW_MODE` - "chain" or "agent" for workflow selection
+
+LLM settings (model, temperature, max_iterations) are in `config/llm_config.json`.
 
 ## Architecture
 
@@ -77,8 +79,7 @@ Create `.env` from `.env.example`:
 project/
 ├── main.py                    # Streamlit entry point
 ├── config/                    # Configuration files
-│   ├── agent_config.json      # Agent settings (model, temperature, iterations)
-│   ├── chain_config.json      # Chain settings (model, temperature)
+│   ├── llm_config.json        # LLM settings (model, temperature, iterations)
 │   └── prompts/
 │       ├── agent_system.txt   # Agent system prompt
 │       └── chain_domain.txt   # Chain domain context
@@ -89,6 +90,7 @@ project/
 │   ├── agents/
 │   │   └── graph_agent.py     # LangGraph iterative agent
 │   ├── core/
+│   │   ├── config.py          # Configuration loader utilities
 │   │   ├── neo4j_utils.py     # Neo4j connection layer
 │   │   └── csv_processor.py   # CSV requirement parser
 │   └── ui/
@@ -132,11 +134,16 @@ The **Agent** is the main implementation - it iteratively queries the database, 
    - Uses Pydantic models for structured output (based on `data/output_schema.json`)
    - No iteration, no tool calling - demonstrates limitations
 
-4. **`src/core/neo4j_utils.py`** - Database connection layer
+4. **`src/core/config.py`** - Configuration utilities
+   - `load_config()` loads JSON from `config/` directory
+   - `load_prompt()` loads prompt text from `config/prompts/`
+   - `get_project_root()` returns project root path
+
+5. **`src/core/neo4j_utils.py`** - Database connection layer
    - `Neo4jConnection` class: `connect()`, `execute_query()`, `get_database_schema()`, `close()`
    - Factory: `create_neo4j_connection()` reads from environment
 
-5. **`src/core/csv_processor.py`** - Requirement input handler
+6. **`src/core/csv_processor.py`** - Requirement input handler
    - `RequirementProcessor` class reads semicolon-delimited CSV (auto-detects delimiter)
    - Format: `Name;Description` (82 requirements in current dataset)
 
@@ -227,5 +234,6 @@ The chain example uses Pydantic models based on `data/output_schema.json`:
 
 To use Anthropic Claude or other providers:
 1. Install: `pip install anthropic langchain-anthropic`
-2. Update `.env` with provider API key
-3. Modify agent initialization in `src/agents/graph_agent.py` to use `ChatAnthropic`
+2. Add provider API key to `.env` (e.g., `ANTHROPIC_API_KEY`)
+3. Update model name in `config/llm_config.json`
+4. Modify agent initialization in `src/agents/graph_agent.py` to use `ChatAnthropic`

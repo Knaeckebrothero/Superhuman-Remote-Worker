@@ -28,7 +28,7 @@ def render():
 
     # Load config
     try:
-        config = load_config("chain_config.json")
+        config = load_config("llm_config.json")["chain"]
         domain_context = load_prompt("chain_domain.txt")
     except FileNotFoundError as e:
         st.error(f"Configuration file not found: {e}")

@@ -1,0 +1,11 @@
+{
+  "agent": {
+    "model": "gpt-5-mini-2025-08-07",
+    "temperature": 0.0,
+    "max_iterations": 5
+  },
+  "chain": {
+    "model": "gpt-5-mini-2025-08-07",
+    "temperature": 0.2
+  }
+}

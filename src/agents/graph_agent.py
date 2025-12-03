@@ -15,6 +15,7 @@ from langgraph.graph.message import add_messages
 from langchain_core.runnables import RunnableConfig
 
 from src.core.neo4j_utils import Neo4jConnection
+from src.core.config import load_config
 
 
 # ============================================================================
@@ -208,27 +209,32 @@ class Neo4jTools:
 class RequirementGraphAgent:
     """LangGraph-based agent for iterative requirement analysis."""
 
-    def __init__(self, neo4j_connection: Neo4jConnection, llm_model: str = None, temperature: float = 0.0, system_prompt: str = None):
+    def __init__(self, neo4j_connection: Neo4jConnection, llm_model: str, temperature: float = 0.0, system_prompt: str = None):
         """
         Initialize the graph agent.
 
         Args:
             neo4j_connection: Active Neo4j connection
-            llm_model: LLM model to use (defaults to env variable)
+            llm_model: LLM model to use
             temperature: LLM temperature setting
             system_prompt: Optional custom system prompt
         """
         self.neo4j = neo4j_connection
-        self.llm_model = llm_model or os.getenv('LLM_MODEL', 'gpt-4-turbo-preview')
+        self.llm_model = llm_model
         self.temperature = temperature
         self.system_prompt = system_prompt
 
-        # Initialize LLM
-        self.llm = ChatOpenAI(
-            model=self.llm_model,
-            temperature=self.temperature,
-            openai_api_key=os.getenv('OPENAI_API_KEY')
-        )
+        # Initialize LLM (supports custom OpenAI-compatible endpoints like vLLM)
+        llm_kwargs = {
+            "model": self.llm_model,
+            "temperature": self.temperature,
+            "api_key": os.getenv('OPENAI_API_KEY'),
+        }
+        base_url = os.getenv('LLM_BASE_URL')
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+
+        self.llm = ChatOpenAI(**llm_kwargs)
 
         # Initialize tools
         self.neo4j_tools = Neo4jTools(neo4j_connection)
@@ -525,7 +531,7 @@ You executed {len(queries)} queries during your investigation. Now synthesize al
 
 def create_graph_agent(neo4j_connection: Neo4jConnection) -> RequirementGraphAgent:
     """
-    Create a requirement graph agent with configuration from environment variables.
+    Create a requirement graph agent with configuration from config file.
 
     Args:
         neo4j_connection: Active Neo4j connection
@@ -533,11 +539,10 @@ def create_graph_agent(neo4j_connection: Neo4jConnection) -> RequirementGraphAge
     Returns:
         Configured RequirementGraphAgent instance
     """
-    llm_model = os.getenv('LLM_MODEL', 'gpt-4-turbo-preview')
-    temperature = float(os.getenv('LLM_TEMPERATURE', '0.0'))
+    config = load_config("llm_config.json")["agent"]
 
     return RequirementGraphAgent(
         neo4j_connection=neo4j_connection,
-        llm_model=llm_model,
-        temperature=temperature
+        llm_model=config["model"],
+        temperature=config.get("temperature", 0.0)
     )

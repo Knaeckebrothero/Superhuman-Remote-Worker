@@ -128,26 +128,32 @@ IMPORTANT Neo4j Query Guidelines:
     def __init__(
         self,
         neo4j_connection: Neo4jConnection,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None
+        model: str,
+        temperature: float = 0.2
     ):
         """
         Initialize the simple chain.
 
         Args:
             neo4j_connection: Active Neo4j connection
-            model: LLM model to use (defaults to env variable or gpt-4o-mini)
-            temperature: LLM temperature (defaults to env variable or 0.2)
+            model: LLM model to use
+            temperature: LLM temperature
         """
         self.neo4j = neo4j_connection
-        self.model = model or os.getenv('LLM_MODEL', 'gpt-4o-mini')
-        self.temperature = temperature if temperature is not None else float(os.getenv('LLM_TEMPERATURE', '0.2'))
+        self.model = model
+        self.temperature = temperature
 
-        self.llm = ChatOpenAI(
-            model=self.model,
-            temperature=self.temperature,
-            openai_api_key=os.getenv('OPENAI_API_KEY')
-        )
+        # Initialize LLM (supports custom OpenAI-compatible endpoints like vLLM)
+        llm_kwargs = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "api_key": os.getenv('OPENAI_API_KEY'),
+        }
+        base_url = os.getenv('LLM_BASE_URL')
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+
+        self.llm = ChatOpenAI(**llm_kwargs)
 
         # Conversation history
         self.messages: List = []
