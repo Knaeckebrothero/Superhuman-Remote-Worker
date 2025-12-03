@@ -59,7 +59,7 @@ The workflow leverages LangChain and a metamodel-based approach:
 - **Multiple Output Formats**: Results available in both JSON (structured) and TXT (human-readable) formats
 - **Flexible LLM Support**: Works with OpenAI (default), Anthropic Claude, Cohere, and other LangChain-compatible providers
 - **Error Handling**: Robust error handling with detailed logging
-- **Comparison Tools**: Built-in script to compare chain vs agent approaches side-by-side
+- **Interactive UI**: Streamlit-based web interface for interactive requirement analysis with streaming progress
 
 ## Database Metamodel
 
@@ -93,31 +93,48 @@ The system uses a specialized graph metamodel designed for requirement traceabil
 
 ### Metamodel Files
 
-- **`database/metamodell.cql`**: Neo4j schema definition with constraints, indexes, and sample queries
-- **`database/neo4j.dump`**: Database dump file for importing the complete graph structure
-- **`metamodell.xml`**: XML representation of the metamodel (if applicable)
+- **`data/metamodell.cql`**: Neo4j schema definition with constraints, indexes, and sample queries
+- **`data/neo4j.dump`**: Database dump file for importing the complete graph structure
+- **`data/metamodell.xml`**: XML representation of the metamodel
+- **`data/output_schema.json`**: Structured output schema for Pydantic models
 
 ## Repository Structure
 
 ```
+├── main.py                      # Streamlit entry point (multi-page app)
+├── config/
+│   ├── agent_config.json        # Agent settings (model, temperature, iterations)
+│   ├── chain_config.json        # Chain settings (model, temperature)
+│   └── prompts/
+│       ├── agent_system.txt     # Agent system prompt
+│       └── chain_domain.txt     # Chain domain context
 ├── src/
 │   ├── __init__.py              # Package initialization
-│   ├── main.py                  # Main workflow orchestrator
-│   ├── neo4j_utils.py           # Neo4j connection and query utilities
-│   ├── csv_processor.py         # CSV file processing (supports semicolon and comma delimiters)
-│   └── requirement_agent.py     # LangChain agent with metamodel-aware query generation
+│   ├── workflow.py              # Batch workflow orchestrator
+│   ├── chain_example.py         # Simple chain demo (for comparison)
+│   ├── agents/
+│   │   ├── __init__.py
+│   │   └── graph_agent.py       # LangGraph iterative agent
+│   ├── core/
+│   │   ├── __init__.py
+│   │   ├── neo4j_utils.py       # Neo4j connection and query utilities
+│   │   └── csv_processor.py     # CSV file processing
+│   └── ui/
+│       ├── __init__.py          # UI helper functions
+│       ├── home.py              # Home page (connection settings)
+│       ├── agent.py             # Agent analysis page
+│       └── chain.py             # Chain analysis page
 ├── data/
-│   └── requirements.csv         # Car rental business requirements (82 requirements)
-├── database/
 │   ├── metamodell.cql           # Neo4j metamodel schema definition
-│   └── neo4j.dump               # Database dump file for import
+│   ├── metamodell.xml           # XML representation of the metamodel
+│   ├── neo4j.dump               # Database dump file for import
+│   ├── output_schema.json       # Structured output schema
+│   └── requirements.csv         # Car rental business requirements (82 requirements)
 ├── output/                      # Generated analysis results (created automatically)
 ├── docker/
 │   └── README.txt               # Docker setup information
-├── metamodell.xml               # XML representation of the metamodel
 ├── .env.example                 # Environment configuration template
 ├── requirements.txt             # Python dependencies
-├── run_workflow.py              # Convenience script to run the workflow
 ├── README.md                    # This file
 └── LICENSE.txt                  # License information
 ```
@@ -200,6 +217,21 @@ ANTHROPIC_API_KEY=your_anthropic_key_here
 LLM_MODEL=claude-3-opus-20240229
 ```
 
+### Configuration Files
+
+The `config/` directory contains additional configuration:
+
+```
+config/
+├── agent_config.json      # Agent settings (model, temperature, max_iterations)
+├── chain_config.json      # Chain settings (model, temperature)
+└── prompts/
+    ├── agent_system.txt   # System prompt for the LangGraph agent
+    └── chain_domain.txt   # Domain context for the simple chain
+```
+
+These files allow you to customize agent/chain behavior without modifying code. The prompts are tightly coupled to the database metamodel.
+
 ## Database Setup
 
 You have two options for setting up the Neo4j database:
@@ -218,7 +250,7 @@ The repository includes a complete database dump with sample data:
    neo4j stop
 
    # Load the dump file (replace <database-name> with your database name, e.g., neo4j)
-   neo4j-admin database load --from-path=database/ <database-name> --overwrite-destination=true
+   neo4j-admin database load --from-path=data/ <database-name> --overwrite-destination=true
 
    # Start the database
    neo4j start
@@ -235,7 +267,7 @@ If you prefer to start with an empty database and create the schema:
 1. **Start Neo4j and open Neo4j Browser** (http://localhost:7474)
 
 2. **Execute the metamodel schema**
-   - Open the file `database/metamodell.cql`
+   - Open the file `data/metamodell.cql`
    - Copy and paste the content into Neo4j Browser
    - Execute the commands to create constraints and indexes
 
@@ -248,99 +280,76 @@ If you prefer to start with an empty database and create the schema:
 Test your database connection:
 
 ```bash
-python -c "from src.neo4j_utils import create_neo4j_connection; conn = create_neo4j_connection(); conn.connect()"
+python -c "from src.core.neo4j_utils import create_neo4j_connection; conn = create_neo4j_connection(); conn.connect()"
 ```
 
 You should see: `✓ Successfully connected to Neo4j at bolt://localhost:7687`
 
 ## Usage
 
-The system supports two approaches for analyzing requirements:
+The system provides two interfaces for analyzing requirements:
 
-1. **Chain Mode** (default): Simple linear workflow - fast and predictable
-2. **Agent Mode**: Iterative reasoning agent - thorough and exploratory
+1. **Interactive UI** (Streamlit): Web-based interface with real-time streaming
+2. **Batch Workflow** (CLI): Process all requirements from CSV file
 
-### Basic Usage
-
-**Chain Mode** (Linear: Refine -> Query -> Analyze):
-```bash
-python run_workflow.py chain
-```
-
-**Agent Mode** (Iterative: Plan -> Query -> Reason -> Repeat):
-```bash
-python run_workflow.py agent
-```
-
-Or use the main module directly:
+### Interactive Streamlit Application
 
 ```bash
-python -m src.main chain   # for chain mode
-python -m src.main agent   # for agent mode
+streamlit run main.py
 ```
 
-You can also set the mode in your `.env` file:
-```bash
-WORKFLOW_MODE=agent
-python run_workflow.py
-```
+This launches a multi-page web application:
+- **Home**: Configure Neo4j database connection
+- **Agent**: Iterative LangGraph agent with streaming progress display
+- **Chain**: Simple one-shot chain for quick analysis
 
-### Comparing Chain vs Agent Approaches
+### Batch Workflow (Command Line)
 
-To see both approaches in action side-by-side:
+Process all requirements from CSV using the LangGraph agent:
 
 ```bash
-python compare_approaches.py "Which requirements are GoBD-relevant?"
+python -m src.workflow
 ```
 
-This will run the same requirement through both workflows and show the differences.
+This reads requirements from the CSV file specified in `CSV_FILE_PATH` and saves results to `output/`.
 
-### Choosing Between Chain and Agent
+### Choosing Between Agent and Chain
 
-**Use Chain Mode when:**
-- You want fast, predictable results
-- Requirements are straightforward
-- You need single-query answers
-- Processing many requirements in batch
+**Agent (Recommended):**
+- Iterative reasoning with multiple query attempts
+- Dynamic schema exploration
+- Error recovery and query refinement
+- Best for complex compliance and impact analysis
 
-**Use Agent Mode when:**
-- Dealing with complex, multi-faceted requirements
-- Need deep exploratory analysis
-- Want the system to investigate multiple angles
-- Compliance analysis requiring thorough investigation
-- Impact analysis across multiple relationship types
+**Chain (Simple):**
+- Single-shot linear workflow
+- Faster but less thorough
+- Good for straightforward requirements
 
 ### Programmatic Usage
 
-You can also use the workflow programmatically in your Python code:
-
 ```python
 from dotenv import load_dotenv
-from src.main import RequirementWorkflow
+from src.workflow import RequirementWorkflow
 
 # Load environment variables
 load_dotenv()
 
-# Create workflow instance (chain mode)
+# Create workflow instance
 workflow = RequirementWorkflow(
     csv_path="data/requirements.csv",
-    output_dir="output",
-    mode="chain"  # or "agent"
+    output_dir="output"
 )
 
 # Run the workflow
-results = workflow.run(
-    refine=True,          # Refine requirements before processing (chain mode)
-    save_format="both"    # Save as both JSON and TXT
-)
+results = workflow.run(save_format="both")  # 'json', 'txt', or 'both'
 
 # Access individual results
 for result in results:
     print(f"Requirement: {result['original_requirement']}")
+    print(f"Plan: {result.get('plan', '')}")
+    print(f"Iterations: {result.get('iterations', 0)}")
     print(f"Analysis: {result['analysis']}")
-    if result.get('mode') == 'agent':
-        print(f"Iterations: {result.get('iterations', 0)}")
-        print(f"Plan: {result.get('plan', '')}")
 ```
 
 ## CSV Format
