@@ -209,7 +209,7 @@ class Neo4jTools:
 class RequirementGraphAgent:
     """LangGraph-based agent for iterative requirement analysis."""
 
-    def __init__(self, neo4j_connection: Neo4jConnection, llm_model: str, temperature: float = 0.0, system_prompt: str = None):
+    def __init__(self, neo4j_connection: Neo4jConnection, llm_model: str, temperature: float = 0.0, system_prompt: str = None, reasoning_level: str = "medium"):
         """
         Initialize the graph agent.
 
@@ -218,11 +218,13 @@ class RequirementGraphAgent:
             llm_model: LLM model to use
             temperature: LLM temperature setting
             system_prompt: Optional custom system prompt
+            reasoning_level: Reasoning effort level (low, medium, high) for gpt-oss models
         """
         self.neo4j = neo4j_connection
         self.llm_model = llm_model
         self.temperature = temperature
         self.system_prompt = system_prompt
+        self.reasoning_level = reasoning_level
 
         # Initialize LLM (supports custom OpenAI-compatible endpoints like vLLM)
         llm_kwargs = {
@@ -246,16 +248,24 @@ class RequirementGraphAgent:
         # Build the graph
         self.graph = self.build_graph()
 
+    def _build_reasoning_directive(self) -> str:
+        """Build the reasoning directive based on configured level."""
+        level = self.reasoning_level if self.reasoning_level in ("low", "medium", "high") else "medium"
+        return f"Reasoning: {level}"
+
     def planner_node(self, state: AgentState) -> AgentState:
         """
         Plan how to approach the requirement analysis.
         """
         requirement = state["requirement"]
+        reasoning_directive = self._build_reasoning_directive()
 
         if self.system_prompt:
-            system_message = self.system_prompt
+            system_message = f"{reasoning_directive}\n\n{self.system_prompt}"
         else:
-            system_message = """You are an expert analyst for Neo4j graph database requirements.
+            system_message = f"""{reasoning_directive}
+
+You are an expert analyst for Neo4j graph database requirements.
 
 IMPORTANT Neo4j Query Guidelines:
 - Use elementId(node) instead of id(node) - the id() function is deprecated
@@ -385,8 +395,11 @@ Create a step-by-step plan (3-5 steps) that you'll execute using the available t
         """
         requirement = state["requirement"]
         queries = state.get("queries_executed", [])
+        reasoning_directive = self._build_reasoning_directive()
 
-        system_message = """You are an expert analyst for requirement traceability and compliance checking in a car rental business system.
+        system_message = f"""{reasoning_directive}
+
+You are an expert analyst for requirement traceability and compliance checking in a car rental business system.
 
 Based on the requirement analysis you've conducted, provide a comprehensive final report with these sections:
 
@@ -544,5 +557,6 @@ def create_graph_agent(neo4j_connection: Neo4jConnection) -> RequirementGraphAge
     return RequirementGraphAgent(
         neo4j_connection=neo4j_connection,
         llm_model=config["model"],
-        temperature=config.get("temperature", 0.0)
+        temperature=config.get("temperature", 0.0),
+        reasoning_level=config.get("reasoning_level", "medium")
     )

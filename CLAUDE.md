@@ -67,9 +67,10 @@ Create `.env` from `.env.example`:
 - `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` - Database connection
 - `CSV_FILE_PATH` - Path to requirements CSV (default: `data/requirements.csv`)
 - `OPENAI_API_KEY` - LLM API key (only credentials in .env)
+- `LLM_BASE_URL` - Optional custom endpoint for self-hosted models (gpt-oss, vLLM, llama.cpp)
 - `WORKFLOW_MODE` - "chain" or "agent" for workflow selection
 
-LLM settings (model, temperature, max_iterations) are in `config/llm_config.json`.
+LLM settings (model, temperature, max_iterations, reasoning_level) are in `config/llm_config.json`.
 
 ## Architecture
 
@@ -79,7 +80,7 @@ LLM settings (model, temperature, max_iterations) are in `config/llm_config.json
 project/
 ├── main.py                    # Streamlit entry point
 ├── config/                    # Configuration files
-│   ├── llm_config.json        # LLM settings (model, temperature, iterations)
+│   ├── llm_config.json        # LLM settings (model, temperature, reasoning_level)
 │   └── prompts/
 │       ├── agent_system.txt   # Agent system prompt
 │       └── chain_domain.txt   # Chain domain context
