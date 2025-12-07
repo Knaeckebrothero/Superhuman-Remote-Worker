@@ -16,6 +16,67 @@ from langchain_core.runnables import RunnableConfig
 
 from src.core.neo4j_utils import Neo4jConnection
 from src.core.config import load_config
+from src.core.metamodel_validator import MetamodelValidator, ComplianceReport, Severity
+
+# Optional: Web search capability
+try:
+    from langchain_tavily import TavilySearch
+    TAVILY_AVAILABLE = os.getenv('TAVILY_API_KEY') is not None
+except ImportError:
+    TAVILY_AVAILABLE = False
+    TavilySearch = None
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def format_report_for_agent(report: ComplianceReport) -> str:
+    """
+    Format a ComplianceReport as a structured string for the LLM agent.
+
+    This provides the agent with all the information needed to explain
+    violations, assess impact, and suggest remediations.
+    """
+    lines = [
+        "## Metamodel Compliance Report",
+        f"**Generated:** {report.timestamp.isoformat()}",
+        f"**Overall Status:** {'PASSED' if report.passed else 'FAILED'}",
+        f"**Errors:** {report.error_count} | **Warnings:** {report.warning_count}",
+        "",
+    ]
+
+    if report.error_count > 0:
+        lines.append("### Critical Violations (Errors)")
+        for result in report.results:
+            if not result.passed and result.severity == Severity.ERROR:
+                lines.append(f"\n**[{result.check_id}] {result.check_name}**")
+                lines.append(f"- Status: FAILED")
+                lines.append(f"- Message: {result.message}")
+                if result.violations:
+                    lines.append("- Violations:")
+                    for v in result.violations[:5]:  # Limit to first 5
+                        lines.append(f"  - {v}")
+                    if len(result.violations) > 5:
+                        lines.append(f"  - ... and {len(result.violations) - 5} more")
+
+    if report.warning_count > 0:
+        lines.append("\n### Quality Warnings")
+        for result in report.results:
+            if not result.passed and result.severity == Severity.WARNING:
+                lines.append(f"\n**[{result.check_id}] {result.check_name}**")
+                lines.append(f"- Message: {result.message}")
+                if result.violations:
+                    lines.append("- Items:")
+                    for v in result.violations[:5]:
+                        lines.append(f"  - {v}")
+                    if len(result.violations) > 5:
+                        lines.append(f"  - ... and {len(result.violations) - 5} more")
+
+    if report.passed and report.warning_count == 0:
+        lines.append("All checks passed successfully. The graph conforms to the metamodel.")
+
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -54,11 +115,21 @@ class AgentState(TypedDict):
 # ============================================================================
 
 class Neo4jTools:
-    """Tools for interacting with Neo4j database."""
+    """Tools for interacting with Neo4j database and external resources."""
 
-    def __init__(self, neo4j_connection: Neo4jConnection):
+    def __init__(self, neo4j_connection: Neo4jConnection, enable_web_search: bool = True):
         self.neo4j = neo4j_connection
         self.schema = neo4j_connection.get_database_schema()
+        self.validator = MetamodelValidator(neo4j_connection)
+
+        # Initialize web search if available and enabled
+        self.web_search_tool = None
+        if enable_web_search and TAVILY_AVAILABLE and TavilySearch:
+            self.web_search_tool = TavilySearch(
+                max_results=5,
+                topic="general",
+                include_answer=True,
+            )
 
     def get_tools(self):
         """Return list of tools for the agent."""
@@ -199,7 +270,119 @@ class Neo4jTools:
             except Exception as e:
                 return f"Error finding sample nodes: {str(e)}"
 
-        return [execute_cypher_query, get_database_schema, count_nodes_by_label, find_sample_nodes]
+        @tool
+        def validate_schema_compliance(
+            check_type: str = "all",
+            specific_check: str = None
+        ) -> str:
+            """
+            Run metamodel compliance checks against the current graph state.
+
+            Use this tool when you need to:
+            - Verify if the graph conforms to the FINIUS metamodel
+            - Check specific constraint categories (structural, relationships, quality)
+            - Re-validate after discussing potential issues
+            - Assess GoBD compliance readiness
+
+            Args:
+                check_type: Category of checks to run. Options:
+                    - "all": Run all checks (A, B, C categories) - default
+                    - "structural": Only node label and property checks (Category A: A1, A2, A3)
+                    - "relationships": Only relationship type/direction checks (Category B: B1, B2, B3)
+                    - "quality": Only semantic quality checks (Category C: C1, C2, C3)
+                    - "specific": Run a single check by ID (requires specific_check parameter)
+                specific_check: Check ID when check_type="specific" (e.g., "A1", "B2", "C3")
+                    - A1: Node labels must be from allowed set
+                    - A2: ID properties must be unique
+                    - A3: Required properties must exist
+                    - B1: Relationship types must be valid
+                    - B2: Relationship directions must be correct
+                    - B3: No invalid self-loops
+                    - C1: Requirements should have connections (warning)
+                    - C2: Messages should specify content (warning)
+                    - C3: GoBD items need impact traceability (warning)
+
+            Returns:
+                Structured compliance report with pass/fail status, violations,
+                warnings, and the Cypher queries used for audit trail.
+            """
+            try:
+                if check_type == "all":
+                    report = self.validator.run_all_checks()
+                elif check_type == "structural":
+                    report = self.validator.run_structural_checks()
+                elif check_type == "relationships":
+                    report = self.validator.run_relationship_checks()
+                elif check_type == "quality":
+                    report = self.validator.run_quality_gate_checks()
+                elif check_type == "specific" and specific_check:
+                    report = self.validator.run_specific_check(specific_check)
+                else:
+                    return "Invalid check_type. Use 'all', 'structural', 'relationships', 'quality', or 'specific' with a specific_check ID."
+
+                return format_report_for_agent(report)
+
+            except ValueError as e:
+                return f"Error: {str(e)}"
+            except Exception as e:
+                return f"Error running compliance check: {str(e)}"
+
+        @tool
+        def web_search(query: str) -> str:
+            """
+            Search the web for information using Tavily AI search.
+
+            Use this tool when you need to:
+            - Look up current regulations, standards, or compliance requirements (e.g., GoBD)
+            - Find documentation about specific technologies or frameworks
+            - Research best practices or industry standards
+            - Get up-to-date information beyond the knowledge cutoff
+            - Verify or supplement information about German accounting principles
+
+            Args:
+                query: The search query. Be specific and include relevant context.
+                    Good: "GoBD compliance requirements for digital invoices Germany 2024"
+                    Bad: "GoBD"
+
+            Returns:
+                Search results with relevant content and sources.
+            """
+            if not self.web_search_tool:
+                return "Web search is not available. Please set TAVILY_API_KEY environment variable and install langchain-tavily."
+
+            try:
+                results = self.web_search_tool.invoke({"query": query})
+
+                # Format results for the agent
+                if isinstance(results, str):
+                    return results
+
+                # Handle list of results
+                if isinstance(results, list):
+                    formatted = []
+                    for i, result in enumerate(results, 1):
+                        if isinstance(result, dict):
+                            title = result.get('title', 'No title')
+                            content = result.get('content', result.get('snippet', 'No content'))
+                            url = result.get('url', '')
+                            formatted.append(f"**Result {i}: {title}**\n{content}\nSource: {url}\n")
+                        else:
+                            formatted.append(f"**Result {i}:** {result}\n")
+                    return "\n".join(formatted) if formatted else "No results found."
+
+                return str(results)
+
+            except Exception as e:
+                return f"Error performing web search: {str(e)}"
+
+        # Build tools list
+        tools = [execute_cypher_query, get_database_schema, count_nodes_by_label, find_sample_nodes, validate_schema_compliance]
+
+        # Add web search if available
+        if self.web_search_tool:
+            tools.append(web_search)
+
+        return tools
 
 
 # ============================================================================
@@ -265,29 +448,50 @@ class RequirementGraphAgent:
         else:
             system_message = f"""{reasoning_directive}
 
-You are an expert analyst for Neo4j graph database requirements.
+You are an expert analyst for Neo4j graph database requirements and metamodel compliance.
 
 IMPORTANT Neo4j Query Guidelines:
 - Use elementId(node) instead of id(node) - the id() function is deprecated
 - Use element_id property when available instead of internal IDs
 - For node matching, prefer property-based queries over ID-based queries
 
-Database Metamodel:
+Database Metamodel (FINIUS):
 - Requirement nodes: Business requirements with properties (rid, name, text, type, goBDRelevant, etc.)
 - BusinessObject nodes: Business domain entities (boid, name, description, domain, owner)
 - Message nodes: System messages (mid, name, description, direction, format, protocol)
 
-Relationships:
-- Requirements can REFINES, DEPENDS_ON, TRACES_TO other requirements
-- Requirements can RELATES_TO_OBJECT or IMPACTS_OBJECT business objects
-- Requirements can RELATES_TO_MESSAGE or IMPACTS_MESSAGE messages
-- Messages can USES_OBJECT or PRODUCES_OBJECT business objects
+Allowed Relationships:
+- Requirement → Requirement: REFINES, DEPENDS_ON, TRACES_TO
+- Requirement → BusinessObject: RELATES_TO_OBJECT, IMPACTS_OBJECT
+- Requirement → Message: RELATES_TO_MESSAGE, IMPACTS_MESSAGE
+- Message → BusinessObject: USES_OBJECT, PRODUCES_OBJECT
+
+Compliance Checking:
+You have access to a validate_schema_compliance tool that performs deterministic checks:
+- Category A (ERROR): Structural constraints (node labels, unique IDs, required properties)
+- Category B (ERROR): Relationship constraints (valid types, correct directions, no invalid self-loops)
+- Category C (WARNING): Quality gates (orphan requirements, message content, GoBD traceability)
+
+Use compliance checking when:
+- Verifying if the graph conforms to the metamodel
+- Assessing GoBD compliance readiness
+- Investigating structural issues before deeper analysis
+- Explaining violations in business terms
+
+Web Search:
+You may have access to a web_search tool for looking up external information.
+Use web search when:
+- Researching GoBD (Grundsätze zur ordnungsmäßigen Führung und Aufbewahrung von Büchern) requirements
+- Looking up current compliance regulations or standards
+- Finding documentation about specific technologies
+- Verifying information about German accounting/tax principles
 
 Your task is to create a plan for analyzing this requirement. Consider:
 1. What information do you need from the database?
-2. What queries might help answer this requirement?
-3. What relationships should you explore?
-4. How can you verify compliance or assess impact?
+2. Should you run compliance checks first to understand graph health?
+3. What queries might help answer this requirement?
+4. What relationships should you explore?
+5. How can you verify compliance or assess impact?
 
 Create a step-by-step plan (3-5 steps) that you'll execute using the available tools."""
 
@@ -406,9 +610,16 @@ Based on the requirement analysis you've conducted, provide a comprehensive fina
 1. **Summary**: Clear, concise answer to the requirement question
 2. **Findings**: Key data points and evidence from your queries
 3. **Compliance Status**: Whether requirement is met, partially met, or not met
-4. **Impact Assessment**: Which business objects, messages, or requirements are affected
-5. **Recommendations**: Specific actions or considerations, especially for GoBD compliance
-6. **Risk Level**: Assessment of any risks or concerns identified
+4. **Metamodel Compliance**: If you ran schema compliance checks, summarize the results:
+   - Structural issues (invalid labels, missing properties)
+   - Relationship violations (invalid types, wrong directions)
+   - Quality warnings (orphan nodes, missing traceability)
+5. **Impact Assessment**: Which business objects, messages, or requirements are affected
+6. **Recommendations**: Specific actions or considerations, including:
+   - GoBD compliance remediation
+   - Metamodel violation fixes (with example Cypher where helpful)
+   - Quality improvements
+7. **Risk Level**: Assessment of any risks or concerns identified
 
 Format your analysis with clear section headers and reference specific data from your investigation."""
 
