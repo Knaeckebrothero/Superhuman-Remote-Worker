@@ -1,11 +1,13 @@
 {
   "agent": {
-    "model": "gpt-5-mini-2025-08-07",
+    "model": "gpt-oss-120b",
     "temperature": 0.0,
-    "max_iterations": 5
+    "max_iterations": 5,
+    "reasoning_level": "high"
   },
   "chain": {
-    "model": "gpt-5-mini-2025-08-07",
-    "temperature": 0.2
+    "model": "gpt-oss-120b",
+    "temperature": 0.2,
+    "reasoning_level": "medium"
   }
 }

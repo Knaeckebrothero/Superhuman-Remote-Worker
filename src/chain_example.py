@@ -129,7 +129,8 @@ IMPORTANT Neo4j Query Guidelines:
         self,
         neo4j_connection: Neo4jConnection,
         model: str,
-        temperature: float = 0.2
+        temperature: float = 0.2,
+        reasoning_level: str = "medium"
     ):
         """
         Initialize the simple chain.
@@ -138,10 +139,12 @@ IMPORTANT Neo4j Query Guidelines:
             neo4j_connection: Active Neo4j connection
             model: LLM model to use
             temperature: LLM temperature
+            reasoning_level: Reasoning effort level (low, medium, high) for gpt-oss models
         """
         self.neo4j = neo4j_connection
         self.model = model
         self.temperature = temperature
+        self.reasoning_level = reasoning_level
 
         # Initialize LLM (supports custom OpenAI-compatible endpoints like vLLM)
         llm_kwargs = {
@@ -157,6 +160,15 @@ IMPORTANT Neo4j Query Guidelines:
 
         # Conversation history
         self.messages: List = []
+
+    def _build_reasoning_directive(self) -> str:
+        """Build the reasoning directive based on configured level."""
+        level = self.reasoning_level if self.reasoning_level in ("low", "medium", "high") else "medium"
+        return f"Reasoning: {level}"
+
+    def _get_system_context(self) -> str:
+        """Get system context with reasoning directive prepended."""
+        return f"{self._build_reasoning_directive()}\n\n{self.DOMAIN_CONTEXT}"
 
     def run(self, requirement: str) -> ChainOutput:
         """
@@ -197,7 +209,7 @@ IMPORTANT Neo4j Query Guidelines:
             Plan text
         """
         self.messages = [
-            SystemMessage(content=self.DOMAIN_CONTEXT),
+            SystemMessage(content=self._get_system_context()),
             HumanMessage(content=f"""Analyze this requirement and create a verification plan.
 
 Requirement: {requirement}
@@ -297,7 +309,9 @@ Analyze these results and provide your final assessment of whether the requireme
 
         # Add system message for structured output
         analysis_messages = [
-            SystemMessage(content=f"""You are analyzing requirement compliance for a car rental business system.
+            SystemMessage(content=f"""{self._build_reasoning_directive()}
+
+You are analyzing requirement compliance for a car rental business system.
 
 Original Requirement: {requirement}
 

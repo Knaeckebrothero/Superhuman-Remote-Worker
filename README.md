@@ -57,7 +57,7 @@ The workflow leverages LangChain and a metamodel-based approach:
 - **Batch Processing**: Process multiple requirements from CSV files (supports both semicolon and comma delimiters)
 - **Comprehensive Reporting**: Generates detailed analysis with compliance status, findings, and recommendations
 - **Multiple Output Formats**: Results available in both JSON (structured) and TXT (human-readable) formats
-- **Flexible LLM Support**: Works with OpenAI (default), Anthropic Claude, Cohere, and other LangChain-compatible providers
+- **Flexible LLM Support**: Works with OpenAI, self-hosted models (gpt-oss-120b, vLLM, llama.cpp), Anthropic Claude, and other OpenAI-compatible endpoints
 - **Error Handling**: Robust error handling with detailed logging
 - **Interactive UI**: Streamlit-based web interface for interactive requirement analysis with streaming progress
 
@@ -103,8 +103,7 @@ The system uses a specialized graph metamodel designed for requirement traceabil
 ```
 ├── main.py                      # Streamlit entry point (multi-page app)
 ├── config/
-│   ├── agent_config.json        # Agent settings (model, temperature, iterations)
-│   ├── chain_config.json        # Chain settings (model, temperature)
+│   ├── llm_config.json          # LLM settings (model, temperature, reasoning_level)
 │   └── prompts/
 │       ├── agent_system.txt     # Agent system prompt
 │       └── chain_domain.txt     # Chain domain context
@@ -188,10 +187,11 @@ NEO4J_PASSWORD=your_password_here
 # CSV Requirements File
 CSV_FILE_PATH=data/requirements.csv
 
-# LLM Configuration (OpenAI)
+# LLM Configuration
 OPENAI_API_KEY=your_openai_api_key_here
-LLM_MODEL=gpt-4-turbo-preview
-LLM_TEMPERATURE=0.0
+
+# Optional: Custom OpenAI-compatible endpoint (for self-hosted models)
+# LLM_BASE_URL=https://your-endpoint.example.com/v1
 ```
 
 ### Configuration Options
@@ -203,32 +203,60 @@ LLM_TEMPERATURE=0.0
 - **NEO4J_USERNAME**: Database username (default: `neo4j`)
 - **NEO4J_PASSWORD**: Database password (set during Neo4j installation)
 - **CSV_FILE_PATH**: Path to your requirements CSV file (default: `data/requirements.csv`)
-- **OPENAI_API_KEY**: Your OpenAI API key for LLM access
-- **LLM_MODEL**: LLM model to use (options: `gpt-4-turbo-preview`, `gpt-4`, `gpt-3.5-turbo`)
-- **LLM_TEMPERATURE**: Temperature setting for LLM (0.0 = deterministic, 1.0 = creative; default: 0.0)
+- **OPENAI_API_KEY**: Your API key for LLM access
+- **LLM_BASE_URL** (optional): Custom OpenAI-compatible endpoint for self-hosted models (e.g., vLLM, llama.cpp, Ollama)
 
 ### Alternative LLM Providers
 
-To use Anthropic Claude or other providers, modify your `.env`:
-
+**Self-hosted models (gpt-oss-120b, Llama, etc.):**
 ```bash
-# For Anthropic Claude
-ANTHROPIC_API_KEY=your_anthropic_key_here
-LLM_MODEL=claude-3-opus-20240229
+OPENAI_API_KEY=any-value-for-local
+LLM_BASE_URL=https://your-endpoint.example.com/v1
 ```
+
+**Anthropic Claude:**
+```bash
+ANTHROPIC_API_KEY=your_anthropic_key_here
+```
+Note: Requires modifying the agent initialization to use `ChatAnthropic`.
 
 ### Configuration Files
 
-The `config/` directory contains additional configuration:
+The `config/` directory contains LLM and prompt configuration:
 
 ```
 config/
-├── agent_config.json      # Agent settings (model, temperature, max_iterations)
-├── chain_config.json      # Chain settings (model, temperature)
+├── llm_config.json        # LLM settings for agent and chain
 └── prompts/
     ├── agent_system.txt   # System prompt for the LangGraph agent
     └── chain_domain.txt   # Domain context for the simple chain
 ```
+
+**llm_config.json** structure:
+```json
+{
+  "agent": {
+    "model": "gpt-oss-120b",
+    "temperature": 0.0,
+    "max_iterations": 5,
+    "reasoning_level": "high"
+  },
+  "chain": {
+    "model": "gpt-oss-120b",
+    "temperature": 0.2,
+    "reasoning_level": "medium"
+  }
+}
+```
+
+**Reasoning Levels** (for gpt-oss models):
+| Level | Description |
+|-------|-------------|
+| `low` | Fast responses for general dialogue |
+| `medium` | Balanced speed and detail (default) |
+| `high` | Deep, detailed analysis with comprehensive reasoning |
+
+The reasoning level is prepended to system prompts as `Reasoning: <level>`. This controls how deeply the model reasons through problems.
 
 These files allow you to customize agent/chain behavior without modifying code. The prompts are tightly coupled to the database metamodel.
 

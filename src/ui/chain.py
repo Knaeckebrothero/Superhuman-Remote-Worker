@@ -67,7 +67,8 @@ def render():
         chain = SimpleChain(
             neo4j_connection=conn,
             model=config.get("model", "gpt-4o-mini"),
-            temperature=config.get("temperature", 0.2)
+            temperature=config.get("temperature", 0.2),
+            reasoning_level=config.get("reasoning_level", "medium")
         )
 
         # Override domain context if loaded
