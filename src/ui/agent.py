@@ -84,7 +84,8 @@ def render():
             neo4j_connection=conn,
             llm_model=config.get("model", "gpt-4o-mini"),
             temperature=config.get("temperature", 0.0),
-            system_prompt=system_prompt
+            system_prompt=system_prompt,
+            reasoning_level=config.get("reasoning_level", "medium")
         )
 
         # Create containers for progress
