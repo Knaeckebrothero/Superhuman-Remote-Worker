@@ -91,7 +91,7 @@ class Monitor:
 
         # Load configuration
         if config is None:
-            full_config = load_config()
+            full_config = load_config("llm_config.json")
             config = full_config.get("orchestrator", {})
 
         self.job_timeout_hours = config.get("job_timeout_hours", 168)  # 7 days default

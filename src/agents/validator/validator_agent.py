@@ -33,7 +33,7 @@ except ImportError:
 
 from src.core.neo4j_utils import Neo4jConnection
 from src.core.config import load_config
-from src.agents.shared.context_manager import ContextManager
+from src.agents.shared.context_manager import ContextManager, ContextConfig
 from src.agents.shared.workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -169,8 +169,12 @@ class ValidatorAgent:
         # Context management
         context_config = config.get("context_management", {})
         self.context_manager = ContextManager(
-            compaction_threshold=context_config.get("compaction_threshold_tokens", 100000),
-            keep_raw_turns=context_config.get("keep_raw_turns", 3),
+            config=ContextConfig(
+                compaction_threshold_tokens=context_config.get("compaction_threshold_tokens", 100_000),
+                summarization_trigger_tokens=context_config.get("summarization_trigger_tokens", 128_000),
+                keep_raw_turns=context_config.get("keep_raw_turns", 3),
+                max_output_tokens=context_config.get("max_output_tokens", 80_000),
+            )
         )
 
         # Build the graph

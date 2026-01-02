@@ -58,6 +58,7 @@ langdetect>=1.0.9
 fastapi>=0.109.0
 uvicorn>=0.27.0
 httpx>=0.26.0  # Async HTTP client for health checks
+python-multipart>=0.0.6  # For FastAPI file uploads
 
 # =============================================================================
 # Citation Engine (local development)
