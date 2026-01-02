@@ -30,7 +30,7 @@ st.sidebar.title("Navigation")
 
 page = st.sidebar.radio(
     "Select Page",
-    ["Home", "Agent", "Chain"],
+    ["Home", "Agent", "Chain", "Document Ingestion"],
     label_visibility="collapsed"
 )
 
@@ -51,4 +51,7 @@ elif page == "Agent":
     render()
 elif page == "Chain":
     from src.ui.chain import render
+    render()
+elif page == "Document Ingestion":
+    from src.ui.document_ingestion import render
     render()

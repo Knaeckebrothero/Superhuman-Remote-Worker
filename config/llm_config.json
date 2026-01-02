@@ -9,5 +9,20 @@
     "model": "gpt-oss-120b",
     "temperature": 0.2,
     "reasoning_level": "medium"
+  },
+  "document_ingestion": {
+    "model": "gpt-oss-120b",
+    "temperature": 0.0,
+    "reasoning_level": "medium",
+    "chunking_strategy": "legal",
+    "max_chunk_size": 1000,
+    "chunk_overlap": 200,
+    "extraction_mode": "balanced",
+    "min_confidence": 0.6,
+    "parallel_extraction": true,
+    "max_candidates": 1000,
+    "duplicate_similarity_threshold": 0.95,
+    "require_entity_existence": false,
+    "auto_integrate": false
   }
 }

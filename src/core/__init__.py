@@ -10,14 +10,41 @@ from src.core.metamodel_validator import (
     CheckResult,
     Severity,
 )
+from src.core.document_processor import (
+    DocumentProcessor,
+    DocumentExtractor,
+    DocumentChunker,
+)
+from src.core.document_models import (
+    DocumentChunk,
+    DocumentMetadata,
+    RequirementCandidate,
+    ValidatedRequirement,
+    ProcessingOptions,
+    PipelineReport,
+)
 
 __all__ = [
+    # Neo4j
     'Neo4jConnection',
     'create_neo4j_connection',
+    # CSV Processing
     'RequirementProcessor',
     'load_requirements_from_env',
+    # Metamodel Validation
     'MetamodelValidator',
     'ComplianceReport',
     'CheckResult',
     'Severity',
+    # Document Processing
+    'DocumentProcessor',
+    'DocumentExtractor',
+    'DocumentChunker',
+    # Document Models
+    'DocumentChunk',
+    'DocumentMetadata',
+    'RequirementCandidate',
+    'ValidatedRequirement',
+    'ProcessingOptions',
+    'PipelineReport',
 ]
