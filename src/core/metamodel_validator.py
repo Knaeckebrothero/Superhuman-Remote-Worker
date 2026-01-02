@@ -113,13 +113,22 @@ class MetamodelValidator:
 
     ALLOWED_RELATIONSHIPS = {
         # (source_label, relationship_type, target_label)
+        # Requirement ↔ Requirement
         ("Requirement", "REFINES", "Requirement"),
         ("Requirement", "DEPENDS_ON", "Requirement"),
         ("Requirement", "TRACES_TO", "Requirement"),
+        ("Requirement", "SUPERSEDES", "Requirement"),  # v2.0
+        # Requirement ↔ BusinessObject
         ("Requirement", "RELATES_TO_OBJECT", "BusinessObject"),
         ("Requirement", "IMPACTS_OBJECT", "BusinessObject"),
+        ("Requirement", "FULFILLED_BY_OBJECT", "BusinessObject"),  # v2.0
+        ("Requirement", "NOT_FULFILLED_BY_OBJECT", "BusinessObject"),  # v2.0
+        # Requirement ↔ Message
         ("Requirement", "RELATES_TO_MESSAGE", "Message"),
         ("Requirement", "IMPACTS_MESSAGE", "Message"),
+        ("Requirement", "FULFILLED_BY_MESSAGE", "Message"),  # v2.0
+        ("Requirement", "NOT_FULFILLED_BY_MESSAGE", "Message"),  # v2.0
+        # Message ↔ BusinessObject
         ("Message", "USES_OBJECT", "BusinessObject"),
         ("Message", "PRODUCES_OBJECT", "BusinessObject"),
     }
@@ -285,13 +294,13 @@ class MetamodelValidator:
              labels(b)[0] AS target_label
         WHERE NOT (
             (source_label = 'Requirement' AND target_label = 'Requirement'
-             AND rel_type IN ['REFINES', 'DEPENDS_ON', 'TRACES_TO'])
+             AND rel_type IN ['REFINES', 'DEPENDS_ON', 'TRACES_TO', 'SUPERSEDES'])
             OR
             (source_label = 'Requirement' AND target_label = 'BusinessObject'
-             AND rel_type IN ['RELATES_TO_OBJECT', 'IMPACTS_OBJECT'])
+             AND rel_type IN ['RELATES_TO_OBJECT', 'IMPACTS_OBJECT', 'FULFILLED_BY_OBJECT', 'NOT_FULFILLED_BY_OBJECT'])
             OR
             (source_label = 'Requirement' AND target_label = 'Message'
-             AND rel_type IN ['RELATES_TO_MESSAGE', 'IMPACTS_MESSAGE'])
+             AND rel_type IN ['RELATES_TO_MESSAGE', 'IMPACTS_MESSAGE', 'FULFILLED_BY_MESSAGE', 'NOT_FULFILLED_BY_MESSAGE'])
             OR
             (source_label = 'Message' AND target_label = 'BusinessObject'
              AND rel_type IN ['USES_OBJECT', 'PRODUCES_OBJECT'])
@@ -327,7 +336,7 @@ class MetamodelValidator:
         # Self-loops are only allowed for Requirement→Requirement relationships
         query = """
         MATCH (n)-[r]->(n)
-        WHERE NOT (n:Requirement AND type(r) IN ['REFINES', 'DEPENDS_ON', 'TRACES_TO'])
+        WHERE NOT (n:Requirement AND type(r) IN ['REFINES', 'DEPENDS_ON', 'TRACES_TO', 'SUPERSEDES'])
         RETURN labels(n)[0] AS label, type(r) AS rel_type,
                CASE WHEN n.rid IS NOT NULL THEN n.rid
                     WHEN n.boid IS NOT NULL THEN n.boid
@@ -437,6 +446,84 @@ class MetamodelValidator:
             execution_time_ms=elapsed,
         )
 
+    def check_c4_unfulfilled_requirements(self) -> CheckResult:
+        """Identify requirements with 'open' compliance status or no fulfillment relationships."""
+        query = """
+        MATCH (r:Requirement)
+        WHERE r.complianceStatus = 'open' OR r.complianceStatus IS NULL
+        OPTIONAL MATCH (r)-[gap:NOT_FULFILLED_BY_OBJECT]->(b:BusinessObject)
+        WITH r, collect(DISTINCT {object: b.name, gap: gap.gapDescription, severity: gap.severity}) AS gaps
+        WHERE size(gaps) > 0 OR r.complianceStatus = 'open'
+        RETURN r.rid AS rid, r.name AS name, r.complianceStatus AS status, gaps
+        LIMIT 100
+        """
+        results, elapsed = self._execute_check(query)
+
+        violations = [
+            {
+                "rid": r["rid"],
+                "name": r["name"],
+                "status": r["status"],
+                "gaps": r["gaps"] if r["gaps"] and r["gaps"][0].get("object") else []
+            }
+            for r in results
+        ]
+        passed = len(violations) == 0
+
+        return CheckResult(
+            check_id="C4",
+            check_name="validate_unfulfilled_requirements",
+            passed=passed,
+            severity=Severity.WARNING,
+            message="No unfulfilled requirements found" if passed else f"Found {len(violations)} requirements with 'open' compliance status or unfulfilled gaps",
+            violations=violations,
+            query_used=query.strip(),
+            execution_time_ms=elapsed,
+        )
+
+    def check_c5_compliance_status_consistency(self) -> CheckResult:
+        """Verify complianceStatus matches actual fulfillment relationships."""
+        query = """
+        MATCH (r:Requirement)
+        OPTIONAL MATCH (r)-[:FULFILLED_BY_OBJECT|FULFILLED_BY_MESSAGE]->(fulfilled)
+        OPTIONAL MATCH (r)-[:NOT_FULFILLED_BY_OBJECT|NOT_FULFILLED_BY_MESSAGE]->(notFulfilled)
+        WITH r, COUNT(DISTINCT fulfilled) AS fulfilledCount, COUNT(DISTINCT notFulfilled) AS gapCount,
+             CASE
+               WHEN COUNT(DISTINCT notFulfilled) = 0 AND COUNT(DISTINCT fulfilled) > 0 THEN 'fulfilled'
+               WHEN COUNT(DISTINCT notFulfilled) > 0 AND COUNT(DISTINCT fulfilled) > 0 THEN 'partial'
+               ELSE 'open'
+             END AS expectedStatus
+        WHERE r.complianceStatus IS NOT NULL AND r.complianceStatus <> expectedStatus
+        RETURN r.rid AS rid, r.name AS name, r.complianceStatus AS actual, expectedStatus AS expected,
+               fulfilledCount, gapCount
+        LIMIT 100
+        """
+        results, elapsed = self._execute_check(query)
+
+        violations = [
+            {
+                "rid": r["rid"],
+                "name": r["name"],
+                "actual_status": r["actual"],
+                "expected_status": r["expected"],
+                "fulfilled_count": r["fulfilledCount"],
+                "gap_count": r["gapCount"],
+            }
+            for r in results
+        ]
+        passed = len(violations) == 0
+
+        return CheckResult(
+            check_id="C5",
+            check_name="validate_compliance_status_consistency",
+            passed=passed,
+            severity=Severity.WARNING,
+            message="All compliance statuses are consistent" if passed else f"Found {len(violations)} requirements with inconsistent complianceStatus",
+            violations=violations,
+            query_used=query.strip(),
+            execution_time_ms=elapsed,
+        )
+
     # =========================================================================
     # Aggregation Methods
     # =========================================================================
@@ -459,6 +546,8 @@ class MetamodelValidator:
         results.append(self.check_c1_orphan_requirements())
         results.append(self.check_c2_message_content())
         results.append(self.check_c3_gobd_traceability())
+        results.append(self.check_c4_unfulfilled_requirements())
+        results.append(self.check_c5_compliance_status_consistency())
 
         # Aggregate results
         error_count = sum(
@@ -501,6 +590,8 @@ class MetamodelValidator:
             self.check_c1_orphan_requirements(),
             self.check_c2_message_content(),
             self.check_c3_gobd_traceability(),
+            self.check_c4_unfulfilled_requirements(),
+            self.check_c5_compliance_status_consistency(),
         ]
         return self._create_report(results)
 
@@ -516,6 +607,8 @@ class MetamodelValidator:
             "C1": self.check_c1_orphan_requirements,
             "C2": self.check_c2_message_content,
             "C3": self.check_c3_gobd_traceability,
+            "C4": self.check_c4_unfulfilled_requirements,
+            "C5": self.check_c5_compliance_status_consistency,
         }
 
         if check_id not in check_map:

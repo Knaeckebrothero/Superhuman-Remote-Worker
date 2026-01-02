@@ -1,9 +1,10 @@
 # Graph-RAG Implementation Roadmap
 
-**Version:** 1.0
+**Version:** 1.5
 **Based on:** masterplan.md v1.1
 **Created:** January 2026
-**Status:** Implementation Guide
+**Updated:** January 2026
+**Status:** Phase 5 Complete - Ready for Phase 6
 
 ---
 
@@ -13,14 +14,14 @@ This document provides a structured implementation roadmap for the Graph-RAG Aut
 
 ### Phase Summary
 
-| Phase | Name | Description | Key Deliverables |
-|-------|------|-------------|------------------|
-| 1 | Foundation & Infrastructure | Database schemas, shared utilities, project restructure | PostgreSQL schema, directory structure, config |
-| 2 | Creator Agent | Document processing and requirement extraction | Creator Agent container, extraction pipeline |
-| 3 | Validator Agent | Graph validation and integration | Validator Agent container, fulfillment tracking |
-| 4 | Orchestrator | Job management and coordination | CLI interface, monitoring, completion detection |
-| 5 | Containerization | Docker deployment setup | Docker Compose, health endpoints, FastAPI |
-| 6 | Testing & Hardening | End-to-end testing and refinement | Integration tests, error recovery validation |
+| Phase | Name | Status | Description | Key Deliverables |
+|-------|------|--------|-------------|------------------|
+| 1 | Foundation & Infrastructure | **COMPLETE** | Database schemas, shared utilities, project restructure | PostgreSQL schema, directory structure, config |
+| 2 | Creator Agent | **COMPLETE** | Document processing and requirement extraction | Creator Agent container, extraction pipeline |
+| 3 | Validator Agent | **COMPLETE** | Graph validation and integration | Validator Agent container, fulfillment tracking |
+| 4 | Orchestrator | **COMPLETE** | Job management and coordination | CLI interface, monitoring, completion detection |
+| 5 | Containerization | **COMPLETE** | Docker deployment setup | Docker Compose, health endpoints, FastAPI |
+| 6 | Testing & Hardening | Pending | End-to-end testing and refinement | Integration tests, error recovery validation |
 
 ### Dependencies Between Phases
 
@@ -377,13 +378,51 @@ CITATION_REASONING_REQUIRED=low
 
 ### Phase 1 Acceptance Criteria
 
-- [ ] New directory structure created and all imports work
-- [ ] PostgreSQL schema created and migration runs successfully
-- [ ] MetamodelValidator updated with new relationship types
-- [ ] Shared utilities implemented and unit tested
-- [ ] Citation Engine added as dependency and configured
-- [ ] Configuration files updated and validated
-- [ ] All existing tests still pass
+- [x] New directory structure created and all imports work
+- [x] PostgreSQL schema created and migration runs successfully
+- [x] MetamodelValidator updated with new relationship types
+- [x] Shared utilities implemented and unit tested
+- [x] Citation Engine added as dependency and configured
+- [x] Configuration files updated and validated
+- [ ] All existing tests still pass (to be verified)
+
+### Phase 1 Implementation Notes
+
+**Completed: January 2026**
+
+**Files Created:**
+- `src/agents/creator/__init__.py` - Creator Agent package stub
+- `src/agents/validator/__init__.py` - Validator Agent package stub
+- `src/agents/shared/__init__.py` - Shared utilities exports
+- `src/agents/shared/context_manager.py` - LLM context window management with pre_model_hook
+- `src/agents/shared/checkpoint.py` - State persistence and recovery (PostgreSQL + file storage)
+- `src/agents/shared/workspace.py` - Working data storage for agents
+- `src/agents/shared/todo_manager.py` - Task tracking for autonomous agents
+- `src/orchestrator/__init__.py` - Orchestrator package stub
+- `src/core/postgres_utils.py` - Async PostgreSQL connection management with job/requirement/checkpoint functions
+- `src/core/citation_utils.py` - Citation Engine integration helper
+- `migrations/001_initial_schema.sql` - Full PostgreSQL schema (jobs, requirement_cache, llm_requests, agent_checkpoints, candidate_workspace)
+- `scripts/init_db.py` - Database initialization script
+
+**Files Modified:**
+- `data/metamodell.cql` - Updated to v2.0 with fulfillment relationships and complianceStatus
+- `src/core/metamodel_validator.py` - Added FULFILLED_BY_*, NOT_FULFILLED_BY_*, SUPERSEDES relationships; added C4, C5 checks
+- `src/core/__init__.py` - Added exports for new utilities
+- `config/llm_config.json` - Added creator_agent, validator_agent, context_management, orchestrator sections
+- `.env.example` - Added PostgreSQL, Citation Engine, and agent configuration
+- `requirements.txt` - Added asyncpg, langgraph-checkpoint-postgres, fastapi, uvicorn, httpx
+- `CLAUDE.md` - Updated with new architecture documentation
+
+**New Neo4j Relationships (v2.0):**
+- `FULFILLED_BY_OBJECT` (Requirement → BusinessObject)
+- `NOT_FULFILLED_BY_OBJECT` (Requirement → BusinessObject)
+- `FULFILLED_BY_MESSAGE` (Requirement → Message)
+- `NOT_FULFILLED_BY_MESSAGE` (Requirement → Message)
+- `SUPERSEDES` (Requirement → Requirement)
+
+**New MetamodelValidator Checks:**
+- C4: `check_c4_unfulfilled_requirements` - Identifies requirements with 'open' compliance status
+- C5: `check_c5_compliance_status_consistency` - Verifies complianceStatus matches fulfillment relationships
 
 ---
 
@@ -533,14 +572,51 @@ def determine_research_depth(self, candidate: dict) -> str:
 
 ### Phase 2 Acceptance Criteria
 
-- [ ] Creator Agent can start and poll for jobs
-- [ ] Document processing extracts text and creates chunks
-- [ ] Candidate extraction identifies potential requirements
-- [ ] Research phase queries web and graph for context
-- [ ] Requirements are written to PostgreSQL cache with status 'pending'
-- [ ] Citations are created for all claims
-- [ ] Agent checkpoints state and can resume from failure
-- [ ] Unit tests cover all major components
+- [x] Creator Agent can start and poll for jobs
+- [x] Document processing extracts text and creates chunks
+- [x] Candidate extraction identifies potential requirements
+- [x] Research phase queries web and graph for context
+- [x] Requirements are written to PostgreSQL cache with status 'pending'
+- [x] Citations are created for all claims
+- [x] Agent checkpoints state and can resume from failure
+- [ ] Unit tests cover all major components (to be verified)
+
+### Phase 2 Implementation Notes
+
+**Completed: January 2026**
+
+**Files Created:**
+- `src/agents/creator/creator_agent.py` - Main CreatorAgent class with LangGraph workflow, CreatorAgentState TypedDict, durable execution with PostgresSaver checkpointing
+- `src/agents/creator/document_processor.py` - CreatorDocumentProcessor with enhanced legal document chunking, section hierarchy detection, cross-reference extraction
+- `src/agents/creator/candidate_extractor.py` - CandidateExtractor with modal verb patterns, GoBD/GDPR indicator detection, entity extraction
+- `src/agents/creator/researcher.py` - Researcher component with Tavily web search integration, Neo4j similar requirement queries, research depth determination
+- `src/agents/creator/tools.py` - CreatorAgentTools providing 13 tools for document processing, research, citation, and cache operations
+- `src/agents/creator/cache_writer.py` - RequirementCacheWriter with validation, duplicate detection, batch writing
+- `src/agents/creator/__init__.py` - Package exports for all Creator Agent components
+
+**Prompts Created:**
+- `config/prompts/creator_preprocessing.txt` - Preprocessing phase prompt (document extraction, chunking)
+- `config/prompts/creator_identification.txt` - Identification phase prompt (candidate extraction)
+- `config/prompts/creator_research.txt` - Research phase prompt (web search, graph queries)
+- `config/prompts/creator_formulation.txt` - Formulation phase prompt (requirement writing)
+
+**Files Modified:**
+- `src/agents/__init__.py` - Added Creator Agent exports to main agents module
+
+**Key Features Implemented:**
+- **LangGraph Workflow**: 5-node state machine (initialize → process → tools → check → finalize)
+- **Context Management**: pre_model_hook integration for 100K token compaction threshold
+- **Document Processing**: PDF, DOCX, TXT, HTML support with legal/technical/general chunking strategies
+- **GoBD Detection**: Pattern-based detection for 20+ GoBD indicators across 6 categories (retention, traceability, immutability, documentation, accessibility, completeness)
+- **Research Depth**: Automatic depth determination (quick/standard/deep) based on candidate attributes
+- **Workspace Integration**: Working data persistence via PostgreSQL candidate_workspace table
+- **Tool Set**: 13 tools including extract_document_text, chunk_document, identify_requirement_candidates, assess_gobd_relevance, web_search, query_similar_requirements, cite_document, cite_web, write_requirement_to_cache
+
+**Architecture Notes:**
+- Creator Agent designed for long-running operations (days/weeks)
+- Polling pattern: Agent polls `jobs` table for pending work
+- Output goes to `requirement_cache` table with status='pending'
+- Validator Agent (Phase 3) will poll `requirement_cache` for pending requirements
 
 ---
 
@@ -679,15 +755,52 @@ class ValidatorAgentState(TypedDict):
 
 ### Phase 3 Acceptance Criteria
 
-- [ ] Validator Agent can start and poll for pending requirements
-- [ ] Relevance analysis determines requirement applicability
-- [ ] Fulfillment checker identifies gaps and fulfilled relationships
-- [ ] Graph integrator creates nodes and relationships correctly
-- [ ] All graph changes pass metamodel validation
-- [ ] Failed validations result in rollback
-- [ ] Agent updates requirement cache status appropriately
-- [ ] Citations created for validation decisions
-- [ ] Unit tests cover all major components
+- [x] Validator Agent can start and poll for pending requirements
+- [x] Relevance analysis determines requirement applicability
+- [x] Fulfillment checker identifies gaps and fulfilled relationships
+- [x] Graph integrator creates nodes and relationships correctly
+- [x] All graph changes pass metamodel validation
+- [x] Failed validations result in rollback
+- [x] Agent updates requirement cache status appropriately
+- [x] Citations created for validation decisions
+- [ ] Unit tests cover all major components (to be verified)
+
+### Phase 3 Implementation Notes
+
+**Completed: January 2026**
+
+**Files Created:**
+- `src/agents/validator/validator_agent.py` - Main ValidatorAgent class with LangGraph workflow, ValidatorAgentState TypedDict, SKIP LOCKED polling, durable execution support
+- `src/agents/validator/relevance_analyzer.py` - RelevanceAnalyzer with domain keyword matching, entity resolution, decision tree logic
+- `src/agents/validator/fulfillment_checker.py` - FulfillmentChecker with per-entity analysis, gap detection, GoBD-specific fulfillment criteria
+- `src/agents/validator/graph_integrator.py` - GraphIntegrator with transaction safety, metamodel validation before commit, rollback on failure
+- `src/agents/validator/tools.py` - ValidatorAgentTools providing 12 tools for graph queries, duplicate detection, entity resolution, and integration
+- `src/agents/validator/cache_reader.py` - RequirementCacheReader with SKIP LOCKED polling, status updates, retry tracking
+- `src/agents/validator/__init__.py` - Package exports for all Validator Agent components
+
+**Prompts Created:**
+- `config/prompts/validator_understanding.txt` - Understanding phase prompt (requirement parsing)
+- `config/prompts/validator_relevance.txt` - Relevance phase prompt (domain matching, duplicates)
+- `config/prompts/validator_fulfillment.txt` - Fulfillment phase prompt (gap detection)
+- `config/prompts/validator_integration.txt` - Integration phase prompt (graph mutations)
+
+**Files Modified:**
+- `src/agents/__init__.py` - Added Validator Agent exports to main agents module
+
+**Key Features Implemented:**
+- **LangGraph Workflow**: 5-node state machine (initialize → process → tools → check → finalize)
+- **Relevance Decision Tree**: Domain keyword matching (core, compliance, technical categories)
+- **Fulfillment Analysis**: Per-entity status (fulfilled, partial, not_fulfilled), gap severity levels
+- **Graph Integration**: Transaction-safe node/relationship creation with metamodel validation
+- **Relationship Types**: FULFILLED_BY_OBJECT, FULFILLED_BY_MESSAGE, NOT_FULFILLED_BY_OBJECT, NOT_FULFILLED_BY_MESSAGE
+- **Cache Integration**: SKIP LOCKED polling, status transitions (pending → validating → integrated/rejected/failed)
+- **Retry Handling**: Configurable max retries, stale validating release
+
+**Architecture Notes:**
+- Validator Agent refactored from existing `RequirementValidatorAgent` and `RequirementGraphAgent`
+- Reuses existing Neo4j tools (execute_cypher_query, get_database_schema, etc.)
+- Adds new tools for graph mutations (create_requirement_node, create_fulfillment_relationship)
+- Polling pattern matches Creator Agent: polls `requirement_cache` table for pending work
 
 ---
 
@@ -800,12 +913,64 @@ python cancel_job.py --job-id <uuid>
 
 ### Phase 4 Acceptance Criteria
 
-- [ ] Jobs can be created via CLI
-- [ ] Job status can be queried
-- [ ] Completion detection works correctly
-- [ ] Stuck state detection triggers appropriate actions
-- [ ] Job reports summarize results correctly
-- [ ] End-to-end flow works with sample document
+- [x] Jobs can be created via CLI
+- [x] Job status can be queried
+- [x] Completion detection works correctly
+- [x] Stuck state detection triggers appropriate actions
+- [x] Job reports summarize results correctly
+- [ ] End-to-end flow works with sample document (to be verified with integration tests)
+
+### Phase 4 Implementation Notes
+
+**Completed: January 2026**
+
+**Files Created:**
+- `src/orchestrator/job_manager.py` - JobManager class for job lifecycle management (creation, status, cancellation, document storage)
+- `src/orchestrator/monitor.py` - Monitor class with JobCompletionStatus enum, HealthStatus dataclass, StuckJobInfo dataclass, completion detection, stuck job detection, agent health checking
+- `src/orchestrator/reporter.py` - Reporter class with JobSummary, RequirementStatistics, LLMStatistics dataclasses, text/JSON report generation, citation summaries
+- `start_orchestrator.py` - CLI to create new jobs with document upload, optional wait for completion
+- `job_status.py` - CLI to check job status, progress, rejected/failed requirements, full reports
+- `list_jobs.py` - CLI to list jobs with filtering, daily statistics
+- `cancel_job.py` - CLI to cancel jobs with optional workspace cleanup
+
+**Files Modified:**
+- `src/orchestrator/__init__.py` - Added exports for all orchestrator components
+
+**Key Features Implemented:**
+- **JobManager**: Job creation with document storage, status queries (using job_summary view), cancellation, workspace cleanup
+- **Monitor**:
+  - Completion detection (creator completed + no pending requirements)
+  - Stuck job detection (configurable threshold, component identification)
+  - Agent health checking via HTTP endpoints
+  - Progress tracking with ETA calculation
+  - wait_for_completion with async callback support
+  - Stuck requirement reset functionality
+- **Reporter**:
+  - RequirementStatistics: counts by status, priority, GoBD/GDPR relevance
+  - LLMStatistics: token usage, request counts, per-agent breakdown
+  - Citation summary aggregation
+  - Text report generation (human-readable)
+  - JSON report generation (API-friendly)
+  - Daily statistics for dashboards
+- **CLI Interfaces**:
+  - All CLIs support JSON output mode
+  - start_orchestrator: --wait flag for synchronous completion
+  - job_status: --report, --progress, --rejected, --failed views
+  - list_jobs: --status filter, --stats for daily statistics
+  - cancel_job: --cleanup for workspace removal, --force to skip confirmation
+
+**Configuration Used (from llm_config.json orchestrator section):**
+- `job_timeout_hours`: 168 (7 days)
+- `stuck_detection_minutes`: 60
+- `max_requirement_retries`: 5
+- `completion_check_interval_seconds`: 30
+
+**Architecture Notes:**
+- All orchestrator components use async/await for PostgreSQL operations
+- Monitor uses job_summary view for efficient status aggregation
+- Reporter reuses count_requirements_by_status from postgres_utils
+- CLI scripts use argparse with rich help text and examples
+- ANSI colors for status display in list_jobs
 
 ---
 
@@ -954,12 +1119,54 @@ CMD ["uvicorn", "src.agents.creator.app:app", "--host", "0.0.0.0", "--port", "80
 
 ### Phase 5 Acceptance Criteria
 
-- [ ] All components have FastAPI apps with health endpoints
-- [ ] Docker images build successfully
-- [ ] Docker Compose brings up full system
-- [ ] Health endpoints respond correctly
-- [ ] Containers can communicate via shared network
-- [ ] Workspace volumes persist correctly
+- [x] All components have FastAPI apps with health endpoints
+- [x] Docker images build successfully
+- [x] Docker Compose brings up full system
+- [x] Health endpoints respond correctly
+- [x] Containers can communicate via shared network
+- [x] Workspace volumes persist correctly
+
+### Phase 5 Implementation Notes
+
+**Completed: January 2026**
+
+**Files Created:**
+- `src/agents/creator/app.py` - Creator Agent FastAPI app with /health, /ready, /status, /shutdown, /metrics endpoints
+- `src/agents/validator/app.py` - Validator Agent FastAPI app with /health, /ready, /status, /shutdown, /metrics endpoints
+- `src/orchestrator/app.py` - Orchestrator FastAPI app with full REST API for job management
+- `docker/Dockerfile.base` - Base image with shared dependencies
+- `docker/Dockerfile.creator` - Creator Agent container (multi-stage build)
+- `docker/Dockerfile.validator` - Validator Agent container (multi-stage build)
+- `docker/Dockerfile.orchestrator` - Orchestrator container (multi-stage build)
+- `docker/init.sql` - PostgreSQL initialization script for Docker
+- `docker-compose.yml` - Production Docker Compose configuration
+- `docker-compose.dev.yml` - Development overrides with hot reload and Adminer
+- `.env.docker.example` - Docker environment template
+
+**FastAPI Apps Features:**
+- **Health Endpoints**: `/health` (liveness), `/ready` (readiness with DB check), `/status` (detailed state)
+- **Graceful Shutdown**: `/shutdown` endpoint for clean container stops
+- **Prometheus Metrics**: `/metrics` endpoint for monitoring
+- **Agent-Specific**: Creator tracks jobs/requirements created; Validator tracks validated/integrated/rejected
+- **Orchestrator API**: Full REST API for job creation, listing, status, reports, cancellation
+
+**Docker Configuration:**
+- Multi-stage builds for smaller images
+- Non-root user for security
+- Health checks with configurable intervals
+- Shared workspace volume for document storage
+- PostgreSQL and Neo4j with persistent volumes
+- Service dependencies with health check conditions
+- Development mode with source code mounting and hot reload
+
+**Ports:**
+- Orchestrator: 8000
+- Creator Agent: 8001
+- Validator Agent: 8002
+- PostgreSQL: 5432
+- Neo4j Bolt: 7687
+- Neo4j Browser: 7474
+- Adminer (dev only): 8080
 
 ---
 
