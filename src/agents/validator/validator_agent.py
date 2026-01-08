@@ -32,7 +32,11 @@ except ImportError:
     AsyncPostgresSaver = None
 
 from src.core.neo4j_utils import Neo4jConnection
-from src.core.config import load_config
+from src.core.config import (
+    load_config,
+    get_validator_max_iterations,
+    get_validator_recursion_limit,
+)
 from src.agents.shared.context_manager import ContextManager, ContextConfig
 from src.agents.shared.workspace import Workspace
 
@@ -135,7 +139,7 @@ class ValidatorAgent:
         self.llm_model = llm_model or agent_config.get("model", "gpt-4o")
         self.temperature = temperature
         self.reasoning_level = reasoning_level
-        self.max_iterations = agent_config.get("max_iterations", 100)
+        self.max_iterations = get_validator_max_iterations()
 
         # Validator settings
         self.duplicate_threshold = duplicate_threshold or validator_config.get("duplicate_threshold", 0.95)
@@ -495,7 +499,7 @@ Begin by understanding the requirement and identifying entities to search for.""
         # Run the workflow
         final_state = self.graph.invoke(
             initial_state,
-            config={"recursion_limit": 100}
+            config={"recursion_limit": get_validator_recursion_limit()}
         )
 
         return final_state.get("validation_result", {})
@@ -536,7 +540,7 @@ Begin by understanding the requirement and identifying entities to search for.""
 
         return self.graph.stream(
             initial_state,
-            config={"recursion_limit": 100}
+            config={"recursion_limit": get_validator_recursion_limit()}
         )
 
     async def start_polling(self) -> None:

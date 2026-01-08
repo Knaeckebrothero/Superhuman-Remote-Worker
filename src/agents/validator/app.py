@@ -1,28 +1,48 @@
 """FastAPI application for the Validator Agent.
 
 This module provides HTTP endpoints for health checking, status monitoring,
-and graceful shutdown of the Validator Agent container.
+validation submission, and graceful shutdown of the Validator Agent container.
 
 Endpoints:
 - GET /health - Basic health check
 - GET /ready - Readiness probe (checks database connections)
 - GET /status - Detailed agent status
 - POST /shutdown - Request graceful shutdown
+- POST /validate - Submit a requirement for validation
+- GET /validate/{request_id} - Get validation status/result
+- GET /requirements/pending - List pending requirements
+- GET /requirements/{id} - Get requirement details
 """
 
 import os
 import asyncio
 import logging
+import uuid as uuid_module
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
-from src.core.postgres_utils import create_postgres_connection, PostgresConnection
+from src.core.postgres_utils import (
+    create_postgres_connection,
+    PostgresConnection,
+    get_pending_requirement,
+    update_requirement_status,
+    create_requirement,
+)
 from src.core.neo4j_utils import create_neo4j_connection, Neo4jConnection
 from src.agents.validator.validator_agent import ValidatorAgent, create_validator_agent
+from src.agents.validator.models import (
+    ValidateRequest,
+    ValidateSubmitResponse,
+    ValidateStatusResponse,
+    GraphChange,
+    PendingRequirementResponse,
+    PendingRequirementsListResponse,
+    RequirementDetailResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +59,9 @@ _requirements_validated: int = 0
 _requirements_integrated: int = 0
 _requirements_rejected: int = 0
 _last_activity: Optional[datetime] = None
+
+# Manual validation tracking - tracks validations submitted via API
+_manual_validations: Dict[str, Dict[str, Any]] = {}  # request_id -> {status, phase, result, ...}
 
 
 class HealthResponse(BaseModel):
@@ -140,11 +163,6 @@ async def _run_agent_loop():
         return
 
     try:
-        # Use the agent's built-in polling loop
-        # We wrap it to track our own metrics
-        from src.core.postgres_utils import get_pending_requirement, update_requirement_status
-        import uuid
-
         while not _shutdown_requested:
             try:
                 # Poll for pending requirement
@@ -171,7 +189,7 @@ async def _run_agent_loop():
                         _requirements_integrated += 1
                         await update_requirement_status(
                             _postgres_conn,
-                            uuid.UUID(req_id),
+                            uuid_module.UUID(req_id),
                             status="integrated",
                             validation_result=result,
                         )
@@ -179,7 +197,7 @@ async def _run_agent_loop():
                         _requirements_rejected += 1
                         await update_requirement_status(
                             _postgres_conn,
-                            uuid.UUID(req_id),
+                            uuid_module.UUID(req_id),
                             status="rejected",
                             validation_result=result,
                             rejection_reason=result.get("rejection_reason", "Validation rejected"),
@@ -356,6 +374,342 @@ async def metrics():
     ]
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# Validation Submission and Status Endpoints
+# =============================================================================
+
+
+async def _process_manual_validation(
+    request_id: str,
+    requirement: Dict[str, Any],
+    job_id: str,
+    requirement_id: str,
+    max_iterations: int,
+):
+    """Background task to process a manually submitted validation."""
+    global _requirements_validated, _requirements_integrated, _requirements_rejected, _last_activity
+
+    try:
+        _manual_validations[request_id]["status"] = "processing"
+        _manual_validations[request_id]["started_at"] = datetime.utcnow()
+        _last_activity = datetime.utcnow()
+
+        if _agent:
+            result = await _agent.validate_requirement(
+                requirement=requirement,
+                job_id=job_id,
+                requirement_id=requirement_id,
+            )
+
+            _requirements_validated += 1
+            _last_activity = datetime.utcnow()
+
+            # Determine outcome
+            if result.get("graph_changes"):
+                _requirements_integrated += 1
+                _manual_validations[request_id]["status"] = "completed"
+                await update_requirement_status(
+                    _postgres_conn,
+                    uuid_module.UUID(requirement_id),
+                    status="integrated",
+                    validation_result=result,
+                )
+            else:
+                _requirements_rejected += 1
+                _manual_validations[request_id]["status"] = "rejected"
+                await update_requirement_status(
+                    _postgres_conn,
+                    uuid_module.UUID(requirement_id),
+                    status="rejected",
+                    validation_result=result,
+                    rejection_reason=result.get("rejection_reason", "Validation rejected"),
+                )
+
+            _manual_validations[request_id]["completed_at"] = datetime.utcnow()
+            _manual_validations[request_id]["result"] = result
+
+            logger.info(f"Manual validation {request_id} completed with status {_manual_validations[request_id]['status']}")
+        else:
+            _manual_validations[request_id]["status"] = "failed"
+            _manual_validations[request_id]["error"] = {"message": "Agent not initialized"}
+
+    except Exception as e:
+        logger.error(f"Error processing manual validation {request_id}: {e}")
+        _manual_validations[request_id]["status"] = "failed"
+        _manual_validations[request_id]["error"] = {"message": str(e)}
+        _manual_validations[request_id]["completed_at"] = datetime.utcnow()
+
+
+@app.post("/validate", response_model=ValidateSubmitResponse)
+async def submit_validation(request: ValidateRequest, background_tasks: BackgroundTasks):
+    """Submit a requirement for validation.
+
+    Can either validate an existing requirement by ID, or create and validate
+    an ad-hoc requirement from the provided data.
+    """
+    if not _postgres_conn or not _postgres_conn.is_connected:
+        raise HTTPException(status_code=503, detail="Database not connected")
+
+    if _shutdown_requested:
+        raise HTTPException(status_code=503, detail="Agent is shutting down")
+
+    try:
+        requirement_id = None
+        requirement_data = None
+        job_id = None
+
+        if request.requirement_id:
+            # Validate existing requirement from cache
+            try:
+                req_uuid = uuid_module.UUID(request.requirement_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid requirement ID format")
+
+            # Fetch requirement from database
+            row = await _postgres_conn.fetchrow(
+                """
+                SELECT * FROM requirement_cache WHERE id = $1
+                """,
+                req_uuid,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="Requirement not found")
+
+            requirement_id = request.requirement_id
+            job_id = str(row["job_id"])
+            requirement_data = dict(row)
+
+        elif request.text:
+            # Create ad-hoc requirement for validation
+            # First, we need a job - create a dummy job for manual testing
+            dummy_job_id = await _postgres_conn.fetchval(
+                """
+                INSERT INTO jobs (prompt, status, creator_status, validator_status)
+                VALUES ('Manual validation test', 'processing', 'completed', 'processing')
+                RETURNING id
+                """
+            )
+            job_id = str(dummy_job_id)
+
+            # Create the requirement
+            req_uuid = await create_requirement(
+                conn=_postgres_conn,
+                job_id=dummy_job_id,
+                text=request.text,
+                name=request.name,
+                req_type=request.type,
+                priority=request.priority,
+                gobd_relevant=request.gobd_relevant,
+                gdpr_relevant=request.gdpr_relevant,
+                mentioned_objects=request.mentioned_objects,
+                mentioned_messages=request.mentioned_messages,
+                confidence=0.9,  # High confidence for manual entries
+            )
+            requirement_id = str(req_uuid)
+
+            # Fetch the created requirement
+            row = await _postgres_conn.fetchrow(
+                "SELECT * FROM requirement_cache WHERE id = $1", req_uuid
+            )
+            requirement_data = dict(row)
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide either requirement_id or text",
+            )
+
+        # Generate request ID for tracking
+        request_id = str(uuid_module.uuid4())
+
+        # Track the manual validation
+        _manual_validations[request_id] = {
+            "requirement_id": requirement_id,
+            "job_id": job_id,
+            "status": "submitted",
+            "phase": None,
+            "iteration": 0,
+            "max_iterations": request.max_iterations,
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+            "result": None,
+        }
+
+        # Start validation in background
+        background_tasks.add_task(
+            _process_manual_validation,
+            request_id,
+            requirement_data,
+            job_id,
+            requirement_id,
+            request.max_iterations,
+        )
+
+        logger.info(f"Manual validation {request_id} submitted for requirement {requirement_id}")
+
+        return ValidateSubmitResponse(
+            request_id=request_id,
+            requirement_id=requirement_id,
+            status="submitted",
+            message="Validation submitted. Poll GET /validate/{request_id} for status.",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error submitting validation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/validate/{request_id}", response_model=ValidateStatusResponse)
+async def get_validation_status(request_id: str):
+    """Get the current status of a validation request."""
+    if request_id not in _manual_validations:
+        raise HTTPException(status_code=404, detail="Validation request not found")
+
+    info = _manual_validations[request_id]
+    result = info.get("result", {}) or {}
+
+    # Convert graph changes to response model
+    graph_changes = []
+    for change in result.get("graph_changes", []):
+        graph_changes.append(
+            GraphChange(
+                operation=change.get("operation", "unknown"),
+                node_type=change.get("node_type"),
+                node_id=change.get("node_id"),
+                relationship_type=change.get("relationship_type"),
+                source_id=change.get("source_id"),
+                target_id=change.get("target_id"),
+                properties=change.get("properties"),
+            )
+        )
+
+    # Calculate progress based on phases
+    phases = ["understanding", "relevance", "fulfillment", "planning", "integration", "documentation"]
+    phases_completed = result.get("phases_completed", [])
+    if isinstance(phases_completed, str):
+        # Convert single phase string to list
+        phase_idx = phases.index(phases_completed) if phases_completed in phases else -1
+        phases_completed = phases[: phase_idx + 1] if phase_idx >= 0 else []
+    progress = (len(phases_completed) / len(phases)) * 100 if phases else 0
+
+    return ValidateStatusResponse(
+        request_id=request_id,
+        requirement_id=info.get("requirement_id"),
+        status=info.get("status", "unknown"),
+        current_phase=info.get("phase") or result.get("current_phase"),
+        phases_completed=phases_completed,
+        iteration=info.get("iteration", 0),
+        max_iterations=info.get("max_iterations", 100),
+        progress_percent=progress,
+        related_objects=result.get("related_objects", []),
+        related_messages=result.get("related_messages", []),
+        fulfillment_analysis=result.get("fulfillment_analysis"),
+        graph_changes=graph_changes,
+        graph_node_id=result.get("graph_node_id"),
+        rejection_reason=result.get("rejection_reason"),
+        started_at=info.get("started_at"),
+        completed_at=info.get("completed_at"),
+        error=info.get("error"),
+    )
+
+
+@app.get("/requirements/pending", response_model=PendingRequirementsListResponse)
+async def list_pending_requirements(limit: int = 50):
+    """List pending requirements from the cache."""
+    if not _postgres_conn or not _postgres_conn.is_connected:
+        raise HTTPException(status_code=503, detail="Database not connected")
+
+    rows = await _postgres_conn.fetch(
+        """
+        SELECT
+            id, job_id, name, text, type, priority, confidence,
+            gobd_relevant, gdpr_relevant, created_at, status
+        FROM requirement_cache
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT $1
+        """,
+        limit,
+    )
+
+    # Get total count
+    total = await _postgres_conn.fetchval(
+        "SELECT COUNT(*) FROM requirement_cache WHERE status = 'pending'"
+    )
+
+    requirements = [
+        PendingRequirementResponse(
+            id=str(row["id"]),
+            job_id=str(row["job_id"]),
+            name=row.get("name"),
+            text=row["text"][:500] + "..." if len(row["text"]) > 500 else row["text"],
+            type=row.get("type"),
+            priority=row.get("priority"),
+            confidence=row.get("confidence", 0.0),
+            gobd_relevant=row.get("gobd_relevant", False),
+            gdpr_relevant=row.get("gdpr_relevant", False),
+            created_at=row.get("created_at"),
+            status=row.get("status", "pending"),
+        )
+        for row in rows
+    ]
+
+    return PendingRequirementsListResponse(
+        total=total,
+        requirements=requirements,
+    )
+
+
+@app.get("/requirements/{requirement_id}", response_model=RequirementDetailResponse)
+async def get_requirement_detail(requirement_id: str):
+    """Get full details of a requirement."""
+    if not _postgres_conn or not _postgres_conn.is_connected:
+        raise HTTPException(status_code=503, detail="Database not connected")
+
+    try:
+        req_uuid = uuid_module.UUID(requirement_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid requirement ID format")
+
+    row = await _postgres_conn.fetchrow(
+        "SELECT * FROM requirement_cache WHERE id = $1", req_uuid
+    )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Requirement not found")
+
+    return RequirementDetailResponse(
+        id=str(row["id"]),
+        job_id=str(row["job_id"]),
+        candidate_id=row.get("candidate_id"),
+        name=row.get("name"),
+        text=row["text"],
+        type=row.get("type"),
+        priority=row.get("priority"),
+        source_document=row.get("source_document"),
+        source_location=row.get("source_location"),
+        gobd_relevant=row.get("gobd_relevant", False),
+        gdpr_relevant=row.get("gdpr_relevant", False),
+        citations=row.get("citations") or [],
+        mentioned_objects=row.get("mentioned_objects") or [],
+        mentioned_messages=row.get("mentioned_messages") or [],
+        reasoning=row.get("reasoning"),
+        research_notes=row.get("research_notes"),
+        confidence=row.get("confidence", 0.0),
+        status=row.get("status", "pending"),
+        validation_result=row.get("validation_result"),
+        graph_node_id=row.get("graph_node_id"),
+        rejection_reason=row.get("rejection_reason"),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+        validated_at=row.get("validated_at"),
+        tags=row.get("tags") or [],
+    )
 
 
 if __name__ == "__main__":

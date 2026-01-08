@@ -1,560 +1,372 @@
-# Neo4j Requirements Compliance & Impact Analysis System
+# Graph-RAG Requirements Compliance System
 
-An intelligent workflow system for analyzing business requirements against a Neo4j graph database. This tool uses LangChain and Large Language Models (LLMs) to automatically generate Cypher queries, execute them against your Neo4j database, and provide comprehensive compliance analysis and impact assessments.
+An intelligent workflow system for analyzing business requirements against a Neo4j graph database. Uses LangChain, LangGraph, and LLMs to automatically extract requirements from documents, validate them against existing knowledge, and integrate them into a compliance-tracking graph.
 
 ## Overview
 
-This repository contains a **Graph-RAG (Retrieval-Augmented Generation) system** specifically designed for **requirement traceability and compliance checking** in a car rental business context. The system is particularly focused on:
+This **Graph-RAG (Retrieval-Augmented Generation) system** is designed for **requirement traceability and compliance checking** in a car rental business context. The system focuses on:
 
 - **GoBD Compliance**: German accounting principles (Grundsätze zur ordnungsmäßigen Führung und Aufbewahrung von Büchern)
+- **GDPR Compliance**: European data protection requirements
 - **Requirement Traceability**: Tracking relationships between requirements, business objects, and system messages
-- **Impact Analysis**: Understanding how new requirements or changes affect existing system components
-- **Compliance Verification**: Automated checking of requirement fulfillment
+- **Impact Analysis**: Understanding how new requirements affect existing system components
+- **Automated Validation**: LLM-powered compliance verification with citation tracking
 
-### Use Cases
+## Architecture
 
-1. **Compliance Auditing**: "Which billing requirements are GoBD-compliant?"
-2. **Impact Assessment**: "Which business objects would be affected by implementing SEPA payment processing?"
-3. **Requirement Analysis**: "Show all requirements related to invoice generation and their dependencies"
-4. **Gap Analysis**: "Which requirements lack connections to business objects or messages?"
-
-### How It Works
-
-The workflow leverages LangChain and a metamodel-based approach:
-1. Reads business requirements from a CSV file (semicolon-delimited format)
-2. Uses an LLM to refine and understand the requirement context
-3. Generates appropriate Cypher queries based on the database metamodel
-4. Executes queries against the Neo4j graph database
-5. Analyzes results using the LLM to provide structured compliance reports
-
-## Table of Contents
-
-- [Features](#features)
-- [Database Metamodel](#database-metamodel)
-- [Repository Structure](#repository-structure)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Database Setup](#database-setup)
-- [Usage](#usage)
-- [CSV Format](#csv-format)
-- [Output](#output)
-- [Examples](#examples)
-- [License](#license)
-- [Contact](#contact)
-
-## Features
-
-- **Dual Workflow Modes**:
-  - **Chain Mode**: Fast linear workflow for straightforward analysis
-  - **Agent Mode**: Iterative reasoning agent with LangGraph for complex requirements
-- **Metamodel-Based Analysis**: Built on a structured metamodel for requirement traceability (Requirement, BusinessObject, Message nodes)
-- **GoBD Compliance Focus**: Specialized support for German accounting compliance requirements
-- **Intelligent Query Generation**: Automatically generates Cypher queries from natural language requirements using LLM
-- **Iterative Reasoning** (Agent Mode): Agent can plan, query, analyze, and decide to investigate further
-- **Tool-Based Architecture** (Agent Mode): Agent uses tools to execute queries, inspect schema, and gather information
-- **Impact Assessment**: Analyzes how requirements affect business objects and system messages
-- **Requirement Traceability**: Tracks dependencies, refinements, and relationships between requirements
-- **Batch Processing**: Process multiple requirements from CSV files (supports both semicolon and comma delimiters)
-- **Comprehensive Reporting**: Generates detailed analysis with compliance status, findings, and recommendations
-- **Multiple Output Formats**: Results available in both JSON (structured) and TXT (human-readable) formats
-- **Flexible LLM Support**: Works with OpenAI, self-hosted models (gpt-oss-120b, vLLM, llama.cpp), Anthropic Claude, and other OpenAI-compatible endpoints
-- **Error Handling**: Robust error handling with detailed logging
-- **Interactive UI**: Streamlit-based web interface for interactive requirement analysis with streaming progress
-
-## Database Metamodel
-
-The system uses a specialized graph metamodel designed for requirement traceability and impact analysis:
-
-### Node Types
-
-1. **Requirement** - Business/system requirements
-   - Properties: `rid` (unique ID), `name`, `text`, `type`, `priority`, `status`, `source`, `valueStream`, `goBDRelevant`
-   - Examples: Invoice generation, SEPA payment processing, audit trail requirements
-
-2. **BusinessObject** - Business domain entities
-   - Properties: `boid` (unique ID), `name`, `description`, `domain`, `owner`
-   - Examples: Invoice, Payment, Reservation, Customer
-
-3. **Message** - System messages/events
-   - Properties: `mid` (unique ID), `name`, `description`, `direction`, `format`, `protocol`, `version`
-   - Examples: ReservationRequest, PaymentConfirmation, InvoiceGenerated
-
-### Relationship Types
-
-- `(Requirement)-[:REFINES]->(Requirement)` - Requirement refinement hierarchy
-- `(Requirement)-[:DEPENDS_ON]->(Requirement)` - Requirement dependencies
-- `(Requirement)-[:TRACES_TO]->(Requirement)` - Traceability links
-- `(Requirement)-[:RELATES_TO_OBJECT]->(BusinessObject)` - Requirement references a business object
-- `(Requirement)-[:IMPACTS_OBJECT]->(BusinessObject)` - Requirement impacts a business object (structural/compliance)
-- `(Requirement)-[:RELATES_TO_MESSAGE]->(Message)` - Requirement references a message
-- `(Requirement)-[:IMPACTS_MESSAGE]->(Message)` - Requirement impacts message generation/handling
-- `(Message)-[:USES_OBJECT]->(BusinessObject)` - Message uses object data
-- `(Message)-[:PRODUCES_OBJECT]->(BusinessObject)` - Message produces/creates object instances
-
-### Metamodel Files
-
-- **`data/metamodell.cql`**: Neo4j schema definition with constraints, indexes, and sample queries
-- **`data/neo4j.dump`**: Database dump file for importing the complete graph structure
-- **`data/metamodell.xml`**: XML representation of the metamodel
-- **`data/output_schema.json`**: Structured output schema for Pydantic models
-
-## Repository Structure
+The system uses a **two-agent autonomous architecture** for long-running requirement processing:
 
 ```
-├── main.py                      # Streamlit entry point (multi-page app)
-├── config/
-│   ├── llm_config.json          # LLM settings (model, temperature, reasoning_level)
-│   └── prompts/
-│       ├── agent_system.txt     # Agent system prompt
-│       └── chain_domain.txt     # Chain domain context
-├── src/
-│   ├── __init__.py              # Package initialization
-│   ├── workflow.py              # Batch workflow orchestrator
-│   ├── chain_example.py         # Simple chain demo (for comparison)
-│   ├── agents/
-│   │   ├── __init__.py
-│   │   └── graph_agent.py       # LangGraph iterative agent
-│   ├── core/
-│   │   ├── __init__.py
-│   │   ├── neo4j_utils.py       # Neo4j connection and query utilities
-│   │   └── csv_processor.py     # CSV file processing
-│   └── ui/
-│       ├── __init__.py          # UI helper functions
-│       ├── home.py              # Home page (connection settings)
-│       ├── agent.py             # Agent analysis page
-│       └── chain.py             # Chain analysis page
-├── data/
-│   ├── metamodell.cql           # Neo4j metamodel schema definition
-│   ├── metamodell.xml           # XML representation of the metamodel
-│   ├── neo4j.dump               # Database dump file for import
-│   ├── output_schema.json       # Structured output schema
-│   └── requirements.csv         # Car rental business requirements (82 requirements)
-├── output/                      # Generated analysis results (created automatically)
-├── docker/
-│   └── README.txt               # Docker setup information
-├── .env.example                 # Environment configuration template
-├── requirements.txt             # Python dependencies
-├── README.md                    # This file
-└── LICENSE.txt                  # License information
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          ORCHESTRATOR                                    │
+│                    (Job Management & Coordination)                       │
+└───────────────────────────────┬─────────────────────────────────────────┘
+                                │
+         ┌──────────────────────┴──────────────────────┐
+         │                                              │
+         ▼                                              ▼
+┌─────────────────────┐                      ┌─────────────────────┐
+│   CREATOR AGENT     │                      │  VALIDATOR AGENT    │
+│                     │                      │                     │
+│ - Document process  │                      │ - Graph exploration │
+│ - Requirement       │   PostgreSQL Cache   │ - Relevance check   │
+│   extraction        │ ◄──────────────────► │ - Fulfillment check │
+│ - Research/citation │   (requirement_cache)│ - Graph integration │
+└─────────────────────┘                      └─────────────────────┘
+                                                        │
+                                                        ▼
+                                              ┌─────────────────────┐
+                                              │       Neo4j         │
+                                              │  (Knowledge Graph)  │
+                                              └─────────────────────┘
 ```
 
-## Installation
+### Components
 
-### Prerequisites
+- **Creator Agent**: Processes documents, extracts requirement candidates, performs web/graph research, creates citations
+- **Validator Agent**: Validates requirements against existing graph, checks fulfillment status, integrates into Neo4j
+- **Orchestrator**: Manages job lifecycle, monitors completion, generates reports
+- **Legacy UI**: Streamlit-based interface for interactive single-requirement analysis
 
-- **Python 3.8 or higher**
-- **Neo4j 5.x** (local installation or Neo4j Desktop/AuraDB)
-  - Download from: https://neo4j.com/download/
-  - Minimum 2GB RAM recommended for the sample dataset
-- **OpenAI API key** (or other supported LLM provider like Anthropic Claude)
-  - Get your API key from: https://platform.openai.com/api-keys
+## Quick Start
 
-### Setup Steps
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
-   cd Uni-Projekt-Graph-RAG
-   ```
-
-2. **Create a virtual environment** (recommended)
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install Python dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure environment variables**
-   ```bash
-   cp .env.example .env
-   # Edit .env with your actual configuration (see Configuration section below)
-   ```
-
-## Configuration
-
-Create a `.env` file in the project root with the following variables:
+### Docker Deployment (Recommended)
 
 ```bash
-# Neo4j Database Configuration
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=your_password_here
+# Clone and configure
+git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
+cd Uni-Projekt-Graph-RAG
+cp .env.docker.example .env
 
-# CSV Requirements File
-CSV_FILE_PATH=data/requirements.csv
+# Edit .env with your LLM API credentials
+# Required: OPENAI_API_KEY or LLM_BASE_URL
+# Optional: TAVILY_API_KEY for web search
 
-# LLM Configuration
-OPENAI_API_KEY=your_openai_api_key_here
+# Start all services
+podman-compose up -d
 
-# Optional: Custom OpenAI-compatible endpoint (for self-hosted models)
-# LLM_BASE_URL=https://your-endpoint.example.com/v1
+# Check status
+podman-compose ps
+
+# View logs
+podman-compose logs -f orchestrator
 ```
 
-### Configuration Options
-
-- **NEO4J_URI**: Connection string for your Neo4j database
-  - Local: `bolt://localhost:7687`
-  - Neo4j Desktop: Usually `bolt://localhost:7687` (check your database settings)
-  - AuraDB: `neo4j+s://xxxxx.databases.neo4j.io`
-- **NEO4J_USERNAME**: Database username (default: `neo4j`)
-- **NEO4J_PASSWORD**: Database password (set during Neo4j installation)
-- **CSV_FILE_PATH**: Path to your requirements CSV file (default: `data/requirements.csv`)
-- **OPENAI_API_KEY**: Your API key for LLM access
-- **LLM_BASE_URL** (optional): Custom OpenAI-compatible endpoint for self-hosted models (e.g., vLLM, llama.cpp, Ollama)
-
-### Alternative LLM Providers
-
-**Self-hosted models (gpt-oss-120b, Llama, etc.):**
-```bash
-OPENAI_API_KEY=any-value-for-local
-LLM_BASE_URL=https://your-endpoint.example.com/v1
-```
-
-**Anthropic Claude:**
-```bash
-ANTHROPIC_API_KEY=your_anthropic_key_here
-```
-Note: Requires modifying the agent initialization to use `ChatAnthropic`.
-
-### Configuration Files
-
-The `config/` directory contains LLM and prompt configuration:
-
-```
-config/
-├── llm_config.json        # LLM settings for agent and chain
-└── prompts/
-    ├── agent_system.txt   # System prompt for the LangGraph agent
-    └── chain_domain.txt   # Domain context for the simple chain
-```
-
-**llm_config.json** structure:
-```json
-{
-  "agent": {
-    "model": "gpt-oss-120b",
-    "temperature": 0.0,
-    "max_iterations": 5,
-    "reasoning_level": "high"
-  },
-  "chain": {
-    "model": "gpt-oss-120b",
-    "temperature": 0.2,
-    "reasoning_level": "medium"
-  }
-}
-```
-
-**Reasoning Levels** (for gpt-oss models):
-| Level | Description |
-|-------|-------------|
-| `low` | Fast responses for general dialogue |
-| `medium` | Balanced speed and detail (default) |
-| `high` | Deep, detailed analysis with comprehensive reasoning |
-
-The reasoning level is prepended to system prompts as `Reasoning: <level>`. This controls how deeply the model reasons through problems.
-
-These files allow you to customize agent/chain behavior without modifying code. The prompts are tightly coupled to the database metamodel.
-
-## Database Setup
-
-You have two options for setting up the Neo4j database:
-
-### Option 1: Import from Database Dump (Recommended)
-
-The repository includes a complete database dump with sample data:
-
-1. **Start your Neo4j database**
-   - Using Neo4j Desktop: Start your database instance
-   - Using command line: `neo4j start`
-
-2. **Import the database dump**
-   ```bash
-   # Stop the database first
-   neo4j stop
-
-   # Load the dump file (replace <database-name> with your database name, e.g., neo4j)
-   neo4j-admin database load --from-path=data/ <database-name> --overwrite-destination=true
-
-   # Start the database
-   neo4j start
-   ```
-
-3. **Verify the import**
-   - Open Neo4j Browser: http://localhost:7474
-   - Run: `MATCH (n) RETURN count(n)` to verify data exists
-
-### Option 2: Create Schema Manually
-
-If you prefer to start with an empty database and create the schema:
-
-1. **Start Neo4j and open Neo4j Browser** (http://localhost:7474)
-
-2. **Execute the metamodel schema**
-   - Open the file `data/metamodell.cql`
-   - Copy and paste the content into Neo4j Browser
-   - Execute the commands to create constraints and indexes
-
-3. **Optional: Add sample data**
-   - You can manually create nodes and relationships following the examples in `metamodell.cql`
-   - Or import requirements from your CSV file
-
-### Verify Database Connection
-
-Test your database connection:
+### Local Development
 
 ```bash
-python -c "from src.core.neo4j_utils import create_neo4j_connection; conn = create_neo4j_connection(); conn.connect()"
-```
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-You should see: `✓ Successfully connected to Neo4j at bolt://localhost:7687`
+# Install dependencies
+pip install -r requirements.txt
+pip install -e ./citation_tool[full]
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your credentials
+
+# Initialize PostgreSQL (requires running PostgreSQL instance)
+python scripts/init_db.py
+
+# Start the legacy Streamlit UI
+streamlit run main.py
+```
 
 ## Usage
 
-The system provides two interfaces for analyzing requirements:
+### Create a Processing Job
 
-1. **Interactive UI** (Streamlit): Web-based interface with real-time streaming
-2. **Batch Workflow** (CLI): Process all requirements from CSV file
+```bash
+# Via CLI
+python start_orchestrator.py \
+  --document-path ./data/gdpr-requirements.pdf \
+  --prompt "Extract and validate GDPR compliance requirements" \
+  --context '{"domain": "car_rental", "region": "EU"}'
 
-### Interactive Streamlit Application
+# Via API (Docker)
+curl -X POST http://localhost:8000/jobs \
+  -F "document=@./data/document.pdf" \
+  -F "prompt=Review for GoBD compliance"
+```
+
+### Monitor Job Progress
+
+```bash
+# CLI
+python job_status.py --job-id <uuid> --progress
+
+# API
+curl http://localhost:8000/jobs/<uuid>
+```
+
+### Get Job Report
+
+```bash
+# CLI
+python job_status.py --job-id <uuid> --report
+
+# API
+curl http://localhost:8000/jobs/<uuid>/report
+```
+
+### Legacy Interactive UI
+
+For single-requirement analysis with streaming progress:
 
 ```bash
 streamlit run main.py
 ```
 
-This launches a multi-page web application:
-- **Home**: Configure Neo4j database connection
-- **Agent**: Iterative LangGraph agent with streaming progress display
-- **Chain**: Simple one-shot chain for quick analysis
+## Configuration
 
-### Batch Workflow (Command Line)
-
-Process all requirements from CSV using the LangGraph agent:
+### Environment Variables
 
 ```bash
-python -m src.workflow
+# Database
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your_password
+DATABASE_URL=postgresql://graphrag:password@localhost:5432/graphrag
+
+# LLM
+OPENAI_API_KEY=sk-xxxxx
+LLM_BASE_URL=http://localhost:8080/v1  # For self-hosted models
+
+# Optional
+TAVILY_API_KEY=tvly-xxxxx  # Web search for Creator Agent
 ```
 
-This reads requirements from the CSV file specified in `CSV_FILE_PATH` and saves results to `output/`.
+### LLM Configuration
 
-### Choosing Between Agent and Chain
-
-**Agent (Recommended):**
-- Iterative reasoning with multiple query attempts
-- Dynamic schema exploration
-- Error recovery and query refinement
-- Best for complex compliance and impact analysis
-
-**Chain (Simple):**
-- Single-shot linear workflow
-- Faster but less thorough
-- Good for straightforward requirements
-
-### Programmatic Usage
-
-```python
-from dotenv import load_dotenv
-from src.workflow import RequirementWorkflow
-
-# Load environment variables
-load_dotenv()
-
-# Create workflow instance
-workflow = RequirementWorkflow(
-    csv_path="data/requirements.csv",
-    output_dir="output"
-)
-
-# Run the workflow
-results = workflow.run(save_format="both")  # 'json', 'txt', or 'both'
-
-# Access individual results
-for result in results:
-    print(f"Requirement: {result['original_requirement']}")
-    print(f"Plan: {result.get('plan', '')}")
-    print(f"Iterations: {result.get('iterations', 0)}")
-    print(f"Analysis: {result['analysis']}")
-```
-
-## CSV Format
-
-The system supports both semicolon-delimited and comma-delimited CSV formats.
-
-### Semicolon-Delimited Format (Current)
-
-The provided `data/requirements.csv` uses semicolon delimiters:
-
-```csv
-Name;Description
-Fahrzeugkatalog durchsuchen;Das System muss es Nutzern ermöglichen, den Fahrzeugkatalog nach verschiedenen Kriterien zu durchsuchen.
-Rechnungserzeugung;Bei Abschluss des Wertstromabschnitts „Mobilität beenden" MUSS das System automatisch eine Rechnung zum Mietvorgang erzeugen.
-GoBD-Compliance;Das System MUSS eine revisionssichere Archivierung aller steuerlich relevanten Unterlagen gewährleisten.
-```
-
-- **First column**: Requirement name/title
-- **Second column**: Requirement description (analyzed by the LLM)
-- The CSV processor automatically detects and handles semicolon delimiters
-
-### Comma-Delimited Format (Alternative)
-
-You can also use traditional comma-delimited CSV files:
-
-```csv
-requirement,category,priority,compliance_standard
-"Vehicle catalog search capability",functional,high,
-"Automatic invoice generation on rental completion",billing,critical,GoBD
-"Audit trail for all accounting transactions",compliance,critical,GoBD
-```
-
-### Supported Columns
-
-- **requirement** or **Description**: The main requirement text (required)
-- **name** or **Name**: Short name/title for the requirement (optional)
-- **category**: Type of requirement (e.g., functional, compliance, billing)
-- **priority**: Priority level (e.g., low, medium, high, critical)
-- **compliance_standard**: Applicable standard (e.g., GoBD, ISO 9001)
-- Any other metadata columns will be preserved and included in the output
-
-### Current Dataset
-
-The included `data/requirements.csv` contains **82 requirements** for a car rental system, including:
-- Vehicle catalog and reservation features (Requirements 1-10)
-- User management and authentication (Requirements 11-18)
-- Payment processing (Requirements 19-23)
-- Billing and invoicing (Requirements 24-61)
-- GoBD compliance and audit trail (Requirements 62-81)
-
-## Output
-
-The workflow generates two types of output files in the `output/` directory:
-
-### JSON Output (`results_YYYYMMDD_HHMMSS.json`)
-
-Structured data including:
-- Original and refined requirements
-- Generated Cypher queries
-- Query results
-- Analysis text
-- Metadata
-
-### Text Output (`results_YYYYMMDD_HHMMSS.txt`)
-
-Human-readable report with:
-- Formatted requirements
-- Executed queries
-- Analysis and recommendations
-- Summary statistics
-
-### Example Output Structure
+Edit `config/llm_config.json`:
 
 ```json
 {
-  "requirement_id": 1,
-  "original_requirement": "All products in category X must comply with Y",
-  "refined_requirement": "Verify that all products with category='X' have compliance_field='Y'",
-  "cypher_query": "MATCH (p:Product) WHERE p.category='X' RETURN p",
-  "result_count": 15,
-  "results": [...],
-  "analysis": "Based on the query results, 15 products were found...",
-  "metadata": {
-    "category": "compliance",
-    "priority": "high"
+  "creator_agent": {
+    "model": "gpt-4",
+    "temperature": 0.0,
+    "reasoning_level": "high",
+    "research_depth": "thorough"
+  },
+  "validator_agent": {
+    "model": "gpt-4",
+    "temperature": 0.0,
+    "auto_integrate": false,
+    "require_citations": true
   }
 }
 ```
 
-## Examples
+**Reasoning Levels** (for compatible models):
+| Level | Use Case |
+|-------|----------|
+| `low` | Fast responses, simple tasks |
+| `medium` | Balanced speed and detail |
+| `high` | Deep analysis, complex compliance |
 
-### Example 1: GoBD Compliance Check
+## Database Metamodel
 
-**Requirement**: "Which requirements are marked as GoBD-relevant and which business objects do they impact?"
+The system uses a graph metamodel designed for requirement traceability:
 
-**Generated Query**:
-```cypher
-MATCH (r:Requirement {goBDRelevant: true})
-OPTIONAL MATCH (r)-[:IMPACTS_OBJECT]->(bo:BusinessObject)
-RETURN r.name, r.text, collect(DISTINCT bo.name) as impacted_objects
-LIMIT 100
+### Node Types
+
+| Type | Key Properties | Description |
+|------|----------------|-------------|
+| `Requirement` | `rid`, `name`, `text`, `goBDRelevant`, `complianceStatus` | Business/system requirements |
+| `BusinessObject` | `boid`, `name`, `domain` | Business domain entities |
+| `Message` | `mid`, `name`, `direction`, `format` | System messages/events |
+
+### Relationships
+
+```
+Requirement → Requirement:    REFINES, DEPENDS_ON, TRACES_TO, SUPERSEDES
+Requirement → BusinessObject: RELATES_TO_OBJECT, IMPACTS_OBJECT, FULFILLED_BY_OBJECT, NOT_FULFILLED_BY_OBJECT
+Requirement → Message:        RELATES_TO_MESSAGE, IMPACTS_MESSAGE, FULFILLED_BY_MESSAGE, NOT_FULFILLED_BY_MESSAGE
+Message → BusinessObject:     USES_OBJECT, PRODUCES_OBJECT
 ```
 
-**Expected Analysis**:
-- **Summary**: Found X requirements marked as GoBD-relevant
-- **Findings**: Requirements like "Revisionssichere Archivierung", "Rechnungserzeugung", etc.
-- **Impact**: Business objects such as Invoice (Rechnung), Payment (Zahlung), Booking (Buchung)
-- **Compliance Status**: All GoBD requirements must have clear object mappings
-- **Recommendations**: Ensure all identified objects implement required audit trails
+### Database Setup
 
-### Example 2: Impact Analysis for Invoice Generation
-
-**Requirement**: "What business objects and messages are affected by the invoice generation requirement?"
-
-**Generated Query**:
-```cypher
-MATCH (r:Requirement)
-WHERE r.name CONTAINS 'Rechnung' OR r.text CONTAINS 'Rechnung'
-OPTIONAL MATCH (r)-[:IMPACTS_OBJECT]->(bo:BusinessObject)
-OPTIONAL MATCH (r)-[:IMPACTS_MESSAGE]->(m:Message)
-RETURN r.name, r.rid,
-       collect(DISTINCT bo.name) as business_objects,
-       collect(DISTINCT m.name) as messages
-LIMIT 100
+**Option 1: Import sample data**
+```bash
+neo4j stop
+neo4j-admin database load --from-path=data/ neo4j --overwrite-destination=true
+neo4j start
 ```
 
-**Expected Analysis**:
-- **Summary**: Invoice-related requirements affect multiple system components
-- **Business Objects**: Rechnung (Invoice), Zahlung (Payment), Reservierung (Reservation)
-- **Messages**: InvoiceGenerated, PaymentReceived, BookingCompleted
-- **Impact Assessment**: Changes to invoicing will cascade to billing, payment processing, and reporting
-- **Recommendations**: Coordinate changes across all affected domains
-
-### Example 3: Requirement Dependency Analysis
-
-**Requirement**: "Show all requirements that depend on payment processing capabilities"
-
-**Generated Query**:
-```cypher
-MATCH (r1:Requirement)-[:DEPENDS_ON]->(r2:Requirement)
-WHERE r2.name CONTAINS 'Zahlung' OR r2.text CONTAINS 'payment'
-RETURN r1.name as dependent_requirement,
-       r2.name as payment_requirement,
-       r1.priority as priority
-ORDER BY r1.priority DESC
-LIMIT 100
+**Option 2: Create schema only**
+```bash
+# Execute data/metamodell.cql in Neo4j Browser
 ```
 
-**Expected Analysis**:
-- **Summary**: Multiple requirements have dependencies on payment functionality
-- **Findings**: Billing, refunds, and deposit handling all depend on core payment processing
-- **Risk Level**: High - Changes to payment processing affect critical business workflows
-- **Recommendations**: Implement payment changes with comprehensive testing across dependent requirements
+## API Reference
 
-### Example 4: Metamodel Quality Check
+### Orchestrator Endpoints (port 8000)
 
-**Requirement**: "Find all requirements that have no relationship to business objects or messages"
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/jobs` | Create new processing job |
+| `GET` | `/jobs` | List all jobs |
+| `GET` | `/jobs/{id}` | Get job details |
+| `GET` | `/jobs/{id}/report` | Get full job report |
+| `DELETE` | `/jobs/{id}` | Cancel job |
 
-**Generated Query**:
+### Health Endpoints (all services)
+
+| Endpoint | Description |
+|----------|-------------|
+| `/health` | Liveness check |
+| `/ready` | Readiness (DB connectivity) |
+| `/status` | Detailed agent state |
+| `/metrics` | Prometheus metrics |
+
+### Service Ports
+
+| Service | Port |
+|---------|------|
+| Orchestrator | 8000 |
+| Creator Agent | 8001 |
+| Validator Agent | 8002 |
+| Neo4j Browser | 7474 |
+| Neo4j Bolt | 7687 |
+| PostgreSQL | 5432 |
+| Adminer (dev) | 8080 |
+
+## CLI Reference
+
+```bash
+# Job management
+python start_orchestrator.py --document-path FILE --prompt TEXT [--wait]
+python job_status.py --job-id UUID [--report|--progress]
+python list_jobs.py [--status STATUS] [--stats]
+python cancel_job.py --job-id UUID [--cleanup]
+
+# Metamodel validation
+python validate_metamodel.py [--check CHECK_ID] [--json]
+
+# Batch processing (legacy)
+python -m src.workflow
+```
+
+## Example Use Cases
+
+### GoBD Compliance Check
+
+```bash
+python start_orchestrator.py \
+  --document-path ./data/billing-spec.pdf \
+  --prompt "Identify GoBD-relevant requirements and verify compliance" \
+  --wait
+```
+
+### GDPR Impact Analysis
+
+```bash
+python start_orchestrator.py \
+  --document-path ./data/eu-expansion.docx \
+  --prompt "Extract GDPR requirements for EU market expansion" \
+  --context '{"region": "EU", "focus": "data_protection"}'
+```
+
+### Requirement Traceability
+
+Query the graph after processing:
+
 ```cypher
-MATCH (r:Requirement)
-WHERE NOT (r)-[:RELATES_TO_OBJECT|IMPACTS_OBJECT]->(:BusinessObject)
-  AND NOT (r)-[:RELATES_TO_MESSAGE|IMPACTS_MESSAGE]->(:Message)
+// Find unfulfilled GoBD requirements
+MATCH (r:Requirement {goBDRelevant: true, complianceStatus: 'open'})
 RETURN r.rid, r.name, r.text
-LIMIT 100
+
+// Show fulfillment relationships
+MATCH (r:Requirement)-[rel:FULFILLED_BY_OBJECT|NOT_FULFILLED_BY_OBJECT]->(bo:BusinessObject)
+RETURN r.name, type(rel), rel.confidence, bo.name
 ```
 
-**Expected Analysis**:
-- **Summary**: Identifies orphaned requirements lacking traceability
-- **Compliance Status**: Not met - Requirements should link to implementation artifacts
-- **Recommendations**: Review each requirement and establish appropriate object/message relationships
+## Project Structure
+
+```
+├── src/
+│   ├── agents/
+│   │   ├── creator/        # Creator Agent
+│   │   ├── validator/      # Validator Agent
+│   │   ├── shared/         # Shared utilities
+│   │   └── graph_agent.py  # Legacy single-agent
+│   ├── core/               # Database utils, config
+│   ├── orchestrator/       # Job management
+│   └── ui/                 # Streamlit pages
+├── config/
+│   ├── llm_config.json     # LLM settings
+│   └── prompts/            # Agent prompts
+├── data/
+│   ├── metamodell.cql      # Neo4j schema
+│   └── requirements.csv    # Sample data (82 requirements)
+├── docker/                 # Dockerfiles
+├── migrations/             # PostgreSQL schema
+└── docker-compose.yml
+```
+
+## Development
+
+### Run with Hot Reload
+
+```bash
+podman-compose -f docker-compose.yml -f docker-compose.dev.yml up
+```
+
+### Run Tests
+
+```bash
+# Syntax check
+python -m py_compile src/**/*.py
+
+# Metamodel validation
+python validate_metamodel.py
+```
+
+### Database Access
+
+```bash
+# PostgreSQL
+podman-compose exec postgres psql -U graphrag -d graphrag
+
+# Neo4j
+podman-compose exec neo4j cypher-shell -u neo4j -p password
+```
+
+## Documentation
+
+- `masterplan.md` - System design and architecture
+- `masterplan_roadmap.md` - Implementation phases and status
+- `CLAUDE.md` - AI assistant guidance
+- `data/metamodell.cql` - Database schema definition
 
 ## License
 
-This project is licensed under the terms of the Creative Commons Attribution 4.0 International License (CC BY 4.0) and the All Rights Reserved License. See the [LICENSE](LICENSE.txt) file for details.
+This project is licensed under Creative Commons Attribution 4.0 International License (CC BY 4.0). See [LICENSE.txt](LICENSE.txt) for details.
 
 ## Contact
 
-[Github](https://github.com/Knaeckebrothero)
-[Mail](mailto:OverlyGenericAddress@pm.me)
+- [GitHub](https://github.com/Knaeckebrothero)
+- [Email](mailto:OverlyGenericAddress@pm.me)

@@ -1,6 +1,6 @@
 """
 Home page for the Requirement Analysis application.
-Provides database connection settings and status.
+Provides service status, database connection settings, and system overview.
 """
 import os
 
@@ -8,9 +8,60 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from src.core.neo4j_utils import Neo4jConnection
+from src.ui.agent_client import get_agent_client, AgentConfig
 
 # Load environment variables for defaults
 load_dotenv()
+
+
+def _render_service_status():
+    """Render the service status section."""
+    st.subheader("Service Status")
+
+    # Get agent client
+    config = AgentConfig.from_env()
+    client = get_agent_client()
+
+    # Check services
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**Creator Agent**")
+        try:
+            health = client.check_creator_health()
+            if health.healthy:
+                st.success(f"Healthy - {health.state or 'idle'}")
+                if health.uptime_seconds:
+                    hours = health.uptime_seconds / 3600
+                    st.caption(f"Uptime: {hours:.1f}h")
+                if health.current_job_id:
+                    st.caption(f"Processing: {health.current_job_id[:8]}...")
+            else:
+                st.error(f"Unhealthy: {health.message}")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+        st.caption(f"URL: {config.creator_url}")
+
+    with col2:
+        st.markdown("**Validator Agent**")
+        try:
+            health = client.check_validator_health()
+            if health.healthy:
+                st.success(f"Healthy - {health.state or 'idle'}")
+                if health.uptime_seconds:
+                    hours = health.uptime_seconds / 3600
+                    st.caption(f"Uptime: {hours:.1f}h")
+                if health.current_job_id:
+                    st.caption(f"Processing: {health.current_job_id[:8]}...")
+            else:
+                st.error(f"Unhealthy: {health.message}")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+        st.caption(f"URL: {config.validator_url}")
+
+    # Refresh button
+    if st.button("Refresh Status", key="refresh_status"):
+        st.rerun()
 
 
 def render():
@@ -20,11 +71,16 @@ def render():
     Analyze requirements against your Neo4j graph database using LLM-powered agents.
 
     **Features:**
-    - **Agent Analysis**: Iterative LangGraph agent with tool-calling capabilities
+    - **Creator Agent**: Document processing and requirement extraction
+    - **Validator Agent**: Requirement validation and graph integration
+    - **Legacy Agent**: Original iterative analysis agent
     - **Chain Analysis**: Simple one-shot chain for comparison
-
-    Configure your database connection below to get started.
     """)
+
+    st.divider()
+
+    # Service status section
+    _render_service_status()
 
     st.divider()
 
@@ -149,9 +205,9 @@ def render():
     st.divider()
     st.subheader("Quick Start")
     st.markdown("""
-    1. **Connect** to your Neo4j database using the form above
-    2. Navigate to **Agent** or **Chain** page using the sidebar
-    3. Enter a requirement to analyze
-    4. Click **Run Analysis** to start
+    1. **Verify** the agent services are running (see Service Status above)
+    2. **Connect** to your Neo4j database using the form above
+    3. Navigate to **Creator Agent** to process documents and extract requirements
+    4. Navigate to **Validator Agent** to validate requirements against the graph
     5. Export results as JSON when done
     """)

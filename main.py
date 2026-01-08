@@ -30,7 +30,7 @@ st.sidebar.title("Navigation")
 
 page = st.sidebar.radio(
     "Select Page",
-    ["Home", "Agent", "Chain", "Document Ingestion"],
+    ["Home", "Creator Agent", "Validator Agent", "Legacy Agent", "Chain", "Document Ingestion"],
     label_visibility="collapsed"
 )
 
@@ -46,8 +46,14 @@ else:
 if page == "Home":
     from src.ui.home import render
     render()
-elif page == "Agent":
-    from src.ui.agent import render
+elif page == "Creator Agent":
+    from src.ui.creator_agent import render
+    render()
+elif page == "Validator Agent":
+    from src.ui.validator_agent import render
+    render()
+elif page == "Legacy Agent":
+    from src.ui.legacy_agent import render
     render()
 elif page == "Chain":
     from src.ui.chain import render

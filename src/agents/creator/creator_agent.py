@@ -23,7 +23,13 @@ from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from src.core.config import load_config, load_prompt, get_project_root
+from src.core.config import (
+    load_config,
+    load_prompt,
+    get_project_root,
+    get_creator_max_iterations,
+    get_creator_recursion_limit,
+)
 from src.core.postgres_utils import (
     PostgresConnection,
     create_postgres_connection,
@@ -288,10 +294,7 @@ Watch for requirements related to:
         )
 
         # Initialize todo manager
-        self.todo_manager = TodoManager(
-            job_id=job_id,
-            postgres_conn=self.postgres_conn
-        )
+        self.todo_manager = TodoManager(self.workspace)
 
         # Update job status
         await update_job_status(
@@ -340,6 +343,16 @@ Start processing now."""
         hook = self.context_manager.create_pre_model_hook()
         processed = hook(state)
         messages_to_send = processed.get("llm_input_messages", state["messages"])
+
+        # Handle consecutive AIMessages - add continuation prompt if needed
+        # Some LLM APIs reject requests with 2+ assistant messages at the end
+        if messages_to_send:
+            last_msg = messages_to_send[-1]
+            if isinstance(last_msg, AIMessage) and not (hasattr(last_msg, "tool_calls") and last_msg.tool_calls):
+                continuation = HumanMessage(content="Continue with the task. Use the available tools to make progress, or indicate if the task is complete.")
+                messages_to_send = list(messages_to_send) + [continuation]
+                state["messages"].append(continuation)
+                logger.debug(f"Added continuation prompt after AIMessage without tool calls")
 
         # Get LLM response
         try:
@@ -564,7 +577,7 @@ Start processing now."""
             processed_candidates=0,
             requirements_created=[],
             iteration=0,
-            max_iterations=max_iterations or self.config.get("max_iterations_per_candidate", 50),
+            max_iterations=max_iterations or get_creator_max_iterations(),
             error=None,
             should_stop=False,
         )
@@ -577,7 +590,7 @@ Start processing now."""
             "configurable": {
                 "thread_id": f"creator_{job_id}",
             },
-            "recursion_limit": 200,
+            "recursion_limit": get_creator_recursion_limit(),
         }
 
         # Run the graph with checkpointing
@@ -618,7 +631,7 @@ Start processing now."""
             processed_candidates=0,
             requirements_created=[],
             iteration=0,
-            max_iterations=max_iterations or self.config.get("max_iterations_per_candidate", 50),
+            max_iterations=max_iterations or get_creator_max_iterations(),
             error=None,
             should_stop=False,
         )
@@ -627,7 +640,7 @@ Start processing now."""
             "configurable": {
                 "thread_id": f"creator_{job_id}",
             },
-            "recursion_limit": 200,
+            "recursion_limit": get_creator_recursion_limit(),
         }
 
         async for state in self.graph.astream(initial_state, config=thread_config):

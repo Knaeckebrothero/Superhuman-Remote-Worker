@@ -10,7 +10,7 @@ Usage:
     python scripts/init_db.py
     python scripts/init_db.py --connection-string "postgresql://user:pass@host:5432/db"
 """
-
+import logging
 import asyncio
 import argparse
 import os
@@ -193,6 +193,57 @@ async def main():
     else:
         print("Database initialization completed with errors.")
         sys.exit(1)
+
+
+def initialize_postgres(logger: logging.Logger, force_reset: bool = False) -> bool:
+    """
+    Initialize PostgreSQL database (called by app_init.py).
+
+    Args:
+        logger: Logger instance.
+        force_reset: If True, drop and recreate all tables.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    import asyncio
+
+    async def _init():
+        # Get connection string
+        connection_string = os.getenv("DATABASE_URL")
+        if not connection_string:
+            host = os.getenv("POSTGRES_HOST", "localhost")
+            port = os.getenv("POSTGRES_PORT", "5432")
+            user = os.getenv("POSTGRES_USER", "graphrag")
+            password = os.getenv("POSTGRES_PASSWORD", "graphrag_password")
+            database = os.getenv("POSTGRES_DB", "graphrag")
+            connection_string = f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+        db_name = connection_string.split('/')[-1].split('?')[0]
+        base_conn_string = connection_string.rsplit('/', 1)[0] + '/postgres'
+
+        # Create database if needed
+        try:
+            await create_database_if_not_exists(base_conn_string, db_name)
+        except Exception as e:
+            logger.warning(f"  Could not check/create database: {e}")
+
+        # Run migration
+        try:
+            await run_migration(connection_string)
+        except Exception as e:
+            logger.error(f"  Migration failed: {e}")
+            return False
+
+        # Verify schema
+        success = await verify_schema(connection_string)
+        return success
+
+    try:
+        return asyncio.run(_init())
+    except Exception as e:
+        logger.error(f"  PostgreSQL initialization failed: {e}")
+        return False
 
 
 if __name__ == "__main__":

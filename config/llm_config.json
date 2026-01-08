@@ -34,7 +34,7 @@
     "chunk_strategy": "legal",
     "max_chunk_size": 1000,
     "polling_interval_seconds": 30,
-    "max_iterations_per_candidate": 50,
+    "max_iterations_per_candidate": 500,
     "web_search_enabled": true,
     "graph_search_enabled": true
   },
@@ -46,7 +46,7 @@
     "auto_integrate": false,
     "require_citations": true,
     "polling_interval_seconds": 10,
-    "max_iterations_per_requirement": 100,
+    "max_iterations_per_requirement": 500,
     "metamodel_validation_strict": true,
     "fulfillment_confidence_threshold": 0.7
   },
