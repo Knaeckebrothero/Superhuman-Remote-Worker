@@ -110,13 +110,34 @@ Instead of loading everything upfront, agents discover context as needed, keepin
 
 ## Proposed Architecture
 
+### Two-Tier Planning Model
+
+The architecture uses a **hybrid approach** combining filesystem-based strategic planning with tool-based tactical execution. This is inspired by how Claude Code and LangChain Deep Agents handle planning:
+
+| Tier | Purpose | Storage | Persistence | Use Case |
+|------|---------|---------|-------------|----------|
+| **Strategic (Filesystem)** | Long-term plans, phases, research | Markdown files in workspace | Permanent, human-readable | "What are we building and why?" |
+| **Tactical (TodoManager)** | Short-term execution steps | In-memory with archive | Session-scoped, archivable | "What are the next 10-20 concrete steps?" |
+
+**Why both?**
+- **Filesystem** gives persistence, debuggability, and supports complex planning documents
+- **TodoManager** provides attention management (reciting objectives keeps the agent focused) and natural checkpoint boundaries
+
+**Workflow:**
+1. Agent creates strategic plan on filesystem (`plans/feature_x.md`) with phases
+2. Agent uses TodoManager to add 10-20 todos for current phase
+3. Agent executes todos, checking them off
+4. When phase complete: `archive_and_reset()` saves todos to `archive/`, clears the list
+5. Context compaction happens at this natural boundary
+6. Agent loads next phase, adds new todos, continues
+
 ### High-Level Design
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     CREATOR AGENT (Unified Prompt)                  │
+│                     UNIVERSAL AGENT (Unified Prompt)                │
 │                                                                     │
-│  "You are a requirement extraction agent. Your workspace contains   │
+│  "You are an autonomous agent. Your workspace contains              │
 │   instructions.md with detailed guidance. Use your tools to read    │
 │   it, make a plan, and execute step by step."                       │
 └─────────────────────────────────────────────────────────────────────┘
@@ -125,14 +146,15 @@ Instead of loading everything upfront, agents discover context as needed, keepin
 ┌─────────────────────────────────────────────────────────────────────┐
 │                            TOOL GROUPS                              │
 ├──────────────────┬──────────────────┬──────────────────────────────┤
-│  Planning Tools  │  Workspace Tools │  Domain Tools                │
+│  Todo Tools      │  Workspace Tools │  Domain Tools                │
+│  (Tactical)      │  (Strategic)     │  (Task-specific)             │
 │                  │                  │                              │
-│  • write_plan    │  • read_file     │  • extract_document_text     │
-│  • read_plan     │  • write_file    │  • chunk_document            │
-│  • add_task      │  • list_files    │  • web_search                │
-│  • complete_task │  • delete_file   │  • query_similar_requirements│
-│  • get_progress  │  • search_files  │  • write_requirement_to_db   │
-│                  │  • create_folder │                              │
+│  • add_todo      │  • read_file     │  • extract_document_text     │
+│  • complete_todo │  • write_file    │  • chunk_document            │
+│  • list_todos    │  • list_files    │  • web_search                │
+│  • get_progress  │  • delete_file   │  • query_similar_requirements│
+│  • archive_todos │  • search_files  │  • write_requirement_to_db   │
+│                  │                  │  • execute_cypher_query      │
 └──────────────────┴──────────────────┴──────────────────────────────┘
                                     │
                                     ▼
@@ -143,19 +165,36 @@ Instead of loading everything upfront, agents discover context as needed, keepin
 │  Optional: pgvector for semantic search over workspace files        │
 │                                                                     │
 │  /job_<uuid>/                                                       │
-│  ├── instructions.md          # How to extract requirements         │
-│  ├── plan.json                # Current task list with status       │
-│  ├── progress.md              # Running log of what's been done     │
 │  │                                                                  │
-│  ├── input/                                                         │
-│  │   └── document.pdf         # Source document                     │
+│  ├── instructions.md          # Task-specific guidance (from template)│
 │  │                                                                  │
-│  ├── chunks/                  # Document chunks                     │
+│  ├── plans/                   # Strategic planning documents        │
+│  │   ├── main_plan.md         # High-level plan with phases         │
+│  │   └── research_notes.md    # Brainstorming, exploration          │
+│  │                                                                  │
+│  ├── archive/                 # Archived todo lists (auto-saved)    │
+│  │   ├── todos_phase_1_<ts>.md  # Completed phase 1 todos          │
+│  │   ├── todos_phase_2_<ts>.md  # Completed phase 2 todos          │
+│  │   └── ...                                                        │
+│  │                                                                  │
+│  ├── tools/                   # Tool documentation (optional)       │
+│  │   └── available_tools.md   # Tools the agent can discover        │
+│  │                                                                  │
+│  ├── documents/               # Input documents                     │
+│  │   ├── source.pdf           # Primary source document             │
+│  │   └── sources/             # Downloaded web pages, references    │
+│  │       └── gobd_info.md                                           │
+│  │                                                                  │
+│  ├── notes/                   # Agent's working notes               │
+│  │   ├── research.md          # Research findings                   │
+│  │   └── decisions.md         # Key decisions and reasoning         │
+│  │                                                                  │
+│  ├── chunks/                  # Document chunks (Creator)           │
 │  │   ├── chunk_001.md         # "## Article 3.1 - Retention..."     │
 │  │   ├── chunk_002.md                                               │
 │  │   └── manifest.json        # Chunk metadata                      │
 │  │                                                                  │
-│  ├── candidates/              # Requirement candidates              │
+│  ├── candidates/              # Requirement candidates (Creator)    │
 │  │   ├── candidates.md        # List of all candidates found        │
 │  │   └── candidates.json      # Structured candidate data           │
 │  │                                                                  │
@@ -164,15 +203,13 @@ Instead of loading everything upfront, agents discover context as needed, keepin
 │  │   │   ├── draft.md         # Requirement text + reasoning        │
 │  │   │   ├── research.md      # Web/graph research findings         │
 │  │   │   ├── citations.json   # Source citations                    │
-│  │   │   ├── validation.md    # Self-review notes                   │
 │  │   │   └── final.json       # Finalized requirement data          │
-│  │   ├── req_002/                                                   │
-│  │   └── ...                                                        │
+│  │   └── req_002/                                                   │
 │  │                                                                  │
 │  └── output/                  # Final outputs                       │
 │      ├── summary.md           # Human-readable summary              │
 │      ├── requirements.json    # All requirements for DB insert      │
-│      └── insert.cypher        # Neo4j queries (if needed)           │
+│      └── completion.json      # Job completion status               │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -231,50 +268,99 @@ For each chunk:
 [... continues with research, formulation, output steps ...]
 ```
 
-#### 3. Planning Tools
+#### 3. Todo Tools (Tactical Execution)
+
+The TodoManager provides short-term task tracking with automatic archiving. Unlike filesystem-based plans, todos are designed for the current execution phase (10-20 concrete steps).
+
+**Key concept:** Todos are like a "notepad page" - you write steps, execute them, then rip off the page (archive) and start fresh for the next phase.
 
 ```python
 @tool
-def write_plan(tasks: List[str]) -> str:
-    """Create or replace the execution plan.
+def add_todo(content: str, priority: int = 0) -> str:
+    """Add a task to the current todo list.
 
     Args:
-        tasks: List of task descriptions in order
+        content: Task description (concrete, actionable)
+        priority: Higher = more important (default 0)
 
     Example:
-        write_plan([
-            "Extract and chunk the document",
-            "Identify requirement candidates from each chunk",
-            "Research candidate 1: GoBD retention requirement",
-            "Formulate and validate requirement 1",
-            "Write requirement 1 to database",
-            ...
-        ])
+        add_todo("Create read_file tool implementation")
+        add_todo("Write unit tests for workspace tools", priority=1)
     """
 
 @tool
-def read_plan() -> str:
-    """Read the current plan with task status.
+def complete_todo(todo_id: str, notes: str = "") -> str:
+    """Mark a todo as complete.
 
-    Returns plan as:
-    1. [x] Extract and chunk the document
-    2. [x] Identify requirement candidates from each chunk
-    3. [ ] Research candidate 1: GoBD retention requirement  <- CURRENT
-    4. [ ] Formulate and validate requirement 1
-    ...
+    Args:
+        todo_id: The todo ID (e.g., "todo_1")
+        notes: Optional completion notes
     """
 
 @tool
-def complete_task(task_number: int, notes: Optional[str] = None) -> str:
-    """Mark a task as complete, optionally with notes."""
+def list_todos() -> str:
+    """List all current todos with status.
 
-@tool
-def add_task(task: str, after_task: Optional[int] = None) -> str:
-    """Add a new task to the plan. Inserted after specified task or at end."""
+    Returns:
+        ○ [todo_1] Create read_file tool implementation
+        ● [todo_2] Write unit tests for workspace tools  <- COMPLETED
+        ◐ [todo_3] Add path validation  <- IN PROGRESS
+    """
 
 @tool
 def get_progress() -> str:
-    """Get summary: X of Y tasks complete, current task, time elapsed."""
+    """Get progress summary for current todos.
+
+    Returns:
+        Progress: 5/12 (41.7% complete)
+        In progress: 1, Pending: 6, Blocked: 0
+    """
+
+@tool
+def archive_and_reset(phase_name: str = "") -> str:
+    """Archive completed todos and reset for next phase.
+
+    This tool:
+    1. Saves current todos to workspace/archive/todos_<phase>_<timestamp>.md
+    2. Clears the todo list
+    3. Returns confirmation prompting agent to add new todos
+
+    Args:
+        phase_name: Optional name for the archived phase (e.g., "phase_1")
+
+    Use this when:
+    - Completing a phase of work
+    - Before context compaction
+    - Transitioning to a different type of task
+
+    Example:
+        archive_and_reset("phase_1_workspace_tools")
+        # Returns: "Archived 12 todos to archive/todos_phase_1_workspace_tools_20250108.md.
+        #           Todo list cleared. Ready for new todos."
+    """
+```
+
+**Archived todo format** (saved to `workspace/archive/todos_<phase>_<ts>.md`):
+
+```markdown
+# Archived Todos: phase_1_workspace_tools
+Archived: 2025-01-08T14:30:00
+
+## Completed (10)
+- [x] Create WorkspaceManager class
+- [x] Implement read_file tool
+- [x] Implement write_file tool
+...
+
+## Was In Progress (1)
+- [ ] Add path validation (stopped mid-task)
+
+## Was Pending (1)
+- [ ] Write integration tests
+
+## Notes
+- Decided to use pathlib for path handling
+- Found edge case with symlinks - documented in notes/decisions.md
 ```
 
 #### 4. Workspace Tools
@@ -377,40 +463,143 @@ When approaching context limits, the compaction hook summarizes:
 
 ## Workflow Example
 
-### Agent's Perspective
+### Strategic Planning Phase (Filesystem)
+
+The agent first creates a strategic plan on the filesystem. This follows the pattern we use ourselves:
 
 ```
-1. Agent starts, reads system prompt
-2. Calls read_file("instructions.md") - learns what to do
-3. Calls write_plan([...]) - creates 12-step plan
-4. Calls extract_document_text("input/document.pdf")
-5. Calls write_file("chunks/chunk_001.md", ...) - saves chunk
-6. Calls complete_task(1, "Document extracted, 8 chunks created")
-7. [Context compaction happens - old tool results summarized]
-8. Calls read_plan() - sees task 2 is next
-9. Calls read_file("chunks/chunk_001.md") - loads first chunk
-10. Identifies candidates, writes to candidates/candidates.md
-11. Calls complete_task(2)
-12. ... continues through plan ...
-13. Calls read_plan() - all tasks complete
-14. Calls write_file("output/summary.md", final_summary)
-15. Signals completion
+1. Agent reads instructions.md - understands the task
+2. Agent creates plans/main_plan.md with:
+   - Problem statement
+   - Brainstormed approaches
+   - Chosen approach with reasoning
+   - High-level implementation phases
+3. Agent refines the plan until satisfied
+```
+
+**Example `plans/main_plan.md`:**
+
+```markdown
+# Requirement Extraction Plan
+
+## Problem
+Extract GoBD compliance requirements from uploaded document.
+
+## Approaches Considered
+1. Sequential chunk processing - simple but may miss cross-references
+2. Two-pass approach - first identify, then deep-dive
+3. Hierarchical extraction - group by compliance domain
+
+## Chosen Approach
+Two-pass approach because:
+- Allows building a complete picture before detailed extraction
+- Better handles requirements that span multiple sections
+
+## Phases
+1. **Document Processing** - Extract text, chunk, identify structure
+2. **Candidate Identification** - First pass to find all potential requirements
+3. **Research & Formulation** - Deep-dive each candidate, add citations
+4. **Output Generation** - Format and write to requirement_cache
+
+## Current Status
+- [x] Phase 1: Document Processing (completed 2025-01-08)
+- [ ] Phase 2: Candidate Identification (in progress)
+- [ ] Phase 3: Research & Formulation
+- [ ] Phase 4: Output Generation
+```
+
+### Tactical Execution Phase (TodoManager)
+
+For each phase, the agent uses TodoManager for concrete steps:
+
+```
+4. Agent reads current phase from plans/main_plan.md
+5. Agent calls add_todo() for each step in current phase:
+   - add_todo("Extract text from document")
+   - add_todo("Chunk document into sections")
+   - add_todo("Write chunks to chunks/ folder")
+   - add_todo("Create manifest.json with metadata")
+6. Agent executes todos one by one:
+   - Calls extract_document_text(...)
+   - Calls complete_todo("todo_1", "Extracted 45 pages")
+   - Calls write_file("chunks/chunk_001.md", ...)
+   - Calls complete_todo("todo_2")
+   - ...
+7. When all todos complete:
+   - Calls archive_and_reset("phase_1_document_processing")
+   - Updates plans/main_plan.md to mark phase complete
+   - [Context compaction happens at this natural boundary]
+8. Agent loads next phase, adds new todos, continues
+```
+
+### Complete Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  STRATEGIC PLANNING (Filesystem)                                    │
+│                                                                     │
+│  1. read_file("instructions.md")                                    │
+│  2. write_file("plans/main_plan.md", brainstormed_plan)            │
+│  3. Refine plan until satisfied                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 1 EXECUTION (TodoManager)                                    │
+│                                                                     │
+│  4. add_todo("Extract text") → add_todo("Chunk") → ...             │
+│  5. Execute todos, complete_todo() after each                       │
+│  6. archive_and_reset("phase_1")                                   │
+│  7. Update plans/main_plan.md: Phase 1 ✓                           │
+│  8. [Context compaction]                                            │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PHASE 2 EXECUTION (TodoManager)                                    │
+│                                                                     │
+│  9. read_file("plans/main_plan.md") - see Phase 2 is next          │
+│  10. add_todo("Scan chunk 1 for requirements") → ...               │
+│  11. Execute todos, complete_todo() after each                      │
+│  12. archive_and_reset("phase_2")                                  │
+│  13. [Context compaction]                                           │
+└─────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                            ...
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  COMPLETION                                                         │
+│                                                                     │
+│  N. All phases complete                                             │
+│  N+1. write_file("output/requirements.json", final_output)         │
+│  N+2. write_file("output/completion.json", status)                 │
+│  N+3. Signal job completion                                         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Human's Perspective (Debugging)
 
 ```bash
-# Watch agent progress
-$ watch cat /workspace/job_abc123/plan.json
+# Watch agent's strategic plan
+$ cat /workspace/job_abc123/plans/main_plan.md
 
-# See what the agent found
-$ cat /workspace/job_abc123/candidates/candidates.md
+# See current todos (if agent is mid-phase)
+$ # TodoManager is in-memory, but you can watch agent's tool calls
 
-# Check a specific requirement's research
-$ cat /workspace/job_abc123/requirements/req_001/research.md
+# See archived todos from completed phases
+$ ls /workspace/job_abc123/archive/
+todos_phase_1_document_processing_20250108_143000.md
+todos_phase_2_candidate_identification_20250108_150000.md
 
-# Resume after crash - all work is there
-$ python run_creator.py --job-id abc123 --resume
+$ cat /workspace/job_abc123/archive/todos_phase_1_*.md
+
+# Check agent's working notes
+$ cat /workspace/job_abc123/notes/research.md
+
+# Resume after crash - workspace has all context
+$ python run_agent.py --config creator.json --job-id abc123 --resume
 ```
 
 ---
@@ -1010,6 +1199,41 @@ All 15 open questions have been decided. ✅
 
 This roadmap breaks down the workspace-centric architecture into sequential implementation phases. Each phase builds on the previous one, ensuring we have a working system at each step before adding complexity.
 
+### Architecture Decision: Universal Agent
+
+**Key Insight:** Analysis of the current Creator and Validator agents reveals they share nearly identical structures:
+- Same 5-node LangGraph pattern (initialize → process → tools → check → finalize)
+- Same ContextManager, AsyncPostgresSaver, and shared infrastructure
+- Same LLM initialization and tool binding patterns
+- Same polling loop patterns
+
+The only differences are:
+- **Tools:** Document processing (Creator) vs graph validation (Validator)
+- **Prompts:** Different instructions for different tasks
+- **Connections:** Creator needs PostgreSQL; Validator needs PostgreSQL + Neo4j
+- **Config:** Different sections in llm_config.json
+
+**Decision:** Instead of refactoring the existing Creator Agent, we will build a new **Universal Agent** from scratch that:
+1. Uses the workspace-centric architecture from the start
+2. Is fully configurable via a JSON configuration file
+3. Can be deployed as "Creator", "Validator", or any future agent type by changing the config
+4. Eliminates code duplication between agents
+
+Once the Universal Agent is working, we delete the old agents and migrate the application.
+
+```
+Current State:
+  src/agents/creator/   (phase-based, ~1500 lines)
+  src/agents/validator/ (phase-based, ~1600 lines)
+  src/agents/shared/    (context, workspace, checkpoint)
+
+Target State:
+  src/agents/universal/ (workspace-based, configurable, ~800 lines)
+  src/agents/shared/    (tools, context, workspace - enhanced)
+  config/agents/creator.json
+  config/agents/validator.json
+```
+
 ---
 
 ### Phase 1: Workspace Foundation
@@ -1047,89 +1271,262 @@ This roadmap breaks down the workspace-centric architecture into sequential impl
 - Implement `delete_file` tool - remove files or empty directories
 - Implement `search_files` tool - basic text search over workspace files (regex/substring)
 - Add path validation to prevent escaping the workspace (security)
+- Create a tool registry system for dynamic tool loading
 - Integrate tools with LangGraph's tool infrastructure
+
+**Tool Registry Design:**
+
+```python
+# src/agents/shared/tools/registry.py
+TOOL_REGISTRY = {
+    # Workspace tools (strategic planning - filesystem operations)
+    "read_file": {"module": "workspace_tools", "function": "read_file"},
+    "write_file": {"module": "workspace_tools", "function": "write_file"},
+    "list_files": {"module": "workspace_tools", "function": "list_files"},
+    "delete_file": {"module": "workspace_tools", "function": "delete_file"},
+    "search_files": {"module": "workspace_tools", "function": "search_files"},
+
+    # Todo tools (tactical execution - in-memory with archive)
+    "add_todo": {"module": "todo_tools", "function": "add_todo"},
+    "complete_todo": {"module": "todo_tools", "function": "complete_todo"},
+    "list_todos": {"module": "todo_tools", "function": "list_todos"},
+    "get_progress": {"module": "todo_tools", "function": "get_progress"},
+    "archive_and_reset": {"module": "todo_tools", "function": "archive_and_reset"},
+
+    # Domain tools (loaded based on config)
+    "extract_document_text": {"module": "document_tools", "function": "extract_document_text"},
+    "chunk_document": {"module": "document_tools", "function": "chunk_document"},
+    "web_search": {"module": "search_tools", "function": "web_search"},
+    "execute_cypher_query": {"module": "graph_tools", "function": "execute_cypher_query"},
+    ...
+}
+
+def load_tools(tool_names: list[str], context: ToolContext) -> list[Tool]:
+    """Load tools by name from registry, injecting required context.
+
+    Args:
+        tool_names: List of tool names to load (from config)
+        context: ToolContext with workspace_manager, todo_manager, db connections
+
+    Returns:
+        List of LangChain Tool objects ready to bind to LLM
+    """
+    ...
+```
 
 **Key decisions to implement:**
 
 - All paths are relative to the job workspace root
 - Tools return concise confirmations, not full file contents (for context efficiency)
 - Path traversal attempts (e.g., `../`) are rejected
+- Tool registry enables config-driven tool loading in Phase 5
 
-**Deliverable:** A complete set of workspace tools that can be added to the agent's toolset.
-
----
-
-### Phase 3: Planning Tools
-
-**Goal:** Implement the planning and progress tracking tools that enable agent self-direction.
-
-**What we'll do:**
-
-- Define the plan data structure (JSON format in `plan.json`)
-- Implement `write_plan` tool - create or replace the task list
-- Implement `read_plan` tool - display current plan with task status
-- Implement `complete_task` tool - mark a task as done, optionally add notes
-- Implement `add_task` tool - insert new tasks into the plan
-- Implement `get_progress` tool - summary view (X of Y complete, current task, elapsed time)
-- Store plan in the workspace filesystem (not in agent state)
-
-**Key decisions to implement:**
-
-- Plan is stored as `plan.json` in the workspace root
-- Task states: pending, in_progress, completed
-- Only one task should be in_progress at a time
-- Progress notes are appended to a `progress.md` log file
-
-**Deliverable:** Planning tools that allow the agent to create, execute, and track its own work plan.
+**Deliverable:** Workspace tools and a tool registry system for dynamic tool loading.
 
 ---
 
-### Phase 4: Instructions & Prompts
+### Phase 3: Todo Tools (Tactical Execution)
 
-**Goal:** Consolidate all phase-specific prompts into a single instructions document and create a simplified system prompt.
+**Goal:** Implement the TodoManager with archiving for short-term task execution.
 
 **What we'll do:**
 
-- Analyze existing phase prompts (`preprocessing`, `identification`, `research`, `formulation`, `output`)
-- Merge all phase guidance into a single `instructions.md` document
-- Structure instructions as a reference guide the agent can consult as needed
-- Create a minimal system prompt that points the agent to its workspace and instructions
-- Place `instructions.md` as a template that gets copied into each new job workspace
-- Remove phase-specific prompt loading from the agent initialization
+- Refactor existing `todo_manager.py` to support the two-tier planning model
+- Implement `add_todo` tool - add tasks to the current execution list
+- Implement `complete_todo` tool - mark a task as done with optional notes
+- Implement `list_todos` tool - display current todos with status
+- Implement `get_progress` tool - summary view (X of Y complete)
+- Implement `archive_and_reset` tool - save todos to workspace archive, clear list
+- Connect TodoManager to WorkspaceManager for archive file storage
+
+**Archive functionality:**
+
+```python
+async def archive_and_reset(self, phase_name: str = "") -> str:
+    """Archive current todos and reset for next phase.
+
+    1. Format todos as markdown (completed, in_progress, pending sections)
+    2. Write to workspace/archive/todos_<phase>_<timestamp>.md
+    3. Clear internal todo list
+    4. Return confirmation message
+    """
+    # Generate archive content
+    archive_content = self._format_archive()
+
+    # Save to workspace
+    filename = f"todos_{phase_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    await self.workspace.write_file(f"archive/{filename}", archive_content)
+
+    # Clear todos
+    self._todos = []
+    self._next_id = 1
+
+    return f"Archived {len(archived)} todos to archive/{filename}. Todo list cleared."
+```
 
 **Key decisions to implement:**
 
-- Instructions are comprehensive but not overwhelming
-- Agent reads instructions on-demand rather than having them in system prompt
-- System prompt focuses on "how to work" (use workspace, follow plan) not domain details
-- Instructions live in `config/workspace/instructions.md` (template)
+- Todos are session-scoped (not persisted to disk until archived)
+- Archive files are human-readable markdown
+- `archive_and_reset` is the natural checkpoint for context compaction
+- Agent can read old archives from `workspace/archive/` if needed for reference
 
-**Deliverable:** A unified instructions document and simplified system prompt that replace the phase-based prompts.
+**Deliverable:** TodoManager with archive functionality that integrates with the workspace filesystem.
 
 ---
 
-### Phase 5: Agent Refactoring
+### Phase 4: Instructions & Agent Configuration
 
-**Goal:** Remove the phase-based state machine and transition to workspace-centric autonomous operation.
+**Goal:** Create the configuration schema and instruction templates that define different agent behaviors.
 
 **What we'll do:**
 
-- Simplify `CreatorAgentState` to remove phase tracking fields
-- Remove the 5-node graph structure with conditional phase edges
-- Replace with a simpler loop: process → tool_call → check_completion → loop/exit
-- Change completion detection from text matching to plan-based (all tasks complete)
-- Update the agent initialization to set up workspace instead of loading phase prompt
-- Ensure existing domain tools (extract_document_text, chunk_document, etc.) still work
-- Update the agent entry point to work with new architecture
+- Design the agent configuration JSON schema
+- Create `creator.json` config with Creator-specific tools, prompts, and settings
+- Create `validator.json` config with Validator-specific tools, prompts, and settings
+- Analyze existing phase prompts from both agents
+- Create `creator_instructions.md` - merged guidance for requirement extraction
+- Create `validator_instructions.md` - merged guidance for validation and graph integration
+- Create a minimal system prompt template that points the agent to its workspace
+- Define the tool registry format (which tools each agent type gets)
+
+**Agent Configuration Schema:**
+
+```json
+{
+  "agent_id": "creator",
+  "display_name": "Creator Agent",
+
+  "llm": {
+    "model": "gpt-oss-120b",
+    "temperature": 0.0,
+    "reasoning_level": "high",
+    "base_url": null
+  },
+
+  "workspace": {
+    "structure": [
+      "plans/",
+      "archive/",
+      "documents/",
+      "documents/sources/",
+      "notes/",
+      "chunks/",
+      "candidates/",
+      "requirements/",
+      "output/"
+    ],
+    "instructions_template": "creator_instructions.md"
+  },
+
+  "tools": {
+    "workspace": ["read_file", "write_file", "list_files", "delete_file", "search_files"],
+    "todo": ["add_todo", "complete_todo", "list_todos", "get_progress", "archive_and_reset"],
+    "domain": ["extract_document_text", "chunk_document", "web_search", "cite_document", "write_requirement_to_cache"]
+  },
+
+  "todo": {
+    "max_items": 25,
+    "archive_on_reset": true,
+    "archive_path": "archive/"
+  },
+
+  "connections": {
+    "postgres": true,
+    "neo4j": false
+  },
+
+  "polling": {
+    "enabled": true,
+    "table": "jobs",
+    "status_field": "creator_status",
+    "interval_seconds": 5
+  },
+
+  "limits": {
+    "max_iterations": 500,
+    "context_threshold_tokens": 80000,
+    "tool_retry_count": 3
+  },
+
+  "context_management": {
+    "compact_on_archive": true,
+    "summarization_prompt": "Summarize the work completed so far, focusing on decisions made and current progress."
+  }
+}
+```
 
 **Key decisions to implement:**
 
-- Agent self-directs via plan rather than phase transitions
-- Completion is detected when plan shows all tasks done
-- No hardcoded workflow - agent decides order based on instructions
-- Domain tools remain unchanged, just work alongside new workspace tools
+- One config file per agent type in `config/agents/`
+- Instructions are templates copied into each job workspace
+- System prompt is generic - domain knowledge lives in instructions.md
+- Tool registry maps tool names to implementations in shared tools package
 
-**Deliverable:** A refactored Creator Agent that uses workspace and planning tools instead of phase-based state machine.
+**Deliverable:** Configuration schema, two agent configs (creator.json, validator.json), and instruction templates for both.
+
+---
+
+### Phase 5: Universal Agent Implementation
+
+**Goal:** Build a new configurable agent from scratch using the workspace-centric architecture.
+
+**What we'll do:**
+
+- Create `src/agents/universal/` package structure
+- Implement `UniversalAgent` class that loads behavior from config file
+- Create simplified `UniversalAgentState` with minimal fields (messages, job_id, workspace_path, iteration, error, should_stop)
+- Build a simple 4-node graph: initialize → process → tools → check (loops back or exits)
+- Implement config-driven tool loading from the tool registry
+- Implement config-driven connection setup (postgres always, neo4j optional)
+- Create the agent entry point (`run_agent.py`) that accepts `--config` parameter
+- Add FastAPI app for HTTP interface (like current agents)
+- Implement polling loop that reads table/field from config
+
+**Universal Agent Structure:**
+
+```
+src/agents/universal/
+├── __init__.py
+├── agent.py           # UniversalAgent class
+├── state.py           # UniversalAgentState (minimal)
+├── graph.py           # LangGraph construction
+├── loader.py          # Config and tool loading
+├── app.py             # FastAPI application
+└── models.py          # Request/response models
+```
+
+**Shared Tools Package (enhanced):**
+
+```
+src/agents/shared/tools/
+├── __init__.py
+├── registry.py        # Tool registry and loader
+├── workspace_tools.py # read_file, write_file, list_files, etc. (strategic)
+├── todo_tools.py      # add_todo, complete_todo, archive_and_reset, etc. (tactical)
+├── document_tools.py  # extract_document_text, chunk_document (from Creator)
+├── graph_tools.py     # execute_cypher_query, create_requirement_node (from Validator)
+├── search_tools.py    # web_search, query_similar_requirements
+└── citation_tools.py  # cite_document, cite_web
+```
+
+The domain tools are migrated from the old agents:
+- `src/agents/creator/tools.py` → `document_tools.py`, `search_tools.py`, `citation_tools.py`
+- `src/agents/validator/tools.py` → `graph_tools.py`
+
+The existing `todo_manager.py` is refactored and the tool wrappers moved to `todo_tools.py`.
+
+**Key decisions to implement:**
+
+- Agent uses two-tier planning: filesystem (strategic) + TodoManager (tactical)
+- Strategic plans live in `workspace/plans/` as markdown files
+- Tactical todos are in-memory, archived to `workspace/archive/` on phase completion
+- `archive_and_reset()` is the natural boundary for context compaction
+- Completion is detected when strategic plan shows all phases done
+- Tools are loaded dynamically based on config `tools.workspace` + `tools.todo` + `tools.domain`
+- Single container image works for any agent type
+
+**Deliverable:** A working Universal Agent that can be configured as either Creator or Validator (or any future agent type).
 
 ---
 
@@ -1208,26 +1605,88 @@ This roadmap breaks down the workspace-centric architecture into sequential impl
 
 ### Phase 9: Testing & Validation
 
-**Goal:** Validate the new architecture against real-world document processing tasks.
+**Goal:** Validate the Universal Agent works correctly as both Creator and Validator.
 
 **What we'll do:**
 
-- Create test cases with sample documents of varying complexity
-- Run end-to-end processing and collect metrics (tokens used, iterations, time)
-- Compare context usage between old and new architecture
-- Verify requirement extraction quality is maintained or improved
-- Test error recovery and resume-from-checkpoint scenarios
-- Benchmark with different document types and sizes
-- Tune recursion limits based on observed behavior
-- Document any issues found and iterate on fixes
+- Test Universal Agent with `creator.json` config:
+  - Run end-to-end document processing
+  - Verify requirement extraction quality matches or exceeds old Creator
+  - Test workspace file operations and planning tools
+  - Measure token usage and iteration counts
+
+- Test Universal Agent with `validator.json` config:
+  - Run validation on requirements from cache
+  - Verify graph integration works correctly
+  - Test Neo4j connection handling
+  - Compare validation quality with old Validator
+
+- Cross-cutting tests:
+  - Error recovery and resume-from-checkpoint
+  - Context compaction under load
+  - Polling loop behavior
+  - Hot-swapping configs (for dashboard use case)
+
+- Collect metrics:
+  - Tokens used per job (compare old vs new)
+  - Iterations per job
+  - Time to completion
+  - Error rates
 
 **Key decisions to implement:**
 
 - Test with actual GoBD/compliance documents
-- Measure both efficiency (tokens, time) and quality (extraction accuracy)
+- Run both agent types against same test data for comparison
 - Establish baseline metrics for ongoing monitoring
+- Document any behavioral differences from old agents
 
-**Deliverable:** Validated workspace-centric architecture with performance benchmarks.
+**Deliverable:** Validated Universal Agent that matches or exceeds the quality of the old specialized agents.
+
+---
+
+### Phase 10: Migration & Cleanup
+
+**Goal:** Replace the old Creator and Validator agents with the Universal Agent.
+
+**What we'll do:**
+
+- Update orchestrator to use Universal Agent with appropriate configs
+- Update `run_creator.py` to launch Universal Agent with `creator.json`
+- Update `run_validator.py` to launch Universal Agent with `validator.json`
+- Update Docker configuration:
+  - Single agent image instead of two
+  - Config file mounted/passed as environment
+- Update docker-compose.yml to use new structure
+- Migrate any remaining code from old agents to shared tools
+- Delete old agent code:
+  - `src/agents/creator/` (entire directory)
+  - `src/agents/validator/` (entire directory)
+- Update imports throughout codebase
+- Update CLAUDE.md and documentation
+- Update Streamlit dashboard to use Universal Agent
+
+**Migration checklist:**
+
+```
+[ ] Orchestrator updated to use Universal Agent
+[ ] run_creator.py uses Universal Agent + creator.json
+[ ] run_validator.py uses Universal Agent + validator.json
+[ ] Docker images consolidated
+[ ] docker-compose.yml updated
+[ ] Old agent directories deleted
+[ ] All imports updated
+[ ] Documentation updated
+[ ] Dashboard updated
+[ ] CI/CD pipelines updated (if any)
+```
+
+**Key decisions to implement:**
+
+- Keep `requirement_cache` interface unchanged for backwards compatibility
+- Old scripts (run_creator.py, run_validator.py) become thin wrappers
+- Dashboard can switch configs without container restart
+
+**Deliverable:** Clean codebase with single Universal Agent, old code removed, all systems working.
 
 ---
 
@@ -1236,21 +1695,30 @@ This roadmap breaks down the workspace-centric architecture into sequential impl
 | Phase | Name | Dependencies | Complexity |
 |-------|------|--------------|------------|
 | 1 | Workspace Foundation | None | Low |
-| 2 | Workspace Tools | Phase 1 | Medium |
-| 3 | Planning Tools | Phase 1 | Medium |
-| 4 | Instructions & Prompts | None (parallel with 1-3) | Low |
-| 5 | Agent Refactoring | Phases 1-4 | High |
+| 2 | Workspace Tools (Strategic) | Phase 1 | Medium |
+| 3 | Todo Tools (Tactical) | Phase 1 | Medium |
+| 4 | Instructions & Agent Configuration | None (parallel with 1-3) | Medium |
+| 5 | Universal Agent Implementation | Phases 1-4 | High |
 | 6 | Context Management | Phase 5 | Medium |
 | 7 | Tool Discovery | Phase 5 | Medium (optional) |
-| 8 | Vector Search | Phases 2, 5 | Medium |
-| 9 | Testing & Validation | All above | Medium |
+| 8 | Vector Search | Phases 2, 5 | Medium (optional) |
+| 9 | Testing & Validation | Phases 1-6 | Medium |
+| 10 | Migration & Cleanup | Phase 9 | Low |
+
+**Two-Tier Planning:**
+- Phase 2 (Workspace Tools) provides **strategic planning** - filesystem for plans, notes, research
+- Phase 3 (Todo Tools) provides **tactical execution** - TodoManager with archive_and_reset()
+- Together they enable the hybrid approach: strategic plans in markdown, tactical todos in tool
 
 **Parallel work opportunities:**
 - Phases 1, 2, 3 can be developed in sequence but tested incrementally
-- Phase 4 (prompts) can be done in parallel with Phases 1-3
-- Phase 7 is optional and can be deferred if Phase 6 provides sufficient context savings
+- Phase 4 (configs & instructions) can be done in parallel with Phases 1-3
+- Phases 7 and 8 are optional enhancements - can be deferred or skipped entirely
+- Phase 10 is straightforward once Phase 9 validates the Universal Agent works
 
-**Critical path:** 1 → 2 → 3 → 5 → 6 → 9
+**Critical path:** 1 → 2 → 3 → 5 → 6 → 9 → 10
+
+**MVP path (minimum to replace old agents):** 1 → 2 → 3 → 4 → 5 → 9 → 10
 
 ---
 
@@ -1258,9 +1726,14 @@ This roadmap breaks down the workspace-centric architecture into sequential impl
 
 | Risk | Mitigation |
 |------|------------|
-| Agent fails to follow instructions effectively | Test with smaller tasks first, iterate on instruction document |
+| Universal Agent doesn't match old agent quality | Test extensively in Phase 9 before migration, keep old code until validated |
+| Agent fails to follow instructions effectively | Test with smaller tasks first, iterate on instruction documents |
 | Context still grows too large | More aggressive tool result clearing, earlier summarization trigger |
-| Planning overhead slows agent down | Monitor planning tool usage, simplify if excessive |
+| Two-tier planning adds complexity | Keep clear separation: filesystem=strategic, todos=tactical |
+| Agent doesn't use archive_and_reset properly | Add instructions, monitor behavior, tune prompts |
 | Workspace I/O becomes bottleneck | Profile and optimize hot paths, consider caching |
 | Vector search adds latency | Make semantic search optional, fallback to keyword |
-| Breaking change for Validator integration | Keep requirement_cache interface unchanged |
+| Config schema doesn't cover all use cases | Design schema carefully in Phase 4, allow extension points |
+| Tool registry becomes complex | Start simple, add sophistication only when needed |
+| Migration breaks orchestrator | Keep requirement_cache and job table interfaces unchanged |
+| Dashboard integration issues | Test hot-swapping configs early in Phase 9 |
