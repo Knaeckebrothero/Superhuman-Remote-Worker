@@ -20,6 +20,9 @@ python-docx>=1.1.0
 beautifulsoup4>=4.12.0
 # Optional: Semantic similarity for advanced duplicate detection
 # sentence-transformers>=2.2.0
+# Vector search for workspace semantic search (Phase 8)
+pgvector>=0.2.0
+langchain-postgres>=0.0.6
 langdetect>=1.0.9
 fastapi>=0.109.0
 uvicorn>=0.27.0

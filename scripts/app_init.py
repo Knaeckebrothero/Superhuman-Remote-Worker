@@ -215,6 +215,47 @@ def run_neo4j_export(logger: logging.Logger) -> bool:
         return False
 
 
+def clean_workspace(logger: logging.Logger) -> bool:
+    """
+    Clean up workspace directories.
+
+    Removes all job workspace directories from WORKSPACE_PATH.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    import shutil
+
+    # Get workspace base path
+    workspace_path = os.getenv("WORKSPACE_PATH")
+    if workspace_path:
+        base_path = PROJECT_ROOT / workspace_path
+    else:
+        base_path = PROJECT_ROOT / "workspace"
+
+    if not base_path.exists():
+        logger.info(f"  Workspace directory does not exist: {base_path}")
+        return True
+
+    # Find and remove job directories
+    job_dirs = list(base_path.glob("job_*"))
+    if not job_dirs:
+        logger.info(f"  No job directories found in {base_path}")
+        return True
+
+    removed = 0
+    for job_dir in job_dirs:
+        try:
+            shutil.rmtree(job_dir)
+            removed += 1
+            logger.debug(f"    Removed: {job_dir.name}")
+        except Exception as e:
+            logger.warning(f"  Failed to remove {job_dir}: {e}")
+
+    logger.info(f"  Removed {removed} job workspace(s) from {base_path}")
+    return True
+
+
 def verify_setup(logger: logging.Logger, skip_postgres: bool, skip_neo4j: bool, skip_mongodb: bool) -> bool:
     """
     Verify that all components are properly initialized.
@@ -315,6 +356,8 @@ def main() -> int:
 
     # Calculate steps
     steps = []
+    if args.force_reset:
+        steps.append(("Workspace", clean_workspace))
     if not args.skip_postgres:
         steps.append(("PostgreSQL", run_postgres_init))
     if not args.skip_neo4j:
@@ -336,9 +379,14 @@ def main() -> int:
             verify_setup(logger, args.skip_postgres, args.skip_neo4j, args.skip_mongodb)
             continue
 
-        logger.info(f"[{current_step}/{total_steps}] Initializing {name}...")
+        if name == "Workspace":
+            logger.info(f"[{current_step}/{total_steps}] Cleaning {name}...")
+        else:
+            logger.info(f"[{current_step}/{total_steps}] Initializing {name}...")
 
-        if name == "Neo4j":
+        if name == "Workspace":
+            success = init_func(logger)
+        elif name == "Neo4j":
             success = init_func(logger, args.force_reset, args.seed)
         else:
             success = init_func(logger, args.force_reset)

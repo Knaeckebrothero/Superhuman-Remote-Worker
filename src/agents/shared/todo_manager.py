@@ -2,13 +2,23 @@
 
 This module provides todo list functionality for agents to track their tasks,
 breaking down complex jobs into manageable steps and monitoring progress.
+
+The TodoManager supports a two-tier planning model:
+- Strategic planning: Long-term plans stored as markdown files in the workspace
+- Tactical execution: Short-term todos managed by this class, archived when complete
+
+Todos are session-scoped (in-memory) until explicitly archived via archive_and_reset().
+This creates natural checkpoints for context compaction.
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from datetime import datetime
 from dataclasses import dataclass, field
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .workspace_manager import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
@@ -72,50 +82,66 @@ class TodoManager:
     """Manages a todo list for an autonomous agent.
 
     Provides methods for creating, updating, and querying todos.
-    Todos are persisted via a Workspace instance.
+    Supports two modes:
 
-    Example:
+    1. Session-scoped (new, recommended for workspace-centric architecture):
+       - Todos are in-memory until archived
+       - Use archive_and_reset() to persist to workspace and clear
+       - Natural checkpoint boundaries for context compaction
+
+    2. Legacy persistence mode (for backward compatibility):
+       - Pass a legacy Workspace instance with load_todo/save_todo methods
+       - Todos are saved after each operation
+
+    Example (session-scoped with archive):
         ```python
-        workspace = Workspace(job_id="123", agent="creator")
-        todo_mgr = TodoManager(workspace)
+        # Create in-memory manager
+        todo_mgr = TodoManager()
 
-        # Add tasks
-        await todo_mgr.add("Process document chunks")
-        await todo_mgr.add("Extract requirement candidates")
-        await todo_mgr.add("Research each candidate", priority=1)
+        # Add tasks for current phase
+        todo_mgr.add_sync("Process document chunks")
+        todo_mgr.add_sync("Extract requirement candidates")
 
         # Work through tasks
-        task = await todo_mgr.next()
-        await todo_mgr.start(task.id)
+        task = todo_mgr.next_sync()
+        todo_mgr.start_sync(task.id)
         # ... do work ...
-        await todo_mgr.complete(task.id, notes=["Processed 15 chunks"])
+        todo_mgr.complete_sync(task.id, notes=["Processed 15 chunks"])
 
-        # Check progress
-        progress = await todo_mgr.get_progress()
-        print(f"{progress['completed']}/{progress['total']} tasks complete")
+        # Archive and reset for next phase
+        workspace_manager = WorkspaceManager(job_id="123", base_path=Path("./workspace"))
+        result = todo_mgr.archive_and_reset("phase_1", workspace_manager)
+        # Saves to workspace/archive/todos_phase_1_20250108_143000.md
         ```
     """
 
-    def __init__(self, workspace: Any):
+    def __init__(self, workspace: Any = None, workspace_manager: Optional["WorkspaceManager"] = None):
         """Initialize todo manager.
 
         Args:
-            workspace: Workspace instance for persistence
+            workspace: Legacy Workspace instance for persistence (optional)
+            workspace_manager: WorkspaceManager for archive operations (optional)
         """
-        self.workspace = workspace
+        self._legacy_workspace = workspace
+        self._workspace_manager = workspace_manager
         self._todos: List[TodoItem] = []
         self._next_id = 1
         self._loaded = False
 
     async def _ensure_loaded(self) -> None:
-        """Ensure todos are loaded from workspace."""
+        """Ensure todos are loaded from legacy workspace (async mode only)."""
         if not self._loaded:
-            await self.load()
+            if self._legacy_workspace is not None:
+                await self.load()
             self._loaded = True
 
     async def load(self) -> None:
-        """Load todos from workspace."""
-        data = await self.workspace.load_todo()
+        """Load todos from legacy workspace (async mode only)."""
+        if self._legacy_workspace is None:
+            logger.debug("No legacy workspace - using session-scoped mode")
+            return
+
+        data = await self._legacy_workspace.load_todo()
         if data:
             self._todos = [TodoItem.from_dict(item) for item in data]
             # Update next ID
@@ -128,8 +154,12 @@ class TodoManager:
         logger.debug(f"Loaded {len(self._todos)} todo items")
 
     async def save(self) -> None:
-        """Save todos to workspace."""
-        await self.workspace.save_todo([t.to_dict() for t in self._todos])
+        """Save todos to legacy workspace (async mode only)."""
+        if self._legacy_workspace is None:
+            logger.debug("No legacy workspace - skipping save (session-scoped mode)")
+            return
+
+        await self._legacy_workspace.save_todo([t.to_dict() for t in self._todos])
         logger.debug(f"Saved {len(self._todos)} todo items")
 
     async def add(
@@ -441,6 +471,327 @@ class TodoManager:
 
         await self.save()
         logger.info("Reset all todos to pending")
+
+    # -------------------------------------------------------------------------
+    # Synchronous methods for session-scoped operation (no persistence)
+    # -------------------------------------------------------------------------
+
+    def add_sync(
+        self,
+        content: str,
+        priority: int = 0,
+        parent_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> TodoItem:
+        """Add a new todo item (synchronous, session-scoped).
+
+        Args:
+            content: Task description
+            priority: Priority level (higher = more important)
+            parent_id: Optional parent task ID for hierarchical todos
+            metadata: Optional additional metadata
+
+        Returns:
+            Created TodoItem
+        """
+        item = TodoItem(
+            id=f"todo_{self._next_id}",
+            content=content,
+            priority=priority,
+            parent_id=parent_id,
+            metadata=metadata or {},
+        )
+
+        self._todos.append(item)
+        self._next_id += 1
+
+        logger.info(f"Added todo: {item.id} - {content}")
+        return item
+
+    def get_sync(self, todo_id: str) -> Optional[TodoItem]:
+        """Get a todo item by ID (synchronous).
+
+        Args:
+            todo_id: Todo ID
+
+        Returns:
+            TodoItem or None if not found
+        """
+        for todo in self._todos:
+            if todo.id == todo_id:
+                return todo
+        return None
+
+    def start_sync(self, todo_id: str) -> Optional[TodoItem]:
+        """Mark a todo as in progress (synchronous).
+
+        Args:
+            todo_id: Todo ID
+
+        Returns:
+            Updated TodoItem or None if not found
+        """
+        todo = self.get_sync(todo_id)
+        if todo:
+            todo.status = TodoStatus.IN_PROGRESS
+            todo.started_at = datetime.utcnow()
+            logger.info(f"Started todo: {todo_id}")
+        return todo
+
+    def complete_sync(
+        self,
+        todo_id: str,
+        notes: Optional[str] = None
+    ) -> Optional[TodoItem]:
+        """Mark a todo as completed (synchronous).
+
+        Args:
+            todo_id: Todo ID
+            notes: Optional completion note
+
+        Returns:
+            Updated TodoItem or None if not found
+        """
+        todo = self.get_sync(todo_id)
+        if todo:
+            todo.status = TodoStatus.COMPLETED
+            todo.completed_at = datetime.utcnow()
+            if notes:
+                todo.notes.append(notes)
+            logger.info(f"Completed todo: {todo_id}")
+        return todo
+
+    def next_sync(self) -> Optional[TodoItem]:
+        """Get the next pending todo item (synchronous).
+
+        Returns the highest priority pending item.
+
+        Returns:
+            Next TodoItem or None if no pending items
+        """
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+        if not pending:
+            return None
+
+        # Sort by priority (descending) then by creation time
+        pending.sort(key=lambda t: (-t.priority, t.created_at))
+        return pending[0]
+
+    def list_all_sync(self) -> List[TodoItem]:
+        """List all todo items (synchronous).
+
+        Returns:
+            List of all TodoItems
+        """
+        return self._todos.copy()
+
+    def list_by_status_sync(self, status: TodoStatus) -> List[TodoItem]:
+        """List todo items by status (synchronous).
+
+        Args:
+            status: Status to filter by
+
+        Returns:
+            List of matching TodoItems
+        """
+        return [t for t in self._todos if t.status == status]
+
+    def get_progress_sync(self) -> Dict[str, Any]:
+        """Get progress summary (synchronous).
+
+        Returns:
+            Dictionary with progress statistics
+        """
+        total = len(self._todos)
+        completed = len([t for t in self._todos if t.status == TodoStatus.COMPLETED])
+        in_progress = len([t for t in self._todos if t.status == TodoStatus.IN_PROGRESS])
+        pending = len([t for t in self._todos if t.status == TodoStatus.PENDING])
+        blocked = len([t for t in self._todos if t.status == TodoStatus.BLOCKED])
+        skipped = len([t for t in self._todos if t.status == TodoStatus.SKIPPED])
+
+        return {
+            "total": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "pending": pending,
+            "blocked": blocked,
+            "skipped": skipped,
+            "completion_percentage": round((completed / total * 100) if total > 0 else 0, 1),
+        }
+
+    # -------------------------------------------------------------------------
+    # Archive functionality for two-tier planning model
+    # -------------------------------------------------------------------------
+
+    def set_workspace_manager(self, workspace_manager: "WorkspaceManager") -> None:
+        """Set the workspace manager for archive operations.
+
+        Args:
+            workspace_manager: Initialized WorkspaceManager instance
+        """
+        self._workspace_manager = workspace_manager
+
+    def _format_archive_content(self, phase_name: str = "") -> str:
+        """Format todos as markdown for archiving.
+
+        Args:
+            phase_name: Optional name for the phase being archived
+
+        Returns:
+            Markdown-formatted archive content
+        """
+        lines = []
+
+        # Header
+        title = f"Archived Todos: {phase_name}" if phase_name else "Archived Todos"
+        lines.append(f"# {title}")
+        lines.append(f"Archived: {datetime.utcnow().isoformat()}")
+        lines.append("")
+
+        # Group by status
+        completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+        blocked = [t for t in self._todos if t.status == TodoStatus.BLOCKED]
+        skipped = [t for t in self._todos if t.status == TodoStatus.SKIPPED]
+
+        # Completed section
+        if completed:
+            lines.append(f"## Completed ({len(completed)})")
+            for todo in completed:
+                lines.append(f"- [x] {todo.content}")
+                if todo.notes:
+                    for note in todo.notes:
+                        lines.append(f"  - {note}")
+            lines.append("")
+
+        # In progress section
+        if in_progress:
+            lines.append(f"## Was In Progress ({len(in_progress)})")
+            for todo in in_progress:
+                lines.append(f"- [ ] {todo.content} (stopped mid-task)")
+                if todo.notes:
+                    for note in todo.notes:
+                        lines.append(f"  - {note}")
+            lines.append("")
+
+        # Pending section
+        if pending:
+            lines.append(f"## Was Pending ({len(pending)})")
+            for todo in pending:
+                priority_marker = f" [P{todo.priority}]" if todo.priority > 0 else ""
+                lines.append(f"- [ ] {todo.content}{priority_marker}")
+            lines.append("")
+
+        # Blocked section
+        if blocked:
+            lines.append(f"## Was Blocked ({len(blocked)})")
+            for todo in blocked:
+                lines.append(f"- [ ] {todo.content}")
+                if todo.notes:
+                    for note in todo.notes:
+                        lines.append(f"  - {note}")
+            lines.append("")
+
+        # Skipped section
+        if skipped:
+            lines.append(f"## Skipped ({len(skipped)})")
+            for todo in skipped:
+                lines.append(f"- [-] {todo.content}")
+                if todo.notes:
+                    for note in todo.notes:
+                        lines.append(f"  - {note}")
+            lines.append("")
+
+        # Summary
+        progress = self.get_progress_sync()
+        lines.append("## Summary")
+        lines.append(f"- Total: {progress['total']}")
+        lines.append(f"- Completed: {progress['completed']} ({progress['completion_percentage']}%)")
+        lines.append(f"- In Progress: {progress['in_progress']}")
+        lines.append(f"- Pending: {progress['pending']}")
+        lines.append(f"- Blocked: {progress['blocked']}")
+        lines.append(f"- Skipped: {progress['skipped']}")
+
+        return "\n".join(lines)
+
+    def archive_and_reset(
+        self,
+        phase_name: str = "",
+        workspace_manager: Optional["WorkspaceManager"] = None
+    ) -> str:
+        """Archive current todos to workspace and reset for next phase.
+
+        This method:
+        1. Formats todos as human-readable markdown
+        2. Writes to workspace/archive/todos_<phase>_<timestamp>.md
+        3. Clears the internal todo list
+        4. Returns confirmation message
+
+        This creates a natural checkpoint for context compaction.
+
+        Args:
+            phase_name: Optional name for the phase being archived
+            workspace_manager: Optional WorkspaceManager (uses instance default if not provided)
+
+        Returns:
+            Confirmation message with archive path
+
+        Raises:
+            ValueError: If no workspace manager is available
+        """
+        ws = workspace_manager or self._workspace_manager
+        if ws is None:
+            raise ValueError(
+                "No workspace manager available. Pass one to archive_and_reset() "
+                "or set it via set_workspace_manager()."
+            )
+
+        # Count items before clearing
+        total_count = len(self._todos)
+
+        if total_count == 0:
+            return "No todos to archive. Todo list is empty."
+
+        # Generate archive content
+        archive_content = self._format_archive_content(phase_name)
+
+        # Generate filename
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        if phase_name:
+            # Sanitize phase name for filename
+            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in phase_name)
+            filename = f"todos_{safe_name}_{timestamp}.md"
+        else:
+            filename = f"todos_{timestamp}.md"
+
+        archive_path = f"archive/{filename}"
+
+        # Write to workspace
+        ws.write_file(archive_path, archive_content)
+
+        # Clear todos
+        self._todos = []
+        self._next_id = 1
+
+        logger.info(f"Archived {total_count} todos to {archive_path}")
+        return f"Archived {total_count} todos to {archive_path}. Todo list cleared. Ready for new todos."
+
+    def clear(self) -> int:
+        """Clear all todos without archiving.
+
+        Returns:
+            Number of todos cleared
+        """
+        count = len(self._todos)
+        self._todos = []
+        self._next_id = 1
+        logger.info(f"Cleared {count} todos without archiving")
+        return count
+
+    # -------------------------------------------------------------------------
+    # Formatting methods
+    # -------------------------------------------------------------------------
 
     def format_list(self, items: Optional[List[TodoItem]] = None) -> str:
         """Format todo items as a readable string.

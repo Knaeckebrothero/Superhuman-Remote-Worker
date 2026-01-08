@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator. See `masterplan.md` for design and `masterplan_roadmap.md` for implementation phases (1-5 complete, Phase 6 Testing pending).
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator. A Universal Agent pattern is also being developed for workspace-centric autonomous tasks. See `masterplan.md` for design and `masterplan_roadmap.md` for implementation phases (1-5 complete, Phase 6 Testing pending).
 
 ## Commands
 
@@ -18,6 +18,11 @@ cp .env.example .env
 
 # Initialize databases with seed data
 python scripts/app_init.py --force-reset --seed
+
+# Run tests
+pytest tests/                            # All tests
+pytest tests/test_workspace_manager.py   # Single test file
+pytest tests/ -k "test_vector"           # Tests matching pattern
 
 # Validate Python syntax
 python -m py_compile src/**/*.py
@@ -102,9 +107,11 @@ python cancel_job.py --job-id <uuid> --cleanup
 **Source locations:**
 - `src/agents/creator/` - Document processing, candidate extraction, research, tools
 - `src/agents/validator/` - Relevance analysis, fulfillment checking, graph integration
-- `src/agents/shared/` - Context manager, checkpointing, workspace
+- `src/agents/shared/` - Context manager, checkpointing, workspace, todo manager, vector search
+- `src/agents/universal/` - Universal Agent pattern with 4-node LangGraph workflow
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
+- `src/database/` - PostgreSQL schema files
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirement_cache` (status: pending)
@@ -142,7 +149,9 @@ Prompts in `config/prompts/` are tightly coupled to the metamodel. When modifyin
 
 ### PostgreSQL Schema
 
-Tables in `migrations/001_initial_schema.sql`: `jobs`, `requirement_cache`, `llm_requests`, `agent_checkpoints`, `candidate_workspace`. Also includes `job_summary` view.
+Schema in `src/database/schema.sql`: `jobs`, `requirement_cache`, `llm_requests`, `agent_checkpoints`, `candidate_workspace`. Also includes `job_summary` view.
+
+Optional vector search in `src/database/schema_vector.sql`: `workspace_embeddings` table for semantic search (requires pgvector).
 
 ### Agent State (LangGraph)
 
@@ -150,6 +159,16 @@ Both agents use PostgresSaver for durable execution with checkpointing.
 
 **CreatorAgentState phases:** preprocessing → identification → research → formulation → output
 **ValidatorAgentState phases:** understanding → relevance → fulfillment → planning → integration
+**UniversalAgentState:** 4-node graph (initialize → process ↔ tools → check → END)
+
+### Universal Agent Pattern
+
+The Universal Agent (`src/agents/universal/`) provides a workspace-centric autonomous pattern:
+- Reads `instructions.md` from workspace to understand task
+- Uses `plans/`, `notes/`, `output/` directories for working data
+- Context management with automatic tool result clearing and summarization
+- Tool retry logic with exponential backoff
+- Completion detection via `output/completion.json`
 
 ### Service Ports
 

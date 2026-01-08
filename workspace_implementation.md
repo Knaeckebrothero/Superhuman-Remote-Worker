@@ -1236,7 +1236,7 @@ Target State:
 
 ---
 
-### Phase 1: Workspace Foundation
+### Phase 1: Workspace Foundation ✅ COMPLETE
 
 **Goal:** Establish the basic workspace infrastructure that agents will use for persistent storage.
 
@@ -1257,9 +1257,17 @@ Target State:
 
 **Deliverable:** A working `WorkspaceManager` that can create, access, and clean up job workspaces.
 
+**Implementation Notes (2025-01-08):**
+- Created `src/agents/shared/workspace_manager.py` with `WorkspaceManager` and `WorkspaceConfig` classes
+- Added `get_workspace_base_path()` for environment-aware path resolution
+- Updated `src/core/config.py` with workspace configuration functions
+- Updated `config/llm_config.json` with `workspace` section
+- Created `tests/test_workspace_manager.py` with 40 unit tests (all passing)
+- Exported new classes from `src/agents/shared/__init__.py`
+
 ---
 
-### Phase 2: Workspace Tools
+### Phase 2: Workspace Tools ✅ COMPLETE
 
 **Goal:** Implement the filesystem tools that the agent will use to interact with its workspace.
 
@@ -1323,9 +1331,22 @@ def load_tools(tool_names: list[str], context: ToolContext) -> list[Tool]:
 
 **Deliverable:** Workspace tools and a tool registry system for dynamic tool loading.
 
+**Implementation Notes (2025-01-08):**
+- Created `src/agents/shared/tools/` package with:
+  - `__init__.py` - Package exports
+  - `context.py` - `ToolContext` class for dependency injection
+  - `workspace_tools.py` - LangGraph tool wrappers using `@tool` decorator
+  - `registry.py` - `TOOL_REGISTRY`, `load_tools()`, category-based tool loading
+- Implemented 8 workspace tools: `read_file`, `write_file`, `append_file`, `list_files`, `delete_file`, `search_files`, `file_exists`, `get_workspace_summary`
+- Tools return concise confirmations (not full file contents) for context efficiency
+- Large files automatically truncated with `[TRUNCATED]` message
+- Tool registry includes placeholder entries for todo tools (Phase 3) and domain tools (Phase 5)
+- Updated `src/agents/shared/__init__.py` with new exports
+- Created `tests/test_workspace_tools.py` with 40 unit tests (all passing)
+
 ---
 
-### Phase 3: Todo Tools (Tactical Execution)
+### Phase 3: Todo Tools (Tactical Execution) ✅ COMPLETE
 
 **Goal:** Implement the TodoManager with archiving for short-term task execution.
 
@@ -1373,9 +1394,22 @@ async def archive_and_reset(self, phase_name: str = "") -> str:
 
 **Deliverable:** TodoManager with archive functionality that integrates with the workspace filesystem.
 
+**Implementation Notes (2025-01-08):**
+- Refactored `src/agents/shared/todo_manager.py` with:
+  - Synchronous methods (`add_sync`, `complete_sync`, `start_sync`, `get_sync`, `next_sync`, `list_all_sync`, `get_progress_sync`)
+  - `archive_and_reset()` method that writes todos as markdown to `workspace/archive/`
+  - `_format_archive_content()` for human-readable markdown archive format
+  - Support for both session-scoped mode (in-memory until archived) and legacy persistence mode
+- Created `src/agents/shared/tools/todo_tools.py` with 7 LangGraph tool wrappers:
+  - `add_todo`, `complete_todo`, `start_todo`, `list_todos`, `get_progress`, `archive_and_reset`, `get_next_todo`
+- Updated `src/agents/shared/tools/registry.py` to load todo tools (removed placeholder markers)
+- Updated `src/agents/shared/tools/__init__.py` and `src/agents/shared/__init__.py` exports
+- Created `tests/test_todo_tools.py` with 41 unit tests (all passing)
+- Total: 121 tests passing (40 Phase 1 + 40 Phase 2 + 41 Phase 3)
+
 ---
 
-### Phase 4: Instructions & Agent Configuration
+### Phase 4: Instructions & Agent Configuration ✅ COMPLETE
 
 **Goal:** Create the configuration schema and instruction templates that define different agent behaviors.
 
@@ -1465,9 +1499,40 @@ async def archive_and_reset(self, phase_name: str = "") -> str:
 
 **Deliverable:** Configuration schema, two agent configs (creator.json, validator.json), and instruction templates for both.
 
+**Implementation Notes (2025-01-08):**
+- Created `config/agents/` directory structure with `instructions/` subdirectory
+- Created `config/agents/schema.json` - JSON Schema for agent configuration validation
+- Created `config/agents/creator.json` with:
+  - LLM configuration (model, temperature, reasoning_level)
+  - Workspace structure for document processing workflow
+  - Tools configuration: 8 workspace tools, 7 todo tools, 10 domain tools
+  - Polling configuration for jobs table
+  - Document processing settings (chunking, extraction mode, confidence threshold)
+  - Research settings (web search, graph search)
+- Created `config/agents/validator.json` with:
+  - LLM configuration matching creator
+  - Simplified workspace structure for validation workflow
+  - Tools configuration: 8 workspace tools, 7 todo tools, 12 domain tools
+  - Polling configuration for requirement_cache table with SKIP LOCKED
+  - Validation settings (duplicate threshold, citations, metamodel validation)
+- Created `config/agents/instructions/creator_instructions.md`:
+  - Merged all 4 Creator phase prompts into comprehensive guidance
+  - Documented all available tools by category
+  - Detailed instructions for each phase (preprocessing, identification, research, formulation)
+  - Planning template for strategic plans
+- Created `config/agents/instructions/validator_instructions.md`:
+  - Merged all 4 Validator phase prompts into comprehensive guidance
+  - Documented all available tools by category
+  - Detailed instructions for each phase (understanding, relevance, fulfillment, integration)
+  - Cypher query examples and metamodel reference
+- Created `config/agents/instructions/system_prompt.md`:
+  - Minimal system prompt template with {agent_display_name} and {job_id} placeholders
+  - Explains two-tier planning model (strategic filesystem + tactical todos)
+  - Context management guidance
+
 ---
 
-### Phase 5: Universal Agent Implementation
+### Phase 5: Universal Agent Implementation [COMPLETE]
 
 **Goal:** Build a new configurable agent from scratch using the workspace-centric architecture.
 
@@ -1528,9 +1593,34 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 
 **Deliverable:** A working Universal Agent that can be configured as either Creator or Validator (or any future agent type).
 
+**Implementation Notes (2025-01-08):**
+- Created `src/agents/universal/` package with all required modules:
+  - `state.py`: Minimal `UniversalAgentState` TypedDict with messages, job_id, workspace_path, iteration, error, should_stop, metadata fields. Uses LangGraph's `add_messages` annotation for automatic message deduplication
+  - `loader.py`: Configuration loading with dataclasses (AgentConfig, LLMConfig, WorkspaceConfig, ToolsConfig, TodoConfig, ConnectionsConfig, PollingConfig, LimitsConfig, ContextManagementConfig). Includes `load_agent_config()`, `create_llm()`, `load_system_prompt()`, `load_instructions()`, `resolve_config_path()`
+  - `graph.py`: 4-node LangGraph StateGraph (initialize → process → tools → check). Implements `build_agent_graph()` with tool routing, completion detection, and context management. Helper functions `_route_from_process`, `_route_from_check`, `_prepare_messages_for_llm`, `_detect_completion`
+  - `agent.py`: `UniversalAgent` class with `from_config()` factory, `initialize()`, `process_job()`, `start_polling()`, `shutdown()`, and `get_status()` methods. Supports both sync and streaming job processing
+  - `models.py`: Pydantic models for API (JobStatus, HealthStatus enums, JobSubmitRequest, JobCancelRequest, JobSubmitResponse, JobStatusResponse, HealthResponse, ReadyResponse, AgentStatusResponse, ErrorResponse, MetricsResponse)
+  - `app.py`: FastAPI application with lifespan manager, health endpoints (/health, /ready, /status), job endpoints (POST/GET /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel), and metrics endpoint
+  - `__init__.py`: Exports UniversalAgent, create_app, UniversalAgentState, and all models
+- Migrated domain tools from Creator and Validator to `src/agents/shared/tools/`:
+  - `document_tools.py`: extract_document_text, chunk_document, identify_requirement_candidates, assess_gobd_relevance, extract_entity_mentions (from Creator)
+  - `search_tools.py`: web_search (Tavily), query_similar_requirements (Neo4j) (from Creator)
+  - `citation_tools.py`: cite_document, cite_web (from Creator)
+  - `cache_tools.py`: write_requirement_to_cache (Creator → Validator handoff)
+  - `graph_tools.py`: 12 Neo4j tools (execute_cypher_query, get_database_schema, find_similar_requirements, check_for_duplicates, resolve_business_object, resolve_message, validate_schema_compliance, create_requirement_node, create_fulfillment_relationship, generate_requirement_id, get_entity_relationships, count_graph_statistics) (from Validator)
+- Updated `src/agents/shared/tools/registry.py` to import and register all domain tools with `_load_domain_tools()` helper
+- Updated `src/agents/shared/tools/context.py` to add `_job_id` field with property getter/setter for direct job_id override
+- Created `run_universal_agent.py` entry point with argparse CLI:
+  - API server mode (default): `python run_universal_agent.py --config creator --port 8001`
+  - Single job mode: `python run_universal_agent.py --config creator --job-id abc123 --document-path ./doc.pdf`
+  - Polling-only mode: `python run_universal_agent.py --config creator --polling-only`
+  - Resume mode: `python run_universal_agent.py --config creator --job-id abc123 --resume`
+- Created comprehensive unit tests in `tests/test_universal_agent.py` (56 tests covering state, loader, graph, models)
+- All tests pass with the venv Python
+
 ---
 
-### Phase 6: Context Management
+### Phase 6: Context Management [COMPLETE]
 
 **Goal:** Implement the context compaction and error handling mechanisms.
 
@@ -1553,9 +1643,47 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 
 **Deliverable:** Context management that keeps the conversation lean while preserving agent effectiveness.
 
+**Implementation Notes (2025-01-08):**
+- Created `src/agents/universal/context.py` with comprehensive context management:
+  - `ContextConfig`: Configuration dataclass with thresholds and limits
+  - `ContextManagementState`: State tracking for compaction operations
+  - `ContextManager`: Main class with multi-tier context management strategy:
+    - `clear_old_tool_results()`: Replace old tool results with placeholders (safest compaction)
+    - `truncate_long_tool_results()`: Truncate results exceeding max_length
+    - `trim_messages()`: Keep recent messages, preserve first human message
+    - `prepare_messages_for_llm()`: Apply all compaction strategies
+    - `summarize_conversation()`: Async LLM-based summarization
+    - `summarize_and_compact()`: Full summarization with message reconstruction
+    - `create_pre_model_hook()`: LangGraph-compatible hook for automatic compaction
+  - `ToolRetryManager`: Retry logic with exponential backoff and failure tracking
+  - `write_error_to_workspace()`: Async function to persist error details
+  - Token counting: tiktoken for accuracy with approximate fallback
+- Created `config/agents/instructions/summarization_prompt.md`: Template for context summarization
+- Updated `src/agents/universal/state.py`:
+  - Added `context_stats` field for tracking compaction operations
+  - Added `tool_retry_state` field for tracking retry attempts
+- Updated `src/agents/universal/graph.py`:
+  - Integrated `ContextManager` in process_node for automatic compaction
+  - Integrated `ToolRetryManager` in tools_node with retry loop
+  - Added token limit checking in check_node
+  - Error persistence to workspace on non-recoverable failures
+  - New function `run_graph_with_summarization()` for advanced summarization support
+- Updated `src/agents/universal/loader.py`:
+  - Added `load_summarization_prompt()` function
+  - Added `get_all_tool_names()` helper function
+- Updated `src/agents/universal/__init__.py` with all new exports
+- Created `tests/test_context_management.py` with 38 comprehensive unit tests:
+  - Tests for ContextConfig and ContextManagementState
+  - Tests for token counting (tiktoken and approximate)
+  - Tests for ContextManager methods (clearing, truncating, trimming, summarization)
+  - Tests for ToolRetryManager (retry logic, backoff, failure tracking)
+  - Tests for write_error_to_workspace
+  - Integration tests for state fields and package exports
+- All 202 tests pass (38 new + 164 existing)
+
 ---
 
-### Phase 7: Tool Discovery (Optional Enhancement)
+### Phase 7: Tool Discovery (Optional Enhancement) [SKIPPED]
 
 **Goal:** Implement server-side tool discovery to reduce initial context usage.
 
@@ -1577,9 +1705,11 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 
 **Deliverable:** A tool discovery mechanism that reduces initial prompt size while maintaining full capability access.
 
+**Status Note (2025-01-08):** Skipped as optional enhancement. The existing tool registry already supports categorized tool loading, which provides similar benefits. Can be revisited if context size becomes a bottleneck.
+
 ---
 
-### Phase 8: Vector Search Integration
+### Phase 8: Vector Search Integration [COMPLETE]
 
 **Goal:** Enable semantic search over workspace contents for improved context retrieval.
 
@@ -1600,6 +1730,36 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 - Same embedding model for all content types initially
 
 **Deliverable:** Semantic search capability over all workspace content.
+
+**Implementation Notes (2025-01-08):**
+- Added `pgvector>=0.2.0` and `langchain-postgres>=0.0.6` to requirements.txt
+- Created `migrations/002_workspace_embeddings.sql`:
+  - `workspace_embeddings` table with 1536-dimension vectors
+  - HNSW index for fast approximate nearest neighbor search
+  - Helper functions: `cleanup_job_embeddings()`, `search_workspace_similar()`
+- Created `src/agents/shared/vector.py` with:
+  - `VectorConfig`: Configuration for embedding model, chunking, search settings
+  - `EmbeddingManager`: Text chunking and OpenAI embedding generation
+  - `WorkspaceVectorStore`: PostgreSQL/pgvector storage with search, indexing, cleanup
+  - `VectorizedWorkspaceManager`: Wrapper that auto-indexes files on write
+  - `create_workspace_vector_store()`: Factory function for initialization
+- Created `src/agents/shared/tools/vector_tools.py` with 3 LangGraph tools:
+  - `semantic_search`: Natural language search over workspace files
+  - `index_file_for_search`: Manual file indexing/re-indexing
+  - `get_vector_index_stats`: Index statistics
+- Updated `src/agents/shared/tools/context.py`:
+  - Added `vector_store` field to `ToolContext`
+  - Added `has_vector_store()` method
+- Updated `src/agents/shared/tools/registry.py`:
+  - Added vector tools to registry with category "workspace"
+  - Separate loading path for vector tools (require vector_store)
+- Updated package exports in `__init__.py` files
+- Created `tests/test_vector_search.py` with 34 unit tests:
+  - VectorConfig, EmbeddingManager, WorkspaceVectorStore tests
+  - VectorizedWorkspaceManager tests
+  - Vector tools and registry tests
+  - Package export tests
+- All 236 tests pass (34 new + 202 existing)
 
 ---
 
@@ -1692,18 +1852,18 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 
 ### Phase Summary
 
-| Phase | Name | Dependencies | Complexity |
-|-------|------|--------------|------------|
-| 1 | Workspace Foundation | None | Low |
-| 2 | Workspace Tools (Strategic) | Phase 1 | Medium |
-| 3 | Todo Tools (Tactical) | Phase 1 | Medium |
-| 4 | Instructions & Agent Configuration | None (parallel with 1-3) | Medium |
-| 5 | Universal Agent Implementation | Phases 1-4 | High |
-| 6 | Context Management | Phase 5 | Medium |
-| 7 | Tool Discovery | Phase 5 | Medium (optional) |
-| 8 | Vector Search | Phases 2, 5 | Medium (optional) |
-| 9 | Testing & Validation | Phases 1-6 | Medium |
-| 10 | Migration & Cleanup | Phase 9 | Low |
+| Phase | Name | Dependencies | Complexity | Status |
+|-------|------|--------------|------------|--------|
+| 1 | Workspace Foundation | None | Low | ✅ Complete |
+| 2 | Workspace Tools (Strategic) | Phase 1 | Medium | ✅ Complete |
+| 3 | Todo Tools (Tactical) | Phase 1 | Medium | ✅ Complete |
+| 4 | Instructions & Agent Configuration | None (parallel with 1-3) | Medium | ✅ Complete |
+| 5 | Universal Agent Implementation | Phases 1-4 | High | ✅ Complete |
+| 6 | Context Management | Phase 5 | Medium | ✅ Complete |
+| 7 | Tool Discovery | Phase 5 | Medium (optional) | ⏭️ Skipped |
+| 8 | Vector Search | Phases 2, 5 | Medium (optional) | ✅ Complete |
+| 9 | Testing & Validation | Phases 1-6 | Medium | |
+| 10 | Migration & Cleanup | Phase 9 | Low | |
 
 **Two-Tier Planning:**
 - Phase 2 (Workspace Tools) provides **strategic planning** - filesystem for plans, notes, research

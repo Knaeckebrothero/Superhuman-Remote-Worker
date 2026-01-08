@@ -61,5 +61,19 @@
     "stuck_detection_minutes": 60,
     "max_requirement_retries": 5,
     "completion_check_interval_seconds": 30
+  },
+  "workspace": {
+    "base_path": "",
+    "structure": [
+      "plans",
+      "archive",
+      "documents",
+      "documents/sources",
+      "notes",
+      "chunks",
+      "candidates",
+      "requirements",
+      "output"
+    ]
   }
 }
