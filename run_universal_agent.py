@@ -66,11 +66,26 @@ def setup_logging(verbose: bool = False):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Reduce noise from libraries
-    if not verbose:
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("uvicorn").setLevel(logging.INFO)
+    # Always suppress noisy third-party libraries - even in verbose mode
+    # These produce massive log output that drowns out useful information
+    noisy_libraries = [
+        "httpx",
+        "httpcore",
+        "httpcore.http11",
+        "openai",
+        "openai._base_client",
+        "pymongo",
+        "pymongo.command",
+        "pymongo.connection",
+        "pymongo.serverSelection",
+        "urllib3",
+        "asyncio",
+    ]
+    for lib in noisy_libraries:
+        logging.getLogger(lib).setLevel(logging.WARNING)
+
+    # uvicorn can be INFO level
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
 
 
 def parse_args():

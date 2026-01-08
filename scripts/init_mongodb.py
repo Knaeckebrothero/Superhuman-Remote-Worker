@@ -130,24 +130,6 @@ def create_collections_and_indexes(client, db_name: str, logger: logging.Logger)
             else:
                 logger.warning(f"  Failed to create index {options['name']}: {e}")
 
-    # Collection: agent_metrics - stores aggregated metrics
-    agent_metrics = db["agent_metrics"]
-
-    metrics_indexes = [
-        ("agent_type", {"name": "idx_metrics_agent"}),
-        ("date", {"name": "idx_metrics_date"}),
-    ]
-
-    for index_spec, options in metrics_indexes:
-        try:
-            agent_metrics.create_index(index_spec, **options)
-            logger.info(f"  Created index: {options['name']}")
-        except Exception as e:
-            if "already exists" in str(e).lower():
-                logger.info(f"  Index exists: {options['name']}")
-            else:
-                logger.warning(f"  Failed to create index {options['name']}: {e}")
-
     logger.info("  Collections and indexes configured")
 
 

@@ -16,9 +16,12 @@ Phase 6 additions:
 
 import asyncio
 import logging
+import time
 import traceback
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Literal, Optional
+
+from src.agents.shared.llm_archiver import get_archiver
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -114,15 +117,31 @@ def build_agent_graph(
         """
         logger.info(f"Initializing job {state['job_id']}")
 
-        # Build initial messages
+        # Build initial messages with metadata
+        metadata = state.get("metadata", {})
+
+        # Build context from metadata
+        context_parts = []
+        if metadata.get("document_path"):
+            context_parts.append(f"**Document to process:** `{metadata['document_path']}`")
+        if metadata.get("prompt"):
+            context_parts.append(f"**Task:** {metadata['prompt']}")
+        if metadata.get("requirement_id"):
+            context_parts.append(f"**Requirement ID:** {metadata['requirement_id']}")
+
+        context_block = ""
+        if context_parts:
+            context_block = "\n\n## Job Context\n" + "\n".join(context_parts) + "\n\n"
+
+        initial_message = (
+            "Begin your task. Start by reading instructions.md to understand "
+            "what you need to do, then create a plan and execute it step by step."
+            f"{context_block}"
+        )
+
         messages: List[BaseMessage] = [
             SystemMessage(content=system_prompt),
-            HumanMessage(
-                content=(
-                    "Begin your task. Start by reading instructions.md to understand "
-                    "what you need to do, then create a plan and execute it step by step."
-                )
-            ),
+            HumanMessage(content=initial_message),
         ]
 
         new_state: Dict[str, Any] = {
@@ -187,13 +206,30 @@ def build_agent_graph(
                 )
 
         try:
-            # Call LLM
+            # Call LLM with timing
+            start_time = time.time()
             response = llm_with_tools.invoke(prepared_messages)
+            latency_ms = int((time.time() - start_time) * 1000)
 
+            tool_call_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
             logger.debug(
                 f"LLM response: {len(response.content)} chars, "
-                f"{len(response.tool_calls) if hasattr(response, 'tool_calls') else 0} tool calls"
+                f"{tool_call_count} tool calls, {latency_ms}ms"
             )
+
+            # Archive to MongoDB
+            archiver = get_archiver()
+            if archiver:
+                archiver.archive(
+                    job_id=state.get("job_id", "unknown"),
+                    agent_type=config.agent_id,
+                    messages=prepared_messages,
+                    response=response,
+                    model=config.llm.model,
+                    latency_ms=latency_ms,
+                    iteration=iteration,
+                    metadata=state.get("metadata"),
+                )
 
             # Update context stats
             new_token_count = context_manager.get_token_count(messages + [response])

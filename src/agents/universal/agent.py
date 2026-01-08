@@ -15,6 +15,7 @@ Key Features:
 import asyncio
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -250,7 +251,8 @@ class UniversalAgent:
         try:
             # Create workspace for this job
             # Base path comes from WORKSPACE_PATH env var or defaults
-            await self._setup_job_workspace(job_id)
+            # This also copies documents to workspace and returns updated metadata
+            updated_metadata = await self._setup_job_workspace(job_id, metadata)
 
             # Load tools for this job
             await self._setup_job_tools()
@@ -264,11 +266,11 @@ class UniversalAgent:
                 system_prompt=system_prompt,
             )
 
-            # Create initial state
+            # Create initial state with updated metadata (workspace-relative paths)
             initial_state = create_initial_state(
                 job_id=job_id,
-                workspace_path=str(self._workspace_manager.workspace_path),
-                metadata=metadata or {},
+                workspace_path=str(self._workspace_manager.path),
+                metadata=updated_metadata,
             )
 
             # Execute graph
@@ -328,17 +330,28 @@ class UniversalAgent:
     async def _setup_job_workspace(
         self,
         job_id: str,
-    ) -> None:
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Set up the workspace for a job.
 
-        Creates the workspace directory structure and copies
-        initial files (instructions, etc.).
+        Creates the workspace directory structure, copies initial files
+        (instructions, documents, etc.), and returns updated metadata
+        with workspace-relative paths.
 
         Base path is determined by:
         1. WORKSPACE_PATH environment variable
         2. /workspace (container mode)
         3. ./workspace (development mode)
+
+        Args:
+            job_id: Unique job identifier
+            metadata: Job metadata (may contain document_path, etc.)
+
+        Returns:
+            Updated metadata with workspace-relative paths
         """
+        metadata = metadata or {}
+
         # Create workspace manager
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
         self._workspace_manager = WorkspaceManager(
@@ -358,12 +371,34 @@ class UniversalAgent:
             instructions,
         )
 
+        # Copy document to workspace if provided
+        updated_metadata = dict(metadata)
+        if metadata.get("document_path"):
+            source_path = Path(metadata["document_path"])
+            if source_path.exists():
+                # Copy to documents/ folder in workspace
+                dest_filename = source_path.name
+                dest_relative = f"documents/{dest_filename}"
+                dest_path = self._workspace_manager.get_path(dest_relative)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                shutil.copy2(source_path, dest_path)
+                logger.info(f"Copied document to workspace: {dest_relative}")
+
+                # Update metadata to use workspace-relative path
+                updated_metadata["document_path"] = dest_relative
+                updated_metadata["original_document_path"] = str(source_path)
+            else:
+                logger.warning(f"Document not found: {source_path}")
+
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(
             workspace_manager=self._workspace_manager,
         )
 
-        logger.debug(f"Workspace created at {workspace_path}")
+        logger.debug(f"Workspace created at {self._workspace_manager.path}")
+
+        return updated_metadata
 
     async def _setup_job_tools(self) -> None:
         """Set up tools for the current job.

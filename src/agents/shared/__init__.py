@@ -51,6 +51,11 @@ from .tools import (
     load_tools,
     get_available_tools,
 )
+from .llm_archiver import (
+    LLMArchiver,
+    get_archiver,
+    archive_llm_request,
+)
 
 __all__ = [
     # Context Management
@@ -87,4 +92,8 @@ __all__ = [
     "TOOL_REGISTRY",
     "load_tools",
     "get_available_tools",
+    # LLM Archiving
+    "LLMArchiver",
+    "get_archiver",
+    "archive_llm_request",
 ]
