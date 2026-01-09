@@ -26,6 +26,17 @@ from .search_tools import create_search_tools, SEARCH_TOOLS_METADATA
 from .citation_tools import create_citation_tools, CITATION_TOOLS_METADATA
 from .cache_tools import create_cache_tools, CACHE_TOOLS_METADATA
 from .graph_tools import create_graph_tools, GRAPH_TOOLS_METADATA
+from .completion_tools import create_completion_tools
+
+# Completion tools metadata
+COMPLETION_TOOLS_METADATA = {
+    "mark_complete": {
+        "module": "completion_tools",
+        "function": "mark_complete",
+        "description": "Signal task completion with structured report",
+        "category": "completion",
+    },
+}
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +60,9 @@ TOOL_REGISTRY.update(SEARCH_TOOLS_METADATA)
 TOOL_REGISTRY.update(CITATION_TOOLS_METADATA)
 TOOL_REGISTRY.update(CACHE_TOOLS_METADATA)
 TOOL_REGISTRY.update(GRAPH_TOOLS_METADATA)
+
+# Register completion tools
+TOOL_REGISTRY.update(COMPLETION_TOOLS_METADATA)
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -190,6 +204,19 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
         domain_tool_names = set(tools_by_category["domain"])
         loaded_domain_tools = _load_domain_tools(domain_tool_names, context)
         all_tools.extend(loaded_domain_tools)
+
+    # Completion tools
+    if "completion" in tools_by_category:
+        if not context.has_workspace():
+            raise ValueError(
+                "Completion tools require a workspace_manager in ToolContext"
+            )
+        completion_tools = create_completion_tools(context)
+        completion_tool_names = set(tools_by_category["completion"])
+        for tool in completion_tools:
+            if tool.name in completion_tool_names:
+                all_tools.append(tool)
+                logger.debug(f"Loaded completion tool: {tool.name}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

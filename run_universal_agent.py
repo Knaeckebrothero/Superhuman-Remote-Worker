@@ -53,6 +53,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.agents.universal import UniversalAgent, create_app
+from src.agents.shared import get_workspace_base_path
 from src.core.postgres_utils import create_postgres_connection, create_job
 
 
@@ -86,6 +87,43 @@ def setup_logging(verbose: bool = False):
 
     # uvicorn can be INFO level
     logging.getLogger("uvicorn").setLevel(logging.INFO)
+
+
+def setup_job_file_logging(job_id: str, verbose: bool = False) -> Path:
+    """Set up file logging for a specific job.
+
+    Creates a log file alongside the job's workspace directory (not inside it,
+    so the agent cannot read its own logs).
+
+    Args:
+        job_id: The job identifier
+        verbose: Whether to use DEBUG level
+
+    Returns:
+        Path to the log file
+    """
+    workspace_base = get_workspace_base_path()
+    workspace_base.mkdir(parents=True, exist_ok=True)
+
+    # Log file is alongside the job folder, not inside it
+    log_file = workspace_base / f"job_{job_id}.log"
+
+    # Create file handler
+    level = logging.DEBUG if verbose else logging.INFO
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
+    # Add to root logger so all logs go to the file
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+
+    logging.getLogger(__name__).info(f"Logging to file: {log_file}")
+
+    return log_file
 
 
 def parse_args():
@@ -174,10 +212,12 @@ async def run_single_job(
     context: dict = None,
     stream: bool = False,
     resume: bool = False,
+    verbose: bool = False,
 ):
     """Run a single job and exit.
 
     If job_id is not provided, creates a new job from document_path and prompt.
+    Logs are written to the workspace directory as job_{job_id}.log.
     """
     logger = logging.getLogger(__name__)
     start_time = datetime.now()
@@ -207,6 +247,9 @@ async def run_single_job(
             await conn.disconnect()
             logger.info("Disconnected from PostgreSQL (job created)")
 
+    # Set up file logging for this job
+    log_file = setup_job_file_logging(job_id, verbose)
+
     # Build metadata for the job
     metadata = {}
     if document_path:
@@ -226,7 +269,7 @@ async def run_single_job(
             final_state = None
             # process_job returns an async generator when stream=True
             # We need to await the coroutine first to get the generator
-            streaming_gen = await agent.process_job(job_id, metadata, stream=True)
+            streaming_gen = await agent.process_job(job_id, metadata, stream=True, resume=resume)
             async for state in streaming_gen:
                 final_state = state
                 # Print streaming updates
@@ -237,7 +280,7 @@ async def run_single_job(
             result = final_state or {}
         else:
             logger.info(f"Processing job {job_id}...")
-            result = await agent.process_job(job_id, metadata)
+            result = await agent.process_job(job_id, metadata, resume=resume)
 
         elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -249,6 +292,7 @@ async def run_single_job(
         print(f"Config:       {config_path}")
         print(f"Iterations:   {result.get('iteration', 0)}")
         print(f"Duration:     {elapsed:.1f}s")
+        print(f"Log file:     {log_file}")
 
         if result.get("error"):
             print(f"Status:       FAILED")
@@ -329,6 +373,7 @@ def main():
             context=context,
             stream=args.stream,
             resume=args.resume,
+            verbose=args.verbose,
         ))
         return
 

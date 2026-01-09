@@ -219,6 +219,7 @@ class UniversalAgent:
         job_id: str,
         metadata: Optional[Dict[str, Any]] = None,
         stream: bool = False,
+        resume: bool = False,
     ) -> Dict[str, Any]:
         """Process a single job.
 
@@ -252,7 +253,7 @@ class UniversalAgent:
             # Create workspace for this job
             # Base path comes from WORKSPACE_PATH env var or defaults
             # This also copies documents to workspace and returns updated metadata
-            updated_metadata = await self._setup_job_workspace(job_id, metadata)
+            updated_metadata = await self._setup_job_workspace(job_id, metadata, resume=resume)
 
             # Load tools for this job
             await self._setup_job_tools()
@@ -331,6 +332,7 @@ class UniversalAgent:
         self,
         job_id: str,
         metadata: Optional[Dict[str, Any]] = None,
+        resume: bool = False,
     ) -> Dict[str, Any]:
         """Set up the workspace for a job.
 
@@ -360,6 +362,25 @@ class UniversalAgent:
                 structure=self.config.workspace.structure,
             )
         )
+
+        # Check if resuming an existing workspace
+        if resume and self._workspace_manager.path.exists():
+            logger.info(f"Resuming job {job_id} with existing workspace")
+            # Verify workspace has required files
+            instructions_path = self._workspace_manager.path / "instructions.md"
+            if not instructions_path.exists():
+                # Only write instructions if missing
+                instructions = load_instructions(self.config)
+                self._workspace_manager.write_file("instructions.md", instructions)
+                logger.debug("Wrote missing instructions.md to workspace")
+
+            # Create todo manager for this workspace
+            self._todo_manager = TodoManager(
+                workspace_manager=self._workspace_manager,
+            )
+
+            logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
+            return metadata or {}
 
         # Initialize workspace (creates directories)
         self._workspace_manager.initialize()

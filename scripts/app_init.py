@@ -219,7 +219,7 @@ def clean_workspace(logger: logging.Logger) -> bool:
     """
     Clean up workspace directories.
 
-    Removes all job workspace directories from WORKSPACE_PATH.
+    Removes all contents from WORKSPACE_PATH.
 
     Returns:
         True if successful, False otherwise.
@@ -237,22 +237,25 @@ def clean_workspace(logger: logging.Logger) -> bool:
         logger.info(f"  Workspace directory does not exist: {base_path}")
         return True
 
-    # Find and remove job directories
-    job_dirs = list(base_path.glob("job_*"))
-    if not job_dirs:
-        logger.info(f"  No job directories found in {base_path}")
+    # Find all items in workspace
+    items = list(base_path.iterdir())
+    if not items:
+        logger.info(f"  Workspace directory is already empty: {base_path}")
         return True
 
     removed = 0
-    for job_dir in job_dirs:
+    for item in items:
         try:
-            shutil.rmtree(job_dir)
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
             removed += 1
-            logger.debug(f"    Removed: {job_dir.name}")
+            logger.debug(f"    Removed: {item.name}")
         except Exception as e:
-            logger.warning(f"  Failed to remove {job_dir}: {e}")
+            logger.warning(f"  Failed to remove {item}: {e}")
 
-    logger.info(f"  Removed {removed} job workspace(s) from {base_path}")
+    logger.info(f"  Removed {removed} item(s) from {base_path}")
     return True
 
 

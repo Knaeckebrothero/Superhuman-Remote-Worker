@@ -207,12 +207,13 @@ def build_agent_graph(
 
         try:
             # Call LLM with timing
+            logger.info(f"Calling LLM ({config.llm.model})...")
             start_time = time.time()
             response = llm_with_tools.invoke(prepared_messages)
             latency_ms = int((time.time() - start_time) * 1000)
 
             tool_call_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
-            logger.debug(
+            logger.info(
                 f"LLM response: {len(response.content)} chars, "
                 f"{tool_call_count} tool calls, {latency_ms}ms"
             )
@@ -293,6 +294,7 @@ def build_agent_graph(
             return {
                 "should_stop": True,
                 "error": error_info,
+                "iteration": iteration,
             }
 
         # Check token limit - if extremely high, force stop
@@ -315,6 +317,7 @@ def build_agent_graph(
             return {
                 "should_stop": True,
                 "error": error_info,
+                "iteration": iteration,
             }
 
         # Check for non-recoverable errors
@@ -329,12 +332,12 @@ def build_agent_graph(
                         {"iteration": iteration, "job_id": state.get("job_id")},
                     )
                 )
-            return {"should_stop": True}
+            return {"should_stop": True, "iteration": iteration}
 
         # Check for completion signals in recent messages
-        if _detect_completion(messages):
+        if _detect_completion(messages, workspace=workspace_manager):
             logger.info("Completion detected in messages")
-            return {"should_stop": True}
+            return {"should_stop": True, "iteration": iteration}
 
         # Apply custom check if provided
         if on_check:
@@ -344,14 +347,14 @@ def build_agent_graph(
 
         # Clear any recoverable errors
         if error and error.get("recoverable"):
-            return {"error": None}
+            return {"error": None, "iteration": iteration}
 
-        return {}
+        return {"iteration": iteration}
 
     # Create tool node using LangGraph prebuilt
     tool_node = ToolNode(tools)
 
-    def tools_node(state: UniversalAgentState) -> Dict[str, Any]:
+    async def tools_node(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute tool calls with retry logic.
 
         Implements:
@@ -379,7 +382,7 @@ def build_agent_graph(
 
         while attempt < max_attempts:
             try:
-                result = tool_node.invoke(state)
+                result = await tool_node.ainvoke(state)
 
                 # Check if any tool results indicate actual errors
                 # (not just the word "error" appearing in content)
@@ -399,8 +402,7 @@ def build_agent_graph(
                         f"Tool error detected, retrying ({attempt}/{max_attempts}) "
                         f"after {delay:.1f}s"
                     )
-                    # Note: In async context, use asyncio.sleep
-                    # For sync, we just continue immediately
+                    await asyncio.sleep(delay)
                     continue
 
                 return {
@@ -450,8 +452,7 @@ def build_agent_graph(
                 # Wait before retry (exponential backoff)
                 delay = retry_manager.get_retry_delay(attempt)
                 logger.info(f"Waiting {delay:.1f}s before retry {attempt + 1}")
-                # In sync context, we can't easily sleep, so we just continue
-                # The delay is more relevant for async execution
+                await asyncio.sleep(delay)
 
         # Should not reach here, but handle gracefully
         return {
@@ -586,16 +587,17 @@ def _is_tool_error(content: str) -> bool:
     return False
 
 
-def _detect_completion(messages: List[BaseMessage]) -> bool:
+def _detect_completion(messages: List[BaseMessage], workspace=None) -> bool:
     """Detect completion signals in messages.
 
-    Looks for indicators that the agent has finished its task:
-    - Explicit completion phrases
-    - Writing completion.json mentioned
-    - Task complete indicators
+    Priority order:
+    1. Check if output/completion.json exists (explicit tool signal)
+    2. Check for tool write confirmations (mark_complete output)
+    3. Fall back to phrase matching (legacy support, reduced scope)
 
     Args:
         messages: Message list to check
+        workspace: Optional workspace manager for file existence check
 
     Returns:
         True if completion detected
@@ -603,36 +605,16 @@ def _detect_completion(messages: List[BaseMessage]) -> bool:
     if not messages:
         return False
 
-    # Check last few AI messages
-    recent_ai_messages = [
-        m for m in messages[-10:]
-        if isinstance(m, AIMessage) and m.content
-    ]
-
-    completion_phrases = [
-        "task is complete",
-        "task has been completed",
-        "work is complete",
-        "work is done",
-        "successfully completed",
-        "all requirements have been",
-        "validation complete",
-        "integration complete",
-        "written to output/completion",
-        "completion.json",
-        "finished processing",
-        "no more items to process",
-        "all items processed",
-    ]
-
-    for msg in recent_ai_messages:
-        content_lower = msg.content.lower()
-        for phrase in completion_phrases:
-            if phrase in content_lower:
+    # Priority 1: Check if completion file exists
+    if workspace:
+        try:
+            if workspace.file_exists("output/completion.json"):
+                logger.debug("Completion detected: output/completion.json exists")
                 return True
+        except Exception:
+            pass  # Workspace not available, continue to other checks
 
-    # Check if recent tool calls actually wrote to completion.json
-    # (not just read or mentioned it in content)
+    # Priority 2: Check recent tool messages for mark_complete output
     recent_tool_messages = [
         m for m in messages[-5:]
         if isinstance(m, ToolMessage)
@@ -640,15 +622,32 @@ def _detect_completion(messages: List[BaseMessage]) -> bool:
 
     for msg in recent_tool_messages:
         content_lower = msg.content.lower()
-        # Check for write confirmation patterns (from workspace tools)
-        write_patterns = [
-            "wrote file: output/completion.json",
-            "wrote file: completion.json",
-            "wrote to output/completion.json",
-            "created output/completion.json",
-        ]
-        for pattern in write_patterns:
-            if pattern in content_lower:
+        # mark_complete tool returns this exact pattern
+        if "wrote file: output/completion.json" in content_lower:
+            logger.debug("Completion detected: mark_complete tool output")
+            return True
+
+    # Priority 3: Legacy phrase matching (for backwards compatibility)
+    # Only check last 3 AI messages to reduce false positives
+    recent_ai_messages = [
+        m for m in messages[-5:]
+        if isinstance(m, AIMessage) and m.content
+    ][-3:]
+
+    # Reduced, more specific phrase list to minimize false positives
+    completion_phrases = [
+        "task is complete",
+        "task has been completed",
+        "work is complete",
+        "successfully completed all",
+        "finished processing all",
+    ]
+
+    for msg in recent_ai_messages:
+        content_lower = msg.content.lower()
+        for phrase in completion_phrases:
+            if phrase in content_lower:
+                logger.debug(f"Completion detected: phrase '{phrase}'")
                 return True
 
     return False

@@ -5,6 +5,7 @@ chunking, and candidate identification capabilities.
 """
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
@@ -62,6 +63,25 @@ def create_document_tools(context: ToolContext) -> List:
     _document_processor = None
     _candidate_extractor = None
 
+    # Get workspace manager if available for path resolution
+    workspace = context.workspace_manager if context.has_workspace() else None
+
+    def resolve_path(path: str) -> str:
+        """Resolve a path relative to workspace if available.
+
+        Args:
+            path: Relative or absolute path
+
+        Returns:
+            Absolute path string
+        """
+        if workspace is not None:
+            # Use workspace to get absolute path
+            resolved = workspace.get_path(path)
+            return str(resolved)
+        # Fall back to treating as absolute or cwd-relative
+        return path
+
     def get_document_processor():
         nonlocal _document_processor
         if _document_processor is None:
@@ -96,7 +116,9 @@ def create_document_tools(context: ToolContext) -> List:
         """Extract text content from a document file.
 
         Args:
-            file_path: Path to the document (PDF, DOCX, TXT, or HTML)
+            file_path: Path to the document (PDF, DOCX, TXT, or HTML).
+                       Can be relative to workspace (e.g., "documents/file.pdf")
+                       or absolute.
 
         Returns:
             Extraction result with metadata and text preview
@@ -106,7 +128,18 @@ def create_document_tools(context: ToolContext) -> List:
             if processor is None:
                 return "Error: Document processor not available"
 
-            result = processor.extract(file_path)
+            # Resolve path relative to workspace
+            resolved_path = resolve_path(file_path)
+            result = processor.extract(resolved_path)
+
+            # Persist full text to workspace
+            full_text = result.get('text', '')
+            output_filename = f"extracted/{Path(file_path).stem}_full_text.txt"
+            if workspace is not None:
+                workspace.write_file(output_filename, full_text)
+                persist_msg = f"\nFull text written to: {output_filename}\nUse read_file(\"{output_filename}\") to access the content."
+            else:
+                persist_msg = "\nNote: No workspace available, full text not persisted."
 
             return f"""Document Extraction Complete
 
@@ -115,9 +148,7 @@ Page Count: {result.get('page_count', 'unknown')}
 Language: {result.get('language', 'unknown')}
 Document Type: {result.get('document_type', 'unknown')}
 Total Characters: {result.get('char_count', 0)}
-
-Preview (first 1000 chars):
-{result.get('text', '')[:1000]}...
+{persist_msg}
 
 Use 'chunk_document' to split this into processable chunks."""
 
@@ -135,7 +166,7 @@ Use 'chunk_document' to split this into processable chunks."""
         """Split a document into chunks for processing.
 
         Args:
-            file_path: Path to the document
+            file_path: Path to the document (relative to workspace or absolute)
             strategy: Chunking strategy ('legal', 'technical', 'general')
             max_chunk_size: Maximum characters per chunk
             overlap: Characters to overlap between chunks
@@ -148,12 +179,27 @@ Use 'chunk_document' to split this into processable chunks."""
             if processor is None:
                 return "Error: Document processor not available"
 
+            # Resolve path relative to workspace
+            resolved_path = resolve_path(file_path)
             chunks = processor.chunk(
-                file_path,
+                resolved_path,
                 strategy=strategy,
                 max_chunk_size=max_chunk_size,
                 overlap=overlap
             )
+
+            # Persist ALL chunks to workspace
+            chunk_files = []
+            if workspace is not None:
+                for i, chunk in enumerate(chunks):
+                    chunk_path = f"chunks/chunk_{i+1:03d}.txt"
+                    chunk_content = chunk.get('text', '')
+                    # Include metadata as header
+                    section = chunk.get('section_hierarchy', [])
+                    section_str = ' > '.join(section) if section else 'N/A'
+                    full_chunk = f"# Chunk {i+1}\nSection: {section_str}\n\n{chunk_content}"
+                    workspace.write_file(chunk_path, full_chunk)
+                    chunk_files.append(chunk_path)
 
             result = f"""Document Chunking Complete
 
@@ -169,14 +215,13 @@ Chunk Statistics:
                 sizes = [len(c.get('text', '')) for c in chunks]
                 result += f"  Min Size: {min(sizes)} chars\n"
                 result += f"  Max Size: {max(sizes)} chars\n"
-                result += f"  Avg Size: {sum(sizes) // len(sizes)} chars\n\n"
+                result += f"  Avg Size: {sum(sizes) // len(sizes)} chars\n"
 
-                result += "First 3 chunks preview:\n"
-                for i, chunk in enumerate(chunks[:3]):
-                    text_preview = chunk.get('text', '')[:200]
-                    section = chunk.get('section_hierarchy', [])
-                    result += f"\n[Chunk {i+1}] Section: {' > '.join(section) or 'N/A'}\n"
-                    result += f"{text_preview}...\n"
+            if chunk_files:
+                result += f"\nChunks written to: chunks/chunk_001.txt through chunks/chunk_{len(chunks):03d}.txt"
+                result += f"\nUse read_file(\"chunks/chunk_001.txt\") to start processing."
+            else:
+                result += "\nNote: No workspace available, chunks not persisted."
 
             return result
 

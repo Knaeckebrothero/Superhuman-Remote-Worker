@@ -60,6 +60,9 @@
       "cite_document",
       "cite_web",
       "write_requirement_to_cache"
+    ],
+    "completion": [
+      "mark_complete"
     ]
   },
 

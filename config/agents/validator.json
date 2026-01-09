@@ -58,6 +58,9 @@
       "generate_requirement_id",
       "get_entity_relationships",
       "count_graph_statistics"
+    ],
+    "completion": [
+      "mark_complete"
     ]
   },
 
