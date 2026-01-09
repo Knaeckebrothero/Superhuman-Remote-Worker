@@ -37,10 +37,9 @@ Extract well-formed, citation-backed requirements from documents and prepare the
 - `extract_document_text(file_path)` - Extract text from PDF, DOCX, TXT, HTML
 - `chunk_document(file_path, strategy, max_chunk_size, overlap)` - Split into chunks
 
-### Candidate Identification Tools
-- `identify_requirement_candidates(text, mode)` - Find requirement-like statements
-- `assess_gobd_relevance(text)` - Check GoBD compliance relevance
-- `extract_entity_mentions(text)` - Find business objects and messages
+### Validation Tools
+- `assess_gobd_relevance(text)` - Validate GoBD compliance relevance for a text
+- `extract_entity_mentions(text)` - Extract business objects and messages from text
 
 ### Research Tools
 - `web_search(query, max_results)` - Search web for context (Tavily)
@@ -91,52 +90,85 @@ After preprocessing, write to `notes/preprocessing_summary.md`:
 ## Phase 2: Candidate Identification
 
 ### Goal
-Identify requirement candidates from document chunks.
-
-### What Constitutes a Requirement
-Look for statements expressing:
-1. **Obligations**: must, shall, required to, verpflichtet, muss
-2. **Capabilities**: can, may, should provide, soll bereitstellen
-3. **Constraints**: at least, maximum, within, mindestens, höchstens
-4. **Compliance**: in accordance with, compliant, gemäß, entsprechend
-
-### GoBD Indicators (Priority)
-Pay special attention to:
-- **Aufbewahrung** (retention) - data/document retention requirements
-- **Nachvollziehbarkeit** (traceability) - audit trail requirements
-- **Unveränderbarkeit** (immutability) - data integrity requirements
-- **Revisionssicherheit** (audit-proof) - compliance documentation
-- **Protokollierung** (logging) - change/access logging
-- **Archivierung** (archiving) - long-term storage requirements
-
-### GDPR Indicators
-Also flag requirements related to:
-- Personal data processing
-- Data subject rights
-- Consent management
-- Data protection impact
-
-### Classification
-Classify each candidate as:
-- **FUNCTIONAL**: What the system does
-- **NON_FUNCTIONAL**: Quality attributes (performance, security, availability)
-- **CONSTRAINT**: Limits and boundaries (time, quantity, format)
-- **COMPLIANCE**: Regulatory requirements (GoBD, GDPR, legal)
+Read through document chunks sequentially and identify requirement-like statements using your language understanding.
 
 ### Process
-For each chunk:
-1. Run `identify_requirement_candidates`
-2. Run `assess_gobd_relevance` for each candidate
-3. Run `extract_entity_mentions` for entity references
-4. Assign confidence scores based on pattern matches
+
+1. **Read the chunk manifest**
+   ```
+   read_file("chunks/manifest.json")
+   ```
+   This shows you all available chunks.
+
+2. **Process chunks in batches**
+   Read 5-10 chunks at a time, analyzing each for requirements:
+   ```
+   read_file("chunks/chunk_001.txt")
+   ```
+
+3. **For each chunk, identify requirements yourself**
+   Look for statements expressing:
+   - **Obligations**: must, shall, required to, verpflichtet, muss, müssen
+   - **Capabilities**: can, may, should provide, soll bereitstellen
+   - **Constraints**: at least, maximum, within X days, mindestens, höchstens
+   - **Compliance**: in accordance with, compliant, gemäß, entsprechend
+
+4. **Record each candidate with:**
+   - The exact requirement text
+   - Source chunk and location (section/paragraph if visible)
+   - Classification: FUNCTIONAL, NON_FUNCTIONAL, CONSTRAINT, COMPLIANCE
+   - Confidence score (0.0-1.0)
+   - GoBD/GDPR relevance flags
+
+5. **Optionally validate with helper tools:**
+   - `assess_gobd_relevance(text)` - Confirms GoBD relevance score
+   - `extract_entity_mentions(text)` - Finds BusinessObjects and Messages
+
+6. **Write candidates to workspace**
+   ```
+   write_file("candidates/candidates.json", "[structured data]")
+   write_file("candidates/candidates.md", "[human-readable summary]")
+   ```
+
+### German Legal Text
+
+German compliance documents use complex grammar. Look for meaning, not patterns:
+- **Verb-final**: "...geführt werden müssen" (must be maintained)
+- **Separated verbs**: "hat...sicherzustellen" (must ensure)
+- **Flexible order**: "notwendig ist" = "ist notwendig"
+- **Conjugations**: muss/müssen/musste/müssten all indicate obligation
+
+Example: "Jede Buchung muss im Zusammenhang mit einem Beleg stehen" is a clear requirement about booking-receipt relationships.
+
+### GoBD Indicators (Priority)
+Flag as GoBD-relevant when you see:
+- **Aufbewahrung/Aufbewahrungspflicht** (retention)
+- **Nachvollziehbarkeit** (traceability)
+- **Unveränderbarkeit** (immutability)
+- **Revisionssicherheit** (audit-proof)
+- **Protokollierung** (logging)
+- **Archivierung** (archiving)
+
+### GDPR Indicators
+Flag as GDPR-relevant when you see:
+- **Personenbezogene Daten** (personal data)
+- **Einwilligung** (consent)
+- **Löschung/Löschfristen** (deletion)
+- **Betroffenenrechte** (data subject rights)
+
+### Classification
+- **FUNCTIONAL**: What the system does
+- **NON_FUNCTIONAL**: Quality attributes (performance, security)
+- **CONSTRAINT**: Limits and boundaries (time, quantity)
+- **COMPLIANCE**: Regulatory requirements (GoBD, GDPR)
 
 ### Output
-Write to `candidates/candidates.md` and `candidates/candidates.json`:
-- Text of each requirement
-- Classification (type)
-- Confidence score (0.0-1.0)
-- GoBD relevance flag and indicators
-- Referenced entities
+Write to `candidates/`:
+- `candidates.json` - Structured data with all fields
+- `candidates.md` - Human-readable summary
+
+Write to `notes/`:
+- `identification_summary.md` - Statistics (total candidates, by type, by confidence)
 
 ---
 

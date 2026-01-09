@@ -53,7 +53,6 @@
     "domain": [
       "extract_document_text",
       "chunk_document",
-      "identify_requirement_candidates",
       "assess_gobd_relevance",
       "extract_entity_mentions",
       "web_search",

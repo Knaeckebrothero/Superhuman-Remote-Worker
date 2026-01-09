@@ -28,7 +28,9 @@ Investigation date: 2026-01-08, updated 2026-01-09
 
 **Phase 12 (2026-01-09 - implementation):** Issue #12 **RESOLVED**. Enhanced tool error logging in `tools_node` with 5 changes: (1) Tool result errors now log tool names and error content; (2) Exception errors now include tool names; (3) Added retry success logging; (4) Final failure log includes tool names and exception; (5) Retry wait log includes tool names.
 
-**Current status:** 13 issues resolved, 1 issue open (#13 - 5 sub-issues). Context overflow loop fixed. File size limit fixed. Tool error logging fixed. Core extraction blocked by #13 - requires architectural change.
+**Phase 13 (2026-01-09 - implementation):** Issue #13 **RESOLVED**. Replaced regex-based extraction with LLM-based extraction. Changes: Removed `identify_requirement_candidates` from `creator.json` tools, rewrote Phase 2 in `creator_instructions.md` to have agent read chunks directly using `read_file`, rewrote `creator_identification.txt` phase prompt. Agent now uses its language understanding to identify requirements instead of broken regex patterns.
+
+**Current status:** All 14 issues resolved. Context overflow loop fixed. File size limit fixed. Tool error logging fixed. Extraction now uses LLM-based approach instead of regex.
 
 ---
 
@@ -1062,13 +1064,21 @@ logger.error(
 
 ---
 
-### 13. Candidate Extractor Returns Zero (P0 - Architecture Issue)
+### ~~13. Candidate Extractor Returns Zero (P0 - Architecture Issue)~~ RESOLVED
 
-**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive)
+**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive), **RESOLVED 2026-01-09**
 
 **Problem:** The `identify_requirement_candidates` tool returns 0 candidates even for documents containing clear requirements.
 
-**Status:** Root cause identified as **fundamental architecture flaw**. Regex-based extraction cannot handle real-world German legal text.
+**Status:** **RESOLVED**. Replaced regex-based extraction with LLM-based extraction.
+
+**Fix Applied:**
+- Removed `identify_requirement_candidates` from `creator.json` tools list
+- Rewrote Phase 2 in `creator_instructions.md` to have agent read chunks directly
+- Rewrote `creator_identification.txt` phase prompt for LLM-based analysis
+- Agent now uses its language understanding instead of regex patterns
+
+**Files modified:** `creator.json`, `creator_instructions.md`, `creator_identification.txt`
 
 #### Observed Behavior
 
@@ -1611,15 +1621,14 @@ This script would need updates to also query the new `agent_audit` collection.
 | **Tier 3: Quality** | #7 Candidate extractor, #8 Web search guidance | **FIXED** |
 | **Tier 3: Observability** | #14 Agent audit collection | **FIXED** |
 | **Tier 4: Infrastructure** | #9 PostgreSQL schema cleanup | **FIXED** |
+| **Tier 0: Architecture** | #13 Candidate extractor architecture | **FIXED** |
+| **Tier 1: Robustness** | #10 Context overflow | **FIXED** |
+| **Tier 2: Context Management** | #11 Full document read | **FIXED** |
+| **Tier 3: Observability** | #12 Tool error logging | **FIXED** |
 
 ### Open
 
-| Tier | Issues | Status |
-|------|--------|--------|
-| **Tier 0: Architecture** | #13 Candidate extractor (5 sub-issues) | **Open - Architecture Change Required** |
-| **Tier 1: Robustness** | #10 Context overflow (6 sub-issues) | **FIXED** |
-| **Tier 2: Context Management** | #11 Full document read (4 sub-issues) | **FIXED** |
-| **Tier 3: Observability** | #12 Tool error logging (4 sub-issues) | **FIXED** |
+All issues resolved.
 
 ### Fix Order
 
@@ -1638,7 +1647,7 @@ This script would need updates to also query the new `agent_audit` collection.
     ↓
 #10.5-10.6 (observability) → Track token/error state     ✓ DONE
     ↓
-#13 (ARCHITECTURE) → Remove regex extraction, use LLM    ☐ TODO (P0 - BLOCKING)
+#13 (ARCHITECTURE) → Remove regex extraction, use LLM    ✓ DONE
     ↓
 #11 (file size limit) → Claude Code-style pre-read check ✓ DONE (all sub-issues addressed)
     ↓
@@ -1665,16 +1674,16 @@ This script would need updates to also query the new `agent_audit` collection.
 
 **Issues discovered 2026-01-09 from job 19c4de92:**
 - #10: Context overflow infinite loop (P0) - **RESOLVED** (error classification, consecutive error tracking, pre-emptive check, enhanced compaction)
-- #11: **Agent reads full document instead of chunks (P1)** - **RESOLVED** (Claude Code-style file size limit)
+- #11: Agent reads full document instead of chunks (P1) - **RESOLVED** (Claude Code-style file size limit)
 - #12: Tool error logging insufficient (P2) - **RESOLVED** (enhanced logging with tool names, error content, retry outcomes)
-- #13: **Candidate extractor architecture flaw (P0)** - regex approach fundamentally broken, needs LLM-based extraction
-- #14: **Agent audit gap (P2)** - **RESOLVED** (new `agent_audit` collection for complete execution tracing)
+- #13: Candidate extractor architecture flaw (P0) - **RESOLVED** (replaced regex with LLM-based extraction)
+- #14: Agent audit gap (P2) - **RESOLVED** (new `agent_audit` collection for complete execution tracing)
 
 Files modified for resolved issues:
 - `graph.py`: #1, #3, #6, #10, #12 (error classification, consecutive error check, pre-emptive token check, improved logging, enhanced tool error logging)
 - `document_tools.py`: #2, #4
 - `workspace_tools.py`: #11 (pre-read size check, error instead of truncation, 25KB default limit)
-- `creator.json`: #11 (explicit max_read_size config)
+- `creator.json`: #11, #13 (explicit max_read_size config, removed identify_requirement_candidates tool)
 - `run_universal_agent.py`: #5
 - `agent.py`: #5
 - `system_prompt.md`: #8
@@ -1687,4 +1696,6 @@ Files modified for resolved issues:
 - `init_db.py`: #9 (updated table verification)
 - `state.py`: #10 (added `consecutive_llm_errors` field)
 - `context.py`: #10 (enhanced `prepare_messages_for_llm` to call `trim_messages`)
+- `creator_instructions.md`: #13 (rewrote Phase 2 for LLM-based extraction, updated tool listing)
+- `creator_identification.txt`: #13 (rewrote phase prompt for LLM-based analysis)
 - Deleted: `schema_vector.sql`, `checkpoint.py`, `workspace.py`, `vector.py`: #9

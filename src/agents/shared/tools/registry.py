@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Set
 from .context import ToolContext
 from .workspace_tools import create_workspace_tools, WORKSPACE_TOOLS_METADATA
 from .todo_tools import create_todo_tools, TODO_TOOLS_METADATA
-from .vector_tools import create_vector_tools, VECTOR_TOOLS_METADATA
 from .document_tools import create_document_tools, DOCUMENT_TOOLS_METADATA
 from .search_tools import create_search_tools, SEARCH_TOOLS_METADATA
 from .citation_tools import create_citation_tools, CITATION_TOOLS_METADATA
@@ -50,9 +49,6 @@ TOOL_REGISTRY.update(WORKSPACE_TOOLS_METADATA)
 
 # Register todo tools (Phase 3)
 TOOL_REGISTRY.update(TODO_TOOLS_METADATA)
-
-# Register vector tools (Phase 8)
-TOOL_REGISTRY.update(VECTOR_TOOLS_METADATA)
 
 # Register domain tools (Phase 5)
 TOOL_REGISTRY.update(DOCUMENT_TOOLS_METADATA)
@@ -155,36 +151,15 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Workspace tools
     if "workspace" in tools_by_category:
         workspace_tool_names = set(tools_by_category["workspace"])
-
-        # Separate vector tools from regular workspace tools
-        vector_tool_names = workspace_tool_names & set(VECTOR_TOOLS_METADATA.keys())
-        regular_workspace_tool_names = workspace_tool_names - vector_tool_names
-
-        # Load regular workspace tools
-        if regular_workspace_tool_names:
-            if not context.has_workspace():
-                raise ValueError(
-                    "Workspace tools require a workspace_manager in ToolContext"
-                )
-            workspace_tools = create_workspace_tools(context)
-            for tool in workspace_tools:
-                if tool.name in regular_workspace_tool_names:
-                    all_tools.append(tool)
-                    logger.debug(f"Loaded workspace tool: {tool.name}")
-
-        # Load vector tools (require vector_store)
-        if vector_tool_names:
-            if not context.has_vector_store():
-                logger.warning(
-                    f"Vector tools {vector_tool_names} require a vector_store in ToolContext. "
-                    "Skipping vector tools."
-                )
-            else:
-                vector_tools = create_vector_tools(context)
-                for tool in vector_tools:
-                    if tool.name in vector_tool_names:
-                        all_tools.append(tool)
-                        logger.debug(f"Loaded vector tool: {tool.name}")
+        if not context.has_workspace():
+            raise ValueError(
+                "Workspace tools require a workspace_manager in ToolContext"
+            )
+        workspace_tools = create_workspace_tools(context)
+        for tool in workspace_tools:
+            if tool.name in workspace_tool_names:
+                all_tools.append(tool)
+                logger.debug(f"Loaded workspace tool: {tool.name}")
 
     # Todo tools
     if "todo" in tools_by_category:

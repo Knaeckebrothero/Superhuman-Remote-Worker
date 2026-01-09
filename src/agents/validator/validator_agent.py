@@ -38,7 +38,7 @@ from src.core.config import (
     get_validator_recursion_limit,
 )
 from src.agents.shared.context_manager import ContextManager, ContextConfig
-from src.agents.shared.workspace import Workspace
+from src.agents.shared.workspace_manager import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +185,7 @@ class ValidatorAgent:
         self.graph = self._build_graph()
 
         # Workspace for working data
-        self.workspace: Optional[Workspace] = None
+        self.workspace: Optional[WorkspaceManager] = None
 
         # State tracking
         self._shutdown_requested = False

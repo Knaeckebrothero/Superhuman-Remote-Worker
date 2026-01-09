@@ -20,8 +20,7 @@ class ToolContext:
 
     Attributes:
         workspace_manager: WorkspaceManager for file operations
-        todo_manager: TodoManager for task tracking (optional, Phase 3)
-        vector_store: WorkspaceVectorStore for semantic search (optional, Phase 8)
+        todo_manager: TodoManager for task tracking (optional)
         postgres_conn: PostgreSQL connection for database operations
         neo4j_conn: Neo4j connection for graph operations
         config: Additional configuration dictionary
@@ -43,7 +42,6 @@ class ToolContext:
 
     workspace_manager: Optional[WorkspaceManager] = None
     todo_manager: Optional[Any] = None  # TodoManager, imported later to avoid circular deps
-    vector_store: Optional[Any] = None  # WorkspaceVectorStore for semantic search (Phase 8)
     postgres_conn: Optional[Any] = None
     neo4j_conn: Optional[Any] = None
     config: Dict[str, Any] = field(default_factory=dict)
@@ -90,10 +88,6 @@ class ToolContext:
     def has_neo4j(self) -> bool:
         """Check if Neo4j connection is available."""
         return self.neo4j_conn is not None
-
-    def has_vector_store(self) -> bool:
-        """Check if vector store is available for semantic search."""
-        return self.vector_store is not None
 
     def get_config(self, key: str, default: Any = None) -> Any:
         """Get a configuration value.

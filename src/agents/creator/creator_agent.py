@@ -38,7 +38,7 @@ from src.core.postgres_utils import (
     update_job_status,
 )
 from src.agents.shared.context_manager import ContextManager, ContextConfig
-from src.agents.shared.workspace import Workspace
+from src.agents.shared.workspace_manager import WorkspaceManager
 from src.agents.shared.todo_manager import TodoManager
 
 logger = logging.getLogger(__name__)
@@ -174,7 +174,7 @@ class CreatorAgent:
 
         # Runtime state
         self.current_job_id: Optional[str] = None
-        self.workspace: Optional[Workspace] = None
+        self.workspace: Optional[WorkspaceManager] = None
         self.todo_manager: Optional[TodoManager] = None
 
         logger.info("Creator Agent initialized")
@@ -287,11 +287,7 @@ Watch for requirements related to:
         state["should_stop"] = False
 
         # Initialize workspace
-        self.workspace = Workspace(
-            job_id=job_id,
-            agent="creator",
-            postgres_conn=self.postgres_conn
-        )
+        self.workspace = WorkspaceManager(job_id=job_id)
 
         # Initialize todo manager
         self.todo_manager = TodoManager(self.workspace)
