@@ -87,10 +87,10 @@ def create_cache_tools(context: ToolContext) -> List:
             # Generate requirement ID
             req_id = str(uuid.uuid4())
 
-            # Insert into requirement_cache table
+            # Insert into requirements table
             query = """
-                INSERT INTO requirement_cache (
-                    id, job_id, text, name, req_type, priority,
+                INSERT INTO requirements (
+                    id, job_id, text, name, type, priority,
                     source_document, source_location,
                     gobd_relevant, gdpr_relevant,
                     citations, mentioned_objects, mentioned_messages,

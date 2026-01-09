@@ -9,7 +9,6 @@ This script:
 Usage:
     python scripts/init_db.py                    # Create tables if not exist
     python scripts/init_db.py --force-reset      # Drop everything, recreate
-    python scripts/init_db.py --with-vector      # Include pgvector tables
 """
 import logging
 import asyncio
@@ -27,9 +26,8 @@ except ImportError:
     print("Error: asyncpg is required. Install with: pip install asyncpg")
     sys.exit(1)
 
-# Schema files
+# Schema file
 SCHEMA_FILE = project_root / "src" / "database" / "schema.sql"
-SCHEMA_VECTOR_FILE = project_root / "src" / "database" / "schema_vector.sql"
 
 
 def get_connection_string() -> str:
@@ -89,18 +87,23 @@ async def run_schema(connection_string: str, schema_file: Path, name: str) -> bo
         await conn.execute(schema_sql)
         print(f"  Applied {name}")
         return True
-    except asyncpg.exceptions.UndefinedObjectError as e:
-        if "vector" in str(e).lower():
-            print(f"  Skipped {name} (pgvector not installed)")
-            return True
-        raise
     finally:
         await conn.close()
 
 
 async def verify_tables(connection_string: str) -> bool:
-    """Verify required tables exist."""
-    required = ['jobs', 'requirement_cache', 'llm_requests', 'agent_checkpoints', 'candidate_workspace']
+    """Verify required tables exist.
+
+    Note: The schema now only contains 2 tables:
+    - jobs: Job tracking and orchestration
+    - requirements: Primary storage for extracted requirements
+
+    Other data is stored elsewhere:
+    - LLM logging: MongoDB (via llm_archiver.py)
+    - Agent checkpointing: LangGraph's AsyncPostgresSaver (creates its own tables)
+    - Agent workspace: Filesystem (workspace_manager.py)
+    """
+    required = ['jobs', 'requirements']
 
     conn = await asyncpg.connect(connection_string)
     try:
@@ -115,18 +118,12 @@ async def verify_tables(connection_string: str) -> bool:
             if not exists:
                 missing.append(table)
 
-        # Check optional tables
-        vector_exists = await conn.fetchval(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'workspace_embeddings')"
-        )
-        print(f"    workspace_embeddings: {'ok' if vector_exists else 'not installed (optional)'}")
-
         return len(missing) == 0
     finally:
         await conn.close()
 
 
-async def init_database(force_reset: bool = False, with_vector: bool = False) -> bool:
+async def init_database(force_reset: bool = False) -> bool:
     """Initialize the database."""
     connection_string = get_connection_string()
     db_name = connection_string.split('/')[-1].split('?')[0]
@@ -147,10 +144,6 @@ async def init_database(force_reset: bool = False, with_vector: bool = False) ->
     if not await run_schema(connection_string, SCHEMA_FILE, "schema.sql"):
         return False
 
-    # Apply vector schema if requested
-    if with_vector:
-        await run_schema(connection_string, SCHEMA_VECTOR_FILE, "schema_vector.sql")
-
     # Verify
     print("  Verifying tables:")
     return await verify_tables(connection_string)
@@ -168,7 +161,6 @@ def initialize_postgres(logger: logging.Logger, force_reset: bool = False) -> bo
 async def main():
     parser = argparse.ArgumentParser(description="Initialize Graph-RAG PostgreSQL database")
     parser.add_argument("--force-reset", action="store_true", help="Drop all tables and recreate")
-    parser.add_argument("--with-vector", action="store_true", help="Include pgvector tables")
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -182,10 +174,7 @@ async def main():
         print("Mode: FORCE RESET (all data will be deleted!)")
     print()
 
-    success = await init_database(
-        force_reset=args.force_reset,
-        with_vector=args.with_vector
-    )
+    success = await init_database(force_reset=args.force_reset)
 
     print()
     if success:

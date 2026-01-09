@@ -115,7 +115,26 @@ def build_agent_graph(
         3. Initializes context management state
         4. Calls optional initialization callback
         """
-        logger.info(f"Initializing job {state['job_id']}")
+        job_id = state.get("job_id", "unknown")
+        logger.info(f"Initializing job {job_id}")
+
+        # Audit: job initialization
+        auditor = get_archiver()
+        if auditor:
+            auditor.audit_step(
+                job_id=job_id,
+                agent_type=config.agent_id,
+                step_type="initialize",
+                node_name="initialize",
+                iteration=0,
+                data={
+                    "state": {
+                        "has_metadata": bool(state.get("metadata")),
+                        "document_path": state.get("metadata", {}).get("document_path"),
+                    }
+                },
+                metadata=state.get("metadata"),
+            )
 
         # Build initial messages with metadata
         metadata = state.get("metadata", {})
@@ -206,6 +225,30 @@ def build_agent_graph(
                 )
 
         try:
+            job_id = state.get("job_id", "unknown")
+
+            # Audit: LLM call start
+            auditor = get_archiver()
+            if auditor:
+                auditor.audit_step(
+                    job_id=job_id,
+                    agent_type=config.agent_id,
+                    step_type="llm_call",
+                    node_name="process",
+                    iteration=iteration,
+                    data={
+                        "llm": {
+                            "model": config.llm.model,
+                            "input_message_count": len(prepared_messages),
+                        },
+                        "state": {
+                            "message_count": len(messages),
+                            "token_count": token_count,
+                        }
+                    },
+                    metadata=state.get("metadata"),
+                )
+
             # Call LLM with timing
             logger.info(f"Calling LLM ({config.llm.model})...")
             start_time = time.time()
@@ -218,17 +261,46 @@ def build_agent_graph(
                 f"{tool_call_count} tool calls, {latency_ms}ms"
             )
 
-            # Archive to MongoDB
-            archiver = get_archiver()
-            if archiver:
-                archiver.archive(
-                    job_id=state.get("job_id", "unknown"),
+            # Archive to MongoDB (existing llm_requests collection)
+            if auditor:
+                auditor.archive(
+                    job_id=job_id,
                     agent_type=config.agent_id,
                     messages=prepared_messages,
                     response=response,
                     model=config.llm.model,
                     latency_ms=latency_ms,
                     iteration=iteration,
+                    metadata=state.get("metadata"),
+                )
+
+                # Audit: LLM response
+                tool_calls_preview = []
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    for tc in response.tool_calls:
+                        tool_calls_preview.append({
+                            "name": tc.get("name", "unknown"),
+                            "call_id": tc.get("id", ""),
+                        })
+
+                auditor.audit_step(
+                    job_id=job_id,
+                    agent_type=config.agent_id,
+                    step_type="llm_response",
+                    node_name="process",
+                    iteration=iteration,
+                    data={
+                        "llm": {
+                            "model": config.llm.model,
+                            "response_content_preview": response.content[:500] if response.content else "",
+                            "tool_calls": tool_calls_preview,
+                            "metrics": {
+                                "output_chars": len(response.content) if response.content else 0,
+                                "tool_call_count": tool_call_count,
+                            }
+                        }
+                    },
+                    latency_ms=latency_ms,
                     metadata=state.get("metadata"),
                 )
 
@@ -248,6 +320,26 @@ def build_agent_graph(
 
         except Exception as e:
             logger.error(f"LLM invocation error: {e}")
+
+            # Audit: LLM error
+            auditor = get_archiver()
+            if auditor:
+                auditor.audit_step(
+                    job_id=state.get("job_id", "unknown"),
+                    agent_type=config.agent_id,
+                    step_type="error",
+                    node_name="process",
+                    iteration=iteration,
+                    data={
+                        "error": {
+                            "type": "llm_error",
+                            "message": str(e)[:500],
+                            "recoverable": True,
+                        }
+                    },
+                    metadata=state.get("metadata"),
+                )
+
             return {
                 "error": {
                     "message": str(e),
@@ -268,15 +360,42 @@ def build_agent_graph(
         4. Handles errors (write to workspace if non-recoverable)
         5. Calls optional check callback
         """
+        job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
         max_iterations = config.limits.max_iterations
         messages = state.get("messages", [])
         error = state.get("error")
         context_stats = state.get("context_stats") or {}
 
+        # Helper to audit check decisions
+        def audit_check(decision: str, reason: str, should_stop: bool):
+            auditor = get_archiver()
+            if auditor:
+                auditor.audit_step(
+                    job_id=job_id,
+                    agent_type=config.agent_id,
+                    step_type="check",
+                    node_name="check",
+                    iteration=iteration,
+                    data={
+                        "check": {
+                            "decision": decision,
+                            "reason": reason,
+                            "should_stop": should_stop,
+                        },
+                        "state": {
+                            "message_count": len(messages),
+                            "token_count": context_stats.get("current_token_count", 0),
+                            "has_error": bool(error),
+                        }
+                    },
+                    metadata=state.get("metadata"),
+                )
+
         # Check iteration limit
         if iteration >= max_iterations:
             logger.warning(f"Max iterations ({max_iterations}) reached")
+            audit_check("stop", "iteration_limit_reached", True)
             error_info = {
                 "message": f"Max iterations ({max_iterations}) reached",
                 "type": "iteration_limit",
@@ -288,7 +407,7 @@ def build_agent_graph(
                     write_error_to_workspace(
                         workspace_manager,
                         error_info,
-                        {"iteration": iteration, "job_id": state.get("job_id")},
+                        {"iteration": iteration, "job_id": job_id},
                     )
                 )
             return {
@@ -301,6 +420,7 @@ def build_agent_graph(
         token_count = context_stats.get("current_token_count", 0)
         if token_count > config.limits.context_threshold_tokens * 1.5:
             logger.warning(f"Token count ({token_count}) exceeds safe limit")
+            audit_check("stop", "token_limit_exceeded", True)
             error_info = {
                 "message": f"Token count ({token_count}) exceeds safe limit",
                 "type": "token_limit",
@@ -311,7 +431,7 @@ def build_agent_graph(
                     write_error_to_workspace(
                         workspace_manager,
                         error_info,
-                        {"token_count": token_count, "job_id": state.get("job_id")},
+                        {"token_count": token_count, "job_id": job_id},
                     )
                 )
             return {
@@ -323,13 +443,14 @@ def build_agent_graph(
         # Check for non-recoverable errors
         if error and not error.get("recoverable", True):
             logger.error(f"Non-recoverable error: {error.get('message')}")
+            audit_check("stop", "non_recoverable_error", True)
             # Write error to workspace
             if workspace_manager:
                 asyncio.create_task(
                     write_error_to_workspace(
                         workspace_manager,
                         error,
-                        {"iteration": iteration, "job_id": state.get("job_id")},
+                        {"iteration": iteration, "job_id": job_id},
                     )
                 )
             return {"should_stop": True, "iteration": iteration}
@@ -337,18 +458,22 @@ def build_agent_graph(
         # Check for completion signals in recent messages
         if _detect_completion(messages, workspace=workspace_manager):
             logger.info("Completion detected in messages")
+            audit_check("stop", "completion_detected", True)
             return {"should_stop": True, "iteration": iteration}
 
         # Apply custom check if provided
         if on_check:
             custom_state = on_check(state)
             if custom_state:
+                audit_check("custom", "custom_check_triggered", custom_state.get("should_stop", False))
                 return custom_state
 
         # Clear any recoverable errors
         if error and error.get("recoverable"):
+            audit_check("continue", "recoverable_error_cleared", False)
             return {"error": None, "iteration": iteration}
 
+        audit_check("continue", "no_stop_condition", False)
         return {"iteration": iteration}
 
     # Create tool node using LangGraph prebuilt
@@ -363,6 +488,8 @@ def build_agent_graph(
         3. Error tracking per tool
         4. Graceful degradation
         """
+        job_id = state.get("job_id", "unknown")
+        iteration = state.get("iteration", 0)
         retry_state = state.get("tool_retry_state") or {
             "current_retries": {},
             "total_retries": 0,
@@ -376,13 +503,38 @@ def build_agent_graph(
         if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
             return {}
 
+        # Extract tool call info for auditing
+        tool_calls_info = []
+        for tc in last_message.tool_calls:
+            tool_calls_info.append({
+                "name": tc.get("name", "unknown"),
+                "call_id": tc.get("id", ""),
+                "args": tc.get("args", {}),
+            })
+
+        # Audit: tool calls before execution
+        auditor = get_archiver()
+        if auditor:
+            for tc_info in tool_calls_info:
+                auditor.audit_tool_call(
+                    job_id=job_id,
+                    agent_type=config.agent_id,
+                    iteration=iteration,
+                    tool_name=tc_info["name"],
+                    call_id=tc_info["call_id"],
+                    arguments=tc_info["args"],
+                    metadata=state.get("metadata"),
+                )
+
         # Try to execute tools
         attempt = 0
         max_attempts = retry_manager.max_retries
 
         while attempt < max_attempts:
             try:
+                start_time = time.time()
                 result = await tool_node.ainvoke(state)
+                execution_time_ms = int((time.time() - start_time) * 1000)
 
                 # Check if any tool results indicate actual errors
                 # (not just the word "error" appearing in content)
@@ -391,6 +543,28 @@ def build_agent_graph(
                     isinstance(m, ToolMessage) and _is_tool_error(m.content)
                     for m in tool_messages
                 )
+
+                # Audit: tool results after execution
+                if auditor:
+                    # Match results to original calls by tool_call_id
+                    call_id_to_info = {tc["call_id"]: tc for tc in tool_calls_info}
+                    for msg in tool_messages:
+                        if isinstance(msg, ToolMessage):
+                            call_id = getattr(msg, "tool_call_id", "")
+                            tc_info = call_id_to_info.get(call_id, {})
+                            is_error = _is_tool_error(msg.content) if msg.content else False
+                            auditor.audit_tool_result(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                iteration=iteration,
+                                tool_name=tc_info.get("name", getattr(msg, "name", "unknown")),
+                                call_id=call_id,
+                                result=msg.content if msg.content else "",
+                                success=not is_error,
+                                latency_ms=execution_time_ms // max(len(tool_messages), 1),
+                                error=msg.content[:500] if is_error else None,
+                                metadata=state.get("metadata"),
+                            )
 
                 if has_errors and attempt < max_attempts - 1:
                     # Retry on error
@@ -413,6 +587,22 @@ def build_agent_graph(
             except Exception as e:
                 logger.error(f"Tool execution error (attempt {attempt + 1}): {e}")
 
+                # Audit: tool execution exception
+                if auditor:
+                    for tc_info in tool_calls_info:
+                        auditor.audit_tool_result(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            iteration=iteration,
+                            tool_name=tc_info["name"],
+                            call_id=tc_info["call_id"],
+                            result="",
+                            success=False,
+                            latency_ms=0,
+                            error=f"Exception: {str(e)[:500]}",
+                            metadata=state.get("metadata"),
+                        )
+
                 # Record failure for each tool
                 for tool_call in last_message.tool_calls:
                     tool_name = tool_call.get("name", "unknown")
@@ -427,6 +617,26 @@ def build_agent_graph(
                 if attempt >= max_attempts:
                     # All retries exhausted - return error messages
                     logger.error(f"Tool execution failed after {max_attempts} attempts")
+
+                    # Audit: final tool failure
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="error",
+                            node_name="tools",
+                            iteration=iteration,
+                            data={
+                                "error": {
+                                    "type": "tool_error",
+                                    "message": f"Tool execution failed after {max_attempts} attempts: {str(e)[:500]}",
+                                    "tools": [tc["name"] for tc in tool_calls_info],
+                                    "recoverable": True,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                        )
+
                     error_messages = []
                     for tool_call in last_message.tool_calls:
                         error_messages.append(

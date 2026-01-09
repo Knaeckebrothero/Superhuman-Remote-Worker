@@ -275,7 +275,7 @@ class RequirementCacheWriter:
 
             existing = await self.postgres_conn.fetch(
                 """
-                SELECT id FROM requirement_cache
+                SELECT id FROM requirements
                 WHERE job_id = $1
                 AND LOWER(TRIM(text)) = $2
                 LIMIT 1

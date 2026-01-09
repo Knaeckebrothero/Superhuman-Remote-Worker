@@ -96,14 +96,15 @@ def clear_database(client, db_name: str, logger: logging.Logger) -> dict:
 
 
 def create_collections_and_indexes(client, db_name: str, logger: logging.Logger) -> None:
-    """Create collections and indexes for LLM request archiving."""
+    """Create collections and indexes for LLM request archiving and agent audit."""
     db = client[db_name]
 
+    # =========================================================================
     # Collection: llm_requests - stores all LLM API requests and responses
+    # =========================================================================
     llm_requests = db["llm_requests"]
 
-    # Create indexes
-    indexes = [
+    llm_indexes = [
         # Query by job
         ("job_id", {"name": "idx_job_id"}),
         # Query by agent
@@ -117,18 +118,58 @@ def create_collections_and_indexes(client, db_name: str, logger: logging.Logger)
          {"name": "idx_job_agent_time"}),
     ]
 
-    for index_spec, options in indexes:
+    logger.info("  Configuring llm_requests collection...")
+    for index_spec, options in llm_indexes:
         try:
             if isinstance(index_spec, list):
                 llm_requests.create_index(index_spec, **options)
             else:
                 llm_requests.create_index(index_spec, **options)
-            logger.info(f"  Created index: {options['name']}")
+            logger.info(f"    Created index: {options['name']}")
         except Exception as e:
             if "already exists" in str(e).lower():
-                logger.info(f"  Index exists: {options['name']}")
+                logger.info(f"    Index exists: {options['name']}")
             else:
-                logger.warning(f"  Failed to create index {options['name']}: {e}")
+                logger.warning(f"    Failed to create index {options['name']}: {e}")
+
+    # =========================================================================
+    # Collection: agent_audit - stores complete agent execution history
+    # =========================================================================
+    agent_audit = db["agent_audit"]
+
+    audit_indexes = [
+        # Query by job
+        ("job_id", {"name": "idx_audit_job_id"}),
+        # Query by step type (llm_call, tool_call, etc.)
+        ("step_type", {"name": "idx_audit_step_type"}),
+        # Query by node name (initialize, process, tools, check)
+        ("node_name", {"name": "idx_audit_node_name"}),
+        # Query by timestamp
+        ("timestamp", {"name": "idx_audit_timestamp"}),
+        # Primary query: job + step_number for ordered retrieval
+        ([("job_id", 1), ("step_number", 1)],
+         {"name": "idx_audit_job_step"}),
+        # Query by job + iteration for grouping
+        ([("job_id", 1), ("iteration", 1), ("step_number", 1)],
+         {"name": "idx_audit_job_iter_step"}),
+        # Query by job + agent + step_type for filtering
+        ([("job_id", 1), ("agent_type", 1), ("step_type", 1)],
+         {"name": "idx_audit_job_agent_type"}),
+    ]
+
+    logger.info("  Configuring agent_audit collection...")
+    for index_spec, options in audit_indexes:
+        try:
+            if isinstance(index_spec, list):
+                agent_audit.create_index(index_spec, **options)
+            else:
+                agent_audit.create_index(index_spec, **options)
+            logger.info(f"    Created index: {options['name']}")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info(f"    Index exists: {options['name']}")
+            else:
+                logger.warning(f"    Failed to create index {options['name']}: {e}")
 
     logger.info("  Collections and indexes configured")
 

@@ -34,7 +34,7 @@ class RequirementCacheReader:
 
         if requirement:
             # Process requirement...
-            await reader.mark_integrated(requirement["id"], graph_node_id="R-0042")
+            await reader.mark_integrated(requirement["id"], neo4j_id="R-0042")
         ```
     """
 
@@ -69,7 +69,7 @@ class RequirementCacheReader:
         """
         if job_id:
             query = """
-                SELECT * FROM requirement_cache
+                SELECT * FROM requirements
                 WHERE status = 'pending' AND job_id = $1 AND retry_count < $2
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
@@ -78,7 +78,7 @@ class RequirementCacheReader:
             row = await self.conn.fetchrow(query, job_id, self.max_retries)
         else:
             query = """
-                SELECT * FROM requirement_cache
+                SELECT * FROM requirements
                 WHERE status = 'pending' AND retry_count < $1
                 ORDER BY priority DESC, created_at ASC
                 LIMIT 1
@@ -90,7 +90,7 @@ class RequirementCacheReader:
             # Update status to validating
             await self.conn.execute(
                 """
-                UPDATE requirement_cache
+                UPDATE requirements
                 SET status = 'validating', updated_at = $2
                 WHERE id = $1
                 """,
@@ -128,13 +128,13 @@ class RequirementCacheReader:
         """
         if job_id:
             query = """
-                SELECT COUNT(*) FROM requirement_cache
+                SELECT COUNT(*) FROM requirements
                 WHERE status = 'pending' AND job_id = $1 AND retry_count < $2
             """
             return await self.conn.fetchval(query, job_id, self.max_retries)
         else:
             query = """
-                SELECT COUNT(*) FROM requirement_cache
+                SELECT COUNT(*) FROM requirements
                 WHERE status = 'pending' AND retry_count < $1
             """
             return await self.conn.fetchval(query, self.max_retries)
@@ -153,13 +153,13 @@ class RequirementCacheReader:
         """
         if job_id:
             query = """
-                SELECT COUNT(*) FROM requirement_cache
+                SELECT COUNT(*) FROM requirements
                 WHERE status = 'validating' AND job_id = $1
             """
             return await self.conn.fetchval(query, job_id)
         else:
             query = """
-                SELECT COUNT(*) FROM requirement_cache
+                SELECT COUNT(*) FROM requirements
                 WHERE status = 'validating'
             """
             return await self.conn.fetchval(query)
@@ -167,32 +167,32 @@ class RequirementCacheReader:
     async def mark_integrated(
         self,
         requirement_id: uuid.UUID,
-        graph_node_id: str,
+        neo4j_id: str,
         validation_result: Optional[Dict] = None,
     ) -> None:
         """Mark a requirement as successfully integrated.
 
         Args:
             requirement_id: Requirement UUID
-            graph_node_id: Created Neo4j node RID
+            neo4j_id: Created Neo4j node RID
             validation_result: Optional validation details
         """
         await self.conn.execute(
             """
-            UPDATE requirement_cache
+            UPDATE requirements
             SET status = 'integrated',
-                graph_node_id = $2,
+                neo4j_id = $2,
                 validation_result = $3,
                 validated_at = $4,
                 updated_at = $4
             WHERE id = $1
             """,
             requirement_id,
-            graph_node_id,
+            neo4j_id,
             json.dumps(validation_result) if validation_result else None,
             datetime.utcnow()
         )
-        logger.info(f"Marked requirement {requirement_id} as integrated ({graph_node_id})")
+        logger.info(f"Marked requirement {requirement_id} as integrated ({neo4j_id})")
 
     async def mark_rejected(
         self,
@@ -209,7 +209,7 @@ class RequirementCacheReader:
         """
         await self.conn.execute(
             """
-            UPDATE requirement_cache
+            UPDATE requirements
             SET status = 'rejected',
                 rejection_reason = $2,
                 validation_result = $3,
@@ -239,7 +239,7 @@ class RequirementCacheReader:
         """
         # Get current retry count
         row = await self.conn.fetchrow(
-            "SELECT retry_count FROM requirement_cache WHERE id = $1",
+            "SELECT retry_count FROM requirements WHERE id = $1",
             requirement_id
         )
 
@@ -260,7 +260,7 @@ class RequirementCacheReader:
 
         await self.conn.execute(
             """
-            UPDATE requirement_cache
+            UPDATE requirements
             SET status = $2,
                 retry_count = $3,
                 last_error = $4,
@@ -291,7 +291,7 @@ class RequirementCacheReader:
         """
         result = await self.conn.execute(
             """
-            UPDATE requirement_cache
+            UPDATE requirements
             SET status = 'pending',
                 updated_at = $2
             WHERE status = 'validating'
@@ -325,7 +325,7 @@ class RequirementCacheReader:
             Requirement data or None
         """
         row = await self.conn.fetchrow(
-            "SELECT * FROM requirement_cache WHERE id = $1",
+            "SELECT * FROM requirements WHERE id = $1",
             requirement_id
         )
 
@@ -362,7 +362,7 @@ class RequirementCacheReader:
         """
         if status:
             query = """
-                SELECT * FROM requirement_cache
+                SELECT * FROM requirements
                 WHERE job_id = $1 AND status = $2
                 ORDER BY created_at ASC
                 LIMIT $3
@@ -370,7 +370,7 @@ class RequirementCacheReader:
             rows = await self.conn.fetch(query, job_id, status, limit)
         else:
             query = """
-                SELECT * FROM requirement_cache
+                SELECT * FROM requirements
                 WHERE job_id = $1
                 ORDER BY created_at ASC
                 LIMIT $2
@@ -407,7 +407,7 @@ class RequirementCacheReader:
         if job_id:
             query = """
                 SELECT status, COUNT(*) as count
-                FROM requirement_cache
+                FROM requirements
                 WHERE job_id = $1
                 GROUP BY status
             """
@@ -415,7 +415,7 @@ class RequirementCacheReader:
         else:
             query = """
                 SELECT status, COUNT(*) as count
-                FROM requirement_cache
+                FROM requirements
                 GROUP BY status
             """
             rows = await self.conn.fetch(query)

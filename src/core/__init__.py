@@ -37,12 +37,6 @@ try:
         get_pending_requirement,
         update_requirement_status,
         count_requirements_by_status,
-        log_llm_request,
-        save_checkpoint,
-        get_latest_checkpoint,
-        save_workspace_data,
-        get_workspace_data,
-        update_workspace_data,
     )
     _postgres_available = True
 except ImportError:
@@ -102,12 +96,6 @@ if _postgres_available:
         'get_pending_requirement',
         'update_requirement_status',
         'count_requirements_by_status',
-        'log_llm_request',
-        'save_checkpoint',
-        'get_latest_checkpoint',
-        'save_workspace_data',
-        'get_workspace_data',
-        'update_workspace_data',
     ])
 
 # Add citation exports if available

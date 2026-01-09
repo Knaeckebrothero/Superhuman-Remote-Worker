@@ -1,7 +1,11 @@
 """PostgreSQL connection utilities for the Graph-RAG Autonomous Agent System.
 
 This module provides async PostgreSQL connection management for shared state
-between Creator and Validator agents, job tracking, and LLM request logging.
+between Creator and Validator agents, job tracking, and requirement storage.
+
+Note: LLM logging is handled by MongoDB (llm_archiver.py).
+Note: Agent checkpointing is handled by LangGraph's AsyncPostgresSaver.
+Note: Agent workspace is handled by filesystem (workspace_manager.py).
 """
 
 import os
@@ -24,8 +28,7 @@ class PostgresConnection:
     """PostgreSQL connection manager for shared state.
 
     Manages a connection pool to PostgreSQL for efficient async database operations.
-    Used by both Creator and Validator agents for job tracking, requirement caching,
-    and LLM request logging.
+    Used by both Creator and Validator agents for job tracking and requirement storage.
 
     Example:
         ```python
@@ -273,7 +276,7 @@ async def update_job_status(
 
 
 # =============================================================================
-# Requirement Cache Functions
+# Requirement Functions
 # =============================================================================
 
 
@@ -296,7 +299,7 @@ async def create_requirement(
     confidence: float = 0.0,
     tags: Optional[List[str]] = None
 ) -> uuid.UUID:
-    """Create a new requirement in the cache.
+    """Create a new requirement in the database.
 
     Args:
         conn: PostgreSQL connection
@@ -322,7 +325,7 @@ async def create_requirement(
     """
     req_id = await conn.fetchval(
         """
-        INSERT INTO requirement_cache (
+        INSERT INTO requirements (
             job_id, text, name, type, priority, source_document, source_location,
             gobd_relevant, gdpr_relevant, citations, mentioned_objects,
             mentioned_messages, reasoning, research_notes, confidence, tags
@@ -359,7 +362,7 @@ async def get_pending_requirement(
     """
     if job_id:
         query = """
-            SELECT * FROM requirement_cache
+            SELECT * FROM requirements
             WHERE status = 'pending' AND job_id = $1
             ORDER BY created_at ASC
             LIMIT 1
@@ -368,7 +371,7 @@ async def get_pending_requirement(
         row = await conn.fetchrow(query, job_id)
     else:
         query = """
-            SELECT * FROM requirement_cache
+            SELECT * FROM requirements
             WHERE status = 'pending'
             ORDER BY created_at ASC
             LIMIT 1
@@ -379,7 +382,7 @@ async def get_pending_requirement(
     if row:
         # Update status to validating
         await conn.execute(
-            "UPDATE requirement_cache SET status = 'validating' WHERE id = $1",
+            "UPDATE requirements SET status = 'validating' WHERE id = $1",
             row['id']
         )
         return dict(row)
@@ -391,7 +394,7 @@ async def update_requirement_status(
     requirement_id: uuid.UUID,
     status: str,
     validation_result: Optional[Dict] = None,
-    graph_node_id: Optional[str] = None,
+    neo4j_id: Optional[str] = None,
     rejection_reason: Optional[str] = None,
     error: Optional[str] = None
 ) -> None:
@@ -402,7 +405,7 @@ async def update_requirement_status(
         requirement_id: Requirement UUID
         status: New status (integrated, rejected, failed)
         validation_result: Validation result details
-        graph_node_id: Created Neo4j node rid
+        neo4j_id: Created Neo4j node rid
         rejection_reason: Reason for rejection
         error: Error message if failed
     """
@@ -415,9 +418,9 @@ async def update_requirement_status(
         values.append(json.dumps(validation_result))
         idx += 1
 
-    if graph_node_id is not None:
-        updates.append(f"graph_node_id = ${idx}")
-        values.append(graph_node_id)
+    if neo4j_id is not None:
+        updates.append(f"neo4j_id = ${idx}")
+        values.append(neo4j_id)
         idx += 1
 
     if rejection_reason is not None:
@@ -437,7 +440,7 @@ async def update_requirement_status(
         idx += 1
 
     values.append(requirement_id)
-    query = f"UPDATE requirement_cache SET {', '.join(updates)} WHERE id = ${idx}"
+    query = f"UPDATE requirements SET {', '.join(updates)} WHERE id = ${idx}"
     await conn.execute(query, *values)
     logger.info(f"Updated requirement {requirement_id} status to {status}")
 
@@ -458,245 +461,13 @@ async def count_requirements_by_status(
     rows = await conn.fetch(
         """
         SELECT status, COUNT(*) as count
-        FROM requirement_cache
+        FROM requirements
         WHERE job_id = $1
         GROUP BY status
         """,
         job_id
     )
     return {row['status']: row['count'] for row in rows}
-
-
-# =============================================================================
-# LLM Request Logging
-# =============================================================================
-
-
-async def log_llm_request(
-    conn: PostgresConnection,
-    agent: str,
-    model: str,
-    messages: List[Dict],
-    job_id: Optional[uuid.UUID] = None,
-    requirement_id: Optional[uuid.UUID] = None,
-    tools: Optional[List[Dict]] = None,
-    temperature: Optional[float] = None,
-    max_tokens: Optional[int] = None,
-    response: Optional[Dict] = None,
-    completion_tokens: Optional[int] = None,
-    prompt_tokens: Optional[int] = None,
-    total_tokens: Optional[int] = None,
-    duration_ms: Optional[int] = None,
-    error: bool = False,
-    error_message: Optional[str] = None
-) -> uuid.UUID:
-    """Log an LLM API request.
-
-    Args:
-        conn: PostgreSQL connection
-        agent: Agent name (creator, validator, orchestrator)
-        model: Model name
-        messages: Request messages
-        job_id: Associated job UUID
-        requirement_id: Associated requirement UUID
-        tools: Tools provided to model
-        temperature: Temperature setting
-        max_tokens: Max tokens setting
-        response: API response
-        completion_tokens: Completion tokens used
-        prompt_tokens: Prompt tokens used
-        total_tokens: Total tokens used
-        duration_ms: Request duration in milliseconds
-        error: Whether request errored
-        error_message: Error message if applicable
-
-    Returns:
-        UUID of logged request
-    """
-    log_id = await conn.fetchval(
-        """
-        INSERT INTO llm_requests (
-            job_id, requirement_id, agent, model, messages, tools,
-            temperature, max_tokens, response, completion_tokens,
-            prompt_tokens, total_tokens, duration_ms, error, error_message,
-            request_completed_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-        RETURNING id
-        """,
-        job_id, requirement_id, agent, model,
-        json.dumps(messages), json.dumps(tools) if tools else None,
-        temperature, max_tokens,
-        json.dumps(response) if response else None,
-        completion_tokens, prompt_tokens, total_tokens,
-        duration_ms, error, error_message,
-        datetime.utcnow()
-    )
-    return log_id
-
-
-# =============================================================================
-# Checkpoint Functions
-# =============================================================================
-
-
-async def save_checkpoint(
-    conn: PostgresConnection,
-    job_id: uuid.UUID,
-    agent: str,
-    thread_id: str,
-    checkpoint_id: str,
-    checkpoint_data: Dict,
-    checkpoint_ns: str = "",
-    parent_checkpoint_id: Optional[str] = None,
-    metadata: Optional[Dict] = None
-) -> uuid.UUID:
-    """Save agent checkpoint for recovery.
-
-    Args:
-        conn: PostgreSQL connection
-        job_id: Associated job UUID
-        agent: Agent name
-        thread_id: LangGraph thread ID
-        checkpoint_id: Checkpoint ID
-        checkpoint_data: Checkpoint state data
-        checkpoint_ns: Checkpoint namespace
-        parent_checkpoint_id: Parent checkpoint ID
-        metadata: Additional metadata
-
-    Returns:
-        UUID of saved checkpoint
-    """
-    cp_id = await conn.fetchval(
-        """
-        INSERT INTO agent_checkpoints (
-            job_id, agent, thread_id, checkpoint_ns, checkpoint_id,
-            parent_checkpoint_id, checkpoint_data, metadata
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id)
-        DO UPDATE SET checkpoint_data = $7, metadata = $8
-        RETURNING id
-        """,
-        job_id, agent, thread_id, checkpoint_ns, checkpoint_id,
-        parent_checkpoint_id, json.dumps(checkpoint_data),
-        json.dumps(metadata or {})
-    )
-    return cp_id
-
-
-async def get_latest_checkpoint(
-    conn: PostgresConnection,
-    job_id: uuid.UUID,
-    agent: str
-) -> Optional[Dict[str, Any]]:
-    """Get the latest checkpoint for an agent/job.
-
-    Args:
-        conn: PostgreSQL connection
-        job_id: Job UUID
-        agent: Agent name
-
-    Returns:
-        Checkpoint data or None
-    """
-    row = await conn.fetchrow(
-        """
-        SELECT * FROM agent_checkpoints
-        WHERE job_id = $1 AND agent = $2
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        job_id, agent
-    )
-    if row:
-        return dict(row)
-    return None
-
-
-# =============================================================================
-# Workspace Functions
-# =============================================================================
-
-
-async def save_workspace_data(
-    conn: PostgresConnection,
-    job_id: uuid.UUID,
-    workspace_type: str,
-    data: Dict
-) -> uuid.UUID:
-    """Save workspace data for Creator Agent.
-
-    Args:
-        conn: PostgreSQL connection
-        job_id: Job UUID
-        workspace_type: Type of workspace data (chunks, candidates, research, todo)
-        data: Data to save
-
-    Returns:
-        UUID of saved workspace entry
-    """
-    ws_id = await conn.fetchval(
-        """
-        INSERT INTO candidate_workspace (job_id, workspace_type, data)
-        VALUES ($1, $2, $3)
-        ON CONFLICT DO NOTHING
-        RETURNING id
-        """,
-        job_id, workspace_type, json.dumps(data)
-    )
-    return ws_id
-
-
-async def get_workspace_data(
-    conn: PostgresConnection,
-    job_id: uuid.UUID,
-    workspace_type: str
-) -> Optional[Dict]:
-    """Get workspace data.
-
-    Args:
-        conn: PostgreSQL connection
-        job_id: Job UUID
-        workspace_type: Type of workspace data
-
-    Returns:
-        Workspace data or None
-    """
-    row = await conn.fetchrow(
-        """
-        SELECT data FROM candidate_workspace
-        WHERE job_id = $1 AND workspace_type = $2
-        ORDER BY updated_at DESC
-        LIMIT 1
-        """,
-        job_id, workspace_type
-    )
-    if row:
-        return row['data']
-    return None
-
-
-async def update_workspace_data(
-    conn: PostgresConnection,
-    job_id: uuid.UUID,
-    workspace_type: str,
-    data: Dict
-) -> None:
-    """Update workspace data.
-
-    Args:
-        conn: PostgreSQL connection
-        job_id: Job UUID
-        workspace_type: Type of workspace data
-        data: New data
-    """
-    await conn.execute(
-        """
-        UPDATE candidate_workspace
-        SET data = $3
-        WHERE job_id = $1 AND workspace_type = $2
-        """,
-        job_id, workspace_type, json.dumps(data)
-    )
 
 
 # =============================================================================

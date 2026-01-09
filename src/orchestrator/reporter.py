@@ -163,7 +163,7 @@ class Reporter:
                 COUNT(*) FILTER (WHERE priority = 'high') as high_priority,
                 COUNT(*) FILTER (WHERE priority = 'medium') as medium_priority,
                 COUNT(*) FILTER (WHERE priority = 'low') as low_priority
-            FROM requirement_cache
+            FROM requirements
             WHERE job_id = $1
             """,
             job_id
@@ -188,58 +188,37 @@ class Reporter:
     async def get_llm_statistics(self, job_id: uuid.UUID) -> LLMStatistics:
         """Get LLM usage statistics for a job.
 
+        Note: LLM statistics are now stored in MongoDB via llm_archiver.py.
+        This method returns data from the jobs table resource tracking fields.
+
         Args:
             job_id: Job UUID
 
         Returns:
             LLMStatistics dataclass
         """
-        # Aggregate statistics
+        # Get basic stats from jobs table
         row = await self.conn.fetchrow(
             """
-            SELECT
-                COUNT(*) as total_requests,
-                COALESCE(SUM(total_tokens), 0) as total_tokens,
-                COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
-                COALESCE(SUM(completion_tokens), 0) as completion_tokens,
-                COUNT(*) FILTER (WHERE error = true) as error_count,
-                COALESCE(AVG(duration_ms), 0) as avg_duration_ms
-            FROM llm_requests
-            WHERE job_id = $1
+            SELECT total_tokens_used, total_requests
+            FROM jobs
+            WHERE id = $1
             """,
             job_id
         )
 
-        base_stats = dict(row) if row else {}
+        if row:
+            return LLMStatistics(
+                total_requests=row['total_requests'] or 0,
+                total_tokens=row['total_tokens_used'] or 0,
+                prompt_tokens=0,  # Not tracked in jobs table
+                completion_tokens=0,  # Not tracked in jobs table
+                error_count=0,  # Not tracked in jobs table
+                avg_duration_ms=0.0,  # Not tracked in jobs table
+                by_agent={}  # Detailed breakdown available in MongoDB
+            )
 
-        # Get per-agent breakdown
-        agent_rows = await self.conn.fetch(
-            """
-            SELECT
-                agent,
-                COUNT(*) as requests,
-                COALESCE(SUM(total_tokens), 0) as tokens
-            FROM llm_requests
-            WHERE job_id = $1
-            GROUP BY agent
-            """,
-            job_id
-        )
-
-        by_agent = {
-            row['agent']: {'requests': row['requests'], 'tokens': row['tokens']}
-            for row in agent_rows
-        }
-
-        return LLMStatistics(
-            total_requests=base_stats.get('total_requests', 0),
-            total_tokens=base_stats.get('total_tokens', 0),
-            prompt_tokens=base_stats.get('prompt_tokens', 0),
-            completion_tokens=base_stats.get('completion_tokens', 0),
-            error_count=base_stats.get('error_count', 0),
-            avg_duration_ms=float(base_stats.get('avg_duration_ms', 0)),
-            by_agent=by_agent
-        )
+        return LLMStatistics()
 
     async def get_citation_summary(self, job_id: uuid.UUID) -> Dict[str, Any]:
         """Get citation summary for a job.
@@ -253,7 +232,7 @@ class Reporter:
         # Get citation counts from requirements
         rows = await self.conn.fetch(
             """
-            SELECT citations FROM requirement_cache
+            SELECT citations FROM requirements
             WHERE job_id = $1 AND citations IS NOT NULL
             """,
             job_id
@@ -288,7 +267,7 @@ class Reporter:
         """
         rows = await self.conn.fetch(
             """
-            SELECT graph_node_id FROM requirement_cache
+            SELECT graph_node_id FROM requirements
             WHERE job_id = $1 AND status = 'integrated' AND graph_node_id IS NOT NULL
             ORDER BY validated_at
             """,
@@ -425,7 +404,7 @@ ERROR
         rows = await self.conn.fetch(
             """
             SELECT id, name, text, rejection_reason, confidence
-            FROM requirement_cache
+            FROM requirements
             WHERE job_id = $1 AND status = 'rejected'
             ORDER BY validated_at
             """,
@@ -448,7 +427,7 @@ ERROR
         rows = await self.conn.fetch(
             """
             SELECT id, name, text, last_error, retry_count
-            FROM requirement_cache
+            FROM requirements
             WHERE job_id = $1 AND status = 'failed'
             ORDER BY created_at
             """,
