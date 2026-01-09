@@ -22,7 +22,13 @@ Investigation date: 2026-01-08, updated 2026-01-09
 
 **Phase 9 (2026-01-09 - implementation):** Issue #9 **RESOLVED**. Refactored PostgreSQL schema to remove deprecated tables and dead code. Changes: Renamed `requirement_cache` to `requirements` (elevated to proper requirements table with `neo4j_id` field), removed `llm_requests`/`agent_checkpoints`/`candidate_workspace` tables, deleted `schema_vector.sql`, removed 6 dead functions from `postgres_utils.py`, deleted deprecated files (`checkpoint.py`, `workspace.py`, `vector.py`), updated all dependent code.
 
-**Current status:** 10 issues resolved, 4 issues open (with 14 sub-issues total). Server-side context limit fixed. Code-side robustness improvements needed for #10, #11, and #12. Core extraction blocked by #13 - requires architectural change.
+**Phase 10 (2026-01-09 - implementation):** Issue #10 **RESOLVED**. Fixed context overflow infinite loop with 4 phases: (1) Error classification - `_classify_llm_error()` detects non-recoverable errors like context overflow, auth failures; (2) Consecutive error tracking - added `consecutive_llm_errors` state field, stops after 3 failures; (3) Pre-emptive token check - catches overflow before LLM call; (4) Enhanced compaction - `prepare_messages_for_llm()` now calls `trim_messages()` when over threshold.
+
+**Phase 11 (2026-01-09 - implementation):** Issue #11 **RESOLVED**. Implemented Claude Code-style file size checking in `read_file` tool. Changes: Pre-read size check using `stat().st_size`, returns error (not truncated content) when file exceeds limit, lowered default from 100KB to 25KB (~7,500 tokens), added helpful error message suggesting alternatives (search_files, read chunks).
+
+**Phase 12 (2026-01-09 - implementation):** Issue #12 **RESOLVED**. Enhanced tool error logging in `tools_node` with 5 changes: (1) Tool result errors now log tool names and error content; (2) Exception errors now include tool names; (3) Added retry success logging; (4) Final failure log includes tool names and exception; (5) Retry wait log includes tool names.
+
+**Current status:** 13 issues resolved, 1 issue open (#13 - 5 sub-issues). Context overflow loop fixed. File size limit fixed. Tool error logging fixed. Core extraction blocked by #13 - requires architectural change.
 
 ---
 
@@ -156,13 +162,23 @@ Support both backends based on configuration - PostgreSQL for simple deployments
 
 ---
 
-### 10. Context Overflow Infinite Loop (P0)
+### 10. Context Overflow Infinite Loop (P0) - RESOLVED
 
-**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive)
+**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive), **RESOLVED 2026-01-09**
 
 **Problem:** Agent gets stuck in infinite retry loop when context exceeds LLM's limit.
 
-**Status:** Server-side issue **RESOLVED** (user fixed llama.cpp config). Code-side issues **OPEN** (6 sub-issues).
+**Status:** **RESOLVED**. Server-side issue fixed by user. Code-side issues fixed with 4 phases of improvements.
+
+**Fix Applied:**
+- Added `_classify_llm_error()` function to detect non-recoverable errors (context overflow, auth, not found)
+- Added `consecutive_llm_errors` state field to track consecutive failures
+- Added consecutive error check in `check_node` (stops after 3 consecutive errors)
+- Added pre-emptive token check in `process_node` before LLM call
+- Updated `prepare_messages_for_llm()` to call `trim_messages()` when over threshold
+- Improved error logging to show error type and consecutive count
+
+**Files modified:** `state.py`, `graph.py`, `context.py`
 
 #### Observed Behavior
 
@@ -494,13 +510,22 @@ This divided the KV cache by 3, giving each parallel slot only ~43k tokens inste
 
 ---
 
-### 11. Agent Reads Full Document Instead of Chunks (P1)
+### 11. Agent Reads Full Document Instead of Chunks (P1) - RESOLVED
 
-**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive)
+**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive), **RESOLVED 2026-01-09**
 
 **Problem:** Agent reads the entire extracted document file instead of individual chunks, causing a massive context spike.
 
-**Status:** Root causes identified. Multiple contributing factors need fixes.
+**Status:** **RESOLVED**. Implemented Claude Code-style file size limit in `read_file` tool.
+
+**Fix Applied:**
+- Pre-read size check using `stat().st_size` - checks file size BEFORE reading content
+- Returns error message (not truncated content) when file exceeds limit
+- Lowered default `max_read_size` from 100KB to 25KB (~7,500 tokens)
+- Added helpful error message with alternatives (search_files, read chunks)
+- Added explicit `max_read_size: 25000` config to `creator.json`
+
+**Files modified:** `workspace_tools.py`, `creator.json`
 
 #### Observed Behavior
 
@@ -775,13 +800,22 @@ Add to `system_prompt.md`:
 
 ---
 
-### 12. Tool Error Logging Insufficient (P2)
+### 12. Tool Error Logging Insufficient (P2) - RESOLVED
 
-**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive)
+**Investigation date:** 2026-01-09, updated 2026-01-09 (deep dive), **RESOLVED 2026-01-09**
 
 **Problem:** Tool errors are logged without error details, making debugging difficult.
 
-**Status:** Root causes identified. 4 sub-issues discovered covering two distinct error paths.
+**Status:** **RESOLVED**. Enhanced tool error logging with tool names and error content.
+
+**Fix Applied:**
+- Tool result errors now log tool names and error content (12.1, 12.2)
+- Exception errors now include tool names (12.3)
+- Added retry success logging when retries succeed (12.4)
+- Final failure log includes tool names and exception message (12.4)
+- Retry wait log includes tool names (12.4)
+
+**Files modified:** `graph.py`
 
 #### Observed Behavior
 
@@ -1583,9 +1617,9 @@ This script would need updates to also query the new `agent_audit` collection.
 | Tier | Issues | Status |
 |------|--------|--------|
 | **Tier 0: Architecture** | #13 Candidate extractor (5 sub-issues) | **Open - Architecture Change Required** |
-| **Tier 1: Pipeline Broken** | #10 Context overflow (6 sub-issues) | **Open - Critical** |
-| **Tier 2: Context Management** | #11 Full document read (4 sub-issues) | **Open - High** |
-| **Tier 3: Observability** | #12 Tool error logging (4 sub-issues) | **Open - Medium** |
+| **Tier 1: Robustness** | #10 Context overflow (6 sub-issues) | **FIXED** |
+| **Tier 2: Context Management** | #11 Full document read (4 sub-issues) | **FIXED** |
+| **Tier 3: Observability** | #12 Tool error logging (4 sub-issues) | **FIXED** |
 
 ### Fix Order
 
@@ -1598,27 +1632,21 @@ This script would need updates to also query the new `agent_audit` collection.
     ↓
 #10 (server config) → Fix llama.cpp parallel config      ✓ DONE (user fixed)
     ↓
+#10.1-10.2 (error handling) → Prevent infinite loops     ✓ DONE
+    ↓
+#10.3 (compaction) → Better context management           ✓ DONE
+    ↓
+#10.5-10.6 (observability) → Track token/error state     ✓ DONE
+    ↓
 #13 (ARCHITECTURE) → Remove regex extraction, use LLM    ☐ TODO (P0 - BLOCKING)
     ↓
-#10.1-10.2 (error handling) → Prevent infinite loops     ☐ TODO (P0)
+#11 (file size limit) → Claude Code-style pre-read check ✓ DONE (all sub-issues addressed)
     ↓
-#10.3-10.4 (compaction) → Better context management      ☐ TODO (P1)
+#12.1-12.2 (tool logging) → Add tool name and error content  ✓ DONE
     ↓
-#11.1 (expose path) → Stop inviting agent to read full   ☐ TODO (P1)
+#12.3 (exception logging) → Add tool name to exceptions  ✓ DONE
     ↓
-#11.4 (instructions) → Add explicit chunk guidance       ☐ TODO (P1)
-    ↓
-#11.2 (max_read_size) → Reduce from 100KB to 10KB        ☐ TODO (P1)
-    ↓
-#11.3 (pre-check) → Add file size warning                ☐ TODO (P2)
-    ↓
-#10.5-10.6 (observability) → Track token/error state     ☐ TODO (P2)
-    ↓
-#12.1-12.2 (tool logging) → Add tool name and error content  ☐ TODO (P2)
-    ↓
-#12.3 (exception logging) → Add tool name to exceptions  ☐ TODO (P2)
-    ↓
-#12.4 (retry outcome) → Log retry success/failure        ☐ TODO (P3)
+#12.4 (retry outcome) → Log retry success/failure        ✓ DONE
     ↓
 #14.4 (agent_audit) → Create new audit collection         ☐ TODO (P2)
     ↓
@@ -1636,15 +1664,17 @@ This script would need updates to also query the new `agent_audit` collection.
 ```
 
 **Issues discovered 2026-01-09 from job 19c4de92:**
-- #10: Context overflow infinite loop (P0) - server issue RESOLVED, 6 code sub-issues open
-- #11: Agent reads full document instead of chunks (P1) - 4 sub-issues identified
-- #12: Tool error logging insufficient (P2) - 4 sub-issues identified (two error paths in tools_node)
+- #10: Context overflow infinite loop (P0) - **RESOLVED** (error classification, consecutive error tracking, pre-emptive check, enhanced compaction)
+- #11: **Agent reads full document instead of chunks (P1)** - **RESOLVED** (Claude Code-style file size limit)
+- #12: Tool error logging insufficient (P2) - **RESOLVED** (enhanced logging with tool names, error content, retry outcomes)
 - #13: **Candidate extractor architecture flaw (P0)** - regex approach fundamentally broken, needs LLM-based extraction
-- #14: **Agent audit gap (P2)** - 6 sub-issues identified (token counts, tool calls format, no tool archiving, single collection, no unified tracking, silent failures). Recommended new `agent_audit` collection for complete execution tracing.
+- #14: **Agent audit gap (P2)** - **RESOLVED** (new `agent_audit` collection for complete execution tracing)
 
 Files modified for resolved issues:
-- `graph.py`: #1, #3, #6
+- `graph.py`: #1, #3, #6, #10, #12 (error classification, consecutive error check, pre-emptive token check, improved logging, enhanced tool error logging)
 - `document_tools.py`: #2, #4
+- `workspace_tools.py`: #11 (pre-read size check, error instead of truncation, 25KB default limit)
+- `creator.json`: #11 (explicit max_read_size config)
 - `run_universal_agent.py`: #5
 - `agent.py`: #5
 - `system_prompt.md`: #8
@@ -1655,4 +1685,6 @@ Files modified for resolved issues:
 - `cache_writer.py`, `cache_reader.py`: #9 (updated table references)
 - `cache_tools.py`: #9 (updated table references)
 - `init_db.py`: #9 (updated table verification)
+- `state.py`: #10 (added `consecutive_llm_errors` field)
+- `context.py`: #10 (enhanced `prepare_messages_for_llm` to call `trim_messages`)
 - Deleted: `schema_vector.sql`, `checkpoint.py`, `workspace.py`, `vector.py`: #9

@@ -48,6 +48,7 @@ class UniversalAgentState(TypedDict):
     iteration: int
     error: Optional[Dict[str, Any]]
     should_stop: bool
+    consecutive_llm_errors: int
 
     # Job metadata (flexible, agent-type specific)
     # For Creator: document_path, prompt, etc.
@@ -95,6 +96,7 @@ def create_initial_state(
         iteration=0,
         error=None,
         should_stop=False,
+        consecutive_llm_errors=0,
         metadata=metadata or {},
         context_stats=None,
         tool_retry_state=None,

@@ -359,7 +359,7 @@ class ContextManager:
         Applies the following in order:
         1. Clear old tool results (if aggressive or above threshold)
         2. Truncate long tool results
-        3. Ensure message structure is valid
+        3. Trim messages if still over threshold
 
         Args:
             messages: Original message list
@@ -380,6 +380,15 @@ class ContextManager:
 
         # Step 2: Truncate long results in remaining messages
         messages = self.truncate_long_tool_results(messages)
+
+        # Step 3: If STILL above threshold, trim messages
+        new_token_count = self.get_token_count(messages)
+        if new_token_count > self.config.compaction_threshold_tokens:
+            logger.warning(
+                f"Context still at {new_token_count} tokens after tool compaction, "
+                f"trimming messages (threshold: {self.config.compaction_threshold_tokens})"
+            )
+            messages = self.trim_messages(messages)
 
         return messages
 

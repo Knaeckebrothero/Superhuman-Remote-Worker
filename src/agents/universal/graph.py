@@ -45,6 +45,49 @@ from .context import (
 
 logger = logging.getLogger(__name__)
 
+# Maximum consecutive LLM errors before stopping
+MAX_CONSECUTIVE_LLM_ERRORS = 3
+
+
+def _classify_llm_error(exception: Exception) -> tuple[str, bool]:
+    """Classify LLM errors to determine recoverability.
+
+    Some errors (like context overflow, auth failures) cannot be fixed by
+    retrying with the same request. Others (like rate limits, network issues)
+    are transient and may succeed on retry.
+
+    Args:
+        exception: The exception raised during LLM invocation
+
+    Returns:
+        Tuple of (error_type, is_recoverable)
+    """
+    error_str = str(exception).lower()
+
+    # Context overflow - NOT recoverable (need to reduce context first)
+    if any(t in error_str for t in ["context", "ctx", "token"]) and \
+       any(t in error_str for t in ["exceed", "limit", "overflow", "too long"]):
+        return "context_overflow", False
+
+    # Authentication errors - NOT recoverable (config issue)
+    if any(t in error_str for t in ["401", "403", "authentication", "api key", "unauthorized"]):
+        return "auth_error", False
+
+    # Model not found - NOT recoverable (config issue)
+    if any(t in error_str for t in ["404", "model not found", "does not exist"]):
+        return "not_found", False
+
+    # Rate limiting - recoverable with backoff
+    if any(t in error_str for t in ["429", "rate limit", "too many requests"]):
+        return "rate_limit", True
+
+    # Network/timeout errors - recoverable
+    if any(t in error_str for t in ["timeout", "connection", "network", "reset"]):
+        return "network_error", True
+
+    # Default: assume recoverable for unknown errors
+    return "llm_error", True
+
 
 def build_agent_graph(
     llm_with_tools: BaseChatModel,
@@ -224,6 +267,34 @@ def build_agent_graph(
                     HumanMessage(content="Please continue with your task.")
                 )
 
+        # Pre-emptive token check - catch context overflow BEFORE LLM call
+        prepared_token_count = context_manager.get_token_count(prepared_messages)
+        if prepared_token_count > config.limits.context_threshold_tokens:
+            logger.warning(
+                f"Context ({prepared_token_count} tokens) exceeds threshold "
+                f"({config.limits.context_threshold_tokens}) after compaction, attempting trim"
+            )
+            # Try more aggressive trimming
+            prepared_messages = context_manager.trim_messages(prepared_messages, keep_recent=10)
+            prepared_token_count = context_manager.get_token_count(prepared_messages)
+
+            # If STILL too large, fail gracefully instead of hitting LLM error
+            if prepared_token_count > config.limits.context_threshold_tokens:
+                error_msg = (
+                    f"Context ({prepared_token_count} tokens) cannot be reduced below "
+                    f"threshold ({config.limits.context_threshold_tokens})"
+                )
+                logger.error(error_msg)
+                return {
+                    "error": {
+                        "message": error_msg,
+                        "type": "context_overflow",
+                        "recoverable": False,
+                    },
+                    "iteration": iteration + 1,
+                    "consecutive_llm_errors": state.get("consecutive_llm_errors", 0) + 1,
+                }
+
         try:
             job_id = state.get("job_id", "unknown")
 
@@ -316,12 +387,17 @@ def build_agent_graph(
                 "messages": [response],
                 "iteration": iteration + 1,
                 "context_stats": context_stats,
+                "consecutive_llm_errors": 0,  # Reset on success
             }
 
         except Exception as e:
-            logger.error(f"LLM invocation error: {e}")
+            # Classify error to determine recoverability
+            error_type, is_recoverable = _classify_llm_error(e)
+            logger.error(
+                f"LLM invocation error ({error_type}, recoverable={is_recoverable}): {e}"
+            )
 
-            # Audit: LLM error
+            # Audit: LLM error with classification
             auditor = get_archiver()
             if auditor:
                 auditor.audit_step(
@@ -332,9 +408,9 @@ def build_agent_graph(
                     iteration=iteration,
                     data={
                         "error": {
-                            "type": "llm_error",
+                            "type": error_type,
                             "message": str(e)[:500],
-                            "recoverable": True,
+                            "recoverable": is_recoverable,
                         }
                     },
                     metadata=state.get("metadata"),
@@ -343,11 +419,12 @@ def build_agent_graph(
             return {
                 "error": {
                     "message": str(e),
-                    "type": "llm_error",
-                    "recoverable": True,
+                    "type": error_type,
+                    "recoverable": is_recoverable,
                     "traceback": traceback.format_exc(),
                 },
                 "iteration": iteration + 1,
+                "consecutive_llm_errors": state.get("consecutive_llm_errors", 0) + 1,
             }
 
     def check_node(state: UniversalAgentState) -> Dict[str, Any]:
@@ -416,6 +493,37 @@ def build_agent_graph(
                 "iteration": iteration,
             }
 
+        # Check consecutive LLM error limit
+        consecutive_errors = state.get("consecutive_llm_errors", 0)
+        if consecutive_errors >= MAX_CONSECUTIVE_LLM_ERRORS:
+            last_error_msg = error.get("message", "unknown") if error else "unknown"
+            logger.error(
+                f"Stopped after {consecutive_errors} consecutive LLM errors. "
+                f"Last error: {last_error_msg[:200]}"
+            )
+            audit_check("stop", "consecutive_llm_error_limit", True)
+            error_info = {
+                "message": (
+                    f"Stopped after {consecutive_errors} consecutive LLM errors. "
+                    f"Last: {last_error_msg[:200]}"
+                ),
+                "type": "consecutive_llm_errors",
+                "recoverable": False,
+            }
+            if workspace_manager:
+                asyncio.create_task(
+                    write_error_to_workspace(
+                        workspace_manager,
+                        error_info,
+                        {"consecutive_errors": consecutive_errors, "job_id": job_id},
+                    )
+                )
+            return {
+                "should_stop": True,
+                "error": error_info,
+                "iteration": iteration,
+            }
+
         # Check token limit - if extremely high, force stop
         token_count = context_stats.get("current_token_count", 0)
         if token_count > config.limits.context_threshold_tokens * 1.5:
@@ -468,8 +576,14 @@ def build_agent_graph(
                 audit_check("custom", "custom_check_triggered", custom_state.get("should_stop", False))
                 return custom_state
 
-        # Clear any recoverable errors
+        # Clear any recoverable errors (with visibility for debugging)
         if error and error.get("recoverable"):
+            consecutive_errors = state.get("consecutive_llm_errors", 0)
+            logger.info(
+                f"Clearing recoverable error (type={error.get('type')}, "
+                f"consecutive={consecutive_errors}/{MAX_CONSECUTIVE_LLM_ERRORS}): "
+                f"{error.get('message', 'unknown')[:100]}"
+            )
             audit_check("continue", "recoverable_error_cleared", False)
             return {"error": None, "iteration": iteration}
 
@@ -572,12 +686,23 @@ def build_agent_graph(
                     retry_manager.record_retry()
                     retry_state["total_retries"] = retry_manager._total_retries
                     delay = retry_manager.get_retry_delay(attempt)
+                    # Extract tool names and error content for logging
+                    tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]
+                    error_contents = [
+                        m.content[:200] for m in tool_messages
+                        if isinstance(m, ToolMessage) and _is_tool_error(m.content)
+                    ]
                     logger.warning(
-                        f"Tool error detected, retrying ({attempt}/{max_attempts}) "
-                        f"after {delay:.1f}s"
+                        f"Tool error for {tool_names}, retrying ({attempt}/{max_attempts}) "
+                        f"after {delay:.1f}s. Error: {error_contents[0] if error_contents else 'unknown'}"
                     )
                     await asyncio.sleep(delay)
                     continue
+
+                # Log retry success if we had previous attempts
+                if attempt > 0:
+                    tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]
+                    logger.info(f"Tool retry succeeded after {attempt} attempt(s) for {tool_names}")
 
                 return {
                     **result,
@@ -585,7 +710,8 @@ def build_agent_graph(
                 }
 
             except Exception as e:
-                logger.error(f"Tool execution error (attempt {attempt + 1}): {e}")
+                tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]
+                logger.error(f"Tool execution error for {tool_names} (attempt {attempt + 1}): {e}")
 
                 # Audit: tool execution exception
                 if auditor:
@@ -616,7 +742,7 @@ def build_agent_graph(
 
                 if attempt >= max_attempts:
                     # All retries exhausted - return error messages
-                    logger.error(f"Tool execution failed after {max_attempts} attempts")
+                    logger.error(f"Tool execution failed for {tool_names} after {max_attempts} attempts: {e}")
 
                     # Audit: final tool failure
                     if auditor:
@@ -661,7 +787,7 @@ def build_agent_graph(
 
                 # Wait before retry (exponential backoff)
                 delay = retry_manager.get_retry_delay(attempt)
-                logger.info(f"Waiting {delay:.1f}s before retry {attempt + 1}")
+                logger.info(f"Waiting {delay:.1f}s before retry {attempt + 1} for {tool_names}")
                 await asyncio.sleep(delay)
 
         # Should not reach here, but handle gracefully

@@ -34,7 +34,7 @@ def create_workspace_tools(context: ToolContext) -> List:
         raise ValueError("ToolContext must have a workspace_manager for workspace tools")
 
     workspace = context.workspace_manager
-    max_read_size = context.get_config("max_read_size", 100_000)  # 100KB default
+    max_read_size = context.get_config("max_read_size", 25_000)  # 25KB default (~7,500 tokens)
     max_search_results = context.get_config("max_search_results", 50)
 
     @tool
@@ -51,17 +51,30 @@ def create_workspace_tools(context: ToolContext) -> List:
             File content or error message
         """
         try:
-            content = workspace.read_file(path)
+            # Check file size BEFORE reading to prevent context overflow
+            if not workspace.exists(path):
+                return f"Error: File not found: {path}"
 
-            # Truncate very large files to prevent context overflow
-            if len(content) > max_read_size:
-                truncated = content[:max_read_size]
+            full_path = workspace.get_path(path)
+            if full_path.is_dir():
+                return f"Error: '{path}' is a directory, not a file. Use list_files to see its contents."
+
+            file_size = full_path.stat().st_size
+
+            # Reject files that are too large - similar to Claude Code's approach
+            if file_size > max_read_size:
+                estimated_tokens = file_size // 4  # Rough estimate: ~4 chars per token
+                max_tokens = max_read_size // 4
                 return (
-                    f"{truncated}\n\n"
-                    f"[TRUNCATED: File is {len(content):,} bytes, showing first {max_read_size:,}. "
-                    f"Use search_files to find specific content.]"
+                    f"Error: File '{path}' ({file_size:,} bytes, ~{estimated_tokens:,} tokens) "
+                    f"exceeds maximum allowed size ({max_read_size:,} bytes, ~{max_tokens:,} tokens).\n\n"
+                    f"Alternatives:\n"
+                    f"- Use search_files('{path.split('/')[-1].split('.')[0]}') to find specific content\n"
+                    f"- Read individual chunks from the chunks/ directory instead\n"
+                    f"- For document content, always prefer reading from chunks/chunk_XXX.txt files"
                 )
 
+            content = workspace.read_file(path)
             return content
 
         except FileNotFoundError:
