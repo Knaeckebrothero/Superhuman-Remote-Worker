@@ -17,10 +17,6 @@
       "archive/",
       "documents/",
       "notes/",
-      "chunks/",
-      "candidates/",
-      "requirements/",
-      "output/",
       "tools/"
     ],
     "instructions_template": "creator_instructions.md",
@@ -42,17 +38,12 @@
       "get_workspace_summary"
     ],
     "todo": [
-      "add_todo",
-      "complete_todo",
-      "start_todo",
-      "list_todos",
-      "get_progress",
-      "archive_and_reset",
-      "get_next_todo"
+      "todo_write",
+      "archive_and_reset"
     ],
     "domain": [
       "extract_document_text",
-      "chunk_document",
+      "get_document_info",
       "web_search",
       "cite_document",
       "cite_web",
@@ -70,7 +61,9 @@
   "todo": {
     "max_items": 25,
     "archive_on_reset": true,
-    "archive_path": "archive/"
+    "archive_path": "archive/",
+    "auto_reflection": true,
+    "reflection_task_content": "Review plan in plans/main_plan.md, update with progress, adjust if needed, create next todos"
   },
 
   "connections": {
@@ -98,7 +91,11 @@
   "context_management": {
     "compact_on_archive": true,
     "keep_recent_tool_results": 5,
-    "summarization_prompt": "Summarize the work completed so far. Focus on: (1) Which document chunks have been processed, (2) How many requirement candidates have been identified, (3) What research has been completed, (4) Current progress on the plan. Include any key decisions made."
+    "summarization_prompt": "Summarize the work completed so far. Focus on: (1) Which document chunks have been processed, (2) How many requirement candidates have been identified, (3) What research has been completed, (4) Current progress on the plan. Include any key decisions made.",
+    "protected_context_enabled": true,
+    "protected_context_plan_file": "plans/main_plan.md",
+    "protected_context_max_chars": 2000,
+    "protected_context_include_todos": true
   },
 
   "document_processing": {

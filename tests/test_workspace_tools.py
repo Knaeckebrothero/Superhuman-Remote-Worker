@@ -40,6 +40,10 @@ context_path = project_root / "src" / "agents" / "shared" / "tools" / "context.p
 context_module = _import_module_directly(context_path, "src.agents.shared.tools.context")
 ToolContext = context_module.ToolContext
 
+# Import pdf_utils before workspace_tools (workspace_tools has a relative import to pdf_utils)
+pdf_utils_path = project_root / "src" / "agents" / "shared" / "tools" / "pdf_utils.py"
+pdf_utils_module = _import_module_directly(pdf_utils_path, "src.agents.shared.tools.pdf_utils")
+
 workspace_tools_path = project_root / "src" / "agents" / "shared" / "tools" / "workspace_tools.py"
 workspace_tools_module = _import_module_directly(workspace_tools_path, "src.agents.shared.tools.workspace_tools")
 create_workspace_tools = workspace_tools_module.create_workspace_tools
@@ -48,6 +52,7 @@ WORKSPACE_TOOLS_METADATA = workspace_tools_module.WORKSPACE_TOOLS_METADATA
 # Create a fake package for the tools module to enable relative imports
 tools_package = ModuleType("src.agents.shared.tools")
 tools_package.context = context_module
+tools_package.pdf_utils = pdf_utils_module
 tools_package.workspace_tools = workspace_tools_module
 tools_package.ToolContext = ToolContext
 tools_package.create_workspace_tools = workspace_tools_module.create_workspace_tools
@@ -84,12 +89,18 @@ graph_tools_path = project_root / "src" / "agents" / "shared" / "tools" / "graph
 graph_tools_module = _import_module_directly(graph_tools_path, "src.agents.shared.tools.graph_tools")
 tools_package.graph_tools = graph_tools_module
 
-# Import vector tools (Phase 8)
+# Import vector tools (Phase 8) - optional, may not exist yet
 vector_tools_path = project_root / "src" / "agents" / "shared" / "tools" / "vector_tools.py"
-vector_tools_module = _import_module_directly(vector_tools_path, "src.agents.shared.tools.vector_tools")
-tools_package.vector_tools = vector_tools_module
-tools_package.create_vector_tools = vector_tools_module.create_vector_tools
-tools_package.VECTOR_TOOLS_METADATA = vector_tools_module.VECTOR_TOOLS_METADATA
+if vector_tools_path.exists():
+    vector_tools_module = _import_module_directly(vector_tools_path, "src.agents.shared.tools.vector_tools")
+    tools_package.vector_tools = vector_tools_module
+    tools_package.create_vector_tools = vector_tools_module.create_vector_tools
+    tools_package.VECTOR_TOOLS_METADATA = vector_tools_module.VECTOR_TOOLS_METADATA
+
+# Import completion tools (needed by registry)
+completion_tools_path = project_root / "src" / "agents" / "shared" / "tools" / "completion_tools.py"
+completion_tools_module = _import_module_directly(completion_tools_path, "src.agents.shared.tools.completion_tools")
+tools_package.completion_tools = completion_tools_module
 
 # Now import registry
 registry_path = project_root / "src" / "agents" / "shared" / "tools" / "registry.py"
@@ -235,7 +246,7 @@ class TestReadFileTool:
         read_tool = next(t for t in tools if t.name == "read_file")
         result = read_tool.invoke({"path": "large.txt"})
 
-        assert "TRUNCATED" in result
+        assert "exceeds maximum allowed size" in result
         assert "1,000 bytes" in result
 
     def test_read_path_traversal_blocked(self, workspace_tools):
@@ -442,7 +453,7 @@ class TestToolRegistry:
         assert "write_file" in workspace_tools
 
         todo_tools = get_tools_by_category("todo")
-        assert "add_todo" in todo_tools
+        assert "todo_write" in todo_tools
 
     def test_get_categories(self):
         """Test getting all categories."""

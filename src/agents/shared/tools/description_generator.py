@@ -50,19 +50,27 @@ def _get_hardcoded_docstrings() -> Dict[str, str]:
         # Workspace tools
         "read_file": """Read content from a file in the workspace.
 
-Use this to retrieve previously written files, read instructions,
-or access any file in your workspace.
+Use this to retrieve files, read instructions, or access documents.
+For PDF files, supports page-based access with auto-pagination.
 
 **Arguments:**
-- `path` (str): Relative path to the file (e.g., "plans/main_plan.md")
+- `path` (str): Relative path to the file (e.g., "documents/GoBD.pdf")
+- `page_start` (int, optional): For PDFs: first page to read (1-indexed, default: 1)
+- `page_end` (int, optional): For PDFs: last page to read (default: auto-limit by size)
 
-**Returns:** File content or error message
+**Returns:** File content or error message. For PDFs, includes page info and continuation guidance.
 
-**Example:**
+**Examples:**
 ```
-read_file("instructions.md")
-read_file("chunks/chunk_001.txt")
-```""",
+read_file("instructions.md")                           # Read text file
+read_file("documents/GoBD.pdf")                        # Read PDF (auto-paginates)
+read_file("documents/GoBD.pdf", page_start=5, page_end=10)  # Read specific pages
+```
+
+**PDF Behavior:**
+- Without page_end: Reads pages until reaching size limit (~25KB), then provides continuation guidance
+- With page_end: Reads exactly the specified page range
+- Each page is marked with [PAGE N] headers for reference""",
 
         "write_file": """Write content to a file in the workspace.
 
@@ -160,6 +168,40 @@ Returns information about the workspace including:
 Use this to understand what's in your workspace.
 
 **Returns:** Workspace summary with statistics""",
+
+        "get_document_info": """Get metadata about a document without reading its full content.
+
+Use this to plan how to read large documents, especially PDFs.
+Returns page count, estimated size, and reading suggestions.
+
+**Arguments:**
+- `path` (str): Relative path to the document (e.g., "documents/GoBD.pdf")
+
+**Returns:** Document information including:
+- Page count (for PDFs)
+- Estimated characters/tokens
+- File size in bytes
+- Document metadata (title, author if available)
+- Suggested reading approach based on document size
+
+**Example:**
+```
+get_document_info("documents/GoBD.pdf")
+```
+
+**Sample Output:**
+```
+Document: GoBD.pdf
+Pages: 45
+File size: 2,300,000 bytes
+Estimated content: ~180,000 chars (~45,000 tokens)
+Average per page: ~4,000 chars (~1,000 tokens)
+
+Suggested approach (document exceeds single-read limit):
+- Read ~6 pages at a time
+- Start with: read_file("documents/GoBD.pdf", page_start=1, page_end=6)
+- Continue with: read_file("documents/GoBD.pdf", page_start=7, page_end=12)
+```""",
 
         # Todo tools
         "add_todo": """Add a task to the current todo list.
@@ -263,20 +305,23 @@ Writes chunks to `chunks/chunk_001.txt` through `chunks/chunk_XXX.txt`.
 
 **Arguments:**
 - `file_path` (str): Path to the document (relative to workspace or absolute)
-- `strategy` (str, optional): Chunking strategy - 'legal', 'technical', or 'general' (default: 'legal')
-- `max_chunk_size` (int, optional): Maximum characters per chunk (default: 1000)
-- `overlap` (int, optional): Characters to overlap between chunks (default: 200)
+- `strategy` (str, optional): Chunking strategy - 'legal', 'technical', 'general', or 'by_page' (default: 'legal')
+- `max_chunk_size` (int, optional): Override max chars per chunk (default: uses preset)
+- `overlap` (int, optional): Override overlap between chunks (default: uses preset)
 
 **Strategies:**
-- **legal**: Respects section boundaries (Article, Section, Paragraph markers)
-- **technical**: Preserves code blocks and technical structure
-- **general**: Simple character-based splitting
+- **legal**: Large chunks (~5000 chars) respecting section boundaries (Article, Section, Paragraph)
+- **technical**: Medium chunks (~3500 chars) preserving code blocks and technical structure
+- **general**: Standard chunks (~2000 chars) with simple character-based splitting
+- **by_page**: One chunk per page - useful for page-level citations and analysis
 
 **Returns:** Summary of chunking results with statistics
 
-**Example:**
+**Examples:**
 ```
-chunk_document("documents/contract.pdf", strategy="legal", max_chunk_size=2000)
+chunk_document("documents/contract.pdf")                     # Uses legal strategy
+chunk_document("documents/api_spec.pdf", strategy="technical")
+chunk_document("documents/report.pdf", strategy="by_page")   # One chunk per page
 ```""",
 
         "identify_requirement_candidates": """Identify requirement-like statements in text.

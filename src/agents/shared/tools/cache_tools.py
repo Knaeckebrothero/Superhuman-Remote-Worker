@@ -97,14 +97,14 @@ def create_cache_tools(context: ToolContext) -> List:
             confidence: Confidence score (0.0-1.0)
 
         Returns:
-            Requirement ID and confirmation
+            "ok: {uuid}" on success, "error: {reason}" on failure
         """
         try:
             if not context.postgres_conn:
-                return "Error: No database connection available"
+                return "error: no database connection"
 
             if not context.job_id:
-                return "Error: No active job context"
+                return "error: no job context"
 
             # Parse comma-separated lists
             citation_list = [c.strip() for c in (citations or "").split(",") if c.strip()]
@@ -160,26 +160,13 @@ def create_cache_tools(context: ToolContext) -> List:
             )
 
             if result:
-                return f"""Requirement Added Successfully
-
-Requirement ID: {req_id}
-Name: {name}
-Type: {req_type}
-Priority: {priority}
-Confidence: {confidence:.2f}
-
-GoBD Relevant: {gobd_relevant}
-GDPR Relevant: {gdpr_relevant}
-
-Status: pending (awaiting validation)
-
-The Validator Agent will process this requirement and integrate it into Neo4j."""
+                return f"ok: {req_id}"
             else:
-                return "Error: Requirement not created"
+                return "error: requirement not created"
 
         except Exception as e:
             logger.error(f"Error adding requirement: {e}")
-            return f"Error adding requirement: {str(e)}"
+            return f"error: {str(e)}"
 
     @tool
     async def list_requirements(

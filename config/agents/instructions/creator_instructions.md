@@ -11,7 +11,7 @@ Extract well-formed, citation-backed requirements from documents and prepare the
 1. **Read this file** to understand your task
 2. **Create a plan** in `plans/main_plan.md` outlining your approach
 3. **Use todos** to track your immediate tasks (10-20 steps at a time)
-4. **Write intermediate results** to files to free up context
+4. **Write notes** to `notes/` to free up context
 5. **Archive and reset** todos when completing each phase
 6. **Check your plan** frequently to stay on track
 
@@ -22,7 +22,9 @@ Extract well-formed, citation-backed requirements from documents and prepare the
 These tools are fundamental and you can use them immediately without reading additional documentation.
 
 **Workspace Tools:**
-- `read_file(path)` - Read files from your workspace
+- `read_file(path)` - Read files from your workspace (supports PDFs with page access)
+- `read_file(path, page_start, page_end)` - Read specific pages from a PDF
+- `get_document_info(path)` - Get document metadata (page count, size) before reading
 - `write_file(path, content)` - Write content to workspace files
 - `append_file(path, content)` - Append to existing files
 - `list_files(path)` - List directory contents
@@ -30,14 +32,35 @@ These tools are fundamental and you can use them immediately without reading add
 - `file_exists(path)` - Check if a file exists
 - `get_workspace_summary()` - Get workspace statistics
 
+### Reading PDFs
+
+For PDF documents, use page-by-page reading:
+
+1. Get document info: `get_document_info("documents/file.pdf")`
+2. Read pages: `read_file("documents/file.pdf", page_start=1, page_end=5)`
+3. Continue with next pages as guided by the continuation message
+
+The tool auto-paginates: if you don't specify `page_end`, it reads pages until reaching the size limit and tells you how to continue.
+
 **Todo Tools:**
-- `add_todo(content, priority)` - Add a task to your list
-- `complete_todo(todo_id, notes)` - Mark a task complete
-- `start_todo(todo_id)` - Mark a task as in progress
-- `list_todos()` - View all current todos
-- `get_progress()` - See completion statistics
-- `archive_and_reset(phase_name)` - Archive todos and start fresh
-- `get_next_todo()` - Get highest priority pending task
+- `todo_write(todos)` - Update the complete todo list (JSON array)
+- `archive_and_reset(phase_name)` - Archive todos and clear for next phase
+
+**How to use todo_write:**
+```json
+todo_write('[
+  {"content": "Get document info", "status": "in_progress", "priority": "high"},
+  {"content": "Read pages 1-10", "status": "pending"},
+  {"content": "Identify requirements", "status": "pending"}
+]')
+```
+
+**Rules:**
+- Submit the COMPLETE list every time (omitted tasks are removed)
+- Have exactly ONE task with `"status": "in_progress"` at a time
+- Use priorities: `"high"`, `"medium"` (default), `"low"`
+- Mark tasks `"completed"` only when fully done
+- The tool returns progress and hints about what to do next
 
 **Completion:**
 - `mark_complete()` - Signal task completion
@@ -47,15 +70,11 @@ These tools are fundamental and you can use them immediately without reading add
 For these specialized tools, read their documentation in `tools/<tool_name>.md` before first use. This ensures you understand the parameters, return values, and usage patterns.
 
 **Document Processing:**
-- `extract_document_text` - Extract text from PDF/DOCX/TXT/HTML
-- `chunk_document` - Split document into chunks
-- `identify_requirement_candidates` - Find requirement-like statements
-- `assess_gobd_relevance` - Check GoBD compliance relevance
-- `extract_entity_mentions` - Find BusinessObject and Message mentions
+- `extract_document_text` - Extract text from PDF/DOCX/TXT/HTML (writes full text to workspace)
+- `get_document_info` - Get document metadata (page count, size) for planning
 
 **Research:**
 - `web_search` - Search the web via Tavily
-- `query_similar_requirements` - Find similar requirements in graph
 
 **Citation:**
 - `cite_document` - Create verified citation for document content
@@ -64,7 +83,9 @@ For these specialized tools, read their documentation in `tools/<tool_name>.md` 
 - `get_citation` - Get details about a specific citation
 
 **Cache:**
-- `write_requirement_to_cache` - Submit requirement to validation pipeline
+- `add_requirement` - Submit requirement to validation pipeline
+- `list_requirements` - List requirements in cache
+- `get_requirement` - Get requirement details
 
 **Important:** Before using any domain tool for the first time, read its documentation:
 ```
@@ -73,17 +94,16 @@ read_file("tools/<tool_name>.md")
 
 ---
 
-## Phase 1: Document Preprocessing
+## Phase 1: Document Analysis
 
 ### Goal
-Prepare the document for systematic requirement extraction.
+Understand the document structure and plan your extraction approach.
 
 ### Steps
-1. Extract text using `extract_document_text`
-2. Analyze document structure (articles, sections, paragraphs)
-3. Chunk using appropriate strategy based on document type
-4. Write chunks to `chunks/` folder
-5. Create `chunks/manifest.json` with metadata
+1. Get document info: `get_document_info("documents/file.pdf")`
+2. Read the first few pages to understand the structure
+3. Identify document type and relevant compliance frameworks
+4. Plan which sections are likely to contain requirements
 
 ### Document Categories
 - **LEGAL**: Contracts, regulations, compliance (GoBD, DSGVO, HGB)
@@ -91,63 +111,39 @@ Prepare the document for systematic requirement extraction.
 - **POLICY**: Guidelines, procedures, internal policies
 - **GENERAL**: Other documents
 
-### Chunking Strategies
-For legal/compliance documents, use the "legal" strategy which:
-- Respects section boundaries (Article, Section, Paragraph markers)
-- Preserves hierarchy (e.g., "Article 3 > Section 3.2 > Paragraph a")
-- Maintains cross-reference context
-
 ### Output
-After preprocessing, write to `notes/preprocessing_summary.md`:
+After analysis, write to `notes/document_analysis.md`:
 - Document type and language
-- Number of chunks created
-- Key structural elements found
+- Total pages and estimated reading plan
+- Key structural elements found (sections, articles)
 - Compliance framework relevance (GoBD, GDPR, etc.)
 
 ---
 
-## Phase 2: Candidate Identification
+## Phase 2: Requirement Extraction
 
 ### Goal
-Read through document chunks sequentially and identify requirement-like statements using your language understanding.
+Read through the document page-by-page, identify requirements, and add them to the cache with citations.
 
 ### Process
 
-1. **Read the chunk manifest**
+1. **Read pages systematically**
    ```
-   read_file("chunks/manifest.json")
+   read_file("documents/file.pdf", page_start=1, page_end=5)
    ```
-   This shows you all available chunks.
+   The tool will guide you on how to continue to the next pages.
 
-2. **Process chunks in batches**
-   Read 5-10 chunks at a time, analyzing each for requirements:
-   ```
-   read_file("chunks/chunk_001.txt")
-   ```
-
-3. **For each chunk, identify requirements yourself**
+2. **For each page, identify requirements**
    Look for statements expressing:
    - **Obligations**: must, shall, required to, verpflichtet, muss, müssen
    - **Capabilities**: can, may, should provide, soll bereitstellen
    - **Constraints**: at least, maximum, within X days, mindestens, höchstens
    - **Compliance**: in accordance with, compliant, gemäß, entsprechend
 
-4. **Record each candidate with:**
-   - The exact requirement text
-   - Source chunk and location (section/paragraph if visible)
-   - Classification: FUNCTIONAL, NON_FUNCTIONAL, CONSTRAINT, COMPLIANCE
-   - Confidence score (0.0-1.0)
-   - GoBD/GDPR relevance flags
-
-5. **Optionally validate with helper tools:**
-   - `assess_gobd_relevance(text)` - Confirms GoBD relevance score
-   - `extract_entity_mentions(text)` - Finds BusinessObjects and Messages
-
-6. **Write candidates to workspace**
-   ```
-   write_file("candidates/candidates.json", "[structured data]")
-   write_file("candidates/candidates.md", "[human-readable summary]")
-   ```
+3. **For each identified requirement:**
+   - Create a citation using `cite_document`
+   - Determine the requirement type and priority
+   - Call `add_requirement` with all required fields
 
 ### German Legal Text
 
@@ -181,127 +177,43 @@ Flag as GDPR-relevant when you see:
 - **CONSTRAINT**: Limits and boundaries (time, quantity)
 - **COMPLIANCE**: Regulatory requirements (GoBD, GDPR)
 
-### Output
-Write to `candidates/`:
-- `candidates.json` - Structured data with all fields
-- `candidates.md` - Human-readable summary
-
-Write to `notes/`:
-- `identification_summary.md` - Statistics (total candidates, by type, by confidence)
-
----
-
-## Phase 3: Research & Enrichment
-
-### Goal
-Enrich requirement candidates with research context.
-
-### Research Depth
-Determine depth based on candidate attributes:
-- **Quick**: High confidence (>0.85), clear requirements
-- **Standard**: Medium confidence, typical requirements
-- **Deep**: Compliance-related, complex, or low confidence
-
-### Web Search Guidelines
-For GoBD-related requirements:
-- "GoBD [specific topic] requirements"
-- "GoBD compliance [keyword]"
-- "German accounting retention [topic]"
-
-For GDPR-related:
-- "GDPR Article [number] requirements"
-- "GDPR [specific topic] compliance"
-
-### Duplicate Detection
-When checking for similar requirements:
-- Similarity > 0.9 = Likely duplicate, verify before creating
-- Similarity 0.7-0.9 = Related, may need refinement
-- Similarity < 0.7 = Distinct, safe to create
-
-### Citation Requirements
-Every claim should have a citation:
-1. Document citations for extracted requirements
-2. Web citations for research findings
-3. Graph citations for related requirements
-
-### Process
-For each candidate:
-1. Determine research depth
-2. Execute web searches for context
-3. Query graph for similar requirements
-4. Create citations for all sources
-5. Note potential duplicates or conflicts
-
-### Output
-For each candidate, write to `requirements/req_XXX/`:
-- `draft.md` - Requirement text and reasoning
-- `research.md` - Research findings
-- `citations.json` - Source citations
-
----
-
-## Phase 4: Formulation & Output
-
-### Goal
-Formulate final requirements and write to cache.
-
 ### Requirement Quality Guidelines
 A well-formed requirement should be:
 - **Atomic**: One requirement per statement
 - **Testable**: Verifiable completion criteria
 - **Clear**: Unambiguous language
-- **Traceable**: Linked to source and entities
+- **Traceable**: Linked to source via citation
 
-### Required Fields
-Each requirement needs:
+### Required Fields for add_requirement
 - **text**: Full requirement statement
 - **name**: Short descriptive title (max 80 chars)
 - **req_type**: functional, compliance, constraint, non_functional
 - **priority**: high, medium, low
-- **citations**: Links to source evidence
-- **entities**: Referenced business objects and messages
+- **gobd_relevant**: true/false
+- **gdpr_relevant**: true/false
+- **citations**: List of citation IDs
 
 ### Priority Assignment
 - **High**: GoBD/GDPR compliance, legal obligations, security-critical
 - **Medium**: Core business functionality, integration requirements
 - **Low**: Nice-to-have features, optimization suggestions
 
-### Skip Candidates When
-- Duplicate of existing requirement (similarity > 0.95)
+### Skip Statements When
+- Duplicate of already extracted requirement
 - Too vague to be actionable
 - Out of scope for the system
-- Confidence < 0.5 after research
+- Not a requirement (just informational text)
 
-### Process
-For each candidate:
-1. Review candidate and research findings
-2. Refine requirement text if needed
-3. Assign all required fields
-4. Create citations linking to sources
-5. Call `write_requirement_to_cache` with all parameters
-6. Log the requirement ID
+---
 
-### Example Formulation
+## Completion
 
-Given candidate:
-> "The system must retain all invoice records for at least 10 years in accordance with GoBD requirements."
+Before finishing:
+1. Call `list_requirements()` to verify all requirements were added successfully
+2. Check that the count matches what you extracted
+3. If any are missing, review the error responses and retry
 
-Formulate as:
-```
-name: "GoBD Invoice Retention"
-type: compliance
-priority: high
-gobd_relevant: true
-mentioned_objects: invoice, record
-reasoning: "Explicit retention period with GoBD reference. Constraint pattern 'at least 10 years' matched."
-confidence: 0.92
-```
-
-### Final Output
-Write to `output/`:
-- `summary.md` - Human-readable summary
-- `requirements.json` - All requirements created
-- `completion.json` - Job completion status
+When verified, call `mark_complete()`.
 
 ---
 
@@ -315,18 +227,12 @@ Use this structure for `plans/main_plan.md`:
 ## Problem
 [Describe the document and extraction task]
 
-## Approaches Considered
-1. [Approach 1]
-2. [Approach 2]
-
-## Chosen Approach
-[Selected approach with reasoning]
+## Approach
+[How you will process the document]
 
 ## Phases
-1. [ ] Document Preprocessing
-2. [ ] Candidate Identification
-3. [ ] Research & Enrichment
-4. [ ] Formulation & Output
+1. [ ] Document Analysis
+2. [ ] Requirement Extraction
 
 ## Current Status
 - Phase: [current phase]
@@ -337,11 +243,8 @@ Use this structure for `plans/main_plan.md`:
 
 ## Important Reminders
 
-1. **Write to files frequently** - This clears your context
-2. **Use todos for current phase only** - Archive when phase completes
-3. **Check your plan** when unsure what to do next
-4. **Create citations** for all claims and requirements
-5. **Be thorough** - Quality over speed
-6. **Handle errors gracefully** - Log issues in `notes/errors.md`
-
-When you complete all phases, write `output/completion.json` with status "complete".
+1. **Use todos** to track progress through each phase
+2. **Create citations** for all requirements
+3. **Check tool responses** - If `add_requirement` returns an error, retry or note it
+4. **Verify before completing** - Call `list_requirements()` to confirm all were added
+5. **Archive todos** when completing a phase

@@ -1,11 +1,12 @@
-"""Unit tests for todo tools and TodoManager archive functionality.
+"""Unit tests for todo tools and TodoManager.
 
-Tests the LangGraph tool wrappers and archive/reset functionality.
+Tests the LangGraph tool wrappers, set_todos_from_list, and archive functionality.
 """
 
 import pytest
 import tempfile
 import sys
+import json
 import importlib.util
 from pathlib import Path
 from datetime import datetime
@@ -91,6 +92,10 @@ tools_package.cache_tools = cache_tools_module
 graph_tools_path = project_root / "src" / "agents" / "shared" / "tools" / "graph_tools.py"
 graph_tools_module = _import_module_directly(graph_tools_path, "src.agents.shared.tools.graph_tools")
 tools_package.graph_tools = graph_tools_module
+
+completion_tools_path = project_root / "src" / "agents" / "shared" / "tools" / "completion_tools.py"
+completion_tools_module = _import_module_directly(completion_tools_path, "src.agents.shared.tools.completion_tools")
+tools_package.completion_tools = completion_tools_module
 
 # Now import registry
 registry_path = project_root / "src" / "agents" / "shared" / "tools" / "registry.py"
@@ -230,6 +235,247 @@ class TestTodoManagerSync:
         assert progress["completion_percentage"] == 50.0
 
 
+class TestTodoManagerSetTodosFromList:
+    """Tests for TodoManager.set_todos_from_list() method."""
+
+    def test_set_todos_basic(self, todo_manager):
+        """Test basic todo list replacement."""
+        todos = [
+            {"content": "Task 1", "status": "pending"},
+            {"content": "Task 2", "status": "in_progress"},
+            {"content": "Task 3", "status": "completed"},
+        ]
+        result = todo_manager.set_todos_from_list(todos)
+
+        assert "Task 1" in result or "Task 2" in result  # Check some content is there
+        assert len(todo_manager.list_all_sync()) == 3
+
+    def test_set_todos_replaces_existing(self, todo_manager):
+        """Test that existing todos are replaced."""
+        todo_manager.add_sync("Old task")
+        assert len(todo_manager.list_all_sync()) == 1
+
+        todos = [{"content": "New task", "status": "pending"}]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        assert len(items) == 1
+        assert items[0].content == "New task"
+
+    def test_set_todos_validates_required_content(self, todo_manager):
+        """Test that missing content raises error."""
+        with pytest.raises(ValueError, match="content"):
+            todo_manager.set_todos_from_list([{"status": "pending"}])
+
+    def test_set_todos_validates_required_status(self, todo_manager):
+        """Test that missing status raises error."""
+        with pytest.raises(ValueError, match="status"):
+            todo_manager.set_todos_from_list([{"content": "Task"}])
+
+    def test_set_todos_validates_status_values(self, todo_manager):
+        """Test that invalid status values raise errors."""
+        with pytest.raises(ValueError, match="invalid status"):
+            todo_manager.set_todos_from_list([
+                {"content": "Task", "status": "unknown"}
+            ])
+
+    def test_set_todos_priority_conversion(self, todo_manager):
+        """Test that string priorities convert correctly."""
+        todos = [
+            {"content": "High", "status": "pending", "priority": "high"},
+            {"content": "Medium", "status": "pending", "priority": "medium"},
+            {"content": "Low", "status": "pending", "priority": "low"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        high_item = next(t for t in items if "High" in t.content)
+        medium_item = next(t for t in items if "Medium" in t.content)
+        low_item = next(t for t in items if "Low" in t.content)
+
+        assert high_item.priority == 2
+        assert medium_item.priority == 1
+        assert low_item.priority == 0
+
+    def test_set_todos_auto_generates_ids(self, todo_manager):
+        """Test that IDs are auto-generated when not provided."""
+        todos = [
+            {"content": "Task 1", "status": "pending"},
+            {"content": "Task 2", "status": "pending"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        assert items[0].id.startswith("todo_")
+        assert items[1].id.startswith("todo_")
+        assert items[0].id != items[1].id
+
+    def test_set_todos_preserves_provided_ids(self, todo_manager):
+        """Test that provided IDs are preserved."""
+        todos = [
+            {"content": "Task", "status": "pending", "id": "custom_id"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        assert items[0].id == "custom_id"
+
+    def test_set_todos_empty_list(self, todo_manager):
+        """Test that empty list clears all todos."""
+        todo_manager.add_sync("Existing task")
+        result = todo_manager.set_todos_from_list([])
+
+        assert len(todo_manager.list_all_sync()) == 0
+        assert "No todos" in result
+
+    def test_set_todos_status_conversion(self, todo_manager):
+        """Test that status strings convert to enums."""
+        todos = [
+            {"content": "Pending", "status": "pending"},
+            {"content": "In Progress", "status": "in_progress"},
+            {"content": "Completed", "status": "completed"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        pending = next(t for t in items if "Pending" in t.content)
+        in_progress = next(t for t in items if "In Progress" in t.content)
+        completed = next(t for t in items if "Completed" in t.content)
+
+        assert pending.status == TodoStatus.PENDING
+        assert in_progress.status == TodoStatus.IN_PROGRESS
+        assert completed.status == TodoStatus.COMPLETED
+
+    def test_format_response_includes_progress(self, todo_manager):
+        """Test response includes progress bar."""
+        todos = [
+            {"content": "Task 1", "status": "completed"},
+            {"content": "Task 2", "status": "pending"},
+        ]
+        result = todo_manager.set_todos_from_list(todos)
+
+        assert "Progress" in result
+        assert "1/2" in result
+        assert "50%" in result
+
+    def test_format_response_includes_hint(self, todo_manager):
+        """Test response includes next action hint."""
+        todos = [
+            {"content": "Current task", "status": "in_progress"},
+            {"content": "Next task", "status": "pending"},
+        ]
+        result = todo_manager.set_todos_from_list(todos)
+
+        assert "Currently working on" in result
+        assert "Current task" in result
+
+
+class TestAutoReflection:
+    """Tests for auto-reflection task injection."""
+
+    def test_reflection_task_auto_appended(self):
+        """Test that reflection task is automatically added when enabled."""
+        todo_manager = TodoManager(
+            auto_reflection=True,
+            reflection_task_content="Review and update plan",
+        )
+        todos = [
+            {"content": "Task 1", "status": "pending"},
+            {"content": "Task 2", "status": "pending"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        # Should have 3 items: 2 original + 1 reflection
+        assert len(items) == 3
+        assert any("Review and update plan" in t.content for t in items)
+
+    def test_reflection_not_duplicated(self):
+        """Test that existing reflection task is not duplicated."""
+        todo_manager = TodoManager(
+            auto_reflection=True,
+            reflection_task_content="Review and update plan",
+        )
+        todos = [
+            {"content": "Task 1", "status": "pending"},
+            {"content": "Review plan and update progress", "status": "pending"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        # Should have 2 items, not 3 (no duplicate reflection)
+        assert len(items) == 2
+
+    def test_reflection_skipped_when_disabled(self):
+        """Test that reflection task is not added when disabled."""
+        todo_manager = TodoManager(
+            auto_reflection=False,
+            reflection_task_content="Review and update plan",
+        )
+        todos = [
+            {"content": "Task 1", "status": "pending"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        assert len(items) == 1
+        assert not any("Review" in t.content for t in items)
+
+    def test_reflection_skipped_when_no_pending(self):
+        """Test that reflection task is not added when no pending tasks."""
+        todo_manager = TodoManager(
+            auto_reflection=True,
+            reflection_task_content="Review and update plan",
+        )
+        todos = [
+            {"content": "Task 1", "status": "completed"},
+            {"content": "Task 2", "status": "completed"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        # Should have 2 items, no reflection added
+        assert len(items) == 2
+        assert not any("Review" in t.content for t in items)
+
+    def test_reflection_has_low_priority(self):
+        """Test that reflection task has lowest priority."""
+        todo_manager = TodoManager(
+            auto_reflection=True,
+            reflection_task_content="Review and update plan",
+        )
+        todos = [
+            {"content": "High priority", "status": "pending", "priority": "high"},
+            {"content": "Medium priority", "status": "pending", "priority": "medium"},
+        ]
+        todo_manager.set_todos_from_list(todos)
+
+        items = todo_manager.list_all_sync()
+        reflection_item = next(t for t in items if "Review" in t.content)
+        high_item = next(t for t in items if "High" in t.content)
+
+        # Reflection should have priority 0 (low), high priority should be 2
+        assert reflection_item.priority == 0
+        assert high_item.priority == 2
+
+    def test_reflection_keywords_detected(self):
+        """Test that various reflection keywords prevent duplication."""
+        todo_manager = TodoManager(
+            auto_reflection=True,
+            reflection_task_content="Review plan, update progress",
+        )
+
+        # Test "update plan" keyword
+        todos1 = [{"content": "Update plan with results", "status": "pending"}]
+        todo_manager.set_todos_from_list(todos1)
+        assert len(todo_manager.list_all_sync()) == 1
+
+        # Test "review progress" keyword
+        todos2 = [{"content": "Review progress on extraction", "status": "pending"}]
+        todo_manager.set_todos_from_list(todos2)
+        assert len(todo_manager.list_all_sync()) == 1
+
+
 class TestTodoManagerArchive:
     """Tests for TodoManager archive functionality."""
 
@@ -260,9 +506,8 @@ class TestTodoManagerArchive:
 
         todo_manager.archive_and_reset("test_phase")
 
-        # Read archive file - list_files returns paths relative to workspace root
+        # Read archive file
         archive_files = workspace_manager.list_files("archive", pattern="*.md")
-        # The path is already relative to workspace, like "archive/todos_xxx.md"
         content = workspace_manager.read_file(archive_files[0])
 
         assert "# Archived Todos: test_phase" in content
@@ -299,9 +544,7 @@ class TestTodoManagerArchive:
 
         archive_files = workspace_manager.list_files("archive", pattern="*.md")
         assert len(archive_files) == 1
-        # Extract just the filename (without path prefix)
         filename = archive_files[0].split("/")[-1]
-        # Verify no special chars in filename
         assert "/" not in filename
         assert ":" not in filename
         assert "*" not in filename
@@ -334,7 +577,7 @@ class TestCreateTodoTools:
     def test_creates_tools(self, tool_context):
         """Test that tools are created successfully."""
         tools = create_todo_tools(tool_context)
-        assert len(tools) > 0
+        assert len(tools) == 2  # todo_write and archive_and_reset
 
     def test_requires_todo_manager(self, workspace_manager):
         """Test that todo manager is required."""
@@ -345,113 +588,88 @@ class TestCreateTodoTools:
     def test_tool_names(self, todo_tools):
         """Test expected tool names are present."""
         tool_names = {t.name for t in todo_tools}
-        expected = {
-            "add_todo",
-            "complete_todo",
-            "start_todo",
-            "list_todos",
-            "get_progress",
-            "archive_and_reset",
-            "get_next_todo",
-        }
-        assert expected.issubset(tool_names)
+        expected = {"todo_write", "archive_and_reset"}
+        assert expected == tool_names
 
 
-class TestAddTodoTool:
-    """Tests for add_todo tool."""
+class TestTodoWriteTool:
+    """Tests for todo_write tool."""
 
-    def test_add_todo(self, todo_tools):
-        """Test adding a todo."""
-        add_tool = next(t for t in todo_tools if t.name == "add_todo")
-        result = add_tool.invoke({"content": "Test task"})
-        assert "Added" in result
-        assert "todo_1" in result
+    def test_todo_write_json_parsing(self, todo_tools):
+        """Test valid JSON is parsed correctly."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
+        result = write_tool.invoke({
+            "todos": '[{"content": "Test task", "status": "pending"}]'
+        })
+        assert "Test task" in result
+        assert "Error" not in result
 
-    def test_add_todo_with_priority(self, todo_tools):
-        """Test adding with priority."""
-        add_tool = next(t for t in todo_tools if t.name == "add_todo")
-        result = add_tool.invoke({"content": "High priority", "priority": 2})
-        assert "Added" in result
+    def test_todo_write_invalid_json(self, todo_tools):
+        """Test invalid JSON returns error."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
+        result = write_tool.invoke({"todos": "not json"})
+        assert "Error" in result
+        assert "JSON" in result
 
+    def test_todo_write_not_array(self, todo_tools):
+        """Test non-array JSON returns error."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
+        result = write_tool.invoke({"todos": '{"content": "task"}'})
+        assert "Error" in result
+        assert "array" in result
 
-class TestCompleteTodoTool:
-    """Tests for complete_todo tool."""
+    def test_todo_write_missing_content(self, todo_tools):
+        """Test missing content returns error."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
+        result = write_tool.invoke({
+            "todos": '[{"status": "pending"}]'
+        })
+        assert "Error" in result
+        assert "content" in result
 
-    def test_complete_todo(self, todo_tools, tool_context):
-        """Test completing a todo."""
-        # Add a todo first
-        tool_context.todo_manager.add_sync("Test task")
+    def test_todo_write_missing_status(self, todo_tools):
+        """Test missing status returns error."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
+        result = write_tool.invoke({
+            "todos": '[{"content": "task"}]'
+        })
+        assert "Error" in result
+        assert "status" in result
 
-        complete_tool = next(t for t in todo_tools if t.name == "complete_todo")
-        result = complete_tool.invoke({"todo_id": "todo_1"})
-        assert "Completed" in result
+    def test_todo_write_full_workflow(self, todo_tools, tool_context):
+        """Test complete add/update/complete cycle."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
 
-    def test_complete_todo_with_notes(self, todo_tools, tool_context):
-        """Test completing with notes."""
-        tool_context.todo_manager.add_sync("Test task")
+        # Add initial tasks
+        result1 = write_tool.invoke({
+            "todos": '[{"content": "Task A", "status": "pending"}, {"content": "Task B", "status": "pending"}]'
+        })
+        assert "Pending (2)" in result1
 
-        complete_tool = next(t for t in todo_tools if t.name == "complete_todo")
-        result = complete_tool.invoke({"todo_id": "todo_1", "notes": "Done!"})
-        assert "Completed" in result
+        # Start first task
+        result2 = write_tool.invoke({
+            "todos": '[{"content": "Task A", "status": "in_progress"}, {"content": "Task B", "status": "pending"}]'
+        })
+        assert "In Progress" in result2
 
-    def test_complete_nonexistent_todo(self, todo_tools):
-        """Test completing non-existent todo."""
-        complete_tool = next(t for t in todo_tools if t.name == "complete_todo")
-        result = complete_tool.invoke({"todo_id": "nonexistent"})
-        assert "not found" in result
+        # Complete first, start second
+        result3 = write_tool.invoke({
+            "todos": '[{"content": "Task A", "status": "completed"}, {"content": "Task B", "status": "in_progress"}]'
+        })
+        assert "Completed" in result3
+        assert "50%" in result3
 
-
-class TestStartTodoTool:
-    """Tests for start_todo tool."""
-
-    def test_start_todo(self, todo_tools, tool_context):
-        """Test starting a todo."""
-        tool_context.todo_manager.add_sync("Test task")
-
-        start_tool = next(t for t in todo_tools if t.name == "start_todo")
-        result = start_tool.invoke({"todo_id": "todo_1"})
-        assert "Started" in result
-
-
-class TestListTodosTool:
-    """Tests for list_todos tool."""
-
-    def test_list_todos_empty(self, todo_tools):
-        """Test listing empty todos."""
-        list_tool = next(t for t in todo_tools if t.name == "list_todos")
-        result = list_tool.invoke({})
-        assert "No todos" in result
-
-    def test_list_todos_with_items(self, todo_tools, tool_context):
-        """Test listing todos."""
-        tool_context.todo_manager.add_sync("Task 1")
-        tool_context.todo_manager.add_sync("Task 2")
-
-        list_tool = next(t for t in todo_tools if t.name == "list_todos")
-        result = list_tool.invoke({})
-        assert "Task 1" in result
-        assert "Task 2" in result
-
-
-class TestGetProgressTool:
-    """Tests for get_progress tool."""
-
-    def test_get_progress_empty(self, todo_tools):
-        """Test progress with no todos."""
-        progress_tool = next(t for t in todo_tools if t.name == "get_progress")
-        result = progress_tool.invoke({})
-        assert "0/0" in result
-
-    def test_get_progress_with_items(self, todo_tools, tool_context):
-        """Test progress with todos."""
-        tool_context.todo_manager.add_sync("Task 1")
-        tool_context.todo_manager.add_sync("Task 2")
-        tool_context.todo_manager.complete_sync("todo_1")
-
-        progress_tool = next(t for t in todo_tools if t.name == "get_progress")
-        result = progress_tool.invoke({})
-        assert "1/2" in result
-        assert "50" in result
+    def test_todo_write_with_priorities(self, todo_tools):
+        """Test high/medium/low priorities work."""
+        write_tool = next(t for t in todo_tools if t.name == "todo_write")
+        result = write_tool.invoke({
+            "todos": json.dumps([
+                {"content": "High priority task", "status": "pending", "priority": "high"},
+                {"content": "Low priority task", "status": "pending", "priority": "low"},
+            ])
+        })
+        assert "[HIGH]" in result
+        assert "High priority task" in result
 
 
 class TestArchiveAndResetTool:
@@ -473,40 +691,21 @@ class TestArchiveAndResetTool:
         assert "empty" in result.lower()
 
 
-class TestGetNextTodoTool:
-    """Tests for get_next_todo tool."""
-
-    def test_get_next_todo(self, todo_tools, tool_context):
-        """Test getting next todo."""
-        tool_context.todo_manager.add_sync("Task 1")
-
-        next_tool = next(t for t in todo_tools if t.name == "get_next_todo")
-        result = next_tool.invoke({})
-        assert "Next" in result
-        assert "Task 1" in result
-
-    def test_get_next_todo_empty(self, todo_tools):
-        """Test getting next todo when empty."""
-        next_tool = next(t for t in todo_tools if t.name == "get_next_todo")
-        result = next_tool.invoke({})
-        assert "No pending" in result
-
-
 class TestTodoToolsRegistry:
     """Tests for todo tools in registry."""
 
-    def test_todo_tools_in_registry(self):
-        """Test that todo tools are registered."""
+    def test_new_todo_tools_in_registry(self):
+        """Test that new todo tools are registered."""
         todo_tools = get_tools_by_category("todo")
-        assert "add_todo" in todo_tools
-        assert "complete_todo" in todo_tools
+        assert "todo_write" in todo_tools
         assert "archive_and_reset" in todo_tools
 
-    def test_todo_tools_not_placeholder(self):
-        """Test that todo tools are not placeholders."""
-        for name in ["add_todo", "complete_todo", "list_todos", "get_progress", "archive_and_reset"]:
-            assert name in TOOL_REGISTRY
-            assert not TOOL_REGISTRY[name].get("placeholder", False)
+    def test_old_tools_removed(self):
+        """Test that old fragmented tools are removed."""
+        todo_tools = get_tools_by_category("todo")
+        old_tools = ["add_todo", "start_todo", "complete_todo", "list_todos", "get_progress", "get_next_todo"]
+        for old_tool in old_tools:
+            assert old_tool not in todo_tools, f"{old_tool} should have been removed"
 
 
 class TestLoadTodoTools:
@@ -514,25 +713,24 @@ class TestLoadTodoTools:
 
     def test_load_todo_tools(self, tool_context):
         """Test loading todo tools through registry."""
-        tools = load_tools(["add_todo", "complete_todo"], tool_context)
+        tools = load_tools(["todo_write", "archive_and_reset"], tool_context)
         assert len(tools) == 2
         tool_names = {t.name for t in tools}
-        assert tool_names == {"add_todo", "complete_todo"}
+        assert tool_names == {"todo_write", "archive_and_reset"}
 
     def test_load_requires_todo_manager(self, workspace_manager):
         """Test that loading todo tools requires todo_manager."""
         context = ToolContext(workspace_manager=workspace_manager)
         with pytest.raises(ValueError, match="todo_manager"):
-            load_tools(["add_todo"], context)
+            load_tools(["todo_write"], context)
 
     def test_load_mixed_tools(self, tool_context):
         """Test loading both workspace and todo tools."""
-        tools = load_tools(["read_file", "add_todo", "list_todos"], tool_context)
-        assert len(tools) == 3
+        tools = load_tools(["read_file", "todo_write"], tool_context)
+        assert len(tools) == 2
         tool_names = {t.name for t in tools}
         assert "read_file" in tool_names
-        assert "add_todo" in tool_names
-        assert "list_todos" in tool_names
+        assert "todo_write" in tool_names
 
 
 class TestTodoToolMetadata:
@@ -540,6 +738,9 @@ class TestTodoToolMetadata:
 
     def test_todo_tools_metadata(self):
         """Test todo tools have proper metadata."""
+        expected_tools = {"todo_write", "archive_and_reset"}
+        assert set(TODO_TOOLS_METADATA.keys()) == expected_tools
+
         for name, meta in TODO_TOOLS_METADATA.items():
             assert "module" in meta
             assert "function" in meta

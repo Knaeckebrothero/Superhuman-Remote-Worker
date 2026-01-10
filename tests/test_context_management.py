@@ -591,5 +591,202 @@ class TestPackageExports:
         assert callable(get_all_tool_names)
 
 
+class TestProtectedContextConfig:
+    """Tests for ProtectedContextConfig dataclass."""
+
+    def test_default_values(self):
+        """Test default configuration values."""
+        from src.agents.universal.context import ProtectedContextConfig
+
+        config = ProtectedContextConfig()
+        assert config.enabled is True
+        assert config.plan_file == "plans/main_plan.md"
+        assert config.max_plan_chars == 2000
+        assert config.include_todos is True
+
+    def test_custom_values(self):
+        """Test custom configuration values."""
+        from src.agents.universal.context import ProtectedContextConfig
+
+        config = ProtectedContextConfig(
+            enabled=False,
+            plan_file="custom/plan.md",
+            max_plan_chars=1000,
+            include_todos=False,
+        )
+        assert config.enabled is False
+        assert config.plan_file == "custom/plan.md"
+        assert config.max_plan_chars == 1000
+        assert config.include_todos is False
+
+
+class TestProtectedContextProvider:
+    """Tests for ProtectedContextProvider class."""
+
+    def test_disabled_returns_none(self):
+        """Test that disabled provider returns None."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+
+        config = ProtectedContextConfig(enabled=False)
+        provider = ProtectedContextProvider(config=config)
+
+        result = provider.get_protected_context()
+        assert result is None
+
+    def test_no_managers_returns_none(self):
+        """Test that provider with no managers returns None."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+
+        config = ProtectedContextConfig(enabled=True)
+        provider = ProtectedContextProvider(config=config)
+
+        result = provider.get_protected_context()
+        assert result is None
+
+    def test_includes_plan_content(self):
+        """Test that plan content is included."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+
+        mock_workspace = MagicMock()
+        mock_workspace.read_file.return_value = "# My Plan\n\nStep 1: Do something"
+
+        config = ProtectedContextConfig(enabled=True, include_todos=False)
+        provider = ProtectedContextProvider(
+            workspace_manager=mock_workspace,
+            config=config,
+        )
+
+        result = provider.get_protected_context()
+
+        assert result is not None
+        assert "[PROTECTED CONTEXT" in result
+        assert "My Plan" in result
+        assert "Step 1" in result
+        mock_workspace.read_file.assert_called_once_with("plans/main_plan.md")
+
+    def test_plan_truncation(self):
+        """Test that long plans are truncated."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+
+        long_plan = "A" * 3000
+        mock_workspace = MagicMock()
+        mock_workspace.read_file.return_value = long_plan
+
+        config = ProtectedContextConfig(enabled=True, max_plan_chars=100, include_todos=False)
+        provider = ProtectedContextProvider(
+            workspace_manager=mock_workspace,
+            config=config,
+        )
+
+        result = provider.get_protected_context()
+
+        assert result is not None
+        assert "[...truncated]" in result
+        # Should have max_plan_chars of content plus truncation marker
+        assert len(result) < 3000
+
+    def test_includes_todos(self):
+        """Test that todos are included."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agents.shared.todo_manager import TodoManager
+
+        # Create a real todo manager with some todos
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Task 1", "status": "pending"},
+            {"content": "Task 2", "status": "in_progress"},
+            {"content": "Task 3", "status": "completed"},
+        ])
+
+        config = ProtectedContextConfig(enabled=True, include_todos=True)
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=config,
+        )
+
+        result = provider.get_protected_context()
+
+        assert result is not None
+        assert "Active Todos" in result
+        assert "Task 1" in result
+        assert "Task 2" in result
+        assert "Task 3" in result
+        # Check status markers
+        assert "[ ]" in result  # pending
+        assert "[>]" in result  # in_progress
+        assert "[x]" in result  # completed
+
+    def test_handles_missing_plan_file(self):
+        """Test graceful handling of missing plan file."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agents.shared.todo_manager import TodoManager
+
+        mock_workspace = MagicMock()
+        mock_workspace.read_file.side_effect = FileNotFoundError("Not found")
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([{"content": "Task", "status": "pending"}])
+
+        config = ProtectedContextConfig(enabled=True, include_todos=True)
+        provider = ProtectedContextProvider(
+            workspace_manager=mock_workspace,
+            todo_manager=todo_manager,
+            config=config,
+        )
+
+        # Should not raise, should still include todos
+        result = provider.get_protected_context()
+        assert result is not None
+        assert "Task" in result
+
+    def test_full_protected_context_format(self):
+        """Test complete protected context format."""
+        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agents.shared.todo_manager import TodoManager
+
+        mock_workspace = MagicMock()
+        mock_workspace.read_file.return_value = "# Phase 2 Plan\nExtract requirements"
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Extract chunk 5", "status": "in_progress"},
+            {"content": "Extract chunk 6", "status": "pending"},
+        ])
+
+        config = ProtectedContextConfig(enabled=True, include_todos=True)
+        provider = ProtectedContextProvider(
+            workspace_manager=mock_workspace,
+            todo_manager=todo_manager,
+            config=config,
+        )
+
+        result = provider.get_protected_context()
+
+        assert "[PROTECTED CONTEXT - Current State]" in result
+        assert "## Current Plan" in result
+        assert "## Active Todos" in result
+        assert "[END PROTECTED CONTEXT]" in result
+
+
+class TestContextManagerWithProtectedProvider:
+    """Tests for ContextManager with protected context provider."""
+
+    def test_set_protected_provider(self):
+        """Test setting protected provider."""
+        from src.agents.universal.context import ProtectedContextProvider
+
+        context_manager = ContextManager()
+        provider = ProtectedContextProvider()
+
+        context_manager.set_protected_provider(provider)
+
+        assert context_manager._protected_provider is provider
+
+    def test_protected_provider_initially_none(self):
+        """Test that protected provider is initially None."""
+        context_manager = ContextManager()
+        assert context_manager._protected_provider is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

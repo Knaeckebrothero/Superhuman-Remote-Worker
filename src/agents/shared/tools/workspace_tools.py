@@ -14,6 +14,7 @@ from typing import List, Optional
 from langchain_core.tools import tool
 
 from .context import ToolContext
+from .pdf_utils import PDFReader, format_document_info, format_read_info
 
 logger = logging.getLogger(__name__)
 
@@ -37,21 +38,31 @@ def create_workspace_tools(context: ToolContext) -> List:
     max_read_size = context.get_config("max_read_size", 25_000)  # 25KB default (~7,500 tokens)
     max_search_results = context.get_config("max_search_results", 50)
 
+    # Initialize PDF reader with same size limit
+    pdf_reader = PDFReader(max_chars_per_read=max_read_size)
+
     @tool
-    def read_file(path: str) -> str:
+    def read_file(
+        path: str,
+        page_start: Optional[int] = None,
+        page_end: Optional[int] = None
+    ) -> str:
         """Read content from a file in the workspace.
 
-        Use this to retrieve previously written files, read instructions,
-        or access any file in your workspace.
+        For PDF files, supports page-based access:
+        - read_file("doc.pdf") - reads first pages within size limit
+        - read_file("doc.pdf", page_start=5, page_end=10) - specific page range
 
         Args:
-            path: Relative path to the file (e.g., "plans/main_plan.md")
+            path: Relative path to the file (e.g., "documents/GoBD.pdf")
+            page_start: For PDFs: first page to read (1-indexed, default: 1)
+            page_end: For PDFs: last page to read (default: auto-limit by size)
 
         Returns:
-            File content or error message
+            File content or error message. For PDFs, includes page info.
         """
         try:
-            # Check file size BEFORE reading to prevent context overflow
+            # Check file exists
             if not workspace.exists(path):
                 return f"Error: File not found: {path}"
 
@@ -59,11 +70,19 @@ def create_workspace_tools(context: ToolContext) -> List:
             if full_path.is_dir():
                 return f"Error: '{path}' is a directory, not a file. Use list_files to see its contents."
 
+            # Handle PDF files with page-based reading
+            if full_path.suffix.lower() == '.pdf':
+                return _read_pdf_file(full_path, path, page_start, page_end)
+
+            # For non-PDF files, page parameters are ignored
+            if page_start is not None or page_end is not None:
+                logger.warning(f"page_start/page_end ignored for non-PDF file: {path}")
+
             file_size = full_path.stat().st_size
 
-            # Reject files that are too large - similar to Claude Code's approach
+            # Reject files that are too large
             if file_size > max_read_size:
-                estimated_tokens = file_size // 4  # Rough estimate: ~4 chars per token
+                estimated_tokens = file_size // 4
                 max_tokens = max_read_size // 4
                 return (
                     f"Error: File '{path}' ({file_size:,} bytes, ~{estimated_tokens:,} tokens) "
@@ -80,11 +99,52 @@ def create_workspace_tools(context: ToolContext) -> List:
         except FileNotFoundError:
             return f"Error: File not found: {path}"
         except ValueError as e:
-            # Path validation errors (e.g., path traversal attempts)
             return f"Error: {str(e)}"
         except Exception as e:
             logger.error(f"read_file error for {path}: {e}")
             return f"Error reading file: {str(e)}"
+
+    def _read_pdf_file(
+        full_path,
+        relative_path: str,
+        page_start: Optional[int],
+        page_end: Optional[int]
+    ) -> str:
+        """Internal helper to read PDF files with page support."""
+        if not pdf_reader.is_available():
+            return "Error: PDF reading requires pdfplumber. Install with: pip install pdfplumber"
+
+        try:
+            text, read_info = pdf_reader.read_pages(
+                full_path,
+                page_start=page_start,
+                page_end=page_end
+            )
+
+            # Build header showing what was read
+            pages = read_info["pages_read"]
+            if len(pages) == 1:
+                header = f"[Page {pages[0]} of {read_info['total_pages']}]"
+            elif len(pages) > 1:
+                header = f"[Pages {pages[0]}-{pages[-1]} of {read_info['total_pages']}]"
+            else:
+                header = f"[No pages read - total pages: {read_info['total_pages']}]"
+
+            # Build result
+            result_parts = [header, "", text]
+
+            # Add continuation guidance if truncated
+            if read_info["was_truncated"]:
+                result_parts.append("")
+                result_parts.append(format_read_info(read_info, relative_path))
+
+            return "\n".join(result_parts)
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"PDF read error for {relative_path}: {e}")
+            return f"Error reading PDF: {str(e)}"
 
     @tool
     def write_file(path: str, content: str) -> str:
@@ -351,6 +411,88 @@ def create_workspace_tools(context: ToolContext) -> List:
             logger.error(f"get_workspace_summary error: {e}")
             return f"Error getting summary: {str(e)}"
 
+    @tool
+    def get_document_info(path: str) -> str:
+        """Get metadata about a document without reading its full content.
+
+        Returns page count, estimated size, and available metadata.
+        Use this before reading large PDFs to plan page-by-page access.
+
+        Args:
+            path: Relative path to the document (e.g., "documents/GoBD.pdf")
+
+        Returns:
+            Document metadata including page count, estimated tokens, file size.
+            For non-PDF files, returns basic file information.
+        """
+        try:
+            if not workspace.exists(path):
+                return f"Error: File not found: {path}"
+
+            full_path = workspace.get_path(path)
+            if full_path.is_dir():
+                return f"Error: '{path}' is a directory, not a file."
+
+            # For PDF files, get detailed info
+            if full_path.suffix.lower() == '.pdf':
+                if not pdf_reader.is_available():
+                    return "Error: PDF info requires pdfplumber. Install with: pip install pdfplumber"
+
+                try:
+                    info = pdf_reader.get_document_info(full_path)
+
+                    # Format with reading suggestions
+                    lines = [format_document_info(info), ""]
+
+                    # Add reading suggestions based on size
+                    total_chars = info.get("estimated_total_chars", 0)
+                    page_count = info.get("page_count", 0)
+
+                    if total_chars <= max_read_size:
+                        lines.append("This document fits in a single read.")
+                        lines.append(f'Use: read_file("{path}")')
+                    else:
+                        # Estimate how many pages fit in one read
+                        chars_per_page = info.get("estimated_chars_per_page", 3000)
+                        pages_per_read = max(1, max_read_size // chars_per_page)
+
+                        lines.append(f"Suggested approach (document exceeds single-read limit):")
+                        lines.append(f"- Read ~{pages_per_read} pages at a time")
+                        lines.append(f'- Start with: read_file("{path}", page_start=1, page_end={min(pages_per_read, page_count)})')
+                        if page_count > pages_per_read:
+                            lines.append(f'- Continue with: read_file("{path}", page_start={pages_per_read + 1}, page_end={min(pages_per_read * 2, page_count)})')
+
+                    return "\n".join(lines)
+
+                except Exception as e:
+                    logger.error(f"PDF info error for {path}: {e}")
+                    return f"Error getting PDF info: {str(e)}"
+
+            # For non-PDF files, return basic info
+            file_size = full_path.stat().st_size
+            estimated_tokens = file_size // 4
+
+            lines = [
+                f"Document: {full_path.name}",
+                f"Type: {full_path.suffix or 'unknown'}",
+                f"File size: {file_size:,} bytes (~{estimated_tokens:,} tokens)",
+            ]
+
+            if file_size <= max_read_size:
+                lines.append(f"\nThis file fits in a single read.")
+                lines.append(f'Use: read_file("{path}")')
+            else:
+                lines.append(f"\nFile exceeds single-read limit ({max_read_size:,} bytes).")
+                lines.append("Consider using search_files() or chunking.")
+
+            return "\n".join(lines)
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"get_document_info error for {path}: {e}")
+            return f"Error: {str(e)}"
+
     # Return all workspace tools
     return [
         read_file,
@@ -361,6 +503,7 @@ def create_workspace_tools(context: ToolContext) -> List:
         search_files,
         file_exists,
         get_workspace_summary,
+        get_document_info,
     ]
 
 
@@ -413,5 +556,13 @@ WORKSPACE_TOOLS_METADATA = {
         "function": "get_workspace_summary",
         "description": "Get a summary of workspace contents",
         "category": "workspace",
+    },
+    "get_document_info": {
+        "module": "workspace_tools",
+        "function": "get_document_info",
+        "description": "Get document metadata (page count, size) for planning access",
+        "category": "workspace",
+        "defer_to_workspace": True,
+        "short_description": "Get PDF/document metadata (pages, size) for planning access.",
     },
 }

@@ -193,7 +193,7 @@ Tools are organized in `src/agents/shared/tools/` and loaded dynamically by the 
 | Category | Tools | Source |
 |----------|-------|--------|
 | `workspace` | read_file, write_file, list_files, search_files, etc. | `workspace_tools.py` |
-| `todo` | add_todo, complete_todo, start_todo, archive_and_reset, etc. | `todo_tools.py` |
+| `todo` | todo_write, archive_and_reset | `todo_tools.py` |
 | `domain` | extract_document_text, chunk_document, web_search, cite_document, etc. | `document_tools.py`, `search_tools.py`, `citation_tools.py` |
 | `completion` | mark_complete | `completion_tools.py` |
 | `graph` | execute_cypher, get_schema, create_requirement_node, etc. | `graph_tools.py` |
@@ -215,3 +215,66 @@ Tools are organized in `src/agents/shared/tools/` and loaded dynamically by the 
 | PostgreSQL | 5432 |
 | Dashboard | 8501 |
 | Adminer (dev) | 8080 |
+
+## Adding New Tools
+
+When adding a new tool to the system:
+
+1. **Create the tool function** in the appropriate file in `src/agents/shared/tools/`:
+   - Workspace operations → `workspace_tools.py`
+   - Document processing → `document_tools.py`
+   - Graph operations → `graph_tools.py`
+   - New category → create new `*_tools.py` file
+
+2. **Add metadata** to the module's `*_TOOLS_METADATA` dict:
+   ```python
+   MYTOOLS_METADATA = {
+       "my_tool": {
+           "module": "mytools",
+           "function": "my_tool",
+           "description": "Short description for LLM context",
+           "category": "domain",
+       },
+   }
+   ```
+
+3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`:
+   ```python
+   from .mytools import create_my_tools, MYTOOLS_METADATA
+   TOOL_REGISTRY.update(MYTOOLS_METADATA)
+   ```
+
+4. **Add to agent config** in `config/agents/<agent>.json` under the appropriate category:
+   ```json
+   "tools": {
+       "domain": ["my_tool", ...]
+   }
+   ```
+
+5. **Tool signature**: Tools receive `ToolContext` as first argument, then user parameters:
+   ```python
+   def my_tool(ctx: ToolContext, param1: str, param2: int = 10) -> str:
+       """Tool docstring becomes LLM description."""
+       return "result"
+   ```
+
+## Testing
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test file
+pytest tests/test_todo_tools.py
+
+# Run with verbose output
+pytest tests/ -v
+
+# Run tests matching pattern
+pytest tests/ -k "workspace"
+
+# Run with coverage
+pytest tests/ --cov=src
+```
+
+Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup like database connections.

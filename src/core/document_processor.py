@@ -47,8 +47,8 @@ except ImportError:
 
 CHUNKING_PRESETS = {
     "legal": {
-        "max_chunk_size": 1000,
-        "overlap_size": 200,
+        "max_chunk_size": 5000,
+        "overlap_size": 500,
         "respect_boundaries": True,
         "boundary_patterns": [
             r"^(?:Article|Section|§|Artikel|Abschnitt)\s+\d+",  # Section headers
@@ -59,8 +59,8 @@ CHUNKING_PRESETS = {
         "preserve_hierarchy": True,
     },
     "technical": {
-        "max_chunk_size": 800,
-        "overlap_size": 150,
+        "max_chunk_size": 3500,
+        "overlap_size": 350,
         "respect_boundaries": True,
         "boundary_patterns": [
             r"^#+\s+",  # Markdown headers
@@ -70,11 +70,19 @@ CHUNKING_PRESETS = {
         "preserve_hierarchy": True,
     },
     "general": {
-        "max_chunk_size": 500,
-        "overlap_size": 100,
+        "max_chunk_size": 2000,
+        "overlap_size": 200,
         "respect_boundaries": False,
         "boundary_patterns": [],
         "preserve_hierarchy": False,
+    },
+    "by_page": {
+        "max_chunk_size": None,  # No limit - one chunk per page
+        "overlap_size": 0,
+        "respect_boundaries": True,
+        "boundary_patterns": [r"\[PAGE \d+\]"],  # Page markers from PDF extraction
+        "preserve_hierarchy": True,
+        "page_based": True,
     },
 }
 
@@ -319,27 +327,30 @@ class DocumentChunker:
 
     def __init__(
         self,
-        max_chunk_size: int = 1000,
+        max_chunk_size: Optional[int] = 1000,
         overlap_size: int = 200,
         respect_boundaries: bool = True,
         boundary_patterns: Optional[List[str]] = None,
         preserve_hierarchy: bool = True,
+        page_based: bool = False,
     ):
         """
         Initialize the chunker.
 
         Args:
-            max_chunk_size: Maximum characters per chunk
+            max_chunk_size: Maximum characters per chunk (None for no limit)
             overlap_size: Characters to overlap between chunks
             respect_boundaries: Whether to split at natural boundaries
             boundary_patterns: Regex patterns for section boundaries
             preserve_hierarchy: Whether to track section hierarchy
+            page_based: If True, create one chunk per page (ignores other settings)
         """
         self.max_chunk_size = max_chunk_size
         self.overlap_size = overlap_size
         self.respect_boundaries = respect_boundaries
         self.boundary_patterns = boundary_patterns or []
         self.preserve_hierarchy = preserve_hierarchy
+        self.page_based = page_based
 
         # Compile boundary patterns
         self._compiled_patterns = [
@@ -372,8 +383,10 @@ class DocumentChunker:
         # Detect structure first
         structure = self._detect_structure(text)
 
-        # Perform chunking
-        if self.respect_boundaries:
+        # Perform chunking based on mode
+        if self.page_based:
+            chunks = self._chunk_by_page(text, structure)
+        elif self.respect_boundaries:
             chunks = self._chunk_with_boundaries(text, structure)
         else:
             chunks = self._chunk_simple(text)
@@ -433,6 +446,53 @@ class DocumentChunker:
 
         return structure
 
+    def _chunk_by_page(self, text: str, structure: Dict[str, Any]) -> List[Dict]:
+        """Create one chunk per page based on [PAGE N] markers.
+
+        Args:
+            text: Full document text with [PAGE N] markers
+            structure: Structure info from _detect_structure
+
+        Returns:
+            List of chunk dictionaries, one per page
+        """
+        chunks = []
+        pages = structure.get("pages", [])
+
+        if not pages:
+            # No page markers found - treat entire text as one chunk
+            if text.strip():
+                chunks.append({
+                    "text": text.strip(),
+                    "start": 0,
+                    "end": len(text),
+                    "hierarchy": [],
+                    "page": 1,
+                })
+            return chunks
+
+        # Add end marker for easier iteration
+        pages_with_end = pages + [{"page": None, "position": len(text)}]
+
+        for i in range(len(pages_with_end) - 1):
+            page_info = pages_with_end[i]
+            next_info = pages_with_end[i + 1]
+
+            page_start = page_info["position"]
+            page_end = next_info["position"]
+            page_text = text[page_start:page_end]
+
+            if page_text.strip():
+                chunks.append({
+                    "text": page_text.strip(),
+                    "start": page_start,
+                    "end": page_end,
+                    "hierarchy": [],
+                    "page": page_info["page"],
+                })
+
+        return chunks
+
     def _chunk_with_boundaries(self, text: str, structure: Dict[str, Any]) -> List[Dict]:
         """Chunk text respecting structural boundaries."""
         chunks = []
@@ -456,7 +516,7 @@ class DocumentChunker:
                 current_hierarchy = self._update_hierarchy(current_hierarchy, section_header)
 
             # If section is small enough, add as single chunk
-            if len(section_text) <= self.max_chunk_size:
+            if self.max_chunk_size is None or len(section_text) <= self.max_chunk_size:
                 if section_text.strip():
                     chunks.append({
                         "text": section_text.strip(),

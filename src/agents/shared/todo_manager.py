@@ -115,18 +115,28 @@ class TodoManager:
         ```
     """
 
-    def __init__(self, workspace: Any = None, workspace_manager: Optional["WorkspaceManager"] = None):
+    def __init__(
+        self,
+        workspace: Any = None,
+        workspace_manager: Optional["WorkspaceManager"] = None,
+        auto_reflection: bool = True,
+        reflection_task_content: str = "Review plan, update progress, create next todos",
+    ):
         """Initialize todo manager.
 
         Args:
             workspace: Legacy Workspace instance for persistence (optional)
             workspace_manager: WorkspaceManager for archive operations (optional)
+            auto_reflection: If True, automatically append a reflection task to todo lists
+            reflection_task_content: Content of the auto-appended reflection task
         """
         self._legacy_workspace = workspace
         self._workspace_manager = workspace_manager
         self._todos: List[TodoItem] = []
         self._next_id = 1
         self._loaded = False
+        self._auto_reflection = auto_reflection
+        self._reflection_task_content = reflection_task_content
 
     async def _ensure_loaded(self) -> None:
         """Ensure todos are loaded from legacy workspace (async mode only)."""
@@ -788,6 +798,242 @@ class TodoManager:
         self._next_id = 1
         logger.info(f"Cleared {count} todos without archiving")
         return count
+
+    # -------------------------------------------------------------------------
+    # TodoWrite pattern - atomic list replacement
+    # -------------------------------------------------------------------------
+
+    def _inject_reflection_task(self, todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Inject a reflection task if not already present.
+
+        This ensures the agent maintains a "roter Faden" (red thread) by always
+        having a task to review their plan and update progress after completing
+        the current batch of work.
+
+        Args:
+            todos: List of todo dictionaries
+
+        Returns:
+            Modified list with reflection task appended if needed
+        """
+        if not self._auto_reflection:
+            return todos
+
+        # Check for existing reflection task using keywords
+        reflection_keywords = ["review plan", "update plan", "review progress", "update progress"]
+        has_reflection = any(
+            any(kw in t.get("content", "").lower() for kw in reflection_keywords)
+            for t in todos
+        )
+
+        if has_reflection:
+            return todos
+
+        # Skip if no pending tasks (nothing to reflect on after)
+        pending = [t for t in todos if t.get("status") == "pending"]
+        if not pending:
+            return todos
+
+        # Append reflection task with lowest priority so it's always last
+        reflection_task = {
+            "content": self._reflection_task_content,
+            "status": "pending",
+            "priority": "low",
+        }
+        return todos + [reflection_task]
+
+    def set_todos_from_list(self, todos: List[Dict[str, Any]]) -> str:
+        """Set the entire todo list from a list of todo dictionaries.
+
+        This is the primary method for the Claude Code-style TodoWrite pattern.
+        It replaces the entire todo list atomically.
+
+        Args:
+            todos: List of todo dicts, each with:
+                - content (str, required): Task description
+                - status (str, required): "pending", "in_progress", or "completed"
+                - priority (str, optional): "high", "medium", or "low" (default: "medium")
+                - id (str, optional): Todo ID (auto-generated if not provided)
+
+        Returns:
+            Formatted summary of the updated todo list with progress and hints
+
+        Raises:
+            ValueError: If a todo dict is missing required fields or has invalid status
+
+        Example:
+            ```python
+            todos = [
+                {"content": "Extract document text", "status": "completed"},
+                {"content": "Chunk document", "status": "in_progress"},
+                {"content": "Identify requirements", "status": "pending", "priority": "high"},
+            ]
+            result = todo_mgr.set_todos_from_list(todos)
+            ```
+        """
+        # Inject reflection task if enabled (maintains "roter Faden")
+        todos = self._inject_reflection_task(todos)
+
+        VALID_STATUSES = {"pending", "in_progress", "completed"}
+        PRIORITY_MAP = {"high": 2, "medium": 1, "low": 0}
+
+        # Build mapping of existing IDs to preserve timestamps
+        existing_by_id = {t.id: t for t in self._todos}
+
+        new_todos = []
+        for i, todo_dict in enumerate(todos):
+            # Validate required fields
+            if "content" not in todo_dict:
+                raise ValueError(f"Todo at index {i} missing required 'content' field")
+            if "status" not in todo_dict:
+                raise ValueError(f"Todo at index {i} missing required 'status' field")
+
+            status_str = todo_dict["status"].lower()
+            if status_str not in VALID_STATUSES:
+                raise ValueError(
+                    f"Todo at index {i} has invalid status '{status_str}'. "
+                    f"Valid values: {VALID_STATUSES}"
+                )
+
+            # Convert status string to enum
+            status = TodoStatus(status_str)
+
+            # Convert priority string to int
+            priority_str = todo_dict.get("priority", "medium").lower()
+            priority = PRIORITY_MAP.get(priority_str, 1)
+
+            # Use provided ID or generate new one
+            todo_id = todo_dict.get("id")
+            if not todo_id:
+                todo_id = f"todo_{self._next_id}"
+                self._next_id += 1
+
+            # Check if we're updating an existing todo (preserve timestamps)
+            existing = existing_by_id.get(todo_id)
+            if existing:
+                item = TodoItem(
+                    id=todo_id,
+                    content=todo_dict["content"],
+                    status=status,
+                    priority=priority,
+                    parent_id=existing.parent_id,
+                    metadata=existing.metadata,
+                    created_at=existing.created_at,
+                    started_at=existing.started_at if status in (TodoStatus.IN_PROGRESS, TodoStatus.COMPLETED) else None,
+                    completed_at=existing.completed_at if status == TodoStatus.COMPLETED else None,
+                    notes=existing.notes,
+                )
+                # Update timestamps based on status transitions
+                if status == TodoStatus.IN_PROGRESS and existing.status != TodoStatus.IN_PROGRESS:
+                    item.started_at = datetime.utcnow()
+                if status == TodoStatus.COMPLETED and existing.status != TodoStatus.COMPLETED:
+                    item.completed_at = datetime.utcnow()
+            else:
+                item = TodoItem(
+                    id=todo_id,
+                    content=todo_dict["content"],
+                    status=status,
+                    priority=priority,
+                )
+                if status == TodoStatus.IN_PROGRESS:
+                    item.started_at = datetime.utcnow()
+                if status == TodoStatus.COMPLETED:
+                    item.completed_at = datetime.utcnow()
+
+            new_todos.append(item)
+
+        # Replace the todo list
+        self._todos = new_todos
+
+        # Update next_id to be higher than any existing ID
+        max_id = 0
+        for todo in self._todos:
+            if todo.id.startswith("todo_"):
+                try:
+                    id_num = int(todo.id.split("_")[1])
+                    max_id = max(max_id, id_num)
+                except (ValueError, IndexError):
+                    pass
+        self._next_id = max(self._next_id, max_id + 1)
+
+        logger.info(f"Set {len(self._todos)} todos via set_todos_from_list")
+
+        # Return formatted summary with progress and hints
+        return self._format_todo_write_response()
+
+    def _format_todo_write_response(self) -> str:
+        """Format the response for todo_write tool.
+
+        Returns a structured response with:
+        1. Current todo list with status icons
+        2. Progress summary
+        3. Hint about what to do next
+        """
+        lines = []
+
+        # Group by status for display
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+        completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
+
+        # Progress summary
+        total = len(self._todos)
+
+        lines.append("## Todo List Updated")
+        lines.append("")
+
+        if total == 0:
+            lines.append("No todos in list. Add tasks with todo_write.")
+            return "\n".join(lines)
+
+        # In progress section
+        if in_progress:
+            lines.append(f"### In Progress ({len(in_progress)})")
+            for todo in in_progress:
+                priority_marker = " [HIGH]" if todo.priority >= 2 else ""
+                lines.append(f"  - [{todo.id}] {todo.content}{priority_marker}")
+            lines.append("")
+
+        # Pending section
+        if pending:
+            lines.append(f"### Pending ({len(pending)})")
+            # Sort by priority (descending)
+            pending_sorted = sorted(pending, key=lambda t: -t.priority)
+            for todo in pending_sorted:
+                priority_marker = " [HIGH]" if todo.priority >= 2 else ""
+                lines.append(f"  - [{todo.id}] {todo.content}{priority_marker}")
+            lines.append("")
+
+        # Completed section (abbreviated)
+        if completed:
+            lines.append(f"### Completed ({len(completed)})")
+            # Only show last 3 completed
+            for todo in completed[-3:]:
+                lines.append(f"  - [x] {todo.content}")
+            if len(completed) > 3:
+                lines.append(f"  - ... and {len(completed) - 3} more")
+            lines.append("")
+
+        # Progress bar
+        completed_count = len(completed)
+        pct = round(completed_count / total * 100) if total > 0 else 0
+        bar_filled = pct // 10
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        lines.append(f"**Progress:** [{bar}] {completed_count}/{total} ({pct}%)")
+        lines.append("")
+
+        # Hint about next action
+        if in_progress:
+            current = in_progress[0]
+            lines.append(f"**Currently working on:** {current.content}")
+        elif pending:
+            # Find highest priority pending
+            next_todo = sorted(pending, key=lambda t: -t.priority)[0]
+            lines.append(f"**Next up:** {next_todo.content}")
+        else:
+            lines.append("**All tasks complete!** Consider using `archive_and_reset` if moving to a new phase.")
+
+        return "\n".join(lines)
 
     # -------------------------------------------------------------------------
     # Formatting methods

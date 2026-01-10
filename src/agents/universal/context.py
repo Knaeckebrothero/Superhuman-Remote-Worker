@@ -78,6 +78,85 @@ class ContextConfig:
     tool_retry_delay_seconds: float = 1.0
 
 
+@dataclass
+class ProtectedContextConfig:
+    """Configuration for protected context that survives compaction.
+
+    Protected context ensures critical information (plan, todos, phase)
+    is always present in the LLM's context window, even after compaction.
+    """
+    enabled: bool = True
+    plan_file: str = "plans/main_plan.md"
+    max_plan_chars: int = 2000
+    include_todos: bool = True
+
+
+@dataclass
+class ProtectedContextProvider:
+    """Provides protected context that survives compaction.
+
+    This maintains the agent's "roter Faden" (red thread) - ensuring
+    continuity of purpose across context compaction events.
+
+    The protected context is read fresh from workspace each time,
+    not cached, so it always reflects the current state.
+    """
+    workspace_manager: Optional[Any] = None
+    todo_manager: Optional[Any] = None
+    config: ProtectedContextConfig = field(default_factory=ProtectedContextConfig)
+
+    def get_protected_context(self) -> Optional[str]:
+        """Build protected context string from workspace files and todos.
+
+        Returns:
+            Formatted protected context string, or None if disabled/empty
+        """
+        if not self.config.enabled:
+            return None
+
+        parts = ["[PROTECTED CONTEXT - Current State]"]
+
+        # Read plan from workspace
+        if self.workspace_manager:
+            try:
+                plan = self.workspace_manager.read_file(self.config.plan_file)
+                if plan:
+                    truncated = plan[:self.config.max_plan_chars]
+                    if len(plan) > self.config.max_plan_chars:
+                        truncated += "\n[...truncated]"
+                    parts.append(f"\n## Current Plan\n{truncated}")
+            except Exception as e:
+                # Plan file may not exist yet - that's OK
+                logger.debug(f"Could not read plan file: {e}")
+
+        # Get current todos
+        if self.config.include_todos and self.todo_manager:
+            try:
+                todos = self.todo_manager.list_all_sync()
+                if todos:
+                    todo_lines = []
+                    for t in todos:
+                        status_marker = {
+                            "pending": "[ ]",
+                            "in_progress": "[>]",
+                            "completed": "[x]",
+                            "blocked": "[!]",
+                            "skipped": "[-]",
+                        }.get(t.status.value, "[ ]")
+                        todo_lines.append(f"- {status_marker} {t.content}")
+                    # Limit to 15 most recent todos to keep context reasonable
+                    parts.append(f"\n## Active Todos\n" + "\n".join(todo_lines[:15]))
+            except Exception as e:
+                logger.debug(f"Could not get todos: {e}")
+
+        parts.append("\n[END PROTECTED CONTEXT]")
+
+        # Only return if we have actual content beyond markers
+        if len(parts) > 2:
+            return "\n".join(parts)
+        return None
+
+
 def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
     """Count tokens using tiktoken for accurate counting.
 
@@ -198,6 +277,19 @@ class ContextManager:
         self.config = config or ContextConfig()
         self.token_counter = get_token_counter(model)
         self._state = ContextManagementState()
+        self._protected_provider: Optional[ProtectedContextProvider] = None
+
+    def set_protected_provider(self, provider: ProtectedContextProvider) -> None:
+        """Set the protected context provider.
+
+        The protected provider supplies context that survives compaction,
+        ensuring the agent maintains its "roter Faden" across context resets.
+
+        Args:
+            provider: Provider for protected context
+        """
+        self._protected_provider = provider
+        logger.info("Protected context provider configured")
 
     @property
     def state(self) -> ContextManagementState:
@@ -551,8 +643,19 @@ Summary:"""
             content=f"[Summary of prior work]\n{summary}"
         )
 
-        # Reconstruct: system + summary + recent
-        result = system_msgs + [summary_msg] + recent_messages
+        # Inject protected context if available (maintains "roter Faden")
+        protected_msg = None
+        if self._protected_provider:
+            protected_content = self._protected_provider.get_protected_context()
+            if protected_content:
+                protected_msg = SystemMessage(content=protected_content)
+                logger.info("Injecting protected context after compaction")
+
+        # Reconstruct: system + protected (if any) + summary + recent
+        result = system_msgs
+        if protected_msg:
+            result = result + [protected_msg]
+        result = result + [summary_msg] + recent_messages
 
         logger.info(
             f"Compacted {len(messages)} messages to {len(result)} "

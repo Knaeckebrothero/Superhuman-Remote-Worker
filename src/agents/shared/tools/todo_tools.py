@@ -1,4 +1,4 @@
-"""Todo tools for tactical execution tracking.
+"""Todo tools - Claude Code TodoWrite pattern.
 
 Provides LangGraph-compatible tools for managing short-term todos
 within the two-tier planning model:
@@ -6,10 +6,11 @@ within the two-tier planning model:
 - Strategic planning: Long-term plans in workspace filesystem
 - Tactical execution: Short-term todos managed by these tools
 
-The tools wrap TodoManager operations and integrate with the workspace
-for archive persistence.
+The primary tool is `todo_write` which follows the Claude Code TodoWrite pattern -
+submitting the entire todo list as a single atomic operation.
 """
 
+import json
 import logging
 from typing import List
 
@@ -42,116 +43,87 @@ def create_todo_tools(context: ToolContext) -> List:
         todo_mgr.set_workspace_manager(context.workspace_manager)
 
     @tool
-    def add_todo(content: str, priority: int = 0) -> str:
-        """Add a task to the current todo list.
+    def todo_write(todos: str) -> str:
+        """Update the todo list with a complete list of tasks.
 
-        Use this to track concrete, actionable steps for the current phase.
-        Break complex work into 10-20 small, specific tasks.
+        This tool replaces the entire todo list with the provided tasks.
+        Use it to:
+        - Add new tasks
+        - Mark tasks as in_progress or completed
+        - Remove tasks (by omitting them)
+        - Reorder or reprioritize tasks
+
+        IMPORTANT: Submit the COMPLETE list every time. Tasks not included
+        will be removed. This ensures the todo list always reflects your
+        current understanding of what needs to be done.
 
         Args:
-            content: Task description (be specific and actionable)
-            priority: Higher number = more important (default 0)
+            todos: JSON array of todo objects. Each object must have:
+                - content (str): Task description
+                - status (str): "pending", "in_progress", or "completed"
+
+                Optional fields:
+                - priority (str): "high", "medium", or "low" (default: "medium")
+                - id (str): Todo ID to preserve (auto-generated if omitted)
 
         Returns:
-            Confirmation with todo ID
+            Formatted summary showing:
+            - Updated todo list grouped by status
+            - Progress bar and statistics
+            - Hint about what to work on next
 
         Examples:
-            add_todo("Extract text from document.pdf")
-            add_todo("Validate requirement REQ-001 against metamodel", priority=1)
+            # Start with initial tasks
+            todo_write('[
+                {"content": "Extract document text", "status": "pending", "priority": "high"},
+                {"content": "Chunk document", "status": "pending"},
+                {"content": "Identify requirements", "status": "pending"}
+            ]')
+
+            # After completing first task and starting second
+            todo_write('[
+                {"content": "Extract document text", "status": "completed"},
+                {"content": "Chunk document", "status": "in_progress"},
+                {"content": "Identify requirements", "status": "pending"}
+            ]')
+
+        Best practices:
+        - Have at most ONE task "in_progress" at a time
+        - Mark tasks "completed" ONLY when fully done
+        - Use "high" priority for blocking/critical tasks
+        - Keep 10-20 tasks for the current phase
+        - Archive with `archive_and_reset` when changing phases
         """
         try:
-            item = todo_mgr.add_sync(content, priority=priority)
-            return f"Added: {item.id} - {content}"
+            # Parse JSON input
+            if isinstance(todos, str):
+                todo_list = json.loads(todos)
+            else:
+                todo_list = todos
+
+            if not isinstance(todo_list, list):
+                return "Error: todos must be a JSON array of todo objects"
+
+            # Validate each todo has required fields
+            for i, todo in enumerate(todo_list):
+                if not isinstance(todo, dict):
+                    return f"Error: todo at index {i} must be an object, got {type(todo).__name__}"
+                if "content" not in todo:
+                    return f"Error: todo at index {i} missing required 'content' field"
+                if "status" not in todo:
+                    return f"Error: todo at index {i} missing required 'status' field"
+
+            # Use the new set_todos_from_list method
+            result = todo_mgr.set_todos_from_list(todo_list)
+            return result
+
+        except json.JSONDecodeError as e:
+            return f"Error parsing JSON: {str(e)}. Ensure todos is a valid JSON array."
+        except ValueError as e:
+            return f"Error: {str(e)}"
         except Exception as e:
-            logger.error(f"add_todo error: {e}")
-            return f"Error adding todo: {str(e)}"
-
-    @tool
-    def complete_todo(todo_id: str, notes: str = "") -> str:
-        """Mark a todo as complete.
-
-        Call this immediately after finishing a task.
-        Optionally add notes about what was accomplished or discovered.
-
-        Args:
-            todo_id: The todo ID (e.g., "todo_1")
-            notes: Optional completion notes (findings, decisions, etc.)
-
-        Returns:
-            Confirmation or error message
-        """
-        try:
-            item = todo_mgr.complete_sync(todo_id, notes=notes if notes else None)
-            if item:
-                return f"Completed: {todo_id}"
-            return f"Todo not found: {todo_id}"
-        except Exception as e:
-            logger.error(f"complete_todo error: {e}")
-            return f"Error completing todo: {str(e)}"
-
-    @tool
-    def start_todo(todo_id: str) -> str:
-        """Mark a todo as in-progress.
-
-        Use this when you begin working on a task to track what's active.
-
-        Args:
-            todo_id: The todo ID to start (e.g., "todo_1")
-
-        Returns:
-            Confirmation or error message
-        """
-        try:
-            item = todo_mgr.start_sync(todo_id)
-            if item:
-                return f"Started: {todo_id} - {item.content}"
-            return f"Todo not found: {todo_id}"
-        except Exception as e:
-            logger.error(f"start_todo error: {e}")
-            return f"Error starting todo: {str(e)}"
-
-    @tool
-    def list_todos() -> str:
-        """List all current todos with their status.
-
-        Shows todos organized by status with visual indicators:
-        - ○ pending
-        - ◐ in progress
-        - ● completed
-        - ✗ blocked
-        - − skipped
-
-        Returns:
-            Formatted list of all todos
-        """
-        try:
-            items = todo_mgr.list_all_sync()
-            return todo_mgr.format_list(items)
-        except Exception as e:
-            logger.error(f"list_todos error: {e}")
-            return f"Error listing todos: {str(e)}"
-
-    @tool
-    def get_progress() -> str:
-        """Get progress summary for current todos.
-
-        Shows completion statistics to track phase progress.
-
-        Returns:
-            Progress summary with counts and percentage
-        """
-        try:
-            progress = todo_mgr.get_progress_sync()
-            return (
-                f"Progress: {progress['completed']}/{progress['total']} "
-                f"({progress['completion_percentage']}% complete)\n"
-                f"In progress: {progress['in_progress']}, "
-                f"Pending: {progress['pending']}, "
-                f"Blocked: {progress['blocked']}"
-            )
-        except Exception as e:
-            logger.error(f"get_progress error: {e}")
-            return f"Error getting progress: {str(e)}"
+            logger.error(f"todo_write error: {e}")
+            return f"Error updating todos: {str(e)}"
 
     @tool
     def archive_and_reset(phase_name: str = "") -> str:
@@ -182,79 +154,25 @@ def create_todo_tools(context: ToolContext) -> List:
             logger.error(f"archive_and_reset error: {e}")
             return f"Error archiving todos: {str(e)}"
 
-    @tool
-    def get_next_todo() -> str:
-        """Get the next pending task to work on.
-
-        Returns the highest priority pending todo.
-
-        Returns:
-            Next todo to work on or message if none pending
-        """
-        try:
-            item = todo_mgr.next_sync()
-            if item:
-                priority_note = f" [priority: {item.priority}]" if item.priority > 0 else ""
-                return f"Next: {item.id} - {item.content}{priority_note}"
-            return "No pending todos. All tasks complete or add new todos."
-        except Exception as e:
-            logger.error(f"get_next_todo error: {e}")
-            return f"Error getting next todo: {str(e)}"
-
-    # Return all todo tools
+    # Return the two todo tools
     return [
-        add_todo,
-        complete_todo,
-        start_todo,
-        list_todos,
-        get_progress,
+        todo_write,
         archive_and_reset,
-        get_next_todo,
     ]
 
 
 # Tool metadata for registry
 TODO_TOOLS_METADATA = {
-    "add_todo": {
+    "todo_write": {
         "module": "todo_tools",
-        "function": "add_todo",
-        "description": "Add a task to the todo list",
-        "category": "todo",
-    },
-    "complete_todo": {
-        "module": "todo_tools",
-        "function": "complete_todo",
-        "description": "Mark a todo as complete",
-        "category": "todo",
-    },
-    "start_todo": {
-        "module": "todo_tools",
-        "function": "start_todo",
-        "description": "Mark a todo as in-progress",
-        "category": "todo",
-    },
-    "list_todos": {
-        "module": "todo_tools",
-        "function": "list_todos",
-        "description": "List all current todos",
-        "category": "todo",
-    },
-    "get_progress": {
-        "module": "todo_tools",
-        "function": "get_progress",
-        "description": "Get progress summary",
+        "function": "todo_write",
+        "description": "Update the complete todo list with tasks and their statuses",
         "category": "todo",
     },
     "archive_and_reset": {
         "module": "todo_tools",
         "function": "archive_and_reset",
         "description": "Archive todos and reset for next phase",
-        "category": "todo",
-    },
-    "get_next_todo": {
-        "module": "todo_tools",
-        "function": "get_next_todo",
-        "description": "Get the next task to work on",
         "category": "todo",
     },
 }

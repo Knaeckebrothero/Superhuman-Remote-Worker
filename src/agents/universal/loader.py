@@ -53,6 +53,8 @@ class TodoConfig:
     max_items: int = 25
     archive_on_reset: bool = True
     archive_path: str = "archive/"
+    auto_reflection: bool = True
+    reflection_task_content: str = "Review plan, update progress, create next todos"
 
 
 @dataclass
@@ -94,6 +96,11 @@ class ContextManagementConfig:
     compact_on_archive: bool = True
     keep_recent_tool_results: int = 5
     summarization_prompt: str = "Summarize the work completed so far."
+    # Protected context settings (maintains "roter Faden" across compaction)
+    protected_context_enabled: bool = True
+    protected_context_plan_file: str = "plans/main_plan.md"
+    protected_context_max_chars: int = 2000
+    protected_context_include_todos: bool = True
 
 
 @dataclass

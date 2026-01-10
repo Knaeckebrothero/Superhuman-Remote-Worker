@@ -95,6 +95,7 @@ def build_agent_graph(
     config: AgentConfig,
     system_prompt: str,
     workspace_manager: Optional[Any] = None,
+    todo_manager: Optional[Any] = None,
     context_config: Optional[ContextConfig] = None,
     summarization_prompt: Optional[str] = None,
     on_initialize: Optional[Callable[[UniversalAgentState], UniversalAgentState]] = None,
@@ -114,6 +115,7 @@ def build_agent_graph(
         config: Agent configuration
         system_prompt: Formatted system prompt
         workspace_manager: Optional workspace manager for error persistence
+        todo_manager: Optional todo manager for protected context injection
         context_config: Optional context management configuration
         summarization_prompt: Optional custom summarization prompt
         on_initialize: Optional callback for initialization customization
@@ -142,6 +144,23 @@ def build_agent_graph(
         keep_recent_tool_results=config.context_management.keep_recent_tool_results,
     )
     context_manager = ContextManager(config=ctx_config)
+
+    # Set up protected context provider (maintains "roter Faden" across compaction)
+    if config.context_management.protected_context_enabled and workspace_manager:
+        from .context import ProtectedContextProvider, ProtectedContextConfig
+        protected_config = ProtectedContextConfig(
+            enabled=config.context_management.protected_context_enabled,
+            plan_file=config.context_management.protected_context_plan_file,
+            max_plan_chars=config.context_management.protected_context_max_chars,
+            include_todos=config.context_management.protected_context_include_todos,
+        )
+        protected_provider = ProtectedContextProvider(
+            workspace_manager=workspace_manager,
+            todo_manager=todo_manager,
+            config=protected_config,
+        )
+        context_manager.set_protected_provider(protected_provider)
+        logger.info("Protected context provider configured for compaction resilience")
 
     # Initialize retry manager
     retry_manager = ToolRetryManager(

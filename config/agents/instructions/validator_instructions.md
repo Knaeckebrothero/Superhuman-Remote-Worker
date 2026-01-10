@@ -31,13 +31,24 @@ These tools are fundamental and you can use them immediately without reading add
 - `get_workspace_summary()` - Get workspace statistics
 
 **Todo Tools:**
-- `add_todo(content, priority)` - Add a task to your list
-- `complete_todo(todo_id, notes)` - Mark a task complete
-- `start_todo(todo_id)` - Mark a task as in progress
-- `list_todos()` - View all current todos
-- `get_progress()` - See completion statistics
-- `archive_and_reset(phase_name)` - Archive todos and start fresh
-- `get_next_todo()` - Get highest priority pending task
+- `todo_write(todos)` - Update the complete todo list (JSON array)
+- `archive_and_reset(phase_name)` - Archive todos and clear for next phase
+
+**How to use todo_write:**
+```json
+todo_write('[
+  {"content": "Analyze requirement REQ-001", "status": "in_progress", "priority": "high"},
+  {"content": "Check for duplicates", "status": "pending"},
+  {"content": "Resolve entity mentions", "status": "pending"}
+]')
+```
+
+**Rules:**
+- Submit the COMPLETE list every time (omitted tasks are removed)
+- Have exactly ONE task with `"status": "in_progress"` at a time
+- Use priorities: `"high"`, `"medium"` (default), `"low"`
+- Mark tasks `"completed"` only when fully done
+- The tool returns progress and hints about what to do next
 
 **Completion:**
 - `mark_complete()` - Signal task completion

@@ -267,6 +267,8 @@ class UniversalAgent:
                 tools=self._tools,
                 config=self.config,
                 system_prompt=system_prompt,
+                workspace_manager=self._workspace_manager,
+                todo_manager=self._todo_manager,
             )
 
             # Create initial state with updated metadata (workspace-relative paths)
@@ -379,6 +381,8 @@ class UniversalAgent:
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(
                 workspace_manager=self._workspace_manager,
+                auto_reflection=self.config.todo.auto_reflection,
+                reflection_task_content=self.config.todo.reflection_task_content,
             )
 
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
@@ -417,6 +421,8 @@ class UniversalAgent:
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(
             workspace_manager=self._workspace_manager,
+            auto_reflection=self.config.todo.auto_reflection,
+            reflection_task_content=self.config.todo.reflection_task_content,
         )
 
         # Generate tool documentation in workspace
