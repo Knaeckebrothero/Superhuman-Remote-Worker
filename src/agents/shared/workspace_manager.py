@@ -28,10 +28,8 @@ class WorkspaceConfig:
 
     # Standard subdirectories to create for each job
     structure: List[str] = field(default_factory=lambda: [
-        "plans",
         "archive",
         "documents",
-        "notes",
         "chunks",
         "candidates",
         "requirements",
@@ -95,8 +93,8 @@ class WorkspaceManager:
         output_file = ws.get_path("output/results.json")
 
         # Read/write files
-        content = ws.read_file("plans/main_plan.md")
-        ws.write_file("notes/research.md", "# Research Notes\\n...")
+        content = ws.read_file("main_plan.md")
+        ws.write_file("research.md", "# Research Notes\\n...")
 
         # List contents
         files = ws.list_files("chunks")

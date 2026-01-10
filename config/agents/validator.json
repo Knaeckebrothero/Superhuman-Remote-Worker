@@ -13,9 +13,7 @@
 
   "workspace": {
     "structure": [
-      "plans/",
       "archive/",
-      "notes/",
       "analysis/",
       "output/",
       "tools/"
@@ -56,7 +54,8 @@
       "count_graph_statistics"
     ],
     "completion": [
-      "mark_complete"
+      "mark_complete",
+      "job_complete"
     ]
   },
 
@@ -65,7 +64,7 @@
     "archive_on_reset": true,
     "archive_path": "archive/",
     "auto_reflection": true,
-    "reflection_task_content": "Review plan in plans/main_plan.md, update with progress, adjust if needed, create next todos"
+    "reflection_task_content": "Review plan in main_plan.md, update with progress, adjust if needed, create next todos"
   },
 
   "connections": {
@@ -96,7 +95,7 @@
     "keep_recent_tool_results": 5,
     "summarization_prompt": "Summarize the validation work completed so far. Focus on: (1) Which requirements have been analyzed, (2) Relevance decisions made, (3) Fulfillment analysis results, (4) Graph integrations completed. Include any key decisions and entity resolutions.",
     "protected_context_enabled": true,
-    "protected_context_plan_file": "plans/main_plan.md",
+    "protected_context_plan_file": "main_plan.md",
     "protected_context_max_chars": 2000,
     "protected_context_include_todos": true
   },

@@ -32,7 +32,13 @@ COMPLETION_TOOLS_METADATA = {
     "mark_complete": {
         "module": "completion_tools",
         "function": "mark_complete",
-        "description": "Signal task completion with structured report",
+        "description": "Signal task/phase completion with structured report",
+        "category": "completion",
+    },
+    "job_complete": {
+        "module": "completion_tools",
+        "function": "job_complete",
+        "description": "Signal FINAL job completion - call when all phases are done",
         "category": "completion",
     },
 }

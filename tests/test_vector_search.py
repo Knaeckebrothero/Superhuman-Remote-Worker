@@ -194,7 +194,7 @@ class TestWorkspaceVectorStore:
         long_content = "This is some content to index that is long enough to be indexed properly."
 
         # Should index markdown files
-        assert store._should_index("notes/research.md", long_content)
+        assert store._should_index("research.md", long_content)
 
         # Should index text files
         assert store._should_index("data/info.txt", long_content)

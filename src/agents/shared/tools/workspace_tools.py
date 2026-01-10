@@ -154,13 +154,13 @@ def create_workspace_tools(context: ToolContext) -> List:
         Overwrites the file if it already exists.
 
         Use this to:
-        - Create plans (plans/main_plan.md)
-        - Save research notes (notes/research.md)
+        - Create plans (main_plan.md)
+        - Save research notes (research.md, document_analysis.md)
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
 
         Args:
-            path: Relative path for the file (e.g., "notes/research.md")
+            path: Relative path for the file (e.g., "research.md")
             content: Content to write
 
         Returns:

@@ -98,7 +98,7 @@ class ContextManagementConfig:
     summarization_prompt: str = "Summarize the work completed so far."
     # Protected context settings (maintains "roter Faden" across compaction)
     protected_context_enabled: bool = True
-    protected_context_plan_file: str = "plans/main_plan.md"
+    protected_context_plan_file: str = "main_plan.md"
     protected_context_max_chars: int = 2000
     protected_context_include_todos: bool = True
 
@@ -390,7 +390,7 @@ Domain tools: {', '.join(config.tools.domain)}
 
 ## How to Work
 
-1. Create a plan in `plans/main_plan.md`
+1. Create a plan in `main_plan.md`
 2. Use todos to track immediate steps
 3. Write results to files as you go
 4. When complete, write status to `output/completion.json`

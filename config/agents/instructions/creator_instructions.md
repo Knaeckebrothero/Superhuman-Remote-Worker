@@ -9,9 +9,9 @@ Extract well-formed, citation-backed requirements from documents and prepare the
 ## How to Work
 
 1. **Read this file** to understand your task
-2. **Create a plan** in `plans/main_plan.md` outlining your approach
+2. **Create a plan** in `main_plan.md` outlining your approach
 3. **Use todos** to track your immediate tasks (10-20 steps at a time)
-4. **Write notes** to `notes/` to free up context
+4. **Write notes** to files (e.g., `document_analysis.md`) to free up context
 5. **Archive and reset** todos when completing each phase
 6. **Check your plan** frequently to stay on track
 
@@ -112,7 +112,7 @@ Understand the document structure and plan your extraction approach.
 - **GENERAL**: Other documents
 
 ### Output
-After analysis, write to `notes/document_analysis.md`:
+After analysis, write to `document_analysis.md`:
 - Document type and language
 - Total pages and estimated reading plan
 - Key structural elements found (sections, articles)
@@ -219,7 +219,7 @@ When verified, call `mark_complete()`.
 
 ## Planning Template
 
-Use this structure for `plans/main_plan.md`:
+Use this structure for `main_plan.md`:
 
 ```markdown
 # Requirement Extraction Plan

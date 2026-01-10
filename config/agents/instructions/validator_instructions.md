@@ -9,7 +9,7 @@ Validate requirement candidates from the cache, check for duplicates, assess rel
 ## How to Work
 
 1. **Read this file** to understand your task
-2. **Create a plan** in `plans/main_plan.md` outlining your approach
+2. **Create a plan** in `main_plan.md` outlining your approach
 3. **Use todos** to track your immediate tasks (10-20 steps at a time)
 4. **Write analysis results** to files to free up context
 5. **Archive and reset** todos when completing each phase
@@ -293,7 +293,7 @@ If requirement should be rejected:
 
 ## Planning Template
 
-Use this structure for `plans/main_plan.md`:
+Use this structure for `main_plan.md`:
 
 ```markdown
 # Requirement Validation Plan

@@ -600,7 +600,7 @@ class TestProtectedContextConfig:
 
         config = ProtectedContextConfig()
         assert config.enabled is True
-        assert config.plan_file == "plans/main_plan.md"
+        assert config.plan_file == "main_plan.md"
         assert config.max_plan_chars == 2000
         assert config.include_todos is True
 
@@ -662,7 +662,7 @@ class TestProtectedContextProvider:
         assert "[PROTECTED CONTEXT" in result
         assert "My Plan" in result
         assert "Step 1" in result
-        mock_workspace.read_file.assert_called_once_with("plans/main_plan.md")
+        mock_workspace.read_file.assert_called_once_with("main_plan.md")
 
     def test_plan_truncation(self):
         """Test that long plans are truncated."""

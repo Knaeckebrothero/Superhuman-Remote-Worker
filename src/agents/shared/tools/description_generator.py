@@ -78,13 +78,13 @@ Creates parent directories automatically if they don't exist.
 Overwrites the file if it already exists.
 
 **Use this to:**
-- Create plans (plans/main_plan.md)
-- Save research notes (notes/research.md)
+- Create plans (main_plan.md)
+- Save research notes (research.md, document_analysis.md)
 - Write intermediate results (candidates/candidates.md)
 - Store processed data (chunks/chunk_001.md)
 
 **Arguments:**
-- `path` (str): Relative path for the file (e.g., "notes/research.md")
+- `path` (str): Relative path for the file (e.g., "research.md")
 - `content` (str): Content to write
 
 **Returns:** Confirmation message with file path and size

@@ -446,7 +446,7 @@ class TestLoadInstructions:
         instructions = load_instructions(config, config_dir=str(temp_config_dir))
 
         assert "Test Agent" in instructions
-        assert "plans/main_plan.md" in instructions
+        assert "main_plan.md" in instructions
 
     def test_load_instructions_from_file(self, temp_config_dir):
         """Test loading instructions from file."""

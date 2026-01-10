@@ -16,7 +16,7 @@ class UniversalAgentState(TypedDict):
     """Minimal state for workspace-centric autonomous agent.
 
     Unlike phase-based agents, the Universal Agent:
-    - Uses workspace files for strategic planning (plans/main_plan.md)
+    - Uses workspace files for strategic planning (main_plan.md)
     - Uses TodoManager for tactical execution (in-memory, archived to workspace)
     - Tracks minimal state - just what's needed for graph execution
 

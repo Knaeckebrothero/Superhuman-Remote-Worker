@@ -175,7 +175,7 @@ The Universal Agent (`src/agents/universal/`) is the primary agent implementatio
 
 **Key features:**
 - Reads `instructions.md` from workspace to understand task context
-- Uses `plans/`, `notes/`, `archive/` directories for strategic planning
+- Uses `main_plan.md` for strategic planning, `archive/` for todo history
 - TodoManager for tactical execution with `archive_and_reset()` for context recovery
 - Automatic context compaction when approaching token limits
 - Completion detection via `mark_complete` tool

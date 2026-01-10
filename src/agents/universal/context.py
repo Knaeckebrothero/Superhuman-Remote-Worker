@@ -86,7 +86,7 @@ class ProtectedContextConfig:
     is always present in the LLM's context window, even after compaction.
     """
     enabled: bool = True
-    plan_file: str = "plans/main_plan.md"
+    plan_file: str = "main_plan.md"
     max_plan_chars: int = 2000
     include_todos: bool = True
 

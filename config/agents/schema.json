@@ -65,7 +65,7 @@
             "type": "string"
           },
           "description": "Directories to create in the workspace",
-          "examples": [["plans/", "archive/", "notes/", "output/"]]
+          "examples": [["archive/", "output/", "tools/"]]
         },
         "instructions_template": {
           "type": "string",
