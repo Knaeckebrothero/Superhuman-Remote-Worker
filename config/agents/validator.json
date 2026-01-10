@@ -17,7 +17,8 @@
       "archive/",
       "notes/",
       "analysis/",
-      "output/"
+      "output/",
+      "tools/"
     ],
     "instructions_template": "validator_instructions.md",
     "initial_files": {

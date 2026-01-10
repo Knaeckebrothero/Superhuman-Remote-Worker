@@ -31,7 +31,6 @@ class WorkspaceConfig:
         "plans",
         "archive",
         "documents",
-        "documents/sources",
         "notes",
         "chunks",
         "candidates",
@@ -337,9 +336,10 @@ class WorkspaceManager:
             return [relative_path]
 
         results = []
+        workspace_resolved = self._workspace_path.resolve()
         for item in dir_path.glob(pattern):
             # Get path relative to workspace root
-            rel = item.relative_to(self._workspace_path)
+            rel = item.relative_to(workspace_resolved)
             # Add trailing slash for directories
             if item.is_dir():
                 results.append(str(rel) + "/")
@@ -361,6 +361,7 @@ class WorkspaceManager:
         """
         search_path = self.get_path(path)
         results = []
+        workspace_resolved = self._workspace_path.resolve()
 
         if not case_sensitive:
             query = query.lower()
@@ -381,7 +382,7 @@ class WorkspaceManager:
                 for i, line in enumerate(lines, 1):
                     search_line = line if case_sensitive else line.lower()
                     if query in search_line:
-                        rel_path = str(file_path.relative_to(self._workspace_path))
+                        rel_path = str(file_path.relative_to(workspace_resolved))
                         results.append({
                             "path": rel_path,
                             "line_number": i,
@@ -441,7 +442,7 @@ class WorkspaceManager:
         """
         summary = {
             "job_id": self.job_id,
-            "path": str(self._workspace_path),
+            "path": "/",  # Always return "/" - agent sees workspace as root
             "exists": self._workspace_path.exists(),
             "directories": {},
             "total_files": 0,

@@ -48,6 +48,16 @@ from .registry import (
     get_tools_by_category,
     load_tools_by_category,
 )
+from .description_generator import (
+    generate_workspace_tool_docs,
+    generate_tool_description,
+    generate_tool_index,
+)
+from .description_override import (
+    apply_description_overrides,
+    get_deferred_tools,
+    get_core_tools,
+)
 
 __all__ = [
     # Context
@@ -68,4 +78,12 @@ __all__ = [
     "get_available_tools",
     "get_tools_by_category",
     "load_tools_by_category",
+    # Description generator
+    "generate_workspace_tool_docs",
+    "generate_tool_description",
+    "generate_tool_index",
+    # Description override
+    "apply_description_overrides",
+    "get_deferred_tools",
+    "get_core_tools",
 ]

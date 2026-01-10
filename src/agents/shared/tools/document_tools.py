@@ -22,30 +22,24 @@ DOCUMENT_TOOLS_METADATA = {
         "function": "extract_document_text",
         "description": "Extract text content from PDF, DOCX, TXT, or HTML documents",
         "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "Extract text from PDF/DOCX/TXT/HTML documents.",
     },
     "chunk_document": {
         "module": "document_tools",
         "function": "chunk_document",
         "description": "Split document into processable chunks with different strategies",
         "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "Split document into chunks (legal/technical/general strategies).",
     },
     "identify_requirement_candidates": {
         "module": "document_tools",
         "function": "identify_requirement_candidates",
         "description": "Identify requirement-like statements in text",
         "category": "domain",
-    },
-    "assess_gobd_relevance": {
-        "module": "document_tools",
-        "function": "assess_gobd_relevance",
-        "description": "Assess whether text is relevant to GoBD compliance",
-        "category": "domain",
-    },
-    "extract_entity_mentions": {
-        "module": "document_tools",
-        "function": "extract_entity_mentions",
-        "description": "Find business object and message mentions in text",
-        "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "Find requirement-like statements in text.",
     },
 }
 
@@ -141,6 +135,20 @@ def create_document_tools(context: ToolContext) -> List:
             else:
                 persist_msg = "\nNote: No workspace available, full text not persisted."
 
+            # Auto-register document as citation source
+            source_msg = ""
+            try:
+                source_id = context.get_or_register_doc_source(
+                    resolved_path,
+                    name=Path(file_path).name
+                )
+                source_msg = f"\nCitation Source ID: {source_id}\nThis document is now registered as a citation source. Use cite_document() to create citations."
+            except ImportError:
+                source_msg = "\nNote: CitationEngine not available, document not registered as source."
+            except Exception as e:
+                logger.warning(f"Could not register document as citation source: {e}")
+                source_msg = f"\nNote: Could not register as citation source: {e}"
+
             return f"""Document Extraction Complete
 
 File: {file_path}
@@ -149,6 +157,7 @@ Language: {result.get('language', 'unknown')}
 Document Type: {result.get('document_type', 'unknown')}
 Total Characters: {result.get('char_count', 0)}
 {persist_msg}
+{source_msg}
 
 Use 'chunk_document' to split this into processable chunks."""
 
@@ -271,85 +280,8 @@ Chunk Statistics:
             logger.error(f"Candidate identification error: {e}")
             return f"Error identifying candidates: {str(e)}"
 
-    @tool
-    def assess_gobd_relevance(text: str) -> str:
-        """Assess whether text is relevant to GoBD compliance.
-
-        GoBD (Grundsaetze zur ordnungsmaessigen Fuehrung und Aufbewahrung)
-        defines German requirements for electronic bookkeeping.
-
-        Args:
-            text: Text to assess
-
-        Returns:
-            GoBD relevance assessment with indicators
-        """
-        try:
-            extractor = get_candidate_extractor()
-            if extractor is None:
-                return "Error: Candidate extractor not available"
-
-            assessment = extractor.assess_gobd(text)
-
-            result = f"""GoBD Relevance Assessment
-
-Is Relevant: {assessment.get('is_relevant', False)}
-Confidence: {assessment.get('confidence', 0):.2f}
-
-Indicators Found:
-"""
-            for ind in assessment.get('indicators', []):
-                result += f"  - {ind}\n"
-
-            result += f"\nGoBD Categories: {', '.join(assessment.get('categories', []))}\n"
-
-            return result
-
-        except Exception as e:
-            logger.error(f"GoBD assessment error: {e}")
-            return f"Error assessing GoBD relevance: {str(e)}"
-
-    @tool
-    def extract_entity_mentions(text: str) -> str:
-        """Find business object and message mentions in text.
-
-        Args:
-            text: Text to analyze
-
-        Returns:
-            Extracted entity mentions
-        """
-        try:
-            extractor = get_candidate_extractor()
-            if extractor is None:
-                return "Error: Candidate extractor not available"
-
-            entities = extractor.extract_entities(text)
-
-            result = "Entity Mentions Found\n\n"
-
-            result += f"Business Objects ({len(entities.get('objects', []))}):\n"
-            for obj in entities.get('objects', []):
-                result += f"  - {obj}\n"
-
-            result += f"\nMessages/Interfaces ({len(entities.get('messages', []))}):\n"
-            for msg in entities.get('messages', []):
-                result += f"  - {msg}\n"
-
-            result += f"\nRequirement References ({len(entities.get('requirements', []))}):\n"
-            for req in entities.get('requirements', []):
-                result += f"  - {req}\n"
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Entity extraction error: {e}")
-            return f"Error extracting entities: {str(e)}"
-
     return [
         extract_document_text,
         chunk_document,
         identify_requirement_candidates,
-        assess_gobd_relevance,
-        extract_entity_mentions,
     ]

@@ -17,43 +17,61 @@ Validate requirement candidates from the cache, check for duplicates, assess rel
 
 ## Available Tools
 
-### Workspace Tools (Strategic Planning)
+### Core Tools (use directly)
+
+These tools are fundamental and you can use them immediately without reading additional documentation.
+
+**Workspace Tools:**
 - `read_file(path)` - Read files from your workspace
 - `write_file(path, content)` - Write content to workspace files
 - `append_file(path, content)` - Append to existing files
 - `list_files(path)` - List directory contents
 - `search_files(query, path)` - Search for content in files
 - `file_exists(path)` - Check if a file exists
+- `get_workspace_summary()` - Get workspace statistics
 
-### Todo Tools (Tactical Execution)
+**Todo Tools:**
 - `add_todo(content, priority)` - Add a task to your list
 - `complete_todo(todo_id, notes)` - Mark a task complete
 - `start_todo(todo_id)` - Mark a task as in progress
 - `list_todos()` - View all current todos
 - `get_progress()` - See completion statistics
 - `archive_and_reset(phase_name)` - Archive todos and start fresh
+- `get_next_todo()` - Get highest priority pending task
 
-### Graph Exploration Tools
-- `execute_cypher_query(query)` - Run Cypher queries against Neo4j
-- `get_database_schema()` - Get node labels, relationship types, properties
-- `count_graph_statistics()` - Get counts of nodes and relationships
+**Completion:**
+- `mark_complete()` - Signal task completion
 
-### Duplicate Detection Tools
-- `find_similar_requirements(text, threshold)` - Find similar requirements (default 0.7)
-- `check_for_duplicates(text)` - Check for near-exact duplicates (0.95 threshold)
+### Domain Tools (read documentation first)
 
-### Entity Resolution Tools
-- `resolve_business_object(mention)` - Match entity to BusinessObject node
-- `resolve_message(mention)` - Match entity to Message node
-- `get_entity_relationships(entity_id, entity_type)` - Get entity's requirements
+For these specialized tools, read their documentation in `tools/<tool_name>.md` before first use. This ensures you understand the parameters, return values, and usage patterns.
 
-### Validation Tools
-- `validate_schema_compliance(check_type)` - Run metamodel compliance checks
+**Graph Exploration:**
+- `execute_cypher_query` - Run Cypher queries against Neo4j
+- `get_database_schema` - Get node labels, relationship types, properties
+- `count_graph_statistics` - Get counts of nodes and relationships
 
-### Graph Modification Tools
-- `generate_requirement_id()` - Get next available RID (R-XXXX format)
-- `create_requirement_node(...)` - Create Requirement node in graph
-- `create_fulfillment_relationship(...)` - Create fulfillment relationships
+**Duplicate Detection:**
+- `find_similar_requirements` - Find similar requirements (default 0.7 threshold)
+- `check_for_duplicates` - Check for near-exact duplicates (0.95 threshold)
+
+**Entity Resolution:**
+- `resolve_business_object` - Match entity mention to BusinessObject node
+- `resolve_message` - Match entity mention to Message node
+- `get_entity_relationships` - Get entity's requirement relationships
+
+**Validation:**
+- `validate_schema_compliance` - Run metamodel compliance checks
+
+**Graph Modification:**
+- `generate_requirement_id` - Get next available RID (R-XXXX format)
+- `create_requirement_node` - Create Requirement node in graph
+- `create_fulfillment_relationship` - Create fulfillment relationships
+
+**Important:** Before using any domain tool for the first time, read its documentation:
+```
+read_file("tools/<tool_name>.md")
+```
 
 ---
 

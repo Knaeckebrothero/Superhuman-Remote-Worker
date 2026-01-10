@@ -16,12 +16,12 @@
       "plans/",
       "archive/",
       "documents/",
-      "documents/sources/",
       "notes/",
       "chunks/",
       "candidates/",
       "requirements/",
-      "output/"
+      "output/",
+      "tools/"
     ],
     "instructions_template": "creator_instructions.md",
     "initial_files": {
@@ -53,13 +53,14 @@
     "domain": [
       "extract_document_text",
       "chunk_document",
-      "assess_gobd_relevance",
-      "extract_entity_mentions",
       "web_search",
-      "query_similar_requirements",
       "cite_document",
       "cite_web",
-      "write_requirement_to_cache"
+      "list_sources",
+      "get_citation",
+      "list_requirements",
+      "get_requirement",
+      "add_requirement"
     ],
     "completion": [
       "mark_complete"

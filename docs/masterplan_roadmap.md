@@ -1051,6 +1051,7 @@ async def shutdown():
 | 5.2.4 | Create base Python image with shared dependencies | `docker/Dockerfile.base` |
 
 **Example Dockerfile:**
+
 ```dockerfile
 # docker/Dockerfile.creator
 
@@ -1065,13 +1066,13 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
-COPY requirements.txt .
+COPY ../requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
-COPY src/ ./src/
-COPY config/ ./config/
-COPY citation_tool/ ./citation_tool/
+COPY ../src ./src/
+COPY ../config ./config/
+COPY ../citation_tool ./citation_tool/
 
 # Install citation tool
 RUN pip install -e ./citation_tool[full]

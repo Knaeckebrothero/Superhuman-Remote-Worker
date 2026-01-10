@@ -2351,7 +2351,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U graphrag"]
+      test: [ "CMD-SHELL", "pg_isready -U graphrag" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -2368,15 +2368,15 @@ services:
       - "7474:7474"
       - "7687:7687"
     healthcheck:
-      test: ["CMD", "wget", "-O", "-", "http://localhost:7474"]
+      test: [ "CMD", "wget", "-O", "-", "http://localhost:7474" ]
       interval: 10s
       timeout: 5s
       retries: 5
 
   orchestrator:
     build:
-      context: .
-      dockerfile: docker/Dockerfile.orchestrator
+      context: ..
+      dockerfile: ../docker/Dockerfile.orchestrator
     environment:
       DATABASE_URL: postgresql://graphrag:${POSTGRES_PASSWORD}@postgres:5432/graphrag
       NEO4J_URI: bolt://neo4j:7687
@@ -2397,8 +2397,8 @@ services:
 
   creator-agent:
     build:
-      context: .
-      dockerfile: docker/Dockerfile.creator
+      context: ..
+      dockerfile: ../docker/Dockerfile.creator
     environment:
       DATABASE_URL: postgresql://graphrag:${POSTGRES_PASSWORD}@postgres:5432/graphrag
       LLM_BASE_URL: ${LLM_BASE_URL}
@@ -2413,8 +2413,8 @@ services:
 
   validator-agent:
     build:
-      context: .
-      dockerfile: docker/Dockerfile.validator
+      context: ..
+      dockerfile: ../docker/Dockerfile.validator
     environment:
       DATABASE_URL: postgresql://graphrag:${POSTGRES_PASSWORD}@postgres:5432/graphrag
       NEO4J_URI: bolt://neo4j:7687

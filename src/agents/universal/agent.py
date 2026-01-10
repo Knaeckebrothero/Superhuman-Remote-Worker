@@ -43,6 +43,8 @@ from .loader import (
     get_all_tool_names,
     resolve_config_path,
 )
+from src.agents.shared.tools.description_generator import generate_workspace_tool_docs
+from src.agents.shared.tools.description_override import apply_description_overrides
 from .graph import build_agent_graph, run_graph_with_streaming
 
 logger = logging.getLogger(__name__)
@@ -417,6 +419,11 @@ class UniversalAgent:
             workspace_manager=self._workspace_manager,
         )
 
+        # Generate tool documentation in workspace
+        tool_names = get_all_tool_names(self.config)
+        tools_dir = self._workspace_manager.get_path("tools")
+        generate_workspace_tool_docs(tool_names, tools_dir)
+
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
         return updated_metadata
@@ -428,12 +435,14 @@ class UniversalAgent:
         (workspace manager, todo manager, connections).
         """
         # Create tool context with dependencies
+        # Merge agent_id into config for citation audit trails
+        tool_config = {**self.config.extra, "agent_id": self.config.agent_id}
         context = ToolContext(
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
             postgres_conn=self.postgres_conn,
             neo4j_conn=self.neo4j_conn,
-            config=self.config.extra,  # Agent-specific config
+            config=tool_config,
             _job_id=self._current_job_id,
         )
 
@@ -454,6 +463,10 @@ class UniversalAgent:
                     logger.debug(f"Tool not implemented: {name}")
 
             self._tools = implemented_tools
+
+        # Apply description overrides for deferred tools
+        # Domain tools get short descriptions; agent reads full docs from workspace
+        self._tools = apply_description_overrides(self._tools)
 
         # Bind tools to LLM
         self._llm_with_tools = self._llm.bind_tools(self._tools)

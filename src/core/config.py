@@ -344,7 +344,6 @@ def get_workspace_structure() -> list[str]:
         "plans",
         "archive",
         "documents",
-        "documents/sources",
         "notes",
         "chunks",
         "candidates",

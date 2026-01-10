@@ -1,10 +1,10 @@
 """Search tools for the Universal Agent.
 
-Provides web search (Tavily) and graph search (Neo4j) capabilities.
+Provides web search capabilities using Tavily API.
 """
 
 import logging
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from langchain_core.tools import tool
 
@@ -20,12 +20,8 @@ SEARCH_TOOLS_METADATA = {
         "function": "web_search",
         "description": "Search the web using Tavily API",
         "category": "domain",
-    },
-    "query_similar_requirements": {
-        "module": "search_tools",
-        "function": "query_similar_requirements",
-        "description": "Find similar requirements in the Neo4j graph",
-        "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "Search the web via Tavily for context and research.",
     },
 }
 
@@ -62,31 +58,53 @@ def create_search_tools(context: ToolContext) -> List:
     def web_search(query: str, max_results: int = 5) -> str:
         """Search the web for context using Tavily.
 
+        Each result is automatically registered as a citation source.
+        Use cite_web() with the URL to create citations from these sources.
+
         Args:
             query: Search query
             max_results: Maximum results to return
 
         Returns:
-            Search results with snippets and URLs
+            Search results with snippets, URLs, and source IDs
         """
         try:
             researcher = get_researcher()
             if researcher is None:
                 # Fallback to direct Tavily if researcher not available
-                return _direct_web_search(query, max_results)
+                return _direct_web_search(query, max_results, context)
 
             results = researcher.web_search(query, max_results=max_results)
 
             if not results:
                 return f"No web results found for: {query}"
 
+            # Register each result as a citation source
+            registered_sources = []
+            for r in results:
+                url = r.get('url', '')
+                title = r.get('title', 'Untitled')
+                if url:
+                    try:
+                        source_id = context.get_or_register_web_source(url, name=title)
+                        registered_sources.append((url, source_id))
+                    except Exception as e:
+                        logger.warning(f"Could not register web source {url}: {e}")
+
+            # Format output with source IDs
             result = f"Web Search Results for: {query}\n"
-            result += f"Results: {len(results)}\n\n"
+            result += f"Results: {len(results)} ({len(registered_sources)} archived as citation sources)\n\n"
 
             for i, r in enumerate(results, 1):
+                url = r.get('url', 'N/A')
+                source_id = next((sid for u, sid in registered_sources if u == url), None)
                 result += f"{i}. {r.get('title', 'Untitled')}\n"
-                result += f"   URL: {r.get('url', 'N/A')}\n"
+                result += f"   URL: {url}\n"
+                if source_id:
+                    result += f"   Source ID: {source_id} (archived)\n"
                 result += f"   {r.get('snippet', '')[:300]}...\n\n"
+
+            result += "To cite: use cite_web(text, url) - sources are already archived."
 
             return result
 
@@ -94,53 +112,22 @@ def create_search_tools(context: ToolContext) -> List:
             logger.error(f"Web search error: {e}")
             return f"Error searching web: {str(e)}"
 
-    @tool
-    def query_similar_requirements(
-        text: str,
-        limit: int = 5
-    ) -> str:
-        """Find similar requirements in the Neo4j graph.
-
-        Args:
-            text: Requirement text to match against
-            limit: Maximum results
-
-        Returns:
-            Similar requirements with similarity scores
-        """
-        try:
-            researcher = get_researcher()
-            if researcher is None:
-                # Fallback to direct Neo4j query
-                return _direct_graph_search(text, limit, context.neo4j_conn)
-
-            similar = researcher.find_similar_requirements(text, limit=limit)
-
-            if not similar:
-                return f"No similar requirements found in the graph."
-
-            result = f"Similar Requirements Found: {len(similar)}\n\n"
-
-            for i, req in enumerate(similar, 1):
-                result += f"{i}. [{req.get('rid', 'N/A')}] {req.get('name', 'Unnamed')}\n"
-                result += f"   Similarity: {req.get('similarity', 0):.2f}\n"
-                result += f"   Text: {req.get('text', '')[:200]}...\n"
-                result += f"   Status: {req.get('status', 'unknown')}\n\n"
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Graph query error: {e}")
-            return f"Error querying similar requirements: {str(e)}"
-
     return [
         web_search,
-        query_similar_requirements,
     ]
 
 
-def _direct_web_search(query: str, max_results: int) -> str:
-    """Direct Tavily web search without Researcher component."""
+def _direct_web_search(query: str, max_results: int, context: Optional[ToolContext] = None) -> str:
+    """Direct Tavily web search without Researcher component.
+
+    Args:
+        query: Search query
+        max_results: Maximum results to return
+        context: Optional ToolContext for source registration
+
+    Returns:
+        Search results with snippets, URLs, and source IDs (if context provided)
+    """
     import os
 
     api_key = os.getenv("TAVILY_API_KEY")
@@ -148,84 +135,51 @@ def _direct_web_search(query: str, max_results: int) -> str:
         return "Error: TAVILY_API_KEY not configured"
 
     try:
-        from tavily import TavilyClient
-        client = TavilyClient(api_key=api_key)
-        response = client.search(query, max_results=max_results)
+        from langchain_tavily import TavilySearch
+        search = TavilySearch(api_key=api_key, max_results=max_results)
+        response = search.invoke({"query": query})
 
         results = response.get("results", [])
         if not results:
             return f"No web results found for: {query}"
 
+        # Register each result as a citation source if context available
+        registered_sources = []
+        if context is not None:
+            for r in results:
+                url = r.get('url', '')
+                title = r.get('title', 'Untitled')
+                if url:
+                    try:
+                        source_id = context.get_or_register_web_source(url, name=title)
+                        registered_sources.append((url, source_id))
+                    except Exception as e:
+                        logger.warning(f"Could not register web source {url}: {e}")
+
+        # Format output
         result = f"Web Search Results for: {query}\n"
-        result += f"Results: {len(results)}\n\n"
+        if registered_sources:
+            result += f"Results: {len(results)} ({len(registered_sources)} archived as citation sources)\n\n"
+        else:
+            result += f"Results: {len(results)}\n\n"
 
         for i, r in enumerate(results, 1):
+            url = r.get('url', 'N/A')
+            source_id = next((sid for u, sid in registered_sources if u == url), None)
             result += f"{i}. {r.get('title', 'Untitled')}\n"
-            result += f"   URL: {r.get('url', 'N/A')}\n"
+            result += f"   URL: {url}\n"
+            if source_id:
+                result += f"   Source ID: {source_id} (archived)\n"
             result += f"   {r.get('content', '')[:300]}...\n\n"
+
+        if registered_sources:
+            result += "To cite: use cite_web(text, url) - sources are already archived."
+        else:
+            result += "To cite information from these results, use cite_web(text, url, title) for each source you reference."
 
         return result
 
     except ImportError:
-        return "Error: Tavily package not installed"
+        return "Error: langchain-tavily package not installed"
     except Exception as e:
         return f"Error searching web: {str(e)}"
-
-
-def _direct_graph_search(text: str, limit: int, neo4j_conn: Any) -> str:
-    """Direct Neo4j search without Researcher component."""
-    if neo4j_conn is None:
-        return "Error: No Neo4j connection available"
-
-    try:
-        from difflib import SequenceMatcher
-
-        # Get all requirements
-        query = """
-        MATCH (r:Requirement)
-        RETURN r.rid AS rid, r.name AS name, r.text AS text,
-               r.status AS status
-        LIMIT 1000
-        """
-        results = neo4j_conn.execute_query(query)
-
-        if not results:
-            return "No requirements found in graph"
-
-        # Calculate similarity
-        text_lower = text.lower().strip()
-        similar = []
-
-        for req in results:
-            req_text = (req.get("text") or "").lower().strip()
-            if not req_text:
-                continue
-
-            similarity = SequenceMatcher(None, text_lower, req_text).ratio()
-
-            if similarity >= 0.3:  # Lower threshold for discovery
-                similar.append({
-                    "rid": req.get("rid"),
-                    "name": req.get("name"),
-                    "text": req.get("text", "")[:200],
-                    "status": req.get("status", "unknown"),
-                    "similarity": round(similarity, 3),
-                })
-
-        similar.sort(key=lambda x: x["similarity"], reverse=True)
-        similar = similar[:limit]
-
-        if not similar:
-            return "No similar requirements found in the graph."
-
-        result = f"Similar Requirements Found: {len(similar)}\n\n"
-        for i, req in enumerate(similar, 1):
-            result += f"{i}. [{req['rid']}] {req['name']}\n"
-            result += f"   Similarity: {req['similarity']:.2f}\n"
-            result += f"   Text: {req['text']}...\n"
-            result += f"   Status: {req['status']}\n\n"
-
-        return result
-
-    except Exception as e:
-        return f"Error querying graph: {str(e)}"

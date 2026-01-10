@@ -334,7 +334,6 @@ def create_workspace_tools(context: ToolContext) -> List:
                 f"Workspace Summary",
                 f"================",
                 f"Job ID: {summary['job_id']}",
-                f"Path: {summary['path']}",
                 f"Total Files: {summary['total_files']}",
                 f"Total Size: {summary['total_size_bytes']:,} bytes",
                 "",

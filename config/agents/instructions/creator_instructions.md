@@ -17,40 +17,59 @@ Extract well-formed, citation-backed requirements from documents and prepare the
 
 ## Available Tools
 
-### Workspace Tools (Strategic Planning)
+### Core Tools (use directly)
+
+These tools are fundamental and you can use them immediately without reading additional documentation.
+
+**Workspace Tools:**
 - `read_file(path)` - Read files from your workspace
 - `write_file(path, content)` - Write content to workspace files
 - `append_file(path, content)` - Append to existing files
 - `list_files(path)` - List directory contents
 - `search_files(query, path)` - Search for content in files
 - `file_exists(path)` - Check if a file exists
+- `get_workspace_summary()` - Get workspace statistics
 
-### Todo Tools (Tactical Execution)
+**Todo Tools:**
 - `add_todo(content, priority)` - Add a task to your list
 - `complete_todo(todo_id, notes)` - Mark a task complete
 - `start_todo(todo_id)` - Mark a task as in progress
 - `list_todos()` - View all current todos
 - `get_progress()` - See completion statistics
 - `archive_and_reset(phase_name)` - Archive todos and start fresh
+- `get_next_todo()` - Get highest priority pending task
 
-### Document Processing Tools
-- `extract_document_text(file_path)` - Extract text from PDF, DOCX, TXT, HTML
-- `chunk_document(file_path, strategy, max_chunk_size, overlap)` - Split into chunks
+**Completion:**
+- `mark_complete()` - Signal task completion
 
-### Validation Tools
-- `assess_gobd_relevance(text)` - Validate GoBD compliance relevance for a text
-- `extract_entity_mentions(text)` - Extract business objects and messages from text
+### Domain Tools (read documentation first)
 
-### Research Tools
-- `web_search(query, max_results)` - Search web for context (Tavily)
-- `query_similar_requirements(text, limit)` - Find similar requirements in graph
+For these specialized tools, read their documentation in `tools/<tool_name>.md` before first use. This ensures you understand the parameters, return values, and usage patterns.
 
-### Citation Tools
-- `cite_document(text, document_path, page, section)` - Cite document content
-- `cite_web(text, url, title, accessed_date)` - Cite web content
+**Document Processing:**
+- `extract_document_text` - Extract text from PDF/DOCX/TXT/HTML
+- `chunk_document` - Split document into chunks
+- `identify_requirement_candidates` - Find requirement-like statements
+- `assess_gobd_relevance` - Check GoBD compliance relevance
+- `extract_entity_mentions` - Find BusinessObject and Message mentions
 
-### Cache Operations
-- `write_requirement_to_cache(...)` - Write validated requirement to cache
+**Research:**
+- `web_search` - Search the web via Tavily
+- `query_similar_requirements` - Find similar requirements in graph
+
+**Citation:**
+- `cite_document` - Create verified citation for document content
+- `cite_web` - Create verified citation for web content
+- `list_sources` - List all registered citation sources
+- `get_citation` - Get details about a specific citation
+
+**Cache:**
+- `write_requirement_to_cache` - Submit requirement to validation pipeline
+
+**Important:** Before using any domain tool for the first time, read its documentation:
+```
+read_file("tools/<tool_name>.md")
+```
 
 ---
 

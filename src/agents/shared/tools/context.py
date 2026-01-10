@@ -25,6 +25,8 @@ class ToolContext:
         neo4j_conn: Neo4j connection for graph operations
         config: Additional configuration dictionary
         job_id: Override job ID (if not using workspace_manager)
+        citation_engine: CitationEngine instance for citation management
+        _source_registry: Cache of registered source identifiers to source IDs
 
     Example:
         ```python
@@ -46,6 +48,8 @@ class ToolContext:
     neo4j_conn: Optional[Any] = None
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
+    citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
+    _source_registry: Dict[str, int] = field(default_factory=dict)  # path/url -> source_id
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -100,3 +104,87 @@ class ToolContext:
             Configuration value or default
         """
         return self.config.get(key, default)
+
+    def get_citation_engine(self) -> Any:
+        """Lazily initialize and return CitationEngine.
+
+        Creates a CitationEngine instance on first call, reuses it afterwards.
+        Uses multi-agent mode (PostgreSQL) via CITATION_DB_URL environment variable.
+
+        Returns:
+            CitationEngine instance
+
+        Raises:
+            ImportError: If citation_engine package is not installed
+        """
+        if self.citation_engine is None:
+            from citation_engine import CitationEngine, CitationContext
+
+            # Create context for audit trails using job_id as session
+            ctx = CitationContext(
+                session_id=self.job_id or "unknown",
+                agent_id=self.config.get("agent_id", "unknown"),
+            )
+
+            # Use multi-agent mode (PostgreSQL) - reads CITATION_DB_URL from env
+            self.citation_engine = CitationEngine(mode="multi-agent", context=ctx)
+            self.citation_engine._connect()
+
+        return self.citation_engine
+
+    def get_or_register_doc_source(self, file_path: str, name: Optional[str] = None) -> int:
+        """Get cached source_id or register new document source.
+
+        Checks the source registry first to avoid re-registering the same document.
+
+        Args:
+            file_path: Path to the document file
+            name: Optional human-readable name for the source
+
+        Returns:
+            source_id for use in citations
+
+        Raises:
+            FileNotFoundError: If document doesn't exist
+        """
+        if file_path in self._source_registry:
+            return self._source_registry[file_path]
+
+        engine = self.get_citation_engine()
+        source = engine.add_doc_source(file_path, name=name)
+        self._source_registry[file_path] = source.id
+        return source.id
+
+    def get_or_register_web_source(self, url: str, name: Optional[str] = None) -> int:
+        """Get cached source_id or register new web source.
+
+        Checks the source registry first to avoid re-registering the same URL.
+
+        Args:
+            url: URL of the web source
+            name: Optional human-readable name for the source
+
+        Returns:
+            source_id for use in citations
+
+        Raises:
+            ConnectionError: If URL cannot be fetched
+        """
+        if url in self._source_registry:
+            return self._source_registry[url]
+
+        engine = self.get_citation_engine()
+        source = engine.add_web_source(url, name=name)
+        self._source_registry[url] = source.id
+        return source.id
+
+    def close_citation_engine(self) -> None:
+        """Close CitationEngine connection if open.
+
+        Should be called when the tool context is being disposed of
+        to properly clean up database connections.
+        """
+        if self.citation_engine is not None:
+            self.citation_engine.close()
+            self.citation_engine = None
+            self._source_registry.clear()
