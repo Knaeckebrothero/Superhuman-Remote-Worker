@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agents/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/config/agents/creator.json` or `src/config/agents/validator.json`).
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agent/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/config/agents/creator.json` or `src/config/agents/validator.json`).
 
 ## Commands
 
@@ -36,10 +36,10 @@ python validate_metamodel.py --check A1   # Specific check
 podman-compose -f docker-compose.dbs.yml up -d
 
 # Run Universal Agent
-python run_universal_agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
-python run_universal_agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
-python run_universal_agent.py --config validator --port 8002                        # API server mode
-python run_universal_agent.py --config creator --polling-only                       # Polling loop only
+python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
+python agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
+python agent.py --config validator --port 8002                        # API server mode
+python agent.py --config creator --polling-only                       # Polling loop only
 
 # Stop databases
 podman-compose -f docker-compose.dbs.yml down -v
@@ -105,13 +105,12 @@ python cancel_job.py --job-id <uuid> --cleanup
 ```
 
 **Source locations:**
-- `src/agents/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, state.py, context_manager.py, loader.py, workspace_manager.py, todo_manager.py)
-- `src/agents/tools/` - Modular tool implementations (registry.py loads tools dynamically)
+- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, state.py, context_manager.py, loader.py, workspace_manager.py, todo_manager.py)
+- `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
 - `src/database/` - PostgreSQL schema files
 - `src/config/agents/` - Agent configuration (JSON) and instruction templates (Markdown)
-- `legacy_system/` - Deprecated Streamlit UI and legacy agents (for backwards compatibility)
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -147,11 +146,9 @@ Schema in `src/database/schema.sql`:
 - `requirements` - Extracted requirements with validation state. Validator queries `WHERE neo4j_id IS NULL` for unprocessed items.
 - `job_summary` - View aggregating requirement counts by status
 
-Optional: `src/database/schema_vector.sql` adds `workspace_embeddings` table for semantic search (requires pgvector extension).
-
 ### Universal Agent Pattern
 
-The Universal Agent (`src/agents/`) is the primary agent implementation:
+The Universal Agent (`src/agent/`) is the primary agent implementation:
 
 **Key files:**
 - `agent.py` - UniversalAgent class with run loop and LLM integration
@@ -181,12 +178,12 @@ The Universal Agent (`src/agents/`) is the primary agent implementation:
 **Creating a new agent type:**
 1. Create `src/config/agents/<name>.json` based on `schema.json`
 2. Create `src/config/agents/instructions/<name>_instructions.md`
-3. Add domain-specific tools to `src/agents/tools/` if needed
-4. Register new tools in `src/agents/tools/registry.py`
+3. Add domain-specific tools to `src/agent/tools/` if needed
+4. Register new tools in `src/agent/tools/registry.py`
 
 ### Tool System
 
-Tools are organized in `src/agents/tools/` and loaded dynamically by the registry:
+Tools are organized in `src/agent/tools/` and loaded dynamically by the registry:
 
 | Category | Source File | Example Tools |
 |----------|-------------|---------------|
@@ -216,20 +213,11 @@ Tools are organized in `src/agents/tools/` and loaded dynamically by the registr
 | Dashboard (Streamlit) | 8501 |
 | Adminer (dev only) | 8080 |
 
-### Legacy System
-
-The legacy Streamlit UI and old agents are in `legacy_system/`:
-- `legacy_system/streamlit_app.py` - Legacy Streamlit entry point
-- `legacy_system/src/ui/` - UI components
-- `legacy_system/src/agents/` - Old agents (graph_agent, document_ingestion_supervisor, etc.)
-
-Use the Universal Agent (`src/agents/`) for all new development.
-
 ## Adding New Tools
 
 When adding a new tool to the system:
 
-1. **Create the tool function** in the appropriate file in `src/agents/tools/`:
+1. **Create the tool function** in the appropriate file in `src/agent/tools/`:
    - Workspace operations → `workspace_tools.py`
    - Document processing → `document_tools.py`
    - Graph operations → `graph_tools.py`
@@ -247,11 +235,7 @@ When adding a new tool to the system:
    }
    ```
 
-3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`:
-   ```python
-   from .mytools import create_my_tools, MYTOOLS_METADATA
-   TOOL_REGISTRY.update(MYTOOLS_METADATA)
-   ```
+3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`
 
 4. **Add to agent config** in `src/config/agents/<agent>.json` under the appropriate category:
    ```json
