@@ -49,7 +49,7 @@ class TestGetBootstrapTodos:
         todos = get_bootstrap_todos()
 
         assert isinstance(todos, list)
-        assert len(todos) == 5
+        assert len(todos) == 3
 
         # Check that all have required fields
         for todo in todos:
@@ -63,19 +63,17 @@ class TestGetBootstrapTodos:
         """Test the sequence of bootstrap todos."""
         todos = get_bootstrap_todos()
 
-        # Check the expected sequence
-        assert "workspace summary" in todos[0]["content"].lower()
-        assert "workspace_summary.md" in todos[1]["content"].lower()
-        assert "instructions.md" in todos[2]["content"].lower()
-        assert "main_plan.md" in todos[3]["content"].lower()
-        assert "phases" in todos[4]["content"].lower()
+        # Check the expected sequence (workspace.md is now injected into system prompt)
+        assert "instructions.md" in todos[0]["content"].lower()
+        assert "main_plan.md" in todos[1]["content"].lower()
+        assert "phases" in todos[2]["content"].lower()
 
     def test_bootstrap_todos_first_task(self):
-        """Test that the first bootstrap task is about generating workspace summary."""
+        """Test that the first bootstrap task is about reading instructions."""
         todos = get_bootstrap_todos()
         first_task = todos[0]
 
-        assert "generate_workspace_summary" in first_task["content"].lower()
+        assert "instructions.md" in first_task["content"].lower()
 
 
 class TestBootstrapPrompt:

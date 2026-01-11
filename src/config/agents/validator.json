@@ -20,7 +20,7 @@
     ],
     "instructions_template": "validator_instructions.md",
     "initial_files": {
-      "instructions.md": "instructions/validator_instructions.md"
+      "workspace.md": "instructions/workspace_template.md"
     }
   },
 

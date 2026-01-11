@@ -307,7 +307,8 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
 def load_system_prompt(
     config: AgentConfig,
     job_id: str,
-    config_dir: Optional[str] = None
+    config_dir: Optional[str] = None,
+    workspace_manager: Optional[Any] = None,
 ) -> str:
     """Load and format the system prompt for the agent.
 
@@ -315,6 +316,7 @@ def load_system_prompt(
         config: Agent configuration
         job_id: Current job ID for placeholder substitution
         config_dir: Base directory for config files (default: config/agents)
+        workspace_manager: Optional workspace manager for reading workspace.md
 
     Returns:
         Formatted system prompt string
@@ -337,15 +339,27 @@ def load_system_prompt(
 Your workspace is at /job_{job_id}/ with tools to read and write files.
 Start by reading `instructions.md` to understand your task.
 
+{workspace_content}
+
 Write findings to files as you go to manage context.
 Use todos to track your immediate steps.
 When done, write completion status to `output/completion.json`.
 """
 
+    # Read workspace.md content if available
+    workspace_content = ""
+    if workspace_manager:
+        try:
+            if workspace_manager.exists("workspace.md"):
+                workspace_content = workspace_manager.read_file("workspace.md")
+        except Exception as e:
+            logger.debug(f"Could not read workspace.md: {e}")
+
     # Substitute placeholders
     prompt = template.format(
         agent_display_name=config.display_name,
         job_id=job_id,
+        workspace_content=workspace_content,
     )
 
     return prompt

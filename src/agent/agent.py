@@ -256,7 +256,9 @@ class UniversalAgent:
             await self._setup_job_tools()
 
             # Build graph for this job
-            system_prompt = load_system_prompt(self.config, job_id)
+            system_prompt = load_system_prompt(
+                self.config, job_id, workspace_manager=self._workspace_manager
+            )
             self._graph = build_agent_graph(
                 llm_with_tools=self._llm_with_tools,
                 tools=self._tools,
@@ -392,6 +394,24 @@ class UniversalAgent:
             "instructions.md",
             instructions,
         )
+
+        # Process initial_files from config (e.g., workspace.md template)
+        if self.config.workspace.initial_files:
+            config_dir = Path(__file__).parent.parent / "config" / "agents"
+            for dest_path, source_path in self.config.workspace.initial_files.items():
+                # Skip instructions.md - already handled above
+                if dest_path == "instructions.md":
+                    continue
+                try:
+                    source_full = config_dir / source_path
+                    if source_full.exists():
+                        content = source_full.read_text(encoding="utf-8")
+                        self._workspace_manager.write_file(dest_path, content)
+                        logger.debug(f"Initialized file: {dest_path} from {source_path}")
+                    else:
+                        logger.warning(f"Initial file template not found: {source_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize {dest_path}: {e}")
 
         # Copy documents to workspace if provided
         updated_metadata = dict(metadata)

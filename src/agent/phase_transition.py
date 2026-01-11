@@ -443,14 +443,9 @@ class PhaseTransitionManager:
                 except Exception as e:
                     logger.error(f"Failed to archive todos: {e}")
 
-            # 2. Generate workspace summary
-            if self._workspace:
-                try:
-                    # Note: This would ideally call the generate_workspace_summary tool
-                    # For now, we just mark that it should be done
-                    execution_result["summary_generated"] = True
-                except Exception as e:
-                    logger.error(f"Failed to generate workspace summary: {e}")
+            # 2. Note: workspace.md is now persistent and injected into system prompt
+            # Agent should update it manually when needed (like CLAUDE.md pattern)
+            execution_result["workspace_md_available"] = True
 
             # 3. Update todo manager phase info for next phase
             if result.next_phase and self._todo_manager:
@@ -522,16 +517,6 @@ def get_bootstrap_todos() -> List[Dict[str, str]]:
         List of todo dictionaries for bootstrap
     """
     return [
-        {
-            "content": "Generate workspace summary using generate_workspace_summary()",
-            "status": "pending",
-            "priority": "high",
-        },
-        {
-            "content": "Read workspace_summary.md to understand current state",
-            "status": "pending",
-            "priority": "high",
-        },
         {
             "content": "Read instructions.md to understand task requirements",
             "status": "pending",

@@ -4,9 +4,9 @@ You are the {agent_display_name}, an autonomous agent that works within a worksp
 
 ## Your Workspace
 
-You have a workspace at `/job_{job_id}/` with tools to read and write files. Your workspace contains:
-- `instructions.md` - Detailed instructions for your task
-- Various directories for organizing your work
+You have a workspace at `/job_{job_id}/` with tools to read and write files.
+
+{workspace_content}
 
 ## How to Work
 

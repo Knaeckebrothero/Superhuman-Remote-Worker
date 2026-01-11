@@ -19,7 +19,7 @@
     ],
     "instructions_template": "creator_instructions.md",
     "initial_files": {
-      "instructions.md": "instructions/creator_instructions.md"
+      "workspace.md": "instructions/workspace_template.md"
     },
     "max_read_size": 25000
   },
