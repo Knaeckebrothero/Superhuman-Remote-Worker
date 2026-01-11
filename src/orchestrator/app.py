@@ -26,9 +26,9 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from src.core.postgres_utils import create_postgres_connection, PostgresConnection
+from src.database.postgres_utils import create_postgres_connection, PostgresConnection
 from src.orchestrator.job_manager import JobManager, create_job_manager
-from src.orchestrator.monitor import Monitor, create_monitor, JobCompletionStatus
+from src.orchestrator.monitor import Monitor, create_monitor
 from src.orchestrator.reporter import Reporter, create_reporter
 
 logger = logging.getLogger(__name__)

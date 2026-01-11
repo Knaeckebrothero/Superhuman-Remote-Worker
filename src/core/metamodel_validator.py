@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Optional
 import time
 
-from .neo4j_utils import Neo4jConnection
+from src.database.neo4j_utils import Neo4jConnection
 
 
 class Severity(Enum):

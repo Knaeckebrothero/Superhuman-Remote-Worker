@@ -19,6 +19,355 @@ The guardrails system introduces:
 3. **Phase-based execution** - Work divided into 5-20 step phases
 4. **Automatic phase transitions** - Workflow triggers when phase completes
 5. **Panic button** - Agent can rewind when stuck
+6. **Nested loop graph architecture** - Graph ENFORCES the workflow, not hopes the agent follows it
+
+---
+
+## Graph Architecture: Nested Loops
+
+### The Problem with Simple ReAct Graphs
+
+A basic ReAct-style graph looks like this:
+
+```
+initialize → process ←→ tools → check → END
+```
+
+This simple loop tries to handle everything through:
+- Pre-model hooks (hidden magic)
+- System message injection (bolted on)
+- Hoping the agent "remembers" to check todos and update plans
+- Protected context providers (more hidden magic)
+
+**The fundamental problem:** We're trying to bolt planning, todos, and memory onto a graph that doesn't structurally enforce them.
+
+### The Solution: Nested Loop Architecture
+
+Instead of hoping the agent follows the workflow, the graph **makes** it happen:
+
+```
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                         OUTER LOOP (Strategic)                            ║
+║                                                                           ║
+║   ┌─────────────────────────────────────────────────────────────────┐    ║
+║   │                      PLAN PHASE (no loop)                       │    ║
+║   │                                                                 │    ║
+║   │   examine      update        update       create               │    ║
+║   │   workspace → memory docs → plan.md → phase todos              │    ║
+║   │                                                                 │    ║
+║   └─────────────────────────────────────────────────────────────────┘    ║
+║                                    ↓                                      ║
+║   ┌─────────────────────────────────────────────────────────────────┐    ║
+║   │                     EXECUTE PHASE (inner loop)                  │    ║
+║   │                                                                 │    ║
+║   │         ┌────────────────────────────────────┐                 │    ║
+║   │         ↓                                    │                 │    ║
+║   │      process ──→ update todos ──→ todos done? ──no──┘         │    ║
+║   │     (ReAct)                           │                        │    ║
+║   │                                      yes                       │    ║
+║   │                                       ↓                        │    ║
+║   │                                 EXIT EXECUTE                   │    ║
+║   └─────────────────────────────────────────────────────────────────┘    ║
+║                                    ↓                                      ║
+║                            goal achieved?                                 ║
+║                             ↓          ↓                                  ║
+║                            no         yes                                 ║
+║                             ↓          ↓                                  ║
+║                    ┌───────┘          END                                ║
+║                    ↓                                                      ║
+║              back to PLAN PHASE                                          ║
+║                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+```
+
+### Why Nested Loops Work
+
+| Aspect | Simple ReAct | Nested Loops |
+|--------|--------------|--------------|
+| Plan checking | Agent might forget | Graph forces it every phase |
+| Todo management | Bolted-on tools | Structural part of graph |
+| Memory | Conversation history | Files on disk |
+| Context wipe | Catastrophic | Just read plan.md |
+| Recovery | Hope for the best | Built-in by design |
+| Debugging | "Why did it do that?" | See exact node that triggered |
+
+### The Key Insight: File-Based Memory
+
+The magic is that every loop iteration, the agent **must** read from disk:
+
+```python
+# Each node reads from disk, not from conversation memory
+def examine_workspace(state):
+    plan = workspace.read("plan.md")       # Truth is on disk
+    memory = workspace.read("workspace.md") # Persistent notes
+    return {"current_plan": plan, "memory": memory}
+```
+
+**If you wipe the conversation entirely, who cares?** The plan is on disk. The notes are in workspace.md. The agent can recover because its memory isn't in the ephemeral conversation—it's persisted to files.
+
+This is similar to how humans work:
+- We write notes
+- We come back to our notes
+- We update our notes
+- The notes ARE the memory, not our recall
+
+### Summarization Becomes Optional
+
+With file-based memory, context summarization becomes less critical:
+- The agent writes findings to files as it goes
+- `plan.md` captures strategic decisions
+- `workspace.md` captures learnings and notes
+- `progress.md` captures what was done
+
+You don't need to summarize the conversation—you need to **persist** important information. The graph forces this at structural checkpoints.
+
+### LangGraph Implementation
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+class AgentState(TypedDict):
+    messages: list
+    plan: str
+    todos: list[Todo]
+    current_todo_idx: int
+    phase_complete: bool
+    goal_achieved: bool
+
+graph = StateGraph(AgentState)
+
+# ═══════════════════════════════════════════════════════════
+# PLAN PHASE (sequential, no loop)
+# ═══════════════════════════════════════════════════════════
+graph.add_node("examine_workspace", examine_workspace)
+graph.add_node("update_memory", update_memory_docs)
+graph.add_node("update_plan", update_plan)
+graph.add_node("create_todos", create_phase_todos)
+
+graph.add_edge(START, "examine_workspace")
+graph.add_edge("examine_workspace", "update_memory")
+graph.add_edge("update_memory", "update_plan")
+graph.add_edge("update_plan", "create_todos")
+
+# ═══════════════════════════════════════════════════════════
+# EXECUTE PHASE (inner loop)
+# ═══════════════════════════════════════════════════════════
+graph.add_node("process", process_current_todo)      # ReAct subgraph
+graph.add_node("update_todos", update_todo_status)
+graph.add_node("check_todos", check_todos_complete)
+
+graph.add_edge("create_todos", "process")            # Enter execute loop
+graph.add_edge("process", "update_todos")
+graph.add_edge("update_todos", "check_todos")
+
+# Inner loop: todos done?
+graph.add_conditional_edges(
+    "check_todos",
+    lambda s: "exit_execute" if s["phase_complete"] else "continue",
+    {
+        "continue": "process",          # ← INNER LOOP BACK
+        "exit_execute": "check_goal",
+    }
+)
+
+# ═══════════════════════════════════════════════════════════
+# OUTER LOOP CHECK
+# ═══════════════════════════════════════════════════════════
+graph.add_node("check_goal", check_goal_achieved)
+
+graph.add_conditional_edges(
+    "check_goal",
+    lambda s: "done" if s["goal_achieved"] else "next_phase",
+    {
+        "next_phase": "examine_workspace",  # ← OUTER LOOP BACK
+        "done": END,
+    }
+)
+```
+
+### Process Node as ReAct Subgraph
+
+The `process` node can itself be a ReAct loop for tool use:
+
+```python
+from langgraph.prebuilt import create_react_agent
+
+react_subgraph = create_react_agent(llm, tools)
+
+def process_current_todo(state):
+    todo = state["todos"][state["current_todo_idx"]]
+
+    # Run ReAct loop scoped to this ONE todo
+    result = react_subgraph.invoke({
+        "messages": [HumanMessage(f"Complete this todo: {todo.content}")]
+    })
+
+    # Persist to disk immediately (file-based memory)
+    workspace.append("progress.md", f"- {todo.content}: done")
+
+    return {"messages": state["messages"] + result["messages"]}
+```
+
+### Comparison with Current Implementation
+
+The current implementation uses hooks and injection to achieve similar goals:
+
+| Component | Current Approach | Nested Loop Approach |
+|-----------|------------------|----------------------|
+| Plan checking | `ProtectedContextProvider` injects plan | `examine_workspace` node reads plan |
+| Todo display | Layer 2 injection via hook | State passed to `process` node |
+| Phase transitions | `PhaseTransitionManager` triggered by tool | `check_todos` → `check_goal` edges |
+| Memory persistence | Agent calls `write_file` | Graph nodes call `workspace.write` |
+| Context compaction | `ContextManager` hooks | Less critical (file-based memory) |
+
+The nested loop approach makes the workflow **explicit in the graph structure** rather than hidden in hooks and providers.
+
+### Implementation Approaches
+
+There are three ways to implement nested loops in LangGraph:
+
+#### Approach 1: Subgraph as Node (Shared State) ✓ RECOMMENDED
+
+When parent and child share state keys, add a compiled subgraph directly as a node:
+
+```python
+# Inner loop (execute phase) - can use prebuilt ReAct agent
+from langgraph.prebuilt import create_react_agent
+
+inner_graph = create_react_agent(llm, tools)
+
+# Outer loop (plan phase)
+class OuterState(TypedDict):
+    messages: Annotated[list, add_messages]  # Shared with inner
+    plan: str
+    todos: list[Todo]
+    phase_complete: bool
+    goal_achieved: bool
+
+outer = StateGraph(OuterState)
+outer.add_node("examine_workspace", examine_workspace)
+outer.add_node("update_plan", update_plan)
+outer.add_node("create_todos", create_todos)
+outer.add_node("execute", inner_graph)  # ← Compiled subgraph as node!
+outer.add_node("check_todos", check_todos)
+outer.add_node("check_goal", check_goal)
+
+# Wire up the loops
+outer.add_edge(START, "examine_workspace")
+outer.add_edge("examine_workspace", "update_plan")
+outer.add_edge("update_plan", "create_todos")
+outer.add_edge("create_todos", "execute")
+outer.add_edge("execute", "check_todos")
+outer.add_conditional_edges("check_todos", lambda s: "execute" if not s["phase_complete"] else "check_goal")
+outer.add_conditional_edges("check_goal", lambda s: END if s["goal_achieved"] else "examine_workspace")
+```
+
+**Pros:** Clean separation, subgraph visible in visualization, automatic state passing
+**Cons:** Must share at least one state key (usually `messages`)
+
+#### Approach 2: Wrapper Function (Different States)
+
+When states are completely different, wrap the subgraph invocation with state transformation:
+
+```python
+class InnerState(TypedDict):
+    current_todo: str
+    tools_result: str
+
+class OuterState(TypedDict):
+    plan: str
+    todos: list[str]
+    phase_complete: bool
+
+def execute_phase(state: OuterState) -> OuterState:
+    """Wrapper transforms state, invokes subgraph, transforms back."""
+    for todo in state["todos"]:
+        # Transform to inner state
+        inner_input = {"current_todo": todo, "tools_result": ""}
+        # Run inner loop
+        inner_output = inner_graph.invoke(inner_input)
+        # Persist result
+        workspace.append("progress.md", f"- {todo}: {inner_output['tools_result']}")
+
+    return {"phase_complete": True}
+
+outer.add_node("execute", execute_phase)  # Function wrapping graph
+```
+
+**Pros:** Complete state isolation, flexible transformation
+**Cons:** Subgraph not visible in LangGraph Studio visualization
+
+#### Approach 3: Single Graph with Conditional Edges (Flat)
+
+Both loops in one graph using state flags and conditional edges:
+
+```python
+graph = StateGraph(AgentState)
+
+# All nodes flat in one graph
+graph.add_node("examine_workspace", examine_workspace)
+graph.add_node("update_plan", update_plan)
+graph.add_node("create_todos", create_todos)
+graph.add_node("process_todo", process_todo)
+graph.add_node("check_todos", check_todos)
+graph.add_node("check_goal", check_goal)
+
+# Inner loop via conditional edge
+graph.add_conditional_edges(
+    "check_todos",
+    lambda s: "check_goal" if s["phase_complete"] else "process_todo",
+)
+
+# Outer loop via conditional edge
+graph.add_conditional_edges(
+    "check_goal",
+    lambda s: END if s["goal_achieved"] else "examine_workspace",
+)
+```
+
+**Pros:** Simple, everything visible, easy to debug
+**Cons:** Gets complex with many nodes, harder to reuse inner loop elsewhere
+
+### Recursion Limits and Safety
+
+LangGraph enforces a default recursion limit of 25 steps. For nested loops, you'll need to increase this:
+
+```python
+# Increase limit for complex workflows
+graph.invoke(input, {"recursion_limit": 100})
+```
+
+**Better approach:** Use state-based loop control instead of relying on recursion limits:
+
+```python
+class AgentState(TypedDict):
+    max_iterations: int
+    current_iteration: int
+
+def should_continue(state: AgentState) -> str:
+    if state["current_iteration"] >= state["max_iterations"]:
+        return "exit"  # Safety valve
+    if state["task_complete"]:
+        return "exit"
+    return "continue"
+```
+
+### Recommendation
+
+For our plan → execute → check architecture, **Approach 1 (Subgraph as Node)** is recommended because:
+
+1. The inner execute loop is a natural ReAct pattern (`create_react_agent` already exists)
+2. Both loops are visible in LangGraph Studio for debugging
+3. State can share the `messages` key for tool call history
+4. Clean separation of concerns between strategic (outer) and tactical (inner) loops
+5. Inner loop can be reused or swapped out easily
+
+### References
+
+- [LangGraph Subgraphs Documentation](https://docs.langchain.com/oss/python/langgraph/use-subgraphs)
+- [Hierarchical Agent Teams Tutorial](https://langchain-ai.github.io/langgraph/tutorials/multi_agent/hierarchical_agent_teams/)
+- [State Transform Between Subgraphs](https://langchain-opentutorial.gitbook.io/langchain-opentutorial/17-langgraph/01-core-features/14-langgraph-subgraph-transform-state)
+- [GRAPH_RECURSION_LIMIT Error Guide](https://docs.langchain.com/oss/python/langgraph/errors/GRAPH_RECURSION_LIMIT)
 
 ---
 
@@ -725,6 +1074,72 @@ Rationale:
 - `tests/test_guardrails.py`
 - `tests/test_phase_transitions.py`
 
+### Phase 7: Nested Loop Graph Architecture (Priority: High)
+
+**Objective:** Refactor the graph to use nested loops instead of hook-based injection.
+
+**Status:** Planned
+
+**Rationale:** The current implementation uses hooks and providers to inject context, todos, and manage phase transitions. This works but hides the workflow logic. The nested loop architecture makes the workflow explicit in the graph structure, improving debuggability and reducing reliance on the agent "remembering" to do things.
+
+**Tasks:**
+
+1. Define new state schema with explicit loop control
+   ```python
+   class AgentState(TypedDict):
+       messages: Annotated[list, add_messages]
+       plan: str                    # Read from plan.md each iteration
+       workspace_memory: str        # Read from workspace.md each iteration
+       todos: list[Todo]
+       current_todo_idx: int
+       phase_complete: bool
+       goal_achieved: bool
+       iteration_count: int         # Safety counter
+   ```
+
+2. Create outer loop nodes (plan phase - no loop)
+   - `examine_workspace` - Read plan.md, workspace.md into state
+   - `update_memory` - Write learnings to workspace.md
+   - `update_plan` - LLM updates plan.md based on progress
+   - `create_todos` - LLM creates todos for next phase
+
+3. Create inner loop using `create_react_agent` as subgraph
+   - Use prebuilt ReAct agent for tool execution
+   - Scope each invocation to ONE todo
+   - Persist results to progress.md after each todo
+
+4. Wire up conditional edges for both loops
+   - Inner loop: `check_todos` → `execute` (if not phase_complete) or `check_goal`
+   - Outer loop: `check_goal` → `examine_workspace` (if not goal_achieved) or END
+
+5. Remove hook-based injection
+   - Remove `ProtectedContextProvider` (state carries plan/todos)
+   - Remove `PhaseTransitionManager` (graph edges handle transitions)
+   - Simplify `ContextManager` (file-based memory reduces need for compaction)
+
+6. Update recursion limit handling
+   - Set appropriate limit for nested loops (e.g., 100)
+   - Add state-based iteration counter as safety valve
+
+**Files to modify:**
+- `src/agent/graph.py` - Complete rewrite to nested loop structure
+- `src/agent/state.py` - New state schema
+- `src/agent/context.py` - Simplify (remove ProtectedContextProvider)
+- `src/agent/phase_transition.py` - May be removed or simplified
+
+**Files to create:**
+- `src/agent/nodes/` - Directory for node implementations
+  - `examine_workspace.py`
+  - `update_plan.py`
+  - `create_todos.py`
+  - `check_goal.py`
+
+**Migration strategy:**
+1. Build new graph in parallel (`graph_v2.py`)
+2. Test with simple tasks
+3. Compare behavior with current implementation
+4. Switch over once validated
+
 ---
 
 ## Implementation Checklist
@@ -766,6 +1181,23 @@ Rationale:
 - [ ] Test context size stays bounded across many phases
 - [ ] Test job completion detection
 
+### Phase 7: Nested Loop Graph Architecture
+- [ ] Define new `AgentState` with loop control fields
+- [ ] Implement `examine_workspace` node (reads plan.md, workspace.md)
+- [ ] Implement `update_memory` node (writes to workspace.md)
+- [ ] Implement `update_plan` node (LLM updates plan.md)
+- [ ] Implement `create_todos` node (LLM creates phase todos)
+- [ ] Integrate `create_react_agent` as inner loop subgraph
+- [ ] Wire up inner loop conditional edges (todo processing)
+- [ ] Wire up outer loop conditional edges (phase transitions)
+- [ ] Remove `ProtectedContextProvider` (no longer needed)
+- [ ] Simplify `PhaseTransitionManager` (graph edges handle it)
+- [ ] Add state-based iteration counter for safety
+- [ ] Set recursion limit to 100 for nested loops
+- [ ] Test new graph with simple task
+- [ ] Compare behavior with current implementation
+- [ ] Migration: switch from graph.py to graph_v2.py
+
 ---
 
 ## Future Enhancements
@@ -798,16 +1230,45 @@ This would help the agent avoid repeating mistakes across phases. Deferred for l
 
 The guardrails system keeps agents focused through:
 
-1. **Protected context** - System prompt and todos always visible
-2. **Phase boundaries** - Natural checkpoints every 5-20 tasks
-3. **Forced re-orientation** - Must re-read plan at phase transitions
-4. **Clean context** - Summarization between phases
+1. **Nested loop graph architecture** - Graph ENFORCES workflow, doesn't hope agent follows it
+2. **File-based memory** - plan.md and workspace.md persist across context resets
+3. **Phase boundaries** - Natural checkpoints every 5-20 tasks
+4. **Forced re-orientation** - Graph structure requires reading plan at phase transitions
 5. **Panic button** - Can rewind when stuck
 6. **Progress tracking** - Plan shows completed vs pending phases
+
+### Architecture Overview
+
+```
+╔═══════════════════════════════════════════════════════════════╗
+║  OUTER LOOP (Strategic)                                       ║
+║                                                               ║
+║  examine_workspace → update_plan → create_todos               ║
+║         ↑                              ↓                      ║
+║         │                    ┌─────────────────┐              ║
+║         │                    │  INNER LOOP     │              ║
+║         │                    │  (Tactical)     │              ║
+║         │                    │                 │              ║
+║         │                    │  execute ←──┐   │              ║
+║         │                    │     ↓       │   │              ║
+║         │                    │  check_todos─┘  │              ║
+║         │                    │     ↓           │              ║
+║         │                    └─────────────────┘              ║
+║         │                              ↓                      ║
+║         └────────────── check_goal ────┴──→ END               ║
+║                         (not done)    (done)                  ║
+╚═══════════════════════════════════════════════════════════════╝
+```
+
+### Key Insight
+
+**Memory lives in files, not conversation history.**
+
+If you wipe the conversation entirely, who cares? The agent reads plan.md and workspace.md at the start of every outer loop iteration. The graph structure forces this—no hooks, no injection, no hoping the agent remembers.
 
 This creates a cycle:
 ```
 Bootstrap → Phase 1 → Transition → Phase 2 → ... → Phase N → job_complete()
 ```
 
-Each cycle refreshes context and forces the agent to stay aligned with its plan.
+Each cycle reads fresh state from disk and forces the agent to stay aligned with its plan.

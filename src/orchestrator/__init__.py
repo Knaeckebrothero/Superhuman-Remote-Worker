@@ -7,7 +7,7 @@ This package provides:
 
 Example:
     ```python
-    from src.core.postgres_utils import create_postgres_connection
+    from src.database.postgres_utils import create_postgres_connection
     from src.orchestrator import (
         JobManager, create_job_manager,
         Monitor, create_monitor,

@@ -144,7 +144,7 @@ def load_agent_config(config_path: str) -> AgentConfig:
 
     Example:
         ```python
-        config = load_agent_config("config/agents/creator.json")
+        config = load_agent_config("src/config/creator.json")
         print(config.display_name)  # "Creator Agent"
         ```
     """
@@ -315,15 +315,15 @@ def load_system_prompt(
     Args:
         config: Agent configuration
         job_id: Current job ID for placeholder substitution
-        config_dir: Base directory for config files (default: config/agents)
+        config_dir: Base directory for config files (default: src/config)
         workspace_manager: Optional workspace manager for reading workspace.md
 
     Returns:
         Formatted system prompt string
     """
     if config_dir is None:
-        # __file__ = src/agents/loader.py -> project root is 3 levels up
-        config_dir = Path(__file__).parent.parent.parent / "src" / "config" / "agents"
+        # __file__ = src/agent/loader.py -> config is at src/config
+        config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -379,8 +379,8 @@ def load_instructions(
         Instructions content to be placed in workspace
     """
     if config_dir is None:
-        # __file__ = src/agents/loader.py -> project root is 3 levels up
-        config_dir = Path(__file__).parent.parent.parent / "src" / "config" / "agents"
+        # __file__ = src/agent/loader.py -> config is at src/config
+        config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -423,8 +423,8 @@ def load_summarization_prompt(config_dir: Optional[str] = None) -> str:
         Summarization prompt content
     """
     if config_dir is None:
-        # __file__ = src/agents/loader.py -> project root is 3 levels up
-        config_dir = Path(__file__).parent.parent.parent / "src" / "config" / "agents"
+        # __file__ = src/agent/loader.py -> config is at src/config
+        config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -483,17 +483,16 @@ def resolve_config_path(config_name: str) -> str:
     Example:
         ```python
         path = resolve_config_path("creator")
-        # Returns: "/path/to/project/config/agents/creator.json"
+        # Returns: "/path/to/project/src/config/creator.json"
         ```
     """
     # If it's already a full path
     if os.path.isabs(config_name) or config_name.endswith(".json"):
         return config_name
 
-    # Resolve relative to config/agents directory
-    # __file__ = src/agents/loader.py
-    # .parent = src/agents, .parent.parent = src, .parent.parent.parent = project root
-    project_root = Path(__file__).parent.parent.parent
-    config_path = project_root / "src" / "config" / "agents" / f"{config_name}.json"
+    # Resolve relative to config directory
+    # __file__ = src/agent/loader.py -> config is at src/config
+    config_dir = Path(__file__).parent.parent / "config"
+    config_path = config_dir / f"{config_name}.json"
 
     return str(config_path)

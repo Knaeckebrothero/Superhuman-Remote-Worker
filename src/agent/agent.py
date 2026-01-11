@@ -23,12 +23,12 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 
-from src.agent.workspace_manager import WorkspaceManager, WorkspaceConfig as WMConfig
-from src.agent.todo_manager import TodoManager
-from src.agent.tools import ToolContext, load_tools
+from .core.workspace import WorkspaceManager, WorkspaceConfig as WMConfig
+from .core.todo import TodoManager
+from .tools import ToolContext, load_tools
 
-from .state import UniversalAgentState, create_initial_state
-from .loader import (
+from .core.state import UniversalAgentState, create_initial_state
+from .core.loader import (
     AgentConfig,
     load_agent_config,
     create_llm,
@@ -37,8 +37,8 @@ from .loader import (
     get_all_tool_names,
     resolve_config_path,
 )
-from src.agent.tools.description_generator import generate_workspace_tool_docs
-from src.agent.tools.description_override import apply_description_overrides
+from .tools.description_generator import generate_workspace_tool_docs
+from .tools.description_override import apply_description_overrides
 from .graph import build_agent_graph, run_graph_with_streaming
 
 logger = logging.getLogger(__name__)
@@ -133,7 +133,7 @@ class UniversalAgent:
 
         Example:
             ```python
-            # By name (looks in config/agents/)
+            # By name (looks in src/config/)
             agent = UniversalAgent.from_config("creator")
 
             # By path
@@ -175,7 +175,7 @@ class UniversalAgent:
         """Set up required database connections."""
         # PostgreSQL connection (always required for job management)
         if self.postgres_conn is None and self.config.connections.postgres:
-            from src.core.postgres_utils import create_postgres_connection
+            from src.database.postgres_utils import create_postgres_connection
             db_url = os.getenv("DATABASE_URL")
             if db_url:
                 self.postgres_conn = create_postgres_connection(db_url)
@@ -186,7 +186,7 @@ class UniversalAgent:
 
         # Neo4j connection (optional, based on config)
         if self.neo4j_conn is None and self.config.connections.neo4j:
-            from src.core.neo4j_utils import Neo4jConnection
+            from src.database.neo4j_utils import Neo4jConnection
             neo4j_uri = os.getenv("NEO4J_URI")
             neo4j_user = os.getenv("NEO4J_USER", "neo4j")
             neo4j_password = os.getenv("NEO4J_PASSWORD")

@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-from src.core.postgres_utils import (
+from src.database.postgres_utils import (
     PostgresConnection,
     create_job,
     get_job,

@@ -22,7 +22,7 @@ from typing import List, Optional
 from langchain_core.tools import tool
 
 from .context import ToolContext
-from ..phase_transition import (
+from ..core.transitions import (
     PhaseTransitionManager,
     TransitionResult,
     TransitionType,

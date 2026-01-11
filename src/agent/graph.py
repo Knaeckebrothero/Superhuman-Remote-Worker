@@ -26,7 +26,7 @@ import traceback
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-from src.agent.llm_archiver import get_archiver
+from .core.archiver import get_archiver
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -39,16 +39,16 @@ from langchain_core.messages import (
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-from .state import UniversalAgentState
-from .loader import AgentConfig
-from .context import (
+from .core.state import UniversalAgentState
+from .core.loader import AgentConfig
+from .core.context import (
     ContextConfig,
     ContextManager,
     ToolRetryManager,
     write_error_to_workspace,
 )
 from .tools.todo_tools import get_last_transition_result
-from .phase_transition import TransitionType, get_bootstrap_todos, BOOTSTRAP_PROMPT
+from .core.transitions import TransitionType, get_bootstrap_todos, BOOTSTRAP_PROMPT
 
 logger = logging.getLogger(__name__)
 

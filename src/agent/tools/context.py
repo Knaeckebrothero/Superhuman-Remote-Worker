@@ -7,7 +7,7 @@ such as workspace managers, database connections, and configuration.
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from src.agent.workspace_manager import WorkspaceManager
+from ..core.workspace import WorkspaceManager
 
 
 @dataclass

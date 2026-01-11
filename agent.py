@@ -60,8 +60,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.agent import UniversalAgent, create_app
-from src.agent.workspace_manager import get_workspace_base_path
-from src.core.postgres_utils import create_postgres_connection, create_job
+from src.agent.core.workspace import get_workspace_base_path
+from src.database.postgres_utils import create_postgres_connection, create_job
 
 
 def setup_logging(verbose: bool = False):

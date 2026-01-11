@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 if TYPE_CHECKING:
-    from .workspace_manager import WorkspaceManager
+    from .workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 

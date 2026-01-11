@@ -76,7 +76,7 @@
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Files to copy into workspace on initialization. Keys are destination paths, values are source paths relative to config/agents/"
+          "description": "Files to copy into workspace on initialization. Keys are destination paths, values are source paths relative to src/config/"
         }
       }
     },

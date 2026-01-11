@@ -15,8 +15,8 @@ from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
 
-from .agent import UniversalAgent
-from .loader import resolve_config_path
+from ..agent import UniversalAgent
+from ..core.loader import resolve_config_path
 from .models import (
     JobSubmitRequest,
     JobSubmitResponse,

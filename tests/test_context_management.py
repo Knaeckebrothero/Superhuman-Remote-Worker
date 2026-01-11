@@ -38,7 +38,7 @@ from langchain_core.messages import (
 )
 
 # Import context module directly to avoid neo4j import issues
-context_module_path = project_root / "src" / "agent" / "context.py"
+context_module_path = project_root / "src" / "agent" / "core" / "context.py"
 context_module = _import_module_directly(context_module_path, "src.agent.context_manager")
 
 ContextConfig = context_module.ContextConfig
@@ -59,7 +59,7 @@ ProtectedContextConfig = context_module.ProtectedContextConfig
 ProtectedContextProvider = context_module.ProtectedContextProvider
 
 # Import todo_manager directly
-todo_manager_path = project_root / "src" / "agent" / "todo_manager.py"
+todo_manager_path = project_root / "src" / "agent" / "core" / "todo.py"
 todo_manager_module = _import_module_directly(todo_manager_path, "src.agent.todo_manager")
 TodoManager = todo_manager_module.TodoManager
 
@@ -525,7 +525,7 @@ class TestStateIntegration:
 
     def test_state_fields_exist(self):
         """Test that new state fields are defined."""
-        from src.agent.state import UniversalAgentState, create_initial_state
+        from src.agent.core.state import UniversalAgentState, create_initial_state
 
         state = create_initial_state(
             job_id="test-job",
@@ -544,7 +544,7 @@ class TestLoaderIntegration:
 
     def test_load_summarization_prompt_exists(self):
         """Test that load_summarization_prompt function exists."""
-        from src.agent.loader import load_summarization_prompt
+        from src.agent.core.loader import load_summarization_prompt
 
         prompt = load_summarization_prompt()
         assert isinstance(prompt, str)
@@ -554,8 +554,8 @@ class TestLoaderIntegration:
 
     def test_get_all_tool_names_exists(self):
         """Test that get_all_tool_names function exists."""
-        from src.agent.loader import get_all_tool_names, AgentConfig
-        from src.agent.loader import ToolsConfig
+        from src.agent.core.loader import get_all_tool_names, AgentConfig
+        from src.agent.core.loader import ToolsConfig
 
         config = AgentConfig(
             agent_id="test",

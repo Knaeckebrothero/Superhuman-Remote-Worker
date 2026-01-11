@@ -139,9 +139,11 @@ if archiver:  # Returns None if MONGODB_URL not set
 
 **Option B: Fix PostgreSQL Logging**
 Wire up `log_llm_request()` in Universal Agent graph:
+
 ```python
 # In graph.py process_node, after LLM response
-from src.core.postgres_utils import log_llm_request
+from src.database.postgres_utils import log_llm_request
+
 await log_llm_request(
     postgres_conn,
     job_id=state["job_id"],

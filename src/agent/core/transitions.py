@@ -19,8 +19,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    from .todo_manager import TodoManager
-    from .workspace_manager import WorkspaceManager
+    from .todo import TodoManager
+    from .workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 

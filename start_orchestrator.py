@@ -15,7 +15,7 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.core.postgres_utils import create_postgres_connection
+from src.database.postgres_utils import create_postgres_connection
 from src.orchestrator.job_manager import create_job_manager
 from src.orchestrator.monitor import create_monitor
 

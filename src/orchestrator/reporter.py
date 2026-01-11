@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field, asdict
 
-from src.core.postgres_utils import (
+from src.database.postgres_utils import (
     PostgresConnection,
     get_job,
     count_requirements_by_status,

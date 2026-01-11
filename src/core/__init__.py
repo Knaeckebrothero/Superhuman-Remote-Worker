@@ -2,7 +2,7 @@
 Core utilities for database connectivity and data processing.
 """
 
-from src.core.neo4j_utils import Neo4jConnection, create_neo4j_connection
+from src.database.neo4j_utils import Neo4jConnection, create_neo4j_connection
 from src.core.csv_processor import RequirementProcessor, load_requirements_from_env
 from src.core.metamodel_validator import (
     MetamodelValidator,
@@ -27,7 +27,7 @@ from src.core.config import load_config, load_prompt, get_project_root
 
 # PostgreSQL utilities (optional - requires asyncpg)
 try:
-    from src.core.postgres_utils import (
+    from src.database.postgres_utils import (
         PostgresConnection,
         create_postgres_connection,
         create_job,
