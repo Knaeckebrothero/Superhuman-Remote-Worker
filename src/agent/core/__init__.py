@@ -22,7 +22,7 @@ from .context import (
     ToolRetryManager,
 )
 from .workspace import WorkspaceManager, WorkspaceConfig
-from .todo import TodoManager, Todo
+from .todo import TodoManager, TodoItem, TodoStatus
 from .archiver import get_archiver, LLMArchiver
 from .transitions import (
     TransitionType,
@@ -56,7 +56,8 @@ __all__ = [
     "WorkspaceConfig",
     # Todo
     "TodoManager",
-    "Todo",
+    "TodoItem",
+    "TodoStatus",
     # Archiver
     "get_archiver",
     "LLMArchiver",

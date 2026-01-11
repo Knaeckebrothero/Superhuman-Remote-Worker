@@ -322,8 +322,8 @@ def load_system_prompt(
         Formatted system prompt string
     """
     if config_dir is None:
-        # __file__ = src/agent/loader.py -> config is at src/config
-        config_dir = Path(__file__).parent.parent / "config"
+        # __file__ = src/agent/core/loader.py -> config is at src/config
+        config_dir = Path(__file__).parent.parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -379,8 +379,8 @@ def load_instructions(
         Instructions content to be placed in workspace
     """
     if config_dir is None:
-        # __file__ = src/agent/loader.py -> config is at src/config
-        config_dir = Path(__file__).parent.parent / "config"
+        # __file__ = src/agent/core/loader.py -> config is at src/config
+        config_dir = Path(__file__).parent.parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -423,8 +423,8 @@ def load_summarization_prompt(config_dir: Optional[str] = None) -> str:
         Summarization prompt content
     """
     if config_dir is None:
-        # __file__ = src/agent/loader.py -> config is at src/config
-        config_dir = Path(__file__).parent.parent / "config"
+        # __file__ = src/agent/core/loader.py -> config is at src/config
+        config_dir = Path(__file__).parent.parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -491,8 +491,8 @@ def resolve_config_path(config_name: str) -> str:
         return config_name
 
     # Resolve relative to config directory
-    # __file__ = src/agent/loader.py -> config is at src/config
-    config_dir = Path(__file__).parent.parent / "config"
+    # __file__ = src/agent/core/loader.py -> config is at src/config
+    config_dir = Path(__file__).parent.parent.parent / "config"
     config_path = config_dir / f"{config_name}.json"
 
     return str(config_path)

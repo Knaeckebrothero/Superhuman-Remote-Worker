@@ -154,7 +154,7 @@ def build_agent_graph(
 
     # Set up protected context provider (maintains "roter Faden" across compaction)
     if config.context_management.protected_context_enabled and workspace_manager:
-        from .context import ProtectedContextProvider, ProtectedContextConfig
+        from .core.context import ProtectedContextProvider, ProtectedContextConfig
         protected_config = ProtectedContextConfig(
             enabled=config.context_management.protected_context_enabled,
             plan_file=config.context_management.protected_context_plan_file,
