@@ -12,6 +12,11 @@ Phase 6 additions:
 - Context management (tool result clearing, summarization)
 - Tool retry logic with exponential backoff
 - Error handling with workspace persistence
+
+Phase 4 additions (Guardrails):
+- Phase transition detection after tool execution
+- Automatic context summarization triggers
+- Phase transition state tracking
 """
 
 import asyncio
@@ -42,6 +47,8 @@ from .context import (
     ToolRetryManager,
     write_error_to_workspace,
 )
+from .tools.todo_tools import get_last_transition_result
+from .phase_transition import TransitionType, get_bootstrap_todos, BOOTSTRAP_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +248,46 @@ def build_agent_graph(
             },
         }
 
+        # Inject bootstrap todos if todo_manager is available
+        if todo_manager:
+            try:
+                # Check if todo list is empty (new job)
+                current_todos = todo_manager.list_all_sync()
+                if not current_todos:
+                    logger.info("Injecting bootstrap todos for new job")
+                    bootstrap_todos = get_bootstrap_todos()
+                    todo_manager.set_todos_from_list(bootstrap_todos)
+
+                    # Set phase info for bootstrap
+                    todo_manager.set_phase_info(
+                        phase_number=0,  # Bootstrap is phase 0
+                        total_phases=0,   # Unknown until plan is created
+                        phase_name="Bootstrap",
+                    )
+
+                    # Audit: bootstrap injection
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="bootstrap",
+                            node_name="initialize",
+                            iteration=0,
+                            data={
+                                "bootstrap": {
+                                    "todos_injected": len(bootstrap_todos),
+                                    "phase": "bootstrap",
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                        )
+
+                    logger.info(f"Injected {len(bootstrap_todos)} bootstrap todos")
+                else:
+                    logger.debug(f"Todo list not empty ({len(current_todos)} items), skipping bootstrap injection")
+            except Exception as e:
+                logger.warning(f"Failed to inject bootstrap todos: {e}")
+
         # Apply custom initialization if provided
         if on_initialize:
             state_copy = dict(state)
@@ -285,6 +332,24 @@ def build_agent_graph(
                 prepared_messages.append(
                     HumanMessage(content="Please continue with your task.")
                 )
+
+        # Inject Layer 2 protected context (todo list with visual separators)
+        # This is injected fresh each time to ensure it reflects current state
+        if context_manager._protected_provider:
+            layer2_content = context_manager._protected_provider.get_layer2_todo_display()
+            if layer2_content:
+                # Insert as a SystemMessage right after the first system message
+                # This keeps it in the "protected" position at the start
+                insert_idx = 1  # After first system message
+                for i, msg in enumerate(prepared_messages):
+                    if isinstance(msg, SystemMessage):
+                        insert_idx = i + 1
+                        break
+                prepared_messages.insert(
+                    insert_idx,
+                    SystemMessage(content=layer2_content)
+                )
+                logger.debug(f"Injected Layer 2 todo display ({len(layer2_content)} chars)")
 
         # Pre-emptive token check - catch context overflow BEFORE LLM call
         prepared_token_count = context_manager.get_token_count(prepared_messages)
@@ -606,6 +671,31 @@ def build_agent_graph(
             audit_check("continue", "recoverable_error_cleared", False)
             return {"error": None, "iteration": iteration}
 
+        # Handle phase transition - trigger context summarization if requested
+        phase_transition = state.get("phase_transition")
+        if phase_transition and phase_transition.get("trigger_summarization"):
+            transition_type = phase_transition.get("transition_type", "unknown")
+            logger.info(
+                f"Phase transition ({transition_type}) detected, "
+                f"triggering context summarization"
+            )
+
+            # Update context stats to indicate summarization was triggered
+            new_context_stats = context_stats.copy()
+            new_context_stats["phase_transition_triggered"] = True
+            new_context_stats["last_transition_type"] = transition_type
+            new_context_stats["total_summarizations"] = context_stats.get("total_summarizations", 0) + 1
+
+            audit_check("continue", f"phase_transition_{transition_type}", False)
+
+            # Clear the phase transition from state (it's been handled)
+            # The transition prompt is already in the tool result message
+            return {
+                "iteration": iteration,
+                "context_stats": new_context_stats,
+                "phase_transition": None,  # Clear after handling
+            }
+
         audit_check("continue", "no_stop_condition", False)
         return {"iteration": iteration}
 
@@ -723,10 +813,47 @@ def build_agent_graph(
                     tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]
                     logger.info(f"Tool retry succeeded after {attempt} attempt(s) for {tool_names}")
 
-                return {
+                # Check for phase transition after todo_complete or todo_rewind
+                phase_transition = None
+                transition_result = get_last_transition_result()
+                if transition_result and transition_result.should_transition:
+                    logger.info(
+                        f"Phase transition detected: {transition_result.transition_type.value}, "
+                        f"trigger_summarization={transition_result.trigger_summarization}"
+                    )
+                    phase_transition = {
+                        "transition_type": transition_result.transition_type.value,
+                        "trigger_summarization": transition_result.trigger_summarization,
+                        "metadata": transition_result.metadata,
+                    }
+
+                    # Audit: phase transition
+                    if auditor:
+                        auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="phase_transition",
+                            node_name="tools",
+                            iteration=iteration,
+                            data={
+                                "transition": {
+                                    "type": transition_result.transition_type.value,
+                                    "trigger_summarization": transition_result.trigger_summarization,
+                                    "metadata": transition_result.metadata,
+                                }
+                            },
+                            metadata=state.get("metadata"),
+                        )
+
+                return_state = {
                     **result,
                     "tool_retry_state": retry_state,
                 }
+
+                if phase_transition:
+                    return_state["phase_transition"] = phase_transition
+
+                return return_state
 
             except Exception as e:
                 tool_names = [tc.get("name", "unknown") for tc in last_message.tool_calls]

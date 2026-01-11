@@ -37,6 +37,8 @@
     ],
     "todo": [
       "todo_write",
+      "todo_complete",
+      "todo_rewind",
       "archive_and_reset"
     ],
     "domain": [

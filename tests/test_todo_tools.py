@@ -31,39 +31,44 @@ def _import_module_directly(module_path: Path, module_name: str):
 config_path = project_root / "src" / "core" / "config.py"
 config_module = _import_module_directly(config_path, "src.core.config")
 
-workspace_manager_path = project_root / "src" / "agents" / "workspace_manager.py"
-workspace_manager_module = _import_module_directly(workspace_manager_path, "src.agents.workspace_manager")
+workspace_manager_path = project_root / "src" / "agent" / "workspace_manager.py"
+workspace_manager_module = _import_module_directly(workspace_manager_path, "src.agent.workspace_manager")
 
 WorkspaceManager = workspace_manager_module.WorkspaceManager
 WorkspaceConfig = workspace_manager_module.WorkspaceConfig
 
-todo_manager_path = project_root / "src" / "agents" / "todo_manager.py"
-todo_manager_module = _import_module_directly(todo_manager_path, "src.agents.todo_manager")
+todo_manager_path = project_root / "src" / "agent" / "todo_manager.py"
+todo_manager_module = _import_module_directly(todo_manager_path, "src.agent.todo_manager")
 
 TodoManager = todo_manager_module.TodoManager
 TodoItem = todo_manager_module.TodoItem
 TodoStatus = todo_manager_module.TodoStatus
 
 # Import tools modules - need to set up fake package structure for relative imports
-context_path = project_root / "src" / "agents" / "tools" / "context.py"
-context_module = _import_module_directly(context_path, "src.agents.tools.context")
+context_path = project_root / "src" / "agent" / "tools" / "context.py"
+context_module = _import_module_directly(context_path, "src.agent.tools.context")
 ToolContext = context_module.ToolContext
 
-workspace_tools_path = project_root / "src" / "agents" / "tools" / "workspace_tools.py"
-workspace_tools_module = _import_module_directly(workspace_tools_path, "src.agents.tools.workspace_tools")
+# Import pdf_utils before workspace_tools (workspace_tools has a relative import to pdf_utils)
+pdf_utils_path = project_root / "src" / "agent" / "tools" / "pdf_utils.py"
+pdf_utils_module = _import_module_directly(pdf_utils_path, "src.agent.tools.pdf_utils")
+
+workspace_tools_path = project_root / "src" / "agent" / "tools" / "workspace_tools.py"
+workspace_tools_module = _import_module_directly(workspace_tools_path, "src.agent.tools.workspace_tools")
 
 # Create a fake package for the tools module to enable relative imports
-tools_package = ModuleType("src.agents.tools")
+tools_package = ModuleType("src.agent.tools")
 tools_package.context = context_module
+tools_package.pdf_utils = pdf_utils_module
 tools_package.workspace_tools = workspace_tools_module
 tools_package.ToolContext = ToolContext
 tools_package.create_workspace_tools = workspace_tools_module.create_workspace_tools
 tools_package.WORKSPACE_TOOLS_METADATA = workspace_tools_module.WORKSPACE_TOOLS_METADATA
-sys.modules["src.agents.tools"] = tools_package
+sys.modules["src.agent.tools"] = tools_package
 
 # Now we can import todo_tools
-todo_tools_path = project_root / "src" / "agents" / "tools" / "todo_tools.py"
-todo_tools_module = _import_module_directly(todo_tools_path, "src.agents.tools.todo_tools")
+todo_tools_path = project_root / "src" / "agent" / "tools" / "todo_tools.py"
+todo_tools_module = _import_module_directly(todo_tools_path, "src.agent.tools.todo_tools")
 create_todo_tools = todo_tools_module.create_todo_tools
 TODO_TOOLS_METADATA = todo_tools_module.TODO_TOOLS_METADATA
 
@@ -73,33 +78,33 @@ tools_package.create_todo_tools = create_todo_tools
 tools_package.TODO_TOOLS_METADATA = TODO_TOOLS_METADATA
 
 # Import domain tools (needed by registry)
-document_tools_path = project_root / "src" / "agents" / "tools" / "document_tools.py"
-document_tools_module = _import_module_directly(document_tools_path, "src.agents.tools.document_tools")
+document_tools_path = project_root / "src" / "agent" / "tools" / "document_tools.py"
+document_tools_module = _import_module_directly(document_tools_path, "src.agent.tools.document_tools")
 tools_package.document_tools = document_tools_module
 
-search_tools_path = project_root / "src" / "agents" / "tools" / "search_tools.py"
-search_tools_module = _import_module_directly(search_tools_path, "src.agents.tools.search_tools")
+search_tools_path = project_root / "src" / "agent" / "tools" / "search_tools.py"
+search_tools_module = _import_module_directly(search_tools_path, "src.agent.tools.search_tools")
 tools_package.search_tools = search_tools_module
 
-citation_tools_path = project_root / "src" / "agents" / "tools" / "citation_tools.py"
-citation_tools_module = _import_module_directly(citation_tools_path, "src.agents.tools.citation_tools")
+citation_tools_path = project_root / "src" / "agent" / "tools" / "citation_tools.py"
+citation_tools_module = _import_module_directly(citation_tools_path, "src.agent.tools.citation_tools")
 tools_package.citation_tools = citation_tools_module
 
-cache_tools_path = project_root / "src" / "agents" / "tools" / "cache_tools.py"
-cache_tools_module = _import_module_directly(cache_tools_path, "src.agents.tools.cache_tools")
+cache_tools_path = project_root / "src" / "agent" / "tools" / "cache_tools.py"
+cache_tools_module = _import_module_directly(cache_tools_path, "src.agent.tools.cache_tools")
 tools_package.cache_tools = cache_tools_module
 
-graph_tools_path = project_root / "src" / "agents" / "tools" / "graph_tools.py"
-graph_tools_module = _import_module_directly(graph_tools_path, "src.agents.tools.graph_tools")
+graph_tools_path = project_root / "src" / "agent" / "tools" / "graph_tools.py"
+graph_tools_module = _import_module_directly(graph_tools_path, "src.agent.tools.graph_tools")
 tools_package.graph_tools = graph_tools_module
 
-completion_tools_path = project_root / "src" / "agents" / "tools" / "completion_tools.py"
-completion_tools_module = _import_module_directly(completion_tools_path, "src.agents.tools.completion_tools")
+completion_tools_path = project_root / "src" / "agent" / "tools" / "completion_tools.py"
+completion_tools_module = _import_module_directly(completion_tools_path, "src.agent.tools.completion_tools")
 tools_package.completion_tools = completion_tools_module
 
 # Now import registry
-registry_path = project_root / "src" / "agents" / "tools" / "registry.py"
-registry_module = _import_module_directly(registry_path, "src.agents.tools.registry")
+registry_path = project_root / "src" / "agent" / "tools" / "registry.py"
+registry_module = _import_module_directly(registry_path, "src.agent.tools.registry")
 TOOL_REGISTRY = registry_module.TOOL_REGISTRY
 load_tools = registry_module.load_tools
 get_tools_by_category = registry_module.get_tools_by_category
@@ -126,13 +131,15 @@ def workspace_manager(temp_workspace):
 @pytest.fixture
 def todo_manager():
     """Create a TodoManager for testing."""
-    return TodoManager()
+    # Disable auto_reflection for cleaner test behavior
+    return TodoManager(auto_reflection=False)
 
 
 @pytest.fixture
 def todo_manager_with_workspace(workspace_manager):
     """Create a TodoManager with workspace manager attached."""
-    mgr = TodoManager(workspace_manager=workspace_manager)
+    # Disable auto_reflection for cleaner test behavior
+    mgr = TodoManager(workspace_manager=workspace_manager, auto_reflection=False)
     return mgr
 
 
@@ -577,7 +584,7 @@ class TestCreateTodoTools:
     def test_creates_tools(self, tool_context):
         """Test that tools are created successfully."""
         tools = create_todo_tools(tool_context)
-        assert len(tools) == 2  # todo_write and archive_and_reset
+        assert len(tools) == 4  # todo_write, archive_and_reset, todo_complete, todo_rewind
 
     def test_requires_todo_manager(self, workspace_manager):
         """Test that todo manager is required."""
@@ -588,7 +595,7 @@ class TestCreateTodoTools:
     def test_tool_names(self, todo_tools):
         """Test expected tool names are present."""
         tool_names = {t.name for t in todo_tools}
-        expected = {"todo_write", "archive_and_reset"}
+        expected = {"todo_write", "archive_and_reset", "todo_complete", "todo_rewind"}
         assert expected == tool_names
 
 
@@ -691,6 +698,95 @@ class TestArchiveAndResetTool:
         assert "empty" in result.lower()
 
 
+class TestTodoCompleteTool:
+    """Tests for todo_complete tool."""
+
+    def test_todo_complete_marks_task_done(self, todo_tools, tool_context):
+        """Test completing the first pending task."""
+        # Add tasks
+        tool_context.todo_manager.add_sync("Task A")
+        tool_context.todo_manager.add_sync("Task B", priority=2)  # Higher priority
+
+        complete_tool = next(t for t in todo_tools if t.name == "todo_complete")
+        result = complete_tool.invoke({})
+
+        # Should complete highest priority task first (Task B)
+        assert "Task B" in result
+        assert "marked complete" in result
+
+    def test_todo_complete_shows_remaining(self, todo_tools, tool_context):
+        """Test that remaining task count is shown."""
+        tool_context.todo_manager.add_sync("Task A")
+        tool_context.todo_manager.add_sync("Task B")
+
+        complete_tool = next(t for t in todo_tools if t.name == "todo_complete")
+        result = complete_tool.invoke({})
+
+        assert "1 task remaining" in result
+
+    def test_todo_complete_shows_all_done(self, todo_tools, tool_context):
+        """Test message when all tasks are done."""
+        tool_context.todo_manager.add_sync("Only task")
+
+        complete_tool = next(t for t in todo_tools if t.name == "todo_complete")
+        result = complete_tool.invoke({})
+
+        assert "All tasks" in result
+        assert "done" in result
+
+    def test_todo_complete_empty_list(self, todo_tools):
+        """Test completing when no tasks exist."""
+        complete_tool = next(t for t in todo_tools if t.name == "todo_complete")
+        result = complete_tool.invoke({})
+
+        assert "No incomplete tasks" in result
+
+
+class TestTodoRewindTool:
+    """Tests for todo_rewind tool."""
+
+    def test_todo_rewind_archives_with_issue(self, todo_tools, tool_context):
+        """Test rewinding archives todos with failure note."""
+        tool_context.todo_manager.add_sync("Task 1")
+        tool_context.todo_manager.add_sync("Task 2")
+
+        rewind_tool = next(t for t in todo_tools if t.name == "todo_rewind")
+        result = rewind_tool.invoke({"issue": "API rate limit exceeded"})
+
+        assert "REWIND triggered" in result
+        assert "API rate limit exceeded" in result
+        assert "main_plan.md" in result
+
+    def test_todo_rewind_clears_todos(self, todo_tools, tool_context):
+        """Test that rewind clears the todo list."""
+        tool_context.todo_manager.add_sync("Task 1")
+
+        rewind_tool = next(t for t in todo_tools if t.name == "todo_rewind")
+        rewind_tool.invoke({"issue": "Test issue"})
+
+        assert len(tool_context.todo_manager.list_all_sync()) == 0
+
+    def test_todo_rewind_requires_issue(self, todo_tools):
+        """Test that issue parameter is required."""
+        rewind_tool = next(t for t in todo_tools if t.name == "todo_rewind")
+        result = rewind_tool.invoke({"issue": ""})
+
+        assert "Error" in result
+        assert "issue" in result.lower()
+
+    def test_todo_rewind_creates_archive_file(self, todo_tools, tool_context):
+        """Test that rewind creates an archive file."""
+        tool_context.todo_manager.add_sync("Task 1")
+
+        rewind_tool = next(t for t in todo_tools if t.name == "todo_rewind")
+        result = rewind_tool.invoke({"issue": "Test issue"})
+
+        # Check archive file was created
+        archive_files = tool_context.workspace_manager.list_files("archive", pattern="*.md")
+        assert len(archive_files) == 1
+        assert "REWIND" in archive_files[0]
+
+
 class TestTodoToolsRegistry:
     """Tests for todo tools in registry."""
 
@@ -699,6 +795,8 @@ class TestTodoToolsRegistry:
         todo_tools = get_tools_by_category("todo")
         assert "todo_write" in todo_tools
         assert "archive_and_reset" in todo_tools
+        assert "todo_complete" in todo_tools
+        assert "todo_rewind" in todo_tools
 
     def test_old_tools_removed(self):
         """Test that old fragmented tools are removed."""
@@ -713,10 +811,10 @@ class TestLoadTodoTools:
 
     def test_load_todo_tools(self, tool_context):
         """Test loading todo tools through registry."""
-        tools = load_tools(["todo_write", "archive_and_reset"], tool_context)
-        assert len(tools) == 2
+        tools = load_tools(["todo_write", "archive_and_reset", "todo_complete", "todo_rewind"], tool_context)
+        assert len(tools) == 4
         tool_names = {t.name for t in tools}
-        assert tool_names == {"todo_write", "archive_and_reset"}
+        assert tool_names == {"todo_write", "archive_and_reset", "todo_complete", "todo_rewind"}
 
     def test_load_requires_todo_manager(self, workspace_manager):
         """Test that loading todo tools requires todo_manager."""
@@ -738,7 +836,7 @@ class TestTodoToolMetadata:
 
     def test_todo_tools_metadata(self):
         """Test todo tools have proper metadata."""
-        expected_tools = {"todo_write", "archive_and_reset"}
+        expected_tools = {"todo_write", "archive_and_reset", "todo_complete", "todo_rewind"}
         assert set(TODO_TOOLS_METADATA.keys()) == expected_tools
 
         for name, meta in TODO_TOOLS_METADATA.items():
@@ -747,3 +845,67 @@ class TestTodoToolMetadata:
             assert "description" in meta
             assert "category" in meta
             assert meta["category"] == "todo"
+
+
+class TestPhaseMetadata:
+    """Tests for phase metadata in TodoManager."""
+
+    def test_set_phase_info(self, todo_manager):
+        """Test setting phase info."""
+        todo_manager.set_phase_info(2, 5, "Extraction")
+        info = todo_manager.get_phase_info()
+
+        assert info["phase_number"] == 2
+        assert info["total_phases"] == 5
+        assert info["phase_name"] == "Extraction"
+
+    def test_phase_indicator_format(self, todo_manager):
+        """Test phase indicator formatting."""
+        todo_manager.set_phase_info(3, 5, "Validation")
+        indicator = todo_manager._format_phase_indicator()
+        assert indicator == "Phase 3 of 5: Validation"
+
+    def test_phase_indicator_no_name(self, todo_manager):
+        """Test phase indicator without name."""
+        todo_manager.set_phase_info(2, 4)
+        indicator = todo_manager._format_phase_indicator()
+        assert indicator == "Phase 2 of 4"
+
+    def test_phase_indicator_unknown_total(self, todo_manager):
+        """Test phase indicator with unknown total."""
+        todo_manager.set_phase_info(1, 0, "Bootstrap")
+        indicator = todo_manager._format_phase_indicator()
+        assert indicator == "Phase 1: Bootstrap"
+
+    def test_phase_indicator_not_set(self, todo_manager):
+        """Test phase indicator when phase not set."""
+        indicator = todo_manager._format_phase_indicator()
+        assert indicator == ""
+
+    def test_complete_includes_phase_info(self, todo_manager):
+        """Test that complete_first_pending_sync includes phase info."""
+        todo_manager.set_phase_info(2, 5, "Extraction")
+        todo_manager.add_sync("Test task")
+
+        result = todo_manager.complete_first_pending_sync()
+        assert "Phase 2 of 5: Extraction" in result["message"]
+
+    def test_archive_includes_phase_in_filename(self, todo_manager_with_workspace):
+        """Test that archive filename includes phase number."""
+        todo_manager_with_workspace.set_phase_info(3, 5)
+        todo_manager_with_workspace.add_sync("Test task")
+
+        result = todo_manager_with_workspace.archive_and_reset()
+        assert "phase3" in result
+
+    def test_archive_header_includes_phase_info(self, todo_manager_with_workspace):
+        """Test that archive header includes phase info."""
+        todo_manager_with_workspace.set_phase_info(2, 4, "Analysis")
+        todo_manager_with_workspace.add_sync("Test task")
+        todo_manager_with_workspace.archive_and_reset()
+
+        ws = todo_manager_with_workspace._workspace_manager
+        archive_files = ws.list_files("archive", pattern="*.md")
+        content = ws.read_file(archive_files[0])
+
+        assert "Phase 2 of 4: Analysis" in content

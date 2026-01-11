@@ -2375,7 +2375,7 @@ services:
 
   orchestrator:
     build:
-      context: ..
+      context: ../..
       dockerfile: ../docker/Dockerfile.orchestrator
     environment:
       DATABASE_URL: postgresql://graphrag:${POSTGRES_PASSWORD}@postgres:5432/graphrag
@@ -2397,7 +2397,7 @@ services:
 
   creator-agent:
     build:
-      context: ..
+      context: ../..
       dockerfile: ../docker/Dockerfile.creator
     environment:
       DATABASE_URL: postgresql://graphrag:${POSTGRES_PASSWORD}@postgres:5432/graphrag
@@ -2413,7 +2413,7 @@ services:
 
   validator-agent:
     build:
-      context: ..
+      context: ../..
       dockerfile: ../docker/Dockerfile.validator
     environment:
       DATABASE_URL: postgresql://graphrag:${POSTGRES_PASSWORD}@postgres:5432/graphrag

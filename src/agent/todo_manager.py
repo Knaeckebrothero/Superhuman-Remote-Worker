@@ -13,7 +13,7 @@ This creates natural checkpoints for context compaction.
 
 import logging
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -41,7 +41,7 @@ class TodoItem:
     priority: int = 0  # Higher = more important
     parent_id: Optional[str] = None  # For hierarchical todos
     metadata: Dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     notes: List[str] = field(default_factory=list)
@@ -71,7 +71,7 @@ class TodoItem:
             priority=data.get("priority", 0),
             parent_id=data.get("parent_id"),
             metadata=data.get("metadata", {}),
-            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.utcnow(),
+            created_at=datetime.fromisoformat(data["created_at"]) if data.get("created_at") else datetime.now(timezone.utc),
             started_at=datetime.fromisoformat(data["started_at"]) if data.get("started_at") else None,
             completed_at=datetime.fromisoformat(data["completed_at"]) if data.get("completed_at") else None,
             notes=data.get("notes", []),
@@ -137,6 +137,11 @@ class TodoManager:
         self._loaded = False
         self._auto_reflection = auto_reflection
         self._reflection_task_content = reflection_task_content
+
+        # Phase tracking for guardrails system
+        self._phase_number: int = 0  # Current phase (0 = bootstrap/not set)
+        self._total_phases: int = 0  # Total phases (0 = unknown)
+        self._phase_name: str = ""   # Optional descriptive name for current phase
 
     async def _ensure_loaded(self) -> None:
         """Ensure todos are loaded from legacy workspace (async mode only)."""
@@ -283,7 +288,7 @@ class TodoManager:
         todo = await self.get(todo_id)
         if todo:
             todo.status = TodoStatus.IN_PROGRESS
-            todo.started_at = datetime.utcnow()
+            todo.started_at = datetime.now(timezone.utc)
             await self.save()
             logger.info(f"Started todo: {todo_id}")
 
@@ -308,7 +313,7 @@ class TodoManager:
         todo = await self.get(todo_id)
         if todo:
             todo.status = TodoStatus.COMPLETED
-            todo.completed_at = datetime.utcnow()
+            todo.completed_at = datetime.now(timezone.utc)
             if notes:
                 todo.notes.extend(notes)
             await self.save()
@@ -544,7 +549,7 @@ class TodoManager:
         todo = self.get_sync(todo_id)
         if todo:
             todo.status = TodoStatus.IN_PROGRESS
-            todo.started_at = datetime.utcnow()
+            todo.started_at = datetime.now(timezone.utc)
             logger.info(f"Started todo: {todo_id}")
         return todo
 
@@ -565,7 +570,7 @@ class TodoManager:
         todo = self.get_sync(todo_id)
         if todo:
             todo.status = TodoStatus.COMPLETED
-            todo.completed_at = datetime.utcnow()
+            todo.completed_at = datetime.now(timezone.utc)
             if notes:
                 todo.notes.append(notes)
             logger.info(f"Completed todo: {todo_id}")
@@ -606,6 +611,91 @@ class TodoManager:
         """
         return [t for t in self._todos if t.status == status]
 
+    def complete_first_pending_sync(self, notes: Optional[str] = None) -> Dict[str, Any]:
+        """Mark the first incomplete task as complete (synchronous).
+
+        This is the core method for the `todo_complete` tool. It finds the first
+        task that is either in_progress or pending (in that order) and marks it
+        as completed.
+
+        Args:
+            notes: Optional completion note to add
+
+        Returns:
+            Dictionary with:
+                - completed: The completed TodoItem (or None)
+                - remaining: Number of remaining incomplete tasks
+                - is_last_task: True if this was the last task in the phase
+                - next_task: The next pending task (or None)
+                - message: Human-readable status message
+        """
+        # First look for in_progress tasks
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+
+        task_to_complete = None
+        if in_progress:
+            task_to_complete = in_progress[0]
+        elif pending:
+            # Sort by priority (descending) then creation time
+            pending.sort(key=lambda t: (-t.priority, t.created_at))
+            task_to_complete = pending[0]
+
+        if not task_to_complete:
+            return {
+                "completed": None,
+                "remaining": 0,
+                "is_last_task": True,
+                "next_task": None,
+                "message": "No incomplete tasks to complete. Todo list is empty or all tasks are done.",
+            }
+
+        # Mark as complete
+        task_to_complete.status = TodoStatus.COMPLETED
+        task_to_complete.completed_at = datetime.now(timezone.utc)
+        if notes:
+            task_to_complete.notes.append(notes)
+
+        logger.info(f"Completed todo: {task_to_complete.id} - {task_to_complete.content}")
+
+        # Calculate remaining
+        remaining_in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        remaining_pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+        remaining_count = len(remaining_in_progress) + len(remaining_pending)
+
+        # Find next task
+        next_task = None
+        if remaining_in_progress:
+            next_task = remaining_in_progress[0]
+        elif remaining_pending:
+            remaining_pending.sort(key=lambda t: (-t.priority, t.created_at))
+            next_task = remaining_pending[0]
+
+        # Build message
+        phase_info = self._format_phase_indicator()
+        phase_prefix = f"[{phase_info}] " if phase_info else ""
+
+        if remaining_count == 0:
+            message = (
+                f"{phase_prefix}Task '{task_to_complete.content}' marked complete. "
+                f"All tasks in this phase are done!"
+            )
+        else:
+            message = (
+                f"{phase_prefix}Task '{task_to_complete.content}' marked complete. "
+                f"{remaining_count} task{'s' if remaining_count != 1 else ''} remaining."
+            )
+            if next_task:
+                message += f"\nNext up: {next_task.content}"
+
+        return {
+            "completed": task_to_complete,
+            "remaining": remaining_count,
+            "is_last_task": remaining_count == 0,
+            "next_task": next_task,
+            "message": message,
+        }
+
     def get_progress_sync(self) -> Dict[str, Any]:
         """Get progress summary (synchronous).
 
@@ -641,6 +731,58 @@ class TodoManager:
         """
         self._workspace_manager = workspace_manager
 
+    # -------------------------------------------------------------------------
+    # Phase tracking for guardrails system
+    # -------------------------------------------------------------------------
+
+    def set_phase_info(
+        self,
+        phase_number: int,
+        total_phases: int = 0,
+        phase_name: str = ""
+    ) -> None:
+        """Set phase information for guardrails system.
+
+        Args:
+            phase_number: Current phase number (1-indexed)
+            total_phases: Total number of phases (0 = unknown)
+            phase_name: Optional descriptive name for the phase
+        """
+        self._phase_number = phase_number
+        self._total_phases = total_phases
+        self._phase_name = phase_name
+        logger.info(f"Set phase info: {phase_number}/{total_phases} - {phase_name or 'unnamed'}")
+
+    def get_phase_info(self) -> Dict[str, Any]:
+        """Get current phase information.
+
+        Returns:
+            Dictionary with phase_number, total_phases, phase_name
+        """
+        return {
+            "phase_number": self._phase_number,
+            "total_phases": self._total_phases,
+            "phase_name": self._phase_name,
+        }
+
+    def _format_phase_indicator(self) -> str:
+        """Format phase indicator for display.
+
+        Returns:
+            Formatted phase string like "Phase 2 of 4: Extraction" or empty string
+        """
+        if self._phase_number == 0:
+            return ""
+
+        if self._total_phases > 0:
+            base = f"Phase {self._phase_number} of {self._total_phases}"
+        else:
+            base = f"Phase {self._phase_number}"
+
+        if self._phase_name:
+            return f"{base}: {self._phase_name}"
+        return base
+
     def _format_archive_content(self, phase_name: str = "") -> str:
         """Format todos as markdown for archiving.
 
@@ -652,10 +794,19 @@ class TodoManager:
         """
         lines = []
 
-        # Header
-        title = f"Archived Todos: {phase_name}" if phase_name else "Archived Todos"
+        # Header with phase info
+        phase_indicator = self._format_phase_indicator()
+        if phase_name and phase_indicator:
+            title = f"Archived Todos: {phase_indicator} - {phase_name}"
+        elif phase_indicator:
+            title = f"Archived Todos: {phase_indicator}"
+        elif phase_name:
+            title = f"Archived Todos: {phase_name}"
+        else:
+            title = "Archived Todos"
+
         lines.append(f"# {title}")
-        lines.append(f"Archived: {datetime.utcnow().isoformat()}")
+        lines.append(f"Archived: {datetime.now(timezone.utc).isoformat()}")
         lines.append("")
 
         # Group by status
@@ -766,15 +917,26 @@ class TodoManager:
         # Generate archive content
         archive_content = self._format_archive_content(phase_name)
 
-        # Generate filename
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        # Generate filename with phase number if available
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+        # Build filename parts
+        parts = ["todos"]
+
+        # Add phase number if set
+        if self._phase_number > 0:
+            parts.append(f"phase{self._phase_number}")
+
+        # Add custom phase name if provided
         if phase_name:
             # Sanitize phase name for filename
             safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in phase_name)
-            filename = f"todos_{safe_name}_{timestamp}.md"
-        else:
-            filename = f"todos_{timestamp}.md"
+            parts.append(safe_name)
 
+        # Add timestamp
+        parts.append(timestamp)
+
+        filename = "_".join(parts) + ".md"
         archive_path = f"archive/{filename}"
 
         # Write to workspace
@@ -798,6 +960,123 @@ class TodoManager:
         self._next_id = 1
         logger.info(f"Cleared {count} todos without archiving")
         return count
+
+    def archive_with_failure_note(
+        self,
+        issue: str,
+        workspace_manager: Optional["WorkspaceManager"] = None
+    ) -> str:
+        """Archive current todos with a failure note and reset for re-planning.
+
+        This is the core method for the `todo_rewind` panic button. It archives
+        the current state with a failure note explaining why the approach didn't
+        work, then clears the todo list to allow for re-planning.
+
+        Args:
+            issue: Description of the issue that caused the rewind
+            workspace_manager: Optional WorkspaceManager (uses instance default if not provided)
+
+        Returns:
+            Message prompting the agent to re-read the plan and re-plan
+
+        Raises:
+            ValueError: If no workspace manager is available
+        """
+        ws = workspace_manager or self._workspace_manager
+        if ws is None:
+            raise ValueError(
+                "No workspace manager available. Pass one to archive_with_failure_note() "
+                "or set it via set_workspace_manager()."
+            )
+
+        # Build failure archive content
+        lines = []
+
+        # Header with failure notice
+        phase_info = self._format_phase_indicator()
+        if phase_info:
+            lines.append(f"# REWIND: {phase_info}")
+        else:
+            lines.append("# REWIND: Todo Archive (Failed Approach)")
+
+        lines.append(f"Archived: {datetime.now(timezone.utc).isoformat()}")
+        lines.append("")
+        lines.append("## Failure Reason")
+        lines.append("")
+        lines.append(f"> {issue}")
+        lines.append("")
+
+        # Include the standard archive content
+        lines.append("## State at Time of Rewind")
+        lines.append("")
+
+        # Group by status
+        completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+
+        if completed:
+            lines.append(f"### Completed Before Rewind ({len(completed)})")
+            for todo in completed:
+                lines.append(f"- [x] {todo.content}")
+            lines.append("")
+
+        if in_progress:
+            lines.append(f"### Was In Progress ({len(in_progress)})")
+            for todo in in_progress:
+                lines.append(f"- [ ] {todo.content} (stopped)")
+            lines.append("")
+
+        if pending:
+            lines.append(f"### Was Pending ({len(pending)})")
+            for todo in pending:
+                lines.append(f"- [ ] {todo.content}")
+            lines.append("")
+
+        # Summary
+        total = len(self._todos)
+        completed_count = len(completed)
+        lines.append("## Summary")
+        lines.append(f"- Total tasks: {total}")
+        lines.append(f"- Completed before rewind: {completed_count}")
+        lines.append(f"- Tasks abandoned: {len(in_progress) + len(pending)}")
+
+        archive_content = "\n".join(lines)
+
+        # Generate filename with REWIND marker
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        if self._phase_number > 0:
+            filename = f"todos_REWIND_phase{self._phase_number}_{timestamp}.md"
+        else:
+            filename = f"todos_REWIND_{timestamp}.md"
+
+        archive_path = f"archive/{filename}"
+
+        # Write to workspace
+        ws.write_file(archive_path, archive_content)
+
+        # Clear todos
+        cleared_count = len(self._todos)
+        self._todos = []
+        self._next_id = 1
+
+        logger.warning(f"REWIND: Archived {cleared_count} todos to {archive_path} - Issue: {issue}")
+
+        # Build response message
+        response_lines = [
+            f"REWIND triggered: {issue}",
+            "",
+            f"Archived {cleared_count} todos to {archive_path}",
+            "",
+            "To recover, you should:",
+            "1. Read main_plan.md to review the overall strategy",
+            "2. Read workspace_summary.md to understand current state",
+            "3. Reconsider your approach based on the issue",
+            "4. Update main_plan.md if the strategy needs to change",
+            "5. Create new todos with todo_write for the revised approach",
+        ]
+
+        return "\n".join(response_lines)
 
     # -------------------------------------------------------------------------
     # TodoWrite pattern - atomic list replacement
@@ -925,9 +1204,9 @@ class TodoManager:
                 )
                 # Update timestamps based on status transitions
                 if status == TodoStatus.IN_PROGRESS and existing.status != TodoStatus.IN_PROGRESS:
-                    item.started_at = datetime.utcnow()
+                    item.started_at = datetime.now(timezone.utc)
                 if status == TodoStatus.COMPLETED and existing.status != TodoStatus.COMPLETED:
-                    item.completed_at = datetime.utcnow()
+                    item.completed_at = datetime.now(timezone.utc)
             else:
                 item = TodoItem(
                     id=todo_id,
@@ -936,9 +1215,9 @@ class TodoManager:
                     priority=priority,
                 )
                 if status == TodoStatus.IN_PROGRESS:
-                    item.started_at = datetime.utcnow()
+                    item.started_at = datetime.now(timezone.utc)
                 if status == TodoStatus.COMPLETED:
-                    item.completed_at = datetime.utcnow()
+                    item.completed_at = datetime.now(timezone.utc)
 
             new_todos.append(item)
 

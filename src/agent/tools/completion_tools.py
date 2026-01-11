@@ -137,16 +137,28 @@ def create_completion_tools(context: ToolContext) -> List:
             logger.info(f"Final deliverables: {deliverables}")
             logger.info(f"Confidence: {confidence}")
 
-            # TODO: Update job status in PostgreSQL database
-            # This should set jobs.status = 'completed' and jobs.completed_at = now()
-            # Requires database connection in ToolContext
-            # if context.has_database():
-            #     context.database.update_job_status(context.job_id, "completed")
+            # Update job status in PostgreSQL database
+            db_updated = False
+            if context.has_postgres():
+                try:
+                    db_updated = context.update_job_status(
+                        status="completed",
+                        completed_at=True,
+                    )
+                    if db_updated:
+                        logger.info(f"Updated job {context.job_id} status to 'completed' in database")
+                    else:
+                        logger.warning(f"Failed to update job status in database")
+                except Exception as e:
+                    logger.error(f"Error updating job status in database: {e}")
+            else:
+                logger.debug("No PostgreSQL connection available, skipping database status update")
 
             # Return message that triggers final completion detection
             # The agent loop should detect "JOB COMPLETE" and terminate
+            db_status = " Database updated." if db_updated else ""
             return (
-                f"JOB COMPLETE - Wrote: output/job_completion.json\n"
+                f"JOB COMPLETE - Wrote: output/job_completion.json{db_status}\n"
                 f"Summary: {summary}\n"
                 f"Deliverables: {len(deliverables)} files\n"
                 f"Confidence: {confidence:.0%}\n"

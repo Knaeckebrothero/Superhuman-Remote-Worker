@@ -15,7 +15,7 @@ Current agent behavior exhibits several issues:
 
 The guardrails system introduces:
 1. **Protected context structure** - Critical information survives summarization
-2. **Two-tier planning** - Strategy (plan.md) vs Tactics (todo list)
+2. **Two-tier planning** - Strategy (`main_plan.md`) vs Tactics (todo list)
 3. **Phase-based execution** - Work divided into 5-20 step phases
 4. **Automatic phase transitions** - Workflow triggers when phase completes
 5. **Panic button** - Agent can rewind when stuck
@@ -83,7 +83,7 @@ When summarization triggers:
 
 ## Two-Tier Planning
 
-### Strategic Layer: `plan.md`
+### Strategic Layer: `main_plan.md`
 
 The execution plan defines the "grand picture":
 - Overall approach to the task
@@ -157,7 +157,7 @@ Every job starts with the same initialization sequence. The todo list is pre-pop
 [ ] Generate workspace summary using generate_workspace_summary()
 [ ] Read workspace_summary.md
 [ ] Read instructions.md
-[ ] Create comprehensive execution plan in plan.md
+[ ] Create comprehensive execution plan in main_plan.md
 [ ] Divide plan into executable phases (5-20 steps each)
 ```
 
@@ -186,13 +186,13 @@ When `todo_complete()` is called on the last task of a phase:
                ▼
 ┌──────────────────────────────┐
 │  LLM reads:                  │
-│  - plan.md                   │
+│  - main_plan.md              │
 │  - instructions.md           │
 │  - workspace_summary.md      │
 └──────────────┬───────────────┘
                ▼
 ┌──────────────────────────────┐
-│  LLM updates plan.md:        │
+│  LLM updates main_plan.md:   │
 │  - Mark phase as COMPLETE    │
 │  - Adjust if needed          │
 │  - Mark next phase CURRENT   │
@@ -253,11 +253,11 @@ This means:
 
 ### Edge Case: All Phases Complete
 
-When the LLM reads plan.md during phase transition and finds NO remaining phases:
+When the LLM reads `main_plan.md` during phase transition and finds NO remaining phases:
 
 ```
 ┌──────────────────────────────┐
-│  LLM reads plan.md           │
+│  LLM reads main_plan.md      │
 │  All phases marked COMPLETE  │
 └──────────────┬───────────────┘
                ▼
@@ -334,9 +334,9 @@ todo_rewind(issue="Step 7 is impossible because the API doesn't support batch op
 Triggers a modified workflow:
 1. Archive current todo list with failure note
 2. Generate workspace summary
-3. Read plan.md, instructions.md, workspace_summary.md
+3. Read `main_plan.md`, `instructions.md`, `workspace_summary.md`
 4. **Reconsider phases** based on the issue
-5. Update plan.md with adjusted approach
+5. Update `main_plan.md` with adjusted approach
 6. Create new todo list for revised phase
 7. Trigger context summary
 
@@ -389,7 +389,7 @@ Generated: 2024-01-15 14:32:00
 
 | File | Purpose | Last Modified |
 |------|---------|---------------|
-| plan.md | Execution plan | 14:30 |
+| main_plan.md | Execution plan | 14:30 |
 | instructions.md | Task instructions | 14:00 |
 | document_analysis.md | Initial analysis | 14:15 |
 | extraction_results.md | Extracted reqs | 14:28 |
@@ -454,44 +454,315 @@ If the agent loops without progress (same state for N iterations):
 
 ---
 
+## Design Decisions
+
+This section documents key design decisions made during planning.
+
+### Q1: Should `todo_complete()` exist separately from `todo_write()`?
+
+**Decision: YES - implement `todo_complete()` as a simpler interface.**
+
+Rationale:
+- `todo_write()` requires the agent to manage the full list (Claude Code pattern)
+- `todo_complete()` is simpler: agent calls it, system finds next incomplete task
+- Having both gives flexibility: `todo_write()` for bulk updates, `todo_complete()` for incremental progress
+- The spec's "simple mental model" benefits from `todo_complete()`
+
+### Q2: Automatic vs agent-driven phase transitions?
+
+**Decision: AUTOMATIC with agent fallback.**
+
+Rationale:
+- Automatic transitions reduce agent cognitive load (spec's goal)
+- Agent still controls when to mark tasks complete
+- System handles the mechanics: archive → summary → read plan → create new todos
+- Agent can manually call `archive_and_reset()` if needed (escape hatch)
+
+### Q3: How should the 5-layer context structure work?
+
+**Decision: Use `ProtectedContextProvider` to inject Layer 2.**
+
+Rationale:
+- Current `ProtectedContextProvider` already reads `main_plan.md` and todos
+- Extend it to format Layer 2 with the visual todo list display from spec
+- Layer 2 injection happens in the process node before LLM call
+- Layers 4-5 handled by `ContextManager` trimming
+
+Implementation notes:
+- `ProtectedContextProvider.get_protected_context()` returns Layer 2 content
+- Inject as a `SystemMessage` or prefix to conversation
+- Ensure visual separators (═══) are included for LLM recognition
+
+### Q4: What about `todo_rewind()`?
+
+**Decision: Implement as specified - critical for recovery.**
+
+Rationale:
+- Without `todo_rewind()`, stuck agents have no escape hatch
+- Archives current state with failure note (preserves work)
+- Triggers re-planning workflow (not just reset)
+- Allows agent to recover from flawed plans
+
+### Q5: Where should `workspace_summary.md` be written?
+
+**Decision: Tool writes to file, agent reads it.**
+
+Rationale:
+- Current `get_workspace_summary()` returns text (doesn't write file)
+- Change to `generate_workspace_summary()` that writes to `workspace_summary.md`
+- Consistent with spec's workflow: generate → read → update plan
+- File persists for debugging and audit
+
+---
+
+## Current Implementation Status
+
+### What Exists (in `src/agent/`)
+
+| Component | File | Status |
+|-----------|------|--------|
+| `todo_write()` | `tools/todo_tools.py` | ✓ Complete |
+| `archive_and_reset()` | `tools/todo_tools.py` | ✓ Complete (with phase number) |
+| `todo_complete()` | `tools/todo_tools.py` | ✓ Complete (Phase 1+4 transition) |
+| `todo_rewind()` | `tools/todo_tools.py` | ✓ Complete (Phase 1+4 transition) |
+| `mark_complete()` | `tools/completion_tools.py` | ✓ Complete |
+| `job_complete()` | `tools/completion_tools.py` | ✓ Partial (needs DB update) |
+| `get_workspace_summary()` | `tools/workspace_tools.py` | ✓ Complete (returns text) |
+| `generate_workspace_summary()` | `tools/workspace_tools.py` | ✓ Complete (Phase 2) |
+| `add_accomplishment()` | `tools/workspace_tools.py` | ✓ Complete (Phase 2) |
+| `add_note()` | `tools/workspace_tools.py` | ✓ Complete (Phase 2) |
+| `TodoManager` | `todo_manager.py` | ✓ Complete (with phase metadata) |
+| `ContextManager` | `context_manager.py` | ✓ Complete |
+| `ProtectedContextProvider` | `context.py` | ✓ Complete (Phase 3 Layer 2 format) |
+| 4-node LangGraph workflow | `graph.py` | ✓ Complete |
+| Completion detection | `graph.py` | ✓ Complete (file/tool/phrase) |
+| `PhaseTransitionManager` | `phase_transition.py` | ✓ Complete (Phase 4) |
+| Phase transition detection | `graph.py` | ✓ Complete (Phase 4) |
+| `get_bootstrap_todos()` | `phase_transition.py` | ✓ Complete (Phase 5) |
+| Bootstrap todo injection | `graph.py` | ✓ Complete (Phase 5) |
+| `update_job_status()` | `tools/context.py` | ✓ Complete (Phase 5) |
+| Database status update | `tools/completion_tools.py` | ✓ Complete (Phase 5) |
+| Focus-on-todos guidance | `instructions/*.md` | ✓ Complete (Phase 5) |
+
+### What's Missing
+
+| Component | Priority | Notes |
+|-----------|----------|-------|
+| ~~`todo_complete()`~~ | ~~High~~ | ✓ Implemented in Phase 1 |
+| ~~`todo_rewind()`~~ | ~~High~~ | ✓ Implemented in Phase 1 |
+| ~~`generate_workspace_summary()`~~ | ~~Medium~~ | ✓ Implemented in Phase 2 |
+| ~~Layer 2 formatted injection~~ | ~~Medium~~ | ✓ Implemented in Phase 3 |
+| ~~Phase transition automation~~ | ~~Medium~~ | ✓ Implemented in Phase 4 |
+| ~~Bootstrap todo injection~~ | ~~Medium~~ | ✓ Implemented in Phase 5 |
+| ~~Database status update~~ | ~~Low~~ | ✓ Implemented in Phase 5 |
+
+---
+
+## Implementation Roadmap
+
+### Phase 1: Core Todo Tools (Priority: High) ✓ COMPLETE
+
+**Objective:** Complete the todo tool suite as specified.
+
+**Status:** Completed on 2026-01-11
+
+**Tasks:**
+1. ✓ Implement `todo_complete()` in `todo_tools.py`
+   - Takes no arguments
+   - Finds first incomplete task, marks complete
+   - Returns status message with remaining count
+   - On last task: triggers phase transition detection
+
+2. ✓ Implement `todo_rewind(issue: str)` in `todo_tools.py`
+   - Archives current todos with failure note
+   - Clears todo list
+   - Returns message prompting re-planning
+
+3. ✓ Add phase metadata to `TodoManager`
+   - Track `phase_number`, `total_phases`
+   - Include in archive file names
+   - Display in progress messages
+
+**Files modified:**
+- `src/agent/tools/todo_tools.py`
+- `src/agent/todo_manager.py`
+- `tests/test_todo_tools.py`
+
+### Phase 2: Workspace Summary (Priority: Medium) ✓ COMPLETE
+
+**Objective:** Generate persistent workspace summaries.
+
+**Status:** Completed on 2026-01-11
+
+**Tasks:**
+1. ✓ Create `generate_workspace_summary()` tool
+   - Writes to `workspace_summary.md`
+   - Includes: files, accomplishments, current state, notes
+   - Format matches spec
+
+2. ✓ Create accomplishment tracking tools
+   - `add_accomplishment()` - record milestone achievements
+   - `add_note()` - record working notes
+   - Both integrate with `generate_workspace_summary()`
+
+3. Integrate with phase transition workflow (deferred to Phase 4)
+   - Called automatically on phase complete
+   - Agent reads it during bootstrap and transitions
+
+**Files modified:**
+- `src/agent/tools/workspace_tools.py`
+- `tests/test_workspace_tools.py`
+
+### Phase 3: Context Layer Structure (Priority: Medium) ✓ COMPLETE
+
+**Objective:** Implement the 5-layer context structure.
+
+**Status:** Completed on 2026-01-11
+
+**Tasks:**
+1. ✓ Enhance `ProtectedContextProvider`
+   - Format Layer 2 with visual separators (═══ and ───)
+   - Include phase indicator (Phase: Name (X of Y))
+   - Add explicit instruction line with current task
+   - Add `get_layer2_todo_display()` method
+   - Add `is_layer2_message()` helper function
+   - Add `LAYER2_START_MARKER` and `LAYER2_TITLE` constants
+
+2. ✓ Update context injection in `graph.py`
+   - Inject Layer 2 before each LLM call (in process_node)
+   - Insert as SystemMessage right after first system message
+   - Always present (not summarized away)
+
+3. ✓ Update `ContextManager` trimming
+   - Document that Layer 2 content is never trimmed
+   - All SystemMessages preserved in `trim_messages()`
+   - Layer 2 injected AFTER preparation, so never subject to trimming
+
+**Files modified:**
+- `src/agent/context.py`
+- `src/agent/graph.py`
+- `tests/test_context_management.py`
+
+### Phase 4: Phase Transition Automation (Priority: Medium) ✓ COMPLETE
+
+**Objective:** Automate phase transitions on last task completion.
+
+**Status:** Completed on 2026-01-11
+
+**Tasks:**
+1. ✓ Detect last task completion in `todo_complete()`
+   - Check if all todos are complete via `is_last_task` flag
+   - Trigger phase transition workflow via PhaseTransitionManager
+
+2. ✓ Implement phase transition workflow
+   - Archive completed todos automatically
+   - Generate workspace summary prompt
+   - Inject transition prompt (read plan, update, create new todos)
+   - Trigger context summarization via state flag
+
+3. ✓ Handle edge case: all phases complete
+   - Automatically inject job completion todos when all phases done
+   - Agent receives JOB_COMPLETE prompt with final verification tasks
+
+**Files modified:**
+- `src/agent/tools/todo_tools.py` - Integration with PhaseTransitionManager
+- `src/agent/graph.py` - Phase transition detection and context summarization trigger
+- `src/agent/state.py` - Added phase_transition field
+- `src/agent/phase_transition.py` - New module with PhaseTransitionManager
+- `tests/test_phase_transitions.py` - 27 tests for phase transitions
+
+### Phase 5: Bootstrap & Completion (Priority: Low) ✓ COMPLETE
+
+**Objective:** Automate job start and end.
+
+**Status:** Completed on 2026-01-11
+
+**Tasks:**
+1. ✓ Implement bootstrap todo injection
+   - Pre-populate initial todos on job start
+   - Standard sequence: summary → read → plan → divide
+
+2. ✓ Complete `job_complete()` database integration
+   - Update `jobs.status = 'completed'`
+   - Set `jobs.completed_at = now()`
+
+3. ✓ Implement system prompt updates
+   - Focus-on-todos guidance
+   - "Trust the process" messaging
+
+**Files modified:**
+- `src/agent/phase_transition.py` - Added get_bootstrap_todos() and BOOTSTRAP_PROMPT
+- `src/agent/graph.py` - Bootstrap injection in initialize_node
+- `src/agent/tools/context.py` - Added update_job_status() method
+- `src/agent/tools/completion_tools.py` - Database integration in job_complete()
+- `src/config/agents/creator.json` - Added todo_complete and todo_rewind
+- `src/config/agents/validator.json` - Added todo_complete and todo_rewind
+- `src/config/agents/instructions/creator_instructions.md` - Focus-on-todos guidance
+- `src/config/agents/instructions/validator_instructions.md` - Focus-on-todos guidance
+- `tests/test_bootstrap_completion.py` - 20 tests for Phase 5
+
+### Phase 6: Testing & Validation (Priority: High, parallel)
+
+**Objective:** Verify the system works end-to-end.
+
+**Tasks:**
+1. Unit tests for new tools
+   - `test_todo_complete()`
+   - `test_todo_rewind()`
+   - `test_generate_workspace_summary()`
+
+2. Integration tests
+   - Full bootstrap → phase 1 → transition → phase 2 cycle
+   - Context size stays bounded across phases
+   - Recovery via `todo_rewind()`
+
+3. Manual validation
+   - Run Creator agent on real document
+   - Verify phase transitions work
+   - Check context doesn't overflow
+
+**Files to create:**
+- `tests/test_guardrails.py`
+- `tests/test_phase_transitions.py`
+
+---
+
 ## Implementation Checklist
 
-### Context Management
-- [ ] Modify context assembly to structure the 5 layers
-- [ ] Ensure layers 1-3 are protected during summarization
-- [ ] Update summarization to only compact layers 4-5
-- [ ] Inject todo list display into layer 2 on every turn
+### Phase 1: Core Todo Tools ✓ COMPLETE
+- [x] Implement `todo_complete()` - marks next incomplete task
+- [x] Implement `todo_rewind(issue)` - panic button with recovery flow
+- [x] Add phase metadata (phase_number, total_phases) to TodoManager
+- [x] Update `archive_and_reset()` to include phase number in filename
 
-### Todo System
-- [ ] Implement `todo_complete()` - marks next incomplete task
-- [ ] Add phase transition detection (when last task completes)
-- [ ] Implement `todo_rewind(issue)` - panic button with recovery flow
-- [ ] Add bootstrap todo injection on job start
-- [ ] Store phase metadata (phase number, total phases) with todo list
+### Phase 2: Workspace Summary ✓ COMPLETE
+- [x] Implement `generate_workspace_summary()` tool (writes file)
+- [x] Ensure workspace_summary.md format matches spec
+- [x] Add accomplishments tracking with `add_accomplishment()` and `add_note()` tools
 
-### Phase Transition Workflow
-- [ ] Create phase transition prompt template
-- [ ] Implement workflow: archive → summary → read → update plan → create todos → summarize
-- [ ] Ensure new todos are in layer 2 BEFORE summarization triggers
-- [ ] Handle edge case: no more phases (trigger job completion prompt)
+### Phase 3: Context Layer Structure ✓ COMPLETE
+- [x] Enhance `ProtectedContextProvider` with Layer 2 formatting
+- [x] Add visual separators (═══) to todo display
+- [x] Update `graph.py` to inject Layer 2 on every turn
+- [x] Ensure Layers 1-3 are never trimmed
 
-### Workspace Tools
-- [ ] Implement `generate_workspace_summary()` tool
-- [ ] Ensure workspace_summary.md format matches spec
+### Phase 4: Phase Transition Automation ✓ COMPLETE
+- [x] Detect last task completion in `todo_complete()`
+- [x] Create phase transition prompt templates (PHASE_TRANSITION_PROMPT, JOB_COMPLETE_PROMPT, REWIND_TRANSITION_PROMPT)
+- [x] Implement workflow: archive → summary → read → update plan → create todos
+- [x] Handle edge case: no more phases (inject job completion todos automatically)
+- [x] Trigger context summarization after phase transition (via state flag)
 
-### Completion
-- [x] Create `job_complete()` tool (DONE)
-- [ ] Add job completion detection (when plan shows all phases complete)
-- [ ] Update database status on job completion
+### Phase 5: Bootstrap & Completion ✓ COMPLETE
+- [x] Add bootstrap todo injection on job start
+- [x] Update `job_complete()` to update PostgreSQL status
+- [x] Rewrite system prompt with focus-on-todos guidance
+- [x] Add "trust the process" messaging
 
-### System Prompt
-- [ ] Rewrite system prompt with focus-on-todos guidance
-- [ ] Remove old two-tier planning instructions (agent shouldn't manage strategy)
-- [ ] Add "trust the process" messaging
-
-### Testing
+### Phase 6: Testing
+- [ ] Test `todo_complete()` flow
+- [ ] Test `todo_rewind()` recovery flow
 - [ ] Test full bootstrap → phase 1 → transition → phase 2 cycle
-- [ ] Test todo_rewind recovery flow
 - [ ] Test context size stays bounded across many phases
 - [ ] Test job completion detection
 

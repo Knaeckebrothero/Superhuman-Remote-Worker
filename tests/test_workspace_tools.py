@@ -29,39 +29,39 @@ def _import_module_directly(module_path: Path, module_name: str):
 config_path = project_root / "src" / "core" / "config.py"
 config_module = _import_module_directly(config_path, "src.core.config")
 
-workspace_manager_path = project_root / "src" / "agents" / "workspace_manager.py"
-workspace_manager_module = _import_module_directly(workspace_manager_path, "src.agents.workspace_manager")
+workspace_manager_path = project_root / "src" / "agent" / "workspace_manager.py"
+workspace_manager_module = _import_module_directly(workspace_manager_path, "src.agent.workspace_manager")
 
 WorkspaceManager = workspace_manager_module.WorkspaceManager
 WorkspaceConfig = workspace_manager_module.WorkspaceConfig
 
 # Import tools modules - need to set up fake package structure for relative imports
-context_path = project_root / "src" / "agents" / "tools" / "context.py"
-context_module = _import_module_directly(context_path, "src.agents.tools.context")
+context_path = project_root / "src" / "agent" / "tools" / "context.py"
+context_module = _import_module_directly(context_path, "src.agent.tools.context")
 ToolContext = context_module.ToolContext
 
 # Import pdf_utils before workspace_tools (workspace_tools has a relative import to pdf_utils)
-pdf_utils_path = project_root / "src" / "agents" / "tools" / "pdf_utils.py"
-pdf_utils_module = _import_module_directly(pdf_utils_path, "src.agents.tools.pdf_utils")
+pdf_utils_path = project_root / "src" / "agent" / "tools" / "pdf_utils.py"
+pdf_utils_module = _import_module_directly(pdf_utils_path, "src.agent.tools.pdf_utils")
 
-workspace_tools_path = project_root / "src" / "agents" / "tools" / "workspace_tools.py"
-workspace_tools_module = _import_module_directly(workspace_tools_path, "src.agents.tools.workspace_tools")
+workspace_tools_path = project_root / "src" / "agent" / "tools" / "workspace_tools.py"
+workspace_tools_module = _import_module_directly(workspace_tools_path, "src.agent.tools.workspace_tools")
 create_workspace_tools = workspace_tools_module.create_workspace_tools
 WORKSPACE_TOOLS_METADATA = workspace_tools_module.WORKSPACE_TOOLS_METADATA
 
 # Create a fake package for the tools module to enable relative imports
-tools_package = ModuleType("src.agents.tools")
+tools_package = ModuleType("src.agent.tools")
 tools_package.context = context_module
 tools_package.pdf_utils = pdf_utils_module
 tools_package.workspace_tools = workspace_tools_module
 tools_package.ToolContext = ToolContext
 tools_package.create_workspace_tools = workspace_tools_module.create_workspace_tools
 tools_package.WORKSPACE_TOOLS_METADATA = workspace_tools_module.WORKSPACE_TOOLS_METADATA
-sys.modules["src.agents.tools"] = tools_package
+sys.modules["src.agent.tools"] = tools_package
 
 # Import todo_tools (needed by registry)
-todo_tools_path = project_root / "src" / "agents" / "tools" / "todo_tools.py"
-todo_tools_module = _import_module_directly(todo_tools_path, "src.agents.tools.todo_tools")
+todo_tools_path = project_root / "src" / "agent" / "tools" / "todo_tools.py"
+todo_tools_module = _import_module_directly(todo_tools_path, "src.agent.tools.todo_tools")
 
 # Update fake package with todo_tools
 tools_package.todo_tools = todo_tools_module
@@ -69,42 +69,42 @@ tools_package.create_todo_tools = todo_tools_module.create_todo_tools
 tools_package.TODO_TOOLS_METADATA = todo_tools_module.TODO_TOOLS_METADATA
 
 # Import domain tools (needed by registry)
-document_tools_path = project_root / "src" / "agents" / "tools" / "document_tools.py"
-document_tools_module = _import_module_directly(document_tools_path, "src.agents.tools.document_tools")
+document_tools_path = project_root / "src" / "agent" / "tools" / "document_tools.py"
+document_tools_module = _import_module_directly(document_tools_path, "src.agent.tools.document_tools")
 tools_package.document_tools = document_tools_module
 
-search_tools_path = project_root / "src" / "agents" / "tools" / "search_tools.py"
-search_tools_module = _import_module_directly(search_tools_path, "src.agents.tools.search_tools")
+search_tools_path = project_root / "src" / "agent" / "tools" / "search_tools.py"
+search_tools_module = _import_module_directly(search_tools_path, "src.agent.tools.search_tools")
 tools_package.search_tools = search_tools_module
 
-citation_tools_path = project_root / "src" / "agents" / "tools" / "citation_tools.py"
-citation_tools_module = _import_module_directly(citation_tools_path, "src.agents.tools.citation_tools")
+citation_tools_path = project_root / "src" / "agent" / "tools" / "citation_tools.py"
+citation_tools_module = _import_module_directly(citation_tools_path, "src.agent.tools.citation_tools")
 tools_package.citation_tools = citation_tools_module
 
-cache_tools_path = project_root / "src" / "agents" / "tools" / "cache_tools.py"
-cache_tools_module = _import_module_directly(cache_tools_path, "src.agents.tools.cache_tools")
+cache_tools_path = project_root / "src" / "agent" / "tools" / "cache_tools.py"
+cache_tools_module = _import_module_directly(cache_tools_path, "src.agent.tools.cache_tools")
 tools_package.cache_tools = cache_tools_module
 
-graph_tools_path = project_root / "src" / "agents" / "tools" / "graph_tools.py"
-graph_tools_module = _import_module_directly(graph_tools_path, "src.agents.tools.graph_tools")
+graph_tools_path = project_root / "src" / "agent" / "tools" / "graph_tools.py"
+graph_tools_module = _import_module_directly(graph_tools_path, "src.agent.tools.graph_tools")
 tools_package.graph_tools = graph_tools_module
 
 # Import vector tools (Phase 8) - optional, may not exist yet
-vector_tools_path = project_root / "src" / "agents" / "tools" / "vector_tools.py"
+vector_tools_path = project_root / "src" / "agent" / "tools" / "vector_tools.py"
 if vector_tools_path.exists():
-    vector_tools_module = _import_module_directly(vector_tools_path, "src.agents.tools.vector_tools")
+    vector_tools_module = _import_module_directly(vector_tools_path, "src.agent.tools.vector_tools")
     tools_package.vector_tools = vector_tools_module
     tools_package.create_vector_tools = vector_tools_module.create_vector_tools
     tools_package.VECTOR_TOOLS_METADATA = vector_tools_module.VECTOR_TOOLS_METADATA
 
 # Import completion tools (needed by registry)
-completion_tools_path = project_root / "src" / "agents" / "tools" / "completion_tools.py"
-completion_tools_module = _import_module_directly(completion_tools_path, "src.agents.tools.completion_tools")
+completion_tools_path = project_root / "src" / "agent" / "tools" / "completion_tools.py"
+completion_tools_module = _import_module_directly(completion_tools_path, "src.agent.tools.completion_tools")
 tools_package.completion_tools = completion_tools_module
 
 # Now import registry
-registry_path = project_root / "src" / "agents" / "tools" / "registry.py"
-registry_module = _import_module_directly(registry_path, "src.agents.tools.registry")
+registry_path = project_root / "src" / "agent" / "tools" / "registry.py"
+registry_module = _import_module_directly(registry_path, "src.agent.tools.registry")
 TOOL_REGISTRY = registry_module.TOOL_REGISTRY
 load_tools = registry_module.load_tools
 get_available_tools = registry_module.get_available_tools
@@ -409,7 +409,8 @@ class TestFileExistsTool:
     def test_exists_directory(self, workspace_tools):
         """Test checking existing directory."""
         exists_tool = next(t for t in workspace_tools if t.name == "file_exists")
-        result = exists_tool.invoke({"path": "plans"})
+        # Use a directory from the default workspace config
+        result = exists_tool.invoke({"path": "archive"})
 
         assert "Exists (directory)" in result
 
@@ -426,14 +427,15 @@ class TestGetWorkspaceSummaryTool:
 
     def test_summary(self, workspace_tools, workspace_manager):
         """Test getting workspace summary."""
-        workspace_manager.write_file("plans/plan.md", "content")
-        workspace_manager.write_file("notes/note.md", "content")
+        # Use directories that exist in the default workspace config
+        workspace_manager.write_file("documents/doc.pdf", "content")
+        workspace_manager.write_file("archive/old.md", "content")
 
         summary_tool = next(t for t in workspace_tools if t.name == "get_workspace_summary")
         result = summary_tool.invoke({})
 
         assert "test-job-123" in result
-        assert "plans/" in result or "plans" in result
+        assert "documents/" in result or "archive/" in result
 
 
 class TestToolRegistry:
@@ -544,3 +546,212 @@ class TestToolMetadata:
             assert "description" in meta
             assert "category" in meta
             assert meta["category"] == "workspace"
+
+
+class TestAddAccomplishmentTool:
+    """Tests for add_accomplishment tool."""
+
+    def test_add_accomplishment_creates_file(self, workspace_tools, workspace_manager):
+        """Test that add_accomplishment creates accomplishments.md."""
+        tool = next(t for t in workspace_tools if t.name == "add_accomplishment")
+        result = tool.invoke({"accomplishment": "Completed initial analysis"})
+
+        assert "Recorded" in result
+        assert workspace_manager.exists("accomplishments.md")
+
+    def test_add_accomplishment_appends(self, workspace_tools, workspace_manager):
+        """Test that add_accomplishment appends to existing file."""
+        tool = next(t for t in workspace_tools if t.name == "add_accomplishment")
+
+        tool.invoke({"accomplishment": "First accomplishment"})
+        tool.invoke({"accomplishment": "Second accomplishment"})
+
+        content = workspace_manager.read_file("accomplishments.md")
+        assert "First accomplishment" in content
+        assert "Second accomplishment" in content
+
+    def test_add_accomplishment_strips_bullet(self, workspace_tools, workspace_manager):
+        """Test that leading bullets are stripped."""
+        tool = next(t for t in workspace_tools if t.name == "add_accomplishment")
+        tool.invoke({"accomplishment": "- Already has bullet"})
+
+        content = workspace_manager.read_file("accomplishments.md")
+        # Should not have double bullet
+        assert "- - Already" not in content
+        assert "- Already has bullet" in content
+
+    def test_add_accomplishment_empty_error(self, workspace_tools):
+        """Test that empty accomplishment returns error."""
+        tool = next(t for t in workspace_tools if t.name == "add_accomplishment")
+        result = tool.invoke({"accomplishment": ""})
+
+        assert "Error" in result
+
+
+class TestAddNoteTool:
+    """Tests for add_note tool."""
+
+    def test_add_note_creates_file(self, workspace_tools, workspace_manager):
+        """Test that add_note creates notes.md."""
+        tool = next(t for t in workspace_tools if t.name == "add_note")
+        result = tool.invoke({"note": "Found unexpected formatting"})
+
+        assert "Noted" in result
+        assert workspace_manager.exists("notes.md")
+
+    def test_add_note_includes_timestamp(self, workspace_tools, workspace_manager):
+        """Test that notes include timestamps."""
+        tool = next(t for t in workspace_tools if t.name == "add_note")
+        tool.invoke({"note": "Important observation"})
+
+        content = workspace_manager.read_file("notes.md")
+        # Should have timestamp like [HH:MM]
+        assert "[" in content
+        assert "]" in content
+        assert "Important observation" in content
+
+    def test_add_note_empty_error(self, workspace_tools):
+        """Test that empty note returns error."""
+        tool = next(t for t in workspace_tools if t.name == "add_note")
+        result = tool.invoke({"note": "  "})
+
+        assert "Error" in result
+
+
+class TestGenerateWorkspaceSummaryTool:
+    """Tests for generate_workspace_summary tool."""
+
+    def test_generate_creates_file(self, workspace_tools, workspace_manager):
+        """Test that generate_workspace_summary creates workspace_summary.md."""
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        result = tool.invoke({})
+
+        assert "Generated" in result
+        assert workspace_manager.exists("workspace_summary.md")
+
+    def test_generate_includes_header(self, workspace_tools, workspace_manager):
+        """Test that summary includes header with timestamp."""
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "# Workspace Summary" in content
+        assert "Generated:" in content
+
+    def test_generate_lists_files(self, workspace_tools, workspace_manager):
+        """Test that summary lists workspace files."""
+        workspace_manager.write_file("main_plan.md", "# Plan")
+        workspace_manager.write_file("research.md", "# Research")
+
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Files" in content
+        assert "main_plan.md" in content
+        assert "Execution plan" in content  # Purpose from heuristics
+
+    def test_generate_includes_accomplishments(self, workspace_tools, workspace_manager):
+        """Test that summary includes accomplishments."""
+        # Add some accomplishments first
+        workspace_manager.write_file("accomplishments.md", "- First milestone\n- Second milestone\n")
+
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Accomplishments" in content
+        assert "First milestone" in content
+
+    def test_generate_includes_notes(self, workspace_tools, workspace_manager):
+        """Test that summary includes notes."""
+        workspace_manager.write_file("notes.md", "- Important note\n- Another note\n")
+
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Notes" in content
+        assert "Important note" in content
+
+    def test_generate_confirmation_message(self, workspace_tools, workspace_manager):
+        """Test that tool returns confirmation with stats."""
+        workspace_manager.write_file("file1.md", "content")
+        workspace_manager.write_file("file2.md", "content")
+
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        result = tool.invoke({})
+
+        assert "Generated workspace_summary.md" in result
+        assert "files documented" in result
+
+    def test_generate_handles_empty_workspace(self, workspace_tools, workspace_manager):
+        """Test that summary handles empty workspace gracefully."""
+        tool = next(t for t in workspace_tools if t.name == "generate_workspace_summary")
+        result = tool.invoke({})
+
+        # Should not error
+        assert "Generated" in result
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Accomplishments" in content
+        assert "(No accomplishments recorded yet)" in content
+
+
+class TestGenerateWorkspaceSummaryWithTodoContext:
+    """Tests for generate_workspace_summary with todo manager context."""
+
+    @pytest.fixture
+    def todo_manager(self):
+        """Create a TodoManager for testing."""
+        # Import TodoManager
+        todo_manager_path = project_root / "src" / "agent" / "todo_manager.py"
+        todo_manager_module = _import_module_directly(todo_manager_path, "src.agent.todo_manager")
+        TodoManager = todo_manager_module.TodoManager
+        return TodoManager()
+
+    @pytest.fixture
+    def full_tool_context(self, workspace_manager, todo_manager):
+        """Create a ToolContext with both workspace and todo manager."""
+        return ToolContext(workspace_manager=workspace_manager, todo_manager=todo_manager)
+
+    @pytest.fixture
+    def full_workspace_tools(self, full_tool_context):
+        """Create workspace tools with full context."""
+        return create_workspace_tools(full_tool_context)
+
+    def test_generate_includes_phase_info(self, full_workspace_tools, workspace_manager, todo_manager):
+        """Test that summary includes phase information."""
+        todo_manager.set_phase_info(2, 5, "Document Analysis")
+
+        tool = next(t for t in full_workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Current State" in content
+        assert "Phase 2 of 5" in content
+        assert "Document Analysis" in content
+
+    def test_generate_includes_todo_progress(self, full_workspace_tools, workspace_manager, todo_manager):
+        """Test that summary includes todo progress."""
+        todo_manager.add_sync("Task 1", priority=1)
+        todo_manager.add_sync("Task 2", priority=1)
+        todo_manager.complete_sync("todo_1")
+
+        tool = next(t for t in full_workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Current State" in content
+        assert "1 of 2" in content or "50.0%" in content
+
+    def test_generate_includes_completed_todos_as_accomplishments(self, full_workspace_tools, workspace_manager, todo_manager):
+        """Test that completed todos appear as accomplishments."""
+        todo_manager.add_sync("Extract requirements", priority=1)
+        todo_manager.complete_sync("todo_1")
+
+        tool = next(t for t in full_workspace_tools if t.name == "generate_workspace_summary")
+        tool.invoke({})
+
+        content = workspace_manager.read_file("workspace_summary.md")
+        assert "## Accomplishments" in content
+        assert "Extract requirements" in content

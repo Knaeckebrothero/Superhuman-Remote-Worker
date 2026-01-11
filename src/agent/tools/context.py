@@ -188,3 +188,79 @@ class ToolContext:
             self.citation_engine.close()
             self.citation_engine = None
             self._source_registry.clear()
+
+    def update_job_status(
+        self,
+        status: str,
+        completed_at: bool = False,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        """Update job status in PostgreSQL.
+
+        This method updates the jobs table with the new status and optionally
+        sets the completed_at timestamp.
+
+        Args:
+            status: New status value (e.g., 'completed', 'failed')
+            completed_at: Whether to set completed_at to now()
+            error_message: Optional error message for failed status
+
+        Returns:
+            True if update was successful, False otherwise
+
+        Raises:
+            ValueError: If no job_id is available
+        """
+        if not self.job_id:
+            raise ValueError("No job_id available for status update")
+
+        if not self.has_postgres():
+            return False
+
+        try:
+            import logging
+            logger = logging.getLogger(__name__)
+
+            cursor = self.postgres_conn.cursor()
+
+            # Build the update query
+            if completed_at:
+                if error_message:
+                    cursor.execute(
+                        """
+                        UPDATE jobs
+                        SET status = %s, completed_at = NOW(), error_message = %s
+                        WHERE id = %s
+                        """,
+                        (status, error_message, self.job_id),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE jobs
+                        SET status = %s, completed_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (status, self.job_id),
+                    )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE jobs
+                    SET status = %s
+                    WHERE id = %s
+                    """,
+                    (status, self.job_id),
+                )
+
+            self.postgres_conn.commit()
+            cursor.close()
+
+            logger.info(f"Updated job {self.job_id} status to '{status}'")
+            return True
+
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Failed to update job status: {e}")
+            return False

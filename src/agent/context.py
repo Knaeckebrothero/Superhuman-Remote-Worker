@@ -30,6 +30,28 @@ from langchain_core.messages import (
 
 logger = logging.getLogger(__name__)
 
+# Layer 2 content markers for identification
+LAYER2_START_MARKER = "═" * 67  # Visual separator for Layer 2 todo display
+LAYER2_TITLE = "ACTIVE TODO LIST"
+
+
+def is_layer2_message(message: BaseMessage) -> bool:
+    """Check if a message is a Layer 2 protected context message.
+
+    Layer 2 messages contain the active todo list with visual separators.
+    These should never be trimmed or summarized.
+
+    Args:
+        message: Message to check
+
+    Returns:
+        True if this is a Layer 2 todo list message
+    """
+    if not isinstance(message, SystemMessage):
+        return False
+    content = message.content if isinstance(message.content, str) else ""
+    return LAYER2_START_MARKER in content and LAYER2_TITLE in content
+
 
 # Try to import tiktoken for accurate token counting
 try:
@@ -129,25 +151,11 @@ class ProtectedContextProvider:
                 # Plan file may not exist yet - that's OK
                 logger.debug(f"Could not read plan file: {e}")
 
-        # Get current todos
+        # Get Layer 2 todo display (visual format for agent focus)
         if self.config.include_todos and self.todo_manager:
-            try:
-                todos = self.todo_manager.list_all_sync()
-                if todos:
-                    todo_lines = []
-                    for t in todos:
-                        status_marker = {
-                            "pending": "[ ]",
-                            "in_progress": "[>]",
-                            "completed": "[x]",
-                            "blocked": "[!]",
-                            "skipped": "[-]",
-                        }.get(t.status.value, "[ ]")
-                        todo_lines.append(f"- {status_marker} {t.content}")
-                    # Limit to 15 most recent todos to keep context reasonable
-                    parts.append(f"\n## Active Todos\n" + "\n".join(todo_lines[:15]))
-            except Exception as e:
-                logger.debug(f"Could not get todos: {e}")
+            layer2_todos = self.get_layer2_todo_display()
+            if layer2_todos:
+                parts.append(f"\n{layer2_todos}")
 
         parts.append("\n[END PROTECTED CONTEXT]")
 
@@ -155,6 +163,134 @@ class ProtectedContextProvider:
         if len(parts) > 2:
             return "\n".join(parts)
         return None
+
+    def get_layer2_todo_display(self) -> Optional[str]:
+        """Generate the Layer 2 todo list display with visual separators.
+
+        Produces a visually distinct todo list format that helps the LLM
+        focus on the current task. Format follows the guardrails spec:
+
+        ═══════════════════════════════════════════════════════════════════
+                                 ACTIVE TODO LIST
+        ═══════════════════════════════════════════════════════════════════
+
+        Phase: Requirement Extraction (2 of 4)
+
+        [x] 1. Process section 1-3
+        [x] 2. Process section 4-6
+        [ ] 3. Consolidate findings      ← CURRENT
+        [ ] 4. Write extraction_results.md
+        [ ] 5. Validate format
+
+        Progress: 2/5 tasks complete
+
+        ───────────────────────────────────────────────────────────────────
+        INSTRUCTION: Complete task 3, then call todo_complete()
+        ═══════════════════════════════════════════════════════════════════
+
+        Returns:
+            Formatted Layer 2 string, or None if no todos
+        """
+        if not self.todo_manager:
+            return None
+
+        try:
+            todos = self.todo_manager.list_all_sync()
+            if not todos:
+                return None
+
+            # Visual separators (use module constants for consistency)
+            thick_sep = LAYER2_START_MARKER
+            thin_sep = "─" * 67
+
+            # Get phase info
+            phase_info = self.todo_manager.get_phase_info()
+            phase_number = phase_info.get("phase_number", 0)
+            total_phases = phase_info.get("total_phases", 0)
+            phase_name = phase_info.get("phase_name", "")
+
+            # Build phase indicator line
+            if phase_number > 0:
+                if phase_name:
+                    phase_line = f"Phase: {phase_name}"
+                else:
+                    phase_line = f"Phase: {phase_number}"
+                if total_phases > 0:
+                    phase_line += f" ({phase_number} of {total_phases})"
+            else:
+                phase_line = "Phase: Bootstrap" if not phase_name else f"Phase: {phase_name}"
+
+            # Build todo lines with numbering
+            todo_lines = []
+            current_task_num = None
+            current_task_content = None
+
+            for idx, t in enumerate(todos[:15], start=1):  # Limit to 15 tasks
+                status_marker = {
+                    "pending": "[ ]",
+                    "in_progress": "[>]",
+                    "completed": "[x]",
+                    "blocked": "[!]",
+                    "skipped": "[-]",
+                }.get(t.status.value, "[ ]")
+
+                # Mark the current task (first in-progress or first pending)
+                is_current = False
+                if current_task_num is None:
+                    if t.status.value == "in_progress":
+                        is_current = True
+                        current_task_num = idx
+                        current_task_content = t.content
+                    elif t.status.value == "pending" and current_task_num is None:
+                        # First pending task is current if no in-progress
+                        is_current = True
+                        current_task_num = idx
+                        current_task_content = t.content
+
+                line = f"{status_marker} {idx}. {t.content}"
+                if is_current:
+                    line += "      ← CURRENT"
+                todo_lines.append(line)
+
+            # Progress stats
+            total = len(todos)
+            completed = len([t for t in todos if t.status.value == "completed"])
+            progress_line = f"Progress: {completed}/{total} tasks complete"
+
+            # Instruction line
+            if current_task_num and current_task_content:
+                # Truncate long task content for instruction
+                task_preview = current_task_content[:40]
+                if len(current_task_content) > 40:
+                    task_preview += "..."
+                instruction = f"INSTRUCTION: Complete task {current_task_num} ({task_preview}), then call todo_complete()"
+            else:
+                instruction = "INSTRUCTION: All tasks complete. Call job_complete() or start next phase."
+
+            # Assemble the display
+            lines = [
+                thick_sep,
+                f"                         {LAYER2_TITLE}",
+                thick_sep,
+                "",
+                phase_line,
+                "",
+            ]
+            lines.extend(todo_lines)
+            lines.extend([
+                "",
+                progress_line,
+                "",
+                thin_sep,
+                instruction,
+                thick_sep,
+            ])
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.debug(f"Could not generate Layer 2 todo display: {e}")
+            return None
 
 
 def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
@@ -491,10 +627,15 @@ class ContextManager:
     ) -> List[BaseMessage]:
         """Trim messages to keep only recent ones.
 
-        Preserves:
-        - All system messages
+        Preserves (never trimmed - implements Layers 1-3 protection):
+        - All system messages (Layer 1: system prompt, Layer 2: todo list)
         - The first human message (original task)
         - Recent conversation messages
+
+        Note: Layer 2 (todo list with visual separators) is injected fresh
+        AFTER this method is called in graph.py, so it's never subject to
+        trimming anyway. This method preserves any SystemMessages that might
+        be in the message history.
 
         Args:
             messages: Message list to trim

@@ -9,6 +9,8 @@ attempts (e.g., '../') are blocked by the underlying WorkspaceManager.
 """
 
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
 
 from langchain_core.tools import tool
@@ -17,6 +19,57 @@ from .context import ToolContext
 from .pdf_utils import PDFReader, format_document_info, format_read_info
 
 logger = logging.getLogger(__name__)
+
+
+# File purpose heuristics for workspace_summary.md
+FILE_PURPOSE_MAP = {
+    "main_plan.md": "Execution plan",
+    "instructions.md": "Task instructions",
+    "workspace_summary.md": "Workspace state snapshot",
+    "accomplishments.md": "Completed milestones",
+    "notes.md": "Working notes",
+    "research.md": "Research findings",
+    "document_analysis.md": "Document analysis",
+    "extraction_results.md": "Extraction results",
+}
+
+
+def _infer_file_purpose(filename: str) -> str:
+    """Infer the purpose of a file from its name.
+
+    Args:
+        filename: Name of the file
+
+    Returns:
+        Inferred purpose string
+    """
+    # Check direct mapping
+    if filename in FILE_PURPOSE_MAP:
+        return FILE_PURPOSE_MAP[filename]
+
+    # Pattern-based inference
+    lower = filename.lower()
+
+    if "chunk" in lower:
+        return "Document chunk"
+    if "candidate" in lower:
+        return "Requirement candidate"
+    if "requirement" in lower:
+        return "Requirements"
+    if "output" in lower or "result" in lower:
+        return "Output data"
+    if "config" in lower:
+        return "Configuration"
+    if "log" in lower:
+        return "Log file"
+    if lower.endswith(".pdf"):
+        return "Source document"
+    if lower.endswith(".json"):
+        return "Structured data"
+    if lower.endswith(".md"):
+        return "Documentation"
+
+    return "Working file"
 
 
 def create_workspace_tools(context: ToolContext) -> List:
@@ -493,6 +546,317 @@ def create_workspace_tools(context: ToolContext) -> List:
             logger.error(f"get_document_info error for {path}: {e}")
             return f"Error: {str(e)}"
 
+    @tool
+    def add_accomplishment(accomplishment: str) -> str:
+        """Record an accomplishment to the accomplishments log.
+
+        Use this tool to track significant milestones and completed work.
+        Accomplishments are displayed in the workspace_summary.md and serve
+        as a high-level record of what has been achieved.
+
+        Good accomplishments are:
+        - Specific and measurable (e.g., "Extracted 23 requirements from sections 1-6")
+        - Milestone-focused (e.g., "Completed document analysis phase")
+        - Meaningful progress indicators (e.g., "Validated all high-priority requirements")
+
+        Args:
+            accomplishment: Description of the accomplishment (without leading "- ")
+
+        Returns:
+            Confirmation message
+
+        Example:
+            add_accomplishment("Extracted 47 requirements from GoBD document")
+            add_accomplishment("Completed Phase 1: Document Analysis")
+        """
+        try:
+            if not accomplishment or not accomplishment.strip():
+                return "Error: accomplishment cannot be empty"
+
+            # Normalize the accomplishment text
+            text = accomplishment.strip()
+
+            # Remove leading bullet if present
+            if text.startswith("- ") or text.startswith("* "):
+                text = text[2:]
+
+            # Format as bullet point
+            line = f"- {text}\n"
+
+            # Append to accomplishments.md (creates if doesn't exist)
+            workspace.append_file("accomplishments.md", line)
+
+            return f"Recorded: {text}"
+
+        except Exception as e:
+            logger.error(f"add_accomplishment error: {e}")
+            return f"Error recording accomplishment: {str(e)}"
+
+    @tool
+    def add_note(note: str) -> str:
+        """Add a note to the working notes log.
+
+        Use this tool to record observations, issues, or information that
+        might be useful later. Notes are displayed in workspace_summary.md.
+
+        Args:
+            note: The note to record (without leading "- ")
+
+        Returns:
+            Confirmation message
+
+        Example:
+            add_note("Document uses non-standard formatting in section 4")
+            add_note("Some requirements span multiple pages")
+        """
+        try:
+            if not note or not note.strip():
+                return "Error: note cannot be empty"
+
+            # Normalize the note text
+            text = note.strip()
+
+            # Remove leading bullet if present
+            if text.startswith("- ") or text.startswith("* "):
+                text = text[2:]
+
+            # Format as bullet point with timestamp
+            timestamp = datetime.now(timezone.utc).strftime("%H:%M")
+            line = f"- [{timestamp}] {text}\n"
+
+            # Append to notes.md (creates if doesn't exist)
+            workspace.append_file("notes.md", line)
+
+            return f"Noted: {text}"
+
+        except Exception as e:
+            logger.error(f"add_note error: {e}")
+            return f"Error adding note: {str(e)}"
+
+    @tool
+    def generate_workspace_summary() -> str:
+        """Generate a comprehensive workspace summary and save it to workspace_summary.md.
+
+        This tool creates a snapshot of the current workspace state, including:
+        - All files with their purposes and last modified times
+        - Accomplishments (read from accomplishments.md if present)
+        - Current state (phase info and todo progress from todo_manager)
+        - Notes (read from notes.md if present)
+
+        The generated summary is written to workspace_summary.md and serves as
+        the agent's "memory" of what has been done. This is essential for:
+        - Phase transitions (re-orienting after context compaction)
+        - Bootstrap process (understanding initial workspace state)
+        - Recovery after todo_rewind
+
+        Returns:
+            Confirmation message with summary highlights
+
+        Example output file (workspace_summary.md):
+            # Workspace Summary
+
+            Generated: 2024-01-15 14:32:00
+
+            ## Files
+            | File | Purpose | Last Modified |
+            |------|---------|---------------|
+            | main_plan.md | Execution plan | 14:30 |
+            | instructions.md | Task instructions | 14:00 |
+
+            ## Accomplishments
+            - Completed document analysis
+            - Extracted 23 requirements
+
+            ## Current State
+            - Working on Phase 2: Requirement Extraction
+            - 2 of 5 tasks complete in current phase
+
+            ## Notes
+            - Document uses non-standard formatting
+        """
+        try:
+            lines = []
+            now = datetime.now(timezone.utc)
+
+            # Header
+            lines.append("# Workspace Summary")
+            lines.append("")
+            lines.append(f"Generated: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+            lines.append("")
+
+            # Files section
+            lines.append("## Files")
+            lines.append("")
+            lines.append("| File | Purpose | Last Modified |")
+            lines.append("|------|---------|---------------|")
+
+            # Get all files in workspace (not in archive or chunks subdirs for brevity)
+            file_entries = []
+            workspace_path = workspace.get_path("")
+
+            # Collect files from root and key directories
+            for item in workspace_path.iterdir():
+                if item.is_file():
+                    # Root level files
+                    purpose = _infer_file_purpose(item.name)
+                    mtime = datetime.fromtimestamp(item.stat().st_mtime)
+                    file_entries.append((item.name, purpose, mtime))
+                elif item.is_dir() and item.name in ("documents", "output"):
+                    # Include files from key directories
+                    for subitem in item.iterdir():
+                        if subitem.is_file():
+                            rel_path = f"{item.name}/{subitem.name}"
+                            purpose = _infer_file_purpose(subitem.name)
+                            mtime = datetime.fromtimestamp(subitem.stat().st_mtime)
+                            file_entries.append((rel_path, purpose, mtime))
+
+            # Sort by modification time (most recent first)
+            file_entries.sort(key=lambda x: x[2], reverse=True)
+
+            # Format file table (limit to 15 most recent)
+            for filename, purpose, mtime in file_entries[:15]:
+                time_str = mtime.strftime("%H:%M")
+                lines.append(f"| {filename} | {purpose} | {time_str} |")
+
+            if len(file_entries) > 15:
+                lines.append(f"| ... | ({len(file_entries) - 15} more files) | |")
+
+            lines.append("")
+
+            # Accomplishments section
+            lines.append("## Accomplishments")
+            lines.append("")
+
+            accomplishments = []
+
+            # Read from accomplishments.md if it exists
+            if workspace.exists("accomplishments.md"):
+                try:
+                    content = workspace.read_file("accomplishments.md")
+                    # Extract bullet points
+                    for line in content.split("\n"):
+                        stripped = line.strip()
+                        if stripped.startswith("- ") or stripped.startswith("* "):
+                            accomplishments.append(stripped)
+                except Exception:
+                    pass
+
+            # Also check for completed todos if todo_manager is available
+            if context.has_todo():
+                todo_mgr = context.todo_manager
+                completed = [t for t in todo_mgr._todos if t.status.value == "completed"]
+                # Add recent completed tasks as accomplishments
+                for todo in completed[-5:]:  # Last 5 completed
+                    acc_line = f"- Completed: {todo.content}"
+                    if acc_line not in accomplishments:
+                        accomplishments.append(acc_line)
+
+            if accomplishments:
+                for acc in accomplishments[:10]:  # Limit to 10
+                    lines.append(acc)
+            else:
+                lines.append("- (No accomplishments recorded yet)")
+
+            lines.append("")
+
+            # Current State section
+            lines.append("## Current State")
+            lines.append("")
+
+            if context.has_todo():
+                todo_mgr = context.todo_manager
+                phase_info = todo_mgr.get_phase_info()
+                progress = todo_mgr.get_progress_sync()
+
+                # Phase indicator
+                if phase_info["phase_number"] > 0:
+                    if phase_info["total_phases"] > 0:
+                        phase_str = f"Phase {phase_info['phase_number']} of {phase_info['total_phases']}"
+                    else:
+                        phase_str = f"Phase {phase_info['phase_number']}"
+                    if phase_info["phase_name"]:
+                        phase_str += f": {phase_info['phase_name']}"
+                    lines.append(f"- Working on {phase_str}")
+                else:
+                    lines.append("- Phase: Bootstrap/Initialization")
+
+                # Progress
+                if progress["total"] > 0:
+                    lines.append(
+                        f"- {progress['completed']} of {progress['total']} tasks complete "
+                        f"in current phase ({progress['completion_percentage']}%)"
+                    )
+
+                    # Current task
+                    in_progress = [t for t in todo_mgr._todos if t.status.value == "in_progress"]
+                    if in_progress:
+                        lines.append(f"- Currently working on: {in_progress[0].content}")
+
+                    # Blocking issues
+                    blocked = progress.get("blocked", 0)
+                    if blocked > 0:
+                        lines.append(f"- {blocked} task(s) blocked")
+                    else:
+                        lines.append("- No blocking issues")
+                else:
+                    lines.append("- No active tasks")
+            else:
+                lines.append("- Todo tracking not available")
+
+            lines.append("")
+
+            # Notes section
+            lines.append("## Notes")
+            lines.append("")
+
+            notes = []
+
+            # Read from notes.md if it exists
+            if workspace.exists("notes.md"):
+                try:
+                    content = workspace.read_file("notes.md")
+                    # Extract bullet points or recent lines
+                    for line in content.split("\n"):
+                        stripped = line.strip()
+                        if stripped.startswith("- ") or stripped.startswith("* "):
+                            notes.append(stripped)
+                except Exception:
+                    pass
+
+            if notes:
+                for note in notes[-5:]:  # Last 5 notes
+                    lines.append(note)
+            else:
+                lines.append("- (No notes recorded)")
+
+            lines.append("")
+
+            # Write to file
+            summary_content = "\n".join(lines)
+            workspace.write_file("workspace_summary.md", summary_content)
+
+            # Build confirmation message
+            file_count = len(file_entries)
+            acc_count = len(accomplishments)
+
+            confirmation_lines = [
+                f"Generated workspace_summary.md",
+                f"- {file_count} files documented",
+                f"- {acc_count} accomplishments recorded",
+            ]
+
+            if context.has_todo():
+                progress = context.todo_manager.get_progress_sync()
+                confirmation_lines.append(
+                    f"- Current progress: {progress['completed']}/{progress['total']} tasks"
+                )
+
+            return "\n".join(confirmation_lines)
+
+        except Exception as e:
+            logger.error(f"generate_workspace_summary error: {e}")
+            return f"Error generating workspace summary: {str(e)}"
+
     # Return all workspace tools
     return [
         read_file,
@@ -504,6 +868,9 @@ def create_workspace_tools(context: ToolContext) -> List:
         file_exists,
         get_workspace_summary,
         get_document_info,
+        add_accomplishment,
+        add_note,
+        generate_workspace_summary,
     ]
 
 
@@ -564,5 +931,23 @@ WORKSPACE_TOOLS_METADATA = {
         "category": "workspace",
         "defer_to_workspace": True,
         "short_description": "Get PDF/document metadata (pages, size) for planning access.",
+    },
+    "add_accomplishment": {
+        "module": "workspace_tools",
+        "function": "add_accomplishment",
+        "description": "Record an accomplishment milestone to accomplishments.md",
+        "category": "workspace",
+    },
+    "add_note": {
+        "module": "workspace_tools",
+        "function": "add_note",
+        "description": "Add a working note to notes.md",
+        "category": "workspace",
+    },
+    "generate_workspace_summary": {
+        "module": "workspace_tools",
+        "function": "generate_workspace_summary",
+        "description": "Generate workspace_summary.md with files, accomplishments, and current state",
+        "category": "workspace",
     },
 }

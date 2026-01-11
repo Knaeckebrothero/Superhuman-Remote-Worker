@@ -28,6 +28,10 @@ Usage:
 
     # Show only tool calls
     python src/scripts/view_llm_conversation.py --job-id <uuid> --tools-only
+
+    # Export single LLM request as HTML (messenger-style visualization)
+    python src/scripts/view_llm_conversation.py --doc-id <mongodb_objectid>
+    python src/scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --html output.html
 """
 
 import argparse
@@ -284,6 +288,298 @@ def export_conversation(job_id, output_path):
         json.dump(records, f, indent=2, default=serialize)
 
     print(f"Exported {len(records)} records to {output_path}")
+    client.close()
+
+
+def export_html_conversation(doc_id: str, output_path: str = None) -> None:
+    """Export a single LLM request document as HTML messenger view.
+
+    Args:
+        doc_id: MongoDB document _id (ObjectId string)
+        output_path: Output HTML file path (default: conversation_<id>.html)
+    """
+    from bson import ObjectId
+    import html as html_lib
+
+    client, db_name = get_mongodb_client()
+    db = client[db_name]
+    collection = db["llm_requests"]
+
+    # Query by ObjectId
+    try:
+        oid = ObjectId(doc_id)
+    except Exception as e:
+        print(f"Invalid ObjectId: {doc_id}")
+        print(f"Error: {e}")
+        return
+
+    record = collection.find_one({"_id": oid})
+
+    if not record:
+        print(f"No document found with _id: {doc_id}")
+        client.close()
+        return
+
+    # Extract data
+    request = record.get("request", {})
+    messages = request.get("messages", [])
+    response = record.get("response", {})
+
+    # Metadata
+    job_id = record.get("job_id", "unknown")
+    agent_type = record.get("agent_type", "unknown")
+    model = record.get("model", "unknown")
+    timestamp = format_timestamp(record.get("timestamp"))
+    iteration = record.get("iteration", "?")
+    latency = record.get("latency_ms", "?")
+
+    # HTML template
+    html_template = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Conversation - {doc_id}</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+            line-height: 1.5;
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 2px solid #ddd;
+            padding-bottom: 10px;
+        }}
+        .metadata {{
+            background: #fff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            font-size: 0.9em;
+        }}
+        .metadata-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }}
+        .metadata-item {{
+            color: #666;
+        }}
+        .metadata-item strong {{
+            color: #333;
+        }}
+        .messages {{
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        .message {{
+            padding: 12px 16px;
+            border-radius: 18px;
+            max-width: 85%;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        }}
+        .role-label {{
+            font-size: 0.7em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+            opacity: 0.7;
+        }}
+        .content {{
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        .system {{
+            background: #e8e8e8;
+            align-self: center;
+            text-align: center;
+            font-style: italic;
+            color: #555;
+            max-width: 95%;
+        }}
+        .human {{
+            background: #dcf8c6;
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }}
+        .assistant {{
+            background: #e3f2fd;
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+        }}
+        .tool {{
+            background: #f3e5f5;
+            align-self: flex-start;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 0.85em;
+            border-bottom-left-radius: 4px;
+        }}
+        .tool-calls {{
+            background: #fff3e0;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 0.85em;
+        }}
+        .tool-call {{
+            margin-bottom: 8px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #ffcc80;
+        }}
+        .tool-call:last-child {{
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }}
+        .tool-name {{
+            font-weight: 600;
+            color: #e65100;
+        }}
+        .tool-args {{
+            margin-top: 4px;
+            padding: 8px;
+            background: #fff8e1;
+            border-radius: 4px;
+            overflow-x: auto;
+        }}
+        pre {{
+            margin: 0;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        .response-section {{
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 2px dashed #ccc;
+        }}
+        .response-section h2 {{
+            color: #1976d2;
+            font-size: 1.1em;
+        }}
+        .message-count {{
+            color: #888;
+            font-size: 0.85em;
+            margin-bottom: 15px;
+        }}
+    </style>
+</head>
+<body>
+    <h1>LLM Conversation</h1>
+    <div class="metadata">
+        <div class="metadata-row">
+            <div class="metadata-item"><strong>Doc ID:</strong> {doc_id}</div>
+            <div class="metadata-item"><strong>Job:</strong> {job_id}</div>
+            <div class="metadata-item"><strong>Agent:</strong> {agent_type}</div>
+        </div>
+        <div class="metadata-row" style="margin-top: 8px;">
+            <div class="metadata-item"><strong>Model:</strong> {model}</div>
+            <div class="metadata-item"><strong>Iteration:</strong> {iteration}</div>
+            <div class="metadata-item"><strong>Latency:</strong> {latency}ms</div>
+            <div class="metadata-item"><strong>Time:</strong> {timestamp}</div>
+        </div>
+    </div>
+
+    <div class="message-count">{message_count} messages in request</div>
+    <div class="messages">
+{messages_html}
+    </div>
+
+    <div class="response-section">
+        <h2>LLM Response</h2>
+        <div class="messages">
+{response_html}
+        </div>
+    </div>
+</body>
+</html>'''
+
+    def escape(text):
+        """Escape HTML special characters."""
+        if text is None:
+            return ""
+        return html_lib.escape(str(text))
+
+    def render_tool_calls(tool_calls):
+        """Render tool calls as HTML."""
+        if not tool_calls:
+            return ""
+
+        html_parts = ['<div class="tool-calls">']
+        for tc in tool_calls:
+            name = escape(tc.get("name", "unknown"))
+            args = tc.get("args", {})
+            args_json = json.dumps(args, indent=2, default=str)
+
+            html_parts.append(f'''<div class="tool-call">
+    <span class="tool-name">{name}</span>
+    <div class="tool-args"><pre>{escape(args_json)}</pre></div>
+</div>''')
+        html_parts.append('</div>')
+        return '\n'.join(html_parts)
+
+    def render_message(msg, indent=8):
+        """Render a single message as HTML."""
+        role = msg.get("role", msg.get("type", "unknown")).lower()
+        content = msg.get("content", "")
+        tool_calls = msg.get("tool_calls", [])
+
+        # Map role to CSS class
+        css_class = role if role in ("system", "human", "assistant", "tool") else "assistant"
+
+        # Build message HTML
+        prefix = " " * indent
+        parts = [f'{prefix}<div class="message {css_class}">']
+        parts.append(f'{prefix}    <div class="role-label">{escape(role)}</div>')
+        parts.append(f'{prefix}    <div class="content">{escape(content)}</div>')
+
+        if tool_calls:
+            tc_html = render_tool_calls(tool_calls)
+            parts.append(tc_html)
+
+        parts.append(f'{prefix}</div>')
+        return '\n'.join(parts)
+
+    # Render all messages
+    messages_html = '\n'.join(render_message(msg) for msg in messages)
+
+    # Render response
+    response_html = render_message(response) if response else '<div class="message assistant"><em>No response</em></div>'
+
+    # Fill template
+    html_content = html_template.format(
+        doc_id=escape(doc_id),
+        job_id=escape(job_id),
+        agent_type=escape(agent_type),
+        model=escape(model),
+        iteration=escape(str(iteration)),
+        latency=escape(str(latency)),
+        timestamp=escape(timestamp),
+        message_count=len(messages),
+        messages_html=messages_html,
+        response_html=response_html,
+    )
+
+    # Determine output path
+    if not output_path:
+        output_path = f"conversation_{doc_id}.html"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    print(f"Exported conversation to: {output_path}")
+    print(f"  Messages: {len(messages)}")
+    print(f"  Job: {job_id}")
+    print(f"  Model: {model}")
+
     client.close()
 
 
@@ -691,10 +987,23 @@ def main():
         help="Show audit trail as timeline visualization",
     )
 
+    # HTML export options
+    parser.add_argument(
+        "--doc-id", "-d",
+        help="MongoDB document _id to visualize as HTML",
+    )
+    parser.add_argument(
+        "--html", "-H",
+        help="Output HTML file path (use with --doc-id, default: conversation_<id>.html)",
+    )
+
     args = parser.parse_args()
 
     try:
-        if args.list:
+        if args.doc_id:
+            # HTML export of single document
+            export_html_conversation(args.doc_id, args.html)
+        elif args.list:
             list_jobs()
         elif args.recent > 0:
             view_recent(args.recent, args.agent_type)

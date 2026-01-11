@@ -5,6 +5,7 @@ token counting, and retry logic.
 """
 
 import asyncio
+import importlib.util
 import sys
 from datetime import datetime, UTC
 from pathlib import Path
@@ -15,7 +16,18 @@ import pytest
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+
+def _import_module_directly(module_path: Path, module_name: str):
+    """Import a module directly without triggering __init__.py side effects."""
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
 
 from langchain_core.messages import (
     AIMessage,
@@ -25,17 +37,31 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.agent.context_manager import (
-    ContextConfig,
-    ContextManager,
-    ContextManagementState,
-    ToolRetryManager,
-    count_tokens_approximate,
-    count_tokens_tiktoken,
-    get_token_counter,
-    write_error_to_workspace,
-    TIKTOKEN_AVAILABLE,
-)
+# Import context module directly to avoid neo4j import issues
+context_module_path = project_root / "src" / "agent" / "context.py"
+context_module = _import_module_directly(context_module_path, "src.agent.context_manager")
+
+ContextConfig = context_module.ContextConfig
+ContextManager = context_module.ContextManager
+ContextManagementState = context_module.ContextManagementState
+ToolRetryManager = context_module.ToolRetryManager
+count_tokens_approximate = context_module.count_tokens_approximate
+count_tokens_tiktoken = context_module.count_tokens_tiktoken
+get_token_counter = context_module.get_token_counter
+write_error_to_workspace = context_module.write_error_to_workspace
+TIKTOKEN_AVAILABLE = context_module.TIKTOKEN_AVAILABLE
+
+# Layer 2 exports
+LAYER2_START_MARKER = context_module.LAYER2_START_MARKER
+LAYER2_TITLE = context_module.LAYER2_TITLE
+is_layer2_message = context_module.is_layer2_message
+ProtectedContextConfig = context_module.ProtectedContextConfig
+ProtectedContextProvider = context_module.ProtectedContextProvider
+
+# Import todo_manager directly
+todo_manager_path = project_root / "src" / "agent" / "todo_manager.py"
+todo_manager_module = _import_module_directly(todo_manager_path, "src.agent.todo_manager")
+TodoManager = todo_manager_module.TodoManager
 
 
 class TestContextConfig:
@@ -596,7 +622,6 @@ class TestProtectedContextConfig:
 
     def test_default_values(self):
         """Test default configuration values."""
-        from src.agent.context_manager import ProtectedContextConfig
 
         config = ProtectedContextConfig()
         assert config.enabled is True
@@ -606,7 +631,6 @@ class TestProtectedContextConfig:
 
     def test_custom_values(self):
         """Test custom configuration values."""
-        from src.agent.context_manager import ProtectedContextConfig
 
         config = ProtectedContextConfig(
             enabled=False,
@@ -625,7 +649,6 @@ class TestProtectedContextProvider:
 
     def test_disabled_returns_none(self):
         """Test that disabled provider returns None."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         config = ProtectedContextConfig(enabled=False)
         provider = ProtectedContextProvider(config=config)
@@ -635,7 +658,6 @@ class TestProtectedContextProvider:
 
     def test_no_managers_returns_none(self):
         """Test that provider with no managers returns None."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         config = ProtectedContextConfig(enabled=True)
         provider = ProtectedContextProvider(config=config)
@@ -645,7 +667,6 @@ class TestProtectedContextProvider:
 
     def test_includes_plan_content(self):
         """Test that plan content is included."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         mock_workspace = MagicMock()
         mock_workspace.read_file.return_value = "# My Plan\n\nStep 1: Do something"
@@ -666,7 +687,6 @@ class TestProtectedContextProvider:
 
     def test_plan_truncation(self):
         """Test that long plans are truncated."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         long_plan = "A" * 3000
         mock_workspace = MagicMock()
@@ -687,8 +707,6 @@ class TestProtectedContextProvider:
 
     def test_includes_todos(self):
         """Test that todos are included."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
-        from src.agent.todo_manager import TodoManager
 
         # Create a real todo manager with some todos
         todo_manager = TodoManager(auto_reflection=False)
@@ -707,7 +725,8 @@ class TestProtectedContextProvider:
         result = provider.get_protected_context()
 
         assert result is not None
-        assert "Active Todos" in result
+        # Now uses Layer 2 visual format instead of "## Active Todos"
+        assert "ACTIVE TODO LIST" in result
         assert "Task 1" in result
         assert "Task 2" in result
         assert "Task 3" in result
@@ -718,8 +737,6 @@ class TestProtectedContextProvider:
 
     def test_handles_missing_plan_file(self):
         """Test graceful handling of missing plan file."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
-        from src.agent.todo_manager import TodoManager
 
         mock_workspace = MagicMock()
         mock_workspace.read_file.side_effect = FileNotFoundError("Not found")
@@ -741,8 +758,6 @@ class TestProtectedContextProvider:
 
     def test_full_protected_context_format(self):
         """Test complete protected context format."""
-        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
-        from src.agent.todo_manager import TodoManager
 
         mock_workspace = MagicMock()
         mock_workspace.read_file.return_value = "# Phase 2 Plan\nExtract requirements"
@@ -764,7 +779,8 @@ class TestProtectedContextProvider:
 
         assert "[PROTECTED CONTEXT - Current State]" in result
         assert "## Current Plan" in result
-        assert "## Active Todos" in result
+        # Now uses Layer 2 visual format instead of "## Active Todos"
+        assert "ACTIVE TODO LIST" in result
         assert "[END PROTECTED CONTEXT]" in result
 
 
@@ -773,7 +789,6 @@ class TestContextManagerWithProtectedProvider:
 
     def test_set_protected_provider(self):
         """Test setting protected provider."""
-        from src.agent.context_manager import ProtectedContextProvider
 
         context_manager = ContextManager()
         provider = ProtectedContextProvider()
@@ -786,6 +801,360 @@ class TestContextManagerWithProtectedProvider:
         """Test that protected provider is initially None."""
         context_manager = ContextManager()
         assert context_manager._protected_provider is None
+
+
+class TestLayer2TodoDisplay:
+    """Tests for Layer 2 todo list display formatting (Phase 3 guardrails)."""
+
+    def test_layer2_visual_separators(self):
+        """Test that Layer 2 display includes visual separators."""
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Task 1", "status": "completed"},
+            {"content": "Task 2", "status": "in_progress"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert result is not None
+        # Check visual separators (thick lines at top and bottom)
+        assert LAYER2_START_MARKER in result
+        # Check thin separator before instruction
+        assert "─" * 67 in result
+
+    def test_layer2_includes_title(self):
+        """Test that Layer 2 display includes ACTIVE TODO LIST title."""
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([{"content": "Task", "status": "pending"}])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert LAYER2_TITLE in result
+
+    def test_layer2_phase_indicator_with_number(self):
+        """Test that Layer 2 display includes phase indicator with number."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_phase_info(phase_number=2, total_phases=4, phase_name="Requirement Extraction")
+        todo_manager.set_todos_from_list([{"content": "Task", "status": "pending"}])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert "Phase: Requirement Extraction (2 of 4)" in result
+
+    def test_layer2_phase_indicator_bootstrap(self):
+        """Test that Layer 2 shows Bootstrap when no phase set."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        # Don't set phase info - should default to Bootstrap
+        todo_manager.set_todos_from_list([{"content": "Task", "status": "pending"}])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert "Phase: Bootstrap" in result
+
+    def test_layer2_numbered_tasks(self):
+        """Test that tasks are numbered in Layer 2 display."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "First task", "status": "completed"},
+            {"content": "Second task", "status": "in_progress"},
+            {"content": "Third task", "status": "pending"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert "1. First task" in result
+        assert "2. Second task" in result
+        assert "3. Third task" in result
+
+    def test_layer2_current_task_marker(self):
+        """Test that current task is marked with arrow."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Done task", "status": "completed"},
+            {"content": "Current task", "status": "in_progress"},
+            {"content": "Future task", "status": "pending"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        # Check that CURRENT marker appears
+        assert "← CURRENT" in result
+        # Verify it's on the right task (in_progress one)
+        lines = result.split("\n")
+        current_line = [l for l in lines if "← CURRENT" in l][0]
+        assert "Current task" in current_line
+
+    def test_layer2_current_task_first_pending_if_no_in_progress(self):
+        """Test that first pending task is marked current when no in_progress."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Done task", "status": "completed"},
+            {"content": "Next task", "status": "pending"},
+            {"content": "Later task", "status": "pending"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        lines = result.split("\n")
+        current_line = [l for l in lines if "← CURRENT" in l][0]
+        assert "Next task" in current_line
+
+    def test_layer2_progress_counter(self):
+        """Test that progress counter is included."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Task 1", "status": "completed"},
+            {"content": "Task 2", "status": "completed"},
+            {"content": "Task 3", "status": "in_progress"},
+            {"content": "Task 4", "status": "pending"},
+            {"content": "Task 5", "status": "pending"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert "Progress: 2/5 tasks complete" in result
+
+    def test_layer2_instruction_line(self):
+        """Test that instruction line is included."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Process documents", "status": "in_progress"},
+            {"content": "Extract data", "status": "pending"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        # Check for instruction line
+        assert "INSTRUCTION:" in result
+        assert "todo_complete()" in result
+        assert "Complete task 1" in result
+
+    def test_layer2_instruction_when_all_complete(self):
+        """Test instruction when all tasks are complete."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([
+            {"content": "Task 1", "status": "completed"},
+            {"content": "Task 2", "status": "completed"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert "All tasks complete" in result
+        assert "job_complete()" in result or "next phase" in result
+
+    def test_layer2_empty_todos_returns_none(self):
+        """Test that empty todo list returns None."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        # No todos added
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert result is None
+
+    def test_layer2_no_todo_manager_returns_none(self):
+        """Test that no todo manager returns None."""
+
+        provider = ProtectedContextProvider(
+            todo_manager=None,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        assert result is None
+
+    def test_layer2_limits_to_15_tasks(self):
+        """Test that Layer 2 display limits to 15 tasks."""
+
+        todo_manager = TodoManager(auto_reflection=False)
+        todos = [{"content": f"Task {i}", "status": "pending"} for i in range(20)]
+        todo_manager.set_todos_from_list(todos)
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        # Should contain tasks 1-15 but not 16-20
+        assert "15. Task 14" in result  # Task 14 is 15th (0-indexed)
+        assert "16." not in result
+
+    def test_layer2_truncates_long_task_in_instruction(self):
+        """Test that long task content is truncated in instruction line."""
+
+        long_task = "This is a very long task description that should be truncated to avoid making the instruction line too long"
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_todos_from_list([{"content": long_task, "status": "in_progress"}])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_layer2_todo_display()
+
+        # The instruction should contain truncated version with "..."
+        lines = result.split("\n")
+        instruction_line = [l for l in lines if "INSTRUCTION:" in l][0]
+        assert "..." in instruction_line
+        assert len(instruction_line) < len(long_task) + 100  # Much shorter than full task
+
+
+class TestIsLayer2Message:
+    """Tests for is_layer2_message helper function."""
+
+    def test_is_layer2_message_true(self):
+        """Test that Layer 2 messages are correctly identified."""
+
+        # Create a message that looks like Layer 2 content
+        layer2_content = f"{LAYER2_START_MARKER}\n{LAYER2_TITLE}\n{LAYER2_START_MARKER}"
+        msg = SystemMessage(content=layer2_content)
+
+        assert is_layer2_message(msg) is True
+
+    def test_is_layer2_message_false_for_regular_system(self):
+        """Test that regular system messages are not Layer 2."""
+
+        msg = SystemMessage(content="You are a helpful assistant.")
+        assert is_layer2_message(msg) is False
+
+    def test_is_layer2_message_false_for_human(self):
+        """Test that human messages are not Layer 2."""
+
+        msg = HumanMessage(content="Process this document.")
+        assert is_layer2_message(msg) is False
+
+    def test_is_layer2_message_false_for_ai(self):
+        """Test that AI messages are not Layer 2."""
+
+        msg = AIMessage(content="I'll help you with that.")
+        assert is_layer2_message(msg) is False
+
+    def test_is_layer2_message_false_for_tool(self):
+        """Test that tool messages are not Layer 2."""
+
+        msg = ToolMessage(content="Result", tool_call_id="123")
+        assert is_layer2_message(msg) is False
+
+
+class TestLayer2Integration:
+    """Integration tests for Layer 2 with protected context."""
+
+    def test_protected_context_includes_layer2(self):
+        """Test that get_protected_context includes Layer 2 formatting."""
+        todo_manager = TodoManager(auto_reflection=False)
+        todo_manager.set_phase_info(phase_number=1, total_phases=3, phase_name="Analysis")
+        todo_manager.set_todos_from_list([
+            {"content": "Analyze document", "status": "in_progress"},
+            {"content": "Extract data", "status": "pending"},
+        ])
+
+        provider = ProtectedContextProvider(
+            todo_manager=todo_manager,
+            config=ProtectedContextConfig(enabled=True, include_todos=True),
+        )
+
+        result = provider.get_protected_context()
+
+        # Should include protected context markers
+        assert "[PROTECTED CONTEXT" in result
+        # Should include Layer 2 visual formatting
+        assert LAYER2_START_MARKER in result
+        assert "ACTIVE TODO LIST" in result
+        assert "Phase: Analysis (1 of 3)" in result
+
+    def test_trim_messages_preserves_system_messages(self):
+        """Test that trim_messages preserves all SystemMessages (including Layer 2)."""
+
+        config = ContextConfig(keep_recent_messages=2)
+        context_manager = ContextManager(config=config)
+
+        # Create a message list with Layer 2 content as SystemMessage
+        layer2_content = f"{LAYER2_START_MARKER}\n{LAYER2_TITLE}\n{LAYER2_START_MARKER}"
+        messages = [
+            SystemMessage(content="Main system prompt"),
+            SystemMessage(content=layer2_content),  # Layer 2
+            HumanMessage(content="Original task"),
+            AIMessage(content="Response 1"),
+            AIMessage(content="Response 2"),
+            AIMessage(content="Response 3"),
+            AIMessage(content="Response 4"),
+            AIMessage(content="Response 5"),
+        ]
+
+        result = context_manager.trim_messages(messages, keep_recent=2)
+
+        # Both SystemMessages should be preserved
+        system_msgs = [m for m in result if isinstance(m, SystemMessage)]
+        assert len(system_msgs) == 2
+        assert "Main system prompt" in system_msgs[0].content
+        assert LAYER2_START_MARKER in system_msgs[1].content
 
 
 if __name__ == "__main__":

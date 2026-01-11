@@ -63,6 +63,11 @@ class UniversalAgentState(TypedDict):
     # Tracks failed tool calls and retry attempts
     tool_retry_state: Optional[Dict[str, Any]]
 
+    # Phase transition state (Guardrails Phase 4)
+    # Set when a phase transition is triggered by todo_complete or todo_rewind
+    # Contains: transition_type, trigger_summarization, metadata
+    phase_transition: Optional[Dict[str, Any]]
+
 
 def create_initial_state(
     job_id: str,
@@ -100,4 +105,5 @@ def create_initial_state(
         metadata=metadata or {},
         context_stats=None,
         tool_retry_state=None,
+        phase_transition=None,
     )
