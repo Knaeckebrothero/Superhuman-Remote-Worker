@@ -25,7 +25,6 @@ from langchain_core.language_models import BaseChatModel
 
 from src.agent.workspace_manager import WorkspaceManager, WorkspaceConfig as WMConfig
 from src.agent.todo_manager import TodoManager
-from src.agent.context_manager import ContextManager, ContextConfig
 from src.agent.tools import ToolContext, load_tools
 
 from .state import UniversalAgentState, create_initial_state
@@ -97,7 +96,6 @@ class UniversalAgent:
         self._llm_with_tools: Optional[BaseChatModel] = None
         self._tools: Optional[List] = None
         self._graph = None
-        self._context_manager: Optional[ContextManager] = None
 
         # Current job state
         self._workspace_manager: Optional[WorkspaceManager] = None
@@ -169,14 +167,6 @@ class UniversalAgent:
 
         # Create LLM
         self._llm = create_llm(self.config.llm)
-
-        # Create context manager
-        self._context_manager = ContextManager(
-            config=ContextConfig(
-                compaction_threshold_tokens=self.config.limits.context_threshold_tokens,
-                keep_raw_turns=self.config.context_management.keep_recent_tool_results,
-            )
-        )
 
         self._initialized = True
         logger.info(f"{self.config.display_name} initialized successfully")

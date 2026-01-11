@@ -13,7 +13,7 @@ from src.agent.app import create_app
 # Shared utilities
 from src.agent.workspace_manager import WorkspaceManager
 from src.agent.todo_manager import TodoManager
-from src.agent.context_manager import ContextManager
+from src.agent.context import ContextManager
 
 __all__ = [
     # Universal Agent

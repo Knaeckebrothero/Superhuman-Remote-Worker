@@ -73,9 +73,7 @@ python cancel_job.py --job-id <uuid> --cleanup
 
 **Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
-**LLM/Agent settings (`src/config/llm_config.json`):** Model, temperature, reasoning_level per agent.
-
-**Agent configs (`src/config/agents/*.json`):** Workspace structure, tools, polling behavior, limits. See `src/config/agents/schema.json` for full spec.
+**Agent configs (`src/config/agents/*.json`):** LLM settings, workspace structure, tools, polling behavior, limits. See `src/config/agents/schema.json` for full spec.
 
 ## Architecture
 
@@ -105,7 +103,7 @@ python cancel_job.py --job-id <uuid> --cleanup
 ```
 
 **Source locations:**
-- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, state.py, context_manager.py, loader.py, workspace_manager.py, todo_manager.py)
+- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, state.py, context.py, loader.py, workspace_manager.py, todo_manager.py)
 - `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
@@ -154,7 +152,7 @@ The Universal Agent (`src/agent/`) is the primary agent implementation:
 - `agent.py` - UniversalAgent class with run loop and LLM integration
 - `graph.py` - LangGraph workflow definition
 - `state.py` - UniversalAgentState TypedDict
-- `context_manager.py` - Context management for runtime dependencies
+- `context.py` - Context management (ContextManager, token counting, compaction)
 - `loader.py` - Configuration and tool loading
 - `app.py` - FastAPI application for containerized deployment
 - `workspace_manager.py` - Filesystem workspace for agent
