@@ -88,7 +88,7 @@ cp .env.example .env
 # Edit .env with your credentials
 
 # Initialize PostgreSQL (requires running PostgreSQL instance)
-python scripts/init_db.py
+python src/scripts/init_db.py
 
 # Start the legacy Streamlit UI
 streamlit run main.py
@@ -160,7 +160,7 @@ TAVILY_API_KEY=tvly-xxxxx  # Web search for Creator Agent
 
 ### LLM Configuration
 
-Edit `config/llm_config.json`:
+Edit `src/config/llm_config.json`:
 
 ```json
 {

@@ -54,10 +54,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy source code
-COPY src/ ./src/
+# Copy source code (includes core utilities needed by legacy UI)
+COPY src/core/ ./src/core/
 COPY config/ ./config/
-COPY main.py ./
+# Copy legacy system for Streamlit dashboard
+COPY legacy_system/ ./legacy_system/
 
 # Create directories
 RUN mkdir -p /app/logs
@@ -74,5 +75,5 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-# Run the Streamlit dashboard
-CMD ["streamlit", "run", "main.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+# Run the Streamlit dashboard from legacy_system
+CMD ["streamlit", "run", "legacy_system/streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]

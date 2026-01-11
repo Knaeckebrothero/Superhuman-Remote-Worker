@@ -24,8 +24,8 @@ def _import_module_directly(module_path: Path, module_name: str):
 
 
 # Import pdf_utils module
-pdf_utils_path = project_root / "src" / "agents" / "shared" / "tools" / "pdf_utils.py"
-pdf_utils_module = _import_module_directly(pdf_utils_path, "src.agents.shared.tools.pdf_utils")
+pdf_utils_path = project_root / "src" / "agents" / "tools" / "pdf_utils.py"
+pdf_utils_module = _import_module_directly(pdf_utils_path, "src.agents.tools.pdf_utils")
 
 PDFReader = pdf_utils_module.PDFReader
 format_document_info = pdf_utils_module.format_document_info

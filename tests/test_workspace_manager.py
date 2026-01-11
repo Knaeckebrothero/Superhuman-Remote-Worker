@@ -30,8 +30,8 @@ config_path = project_root / "src" / "core" / "config.py"
 config_module = _import_module_directly(config_path, "src.core.config")
 
 # Now import workspace_manager
-workspace_manager_path = project_root / "src" / "agents" / "shared" / "workspace_manager.py"
-workspace_manager_module = _import_module_directly(workspace_manager_path, "src.agents.shared.workspace_manager")
+workspace_manager_path = project_root / "src" / "agents" / "workspace_manager.py"
+workspace_manager_module = _import_module_directly(workspace_manager_path, "src.agents.workspace_manager")
 
 WorkspaceManager = workspace_manager_module.WorkspaceManager
 WorkspaceConfig = workspace_manager_module.WorkspaceConfig

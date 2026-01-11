@@ -99,18 +99,18 @@ write_requirement_to_cache(
 
 | File | Purpose |
 |------|---------|
-| `src/agents/shared/tools/description_generator.py` | Generates markdown documentation |
-| `src/agents/universal/agent.py` | Calls generator during workspace setup |
+| `src/agents/tools/description_generator.py` | Generates markdown documentation |
+| `src/agents/agent.py` | Calls generator during workspace setup |
 | `config/agents/creator.json` | Includes `tools/` in workspace structure |
 | `config/agents/validator.json` | Includes `tools/` in workspace structure |
 
 ### Generator Functions
 
 ```python
-from src.agents.shared.tools import (
+from src.agent.tools import (
     generate_workspace_tool_docs,  # Main entry point
-    generate_tool_description,      # Single tool doc
-    generate_tool_index,            # README.md content
+    generate_tool_description,  # Single tool doc
+    generate_tool_index,  # README.md content
 )
 
 # Generate all docs for a list of tools

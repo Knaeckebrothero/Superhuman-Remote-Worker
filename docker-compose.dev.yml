@@ -40,24 +40,28 @@ services:
   creator:
     build:
       context: .
-      dockerfile: docker/Dockerfile.creator
+      dockerfile: docker/Dockerfile.agent
     environment:
+      AGENT_CONFIG: creator
+      AGENT_PORT: 8001
       LOG_LEVEL: DEBUG
     volumes:
       - ./src:/app/src:ro
       - ./config:/app/config:ro
-    command: ["uvicorn", "src.agents.creator.app:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    command: ["uvicorn", "src.agents.universal.app:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
 
   validator:
     build:
       context: .
-      dockerfile: docker/Dockerfile.validator
+      dockerfile: docker/Dockerfile.agent
     environment:
+      AGENT_CONFIG: validator
+      AGENT_PORT: 8002
       LOG_LEVEL: DEBUG
     volumes:
       - ./src:/app/src:ro
       - ./config:/app/config:ro
-    command: ["uvicorn", "src.agents.validator.app:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+    command: ["uvicorn", "src.agents.universal.app:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
 
   # Optional: Adminer for database management
   adminer:

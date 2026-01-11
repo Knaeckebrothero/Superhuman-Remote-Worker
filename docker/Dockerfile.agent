@@ -1,0 +1,95 @@
+# =============================================================================
+# Universal Agent Dockerfile
+# =============================================================================
+#
+# A unified Docker image for all agent types (Creator, Validator, etc.).
+# The agent behavior is determined by the AGENT_CONFIG environment variable.
+#
+# Build:
+#   docker build -t graphrag-agent -f docker/Dockerfile.agent .
+#
+# Run as Creator:
+#   docker run -p 8001:8001 \
+#     -e AGENT_CONFIG=creator \
+#     -e DATABASE_URL=postgresql://... \
+#     -e OPENAI_API_KEY=... \
+#     graphrag-agent
+#
+# Run as Validator:
+#   docker run -p 8002:8002 \
+#     -e AGENT_CONFIG=validator \
+#     -e AGENT_PORT=8002 \
+#     -e DATABASE_URL=postgresql://... \
+#     -e NEO4J_URI=bolt://... \
+#     -e OPENAI_API_KEY=... \
+#     graphrag-agent
+# =============================================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Production image
+FROM python:3.11-slim
+
+LABEL maintainer="Graph-RAG Team"
+LABEL description="Universal Agent for document processing and requirement validation"
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    AGENT_CONFIG=creator \
+    AGENT_PORT=8001
+
+WORKDIR /app
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy source code
+COPY src/ ./src/
+COPY config/ ./config/
+COPY citation_tool/ ./citation_tool/
+COPY run_universal_agent.py ./
+
+# Install citation tool
+RUN if [ -d "./citation_tool" ] && [ -f "./citation_tool/pyproject.toml" ]; then \
+        pip install --no-cache-dir -e ./citation_tool[full]; \
+    fi
+
+# Create directories
+RUN mkdir -p /app/workspace /app/logs
+
+# Create non-root user
+RUN groupadd -r graphrag && useradd -r -g graphrag graphrag
+RUN chown -R graphrag:graphrag /app
+USER graphrag
+
+# Expose default port (can be overridden)
+EXPOSE 8001
+EXPOSE 8002
+
+# Health check using the configured port
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${AGENT_PORT}/health || exit 1
+
+# Run the Universal Agent with config from environment
+CMD python run_universal_agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0

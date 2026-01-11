@@ -34,20 +34,20 @@ def _import_module_directly(module_path: Path, module_name: str):
 
 
 # Import universal agent modules directly
-universal_dir = project_root / "src" / "agents" / "universal"
+agents_dir = project_root / "src" / "agents"
 
 # Import state module
 state_module = _import_module_directly(
-    universal_dir / "state.py",
-    "src.agents.universal.state"
+    agents_dir / "state.py",
+    "src.agents.state"
 )
 UniversalAgentState = state_module.UniversalAgentState
 create_initial_state = state_module.create_initial_state
 
 # Import loader module
 loader_module = _import_module_directly(
-    universal_dir / "loader.py",
-    "src.agents.universal.loader"
+    agents_dir / "loader.py",
+    "src.agents.loader"
 )
 AgentConfig = loader_module.AgentConfig
 LLMConfig = loader_module.LLMConfig
@@ -67,8 +67,8 @@ resolve_config_path = loader_module.resolve_config_path
 
 # Import models module
 models_module = _import_module_directly(
-    universal_dir / "models.py",
-    "src.agents.universal.models"
+    agents_dir / "models.py",
+    "src.agents.models"
 )
 JobStatus = models_module.JobStatus
 HealthStatus = models_module.HealthStatus
@@ -85,7 +85,7 @@ MetricsResponse = models_module.MetricsResponse
 # Import graph module functions (need LangChain imports)
 try:
     graph_module = _import_module_directly(
-        universal_dir / "graph.py",
+        agents_dir / "graph.py",
         "src.agents.universal.graph"
     )
     _route_from_process = graph_module._route_from_process

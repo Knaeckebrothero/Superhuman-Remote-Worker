@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration. See `docs/masterplan.md` for design and `docs/masterplan_roadmap.md` for implementation phases (1-5 complete, Phase 6 Testing pending).
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agents/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/config/agents/creator.json` or `src/config/agents/validator.json`).
 
 ## Commands
 
@@ -17,7 +17,7 @@ pip install -e ./citation_tool[full]
 cp .env.example .env
 
 # Initialize databases with seed data
-python scripts/app_init.py --force-reset --seed
+python src/scripts/app_init.py --force-reset --seed
 
 # Run tests
 pytest tests/                            # All tests
@@ -35,15 +35,11 @@ python validate_metamodel.py --check A1   # Specific check
 # Start databases only
 podman-compose -f docker-compose.dbs.yml up -d
 
-# Run Universal Agent (preferred entry point)
+# Run Universal Agent
 python run_universal_agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
 python run_universal_agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
 python run_universal_agent.py --config validator --port 8002                        # API server mode
 python run_universal_agent.py --config creator --polling-only                       # Polling loop only
-
-# Legacy agent runners (still functional)
-python run_creator.py --document-path ./data/doc.pdf --prompt "Extract requirements"
-python run_validator.py --verbose
 
 # Stop databases
 podman-compose -f docker-compose.dbs.yml down -v
@@ -77,9 +73,9 @@ python cancel_job.py --job-id <uuid> --cleanup
 
 **Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
-**LLM/Agent settings (`config/llm_config.json`):** Model, temperature, reasoning_level per agent. Key sections: `creator_agent`, `validator_agent`, `orchestrator`, `context_management`.
+**LLM/Agent settings (`src/config/llm_config.json`):** Model, temperature, reasoning_level per agent.
 
-**Agent configs (`config/agents/*.json`):** Workspace structure, tools, polling behavior, limits. See `config/agents/schema.json` for full spec.
+**Agent configs (`src/config/agents/*.json`):** Workspace structure, tools, polling behavior, limits. See `src/config/agents/schema.json` for full spec.
 
 ## Architecture
 
@@ -94,10 +90,11 @@ python cancel_job.py --job-id <uuid> --cleanup
        ▼                                      ▼
 ┌──────────────────┐                ┌──────────────────┐
 │ CREATOR (8001)   │                │ VALIDATOR (8002) │
+│ (Universal Agent)│                │ (Universal Agent)│
 │                  │                │                  │
-│ Document → Chunk │ requirements   │ Relevance check  │
-│ Extract → Research  (PostgreSQL) │ Fulfillment check│
-│ Formulate → Cache│◄──────────────►│ Graph integration│
+│ Document → Extract  requirements  │ Relevance check  │
+│ Research → Cache │ (PostgreSQL)  │ Fulfillment check│
+│                  │◄──────────────►│ Graph integration│
 └──────────────────┘                └────────┬─────────┘
                                              │
                                              ▼
@@ -108,15 +105,13 @@ python cancel_job.py --job-id <uuid> --cleanup
 ```
 
 **Source locations:**
-- `src/agents/universal/` - **Universal Agent**: Config-driven with 4-node LangGraph workflow (initialize → process ↔ tools → check → END)
-- `src/agents/creator/` - Creator-specific: document processing, candidate extraction, research
-- `src/agents/validator/` - Validator-specific: relevance analysis, fulfillment checking, graph integration
-- `src/agents/shared/` - Shared utilities: workspace_manager.py, todo_manager.py, context_manager.py
-- `src/agents/shared/tools/` - Modular tool implementations by category (registry.py loads tools dynamically)
+- `src/agents/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, state.py, context_manager.py, loader.py, workspace_manager.py, todo_manager.py)
+- `src/agents/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
 - `src/database/` - PostgreSQL schema files
-- `config/agents/` - Agent configuration (JSON) and instructions (Markdown)
+- `src/config/agents/` - Agent configuration (JSON) and instruction templates (Markdown)
+- `legacy_system/` - Deprecated Streamlit UI and legacy agents (for backwards compatibility)
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -134,13 +129,6 @@ python cancel_job.py --job-id <uuid> --cleanup
 - `REFINES`, `DEPENDS_ON`, `TRACES_TO`, `SUPERSEDES` (Requirement → Requirement)
 
 Schema: `data/metamodell.cql`. Seed data: `data/seed_data.cypher`.
-
-### Prompt-Metamodel Coupling
-
-Prompts in `config/prompts/` are tightly coupled to the metamodel. When modifying schema:
-1. Update `data/metamodell.cql`
-2. Update prompts (especially `agent_system.txt`, `chain_domain.txt`, `validator_integration.txt`)
-3. Update `MetamodelValidator.ALLOWED_*` constants in `src/core/metamodel_validator.py`
 
 ### Neo4j Query Guidelines
 
@@ -163,9 +151,19 @@ Optional: `src/database/schema_vector.sql` adds `workspace_embeddings` table for
 
 ### Universal Agent Pattern
 
-The Universal Agent (`src/agents/universal/`) is the primary agent implementation:
+The Universal Agent (`src/agents/`) is the primary agent implementation:
 
-**Configuration (`config/agents/<name>.json`):**
+**Key files:**
+- `agent.py` - UniversalAgent class with run loop and LLM integration
+- `graph.py` - LangGraph workflow definition
+- `state.py` - UniversalAgentState TypedDict
+- `context_manager.py` - Context management for runtime dependencies
+- `loader.py` - Configuration and tool loading
+- `app.py` - FastAPI application for containerized deployment
+- `workspace_manager.py` - Filesystem workspace for agent
+- `todo_manager.py` - Task management with archiving
+
+**Configuration (`src/config/agents/<name>.json`):**
 - `llm`: Model, temperature, reasoning level
 - `workspace.structure`: Directory layout for agent's filesystem
 - `tools`: Tool categories (workspace, todo, domain, completion)
@@ -181,46 +179,57 @@ The Universal Agent (`src/agents/universal/`) is the primary agent implementatio
 - Completion detection via `mark_complete` tool
 
 **Creating a new agent type:**
-1. Create `config/agents/<name>.json` based on `schema.json`
-2. Create `config/agents/instructions/<name>_instructions.md`
-3. Add domain-specific tools to `src/agents/shared/tools/` if needed
-4. Register new tools in `src/agents/shared/tools/registry.py`
+1. Create `src/config/agents/<name>.json` based on `schema.json`
+2. Create `src/config/agents/instructions/<name>_instructions.md`
+3. Add domain-specific tools to `src/agents/tools/` if needed
+4. Register new tools in `src/agents/tools/registry.py`
 
 ### Tool System
 
-Tools are organized in `src/agents/shared/tools/` and loaded dynamically by the registry:
+Tools are organized in `src/agents/tools/` and loaded dynamically by the registry:
 
-| Category | Tools | Source |
-|----------|-------|--------|
-| `workspace` | read_file, write_file, list_files, search_files, etc. | `workspace_tools.py` |
-| `todo` | todo_write, archive_and_reset | `todo_tools.py` |
-| `domain` | extract_document_text, chunk_document, web_search, cite_document, etc. | `document_tools.py`, `search_tools.py`, `citation_tools.py` |
-| `completion` | mark_complete | `completion_tools.py` |
-| `graph` | execute_cypher, get_schema, create_requirement_node, etc. | `graph_tools.py` |
-| `cache` | add_requirement, list_requirements, get_requirement | `cache_tools.py` |
+| Category | Source File | Example Tools |
+|----------|-------------|---------------|
+| `workspace` | `workspace_tools.py` | read_file, write_file, list_files, search_files, get_workspace_summary |
+| `todo` | `todo_tools.py` | todo_write, archive_and_reset |
+| `domain` | `document_tools.py` | extract_document_text, chunk_document |
+| `domain` | `search_tools.py` | web_search (Tavily) |
+| `domain` | `citation_tools.py` | cite_document, cite_web, list_sources, get_citation |
+| `domain` | `cache_tools.py` | add_requirement, list_requirements, get_requirement |
+| `graph` | `graph_tools.py` | execute_cypher, get_schema, create_requirement_node |
+| `completion` | `completion_tools.py` | mark_complete, job_complete |
 
-**Tool context** (`ToolContext` dataclass in `context.py`) provides tools with access to workspace, todo manager, and database connections.
+**Tool context** (`ToolContext` dataclass in `tools/context.py`) provides tools with access to workspace, todo manager, and database connections.
 
-**On-demand descriptions:** Tools support deferred description loading via `description_override.py`. Tools marked with `defer_to_workspace=True` use short descriptions in the LLM context, with full documentation generated in `workspace/tools/<name>.md` by `description_generator.py`. See `docs/tool_implementation.md` for the full design.
+**On-demand descriptions:** Tools marked with `defer_to_workspace=True` in their metadata use short descriptions in the LLM context, with full documentation generated in `workspace/tools/<name>.md`. See `description_override.py` and `description_generator.py`.
 
 ### Service Ports
 
 | Service | Port |
 |---------|------|
 | Orchestrator | 8000 |
-| Creator (Universal) | 8001 |
-| Validator (Universal) | 8002 |
+| Creator (Universal Agent) | 8001 |
+| Validator (Universal Agent) | 8002 |
 | Neo4j Bolt | 7687 |
 | Neo4j Browser | 7474 |
 | PostgreSQL | 5432 |
-| Dashboard | 8501 |
-| Adminer (dev) | 8080 |
+| Dashboard (Streamlit) | 8501 |
+| Adminer (dev only) | 8080 |
+
+### Legacy System
+
+The legacy Streamlit UI and old agents are in `legacy_system/`:
+- `legacy_system/streamlit_app.py` - Legacy Streamlit entry point
+- `legacy_system/src/ui/` - UI components
+- `legacy_system/src/agents/` - Old agents (graph_agent, document_ingestion_supervisor, etc.)
+
+Use the Universal Agent (`src/agents/`) for all new development.
 
 ## Adding New Tools
 
 When adding a new tool to the system:
 
-1. **Create the tool function** in the appropriate file in `src/agents/shared/tools/`:
+1. **Create the tool function** in the appropriate file in `src/agents/tools/`:
    - Workspace operations → `workspace_tools.py`
    - Document processing → `document_tools.py`
    - Graph operations → `graph_tools.py`
@@ -244,7 +253,7 @@ When adding a new tool to the system:
    TOOL_REGISTRY.update(MYTOOLS_METADATA)
    ```
 
-4. **Add to agent config** in `config/agents/<agent>.json` under the appropriate category:
+4. **Add to agent config** in `src/config/agents/<agent>.json` under the appropriate category:
    ```json
    "tools": {
        "domain": ["my_tool", ...]

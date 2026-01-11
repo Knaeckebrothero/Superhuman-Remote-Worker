@@ -1847,6 +1847,16 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 
 **Deliverable:** Clean codebase with single Universal Agent, old code removed, all systems working.
 
+**Implementation Notes (2025-01-10):**
+- Deleted `run_creator.py` and `run_validator.py` (use `run_universal_agent.py --config creator/validator` instead)
+- Created unified `docker/Dockerfile.agent` (replaces Dockerfile.creator and Dockerfile.validator)
+- Updated `docker-compose.yml` and `docker-compose.dev.yml` to use unified Dockerfile with `AGENT_CONFIG` env var
+- Removed `src/agents/creator/` and `src/agents/validator/` directories
+- Updated `src/agents/shared/tools/search_tools.py` to remove dependency on old Researcher class
+- Updated `src/agents/__init__.py` to export Universal Agent instead of old Creator/Validator
+- Updated `CLAUDE.md` to remove references to deleted files and directories
+- Legacy document ingestion pipeline agents retained in `src/agents/` for backwards compatibility
+
 ---
 
 ### Phase Summary
@@ -1860,9 +1870,9 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 | 5 | Universal Agent Implementation | Phases 1-4 | High | ✅ Complete |
 | 6 | Context Management | Phase 5 | Medium | ✅ Complete |
 | 7 | Tool Discovery | Phase 5 | Medium (optional) | ⏭️ Skipped |
-| 8 | Vector Search | Phases 2, 5 | Medium (optional) | ✅ Complete |
-| 9 | Testing & Validation | Phases 1-6 | Medium | |
-| 10 | Migration & Cleanup | Phase 9 | Low | |
+| 8 | Vector Search | Phases 2, 5 | Medium (optional) | ⏭️ Skipped |
+| 9 | Testing & Validation | Phases 1-6 | Medium | ✅ In Progress |
+| 10 | Migration & Cleanup | Phase 9 | Low | ✅ Complete |
 
 **Two-Tier Planning:**
 - Phase 2 (Workspace Tools) provides **strategic planning** - filesystem for plans, notes, research

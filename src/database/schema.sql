@@ -2,7 +2,7 @@
 -- PostgreSQL Schema
 --
 -- This file defines all tables for the Graph-RAG system.
--- Run with: python scripts/app_init.py --force-reset
+-- Run with: python src/scripts/app_init.py --force-reset
 --
 -- Tables:
 --   jobs         - Job tracking and orchestration

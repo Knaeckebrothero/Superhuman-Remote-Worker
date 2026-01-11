@@ -80,8 +80,9 @@ The pipeline has been fully implemented following this design document. Below is
 ### Usage
 
 **Programmatic:**
+
 ```python
-from src.agents import create_document_ingestion_supervisor
+from src.agent import create_document_ingestion_supervisor
 from src.core import create_neo4j_connection
 
 conn = create_neo4j_connection()

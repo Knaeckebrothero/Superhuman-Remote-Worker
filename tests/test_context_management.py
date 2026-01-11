@@ -25,7 +25,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from src.agents.universal.context import (
+from src.agent.context_manager import (
     ContextConfig,
     ContextManager,
     ContextManagementState,
@@ -499,7 +499,7 @@ class TestStateIntegration:
 
     def test_state_fields_exist(self):
         """Test that new state fields are defined."""
-        from src.agents.universal.state import UniversalAgentState, create_initial_state
+        from src.agent.state import UniversalAgentState, create_initial_state
 
         state = create_initial_state(
             job_id="test-job",
@@ -518,7 +518,7 @@ class TestLoaderIntegration:
 
     def test_load_summarization_prompt_exists(self):
         """Test that load_summarization_prompt function exists."""
-        from src.agents.universal.loader import load_summarization_prompt
+        from src.agent.loader import load_summarization_prompt
 
         prompt = load_summarization_prompt()
         assert isinstance(prompt, str)
@@ -528,8 +528,8 @@ class TestLoaderIntegration:
 
     def test_get_all_tool_names_exists(self):
         """Test that get_all_tool_names function exists."""
-        from src.agents.universal.loader import get_all_tool_names, AgentConfig
-        from src.agents.universal.loader import ToolsConfig
+        from src.agent.loader import get_all_tool_names, AgentConfig
+        from src.agent.loader import ToolsConfig
 
         config = AgentConfig(
             agent_id="test",
@@ -552,7 +552,7 @@ class TestPackageExports:
 
     def test_context_exports(self):
         """Test that context management classes are exported."""
-        from src.agents.universal import (
+        from src.agent import (
             ContextConfig,
             ContextManager,
             ContextManagementState,
@@ -570,7 +570,7 @@ class TestPackageExports:
 
     def test_graph_exports(self):
         """Test that graph functions are exported."""
-        from src.agents.universal import (
+        from src.agent import (
             build_agent_graph,
             run_graph_with_streaming,
             run_graph_with_summarization,
@@ -582,7 +582,7 @@ class TestPackageExports:
 
     def test_loader_exports(self):
         """Test that loader functions are exported."""
-        from src.agents.universal import (
+        from src.agent import (
             load_summarization_prompt,
             get_all_tool_names,
         )
@@ -596,7 +596,7 @@ class TestProtectedContextConfig:
 
     def test_default_values(self):
         """Test default configuration values."""
-        from src.agents.universal.context import ProtectedContextConfig
+        from src.agent.context_manager import ProtectedContextConfig
 
         config = ProtectedContextConfig()
         assert config.enabled is True
@@ -606,7 +606,7 @@ class TestProtectedContextConfig:
 
     def test_custom_values(self):
         """Test custom configuration values."""
-        from src.agents.universal.context import ProtectedContextConfig
+        from src.agent.context_manager import ProtectedContextConfig
 
         config = ProtectedContextConfig(
             enabled=False,
@@ -625,7 +625,7 @@ class TestProtectedContextProvider:
 
     def test_disabled_returns_none(self):
         """Test that disabled provider returns None."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         config = ProtectedContextConfig(enabled=False)
         provider = ProtectedContextProvider(config=config)
@@ -635,7 +635,7 @@ class TestProtectedContextProvider:
 
     def test_no_managers_returns_none(self):
         """Test that provider with no managers returns None."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         config = ProtectedContextConfig(enabled=True)
         provider = ProtectedContextProvider(config=config)
@@ -645,7 +645,7 @@ class TestProtectedContextProvider:
 
     def test_includes_plan_content(self):
         """Test that plan content is included."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         mock_workspace = MagicMock()
         mock_workspace.read_file.return_value = "# My Plan\n\nStep 1: Do something"
@@ -666,7 +666,7 @@ class TestProtectedContextProvider:
 
     def test_plan_truncation(self):
         """Test that long plans are truncated."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
 
         long_plan = "A" * 3000
         mock_workspace = MagicMock()
@@ -687,8 +687,8 @@ class TestProtectedContextProvider:
 
     def test_includes_todos(self):
         """Test that todos are included."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
-        from src.agents.shared.todo_manager import TodoManager
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.todo_manager import TodoManager
 
         # Create a real todo manager with some todos
         todo_manager = TodoManager(auto_reflection=False)
@@ -718,8 +718,8 @@ class TestProtectedContextProvider:
 
     def test_handles_missing_plan_file(self):
         """Test graceful handling of missing plan file."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
-        from src.agents.shared.todo_manager import TodoManager
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.todo_manager import TodoManager
 
         mock_workspace = MagicMock()
         mock_workspace.read_file.side_effect = FileNotFoundError("Not found")
@@ -741,8 +741,8 @@ class TestProtectedContextProvider:
 
     def test_full_protected_context_format(self):
         """Test complete protected context format."""
-        from src.agents.universal.context import ProtectedContextConfig, ProtectedContextProvider
-        from src.agents.shared.todo_manager import TodoManager
+        from src.agent.context_manager import ProtectedContextConfig, ProtectedContextProvider
+        from src.agent.todo_manager import TodoManager
 
         mock_workspace = MagicMock()
         mock_workspace.read_file.return_value = "# Phase 2 Plan\nExtract requirements"
@@ -773,7 +773,7 @@ class TestContextManagerWithProtectedProvider:
 
     def test_set_protected_provider(self):
         """Test setting protected provider."""
-        from src.agents.universal.context import ProtectedContextProvider
+        from src.agent.context_manager import ProtectedContextProvider
 
         context_manager = ContextManager()
         provider = ProtectedContextProvider()
