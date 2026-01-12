@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agent/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/config/agents/creator.json` or `src/config/agents/validator.json`).
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agent/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/config/creator.json` or `src/config/validator.json`).
 
 ## Commands
 
@@ -73,7 +73,7 @@ python cancel_job.py --job-id <uuid> --cleanup
 
 **Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
-**Agent configs (`src/config/agents/*.json`):** LLM settings, workspace structure, tools, polling behavior, limits. See `src/config/agents/schema.json` for full spec.
+**Agent configs (`src/config/*.json`):** LLM settings, workspace structure, tools, polling behavior, limits. See `src/config/schema.json` for full spec.
 
 ## Architecture
 
@@ -103,12 +103,14 @@ python cancel_job.py --job-id <uuid> --cleanup
 ```
 
 **Source locations:**
-- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, state.py, context.py, loader.py, workspace_manager.py, todo_manager.py)
+- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
+- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, todo.py, transitions.py)
 - `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
+- `src/agent/api/` - FastAPI application for containerized deployment
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
-- `src/database/` - PostgreSQL schema files
-- `src/config/agents/` - Agent configuration (JSON) and instruction templates (Markdown)
+- `src/database/` - PostgreSQL schema and utilities
+- `src/config/` - Agent configuration (JSON) and instruction templates (Markdown in `instructions/`)
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -149,16 +151,16 @@ Schema in `src/database/schema.sql`:
 The Universal Agent (`src/agent/`) is the primary agent implementation:
 
 **Key files:**
-- `agent.py` - UniversalAgent class with run loop and LLM integration
-- `graph.py` - LangGraph workflow definition
-- `state.py` - UniversalAgentState TypedDict
-- `context.py` - Context management (ContextManager, token counting, compaction)
-- `loader.py` - Configuration and tool loading
-- `app.py` - FastAPI application for containerized deployment
-- `workspace_manager.py` - Filesystem workspace for agent
-- `todo_manager.py` - Task management with archiving
+- `src/agent/agent.py` - UniversalAgent class with run loop and LLM integration
+- `src/agent/graph.py` - LangGraph workflow definition
+- `src/agent/core/state.py` - UniversalAgentState TypedDict
+- `src/agent/core/context.py` - Context management (ContextManager, token counting, compaction)
+- `src/agent/core/loader.py` - Configuration and tool loading
+- `src/agent/core/workspace.py` - Filesystem workspace for agent
+- `src/agent/core/todo.py` - Task management with archiving
+- `src/agent/api/app.py` - FastAPI application for containerized deployment
 
-**Configuration (`src/config/agents/<name>.json`):**
+**Configuration (`src/config/<name>.json`):**
 - `llm`: Model, temperature, reasoning level
 - `workspace.structure`: Directory layout for agent's filesystem
 - `tools`: Tool categories (workspace, todo, domain, completion)
@@ -174,8 +176,8 @@ The Universal Agent (`src/agent/`) is the primary agent implementation:
 - Completion detection via `mark_complete` tool
 
 **Creating a new agent type:**
-1. Create `src/config/agents/<name>.json` based on `schema.json`
-2. Create `src/config/agents/instructions/<name>_instructions.md`
+1. Create `src/config/<name>.json` based on `schema.json`
+2. Create `src/config/instructions/<name>_instructions.md`
 3. Add domain-specific tools to `src/agent/tools/` if needed
 4. Register new tools in `src/agent/tools/registry.py`
 
@@ -235,7 +237,7 @@ When adding a new tool to the system:
 
 3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`
 
-4. **Add to agent config** in `src/config/agents/<agent>.json` under the appropriate category:
+4. **Add to agent config** in `src/config/<agent>.json` under the appropriate category:
    ```json
    "tools": {
        "domain": ["my_tool", ...]
