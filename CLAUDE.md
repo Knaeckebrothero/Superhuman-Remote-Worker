@@ -103,8 +103,9 @@ python cancel_job.py --job-id <uuid> --cleanup
 ```
 
 **Source locations:**
-- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
-- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, todo.py, transitions.py)
+- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, graph_nested.py)
+- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py)
+- `src/agent/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
 - `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/agent/api/` - FastAPI application for containerized deployment
 - `src/orchestrator/` - Job manager, monitor, reporter
@@ -148,17 +149,33 @@ Schema in `src/database/schema.sql`:
 
 ### Universal Agent Pattern
 
-The Universal Agent (`src/agent/`) is the primary agent implementation:
+The Universal Agent (`src/agent/`) is the primary agent implementation with a **nested loop architecture**:
 
 **Key files:**
 - `src/agent/agent.py` - UniversalAgent class with run loop and LLM integration
-- `src/agent/graph.py` - LangGraph workflow definition
-- `src/agent/core/state.py` - UniversalAgentState TypedDict
+- `src/agent/graph.py` - Legacy LangGraph workflow (simple ReAct)
+- `src/agent/graph_nested.py` - **New nested loop graph** (initialization → outer loop → inner loop)
+- `src/agent/core/state.py` - UniversalAgentState TypedDict with loop control fields
 - `src/agent/core/context.py` - Context management (ContextManager, token counting, compaction)
 - `src/agent/core/loader.py` - Configuration and tool loading
 - `src/agent/core/workspace.py` - Filesystem workspace for agent
-- `src/agent/core/todo.py` - Task management with archiving
 - `src/agent/api/app.py` - FastAPI application for containerized deployment
+
+**Manager layer (`src/agent/managers/`):**
+- `todo.py` - **TodoManager** (stateful): Task tracking with add/complete/archive
+- `plan.py` - **PlanManager** (service): Read/write main_plan.md, phase detection
+- `memory.py` - **MemoryManager** (service): Read/write workspace.md, section management
+
+**Nested loop architecture:**
+```
+INITIALIZATION → read_instructions → create_plan → init_todos
+                                        ↓
+OUTER LOOP (strategic) → read_plan → update_memory → create_todos
+                                        ↓
+INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
+                                        ↓
+                            check_goal → END or back to OUTER LOOP
+```
 
 **Configuration (`src/config/<name>.json`):**
 - `llm`: Model, temperature, reasoning level
@@ -170,8 +187,9 @@ The Universal Agent (`src/agent/`) is the primary agent implementation:
 
 **Key features:**
 - Reads `instructions.md` from workspace to understand task context
-- Uses `main_plan.md` for strategic planning, `archive/` for todo history
-- TodoManager for tactical execution with `archive_and_reset()` for context recovery
+- Uses `main_plan.md` for strategic planning (read at phase transitions)
+- Uses `workspace.md` as persistent memory (injected into system prompt, like CLAUDE.md)
+- TodoManager for tactical execution with `archive()` at phase completion
 - Automatic context compaction when approaching token limits
 - Completion detection via `mark_complete` tool
 
@@ -254,20 +272,33 @@ When adding a new tool to the system:
 ## Testing
 
 ```bash
-# Run all tests
-pytest tests/
+# Run all tests (use venv for full test suite)
+.venv/bin/python -m pytest tests/
 
 # Run specific test file
-pytest tests/test_todo_tools.py
+.venv/bin/python -m pytest tests/test_todo_tools.py
 
 # Run with verbose output
-pytest tests/ -v
+.venv/bin/python -m pytest tests/ -v
 
 # Run tests matching pattern
-pytest tests/ -k "workspace"
+.venv/bin/python -m pytest tests/ -k "workspace"
 
 # Run with coverage
-pytest tests/ --cov=src
+.venv/bin/python -m pytest tests/ --cov=src
+
+# Manager tests (nested loop architecture)
+.venv/bin/python -m pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
+
+# Graph nested tests
+.venv/bin/python -m pytest tests/test_graph_nested.py -v
 ```
+
+**Key test files:**
+- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager
+- `tests/test_graph_nested.py` - Tests for routing functions and graph nodes
+- `tests/test_workspace_manager.py` - WorkspaceManager tests
+- `tests/test_todo_tools.py` - Todo tool tests (legacy)
+- `tests/test_context_management.py` - Context compaction tests
 
 Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup like database connections.

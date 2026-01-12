@@ -30,28 +30,6 @@ from langchain_core.messages import (
 
 logger = logging.getLogger(__name__)
 
-# Layer 2 content markers for identification
-LAYER2_START_MARKER = "═" * 67  # Visual separator for Layer 2 todo display
-LAYER2_TITLE = "ACTIVE TODO LIST"
-
-
-def is_layer2_message(message: BaseMessage) -> bool:
-    """Check if a message is a Layer 2 protected context message.
-
-    Layer 2 messages contain the active todo list with visual separators.
-    These should never be trimmed or summarized.
-
-    Args:
-        message: Message to check
-
-    Returns:
-        True if this is a Layer 2 todo list message
-    """
-    if not isinstance(message, SystemMessage):
-        return False
-    content = message.content if isinstance(message.content, str) else ""
-    return LAYER2_START_MARKER in content and LAYER2_TITLE in content
-
 
 # Try to import tiktoken for accurate token counting
 try:
@@ -100,12 +78,19 @@ class ContextConfig:
     tool_retry_delay_seconds: float = 1.0
 
 
+# =============================================================================
+# DEPRECATED CLASSES - Kept for backwards compatibility with graph.py
+# =============================================================================
+
+
 @dataclass
 class ProtectedContextConfig:
-    """Configuration for protected context that survives compaction.
+    """DEPRECATED: Configuration for protected context.
 
-    Protected context ensures critical information (plan, todos, phase)
-    is always present in the LLM's context window, even after compaction.
+    This class is deprecated and does nothing. The new nested loop graph
+    (graph_nested.py) injects workspace.md directly into the system prompt.
+
+    Kept for backwards compatibility with graph.py.
     """
     enabled: bool = True
     plan_file: str = "main_plan.md"
@@ -115,182 +100,34 @@ class ProtectedContextConfig:
 
 @dataclass
 class ProtectedContextProvider:
-    """Provides protected context that survives compaction.
+    """DEPRECATED: Provider for protected context.
 
-    This maintains the agent's "roter Faden" (red thread) - ensuring
-    continuity of purpose across context compaction events.
+    This class is deprecated and does nothing. The new nested loop graph
+    (graph_nested.py) injects workspace.md directly into the system prompt.
 
-    The protected context is read fresh from workspace each time,
-    not cached, so it always reflects the current state.
+    Kept for backwards compatibility with graph.py.
     """
     workspace_manager: Optional[Any] = None
     todo_manager: Optional[Any] = None
     config: ProtectedContextConfig = field(default_factory=ProtectedContextConfig)
 
     def get_protected_context(self) -> Optional[str]:
-        """Build protected context string from workspace files and todos.
-
-        Returns:
-            Formatted protected context string, or None if disabled/empty
-        """
-        if not self.config.enabled:
-            return None
-
-        parts = ["[PROTECTED CONTEXT - Current State]"]
-
-        # Read plan from workspace
-        if self.workspace_manager:
-            try:
-                plan = self.workspace_manager.read_file(self.config.plan_file)
-                if plan:
-                    truncated = plan[:self.config.max_plan_chars]
-                    if len(plan) > self.config.max_plan_chars:
-                        truncated += "\n[...truncated]"
-                    parts.append(f"\n## Current Plan\n{truncated}")
-            except Exception as e:
-                # Plan file may not exist yet - that's OK
-                logger.debug(f"Could not read plan file: {e}")
-
-        # Get Layer 2 todo display (visual format for agent focus)
-        if self.config.include_todos and self.todo_manager:
-            layer2_todos = self.get_layer2_todo_display()
-            if layer2_todos:
-                parts.append(f"\n{layer2_todos}")
-
-        parts.append("\n[END PROTECTED CONTEXT]")
-
-        # Only return if we have actual content beyond markers
-        if len(parts) > 2:
-            return "\n".join(parts)
+        """DEPRECATED: Returns None. Use managers/memory.py instead."""
+        import warnings
+        warnings.warn(
+            "ProtectedContextProvider is deprecated. "
+            "Use MemoryManager from src/agent/managers/memory.py instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         return None
 
     def get_layer2_todo_display(self) -> Optional[str]:
-        """Generate the Layer 2 todo list display with visual separators.
+        """DEPRECATED: Returns None. Use managers/todo.py format_for_display() instead."""
+        return None
 
-        Produces a visually distinct todo list format that helps the LLM
-        focus on the current task. Format follows the guardrails spec:
 
-        ═══════════════════════════════════════════════════════════════════
-                                 ACTIVE TODO LIST
-        ═══════════════════════════════════════════════════════════════════
-
-        Phase: Requirement Extraction (2 of 4)
-
-        [x] 1. Process section 1-3
-        [x] 2. Process section 4-6
-        [ ] 3. Consolidate findings      ← CURRENT
-        [ ] 4. Write extraction_results.md
-        [ ] 5. Validate format
-
-        Progress: 2/5 tasks complete
-
-        ───────────────────────────────────────────────────────────────────
-        INSTRUCTION: Complete task 3, then call todo_complete()
-        ═══════════════════════════════════════════════════════════════════
-
-        Returns:
-            Formatted Layer 2 string, or None if no todos
-        """
-        if not self.todo_manager:
-            return None
-
-        try:
-            todos = self.todo_manager.list_all_sync()
-            if not todos:
-                return None
-
-            # Visual separators (use module constants for consistency)
-            thick_sep = LAYER2_START_MARKER
-            thin_sep = "─" * 67
-
-            # Get phase info
-            phase_info = self.todo_manager.get_phase_info()
-            phase_number = phase_info.get("phase_number", 0)
-            total_phases = phase_info.get("total_phases", 0)
-            phase_name = phase_info.get("phase_name", "")
-
-            # Build phase indicator line
-            if phase_number > 0:
-                if phase_name:
-                    phase_line = f"Phase: {phase_name}"
-                else:
-                    phase_line = f"Phase: {phase_number}"
-                if total_phases > 0:
-                    phase_line += f" ({phase_number} of {total_phases})"
-            else:
-                phase_line = "Phase: Bootstrap" if not phase_name else f"Phase: {phase_name}"
-
-            # Build todo lines with numbering
-            todo_lines = []
-            current_task_num = None
-            current_task_content = None
-
-            for idx, t in enumerate(todos[:15], start=1):  # Limit to 15 tasks
-                status_marker = {
-                    "pending": "[ ]",
-                    "in_progress": "[>]",
-                    "completed": "[x]",
-                    "blocked": "[!]",
-                    "skipped": "[-]",
-                }.get(t.status.value, "[ ]")
-
-                # Mark the current task (first in-progress or first pending)
-                is_current = False
-                if current_task_num is None:
-                    if t.status.value == "in_progress":
-                        is_current = True
-                        current_task_num = idx
-                        current_task_content = t.content
-                    elif t.status.value == "pending" and current_task_num is None:
-                        # First pending task is current if no in-progress
-                        is_current = True
-                        current_task_num = idx
-                        current_task_content = t.content
-
-                line = f"{status_marker} {idx}. {t.content}"
-                if is_current:
-                    line += "      ← CURRENT"
-                todo_lines.append(line)
-
-            # Progress stats
-            total = len(todos)
-            completed = len([t for t in todos if t.status.value == "completed"])
-            progress_line = f"Progress: {completed}/{total} tasks complete"
-
-            # Instruction line
-            if current_task_num and current_task_content:
-                # Truncate long task content for instruction
-                task_preview = current_task_content[:40]
-                if len(current_task_content) > 40:
-                    task_preview += "..."
-                instruction = f"INSTRUCTION: Complete task {current_task_num} ({task_preview}), then call todo_complete()"
-            else:
-                instruction = "INSTRUCTION: All tasks complete. Call job_complete() or start next phase."
-
-            # Assemble the display
-            lines = [
-                thick_sep,
-                f"                         {LAYER2_TITLE}",
-                thick_sep,
-                "",
-                phase_line,
-                "",
-            ]
-            lines.extend(todo_lines)
-            lines.extend([
-                "",
-                progress_line,
-                "",
-                thin_sep,
-                instruction,
-                thick_sep,
-            ])
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.debug(f"Could not generate Layer 2 todo display: {e}")
-            return None
+# =============================================================================
 
 
 def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
@@ -413,19 +250,24 @@ class ContextManager:
         self.config = config or ContextConfig()
         self.token_counter = get_token_counter(model)
         self._state = ContextManagementState()
-        self._protected_provider: Optional[ProtectedContextProvider] = None
+        self._protected_provider: Optional[ProtectedContextProvider] = None  # DEPRECATED
 
     def set_protected_provider(self, provider: ProtectedContextProvider) -> None:
-        """Set the protected context provider.
+        """DEPRECATED: Set the protected context provider.
 
-        The protected provider supplies context that survives compaction,
-        ensuring the agent maintains its "roter Faden" across context resets.
+        This method is deprecated and has no effect. The new nested loop graph
+        injects workspace.md directly into the system prompt.
 
-        Args:
-            provider: Provider for protected context
+        Kept for backwards compatibility with graph.py.
         """
+        import warnings
+        warnings.warn(
+            "set_protected_provider is deprecated and has no effect. "
+            "Use graph_nested.py which injects workspace.md directly.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         self._protected_provider = provider
-        logger.info("Protected context provider configured")
 
     @property
     def state(self) -> ContextManagementState:
@@ -784,19 +626,9 @@ Summary:"""
             content=f"[Summary of prior work]\n{summary}"
         )
 
-        # Inject protected context if available (maintains "roter Faden")
-        protected_msg = None
-        if self._protected_provider:
-            protected_content = self._protected_provider.get_protected_context()
-            if protected_content:
-                protected_msg = SystemMessage(content=protected_content)
-                logger.info("Injecting protected context after compaction")
-
-        # Reconstruct: system + protected (if any) + summary + recent
-        result = system_msgs
-        if protected_msg:
-            result = result + [protected_msg]
-        result = result + [summary_msg] + recent_messages
+        # Reconstruct: system + summary + recent
+        # Note: workspace.md is now injected via system prompt in nested loop graph
+        result = system_msgs + [summary_msg] + recent_messages
 
         logger.info(
             f"Compacted {len(messages)} messages to {len(result)} "

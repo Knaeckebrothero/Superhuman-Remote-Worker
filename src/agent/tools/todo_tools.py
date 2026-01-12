@@ -9,10 +9,10 @@ within the two-tier planning model:
 The primary tool is `todo_write` which follows the Claude Code TodoWrite pattern -
 submitting the entire todo list as a single atomic operation.
 
-Phase 4 additions:
-- Integration with PhaseTransitionManager for automatic phase transitions
-- Phase transition detection when last task is completed
-- Transition prompts injected into responses
+NOTE: The phase transition code in this module is legacy.
+For the new nested loop graph (graph_nested.py), phase transitions
+are handled structurally via graph nodes, not via tool callbacks.
+The transition code is kept for backwards compatibility with graph.py.
 """
 
 import json
@@ -32,12 +32,16 @@ from ..core.transitions import (
 logger = logging.getLogger(__name__)
 
 
-# Store the last transition result for the graph to pick up
+# LEGACY: Store the last transition result for the old graph.py to pick up
+# Not used by the new nested loop graph (graph_nested.py)
 _last_transition_result: Optional[TransitionResult] = None
 
 
 def get_last_transition_result() -> Optional[TransitionResult]:
     """Get the last phase transition result.
+
+    LEGACY: Used by old graph.py. The new nested loop graph handles
+    transitions via graph nodes, not this callback mechanism.
 
     This is called by the graph to check if a phase transition should occur.
     After retrieval, the result is cleared.
@@ -52,7 +56,10 @@ def get_last_transition_result() -> Optional[TransitionResult]:
 
 
 def _set_transition_result(result: TransitionResult) -> None:
-    """Set the transition result for the graph to pick up."""
+    """Set the transition result for the graph to pick up.
+
+    LEGACY: Used by old graph.py.
+    """
     global _last_transition_result
     _last_transition_result = result
 

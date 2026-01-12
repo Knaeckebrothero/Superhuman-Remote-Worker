@@ -96,7 +96,10 @@ class ContextManagementConfig:
     compact_on_archive: bool = True
     keep_recent_tool_results: int = 5
     summarization_prompt: str = "Summarize the work completed so far."
-    # Protected context settings (maintains "roter Faden" across compaction)
+    # DEPRECATED: Protected context settings
+    # The new nested loop graph (graph_nested.py) injects workspace.md
+    # into the system prompt directly, replacing the protected context mechanism.
+    # These fields are kept for backwards compatibility with graph.py.
     protected_context_enabled: bool = True
     protected_context_plan_file: str = "main_plan.md"
     protected_context_max_chars: int = 2000

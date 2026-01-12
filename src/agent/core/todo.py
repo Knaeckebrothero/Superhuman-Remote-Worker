@@ -1,5 +1,18 @@
 """Todo list management for autonomous agents.
 
+DEPRECATION NOTICE:
+This module is legacy code. For new development, use:
+- src/agent/managers/todo.py - New TodoManager for nested loop graph
+
+The legacy TodoManager in this file has additional features like phase tracking
+and hierarchical todos that the todo_tools.py depends on. It is kept for
+backwards compatibility with graph.py and todo_tools.py.
+
+The new TodoManager in managers/ is simpler and designed for the
+nested loop graph architecture (graph_nested.py).
+
+---
+
 This module provides todo list functionality for agents to track their tasks,
 breaking down complex jobs into manageable steps and monitoring progress.
 

@@ -675,3 +675,134 @@ The managers encapsulate the complexity:
 - `MemoryManager` handles workspace.md operations
 
 The graph just orchestrates the flow between them.
+
+---
+
+## Implementation Status
+
+### Implemented Files
+
+| File | Purpose | Status |
+|------|---------|--------|
+| `src/agent/managers/__init__.py` | Package exports | ✓ Complete |
+| `src/agent/managers/todo.py` | TodoManager (stateful) | ✓ Complete |
+| `src/agent/managers/plan.py` | PlanManager (service) | ✓ Complete |
+| `src/agent/managers/memory.py` | MemoryManager (service) | ✓ Complete |
+| `src/agent/graph_nested.py` | Nested loop graph | ✓ Complete |
+| `src/agent/core/state.py` | State with loop control fields | ✓ Complete |
+
+### Manager APIs
+
+#### TodoManager
+
+```python
+todo_mgr = TodoManager(workspace_manager)
+
+# Add and manage todos
+item = todo_mgr.add("Task description", priority="high")
+todo_mgr.start("todo_1")
+todo_mgr.complete("todo_1", notes=["Completed successfully"])
+
+# List todos
+all_todos = todo_mgr.list_all()
+pending = todo_mgr.list_pending()  # Sorted by priority
+
+# Check status
+if todo_mgr.all_complete():
+    todo_mgr.archive("phase_1")  # Archives to workspace/archive/
+
+# Display
+display_text = todo_mgr.format_for_display()  # For Layer 2 injection
+progress = todo_mgr.get_progress()  # {"total": 5, "completed": 2, ...}
+```
+
+#### PlanManager
+
+```python
+plan_mgr = PlanManager(workspace_manager)
+
+# Check and read
+if plan_mgr.exists():
+    content = plan_mgr.read()
+
+# Write
+plan_mgr.write("# Plan\n\n## Phase 1\n...")
+
+# Phase detection
+current = plan_mgr.get_current_phase()  # Returns phase name or None
+is_done = plan_mgr.is_complete()  # True if all phases complete
+
+# Mark complete
+plan_mgr.mark_phase_complete("Phase 1")
+```
+
+#### MemoryManager
+
+```python
+mem_mgr = MemoryManager(workspace_manager)
+
+# Basic operations
+mem_mgr.write("# Workspace Memory\n\n## Current State\n...")
+content = mem_mgr.read()
+
+# Section operations
+state_section = mem_mgr.get_section("Current State")
+mem_mgr.update_section("Accomplishments", "- Task 1 done")
+mem_mgr.append_to_section("Notes", "Important observation")
+
+# State helpers
+state = mem_mgr.get_state()  # {"phase": "2", "status": "active"}
+mem_mgr.set_state("Phase", "3")
+```
+
+### Test Files
+
+| Test File | Tests | Status |
+|-----------|-------|--------|
+| `tests/test_managers_todo.py` | 41 tests | ✓ All passing |
+| `tests/test_managers_plan.py` | 32 tests | ✓ All passing |
+| `tests/test_managers_memory.py` | 28 tests | ✓ All passing |
+| `tests/test_graph_nested.py` | 28 tests | ✓ All passing |
+
+Run tests with:
+```bash
+.venv/bin/python -m pytest tests/test_managers_*.py tests/test_graph_nested.py -v
+```
+
+### Graph Nodes
+
+The nested loop graph (`src/agent/graph_nested.py`) includes:
+
+**Initialization nodes:**
+- `init_workspace` - Creates workspace.md from template
+- `read_instructions` - Reads instructions.md into context
+- `create_plan` - LLM creates main_plan.md
+- `init_todos` - Extracts todos from first phase
+
+**Plan phase nodes:**
+- `read_plan` - Reads plan at phase transitions
+- `update_memory` - LLM updates workspace.md
+- `create_todos` - Extracts todos for current phase
+
+**Execute phase nodes:**
+- `execute` - ReAct execution with tools
+- `check_todos` - Checks if all todos complete
+- `archive_phase` - Archives todos and marks phase complete
+
+**Routing functions:**
+- `route_entry` - Routes based on initialization state
+- `route_after_execute` - Routes based on tool calls
+- `route_after_check_todos` - Routes based on phase completion
+- `route_after_check_goal` - Routes based on goal achievement
+
+### Legacy Code (Deprecated)
+
+The following are deprecated and will be removed in a future version:
+
+| File | Reason |
+|------|--------|
+| `src/agent/core/todo.py` | Replaced by `managers/todo.py` |
+| `src/agent/core/transitions.py` | Replaced by graph nodes |
+| `ProtectedContextProvider` in `context.py` | Replaced by MemoryManager |
+
+The legacy `graph.py` is preserved for backwards compatibility but new code should use `graph_nested.py`.

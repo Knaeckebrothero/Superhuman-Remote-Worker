@@ -1,15 +1,17 @@
 """Phase transition automation for the guardrails system.
 
-This module implements automatic phase transitions as described in guardrails.md.
-When an agent completes all tasks in a phase, this module:
-1. Archives completed todos
-2. Generates a workspace summary
-3. Reads main_plan.md to identify the next phase
-4. Injects a transition prompt to guide the agent
-5. Triggers context summarization
+DEPRECATION NOTICE:
+This module is legacy code for the old graph.py architecture.
+The new nested loop graph (graph_nested.py) handles phase transitions
+structurally via graph nodes and doesn't need this module.
 
-The agent is guided through transitions via prompts, but doesn't need to
-understand the mechanics - it just focuses on completing tasks.
+For new code, use:
+- src/agent/managers/plan.py - PlanManager for plan operations
+- src/agent/managers/todo.py - TodoManager for todo operations
+- src/agent/graph_nested.py - Nested loop graph with built-in transitions
+
+This module is kept for backwards compatibility with graph.py.
+It will be removed in a future version.
 """
 
 import logging

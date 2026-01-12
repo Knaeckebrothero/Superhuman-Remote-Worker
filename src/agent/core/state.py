@@ -1,8 +1,13 @@
 """Universal Agent State.
 
-Defines the minimal state structure for the workspace-centric agent architecture.
-This state is simpler than the phase-based states used by Creator/Validator agents
-because the agent manages its workflow through workspace files rather than state fields.
+Defines the state structure for the nested loop graph architecture.
+The state supports:
+- Initialization flow (runs once at job start)
+- Outer loop (strategic planning at phase transitions)
+- Inner loop (tactical execution with todos)
+
+File-based memory (workspace.md, main_plan.md) provides persistence
+across context compaction, while state fields control loop flow.
 """
 
 from typing import Any, Dict, List, Optional, Annotated
@@ -13,26 +18,48 @@ from langgraph.graph.message import add_messages
 
 
 class UniversalAgentState(TypedDict):
-    """Minimal state for workspace-centric autonomous agent.
+    """State for nested loop graph architecture.
 
-    Unlike phase-based agents, the Universal Agent:
-    - Uses workspace files for strategic planning (main_plan.md)
-    - Uses TodoManager for tactical execution (in-memory, archived to workspace)
-    - Tracks minimal state - just what's needed for graph execution
+    The Universal Agent uses a nested loop structure:
+    1. Initialization: Set up workspace, read instructions, create plan
+    2. Outer loop: Read plan, update memory, create todos for phase
+    3. Inner loop: Execute todos until phase complete
+    4. Goal check: Continue outer loop or end
 
-    The agent discovers what to do by reading instructions.md and maintains
-    progress through workspace files and todos, not through state fields.
+    File-based context:
+    - workspace.md: Long-term memory, always in system prompt
+    - main_plan.md: Strategic direction, read at phase transitions
+    - archive/: Completed todos by phase
 
     Attributes:
         messages: Conversation history with automatic deduplication
         job_id: Unique identifier for the current job
         workspace_path: Path to the job's workspace directory
-        iteration: Current LLM iteration count (for limits)
+
+        # Loop control (nested loop architecture)
+        initialized: Whether initialization has completed
+        phase_complete: Inner loop exit condition (all todos done)
+        goal_achieved: Outer loop exit condition (plan complete)
+        iteration: Current iteration count (safety limit)
+        max_iterations: Maximum iterations before forced stop
+
+        # File-based context
+        workspace_memory: Contents of workspace.md for system prompt
+
+        # Execution control
         error: Error information if something went wrong
         should_stop: Flag to signal workflow termination
-        metadata: Optional job-specific metadata (document path, etc.)
-        context_stats: Statistics from context management operations
-        tool_retry_state: State for tool retry tracking
+        consecutive_llm_errors: Count of consecutive LLM failures
+
+        # Job metadata
+        metadata: Job-specific data (document_path, prompt, etc.)
+
+        # Context management
+        context_stats: Token counts and compaction statistics
+        tool_retry_state: Failed tool call tracking
+
+        # Legacy (for backwards compatibility)
+        phase_transition: Old phase transition state
     """
 
     # Core LangGraph state - messages are automatically merged/deduped
@@ -40,12 +67,19 @@ class UniversalAgentState(TypedDict):
 
     # Job identification
     job_id: str
-
-    # Workspace path (relative to workspace base)
     workspace_path: str
 
+    # Loop control (nested loop architecture)
+    initialized: bool                    # Has initialization completed
+    phase_complete: bool                 # Inner loop exit: all todos done
+    goal_achieved: bool                  # Outer loop exit: plan complete
+    iteration: int                       # Current iteration count
+    max_iterations: int                  # Safety limit
+
+    # File-based context (read from workspace into state)
+    workspace_memory: str                # Contents of workspace.md
+
     # Execution control
-    iteration: int
     error: Optional[Dict[str, Any]]
     should_stop: bool
     consecutive_llm_errors: int
@@ -55,15 +89,15 @@ class UniversalAgentState(TypedDict):
     # For Validator: requirement_id, requirement_data, etc.
     metadata: Dict[str, Any]
 
-    # Context management state (Phase 6)
+    # Context management state
     # Tracks token counts, compaction operations, summaries generated
     context_stats: Optional[Dict[str, Any]]
 
-    # Tool retry state (Phase 6)
+    # Tool retry state
     # Tracks failed tool calls and retry attempts
     tool_retry_state: Optional[Dict[str, Any]]
 
-    # Phase transition state (Guardrails Phase 4)
+    # Phase transition state (legacy, for backwards compatibility)
     # Set when a phase transition is triggered by todo_complete or todo_rewind
     # Contains: transition_type, trigger_summarization, metadata
     phase_transition: Optional[Dict[str, Any]]
@@ -72,14 +106,22 @@ class UniversalAgentState(TypedDict):
 def create_initial_state(
     job_id: str,
     workspace_path: str,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    max_iterations: int = 500,
 ) -> UniversalAgentState:
     """Create an initial state for a new job.
+
+    The state is initialized for the nested loop graph:
+    - initialized=False: Triggers initialization flow
+    - phase_complete=False: Inner loop will run
+    - goal_achieved=False: Outer loop will continue
+    - workspace_memory="": Will be populated from workspace.md
 
     Args:
         job_id: Unique job identifier
         workspace_path: Path to job workspace
         metadata: Optional job-specific data
+        max_iterations: Safety limit for iterations (default: 500)
 
     Returns:
         Initial UniversalAgentState ready for graph invocation
@@ -95,15 +137,33 @@ def create_initial_state(
         ```
     """
     return UniversalAgentState(
+        # Core
         messages=[],
         job_id=job_id,
         workspace_path=workspace_path,
+
+        # Loop control
+        initialized=False,
+        phase_complete=False,
+        goal_achieved=False,
         iteration=0,
+        max_iterations=max_iterations,
+
+        # File-based context
+        workspace_memory="",
+
+        # Execution control
         error=None,
         should_stop=False,
         consecutive_llm_errors=0,
+
+        # Metadata
         metadata=metadata or {},
+
+        # Context management
         context_stats=None,
         tool_retry_state=None,
+
+        # Legacy
         phase_transition=None,
     )
