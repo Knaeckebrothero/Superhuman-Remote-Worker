@@ -74,12 +74,12 @@
 
   "polling": {
     "enabled": true,
-    "table": "requirement_cache",
-    "status_field": "validation_status",
+    "table": "requirements",
+    "status_field": "status",
     "status_value_pending": "pending",
     "status_value_processing": "validating",
-    "status_value_complete": "validated",
-    "status_value_failed": "rejected",
+    "status_value_complete": "integrated",
+    "status_value_failed": "failed",
     "interval_seconds": 10,
     "use_skip_locked": true
   },
