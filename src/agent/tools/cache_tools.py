@@ -9,6 +9,7 @@ Used by the Creator Agent to manage requirements before the Validator
 Agent integrates them into Neo4j.
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -61,7 +62,7 @@ def create_cache_tools(context: ToolContext) -> List:
     """
 
     @tool
-    async def add_requirement(
+    def add_requirement(
         text: str,
         name: str,
         req_type: str = "functional",
@@ -140,7 +141,7 @@ def create_cache_tools(context: ToolContext) -> List:
             objects_json = json.dumps(object_list)
             messages_json = json.dumps(message_list)
 
-            result = await context.postgres_conn.fetchrow(
+            result = asyncio.run(context.postgres_conn.fetchrow(
                 query,
                 req_id,
                 context.job_id,
@@ -157,7 +158,7 @@ def create_cache_tools(context: ToolContext) -> List:
                 messages_json,
                 reasoning,
                 confidence,
-            )
+            ))
 
             if result:
                 return f"ok: {req_id}"
@@ -169,7 +170,7 @@ def create_cache_tools(context: ToolContext) -> List:
             return f"error: {str(e)}"
 
     @tool
-    async def list_requirements(
+    def list_requirements(
         status: Optional[str] = None,
         job_id: Optional[str] = None,
         limit: int = 20,
@@ -225,7 +226,7 @@ def create_cache_tools(context: ToolContext) -> List:
             """
             params.extend([limit, offset])
 
-            rows = await context.postgres_conn.fetch(query, *params)
+            rows = asyncio.run(context.postgres_conn.fetch(query, *params))
 
             if not rows:
                 filter_desc = []
@@ -262,7 +263,7 @@ def create_cache_tools(context: ToolContext) -> List:
             return f"Error listing requirements: {str(e)}"
 
     @tool
-    async def get_requirement(requirement_id: str) -> str:
+    def get_requirement(requirement_id: str) -> str:
         """Get full details of a specific requirement by ID.
 
         Args:
@@ -282,7 +283,7 @@ def create_cache_tools(context: ToolContext) -> List:
                 LIMIT 1
             """
 
-            row = await context.postgres_conn.fetchrow(query, requirement_id)
+            row = asyncio.run(context.postgres_conn.fetchrow(query, requirement_id))
 
             if not row:
                 return f"Requirement not found: {requirement_id}"
