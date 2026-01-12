@@ -379,3 +379,235 @@ class TodoManager:
             "pending": total - completed,
             "percentage": round((completed / total * 100) if total > 0 else 0, 1),
         }
+
+    # =========================================================================
+    # Compatibility methods for todo_tools.py
+    # =========================================================================
+
+    def set_todos_from_list(self, todo_list: List[Dict[str, Any]]) -> str:
+        """Replace all todos with items from a list of dictionaries.
+
+        This is used by the todo_write tool to atomically replace the
+        entire todo list.
+
+        Args:
+            todo_list: List of todo dictionaries with keys:
+                - content (str): Task description (required)
+                - status (str): "pending", "in_progress", or "completed"
+                - priority (str): "high", "medium", or "low" (optional)
+                - id (str): Todo ID (optional, auto-generated if missing)
+
+        Returns:
+            Formatted summary of the updated todo list
+        """
+        # Clear existing todos
+        self._todos = []
+        self._next_id = 1
+
+        # Add each todo from the list
+        for item in todo_list:
+            content = item.get("content", "")
+            status_str = item.get("status", "pending")
+            priority = item.get("priority", "medium")
+            todo_id = item.get("id")
+
+            # Create todo item
+            if todo_id:
+                todo = TodoItem(
+                    id=todo_id,
+                    content=content,
+                    priority=priority,
+                    status=TodoStatus(status_str),
+                )
+            else:
+                todo = TodoItem(
+                    id=f"todo_{self._next_id}",
+                    content=content,
+                    priority=priority,
+                    status=TodoStatus(status_str),
+                )
+                self._next_id += 1
+
+            self._todos.append(todo)
+
+        logger.info(f"Set {len(self._todos)} todos from list")
+        return self._format_todo_summary()
+
+    def archive_and_reset(self, phase_name: str = "") -> str:
+        """Archive todos and reset for next phase.
+
+        Convenience method that calls archive() and returns a
+        user-friendly message.
+
+        Args:
+            phase_name: Optional name for the archived phase
+
+        Returns:
+            Confirmation message with archive path
+        """
+        if not self._todos:
+            return "No todos to archive. The todo list is already empty."
+
+        count = len(self._todos)
+        archive_path = self.archive(phase_name)
+
+        return (
+            f"Archived {count} todos to {archive_path}.\n"
+            f"Todo list cleared. Ready for new phase.\n"
+            f"Use todo_write to add new tasks."
+        )
+
+    def complete_first_pending_sync(self) -> Dict[str, Any]:
+        """Find and complete the first pending or in-progress task.
+
+        Looks for tasks in this order:
+        1. First in_progress task
+        2. First pending task (by priority)
+
+        Returns:
+            Dictionary with:
+                - message (str): Status message
+                - completed_id (str): ID of completed task (if any)
+                - is_last_task (bool): True if this was the last task
+        """
+        # Find first in_progress task
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        if in_progress:
+            target = in_progress[0]
+        else:
+            # Find first pending task
+            pending = self.list_pending()
+            if not pending:
+                return {
+                    "message": "No pending tasks to complete.",
+                    "completed_id": None,
+                    "is_last_task": True,
+                }
+            target = pending[0]
+
+        # Complete it
+        self.complete(target.id)
+
+        # Check if all complete now
+        is_last = self.all_complete()
+
+        # Build message
+        remaining = len(self.list_pending())
+        if is_last:
+            message = (
+                f"Completed: {target.content}\n"
+                f"All tasks complete! Ready for phase transition."
+            )
+        else:
+            next_task = self.list_pending()[0] if remaining > 0 else None
+            next_str = f"\nNext: {next_task.content}" if next_task else ""
+            message = (
+                f"Completed: {target.content}\n"
+                f"Remaining: {remaining} tasks{next_str}"
+            )
+
+        return {
+            "message": message,
+            "completed_id": target.id,
+            "is_last_task": is_last,
+        }
+
+    def _format_todo_summary(self) -> str:
+        """Format a summary of the current todo list.
+
+        Returns:
+            Formatted summary string
+        """
+        if not self._todos:
+            return "Todo list is empty."
+
+        lines = []
+        progress = self.get_progress()
+        bar_len = 20
+        filled = int(bar_len * progress["percentage"] / 100)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        lines.append(f"Progress: [{bar}] {progress['percentage']}%")
+        lines.append(f"Total: {progress['total']} | Completed: {progress['completed']} | Pending: {progress['pending']}")
+        lines.append("")
+
+        # Group by status
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+        completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
+
+        if in_progress:
+            lines.append("IN PROGRESS:")
+            for t in in_progress:
+                lines.append(f"  → {t.content}")
+
+        if pending:
+            lines.append("PENDING:")
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            for t in sorted(pending, key=lambda x: priority_order.get(x.priority, 1)):
+                marker = "[!]" if t.priority == "high" else "[ ]"
+                lines.append(f"  {marker} {t.content}")
+
+        if completed:
+            lines.append(f"COMPLETED: ({len(completed)} tasks)")
+            for t in completed[:3]:  # Show last 3
+                lines.append(f"  ✓ {t.content}")
+            if len(completed) > 3:
+                lines.append(f"  ... and {len(completed) - 3} more")
+
+        return "\n".join(lines)
+
+    def set_phase_info(
+        self,
+        phase_number: int = 0,
+        total_phases: int = 0,
+        phase_name: str = "",
+    ) -> None:
+        """Legacy compatibility stub - phase tracking is no longer used.
+
+        In the new nested loop architecture, phase transitions are handled
+        structurally by graph nodes, not via TodoManager state.
+
+        Args:
+            phase_number: Ignored
+            total_phases: Ignored
+            phase_name: Ignored
+        """
+        logger.debug(
+            f"set_phase_info called (ignored): phase={phase_number}/{total_phases}, name={phase_name}"
+        )
+
+    def archive_with_failure_note(self, issue: str) -> str:
+        """Archive todos with a failure note.
+
+        Used by todo_rewind when the current approach isn't working.
+
+        Args:
+            issue: Description of why the approach failed
+
+        Returns:
+            Confirmation message
+        """
+        if not self._todos:
+            return "No todos to archive."
+
+        # Add failure note to archive content
+        count = len(self._todos)
+        phase_name = f"failed_{datetime.now(timezone.utc).strftime('%H%M%S')}"
+
+        # Archive with phase name indicating failure
+        archive_path = self.archive(phase_name)
+
+        # Append failure note to the archive file
+        note_content = f"\n\n## Failure Note\n\n{issue}\n"
+        try:
+            existing = self._workspace.read_file(archive_path)
+            self._workspace.write_file(archive_path, existing + note_content)
+        except Exception as e:
+            logger.warning(f"Could not append failure note: {e}")
+
+        return (
+            f"Archived {count} todos with failure note to {archive_path}.\n"
+            f"Issue: {issue}\n"
+            f"Todo list cleared for re-planning."
+        )

@@ -20,8 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class WorkspaceConfig:
-    """Configuration for workspace management."""
+class WorkspaceManagerConfig:
+    """Configuration for WorkspaceManager.
+
+    Note: This is distinct from loader.py:WorkspaceConfig which is used
+    for AgentConfig JSON parsing. This class configures the runtime
+    WorkspaceManager behavior.
+    """
 
     # Base path for all workspaces
     base_path: Optional[str] = None
@@ -40,7 +45,7 @@ class WorkspaceConfig:
     instructions_template: Optional[str] = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> "WorkspaceConfig":
+    def from_dict(cls, data: dict) -> "WorkspaceManagerConfig":
         """Create config from dictionary."""
         return cls(
             base_path=data.get("base_path"),
@@ -107,7 +112,7 @@ class WorkspaceManager:
     def __init__(
         self,
         job_id: str,
-        config: Optional[WorkspaceConfig] = None,
+        config: Optional[WorkspaceManagerConfig] = None,
         base_path: Optional[Path] = None,
     ):
         """Initialize workspace manager.
@@ -118,7 +123,7 @@ class WorkspaceManager:
             base_path: Override base path (for testing)
         """
         self.job_id = job_id
-        self.config = config or WorkspaceConfig()
+        self.config = config or WorkspaceManagerConfig()
 
         # Determine base path
         if base_path:

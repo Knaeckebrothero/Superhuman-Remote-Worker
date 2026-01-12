@@ -1,6 +1,6 @@
-"""Universal Agent Implementation.
+"""Agent Implementation.
 
-The Universal Agent is a configurable, workspace-centric autonomous agent
+This Agent is a configurable, workspace-centric autonomous agent
 that can be deployed as Creator, Validator, or any future agent type by
 changing its configuration file.
 
@@ -23,8 +23,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 
-from .core.workspace import WorkspaceManager, WorkspaceConfig as WMConfig
-from .core.todo import TodoManager
+from .core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from .managers import TodoManager
 from .tools import ToolContext, load_tools
 
 from .core.state import UniversalAgentState, create_initial_state
@@ -391,7 +391,7 @@ Status: Starting
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
         self._workspace_manager = WorkspaceManager(
             job_id=job_id,
-            config=WMConfig(
+            config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
             )
         )
@@ -408,11 +408,7 @@ Status: Starting
                 logger.debug("Wrote missing instructions.md to workspace")
 
             # Create todo manager for this workspace
-            self._todo_manager = TodoManager(
-                workspace_manager=self._workspace_manager,
-                auto_reflection=self.config.todo.auto_reflection,
-                reflection_task_content=self.config.todo.reflection_task_content,
-            )
+            self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
             return metadata or {}
@@ -495,11 +491,7 @@ Status: Starting
                 logger.warning(f"Document not found: {source_path}")
 
         # Create todo manager for this workspace
-        self._todo_manager = TodoManager(
-            workspace_manager=self._workspace_manager,
-            auto_reflection=self.config.todo.auto_reflection,
-            reflection_task_content=self.config.todo.reflection_task_content,
-        )
+        self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
         # Generate tool documentation in workspace
         tool_names = get_all_tool_names(self.config)

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agent/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/config/creator.json` or `src/config/validator.json`).
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agent/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/agent/config/creator.json` or `src/agent/config/validator.json`).
 
 ## Commands
 
@@ -21,8 +21,8 @@ python src/scripts/app_init.py --force-reset --seed
 
 # Run tests
 pytest tests/                            # All tests
-pytest tests/test_workspace_manager.py   # Single test file
-pytest tests/ -k "test_vector"           # Tests matching pattern
+pytest tests/test_graph.py               # Single test file
+pytest tests/ -k "managers"              # Tests matching pattern
 
 # Metamodel validation
 python validate_metamodel.py              # All checks
@@ -73,7 +73,7 @@ python cancel_job.py --job-id <uuid> --cleanup
 
 **Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
-**Agent configs (`src/config/*.json`):** LLM settings, workspace structure, tools, polling behavior, limits. See `src/config/schema.json` for full spec.
+**Agent configs (`src/agent/config/*.json`):** LLM settings, workspace structure, tools, polling behavior, limits. See `src/agent/config/schema.json` for full spec.
 
 ## Architecture
 
@@ -111,9 +111,9 @@ python cancel_job.py --job-id <uuid> --cleanup
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
 - `src/database/` - PostgreSQL schema and utilities
-- `src/config/` - Agent configuration (JSON) and instruction templates (Markdown in `instructions/`)
+- `src/agent/config/` - Agent configuration (JSON) and prompts (Markdown in `prompts/`)
 
-**Note on legacy code:** `src/agent/core/todo.py` and `src/agent/core/transitions.py` are deprecated. New code should use `src/agent/managers/` and the nested loop graph (`src/agent/graph.py`).
+**Manager layer:** Task management uses `src/agent/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/agent/graph.py`).
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -179,7 +179,7 @@ INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
                             check_goal → END or back to OUTER LOOP
 ```
 
-**Configuration (`src/config/<name>.json`):**
+**Configuration (`src/agent/config/<name>.json`):**
 - `llm`: Model, temperature, reasoning level
 - `workspace.structure`: Directory layout for agent's filesystem
 - `tools`: Tool categories (workspace, todo, domain, completion)
@@ -200,8 +200,8 @@ INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
 The nested loop graph creates its own managers inside `build_nested_loop_graph()`. The graph uses an audited tool node (`create_audited_tool_node`) that logs all tool calls and results for debugging and compliance.
 
 **Creating a new agent type:**
-1. Create `src/config/<name>.json` based on `schema.json`
-2. Create `src/config/instructions/<name>_instructions.md`
+1. Create `src/agent/config/<name>.json` based on `schema.json`
+2. Create `src/agent/config/prompts/<name>_instructions.md`
 3. Add domain-specific tools to `src/agent/tools/` if needed
 4. Register new tools in `src/agent/tools/registry.py`
 
@@ -261,7 +261,7 @@ When adding a new tool to the system:
 
 3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`
 
-4. **Add to agent config** in `src/config/<agent>.json` under the appropriate category:
+4. **Add to agent config** in `src/agent/config/<agent>.json` under the appropriate category:
    ```json
    "tools": {
        "domain": ["my_tool", ...]
@@ -278,35 +278,27 @@ When adding a new tool to the system:
 ## Testing
 
 ```bash
-# Run all tests (use venv for full test suite)
-.venv/bin/python -m pytest tests/
+# Run all tests
+pytest tests/
 
 # Run specific test file
-.venv/bin/python -m pytest tests/test_todo_tools.py
+pytest tests/test_graph.py
 
 # Run with verbose output
-.venv/bin/python -m pytest tests/ -v
+pytest tests/ -v
 
 # Run tests matching pattern
-.venv/bin/python -m pytest tests/ -k "workspace"
+pytest tests/ -k "managers"
 
 # Run with coverage
-.venv/bin/python -m pytest tests/ --cov=src
+pytest tests/ --cov=src
 
 # Manager tests (nested loop architecture)
-.venv/bin/python -m pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
-
-# Graph tests
-.venv/bin/python -m pytest tests/test_graph.py -v
+pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
 ```
 
 **Key test files:**
-- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager (new architecture)
+- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager
 - `tests/test_graph.py` - Tests for routing functions and graph nodes
-- `tests/test_workspace_manager.py` - WorkspaceManager tests
-- `tests/test_workspace_tools.py` - Workspace tool tests
-- `tests/test_context_management.py` - Context compaction tests
-- `tests/test_todo_tools.py` - Todo tool tests (uses legacy `src/agent/core/todo.py`)
-- `tests/test_phase_transitions.py` - Phase transition tests (uses legacy `src/agent/core/transitions.py`)
 
-Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup like database connections.
+Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup.

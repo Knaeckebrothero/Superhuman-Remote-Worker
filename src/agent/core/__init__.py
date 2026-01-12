@@ -1,7 +1,9 @@
 """Core utilities for Universal Agent.
 
 Contains state management, context handling, workspace operations,
-todo management, and supporting infrastructure.
+and supporting infrastructure.
+
+NOTE: For TodoManager, use src.agent.managers.TodoManager instead.
 """
 
 from .state import UniversalAgentState, create_initial_state
@@ -17,21 +19,10 @@ from .loader import (
 from .context import (
     ContextConfig,
     ContextManager,
-    ProtectedContextConfig,
-    ProtectedContextProvider,
     ToolRetryManager,
 )
-from .workspace import WorkspaceManager, WorkspaceConfig
-from .todo import TodoManager, TodoItem, TodoStatus
+from .workspace import WorkspaceManager, WorkspaceManagerConfig
 from .archiver import get_archiver, LLMArchiver
-from .transitions import (
-    TransitionType,
-    TransitionResult,
-    PhaseInfo,
-    PhaseTransitionManager,
-    get_bootstrap_todos,
-    BOOTSTRAP_PROMPT,
-)
 
 __all__ = [
     # State
@@ -48,24 +39,11 @@ __all__ = [
     # Context
     "ContextConfig",
     "ContextManager",
-    "ProtectedContextConfig",
-    "ProtectedContextProvider",
     "ToolRetryManager",
     # Workspace
     "WorkspaceManager",
-    "WorkspaceConfig",
-    # Todo
-    "TodoManager",
-    "TodoItem",
-    "TodoStatus",
+    "WorkspaceManagerConfig",
     # Archiver
     "get_archiver",
     "LLMArchiver",
-    # Transitions
-    "TransitionType",
-    "TransitionResult",
-    "PhaseInfo",
-    "PhaseTransitionManager",
-    "get_bootstrap_todos",
-    "BOOTSTRAP_PROMPT",
 ]

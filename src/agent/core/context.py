@@ -17,7 +17,7 @@ References:
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -76,58 +76,6 @@ class ContextConfig:
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
-
-
-# =============================================================================
-# DEPRECATED CLASSES - Kept for backwards compatibility with graph.py
-# =============================================================================
-
-
-@dataclass
-class ProtectedContextConfig:
-    """DEPRECATED: Configuration for protected context.
-
-    This class is deprecated and does nothing. The new nested loop graph
-    (graph.py) injects workspace.md directly into the system prompt.
-
-    Kept for backwards compatibility with graph.py.
-    """
-    enabled: bool = True
-    plan_file: str = "main_plan.md"
-    max_plan_chars: int = 2000
-    include_todos: bool = True
-
-
-@dataclass
-class ProtectedContextProvider:
-    """DEPRECATED: Provider for protected context.
-
-    This class is deprecated and does nothing. The new nested loop graph
-    (graph.py) injects workspace.md directly into the system prompt.
-
-    Kept for backwards compatibility with graph.py.
-    """
-    workspace_manager: Optional[Any] = None
-    todo_manager: Optional[Any] = None
-    config: ProtectedContextConfig = field(default_factory=ProtectedContextConfig)
-
-    def get_protected_context(self) -> Optional[str]:
-        """DEPRECATED: Returns None. Use managers/memory.py instead."""
-        import warnings
-        warnings.warn(
-            "ProtectedContextProvider is deprecated. "
-            "Use MemoryManager from src/agent/managers/memory.py instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        return None
-
-    def get_layer2_todo_display(self) -> Optional[str]:
-        """DEPRECATED: Returns None. Use managers/todo.py format_for_display() instead."""
-        return None
-
-
-# =============================================================================
 
 
 def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
@@ -250,24 +198,6 @@ class ContextManager:
         self.config = config or ContextConfig()
         self.token_counter = get_token_counter(model)
         self._state = ContextManagementState()
-        self._protected_provider: Optional[ProtectedContextProvider] = None  # DEPRECATED
-
-    def set_protected_provider(self, provider: ProtectedContextProvider) -> None:
-        """DEPRECATED: Set the protected context provider.
-
-        This method is deprecated and has no effect. The new nested loop graph
-        injects workspace.md directly into the system prompt.
-
-        Kept for backwards compatibility with graph.py.
-        """
-        import warnings
-        warnings.warn(
-            "set_protected_provider is deprecated and has no effect. "
-            "Use graph.py which injects workspace.md directly.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-        self._protected_provider = provider
 
     @property
     def state(self) -> ContextManagementState:

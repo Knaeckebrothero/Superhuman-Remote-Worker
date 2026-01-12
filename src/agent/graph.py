@@ -59,7 +59,12 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
 from .core.state import UniversalAgentState
-from .core.loader import AgentConfig
+from .core.loader import (
+    AgentConfig,
+    load_planning_prompt,
+    load_todo_extraction_prompt,
+    load_memory_update_prompt,
+)
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
 from .managers import TodoManager, PlanManager, MemoryManager
@@ -187,10 +192,17 @@ def create_create_plan_node(
     llm: BaseChatModel,
     plan_manager: PlanManager,
     config: AgentConfig,
+    planning_prompt: str = "",
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the create_plan node.
 
     This node uses the LLM to create main_plan.md from instructions.
+
+    Args:
+        llm: LLM instance for plan generation
+        plan_manager: Plan manager for reading/writing plans
+        config: Agent configuration
+        planning_prompt: Prompt template for plan creation (loaded from file)
     """
 
     def create_plan(state: UniversalAgentState) -> Dict[str, Any]:
@@ -210,41 +222,13 @@ def create_create_plan_node(
 
         messages = state.get("messages", [])
 
-        # Create planning prompt
-        planning_prompt = """Based on the instructions, create a structured plan in markdown format.
-
-The plan should have:
-1. A clear goal statement
-2. Numbered phases (## Phase 1, ## Phase 2, etc.)
-3. Each phase should have specific, actionable steps
-4. Mark initial status as "pending" for each phase
-
-Format example:
-```markdown
-# Plan: [Goal Summary]
-
-## Goal
-[Clear statement of what needs to be accomplished]
-
-## Phase 1: [Phase Name]
-Status: pending
-
-Steps:
-- [ ] Step 1
-- [ ] Step 2
-
-## Phase 2: [Phase Name]
-Status: pending
-
-Steps:
-- [ ] Step 1
-- [ ] Step 2
-```
-
-Create the plan now. Be specific and actionable."""
+        # Use loaded planning prompt or fallback
+        prompt_text = planning_prompt or """Create a structured plan with numbered phases.
+Each phase should have specific, actionable steps.
+Mark initial status as "pending" for each phase."""
 
         # Call LLM to create plan
-        plan_messages = messages + [HumanMessage(content=planning_prompt)]
+        plan_messages = messages + [HumanMessage(content=prompt_text)]
 
         # Audit LLM call
         auditor = get_archiver()
@@ -320,10 +304,18 @@ def create_init_todos_node(
     plan_manager: PlanManager,
     todo_manager: TodoManager,
     config: AgentConfig,
+    todo_extraction_prompt: str = "",
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the init_todos node.
 
     This node extracts todos for the first phase from the plan.
+
+    Args:
+        llm: LLM instance for todo extraction
+        plan_manager: Plan manager for reading plan
+        todo_manager: Todo manager for writing todos
+        config: Agent configuration
+        todo_extraction_prompt: Prompt template with {current_phase} and {plan_content} vars
     """
 
     def init_todos(state: UniversalAgentState) -> Dict[str, Any]:
@@ -337,20 +329,17 @@ def create_init_todos_node(
         if not current_phase:
             current_phase = "Phase 1"
 
-        # Create todo extraction prompt
-        extraction_prompt = f"""Based on this plan, extract the specific todos for {current_phase}.
-
-Plan:
+        # Use loaded prompt or fallback
+        prompt_template = todo_extraction_prompt or """Extract todos for {current_phase} from:
 {plan_content}
 
-List the todos as a JSON array with this format:
-[
-  {{"content": "Todo description", "priority": "high|medium|low"}},
-  ...
-]
+Return a JSON array: [{{"content": "Task", "priority": "high|medium|low"}}]
+Return ONLY the JSON array."""
 
-Only include todos for {current_phase}. Be specific and actionable.
-Return ONLY the JSON array, no other text."""
+        extraction_prompt = prompt_template.format(
+            current_phase=current_phase,
+            plan_content=plan_content,
+        )
 
         messages = state.get("messages", [])
         todo_messages = messages + [HumanMessage(content=extraction_prompt)]
@@ -511,10 +500,17 @@ def create_update_memory_node(
     llm: BaseChatModel,
     memory_manager: MemoryManager,
     config: AgentConfig,
+    memory_update_prompt: str = "",
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the update_memory node.
 
     This node has the LLM update workspace.md with learnings.
+
+    Args:
+        llm: LLM instance for memory updates
+        memory_manager: Memory manager for reading/writing workspace.md
+        config: Agent configuration
+        memory_update_prompt: Prompt template with {current_memory} var
     """
 
     def update_memory(state: UniversalAgentState) -> Dict[str, Any]:
@@ -526,20 +522,14 @@ def create_update_memory_node(
         current_memory = memory_manager.read()
         messages = state.get("messages", [])
 
-        # Create memory update prompt
-        update_prompt = f"""Review the recent work and update the workspace memory.
-
-Current workspace.md:
+        # Use loaded prompt or fallback
+        prompt_template = memory_update_prompt or """Update workspace.md based on recent work.
+Current content:
 {current_memory}
 
-Update the following sections as needed:
-- Current State: Update phase and status
-- Accomplishments: Add any completed work
-- Key Decisions: Record important decisions made
-- Notes: Add relevant observations
+Return the complete updated content."""
 
-Return the complete updated workspace.md content.
-Keep the same markdown structure. Be concise."""
+        update_prompt = prompt_template.format(current_memory=current_memory)
 
         memory_messages = messages[-10:] + [HumanMessage(content=update_prompt)]
 
@@ -615,10 +605,18 @@ def create_create_todos_node(
     plan_manager: PlanManager,
     todo_manager: TodoManager,
     config: AgentConfig,
+    todo_extraction_prompt: str = "",
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the create_todos node.
 
     This node extracts todos for the current phase.
+
+    Args:
+        llm: LLM instance for todo extraction
+        plan_manager: Plan manager for reading plan
+        todo_manager: Todo manager for writing todos
+        config: Agent configuration
+        todo_extraction_prompt: Prompt template with {current_phase} and {plan_content} vars
     """
 
     def create_todos(state: UniversalAgentState) -> Dict[str, Any]:
@@ -636,15 +634,17 @@ def create_create_todos_node(
                 "goal_achieved": True,
             }
 
-        # Create todo extraction prompt
-        extraction_prompt = f"""Extract specific todos for {current_phase} from this plan:
-
+        # Use loaded prompt or fallback
+        prompt_template = todo_extraction_prompt or """Extract todos for {current_phase} from:
 {plan_content}
 
-Return a JSON array:
-[{{"content": "Task description", "priority": "high|medium|low"}}]
+Return a JSON array: [{{"content": "Task", "priority": "high|medium|low"}}]
+Return ONLY the JSON array."""
 
-Only include todos for {current_phase}. Return ONLY the JSON array."""
+        extraction_prompt = prompt_template.format(
+            current_phase=current_phase,
+            plan_content=plan_content,
+        )
 
         messages = state.get("messages", [])
         todo_messages = messages[-5:] + [HumanMessage(content=extraction_prompt)]
@@ -1313,6 +1313,11 @@ def build_nested_loop_graph(
     plan_manager = PlanManager(workspace)
     memory_manager = MemoryManager(workspace)
 
+    # Load prompts from files
+    planning_prompt = load_planning_prompt()
+    todo_extraction_prompt = load_todo_extraction_prompt()
+    memory_update_prompt = load_memory_update_prompt()
+
     # Default workspace template
     if not workspace_template:
         workspace_template = """# Workspace Memory
@@ -1345,13 +1350,13 @@ Status: Starting
     # Initialization
     init_workspace = create_init_workspace_node(memory_manager, workspace_template, config)
     read_instructions = create_read_instructions_node(workspace, config)
-    create_plan = create_create_plan_node(llm, plan_manager, config)
-    init_todos = create_init_todos_node(llm, plan_manager, todo_manager, config)
+    create_plan = create_create_plan_node(llm, plan_manager, config, planning_prompt)
+    init_todos = create_init_todos_node(llm, plan_manager, todo_manager, config, todo_extraction_prompt)
 
     # Plan phase
     read_plan = create_read_plan_node(plan_manager, memory_manager, config)
-    update_memory = create_update_memory_node(llm, memory_manager, config)
-    create_todos = create_create_todos_node(llm, plan_manager, todo_manager, config)
+    update_memory = create_update_memory_node(llm, memory_manager, config, memory_update_prompt)
+    create_todos = create_create_todos_node(llm, plan_manager, todo_manager, config, todo_extraction_prompt)
 
     # Execute phase
     execute = create_execute_node(llm_with_tools, todo_manager, memory_manager, system_prompt, config)

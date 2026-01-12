@@ -238,9 +238,10 @@
           "default": 5,
           "description": "Number of recent tool results to keep in full"
         },
-        "summarization_prompt": {
+        "summarization_template": {
           "type": "string",
-          "description": "Prompt for context summarization"
+          "description": "Filename of summarization prompt template (in prompts/ folder)",
+          "default": "summarization_prompt.md"
         }
       }
     }

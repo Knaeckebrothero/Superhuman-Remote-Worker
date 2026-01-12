@@ -1,21 +1,24 @@
-# Workspace Context
+# Workspace Memory
 
-This file is your persistent memory. It is automatically included in your context.
-Update it with write_file("workspace.md", content) to persist important information.
+This file persists across context compaction. Update it to preserve important information.
 
-## Current State
+## Status
 
-Phase: Bootstrap
-Status: Initializing workspace
+- **Phase**: Bootstrap
+- **Progress**: Initializing
 
 ## Accomplishments
 
-(None yet - record milestones here)
+(Record completed milestones)
 
 ## Key Decisions
 
-(Record important decisions for reference across context compaction)
+(Record decisions and reasoning for future reference)
+
+## Entities
+
+(Track resolved entities, IDs, relationships)
 
 ## Notes
 
-(Working notes and observations)
+(Working observations and reminders)

@@ -8,67 +8,24 @@ within the two-tier planning model:
 
 The primary tool is `todo_write` which follows the Claude Code TodoWrite pattern -
 submitting the entire todo list as a single atomic operation.
-
-NOTE: The phase transition code in this module is legacy.
-For the new nested loop graph (graph.py), phase transitions
-are handled structurally via graph nodes, not via tool callbacks.
-The transition code is kept for backwards compatibility with graph.py.
 """
 
 import json
 import logging
-from typing import List, Optional
+from typing import List
 
 from langchain_core.tools import tool
 
 from .context import ToolContext
-from ..core.transitions import (
-    PhaseTransitionManager,
-    TransitionResult,
-    TransitionType,
-    get_job_completion_todos,
-)
 
 logger = logging.getLogger(__name__)
-
-
-# LEGACY: Store the last transition result for the old graph.py to pick up
-# Not used by the new nested loop graph (graph.py)
-_last_transition_result: Optional[TransitionResult] = None
-
-
-def get_last_transition_result() -> Optional[TransitionResult]:
-    """Get the last phase transition result.
-
-    LEGACY: Used by old graph.py. The new nested loop graph handles
-    transitions via graph nodes, not this callback mechanism.
-
-    This is called by the graph to check if a phase transition should occur.
-    After retrieval, the result is cleared.
-
-    Returns:
-        TransitionResult if a transition should occur, None otherwise
-    """
-    global _last_transition_result
-    result = _last_transition_result
-    _last_transition_result = None
-    return result
-
-
-def _set_transition_result(result: TransitionResult) -> None:
-    """Set the transition result for the graph to pick up.
-
-    LEGACY: Used by old graph.py.
-    """
-    global _last_transition_result
-    _last_transition_result = result
 
 
 def create_todo_tools(context: ToolContext) -> List:
     """Create todo tools bound to a specific context.
 
     Args:
-        context: ToolContext with todo_manager (and optionally workspace_manager for archives)
+        context: ToolContext with todo_manager
 
     Returns:
         List of LangChain tool functions
@@ -80,10 +37,6 @@ def create_todo_tools(context: ToolContext) -> List:
         raise ValueError("ToolContext must have a todo_manager for todo tools")
 
     todo_mgr = context.todo_manager
-
-    # If workspace manager is available, set it for archive operations
-    if context.has_workspace():
-        todo_mgr.set_workspace_manager(context.workspace_manager)
 
     @tool
     def todo_write(todos: str) -> str:
@@ -156,7 +109,7 @@ def create_todo_tools(context: ToolContext) -> List:
                 if "status" not in todo:
                     return f"Error: todo at index {i} missing required 'status' field"
 
-            # Use the new set_todos_from_list method
+            # Use the set_todos_from_list method
             result = todo_mgr.set_todos_from_list(todo_list)
             return result
 
@@ -216,55 +169,16 @@ def create_todo_tools(context: ToolContext) -> List:
             - Which task was completed
             - How many tasks remain
             - What the next task is (if any)
-            - Phase transition instructions (if this was the last task)
 
         Note:
-            When you complete the last task in a phase, this tool automatically
-            triggers phase transition. You'll receive instructions to:
-            1. Read main_plan.md
-            2. Update the plan
-            3. Create new todos for the next phase
+            When all tasks are complete, consider:
+            1. Reading main_plan.md to check overall progress
+            2. Using archive_and_reset to archive completed work
+            3. Creating new todos for the next phase
         """
         try:
             result = todo_mgr.complete_first_pending_sync()
-            message = result["message"]
-
-            # Check if this was the last task in the phase
-            if result.get("is_last_task", False):
-                logger.info("Last task in phase completed, checking for phase transition")
-
-                # Create phase transition manager
-                transition_mgr = PhaseTransitionManager(
-                    workspace_manager=context.workspace_manager if context.has_workspace() else None,
-                    todo_manager=todo_mgr,
-                )
-
-                # Check for transition
-                transition_result = transition_mgr.check_transition(is_last_task=True)
-
-                if transition_result.should_transition:
-                    # Execute the transition (archive todos, etc.)
-                    execution = transition_mgr.execute_transition(transition_result)
-                    logger.info(f"Phase transition executed: {execution}")
-
-                    # Store the result for the graph to pick up
-                    _set_transition_result(transition_result)
-
-                    # If all phases are complete, automatically inject job completion todos
-                    if transition_result.transition_type == TransitionType.JOB_COMPLETE:
-                        logger.info("All phases complete, injecting job completion todos")
-                        completion_todos = get_job_completion_todos()
-                        todo_mgr.set_todos_from_list(completion_todos)
-                        todo_mgr.set_phase_info(
-                            phase_number=0,  # Special phase for job completion
-                            total_phases=0,
-                            phase_name="Job Completion",
-                        )
-
-                    # Append the transition prompt to the message
-                    message += "\n\n" + transition_result.transition_prompt
-
-            return message
+            return result["message"]
 
         except Exception as e:
             logger.error(f"todo_complete error: {e}")
@@ -287,13 +201,11 @@ def create_todo_tools(context: ToolContext) -> List:
         This tool will:
         1. Archive your current todos with the failure reason
         2. Clear the todo list
-        3. Trigger a rewind transition with recovery instructions
 
-        After calling this, you will receive detailed instructions to:
+        After calling this, you should:
         1. Read main_plan.md to review overall strategy
-        2. Read workspace_summary.md for current state
-        3. Update main_plan.md if needed
-        4. Create new todos with todo_write()
+        2. Update main_plan.md if needed
+        3. Create new todos with todo_write()
 
         Args:
             issue: Description of WHY the current approach isn't working.
@@ -301,7 +213,7 @@ def create_todo_tools(context: ToolContext) -> List:
                    Example: "The API doesn't support batch operations >100 items"
 
         Returns:
-            Rewind transition instructions for recovery
+            Confirmation message with instructions for re-planning
         """
         if not issue or not issue.strip():
             return "Error: You must provide an 'issue' describing why the rewind is needed."
@@ -310,20 +222,14 @@ def create_todo_tools(context: ToolContext) -> List:
             # Archive with failure note
             result = todo_mgr.archive_with_failure_note(issue.strip())
 
-            # Create phase transition manager for rewind transition
-            transition_mgr = PhaseTransitionManager(
-                workspace_manager=context.workspace_manager if context.has_workspace() else None,
-                todo_manager=todo_mgr,
+            # Return with re-planning instructions
+            return (
+                f"{result}\n\n"
+                "To recover, please:\n"
+                "1. Read main_plan.md to review the overall strategy\n"
+                "2. Update main_plan.md if the approach needs to change\n"
+                "3. Create new todos with todo_write()"
             )
-
-            # Get rewind transition result
-            transition_result = transition_mgr.check_rewind_transition(issue.strip())
-
-            # Store the result for the graph to pick up
-            _set_transition_result(transition_result)
-
-            # Return the rewind transition prompt
-            return transition_result.transition_prompt
 
         except ValueError as e:
             return f"Error: {str(e)}"

@@ -53,8 +53,6 @@ class TodoConfig:
     max_items: int = 25
     archive_on_reset: bool = True
     archive_path: str = "archive/"
-    auto_reflection: bool = True
-    reflection_task_content: str = "Review plan, update progress, create next todos"
 
 
 @dataclass
@@ -95,15 +93,7 @@ class ContextManagementConfig:
 
     compact_on_archive: bool = True
     keep_recent_tool_results: int = 5
-    summarization_prompt: str = "Summarize the work completed so far."
-    # DEPRECATED: Protected context settings
-    # The new nested loop graph (graph.py) injects workspace.md
-    # into the system prompt directly, replacing the protected context mechanism.
-    # These fields are kept for backwards compatibility with graph.py.
-    protected_context_enabled: bool = True
-    protected_context_plan_file: str = "main_plan.md"
-    protected_context_max_chars: int = 2000
-    protected_context_include_todos: bool = True
+    summarization_template: str = "summarization_prompt.md"
 
 
 @dataclass
@@ -226,9 +216,9 @@ def load_agent_config(config_path: str) -> AgentConfig:
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
         keep_recent_tool_results=context_data.get("keep_recent_tool_results", 5),
-        summarization_prompt=context_data.get(
-            "summarization_prompt",
-            "Summarize the work completed so far."
+        summarization_template=context_data.get(
+            "summarization_template",
+            "summarization_prompt.md"
         ),
     )
 
@@ -416,22 +406,30 @@ Domain tools: {', '.join(config.tools.domain)}
 """
 
 
-def load_summarization_prompt(config_dir: Optional[str] = None) -> str:
+def load_summarization_prompt(
+    config: Optional["AgentConfig"] = None,
+    config_dir: Optional[str] = None
+) -> str:
     """Load the summarization prompt template.
 
     Args:
+        config: Agent configuration (to get agent-specific template)
         config_dir: Base directory for config files
 
     Returns:
         Summarization prompt content
     """
     if config_dir is None:
-        # __file__ = src/agent/core/loader.py -> config is at src/agent/config
         config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
-    prompt_path = config_dir / "prompts" / "summarization_prompt.md"
+    # Use agent-specific template if available
+    template_name = "summarization_prompt.md"
+    if config and config.context_management.summarization_template:
+        template_name = config.context_management.summarization_template
+
+    prompt_path = config_dir / "prompts" / template_name
 
     if prompt_path.exists():
         with open(prompt_path, "r", encoding="utf-8") as f:
@@ -453,8 +451,93 @@ Keep the summary under 500 words. Use bullet points.
 
 Conversation:
 {conversation}
+"""
 
-Summary:"""
+
+def load_planning_prompt(config_dir: Optional[str] = None) -> str:
+    """Load the planning prompt template.
+
+    Args:
+        config_dir: Base directory for config files
+
+    Returns:
+        Planning prompt content
+    """
+    if config_dir is None:
+        config_dir = Path(__file__).parent.parent / "config"
+    else:
+        config_dir = Path(config_dir)
+
+    prompt_path = config_dir / "prompts" / "planning_prompt.md"
+
+    if prompt_path.exists():
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+    else:
+        logger.warning(f"Planning prompt not found: {prompt_path}")
+        return """Create a structured plan with numbered phases.
+Each phase should have specific, actionable steps.
+Mark initial status as "pending" for each phase."""
+
+
+def load_todo_extraction_prompt(config_dir: Optional[str] = None) -> str:
+    """Load the todo extraction prompt template.
+
+    Template variables: {current_phase}, {plan_content}
+
+    Args:
+        config_dir: Base directory for config files
+
+    Returns:
+        Todo extraction prompt content
+    """
+    if config_dir is None:
+        config_dir = Path(__file__).parent.parent / "config"
+    else:
+        config_dir = Path(config_dir)
+
+    prompt_path = config_dir / "prompts" / "todo_extraction_prompt.md"
+
+    if prompt_path.exists():
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+    else:
+        logger.warning(f"Todo extraction prompt not found: {prompt_path}")
+        return """Extract todos for {current_phase} from:
+{plan_content}
+
+Return a JSON array: [{{"content": "Task", "priority": "high|medium|low"}}]
+Return ONLY the JSON array."""
+
+
+def load_memory_update_prompt(config_dir: Optional[str] = None) -> str:
+    """Load the memory update prompt template.
+
+    Template variable: {current_memory}
+
+    Args:
+        config_dir: Base directory for config files
+
+    Returns:
+        Memory update prompt content
+    """
+    if config_dir is None:
+        config_dir = Path(__file__).parent.parent / "config"
+    else:
+        config_dir = Path(config_dir)
+
+    prompt_path = config_dir / "prompts" / "memory_update_prompt.md"
+
+    if prompt_path.exists():
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+    else:
+        logger.warning(f"Memory update prompt not found: {prompt_path}")
+        return """Update workspace.md based on recent work.
+Current content:
+{current_memory}
+
+Return the complete updated content."""
 
 
 def get_all_tool_names(config: AgentConfig) -> List[str]:

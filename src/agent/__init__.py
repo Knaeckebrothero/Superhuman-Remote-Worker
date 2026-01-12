@@ -10,9 +10,8 @@ from .agent import UniversalAgent
 from .core.state import UniversalAgentState
 from .api.app import create_app
 
-# Shared utilities (legacy location - prefer managers package)
+# Shared utilities
 from .core.workspace import WorkspaceManager
-from .core.todo import TodoManager as LegacyTodoManager
 from .core.context import ContextManager
 
 # New managers package (nested loop architecture)
@@ -29,8 +28,6 @@ from .core.context import (
     ContextConfig,
     ContextManagementState,
     ToolRetryManager,
-    ProtectedContextConfig,  # DEPRECATED - kept for backwards compat
-    ProtectedContextProvider,  # DEPRECATED - kept for backwards compat
     count_tokens_tiktoken,
     count_tokens_approximate,
     get_token_counter,
@@ -62,16 +59,13 @@ __all__ = [
     'TodoStatus',
     'PlanManager',
     'MemoryManager',
-    # Shared utilities (legacy)
+    # Shared utilities
     'WorkspaceManager',
-    'LegacyTodoManager',
     'ContextManager',
     # Context management
     'ContextConfig',
     'ContextManagementState',
     'ToolRetryManager',
-    'ProtectedContextConfig',  # DEPRECATED
-    'ProtectedContextProvider',  # DEPRECATED
     'count_tokens_tiktoken',
     'count_tokens_approximate',
     'get_token_counter',
