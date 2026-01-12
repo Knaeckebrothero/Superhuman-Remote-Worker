@@ -20,7 +20,7 @@
     ],
     "instructions_template": "validator_instructions.md",
     "initial_files": {
-      "workspace.md": "instructions/workspace_template.md"
+      "workspace.md": "prompts/workspace_template.md"
     }
   },
 

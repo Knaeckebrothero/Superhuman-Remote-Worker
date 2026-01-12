@@ -2,13 +2,13 @@
 
 DEPRECATION NOTICE:
 This module is legacy code for the old graph.py architecture.
-The new nested loop graph (graph_nested.py) handles phase transitions
+The new nested loop graph (graph.py) handles phase transitions
 structurally via graph nodes and doesn't need this module.
 
 For new code, use:
 - src/agent/managers/plan.py - PlanManager for plan operations
 - src/agent/managers/todo.py - TodoManager for todo operations
-- src/agent/graph_nested.py - Nested loop graph with built-in transitions
+- src/agent/graph.py - Nested loop graph with built-in transitions
 
 This module is kept for backwards compatibility with graph.py.
 It will be removed in a future version.

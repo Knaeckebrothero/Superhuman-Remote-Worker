@@ -9,7 +9,7 @@ and hierarchical todos that the todo_tools.py depends on. It is kept for
 backwards compatibility with graph.py and todo_tools.py.
 
 The new TodoManager in managers/ is simpler and designed for the
-nested loop graph architecture (graph_nested.py).
+nested loop graph architecture (graph.py).
 
 ---
 

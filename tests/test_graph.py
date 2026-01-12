@@ -1,4 +1,4 @@
-"""Unit tests for graph_nested.py.
+"""Unit tests for graph.py (nested loop graph).
 
 Tests the nested loop graph architecture routing functions and helper utilities.
 LLM-dependent nodes are tested with mocks or integration tests.
@@ -19,7 +19,7 @@ if str(src_path) not in sys.path:
 # Import via package (requires langgraph in environment)
 from agent.core.workspace import WorkspaceManager
 from agent.managers import TodoManager, PlanManager, MemoryManager
-from agent.graph_nested import (
+from agent.graph import (
     route_entry,
     route_after_init,
     route_after_execute,
@@ -61,6 +61,15 @@ def managers(workspace_manager):
         "memory": MemoryManager(workspace_manager),
         "workspace": workspace_manager,
     }
+
+
+@pytest.fixture
+def mock_config():
+    """Create a mock AgentConfig for testing."""
+    config = MagicMock()
+    config.agent_id = "test-agent"
+    config.llm.model = "test-model"
+    return config
 
 
 class TestRouteEntry:
@@ -214,10 +223,10 @@ class TestGetManagersFromWorkspace:
 class TestInitWorkspaceNode:
     """Tests for init_workspace node."""
 
-    def test_creates_workspace_md(self, managers):
+    def test_creates_workspace_md(self, managers, mock_config):
         """Test that init creates workspace.md from template."""
         template = "# Test Template\n\n## Section\nContent"
-        node = create_init_workspace_node(managers["memory"], template)
+        node = create_init_workspace_node(managers["memory"], template, mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -226,12 +235,12 @@ class TestInitWorkspaceNode:
         assert "Test Template" in result["workspace_memory"]
         assert managers["memory"].exists()
 
-    def test_preserves_existing_workspace_md(self, managers):
+    def test_preserves_existing_workspace_md(self, managers, mock_config):
         """Test that existing workspace.md is not overwritten."""
         managers["memory"].write("# Existing Content")
 
         template = "# New Template"
-        node = create_init_workspace_node(managers["memory"], template)
+        node = create_init_workspace_node(managers["memory"], template, mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -244,11 +253,11 @@ class TestInitWorkspaceNode:
 class TestReadInstructionsNode:
     """Tests for read_instructions node."""
 
-    def test_reads_instructions_file(self, managers):
+    def test_reads_instructions_file(self, managers, mock_config):
         """Test reading instructions.md."""
         managers["workspace"].write_file("instructions.md", "# Task Instructions\n\nDo this task.")
 
-        node = create_read_instructions_node(managers["workspace"])
+        node = create_read_instructions_node(managers["workspace"], mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -257,9 +266,9 @@ class TestReadInstructionsNode:
         assert len(result["messages"]) == 1
         assert "Task Instructions" in result["messages"][0].content
 
-    def test_handles_missing_instructions(self, managers):
+    def test_handles_missing_instructions(self, managers, mock_config):
         """Test behavior when instructions.md doesn't exist."""
-        node = create_read_instructions_node(managers["workspace"])
+        node = create_read_instructions_node(managers["workspace"], mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -272,35 +281,35 @@ class TestReadInstructionsNode:
 class TestCheckTodosNode:
     """Tests for check_todos node."""
 
-    def test_todos_not_complete(self, managers):
+    def test_todos_not_complete(self, managers, mock_config):
         """Test check when todos are not complete."""
         managers["todo"].add("Task 1")
         managers["todo"].add("Task 2")
 
-        node = create_check_todos_node(managers["todo"])
+        node = create_check_todos_node(managers["todo"], mock_config)
 
         state = {"job_id": "test-123", "iteration": 0, "max_iterations": 500}
         result = node(state)
 
         assert result.get("phase_complete") is False
 
-    def test_todos_all_complete(self, managers):
+    def test_todos_all_complete(self, managers, mock_config):
         """Test check when all todos are complete."""
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
 
-        node = create_check_todos_node(managers["todo"])
+        node = create_check_todos_node(managers["todo"], mock_config)
 
         state = {"job_id": "test-123", "iteration": 0, "max_iterations": 500}
         result = node(state)
 
         assert result.get("phase_complete") is True
 
-    def test_max_iterations_reached(self, managers):
+    def test_max_iterations_reached(self, managers, mock_config):
         """Test that max iterations triggers stop."""
         managers["todo"].add("Task 1")
 
-        node = create_check_todos_node(managers["todo"])
+        node = create_check_todos_node(managers["todo"], mock_config)
 
         state = {"job_id": "test-123", "iteration": 500, "max_iterations": 500}
         result = node(state)
@@ -313,13 +322,13 @@ class TestCheckTodosNode:
 class TestArchivePhaseNode:
     """Tests for archive_phase node."""
 
-    def test_archives_todos(self, managers):
+    def test_archives_todos(self, managers, mock_config):
         """Test that todos are archived."""
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
         managers["plan"].write("## Phase 1: Test\n\n- [x] Task 1")
 
-        node = create_archive_phase_node(managers["todo"], managers["plan"])
+        node = create_archive_phase_node(managers["todo"], managers["plan"], mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -333,22 +342,22 @@ class TestArchivePhaseNode:
 class TestCheckGoalNode:
     """Tests for check_goal node."""
 
-    def test_goal_not_achieved(self, managers):
+    def test_goal_not_achieved(self, managers, mock_config):
         """Test when plan is not complete."""
         managers["plan"].write("## Phase 1\n\n- [ ] Task 1")
 
-        node = create_check_goal_node(managers["plan"])
+        node = create_check_goal_node(managers["plan"], mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
 
         assert result.get("goal_achieved") is False
 
-    def test_goal_achieved_plan_complete(self, managers):
+    def test_goal_achieved_plan_complete(self, managers, mock_config):
         """Test when plan is marked complete."""
         managers["plan"].write("# Plan\n\n# Complete\n\nAll done.")
 
-        node = create_check_goal_node(managers["plan"])
+        node = create_check_goal_node(managers["plan"], mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -356,7 +365,7 @@ class TestCheckGoalNode:
         assert result.get("goal_achieved") is True
         assert result.get("should_stop") is True
 
-    def test_goal_achieved_no_more_phases(self, managers):
+    def test_goal_achieved_no_more_phases(self, managers, mock_config):
         """Test when there are no more phases."""
         # Plan with all phases complete (no pending phases)
         managers["plan"].write("""# Plan
@@ -365,7 +374,7 @@ class TestCheckGoalNode:
 - [x] Done
 """)
 
-        node = create_check_goal_node(managers["plan"])
+        node = create_check_goal_node(managers["plan"], mock_config)
 
         state = {"job_id": "test-123"}
         result = node(state)

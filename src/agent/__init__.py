@@ -37,16 +37,10 @@ from .core.context import (
     write_error_to_workspace,
 )
 
-# Graph exports (legacy)
+# Graph exports
 from .graph import (
-    build_agent_graph,
-    run_graph_with_streaming,
-    run_graph_with_summarization,
-)
-
-# Nested loop graph (new architecture)
-from .graph_nested import (
     build_nested_loop_graph,
+    run_graph_with_streaming,
     get_managers_from_workspace,
 )
 
@@ -82,12 +76,9 @@ __all__ = [
     'count_tokens_approximate',
     'get_token_counter',
     'write_error_to_workspace',
-    # Graph (legacy)
-    'build_agent_graph',
-    'run_graph_with_streaming',
-    'run_graph_with_summarization',
-    # Nested loop graph (new)
+    # Graph
     'build_nested_loop_graph',
+    'run_graph_with_streaming',
     'get_managers_from_workspace',
     # Loader
     'load_summarization_prompt',

@@ -97,7 +97,7 @@ class ContextManagementConfig:
     keep_recent_tool_results: int = 5
     summarization_prompt: str = "Summarize the work completed so far."
     # DEPRECATED: Protected context settings
-    # The new nested loop graph (graph_nested.py) injects workspace.md
+    # The new nested loop graph (graph.py) injects workspace.md
     # into the system prompt directly, replacing the protected context mechanism.
     # These fields are kept for backwards compatibility with graph.py.
     protected_context_enabled: bool = True
@@ -147,7 +147,7 @@ def load_agent_config(config_path: str) -> AgentConfig:
 
     Example:
         ```python
-        config = load_agent_config("src/config/creator.json")
+        config = load_agent_config("src/agent/config/creator.json")
         print(config.display_name)  # "Creator Agent"
         ```
     """
@@ -318,19 +318,19 @@ def load_system_prompt(
     Args:
         config: Agent configuration
         job_id: Current job ID for placeholder substitution
-        config_dir: Base directory for config files (default: src/config)
+        config_dir: Base directory for config files (default: src/agent/config)
         workspace_manager: Optional workspace manager for reading workspace.md
 
     Returns:
         Formatted system prompt string
     """
     if config_dir is None:
-        # __file__ = src/agent/core/loader.py -> config is at src/config
-        config_dir = Path(__file__).parent.parent.parent / "config"
+        # __file__ = src/agent/core/loader.py -> config is at src/agent/config
+        config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
-    system_prompt_path = config_dir / "instructions" / "system_prompt.md"
+    system_prompt_path = config_dir / "prompts" / "system_prompt.md"
 
     if system_prompt_path.exists():
         with open(system_prompt_path, "r", encoding="utf-8") as f:
@@ -382,12 +382,12 @@ def load_instructions(
         Instructions content to be placed in workspace
     """
     if config_dir is None:
-        # __file__ = src/agent/core/loader.py -> config is at src/config
-        config_dir = Path(__file__).parent.parent.parent / "config"
+        # __file__ = src/agent/core/loader.py -> config is at src/agent/config
+        config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
-    instructions_path = config_dir / "instructions" / config.workspace.instructions_template
+    instructions_path = config_dir / "prompts" / config.workspace.instructions_template
 
     if instructions_path.exists():
         with open(instructions_path, "r", encoding="utf-8") as f:
@@ -426,12 +426,12 @@ def load_summarization_prompt(config_dir: Optional[str] = None) -> str:
         Summarization prompt content
     """
     if config_dir is None:
-        # __file__ = src/agent/core/loader.py -> config is at src/config
-        config_dir = Path(__file__).parent.parent.parent / "config"
+        # __file__ = src/agent/core/loader.py -> config is at src/agent/config
+        config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
 
-    prompt_path = config_dir / "instructions" / "summarization_prompt.md"
+    prompt_path = config_dir / "prompts" / "summarization_prompt.md"
 
     if prompt_path.exists():
         with open(prompt_path, "r", encoding="utf-8") as f:
@@ -486,7 +486,7 @@ def resolve_config_path(config_name: str) -> str:
     Example:
         ```python
         path = resolve_config_path("creator")
-        # Returns: "/path/to/project/src/config/creator.json"
+        # Returns: "/path/to/project/src/agent/config/creator.json"
         ```
     """
     # If it's already a full path
@@ -494,8 +494,8 @@ def resolve_config_path(config_name: str) -> str:
         return config_name
 
     # Resolve relative to config directory
-    # __file__ = src/agent/core/loader.py -> config is at src/config
-    config_dir = Path(__file__).parent.parent.parent / "config"
+    # __file__ = src/agent/core/loader.py -> config is at src/agent/config
+    config_dir = Path(__file__).parent.parent / "config"
     config_path = config_dir / f"{config_name}.json"
 
     return str(config_path)

@@ -39,7 +39,7 @@ from .core.loader import (
 )
 from .tools.description_generator import generate_workspace_tool_docs
 from .tools.description_override import apply_description_overrides
-from .graph import build_agent_graph, run_graph_with_streaming
+from .graph import build_nested_loop_graph, run_graph_with_streaming
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class UniversalAgent:
 
         Example:
             ```python
-            # By name (looks in src/config/)
+            # By name (looks in src/agent/config/)
             agent = UniversalAgent.from_config("creator")
 
             # By path
@@ -249,13 +249,18 @@ class UniversalAgent:
             system_prompt = load_system_prompt(
                 self.config, job_id, workspace_manager=self._workspace_manager
             )
-            self._graph = build_agent_graph(
+
+            # Load workspace template for nested loop graph
+            workspace_template = self._load_workspace_template()
+
+            self._graph = build_nested_loop_graph(
+                llm=self._llm,
                 llm_with_tools=self._llm_with_tools,
                 tools=self._tools,
                 config=self.config,
                 system_prompt=system_prompt,
-                workspace_manager=self._workspace_manager,
-                todo_manager=self._todo_manager,
+                workspace=self._workspace_manager,
+                workspace_template=workspace_template,
             )
 
             # Create initial state with updated metadata (workspace-relative paths)
@@ -318,6 +323,43 @@ class UniversalAgent:
             yield state
 
         self._jobs_processed += 1
+
+    def _load_workspace_template(self) -> str:
+        """Load the workspace.md template for the nested loop graph.
+
+        Returns:
+            Template content for workspace.md
+        """
+        # Template is at src/agent/config/prompts/workspace_template.md
+        config_dir = Path(__file__).parent / "config" / "prompts"
+        template_path = config_dir / "workspace_template.md"
+
+        if template_path.exists():
+            return template_path.read_text(encoding="utf-8")
+
+        # Fallback default template
+        return """# Workspace Memory
+
+This file is your persistent memory across context compaction.
+Update it with important information as you work.
+
+## Current State
+
+Phase: Bootstrap
+Status: Starting
+
+## Accomplishments
+
+(None yet)
+
+## Key Decisions
+
+(None yet)
+
+## Notes
+
+(Working notes)
+"""
 
     async def _setup_job_workspace(
         self,

@@ -88,7 +88,7 @@ class ProtectedContextConfig:
     """DEPRECATED: Configuration for protected context.
 
     This class is deprecated and does nothing. The new nested loop graph
-    (graph_nested.py) injects workspace.md directly into the system prompt.
+    (graph.py) injects workspace.md directly into the system prompt.
 
     Kept for backwards compatibility with graph.py.
     """
@@ -103,7 +103,7 @@ class ProtectedContextProvider:
     """DEPRECATED: Provider for protected context.
 
     This class is deprecated and does nothing. The new nested loop graph
-    (graph_nested.py) injects workspace.md directly into the system prompt.
+    (graph.py) injects workspace.md directly into the system prompt.
 
     Kept for backwards compatibility with graph.py.
     """
@@ -263,7 +263,7 @@ class ContextManager:
         import warnings
         warnings.warn(
             "set_protected_provider is deprecated and has no effect. "
-            "Use graph_nested.py which injects workspace.md directly.",
+            "Use graph.py which injects workspace.md directly.",
             DeprecationWarning,
             stacklevel=2
         )

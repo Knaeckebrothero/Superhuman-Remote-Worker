@@ -10,7 +10,7 @@ The primary tool is `todo_write` which follows the Claude Code TodoWrite pattern
 submitting the entire todo list as a single atomic operation.
 
 NOTE: The phase transition code in this module is legacy.
-For the new nested loop graph (graph_nested.py), phase transitions
+For the new nested loop graph (graph.py), phase transitions
 are handled structurally via graph nodes, not via tool callbacks.
 The transition code is kept for backwards compatibility with graph.py.
 """
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # LEGACY: Store the last transition result for the old graph.py to pick up
-# Not used by the new nested loop graph (graph_nested.py)
+# Not used by the new nested loop graph (graph.py)
 _last_transition_result: Optional[TransitionResult] = None
 
 

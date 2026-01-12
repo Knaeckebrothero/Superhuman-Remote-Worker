@@ -688,7 +688,7 @@ The graph just orchestrates the flow between them.
 | `src/agent/managers/todo.py` | TodoManager (stateful) | ✓ Complete |
 | `src/agent/managers/plan.py` | PlanManager (service) | ✓ Complete |
 | `src/agent/managers/memory.py` | MemoryManager (service) | ✓ Complete |
-| `src/agent/graph_nested.py` | Nested loop graph | ✓ Complete |
+| `src/agent/graph.py` | Nested loop graph | ✓ Complete |
 | `src/agent/core/state.py` | State with loop control fields | ✓ Complete |
 
 ### Manager APIs
@@ -762,16 +762,16 @@ mem_mgr.set_state("Phase", "3")
 | `tests/test_managers_todo.py` | 41 tests | ✓ All passing |
 | `tests/test_managers_plan.py` | 32 tests | ✓ All passing |
 | `tests/test_managers_memory.py` | 28 tests | ✓ All passing |
-| `tests/test_graph_nested.py` | 28 tests | ✓ All passing |
+| `tests/test_graph.py` | 28 tests | ✓ All passing |
 
 Run tests with:
 ```bash
-.venv/bin/python -m pytest tests/test_managers_*.py tests/test_graph_nested.py -v
+.venv/bin/python -m pytest tests/test_managers_*.py tests/test_graph.py -v
 ```
 
 ### Graph Nodes
 
-The nested loop graph (`src/agent/graph_nested.py`) includes:
+The nested loop graph (`src/agent/graph.py`) includes:
 
 **Initialization nodes:**
 - `init_workspace` - Creates workspace.md from template
@@ -805,4 +805,4 @@ The following are deprecated and will be removed in a future version:
 | `src/agent/core/transitions.py` | Replaced by graph nodes |
 | `ProtectedContextProvider` in `context.py` | Replaced by MemoryManager |
 
-The legacy `graph.py` is preserved for backwards compatibility but new code should use `graph_nested.py`.
+The old ReAct-only graph has been removed. The nested loop graph in `graph.py` is the only implementation.

@@ -103,8 +103,8 @@ python cancel_job.py --job-id <uuid> --cleanup
 ```
 
 **Source locations:**
-- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py, graph_nested.py)
-- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py)
+- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
+- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
 - `src/agent/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
 - `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/agent/api/` - FastAPI application for containerized deployment
@@ -112,6 +112,8 @@ python cancel_job.py --job-id <uuid> --cleanup
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
 - `src/database/` - PostgreSQL schema and utilities
 - `src/config/` - Agent configuration (JSON) and instruction templates (Markdown in `instructions/`)
+
+**Note on legacy code:** `src/agent/core/todo.py` and `src/agent/core/transitions.py` are deprecated. New code should use `src/agent/managers/` and the nested loop graph (`src/agent/graph.py`).
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -153,12 +155,12 @@ The Universal Agent (`src/agent/`) is the primary agent implementation with a **
 
 **Key files:**
 - `src/agent/agent.py` - UniversalAgent class with run loop and LLM integration
-- `src/agent/graph.py` - Legacy LangGraph workflow (simple ReAct)
-- `src/agent/graph_nested.py` - **New nested loop graph** (initialization → outer loop → inner loop)
+- `src/agent/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
 - `src/agent/core/state.py` - UniversalAgentState TypedDict with loop control fields
 - `src/agent/core/context.py` - Context management (ContextManager, token counting, compaction)
 - `src/agent/core/loader.py` - Configuration and tool loading
 - `src/agent/core/workspace.py` - Filesystem workspace for agent
+- `src/agent/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
 - `src/agent/api/app.py` - FastAPI application for containerized deployment
 
 **Manager layer (`src/agent/managers/`):**
@@ -192,6 +194,10 @@ INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
 - TodoManager for tactical execution with `archive()` at phase completion
 - Automatic context compaction when approaching token limits
 - Completion detection via `mark_complete` tool
+- Audit logging via archiver (tracks LLM calls, tool calls, phase transitions)
+
+**Graph execution flow:**
+The nested loop graph creates its own managers inside `build_nested_loop_graph()`. The graph uses an audited tool node (`create_audited_tool_node`) that logs all tool calls and results for debugging and compliance.
 
 **Creating a new agent type:**
 1. Create `src/config/<name>.json` based on `schema.json`
@@ -290,15 +296,17 @@ When adding a new tool to the system:
 # Manager tests (nested loop architecture)
 .venv/bin/python -m pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
 
-# Graph nested tests
-.venv/bin/python -m pytest tests/test_graph_nested.py -v
+# Graph tests
+.venv/bin/python -m pytest tests/test_graph.py -v
 ```
 
 **Key test files:**
-- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager
-- `tests/test_graph_nested.py` - Tests for routing functions and graph nodes
+- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager (new architecture)
+- `tests/test_graph.py` - Tests for routing functions and graph nodes
 - `tests/test_workspace_manager.py` - WorkspaceManager tests
-- `tests/test_todo_tools.py` - Todo tool tests (legacy)
+- `tests/test_workspace_tools.py` - Workspace tool tests
 - `tests/test_context_management.py` - Context compaction tests
+- `tests/test_todo_tools.py` - Todo tool tests (uses legacy `src/agent/core/todo.py`)
+- `tests/test_phase_transitions.py` - Phase transition tests (uses legacy `src/agent/core/transitions.py`)
 
 Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup like database connections.

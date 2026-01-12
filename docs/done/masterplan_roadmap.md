@@ -1071,7 +1071,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
 COPY ../../src ./src/
-COPY ../../src/config ./config/
+COPY ../../src/agent/config ./config/
 COPY ../../citation_tool ./citation_tool/
 
 # Install citation tool
