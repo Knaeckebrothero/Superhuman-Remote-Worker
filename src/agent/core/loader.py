@@ -548,14 +548,14 @@ def load_system_prompt(
         except Exception as e:
             logger.debug(f"Could not read workspace.md: {e}")
 
-    # Get thinking level from LLM config (defaults to "high")
-    thinking_level = config.llm.reasoning_level or "high"
+    # Get OSS reasoning level from LLM config (defaults to "high")
+    oss_reasoning_level = config.llm.reasoning_level or "high"
 
     # Substitute placeholders
     prompt = template.format(
         agent_display_name=config.display_name,
         workspace_content=workspace_content,
-        thinking_level=thinking_level,
+        oss_reasoning_level=oss_reasoning_level,
     )
 
     return prompt
