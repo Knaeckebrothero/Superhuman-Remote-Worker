@@ -68,10 +68,10 @@ class ContextConfig:
         tool_retry_count: Number of retries for failed tool calls
         tool_retry_delay_seconds: Delay between retries
     """
-    compaction_threshold_tokens: int = 80_000
+    compaction_threshold_tokens: int = 100_000
     summarization_threshold_tokens: int = 100_000
-    keep_recent_tool_results: int = 5
-    keep_recent_messages: int = 20
+    keep_recent_tool_results: int = 10
+    keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3

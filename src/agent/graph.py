@@ -65,10 +65,12 @@ from .core.loader import (
     load_planning_prompt,
     load_todo_extraction_prompt,
     load_memory_update_prompt,
+    load_summarization_prompt,
     render_system_prompt,
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
+from .core.context import ContextManager, ContextConfig
 from .managers import TodoManager, PlanManager, MemoryManager
 
 logger = logging.getLogger(__name__)
@@ -743,6 +745,7 @@ def create_execute_node(
     workspace_manager: WorkspaceManager,
     system_prompt_template: str,
     config: AgentConfig,
+    context_mgr: ContextManager,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node.
 
@@ -774,6 +777,9 @@ def create_execute_node(
             workspace_content=workspace_content,
         )
         prepared_messages.append(SystemMessage(content=full_system))
+
+        # Always clear old tool results, keep last 10
+        messages = context_mgr.clear_old_tool_results(messages)
 
         # Add conversation history (keep recent)
         for msg in messages[-20:]:
@@ -980,10 +986,14 @@ def create_archive_phase_node(
     todo_manager: TodoManager,
     plan_manager: PlanManager,
     config: AgentConfig,
+    context_mgr: ContextManager,
+    llm: BaseChatModel,
+    summarization_prompt: str,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
     This node archives completed todos and marks phase complete.
+    Also performs context compaction if configured.
     """
 
     def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
@@ -1022,6 +1032,40 @@ def create_archive_phase_node(
         message = AIMessage(
             content=f"Phase complete. Archived todos to {archive_path}. Moving to next phase."
         )
+
+        # Context compaction at phase boundary
+        messages = state.get("messages", [])
+        compacted_messages = None
+
+        if config.context_management.compact_on_archive:
+            if context_mgr.should_summarize(messages):
+                import asyncio
+                oss_reasoning_level = config.llm.reasoning_level or "high"
+
+                # Run async summarization
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+
+                compacted_messages = loop.run_until_complete(
+                    context_mgr.summarize_and_compact(
+                        messages,
+                        llm,
+                        summarization_prompt,
+                        oss_reasoning_level,
+                    )
+                )
+                logger.info(
+                    f"[{job_id}] Compacted context: {len(messages)} -> {len(compacted_messages)} messages"
+                )
+
+        # Return with compacted messages if compaction occurred
+        if compacted_messages is not None:
+            return {
+                "messages": compacted_messages + [message],
+            }
 
         return {
             "messages": [message],
@@ -1311,10 +1355,20 @@ def build_nested_loop_graph(
     plan_manager = PlanManager(workspace)
     memory_manager = MemoryManager(workspace)
 
+    # Create context manager for context window management
+    context_config = ContextConfig(
+        compaction_threshold_tokens=config.limits.context_threshold_tokens,
+        summarization_threshold_tokens=config.limits.context_threshold_tokens,
+        keep_recent_messages=10,
+        keep_recent_tool_results=10,
+    )
+    context_mgr = ContextManager(config=context_config, model=config.llm.model)
+
     # Load prompts from files
     planning_prompt = load_planning_prompt()
     todo_extraction_prompt = load_todo_extraction_prompt()
     memory_update_prompt = load_memory_update_prompt()
+    summarization_prompt = load_summarization_prompt(config)
 
     if not workspace_template:
         raise ValueError("workspace_template is required")
@@ -1337,10 +1391,13 @@ def build_nested_loop_graph(
     # Execute phase
     execute = create_execute_node(
         llm_with_tools, todo_manager, memory_manager, workspace,
-        system_prompt_template, config
+        system_prompt_template, config, context_mgr
     )
     check_todos = create_check_todos_node(todo_manager, config)
-    archive_phase = create_archive_phase_node(todo_manager, plan_manager, config)
+    archive_phase = create_archive_phase_node(
+        todo_manager, plan_manager, config,
+        context_mgr, llm, summarization_prompt
+    )
 
     # Goal check
     check_goal = create_check_goal_node(plan_manager, config)

@@ -64,13 +64,13 @@
 
   "limits": {
     "max_iterations": 500,
-    "context_threshold_tokens": 80000,
+    "context_threshold_tokens": 100000,
     "tool_retry_count": 3
   },
 
   "context_management": {
     "compact_on_archive": true,
-    "keep_recent_tool_results": 5,
+    "keep_recent_tool_results": 10,
     "summarization_template": "summarization_prompt.md"
   }
 }
