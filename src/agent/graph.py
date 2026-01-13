@@ -65,6 +65,7 @@ from .core.loader import (
     load_planning_prompt,
     load_todo_extraction_prompt,
     load_memory_update_prompt,
+    render_system_prompt,
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
@@ -223,7 +224,9 @@ def create_create_plan_node(
 
         messages = state.get("messages", [])
 
-        prompt_text = planning_prompt
+        # Format planning prompt with reasoning level
+        oss_reasoning_level = config.llm.reasoning_level or "high"
+        prompt_text = planning_prompt.format(oss_reasoning_level=oss_reasoning_level)
 
         # Call LLM to create plan
         plan_messages = messages + [HumanMessage(content=prompt_text)]
@@ -327,9 +330,12 @@ def create_init_todos_node(
         if not current_phase:
             current_phase = "Phase 1"
 
+        # Format with reasoning level
+        oss_reasoning_level = config.llm.reasoning_level or "high"
         extraction_prompt = todo_extraction_prompt.format(
             current_phase=current_phase,
             plan_content=plan_content,
+            oss_reasoning_level=oss_reasoning_level,
         )
 
         messages = state.get("messages", [])
@@ -513,7 +519,12 @@ def create_update_memory_node(
         current_memory = memory_manager.read()
         messages = state.get("messages", [])
 
-        update_prompt = memory_update_prompt.format(current_memory=current_memory)
+        # Format with reasoning level
+        oss_reasoning_level = config.llm.reasoning_level or "high"
+        update_prompt = memory_update_prompt.format(
+            current_memory=current_memory,
+            oss_reasoning_level=oss_reasoning_level,
+        )
 
         memory_messages = messages[-10:] + [HumanMessage(content=update_prompt)]
 
@@ -618,9 +629,12 @@ def create_create_todos_node(
                 "goal_achieved": True,
             }
 
+        # Format with reasoning level
+        oss_reasoning_level = config.llm.reasoning_level or "high"
         extraction_prompt = todo_extraction_prompt.format(
             current_phase=current_phase,
             plan_content=plan_content,
+            oss_reasoning_level=oss_reasoning_level,
         )
 
         messages = state.get("messages", [])
@@ -726,7 +740,8 @@ def create_execute_node(
     llm_with_tools: BaseChatModel,
     todo_manager: TodoManager,
     memory_manager: MemoryManager,
-    system_prompt: str,
+    workspace_manager: WorkspaceManager,
+    system_prompt_template: str,
     config: AgentConfig,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node.
@@ -745,14 +760,20 @@ def create_execute_node(
         # Build messages for LLM
         prepared_messages = []
 
-        # System prompt with workspace memory
-        workspace_memory = state.get("workspace_memory", "")
-        full_system = f"{system_prompt}\n\n## Workspace Context\n\n{workspace_memory}"
-        prepared_messages.append(SystemMessage(content=full_system))
+        # Get current dynamic content for system prompt
+        todos_content = todo_manager.format_for_display()
+        workspace_content = ""
+        if workspace_manager.exists("workspace.md"):
+            workspace_content = workspace_manager.read_file("workspace.md")
 
-        # Add todo context
-        todo_display = todo_manager.format_for_display()
-        prepared_messages.append(SystemMessage(content=f"\n{todo_display}\n"))
+        # Render system prompt with current todos and workspace
+        full_system = render_system_prompt(
+            template=system_prompt_template,
+            config=config,
+            todos_content=todos_content,
+            workspace_content=workspace_content,
+        )
+        prepared_messages.append(SystemMessage(content=full_system))
 
         # Add conversation history (keep recent)
         for msg in messages[-20:]:
@@ -1261,7 +1282,7 @@ def build_nested_loop_graph(
     llm_with_tools: BaseChatModel,
     tools: List[Any],
     config: AgentConfig,
-    system_prompt: str,
+    system_prompt_template: str,
     workspace: WorkspaceManager,
     workspace_template: str = "",
 ) -> StateGraph:
@@ -1278,7 +1299,7 @@ def build_nested_loop_graph(
         llm_with_tools: LLM with tools bound for execution
         tools: List of tool objects
         config: Agent configuration
-        system_prompt: Base system prompt
+        system_prompt_template: Raw system prompt template with placeholders
         workspace: WorkspaceManager instance
         workspace_template: Template content for workspace.md
 
@@ -1314,7 +1335,10 @@ def build_nested_loop_graph(
     create_todos = create_create_todos_node(llm, plan_manager, todo_manager, config, todo_extraction_prompt)
 
     # Execute phase
-    execute = create_execute_node(llm_with_tools, todo_manager, memory_manager, system_prompt, config)
+    execute = create_execute_node(
+        llm_with_tools, todo_manager, memory_manager, workspace,
+        system_prompt_template, config
+    )
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(todo_manager, plan_manager, config)
 

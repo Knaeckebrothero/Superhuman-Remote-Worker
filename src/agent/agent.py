@@ -32,7 +32,7 @@ from .core.loader import (
     AgentConfig,
     load_agent_config,
     create_llm,
-    load_system_prompt,
+    load_system_prompt_template,
     load_instructions,
     get_all_tool_names,
     resolve_config_path,
@@ -235,9 +235,7 @@ class UniversalAgent:
             await self._setup_job_tools()
 
             # Build graph for this job
-            system_prompt = load_system_prompt(
-                self.config, workspace_manager=self._workspace_manager
-            )
+            system_prompt_template = load_system_prompt_template()
 
             # Load workspace template for nested loop graph
             workspace_template = self._load_workspace_template()
@@ -247,7 +245,7 @@ class UniversalAgent:
                 llm_with_tools=self._llm_with_tools,
                 tools=self._tools,
                 config=self.config,
-                system_prompt=system_prompt,
+                system_prompt_template=system_prompt_template,
                 workspace=self._workspace_manager,
                 workspace_template=workspace_template,
             )

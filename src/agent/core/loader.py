@@ -510,23 +510,16 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
     return llm
 
 
-def load_system_prompt(
-    config: AgentConfig,
-    config_dir: Optional[str] = None,
-    workspace_manager: Optional[Any] = None,
-) -> str:
-    """Load and format the system prompt for the agent.
+def load_system_prompt_template(config_dir: Optional[str] = None) -> str:
+    """Load the raw system prompt template without substitution.
 
     Args:
-        config: Agent configuration
         config_dir: Base directory for config files (default: src/agent/config)
-        workspace_manager: Optional workspace manager for reading workspace.md
 
     Returns:
-        Formatted system prompt string
+        Raw template string with placeholders
     """
     if config_dir is None:
-        # __file__ = src/agent/core/loader.py -> config is at src/agent/config
         config_dir = Path(__file__).parent.parent / "config"
     else:
         config_dir = Path(config_dir)
@@ -537,7 +530,57 @@ def load_system_prompt(
         raise FileNotFoundError(f"System prompt not found: {system_prompt_path}")
 
     with open(system_prompt_path, "r", encoding="utf-8") as f:
-        template = f.read()
+        return f.read()
+
+
+def render_system_prompt(
+    template: str,
+    config: AgentConfig,
+    todos_content: str = "",
+    workspace_content: str = "",
+) -> str:
+    """Render system prompt template with current values.
+
+    Args:
+        template: Raw template string with placeholders
+        config: Agent configuration
+        todos_content: Formatted todo list string
+        workspace_content: Contents of workspace.md
+
+    Returns:
+        Rendered system prompt string
+    """
+    oss_reasoning_level = config.llm.reasoning_level or "high"
+
+    return template.format(
+        agent_display_name=config.display_name,
+        oss_reasoning_level=oss_reasoning_level,
+        todos_content=todos_content,
+        workspace_content=workspace_content,
+    )
+
+
+def load_system_prompt(
+    config: AgentConfig,
+    config_dir: Optional[str] = None,
+    workspace_manager: Optional[Any] = None,
+    todos_content: str = "",
+) -> str:
+    """Load and format the system prompt for the agent.
+
+    This is a convenience function that combines load_system_prompt_template()
+    and render_system_prompt() for backwards compatibility.
+
+    Args:
+        config: Agent configuration
+        config_dir: Base directory for config files (default: src/agent/config)
+        workspace_manager: Optional workspace manager for reading workspace.md
+        todos_content: Formatted todo list string
+
+    Returns:
+        Formatted system prompt string
+    """
+    template = load_system_prompt_template(config_dir)
 
     # Read workspace.md content if available
     workspace_content = ""
@@ -548,17 +591,12 @@ def load_system_prompt(
         except Exception as e:
             logger.debug(f"Could not read workspace.md: {e}")
 
-    # Get OSS reasoning level from LLM config (defaults to "high")
-    oss_reasoning_level = config.llm.reasoning_level or "high"
-
-    # Substitute placeholders
-    prompt = template.format(
-        agent_display_name=config.display_name,
+    return render_system_prompt(
+        template=template,
+        config=config,
+        todos_content=todos_content,
         workspace_content=workspace_content,
-        oss_reasoning_level=oss_reasoning_level,
     )
-
-    return prompt
 
 
 def load_instructions(

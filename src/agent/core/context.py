@@ -450,6 +450,7 @@ class ContextManager:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
+        oss_reasoning_level: str = "high",
     ) -> str:
         """Generate a summary of the conversation.
 
@@ -457,6 +458,7 @@ class ContextManager:
             messages: Messages to summarize
             llm: LLM to use for summarization
             summarization_prompt: Optional custom prompt
+            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
 
         Returns:
             Summary string
@@ -498,7 +500,10 @@ Conversation:
 Summary:"""
 
         prompt = summarization_prompt or default_prompt
-        prompt = prompt.format(conversation=conversation_text)
+        prompt = prompt.format(
+            conversation=conversation_text,
+            oss_reasoning_level=oss_reasoning_level,
+        )
 
         try:
             response = await llm.ainvoke([HumanMessage(content=prompt)])
@@ -519,6 +524,7 @@ Summary:"""
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
+        oss_reasoning_level: str = "high",
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -529,6 +535,7 @@ Summary:"""
             messages: Full message history
             llm: LLM for summarization
             summarization_prompt: Optional custom prompt
+            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
 
         Returns:
             Compacted message list with summary prepended
@@ -548,7 +555,8 @@ Summary:"""
         summary = await self.summarize_conversation(
             messages_to_summarize,
             llm,
-            summarization_prompt
+            summarization_prompt,
+            oss_reasoning_level,
         )
 
         # Create summary message
