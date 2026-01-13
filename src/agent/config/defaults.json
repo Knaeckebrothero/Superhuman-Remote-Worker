@@ -63,7 +63,7 @@
   },
 
   "limits": {
-    "max_iterations": 500,
+    "max_iterations": 10000,
     "context_threshold_tokens": 100000,
     "tool_retry_count": 3
   },

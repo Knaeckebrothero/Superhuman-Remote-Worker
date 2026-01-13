@@ -70,7 +70,7 @@ from .core.loader import (
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
-from .core.context import ContextManager, ContextConfig
+from .core.context import ContextManager, ContextConfig, find_safe_slice_start
 from .managers import TodoManager, PlanManager, MemoryManager
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,43 @@ def _is_tool_error(content: str) -> bool:
     content_lower = content.lower()
     error_indicators = ["error:", "failed:", "exception:", "traceback"]
     return any(indicator in content_lower for indicator in error_indicators)
+
+
+def _extract_markdown_content(content: str) -> str:
+    """Extract clean markdown content from LLM response.
+
+    LLMs sometimes wrap their output in markdown code blocks or add file headers like:
+        **File: `main_plan.md`**
+        ```markdown
+        ...actual content...
+        ```
+
+    This function strips those wrappers to get the actual content.
+
+    Args:
+        content: Raw LLM response content
+
+    Returns:
+        Cleaned markdown content
+    """
+    import re
+
+    if not content:
+        return content
+
+    result = content.strip()
+
+    # Remove file header patterns like "**File: `filename.md`**" or "**File: filename.md**"
+    result = re.sub(r'^\*\*File:\s*`?[^`\n]+`?\*\*\s*\n*', '', result, flags=re.IGNORECASE)
+
+    # Check if the content is wrapped in a markdown code block
+    # Pattern: ```markdown or ``` at start, ``` at end
+    code_block_pattern = r'^```(?:markdown|md)?\s*\n(.*?)\n```\s*$'
+    match = re.match(code_block_pattern, result, re.DOTALL | re.IGNORECASE)
+    if match:
+        result = match.group(1)
+
+    return result.strip()
 
 
 # =============================================================================
@@ -288,8 +325,8 @@ def create_create_plan_node(
                 metadata=state.get("metadata"),
             )
 
-        # Extract plan content from response
-        plan_content = response.content
+        # Extract plan content from response, cleaning up any markdown wrappers
+        plan_content = _extract_markdown_content(response.content)
 
         # Write plan to workspace
         plan_manager.write(plan_content)
@@ -528,7 +565,10 @@ def create_update_memory_node(
             oss_reasoning_level=oss_reasoning_level,
         )
 
-        memory_messages = messages[-10:] + [HumanMessage(content=update_prompt)]
+        # Slice messages safely to avoid orphaning ToolMessages
+        target_start = max(0, len(messages) - 10)
+        safe_start = find_safe_slice_start(messages, target_start)
+        memory_messages = messages[safe_start:] + [HumanMessage(content=update_prompt)]
 
         # Audit LLM call
         auditor = get_archiver()
@@ -640,7 +680,10 @@ def create_create_todos_node(
         )
 
         messages = state.get("messages", [])
-        todo_messages = messages[-5:] + [HumanMessage(content=extraction_prompt)]
+        # Slice messages safely to avoid orphaning ToolMessages
+        target_start = max(0, len(messages) - 5)
+        safe_start = find_safe_slice_start(messages, target_start)
+        todo_messages = messages[safe_start:] + [HumanMessage(content=extraction_prompt)]
 
         # Audit LLM call
         auditor = get_archiver()
@@ -781,8 +824,11 @@ def create_execute_node(
         # Always clear old tool results, keep last 10
         messages = context_mgr.clear_old_tool_results(messages)
 
-        # Add conversation history (keep recent)
-        for msg in messages[-20:]:
+        # Add conversation history (keep recent), ensuring we don't orphan ToolMessages
+        # Find a safe slice boundary that doesn't split AIMessage/ToolMessage pairs
+        target_start = max(0, len(messages) - 20)
+        safe_start = find_safe_slice_start(messages, target_start)
+        for msg in messages[safe_start:]:
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 

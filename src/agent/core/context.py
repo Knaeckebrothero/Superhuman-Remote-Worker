@@ -31,6 +31,82 @@ from langchain_core.messages import (
 logger = logging.getLogger(__name__)
 
 
+def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int:
+    """Find a safe starting index that doesn't orphan ToolMessages.
+
+    When slicing messages, we must ensure that if we include a ToolMessage,
+    we also include its corresponding AIMessage with the tool_call.
+    This function adjusts the start index backwards if needed.
+
+    Args:
+        messages: Full message list
+        target_start: Desired start index
+
+    Returns:
+        Adjusted start index that won't orphan ToolMessages
+    """
+    if target_start <= 0:
+        return 0
+
+    if target_start >= len(messages):
+        return len(messages)
+
+    # If the message at target_start is a ToolMessage, we need to find
+    # the preceding AIMessage that contains the tool_call
+    adjusted_start = target_start
+
+    # Check if we're starting at or near ToolMessages that would be orphaned
+    # Walk backwards to find a safe boundary
+    while adjusted_start > 0:
+        msg = messages[adjusted_start]
+
+        if isinstance(msg, ToolMessage):
+            # This ToolMessage needs its parent AIMessage
+            # Look backwards for the AIMessage with matching tool_call
+            tool_call_id = getattr(msg, 'tool_call_id', None)
+
+            if tool_call_id:
+                for i in range(adjusted_start - 1, -1, -1):
+                    prev_msg = messages[i]
+                    if isinstance(prev_msg, AIMessage):
+                        if hasattr(prev_msg, 'tool_calls') and prev_msg.tool_calls:
+                            # Check if this AIMessage has the matching tool_call
+                            for tc in prev_msg.tool_calls:
+                                if tc.get('id') == tool_call_id:
+                                    # Found the parent - start from here
+                                    adjusted_start = i
+                                    break
+                            else:
+                                continue
+                            break
+                        # AIMessage without tool_calls - safe boundary
+                        break
+                    elif isinstance(prev_msg, HumanMessage):
+                        # Human message - safe boundary
+                        break
+                else:
+                    # Couldn't find parent, start from beginning
+                    adjusted_start = 0
+            break
+        elif isinstance(msg, AIMessage):
+            # Starting at an AIMessage is safe
+            break
+        elif isinstance(msg, HumanMessage):
+            # Starting at a HumanMessage is safe
+            break
+        else:
+            # Other message types - check the previous one
+            adjusted_start -= 1
+
+    if adjusted_start != target_start:
+        logger.debug(
+            f"Adjusted slice start from {target_start} to {adjusted_start} "
+            "to preserve tool call pairs"
+        )
+
+    return adjusted_start
+
+
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken
@@ -435,8 +511,10 @@ class ContextManager:
         if first_human_idx is not None and first_human_idx < len(conversation) - keep_recent:
             trimmed_conversation = [conversation[first_human_idx]]
 
-        # Add recent messages
-        trimmed_conversation.extend(conversation[-keep_recent:])
+        # Add recent messages, ensuring we don't orphan ToolMessages
+        target_start = len(conversation) - keep_recent
+        safe_start = find_safe_slice_start(conversation, target_start)
+        trimmed_conversation.extend(conversation[safe_start:])
 
         trimmed_count = len(conversation) - len(trimmed_conversation)
         if trimmed_count > 0:

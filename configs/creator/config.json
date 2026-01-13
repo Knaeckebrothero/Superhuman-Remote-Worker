@@ -31,17 +31,13 @@
   },
 
   "todo": {
-    "max_items": 25
+    "max_items": 20
   },
 
   "polling": {
     "table": "jobs",
     "status_field": "creator_status",
     "interval_seconds": 30
-  },
-
-  "context_management": {
-    "summarization_template": "summarization_prompt.md"
   },
 
   "document_processing": {
