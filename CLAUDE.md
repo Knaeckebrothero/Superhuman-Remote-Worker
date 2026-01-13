@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. The Universal Agent (`src/agent/`) is a config-driven, workspace-centric agent deployed as Creator or Validator by changing its JSON configuration (`src/agent/config/creator.json` or `src/agent/config/validator.json`).
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. Agent behavior is configured via JSON files in `configs/{name}/` that extend framework defaults via `$extends`.
 
 ## Commands
 
@@ -35,8 +35,9 @@ python validate_metamodel.py --check A1   # Specific check
 # Start databases only
 podman-compose -f docker-compose.dbs.yml up -d
 
-# Run Universal Agent
+# Run Universal Agent (config resolution: configs/{name}/ → src/agent/config/{name}.json)
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
+python agent.py --config creator --document-dir ./data/context/ --prompt "Extract all requirements"
 python agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
 python agent.py --config validator --port 8002                        # API server mode
 python agent.py --config creator --polling-only                       # Polling loop only
@@ -73,7 +74,14 @@ python cancel_job.py --job-id <uuid> --cleanup
 
 **Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
-**Agent configs (`src/agent/config/*.json`):** LLM settings, workspace structure, tools, polling behavior, limits. See `src/agent/config/schema.json` for full spec.
+**Agent configs:** Two-tier configuration system with inheritance:
+- `src/agent/config/defaults.json` - Framework defaults (LLM, workspace, tools, polling, limits)
+- `configs/{name}/config.json` - Deployment configs that extend defaults via `$extends`
+- `configs/{name}/*.md` - Deployment-specific prompts (override framework prompts)
+
+Config resolution: `--config creator` checks `configs/creator/config.json` first, falls back to `src/agent/config/creator.json`.
+
+See `src/agent/config/schema.json` for full spec.
 
 ## Architecture
 
@@ -105,13 +113,15 @@ python cancel_job.py --job-id <uuid> --cleanup
 **Source locations:**
 - `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
 - `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
+- `src/agent/core/loader.py` - **Config system**: `resolve_config_path()`, `load_and_merge_config()`, `PromptResolver`
 - `src/agent/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
 - `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/agent/api/` - FastAPI application for containerized deployment
+- `configs/` - **Deployment configs** (creator/, validator/) with `config.json` + prompt overrides
 - `src/orchestrator/` - Job manager, monitor, reporter
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
 - `src/database/` - PostgreSQL schema and utilities
-- `src/agent/config/` - Agent configuration (JSON) and prompts (Markdown in `prompts/`)
+- `src/agent/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
 
 **Manager layer:** Task management uses `src/agent/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/agent/graph.py`).
 
@@ -158,7 +168,7 @@ The Universal Agent (`src/agent/`) is the primary agent implementation with a **
 - `src/agent/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
 - `src/agent/core/state.py` - UniversalAgentState TypedDict with loop control fields
 - `src/agent/core/context.py` - Context management (ContextManager, token counting, compaction)
-- `src/agent/core/loader.py` - Configuration and tool loading
+- `src/agent/core/loader.py` - **Config system** with inheritance and prompt resolution
 - `src/agent/core/workspace.py` - Filesystem workspace for agent
 - `src/agent/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
 - `src/agent/api/app.py` - FastAPI application for containerized deployment
@@ -179,13 +189,29 @@ INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
                             check_goal → END or back to OUTER LOOP
 ```
 
-**Configuration (`src/agent/config/<name>.json`):**
-- `llm`: Model, temperature, reasoning level
-- `workspace.structure`: Directory layout for agent's filesystem
-- `tools`: Tool categories (workspace, todo, domain, completion)
-- `polling`: Which table to poll, status fields, intervals
-- `limits`: Max iterations, context threshold, retry count
-- `context_management`: Compaction settings, summarization prompts
+**Configuration inheritance:**
+```
+src/agent/config/defaults.json     ← Framework defaults
+        ↑ $extends
+configs/creator/config.json        ← Deployment overrides (agent_id, tools, polling, etc.)
+configs/creator/instructions.md    ← Deployment prompts (override framework prompts/)
+```
+
+Merge semantics (`deep_merge` in loader.py):
+- Objects (dicts): Recursively merge
+- Arrays (lists): Override replaces entirely
+- Scalars: Override replaces
+- `null` in override: Clears the key
+
+Config fields:
+- `$extends`: Parent config name (resolved via `resolve_config_path()`)
+- `agent_id`, `display_name`: Agent identity
+- `llm`: Model, temperature, reasoning level, base_url
+- `workspace.structure`: Directory layout, `instructions_template`
+- `tools`: Categories (workspace, todo, domain, completion)
+- `polling`: Table, status_field, intervals, use_skip_locked
+- `limits`: max_iterations, context_threshold_tokens
+- `connections`: postgres, neo4j (boolean flags)
 
 **Key features:**
 - Reads `instructions.md` from workspace to understand task context
@@ -200,10 +226,14 @@ INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
 The nested loop graph creates its own managers inside `build_nested_loop_graph()`. The graph uses an audited tool node (`create_audited_tool_node`) that logs all tool calls and results for debugging and compliance.
 
 **Creating a new agent type:**
-1. Create `src/agent/config/<name>.json` based on `schema.json`
-2. Create `src/agent/config/prompts/<name>_instructions.md`
-3. Add domain-specific tools to `src/agent/tools/` if needed
-4. Register new tools in `src/agent/tools/registry.py`
+1. Create `configs/<name>/config.json` extending `defaults`:
+   ```json
+   {"$extends": "defaults", "agent_id": "<name>", "display_name": "<Name> Agent", ...}
+   ```
+2. Create `configs/<name>/instructions.md` (task instructions)
+3. Optionally add `configs/<name>/summarization_prompt.md` (override)
+4. Add domain-specific tools to `src/agent/tools/` if needed
+5. Register new tools in `src/agent/tools/registry.py`
 
 ### Tool System
 
@@ -261,7 +291,7 @@ When adding a new tool to the system:
 
 3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`
 
-4. **Add to agent config** in `src/agent/config/<agent>.json` under the appropriate category:
+4. **Add to deployment config** in `configs/<agent>/config.json` under the appropriate category:
    ```json
    "tools": {
        "domain": ["my_tool", ...]

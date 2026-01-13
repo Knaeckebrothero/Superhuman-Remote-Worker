@@ -1,15 +1,9 @@
 {
-  "$schema": "schema.json",
+  "$schema": "../../src/agent/config/schema.json",
+  "$extends": "defaults",
   "agent_id": "validator",
   "display_name": "Validator Agent",
   "description": "Autonomous agent for validating requirements from the cache and integrating them into the Neo4j knowledge graph.",
-
-  "llm": {
-    "model": "gpt-oss-120b",
-    "temperature": 0.0,
-    "reasoning_level": "high",
-    "base_url": null
-  },
 
   "workspace": {
     "structure": [
@@ -18,29 +12,10 @@
       "output/",
       "tools/"
     ],
-    "instructions_template": "validator_instructions.md",
-    "initial_files": {
-      "workspace.md": "prompts/workspace_template.md"
-    }
+    "instructions_template": "instructions.md"
   },
 
   "tools": {
-    "workspace": [
-      "read_file",
-      "write_file",
-      "append_file",
-      "list_files",
-      "delete_file",
-      "search_files",
-      "file_exists",
-      "get_workspace_summary"
-    ],
-    "todo": [
-      "todo_write",
-      "todo_complete",
-      "todo_rewind",
-      "archive_and_reset"
-    ],
     "domain": [
       "execute_cypher_query",
       "get_database_schema",
@@ -54,46 +29,28 @@
       "generate_requirement_id",
       "get_entity_relationships",
       "count_graph_statistics"
-    ],
-    "completion": [
-      "mark_complete",
-      "job_complete"
     ]
   },
 
   "todo": {
-    "max_items": 20,
-    "archive_on_reset": true,
-    "archive_path": "archive/"
+    "max_items": 20
   },
 
   "connections": {
-    "postgres": true,
     "neo4j": true
   },
 
   "polling": {
-    "enabled": true,
     "table": "requirements",
     "status_field": "status",
-    "status_value_pending": "pending",
     "status_value_processing": "validating",
     "status_value_complete": "integrated",
-    "status_value_failed": "failed",
     "interval_seconds": 10,
     "use_skip_locked": true
   },
 
-  "limits": {
-    "max_iterations": 500,
-    "context_threshold_tokens": 80000,
-    "tool_retry_count": 3
-  },
-
   "context_management": {
-    "compact_on_archive": true,
-    "keep_recent_tool_results": 5,
-    "summarization_template": "validator_summarization_prompt.md"
+    "summarization_template": "summarization_prompt.md"
   },
 
   "validation": {

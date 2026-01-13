@@ -65,9 +65,9 @@ find_similar_requirements(requirement_text)  # 70% threshold
 ```
 
 <duplicate_rules>
-- Similarity > 95% → REJECT as duplicate
-- Similarity 70-95% → Related, note for reference
-- Similarity < 70% → Distinct, proceed
+- Similarity > 95% -> REJECT as duplicate
+- Similarity 70-95% -> Related, note for reference
+- Similarity < 70% -> Distinct, proceed
 </duplicate_rules>
 
 ### Entity Resolution
@@ -96,7 +96,7 @@ Record matches with confidence scores.
 - Unresolved mentions
 - Similar requirements found
 
-If NOT_RELEVANT or DUPLICATE → skip to rejection handling.
+If NOT_RELEVANT or DUPLICATE -> skip to rejection handling.
 
 ---
 
@@ -169,17 +169,17 @@ create_requirement_node(
 ```
 
 <compliance_status_rules>
-- All entities fulfilled → `fulfilled`
-- Mix of fulfilled/not → `partial`
-- No fulfillment evidence → `open`
+- All entities fulfilled -> `fulfilled`
+- Mix of fulfilled/not -> `partial`
+- No fulfillment evidence -> `open`
 </compliance_status_rules>
 
 ### Relationship Types
 
 <fulfillment_relationships>
 **Fulfilled**:
-- `FULFILLED_BY_OBJECT` (Requirement → BusinessObject)
-- `FULFILLED_BY_MESSAGE` (Requirement → Message)
+- `FULFILLED_BY_OBJECT` (Requirement -> BusinessObject)
+- `FULFILLED_BY_MESSAGE` (Requirement -> Message)
 - Properties: confidence, evidence, validatedAt
 
 **Not Fulfilled**:

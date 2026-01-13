@@ -1,8 +1,6 @@
 {
   "$schema": "schema.json",
-  "agent_id": "creator",
-  "display_name": "Creator Agent",
-  "description": "Autonomous agent for extracting requirements from documents and writing them to the requirement cache.",
+  "$comment": "Framework defaults - deployments extend this via $extends",
 
   "llm": {
     "model": "gpt-oss-120b",
@@ -14,14 +12,11 @@
   "workspace": {
     "structure": [
       "archive/",
-      "documents/",
       "tools/"
     ],
-    "instructions_template": "creator_instructions.md",
     "initial_files": {
       "workspace.md": "prompts/workspace_template.md"
-    },
-    "max_read_size": 25000
+    }
   },
 
   "tools": {
@@ -41,18 +36,7 @@
       "todo_rewind",
       "archive_and_reset"
     ],
-    "domain": [
-      "extract_document_text",
-      "get_document_info",
-      "web_search",
-      "cite_document",
-      "cite_web",
-      "list_sources",
-      "get_citation",
-      "list_requirements",
-      "get_requirement",
-      "add_requirement"
-    ],
+    "domain": [],
     "completion": [
       "mark_complete",
       "job_complete"
@@ -60,7 +44,6 @@
   },
 
   "todo": {
-    "max_items": 25,
     "archive_on_reset": true,
     "archive_path": "archive/"
   },
@@ -72,8 +55,6 @@
 
   "polling": {
     "enabled": true,
-    "table": "jobs",
-    "status_field": "creator_status",
     "status_value_pending": "pending",
     "status_value_processing": "processing",
     "status_value_complete": "complete",
@@ -90,20 +71,6 @@
   "context_management": {
     "compact_on_archive": true,
     "keep_recent_tool_results": 5,
-    "summarization_template": "creator_summarization_prompt.md"
-  },
-
-  "document_processing": {
-    "chunking_strategy": "legal",
-    "max_chunk_size": 1000,
-    "chunk_overlap": 200,
-    "extraction_mode": "balanced",
-    "min_confidence_threshold": 0.6
-  },
-
-  "research": {
-    "web_search_enabled": true,
-    "graph_search_enabled": true,
-    "research_depth": "thorough"
+    "summarization_template": "summarization_prompt.md"
   }
 }

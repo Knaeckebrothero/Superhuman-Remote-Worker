@@ -1,4 +1,5 @@
-"""Nested Loop Graph for Universal Agent.
+"""
+Universal Agent - Nested Loop Graph for Universal Agent.
 
 Implements the nested loop graph architecture with:
 - Initialization flow (runs once)
@@ -26,18 +27,18 @@ Graph Structure:
 ║   │                                                                 │     ║
 ║   │         ┌────────────────────────────────────────┐              │     ║
 ║   │         ↓                                        │              │     ║
-║   │      execute ──→ check_todos ──→ todos done? ──no──┘            │    ║
-║   │      (ReAct)           │                                        │    ║
-║   │                       yes                                       │    ║
-║   │                        ↓                                        │    ║
-║   │                  archive_phase                                  │    ║
-║   └─────────────────────────────────────────────────────────────────┘    ║
+║   │      execute ─→ check_todos ─→ todos done? ──no──┘              │     ║
+║   │      (ReAct)           │                                        │     ║
+║   │                       yes                                       │     ║
+║   │                        ↓                                        │     ║
+║   │                  archive_phase                                  │     ║
+║   └─────────────────────────────────────────────────────────────────┘     ║
 ║                                    ↓                                      ║
-║                            check_goal                                     ║
-║                             ↓          ↓                                  ║
-║                            no         yes                                 ║
-║                             ↓          ↓                                  ║
-║                    back to PLAN       END                                ║
+║                               check_goal                                  ║
+║                              ↓          ↓                                 ║
+║                             no         yes                                ║
+║                              ↓          ↓                                 ║
+║                       back to PLAN     END                                ║
 ║                                                                           ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 ```
@@ -222,10 +223,7 @@ def create_create_plan_node(
 
         messages = state.get("messages", [])
 
-        # Use loaded planning prompt or fallback
-        prompt_text = planning_prompt or """Create a structured plan with numbered phases.
-Each phase should have specific, actionable steps.
-Mark initial status as "pending" for each phase."""
+        prompt_text = planning_prompt
 
         # Call LLM to create plan
         plan_messages = messages + [HumanMessage(content=prompt_text)]
@@ -329,14 +327,7 @@ def create_init_todos_node(
         if not current_phase:
             current_phase = "Phase 1"
 
-        # Use loaded prompt or fallback
-        prompt_template = todo_extraction_prompt or """Extract todos for {current_phase} from:
-{plan_content}
-
-Return a JSON array: [{{"content": "Task", "priority": "high|medium|low"}}]
-Return ONLY the JSON array."""
-
-        extraction_prompt = prompt_template.format(
+        extraction_prompt = todo_extraction_prompt.format(
             current_phase=current_phase,
             plan_content=plan_content,
         )
@@ -522,14 +513,7 @@ def create_update_memory_node(
         current_memory = memory_manager.read()
         messages = state.get("messages", [])
 
-        # Use loaded prompt or fallback
-        prompt_template = memory_update_prompt or """Update workspace.md based on recent work.
-Current content:
-{current_memory}
-
-Return the complete updated content."""
-
-        update_prompt = prompt_template.format(current_memory=current_memory)
+        update_prompt = memory_update_prompt.format(current_memory=current_memory)
 
         memory_messages = messages[-10:] + [HumanMessage(content=update_prompt)]
 
@@ -634,14 +618,7 @@ def create_create_todos_node(
                 "goal_achieved": True,
             }
 
-        # Use loaded prompt or fallback
-        prompt_template = todo_extraction_prompt or """Extract todos for {current_phase} from:
-{plan_content}
-
-Return a JSON array: [{{"content": "Task", "priority": "high|medium|low"}}]
-Return ONLY the JSON array."""
-
-        extraction_prompt = prompt_template.format(
+        extraction_prompt = todo_extraction_prompt.format(
             current_phase=current_phase,
             plan_content=plan_content,
         )
@@ -1318,30 +1295,8 @@ def build_nested_loop_graph(
     todo_extraction_prompt = load_todo_extraction_prompt()
     memory_update_prompt = load_memory_update_prompt()
 
-    # Default workspace template
     if not workspace_template:
-        workspace_template = """# Workspace Memory
-
-This file is your persistent memory across context compaction.
-Update it with important information as you work.
-
-## Current State
-
-Phase: 1
-Status: Starting
-
-## Accomplishments
-
-(None yet)
-
-## Key Decisions
-
-(None yet)
-
-## Notes
-
-(Working notes)
-"""
+        raise ValueError("workspace_template is required")
 
     # Create graph
     workflow = StateGraph(UniversalAgentState)

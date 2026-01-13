@@ -41,11 +41,13 @@ from .tools.description_generator import generate_workspace_tool_docs
 from .tools.description_override import apply_description_overrides
 from .graph import build_nested_loop_graph, run_graph_with_streaming
 
+
 logger = logging.getLogger(__name__)
 
 
 class UniversalAgent:
-    """Configurable autonomous agent using workspace-centric architecture.
+    """
+    Configurable autonomous agent using workspace-centric architecture.
 
     The Universal Agent reads its behavior from a JSON configuration file,
     enabling a single implementation to serve as Creator, Validator, or
@@ -56,31 +58,15 @@ class UniversalAgent:
     - Tactical Execution: TodoManager with archive_and_reset()
     - Context Management: Automatic compaction and summarization
     - Tool Loading: Dynamic based on config.tools
-
-    Example:
-        ```python
-        # Create agent from config
-        agent = UniversalAgent.from_config("creator")
-        await agent.initialize()
-
-        # Process a job
-        result = await agent.process_job(
-            job_id="abc123",
-            metadata={"document_path": "/data/doc.pdf"}
-        )
-
-        # Cleanup
-        await agent.shutdown()
-        ```
     """
-
     def __init__(
         self,
         config: AgentConfig,
         postgres_conn: Optional[Any] = None,
         neo4j_conn: Optional[Any] = None,
     ):
-        """Initialize the Universal Agent.
+        """
+        Initialize the Universal Agent.
 
         Args:
             config: Agent configuration (from JSON file)
@@ -114,6 +100,16 @@ class UniversalAgent:
             f"Created {config.display_name} (agent_id={config.agent_id})"
         )
 
+    @property
+    def agent_id(self) -> str:
+        """Get the agent ID."""
+        return self.config.agent_id
+
+    @property
+    def display_name(self) -> str:
+        """Get the display name."""
+        return self.config.display_name
+
     @classmethod
     def from_config(
         cls,
@@ -121,7 +117,8 @@ class UniversalAgent:
         postgres_conn: Optional[Any] = None,
         neo4j_conn: Optional[Any] = None,
     ) -> "UniversalAgent":
-        """Create an agent from a configuration file.
+        """
+        Create an agent from a configuration file.
 
         Args:
             config_path: Path to config file or config name (e.g., "creator")
@@ -130,28 +127,20 @@ class UniversalAgent:
 
         Returns:
             UniversalAgent instance
-
-        Example:
-            ```python
-            # By name (looks in src/agent/config/)
-            agent = UniversalAgent.from_config("creator")
-
-            # By path
-            agent = UniversalAgent.from_config("/path/to/my_agent.json")
-            ```
         """
-        resolved_path = resolve_config_path(config_path)
-        config = load_agent_config(resolved_path)
+        resolved_path, deployment_dir = resolve_config_path(config_path)
+        config = load_agent_config(resolved_path, deployment_dir)
         return cls(config, postgres_conn, neo4j_conn)
 
     async def initialize(self) -> None:
-        """Initialize the agent and its components.
+        """
+        Initialize the agent and its components.
 
         This must be called before processing jobs. Sets up:
         - Database connections (if not provided)
         - LLM instance
         - Context manager
-        - Base tools (workspace, todo)
+        - Base tools (workspace, to-do)
 
         Raises:
             RuntimeError: If required connections cannot be established
@@ -247,7 +236,7 @@ class UniversalAgent:
 
             # Build graph for this job
             system_prompt = load_system_prompt(
-                self.config, job_id, workspace_manager=self._workspace_manager
+                self.config, workspace_manager=self._workspace_manager
             )
 
             # Load workspace template for nested loop graph
@@ -334,32 +323,9 @@ class UniversalAgent:
         config_dir = Path(__file__).parent / "config" / "prompts"
         template_path = config_dir / "workspace_template.md"
 
-        if template_path.exists():
-            return template_path.read_text(encoding="utf-8")
-
-        # Fallback default template
-        return """# Workspace Memory
-
-This file is your persistent memory across context compaction.
-Update it with important information as you work.
-
-## Current State
-
-Phase: Bootstrap
-Status: Starting
-
-## Accomplishments
-
-(None yet)
-
-## Key Decisions
-
-(None yet)
-
-## Notes
-
-(Working notes)
-"""
+        if not template_path.exists():
+            raise FileNotFoundError(f"Workspace template not found: {template_path}")
+        return template_path.read_text(encoding="utf-8")
 
     async def _setup_job_workspace(
         self,
@@ -743,12 +709,3 @@ Status: Starting
             },
         }
 
-    @property
-    def agent_id(self) -> str:
-        """Get the agent ID."""
-        return self.config.agent_id
-
-    @property
-    def display_name(self) -> str:
-        """Get the display name."""
-        return self.config.display_name

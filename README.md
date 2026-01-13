@@ -78,37 +78,44 @@ python agent.py --config validator --port 8002  # Validator server
 
 ## Architecture
 
-The system uses a two-agent autonomous architecture:
+The system uses a **Universal Agent** pattern - a single config-driven agent that can be deployed as either Creator or Validator by changing its configuration:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                          ORCHESTRATOR                               │
 │                    (Job Management & Coordination)                  │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-         ┌──────────────────────┴──────────────────────┐
-         │                                              │
-         ▼                                              ▼
-┌─────────────────────┐                      ┌─────────────────────┐
-│   CREATOR AGENT     │                      │  VALIDATOR AGENT    │
-│                     │                      │                     │
-│ - Document process  │                      │ - Graph exploration │
-│ - Requirement       │   PostgreSQL Cache   │ - Relevance check   │
-│   extraction        │ ◄──────────────────► │ - Fulfillment check │
-│ - Research/citation │   (requirements)     │ - Graph integration │
-└─────────────────────┘                      └─────────────────────┘
-                                                        │
-                                                        ▼
-                                              ┌─────────────────────┐
-                                              │       Neo4j         │
-                                              │  (Knowledge Graph)  │
-                                              └─────────────────────┘
+└───────────────────────────────────┬─────────────────────────────────┘
+                                    │
+         ┌──────────────────────────┴──────────────────────────┐
+         │                                                      │
+         ▼                                                      ▼
+┌───────────────────────────┐                    ┌───────────────────────────┐
+│     UNIVERSAL AGENT       │                    │     UNIVERSAL AGENT       │
+│   (config: creator)       │                    │   (config: validator)     │
+│                           │                    │                           │
+│ - Document processing     │  PostgreSQL Cache  │ - Graph exploration       │
+│ - Requirement extraction  │ ◄────────────────► │ - Relevance checking      │
+│ - Research & citations    │   (requirements)   │ - Fulfillment validation  │
+│                           │                    │ - Neo4j integration       │
+└───────────────────────────┘                    └───────────────────────────┘
+                                                              │
+                                                              ▼
+                                                  ┌─────────────────────┐
+                                                  │       Neo4j         │
+                                                  │  (Knowledge Graph)  │
+                                                  └─────────────────────┘
 ```
 
-**Components:**
-- **Creator Agent** - Processes documents, extracts requirements, performs research, creates citations
-- **Validator Agent** - Validates requirements against the graph, checks fulfillment, integrates into Neo4j
-- **Orchestrator** - Manages job lifecycle, monitors completion, generates reports
+**Universal Agent:**
+
+The same agent codebase (`src/agent/`) serves both roles. Behavior is determined by configuration:
+
+| Config | Purpose | Tools | Polls |
+|--------|---------|-------|-------|
+| `creator` | Extract requirements from documents | document, search, citation, cache | `jobs` table |
+| `validator` | Validate and integrate into graph | graph, cypher, validation | `requirements` table |
+
+Configs live in `configs/{name}/` and extend framework defaults via `$extends`. See [CLAUDE.md](CLAUDE.md) for the full configuration system.
 
 **Data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table

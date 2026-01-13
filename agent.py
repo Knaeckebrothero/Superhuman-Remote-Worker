@@ -145,7 +145,10 @@ def parse_args():
     parser.add_argument(
         "--config", "-c",
         default="creator",
-        help="Agent config name or path (default: creator)",
+        help=(
+            "Agent config name or path. Looks in configs/{name}/ first, "
+            "then src/agent/config/. (default: creator)"
+        ),
     )
 
     # Server options

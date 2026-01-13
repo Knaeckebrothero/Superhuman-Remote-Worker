@@ -1,0 +1,60 @@
+{
+  "$schema": "../../src/agent/config/schema.json",
+  "$extends": "defaults",
+  "agent_id": "creator",
+  "display_name": "Creator Agent",
+  "description": "Autonomous agent for extracting requirements from documents and writing them to the requirement cache.",
+
+  "workspace": {
+    "structure": [
+      "archive/",
+      "documents/",
+      "tools/"
+    ],
+    "instructions_template": "instructions.md",
+    "max_read_size": 25000
+  },
+
+  "tools": {
+    "domain": [
+      "extract_document_text",
+      "get_document_info",
+      "web_search",
+      "cite_document",
+      "cite_web",
+      "list_sources",
+      "get_citation",
+      "list_requirements",
+      "get_requirement",
+      "add_requirement"
+    ]
+  },
+
+  "todo": {
+    "max_items": 25
+  },
+
+  "polling": {
+    "table": "jobs",
+    "status_field": "creator_status",
+    "interval_seconds": 30
+  },
+
+  "context_management": {
+    "summarization_template": "summarization_prompt.md"
+  },
+
+  "document_processing": {
+    "chunking_strategy": "legal",
+    "max_chunk_size": 1000,
+    "chunk_overlap": 200,
+    "extraction_mode": "balanced",
+    "min_confidence_threshold": 0.6
+  },
+
+  "research": {
+    "web_search_enabled": true,
+    "graph_search_enabled": true,
+    "research_depth": "thorough"
+  }
+}

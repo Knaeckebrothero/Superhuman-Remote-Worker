@@ -276,14 +276,19 @@ def create_cache_tools(context: ToolContext) -> List:
             if not context.postgres_conn:
                 return "Error: No database connection available"
 
+            if not context.job_id:
+                return "Error: No job context available"
+
             query = """
                 SELECT *
                 FROM requirements
-                WHERE id = $1::uuid
+                WHERE id = $1::uuid AND job_id = $2::uuid
                 LIMIT 1
             """
 
-            row = asyncio.run(context.postgres_conn.fetchrow(query, requirement_id))
+            row = asyncio.run(context.postgres_conn.fetchrow(
+                query, requirement_id, context.job_id
+            ))
 
             if not row:
                 return f"Requirement not found: {requirement_id}"
