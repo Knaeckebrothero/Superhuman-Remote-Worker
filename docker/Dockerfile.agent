@@ -23,6 +23,8 @@
 #     -e NEO4J_URI=bolt://... \
 #     -e OPENAI_API_KEY=... \
 #     graphrag-agent
+#
+# Entry point: agent.py (Universal Agent CLI)
 # =============================================================================
 
 FROM python:3.11-slim AS builder
@@ -68,7 +70,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY src/ ./src/
 COPY configs/ ./configs/
 COPY citation_tool/ ./citation_tool/
-COPY run_universal_agent.py ./
+COPY agent.py ./
 
 # Install citation tool
 RUN if [ -d "./citation_tool" ] && [ -f "./citation_tool/pyproject.toml" ]; then \
@@ -92,4 +94,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${AGENT_PORT}/health || exit 1
 
 # Run the Universal Agent with config from environment
-CMD python run_universal_agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0
+CMD python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0
