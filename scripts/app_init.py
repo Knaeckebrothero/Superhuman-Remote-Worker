@@ -9,25 +9,25 @@ This script initializes the complete application environment including:
 
 Usage:
     # Initialize everything (PostgreSQL + Neo4j)
-    python src/scripts/app_init.py
+    python scripts/app_init.py
 
     # Force reset everything (delete all data, recreate databases)
-    python src/scripts/app_init.py --force-reset
+    python scripts/app_init.py --force-reset
 
     # With seed data (load sample requirements into Neo4j)
-    python src/scripts/app_init.py --seed
+    python scripts/app_init.py --seed
 
     # Skip specific databases
-    python src/scripts/app_init.py --skip-postgres
-    python src/scripts/app_init.py --skip-neo4j
-    python src/scripts/app_init.py --skip-mongodb
+    python scripts/app_init.py --skip-postgres
+    python scripts/app_init.py --skip-neo4j
+    python scripts/app_init.py --skip-mongodb
 
     # Initialize only specific database
-    python src/scripts/app_init.py --only-neo4j
-    python src/scripts/app_init.py --only-postgres
+    python scripts/app_init.py --only-neo4j
+    python scripts/app_init.py --only-postgres
 
     # Export current Neo4j data (for creating seed files)
-    python src/scripts/app_init.py --export-neo4j
+    python scripts/app_init.py --export-neo4j
 """
 import argparse
 import logging
@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -62,15 +62,15 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python src/scripts/app_init.py                    # Initialize all databases
-  python src/scripts/app_init.py --force-reset      # Reset and reinitialize everything
-  python src/scripts/app_init.py --seed             # Initialize with sample data
-  python src/scripts/app_init.py --skip-mongodb     # Skip MongoDB (if not needed)
-  python src/scripts/app_init.py --only-neo4j       # Only initialize Neo4j
-  python src/scripts/app_init.py --export-neo4j     # Export Neo4j data for seeding
+  python scripts/app_init.py                    # Initialize all databases
+  python scripts/app_init.py --force-reset      # Reset and reinitialize everything
+  python scripts/app_init.py --seed             # Initialize with sample data
+  python scripts/app_init.py --skip-mongodb     # Skip MongoDB (if not needed)
+  python scripts/app_init.py --only-neo4j       # Only initialize Neo4j
+  python scripts/app_init.py --export-neo4j     # Export Neo4j data for seeding
 
 Database reset commands (development):
-  python src/scripts/app_init.py --force-reset --seed  # Fresh start with seed data
+  python scripts/app_init.py --force-reset --seed  # Fresh start with seed data
         """,
     )
     parser.add_argument(
