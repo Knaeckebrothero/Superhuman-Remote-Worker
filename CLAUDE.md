@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. Agent behavior is configured via JSON files in `configs/{name}/` that extend framework defaults via `$extends`.
+**Architecture:** Two-agent autonomous system (Creator + Validator) with a Streamlit Dashboard for job management, unified via the **Universal Agent** pattern. Agent behavior is configured via JSON files in `configs/{name}/` that extend framework defaults via `$extends`.
 
 ## Commands
 
@@ -17,7 +17,7 @@ pip install -e ./citation_tool[full]
 cp .env.example .env
 
 # Initialize databases with seed data
-python src/scripts/app_init.py --force-reset --seed
+python scripts/app_init.py --force-reset --seed
 
 # Run tests
 pytest tests/                            # All tests
@@ -63,11 +63,16 @@ podman-compose build --no-cache creator validator dashboard
 
 ### Job Management
 
+Jobs are managed via the **Streamlit Dashboard** (http://localhost:8501) or CLI scripts:
+
 ```bash
-python start_orchestrator.py --document-path ./data/doc.pdf --prompt "Extract GoBD requirements" --wait
-python job_status.py --job-id <uuid> --report
-python list_jobs.py --status pending --stats
-python cancel_job.py --job-id <uuid> --cleanup
+# Dashboard (primary interface)
+cd dashboard && streamlit run app.py
+
+# CLI debugging tools (in scripts/)
+python scripts/job_status.py --job-id <uuid> --progress
+python scripts/list_jobs.py --status pending --stats
+python scripts/cancel_job.py --job-id <uuid> --force
 ```
 
 ## Configuration
@@ -87,8 +92,8 @@ See `src/agent/config/schema.json` for full spec.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR (port 8000)                         │
-│               Job Management, Monitoring, Reports                   │
+│                      DASHBOARD (port 8501)                          │
+│                 Streamlit UI - Job Management                       │
 └─────────────────────────┬───────────────────────────────────────────┘
                           │
        ┌──────────────────┴──────────────────┐
@@ -118,7 +123,8 @@ See `src/agent/config/schema.json` for full spec.
 - `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
 - `src/agent/api/` - FastAPI application for containerized deployment
 - `configs/` - **Deployment configs** (creator/, validator/) with `config.json` + prompt overrides
-- `src/orchestrator/` - Job manager, monitor, reporter
+- `dashboard/` - **Streamlit Dashboard** for job management (multi-page: app.py, pages/, db.py, agents.py)
+- `scripts/` - CLI tools and init scripts (app_init.py, init_*.py, job_status.py, list_jobs.py, cancel_job.py)
 - `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
 - `src/database/` - PostgreSQL schema and utilities
 - `src/agent/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
@@ -258,14 +264,12 @@ Tools are organized in `src/agent/tools/` and loaded dynamically by the registry
 
 | Service | Port |
 |---------|------|
-| Orchestrator | 8000 |
+| Dashboard (Streamlit) | 8501 |
 | Creator (Universal Agent) | 8001 |
 | Validator (Universal Agent) | 8002 |
 | Neo4j Bolt | 7687 |
 | Neo4j Browser | 7474 |
 | PostgreSQL | 5432 |
-| Dashboard (Streamlit) | 8501 |
-| Adminer (dev only) | 8080 |
 
 ## Adding New Tools
 

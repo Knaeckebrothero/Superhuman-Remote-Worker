@@ -8,19 +8,19 @@ This script:
 
 Usage:
     # Apply schema only (safe for existing data)
-    python src/scripts/init_neo4j.py
+    python scripts/init_neo4j.py
 
     # Clear database and apply fresh schema
-    python src/scripts/init_neo4j.py --clear
+    python scripts/init_neo4j.py --clear
 
     # Clear and load seed data
-    python src/scripts/init_neo4j.py --clear --seed
+    python scripts/init_neo4j.py --clear --seed
 
     # Load specific seed file
-    python src/scripts/init_neo4j.py --clear --seed-file data/seed_data.cypher
+    python scripts/init_neo4j.py --clear --seed-file data/seed_data.cypher
 
     # Export current data for later seeding
-    python src/scripts/init_neo4j.py --export --export-file data/seed_data.cypher
+    python scripts/init_neo4j.py --export --export-file data/seed_data.cypher
 """
 import logging
 import argparse
@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 
 # Add project root to path
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from dotenv import load_dotenv

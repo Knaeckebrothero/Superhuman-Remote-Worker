@@ -4,76 +4,167 @@ A Graph-RAG system for requirement traceability and compliance checking. Uses La
 
 ## Table of Contents
 
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-  - [Docker Deployment](#docker-deployment)
-  - [Local Development](#local-development)
+- [Prerequisites](#prerequisites)
+- [Production Deployment](#production-deployment)
+- [Development Setup](#development-setup)
 - [Architecture](#architecture)
 - [License](#license)
 
-## Quick Start
+## Prerequisites
+
+- **Docker or Podman** with Compose support
+- **Git**
+- **Python 3.11+** (development only)
+
+## Production Deployment
+
+Deploy the complete system using pre-built container images.
+
+### 1. Clone and Configure
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-pip install -e ./citation_tool[full]
-
-# Configure environment
-cp .env.example .env  # Edit with your API credentials
-
-# Start databases
-podman-compose -f docker-compose.dev.yaml up -d
-
-# Initialize with seed data
-python src/scripts/app_init.py --force-reset --seed
-
-# Run the agent
-python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
-```
-
-## Installation
-
-### Docker Deployment
-
-```bash
-# Clone and configure
 git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
 cd Uni-Projekt-Graph-RAG
 cp .env.example .env
-# Edit .env with your API credentials (OPENAI_API_KEY or LLM_BASE_URL)
-
-# Start all services
-podman-compose up -d
-
-# View logs
-podman-compose logs -f dashboard
 ```
 
-### Local Development
+### 2. Edit Environment Variables
+
+Edit `.env` with your configuration:
+
+**Required:**
+- `OPENAI_API_KEY` - Your OpenAI API key, or compatible API key
+- `LLM_BASE_URL` - Custom endpoint URL (if using self-hosted models)
+
+**Optional:**
+- `TAVILY_API_KEY` - For web search functionality in Creator agent
+- `NEO4J_PASSWORD`, `POSTGRES_PASSWORD` - Custom database passwords
+- `LOG_LEVEL` - DEBUG, INFO, WARNING, ERROR (default: INFO)
+- Port overrides: `CREATOR_PORT`, `VALIDATOR_PORT`, `DASHBOARD_PORT`, etc.
+
+### 3. Start All Services
 
 ```bash
-# Create virtual environment
+podman-compose up -d
+```
+
+This starts:
+- **PostgreSQL** - Job tracking and requirement cache
+- **Neo4j** - Knowledge graph storage
+- **Creator Agent** - Document processing and requirement extraction
+- **Validator Agent** - Requirement validation and graph integration
+- **Dashboard** - Streamlit UI for job management
+
+### 4. Access Services
+
+| Service | URL |
+|---------|-----|
+| Dashboard | http://localhost:8501 |
+| Neo4j Browser | http://localhost:7474 |
+| Creator API | http://localhost:8001 |
+| Validator API | http://localhost:8002 |
+
+### 5. Common Operations
+
+```bash
+# View logs
+podman-compose logs -f
+podman-compose logs -f creator validator
+
+# Check service status
+podman-compose ps
+
+# Restart services
+podman-compose restart
+
+# Stop all services
+podman-compose down
+
+# Stop and remove all data
+podman-compose down -v
+```
+
+## Development Setup
+
+Run databases in containers while developing agents locally with Python.
+
+### 1. Clone and Set Up Python Environment
+
+```bash
+git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
+cd Uni-Projekt-Graph-RAG
+
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
-# Install dependencies
 pip install -r requirements.txt
 pip install -e ./citation_tool[full]
+```
 
-# Configure environment
+### 2. Configure Environment
+
+```bash
 cp .env.example .env
-# Edit .env with your credentials
+# Edit .env with your API credentials
+```
 
-# Start databases only
+### 3. Start Databases
+
+```bash
 podman-compose -f docker-compose.dev.yaml up -d
+```
 
-# Initialize databases
+This starts PostgreSQL, Neo4j, and MongoDB (for optional LLM request logging).
+
+### 4. Initialize Databases
+
+```bash
+# First time setup with sample data
+python src/scripts/app_init.py --seed
+
+# Reset everything (deletes all data)
 python src/scripts/app_init.py --force-reset --seed
+```
 
-# Run Universal Agent
+### 5. Run Agents Locally
+
+```bash
+# Process a document
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
-python agent.py --config creator --port 8001  # API server mode
-python agent.py --config validator --port 8002  # Validator server
+
+# Run Creator as API server
+python agent.py --config creator --port 8001
+
+# Run Validator as API server
+python agent.py --config validator --port 8002
+
+# Run with streaming output
+python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+```
+
+### 6. Database Management
+
+```bash
+# Reset PostgreSQL only
+python src/scripts/app_init.py --only-postgres --force-reset
+
+# Reset Neo4j with seed data
+python src/scripts/app_init.py --only-neo4j --force-reset --seed
+
+# View init script options
+python src/scripts/app_init.py --help
+
+# Nuclear option: remove all Docker volumes and reinitialize
+podman-compose -f docker-compose.dev.yaml down -v
+podman-compose -f docker-compose.dev.yaml up -d
+python src/scripts/app_init.py --seed
+```
+
+### 7. Stop Databases
+
+```bash
+podman-compose -f docker-compose.dev.yaml down      # Keep data
+podman-compose -f docker-compose.dev.yaml down -v   # Remove data
 ```
 
 ## Architecture

@@ -7,8 +7,8 @@ This script:
 3. Creates all tables from schema.sql
 
 Usage:
-    python src/scripts/init_db.py                    # Create tables if not exist
-    python src/scripts/init_db.py --force-reset      # Drop everything, recreate
+    python scripts/init_db.py                    # Create tables if not exist
+    python scripts/init_db.py --force-reset      # Drop everything, recreate
 """
 import logging
 import asyncio
@@ -17,7 +17,7 @@ import os
 import sys
 from pathlib import Path
 
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 try:
