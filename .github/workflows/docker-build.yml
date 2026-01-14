@@ -3,11 +3,6 @@ name: Build and Push Docker Images
 on:
   push:
     branches:
-      - develop
-      - main
-  pull_request:
-    branches:
-      - develop
       - main
 
 env:
@@ -15,7 +10,7 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push-frontend:
+  build-agent:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,69 +23,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Verify Docker directory and files
-        run: |
-          echo "Current directory:"
-          pwd
-          echo ""
-          echo "Repository structure:"
-          ls -la
-          echo ""
-
-          if [ ! -d "docker" ]; then
-            echo "Error: docker directory not found!"
-            echo "Please ensure the docker directory exists with Dockerfile and nginx.conf"
-            exit 1
-          fi
-
-          echo "Docker directory contents:"
-          ls -la docker/
-          echo ""
-
-          if [ ! -f "docker/Dockerfile" ]; then
-            echo "Error: docker/Dockerfile not found!"
-            exit 1
-          fi
-
-          if [ ! -f "docker/nginx.conf" ]; then
-            echo "Error: docker/nginx.conf not found!"
-            exit 1
-          fi
-
-          echo "✅ All required Docker files found"
-
-      - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
+      - name: Log in to Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for frontend
-        id: meta-frontend
+      - name: Extract metadata for Agent
+        id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,format=short,prefix=${{ github.event_name == 'pull_request' && 'pr-' || 'sha-' }}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=develop-latest,enable=${{ github.ref == 'refs/heads/develop' && github.event_name != 'pull_request' }}
+            type=raw,value=latest
+            type=sha,format=short,prefix=sha-
 
-      - name: Build and push Frontend Docker image
+      - name: Build and push Agent image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-frontend.outputs.tags }}
-          labels: ${{ steps.meta-frontend.outputs.labels }}
+          file: ./docker/Dockerfile.agent
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  build-and-push-backend:
+  build-dashboard:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -103,356 +63,29 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Verify Backend files
-        run: |
-          echo "Checking backend files..."
-
-          if [ ! -d "backend" ]; then
-            echo "Error: backend/ directory not found!"
-            exit 1
-          fi
-
-          if [ ! -f "start_backend.py" ]; then
-            echo "Error: start_backend.py not found!"
-            exit 1
-          fi
-
-          if [ ! -f "requirements.txt" ]; then
-            echo "Error: requirements.txt not found!"
-            exit 1
-          fi
-
-          if [ ! -f "docker/backend.Dockerfile" ]; then
-            echo "Error: docker/backend.Dockerfile not found!"
-            exit 1
-          fi
-
-          echo "Backend directory structure:"
-          ls -la backend/
-          echo ""
-          echo "All required backend files found"
-
-      - name: Log in to the Container registry
-        if: github.event_name != 'pull_request'
+      - name: Log in to Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for backend
-        id: meta-backend
+      - name: Extract metadata for Dashboard
+        id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-dashboard
           tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=sha,format=short,prefix=${{ github.event_name == 'pull_request' && 'pr-' || 'sha-' }}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=develop-latest,enable=${{ github.ref == 'refs/heads/develop' && github.event_name != 'pull_request' }}
+            type=raw,value=latest
+            type=sha,format=short,prefix=sha-
 
-      - name: Build and push Backend Docker image
+      - name: Build and push Dashboard image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/backend.Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-backend.outputs.tags }}
-          labels: ${{ steps.meta-backend.outputs.labels }}
+          file: ./docker/Dockerfile.dashboard
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  create-deployment-artifacts:
-    needs: [build-and-push-frontend, build-and-push-backend]
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-
-    steps:
-      - name: Create deployment artifacts
-        run: |
-          echo "Creating deployment directory..."
-          mkdir -p deployment
-
-          # Determine image tag based on branch
-          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-            IMAGE_TAG="latest"
-            ENV_TYPE="production"
-          else
-            IMAGE_TAG="develop-latest"
-            ENV_TYPE="development"
-          fi
-
-          echo "Building deployment artifacts for: $ENV_TYPE (tag: $IMAGE_TAG)"
-
-          # Create docker-compose.yml with appropriate tag
-          cat > deployment/docker-compose.yml << EOF
-          version: '3.8'
-
-          services:
-            postgres:
-              image: postgres:16-alpine
-              container_name: fessi-postgres
-              ports:
-                - "\${POSTGRES_PORT:-5432}:5432"
-              environment:
-                - POSTGRES_USER=\${POSTGRES_USER:-fessi}
-                - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD:-fessi_password}
-                - POSTGRES_DB=\${POSTGRES_DB:-fessi_chat}
-              volumes:
-                - postgres_data:/var/lib/postgresql/data
-              healthcheck:
-                test: ["CMD-SHELL", "pg_isready -U \${POSTGRES_USER:-fessi} -d \${POSTGRES_DB:-fessi_chat}"]
-                interval: 5s
-                timeout: 5s
-                retries: 5
-              networks:
-                - app-network
-              restart: unless-stopped
-
-            neo4j:
-              image: neo4j:5.15-community
-              container_name: fessi-neo4j
-              environment:
-                - NEO4J_AUTH=\${NEO4J_USER:-neo4j}/\${NEO4J_PASSWORD:-fessi_neo4j}
-                - NEO4J_PLUGINS=["apoc"]
-                - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-              volumes:
-                - neo4j_data:/data
-              healthcheck:
-                test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
-                interval: 10s
-                timeout: 10s
-                retries: 5
-                start_period: 30s
-              networks:
-                - app-network
-              restart: unless-stopped
-
-            db-init:
-              image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${IMAGE_TAG}
-              container_name: fessi-db-init
-              command: ["python", "-m", "backend.app_init", "--prod"]
-              environment:
-                - POSTGRES_HOST=postgres
-                - POSTGRES_PORT=5432
-                - POSTGRES_DB=\${POSTGRES_DB:-fessi_chat}
-                - POSTGRES_USER=\${POSTGRES_USER:-fessi}
-                - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD:-fessi_password}
-                - NEO4J_URI=bolt://neo4j:7687
-                - NEO4J_USER=\${NEO4J_USER:-neo4j}
-                - NEO4J_PASSWORD=\${NEO4J_PASSWORD:-fessi_neo4j}
-              depends_on:
-                postgres:
-                  condition: service_healthy
-                neo4j:
-                  condition: service_healthy
-              networks:
-                - app-network
-              restart: "no"
-
-            frontend:
-              image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend:${IMAGE_TAG}
-              container_name: fessi-frontend
-              ports:
-                - "\${FRONTEND_PORT:-8080}:80"
-              restart: unless-stopped
-              environment:
-                - NODE_ENV=production
-                - API_URL=\${API_URL:-https://localhost:8443}
-              depends_on:
-                - backend
-              networks:
-                - app-network
-
-            backend:
-              image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${IMAGE_TAG}
-              container_name: fessi-backend
-              ports:
-                - "\${BACKEND_PORT:-8443}:8443"
-              restart: unless-stopped
-              environment:
-                # SSL/TLS
-                - USE_DEV_CERTS=True
-                # PostgreSQL
-                - POSTGRES_HOST=postgres
-                - POSTGRES_PORT=5432
-                - POSTGRES_DB=\${POSTGRES_DB:-fessi_chat}
-                - POSTGRES_USER=\${POSTGRES_USER:-fessi}
-                - POSTGRES_PASSWORD=\${POSTGRES_PASSWORD:-fessi_password}
-                # Neo4j
-                - NEO4J_URI=bolt://neo4j:7687
-                - NEO4J_USER=\${NEO4J_USER:-neo4j}
-                - NEO4J_PASSWORD=\${NEO4J_PASSWORD:-fessi_neo4j}
-                # LLM Provider
-                - LLM_PROVIDER=\${LLM_PROVIDER:-}
-                - REPLICATE_API_TOKEN=\${REPLICATE_API_TOKEN:-}
-                - OPENAI_API_KEY=\${OPENAI_API_KEY:-}
-                - OPENAI_MODEL=\${OPENAI_MODEL:-gpt-4o-mini}
-                - OPENAI_BASE_URL=\${OPENAI_BASE_URL:-}
-                - ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}
-                - ANTHROPIC_MODEL=\${ANTHROPIC_MODEL:-}
-                # Vision/Multimodal
-                - MODEL_RECEIVE_IMAGES=\${MODEL_RECEIVE_IMAGES:-false}
-                - MODEL_RECEIVE_IMAGES_PDF=\${MODEL_RECEIVE_IMAGES_PDF:-false}
-                - VISION_BASE_URL=\${VISION_BASE_URL:-}
-                - VISION_MODEL=\${VISION_MODEL:-gpt-4o-mini}
-                # Audio Transcription
-                - USE_LOCAL_WHISPER=\${USE_LOCAL_WHISPER:-false}
-                - LOCAL_WHISPER_MODEL=\${LOCAL_WHISPER_MODEL:-base}
-                - WHISPER_BASE_URL=\${WHISPER_BASE_URL:-}
-                - WHISPER_MODEL=\${WHISPER_MODEL:-whisper-1}
-                - WHISPER_LANGUAGE=\${WHISPER_LANGUAGE:-}
-                # Logging
-                - LOG_LEVEL=\${LOG_LEVEL:-INFO}
-              volumes:
-                - filesystem_data:/app/.filesystem
-              depends_on:
-                db-init:
-                  condition: service_completed_successfully
-              networks:
-                - app-network
-
-          networks:
-            app-network:
-              driver: bridge
-
-          volumes:
-            postgres_data:
-            neo4j_data:
-            filesystem_data:
-          EOF
-
-          # Create deployment instructions
-          cat > deployment/README.md << EOF
-          # Deployment Instructions
-
-          ## Environment: ${ENV_TYPE^}
-
-          This deployment package uses the \`${IMAGE_TAG}\` image tag.
-
-          ## Prerequisites
-
-          1. Docker and Docker Compose installed
-          2. An LLM API key (OpenAI, Anthropic, or Replicate)
-
-          ## Quick Start
-
-          1. Copy the \`.env.example\` file and fill in your values:
-          \`\`\`bash
-          cp .env.example .env
-          # Edit .env with your credentials
-          \`\`\`
-
-          2. Pull and run the containers:
-          \`\`\`bash
-          docker-compose up -d
-          \`\`\`
-
-          The \`db-init\` container will automatically initialize the PostgreSQL and Neo4j databases on first run.
-
-          ## Services
-
-          - **postgres**: PostgreSQL 16 database for conversations and messages
-          - **neo4j**: Neo4j 5.15 knowledge graph for waste disposal information
-          - **db-init**: Database initialization container (creates/updates schema, no test data)
-          - **frontend**: Angular web application
-          - **backend**: FastAPI backend with LangGraph agent
-
-          ## Access the Application
-
-          - Frontend: http://localhost:8080
-          - Backend API: https://localhost:8443/api/docs
-
-          ## Image Information
-
-          - Registry: ${{ env.REGISTRY }}
-          - Frontend Image: ${{ env.IMAGE_NAME }}-frontend:${IMAGE_TAG}
-          - Backend Image: ${{ env.IMAGE_NAME }}-backend:${IMAGE_TAG}
-          - Environment: ${ENV_TYPE}
-
-          ## Switching Environments
-
-          To switch between production and development images, change the image tags:
-          - **Production**: Use \`:latest\` tag (built from \`main\` branch)
-          - **Development**: Use \`:develop-latest\` tag (built from \`develop\` branch)
-
-          ## Notes
-
-          - The backend uses self-signed certificates. You'll need to accept the certificate warning in your browser.
-          - PostgreSQL data is persisted in a Docker volume
-          - Neo4j knowledge graph data is persisted in a Docker volume
-          - Configure at least one LLM provider (OpenAI recommended) for AI responses to work
-          EOF
-
-          # Create .env template
-          cat > deployment/.env.example << 'ENVEOF'
-          # Copy this file to .env and fill in your values
-
-          # ============================================
-          # LLM Provider Configuration (choose one)
-          # ============================================
-          # Option 1: OpenAI (recommended)
-          OPENAI_API_KEY=your_openai_api_key_here
-          OPENAI_MODEL=gpt-4o-mini
-          # OPENAI_BASE_URL=http://your-llama-cpp-server:8080/v1  # Optional: custom endpoint
-
-          # Option 2: Anthropic
-          # ANTHROPIC_API_KEY=your_anthropic_api_key_here
-          # ANTHROPIC_MODEL=claude-3-haiku-20240307
-
-          # Option 3: Replicate (legacy)
-          # REPLICATE_API_TOKEN=your_replicate_api_token_here
-
-          # ============================================
-          # Database Configuration
-          # ============================================
-          # PostgreSQL
-          POSTGRES_USER=fessi
-          POSTGRES_PASSWORD=your_secure_password_here
-          POSTGRES_DB=fessi_chat
-
-          # Neo4j
-          NEO4J_USER=neo4j
-          NEO4J_PASSWORD=your_neo4j_password_here
-
-          # ============================================
-          # Optional: Ports & URLs
-          # ============================================
-          FRONTEND_PORT=8080
-          BACKEND_PORT=8443
-          # API_URL=https://your-backend-host:8443  # Frontend API endpoint
-
-          # ============================================
-          # Optional: Vision & Multimodal
-          # ============================================
-          # MODEL_RECEIVE_IMAGES=false
-          # VISION_MODEL=gpt-4o-mini
-
-          # ============================================
-          # Optional: Audio Transcription
-          # ============================================
-          # USE_LOCAL_WHISPER=false
-          # LOCAL_WHISPER_MODEL=base
-          # WHISPER_MODEL=whisper-1
-
-          # ============================================
-          # Optional: Logging
-          # ============================================
-          # LOG_LEVEL=INFO
-          ENVEOF
-
-          # List deployment directory contents for verification
-          echo "Deployment directory contents:"
-          ls -la deployment/
-          echo ""
-          echo "docker-compose.yml image tags:"
-          grep "image:" deployment/docker-compose.yml || true
-
-      - name: Upload deployment artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-artifacts-${{ github.ref_name }}
-          path: deployment/
-          retention-days: 14
-

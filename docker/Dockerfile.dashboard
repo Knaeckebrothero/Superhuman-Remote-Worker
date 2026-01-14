@@ -2,16 +2,16 @@
 # Dashboard Dockerfile
 # =============================================================================
 #
-# The Dashboard provides a Streamlit UI for manual agent testing.
+# Streamlit UI for job management and agent monitoring.
 #
 # Build:
 #   docker build -t graphrag-dashboard -f docker/Dockerfile.dashboard .
 #
 # Run:
 #   docker run -p 8501:8501 \
+#     -e DATABASE_URL=postgresql://... \
 #     -e CREATOR_AGENT_URL=http://creator:8001 \
 #     -e VALIDATOR_AGENT_URL=http://validator:8002 \
-#     -e NEO4J_URI=bolt://... \
 #     graphrag-dashboard
 # =============================================================================
 
@@ -25,15 +25,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
-COPY requirements.txt .
+# Copy and install dashboard requirements
+COPY dashboard/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Production image
 FROM python:3.11-slim
 
 LABEL maintainer="Graph-RAG Team"
-LABEL description="Streamlit Dashboard for manual agent testing"
+LABEL description="Streamlit Dashboard for job management and agent monitoring"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -54,14 +54,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy source code (includes core utilities needed by legacy UI)
-COPY src/core/ ./src/core/
-COPY config/ ./config/
-# Copy legacy system for Streamlit dashboard
-COPY legacy_system/ ./legacy_system/
-
-# Create directories
-RUN mkdir -p /app/logs
+# Copy dashboard code
+COPY dashboard/ ./dashboard/
 
 # Create non-root user
 RUN groupadd -r graphrag && useradd -r -g graphrag graphrag
@@ -75,5 +69,5 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-# Run the Streamlit dashboard from legacy_system
-CMD ["streamlit", "run", "legacy_system/streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+# Run the Streamlit dashboard
+CMD ["streamlit", "run", "dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
