@@ -565,10 +565,8 @@ def create_update_memory_node(
             oss_reasoning_level=oss_reasoning_level,
         )
 
-        # Slice messages safely to avoid orphaning ToolMessages
-        target_start = max(0, len(messages) - 10)
-        safe_start = find_safe_slice_start(messages, target_start)
-        memory_messages = messages[safe_start:] + [HumanMessage(content=update_prompt)]
+        # Include all messages (excluding system messages) for full context
+        memory_messages = [m for m in messages if not isinstance(m, SystemMessage)] + [HumanMessage(content=update_prompt)]
 
         # Audit LLM call
         auditor = get_archiver()
@@ -680,10 +678,8 @@ def create_create_todos_node(
         )
 
         messages = state.get("messages", [])
-        # Slice messages safely to avoid orphaning ToolMessages
-        target_start = max(0, len(messages) - 5)
-        safe_start = find_safe_slice_start(messages, target_start)
-        todo_messages = messages[safe_start:] + [HumanMessage(content=extraction_prompt)]
+        # Include all messages (excluding system messages) for full context
+        todo_messages = [m for m in messages if not isinstance(m, SystemMessage)] + [HumanMessage(content=extraction_prompt)]
 
         # Audit LLM call
         auditor = get_archiver()
@@ -824,11 +820,8 @@ def create_execute_node(
         # Always clear old tool results, keep last 10
         messages = context_mgr.clear_old_tool_results(messages)
 
-        # Add conversation history (keep recent), ensuring we don't orphan ToolMessages
-        # Find a safe slice boundary that doesn't split AIMessage/ToolMessage pairs
-        target_start = max(0, len(messages) - 20)
-        safe_start = find_safe_slice_start(messages, target_start)
-        for msg in messages[safe_start:]:
+        # Add full conversation history (excluding system messages)
+        for msg in messages:
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
@@ -1297,7 +1290,7 @@ def create_audited_tool_node(
     """
     tool_node = ToolNode(tools)
 
-    def audited_tools(state: UniversalAgentState) -> Dict[str, Any]:
+    async def audited_tools(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute tools with audit logging."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
@@ -1329,9 +1322,9 @@ def create_audited_tool_node(
                     metadata=state.get("metadata"),
                 )
 
-        # Execute tools with timing
+        # Execute tools with timing (use ainvoke for async tool support)
         start_time = time.time()
-        result = tool_node.invoke(state)
+        result = await tool_node.ainvoke(state)
         execution_time_ms = int((time.time() - start_time) * 1000)
 
         # Audit tool results

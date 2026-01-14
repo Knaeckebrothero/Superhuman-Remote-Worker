@@ -559,8 +559,8 @@ class ContextManager:
                 # Just note that a tool was called, don't include full result
                 formatted_parts.append(f"[Tool result: {len(msg.content)} chars]")
 
-        # Limit to avoid summarization being too long
-        conversation_text = "\n".join(formatted_parts[-100:])
+        # Include all formatted parts for complete context
+        conversation_text = "\n".join(formatted_parts)
 
         default_prompt = """Summarize this agent conversation concisely.
 Focus on:
