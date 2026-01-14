@@ -33,7 +33,7 @@ python validate_metamodel.py --check A1   # Specific check
 
 ```bash
 # Start databases only
-podman-compose -f docker-compose.dbs.yml up -d
+podman-compose -f docker-compose.dev.yaml up -d
 
 # Run Universal Agent (config resolution: configs/{name}/ → src/agent/config/{name}.json)
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
@@ -43,7 +43,7 @@ python agent.py --config validator --port 8002                        # API serv
 python agent.py --config creator --polling-only                       # Polling loop only
 
 # Stop databases
-podman-compose -f docker-compose.dbs.yml down -v
+podman-compose -f docker-compose.dev.yaml down -v
 ```
 
 ### Docker Deployment
@@ -51,14 +51,14 @@ podman-compose -f docker-compose.dbs.yml down -v
 ```bash
 # Full system
 podman-compose up -d
-podman-compose logs -f creator validator orchestrator
+podman-compose logs -f creator validator dashboard
 
 # Database access
 podman-compose exec postgres psql -U graphrag -d graphrag
 podman-compose exec neo4j cypher-shell -u neo4j -p neo4j_password
 
 # Rebuild
-podman-compose build --no-cache creator validator orchestrator
+podman-compose build --no-cache creator validator dashboard
 ```
 
 ### Job Management
