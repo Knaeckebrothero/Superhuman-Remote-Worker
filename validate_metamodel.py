@@ -11,7 +11,7 @@ import json
 import sys
 from dotenv import load_dotenv
 
-from src.core import create_neo4j_connection, MetamodelValidator
+from src.utils import create_neo4j_connection, MetamodelValidator
 
 
 def main():

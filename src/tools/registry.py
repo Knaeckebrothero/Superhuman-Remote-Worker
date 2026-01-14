@@ -5,7 +5,7 @@ to load them based on configuration. This enables the Universal Agent
 to load different tool sets based on its config file.
 
 Usage:
-    from src.agents.tools import load_tools, ToolContext
+    from src.tools import load_tools, ToolContext
 
     context = ToolContext(workspace_manager=ws)
     tools = load_tools(["read_file", "write_file", "list_files"], context)

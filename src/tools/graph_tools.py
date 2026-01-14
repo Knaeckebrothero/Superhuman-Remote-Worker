@@ -435,7 +435,7 @@ RECOMMENDATION: REJECT as duplicate of {req['rid']}"""
             return "Error: No Neo4j connection available"
 
         try:
-            from src.core.metamodel_validator import MetamodelValidator, Severity
+            from src.utils.metamodel_validator import MetamodelValidator, Severity
             validator = MetamodelValidator(neo4j)
 
             if check_type == "all":

@@ -76,7 +76,7 @@ def get_workspace_base_path() -> Path:
         return container_path
 
     # Development mode: use ./workspace relative to project root
-    from src.core.config import get_project_root
+    from src.utils.config import get_project_root
     return get_project_root() / "workspace"
 
 
@@ -171,7 +171,7 @@ class WorkspaceManager:
 
     def _copy_instructions_template(self) -> None:
         """Copy instructions template to workspace."""
-        from src.core.config import get_project_root
+        from src.utils.config import get_project_root
 
         template_path = get_project_root() / "config" / "prompts" / self.config.instructions_template
         dest_path = self._workspace_path / "instructions.md"
