@@ -59,8 +59,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dotenv import load_dotenv
 load_dotenv()
 
-from src.agent import UniversalAgent, create_app
-from src.agent.core.workspace import get_workspace_base_path
+from src import UniversalAgent, create_app
+from src.core.workspace import get_workspace_base_path
 from src.database.postgres_utils import create_postgres_connection, create_job
 
 

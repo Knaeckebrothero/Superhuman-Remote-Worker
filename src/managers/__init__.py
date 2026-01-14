@@ -17,8 +17,8 @@ files in the job workspace.
 
 Example:
     ```python
-    from src.agent.core.workspace import WorkspaceManager
-    from src.agent.managers import TodoManager, PlanManager, MemoryManager
+    from src.core.workspace import WorkspaceManager
+    from src.managers import TodoManager, PlanManager, MemoryManager
 
     # Create workspace
     workspace = WorkspaceManager(job_id="abc123")
