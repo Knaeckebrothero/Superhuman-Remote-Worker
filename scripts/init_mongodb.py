@@ -8,13 +8,13 @@ This script:
 
 Usage:
     # Initialize MongoDB (create collections and indexes)
-    python src/scripts/init_mongodb.py
+    python scripts/init_mongodb.py
 
     # Clear all data and reinitialize
-    python src/scripts/init_mongodb.py --clear
+    python scripts/init_mongodb.py --clear
 
     # Check connection only
-    python src/scripts/init_mongodb.py --check
+    python scripts/init_mongodb.py --check
 
 Environment Variables (from .env):
     MONGODB_URL - MongoDB connection string (optional)
@@ -29,7 +29,7 @@ from pathlib import Path
 from datetime import datetime
 
 # Add project root to path
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from dotenv import load_dotenv

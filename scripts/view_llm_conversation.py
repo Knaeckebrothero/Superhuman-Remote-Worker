@@ -6,32 +6,32 @@ history and complete agent execution audit trail for debugging and analysis.
 
 Usage:
     # View all LLM requests for a job
-    python src/scripts/view_llm_conversation.py --job-id <uuid>
+    python scripts/view_llm_conversation.py --job-id <uuid>
 
     # View complete audit trail (all agent steps)
-    python src/scripts/view_llm_conversation.py --job-id <uuid> --audit
+    python scripts/view_llm_conversation.py --job-id <uuid> --audit
 
     # View only tool calls in audit trail
-    python src/scripts/view_llm_conversation.py --job-id <uuid> --audit --step-type tool_call
+    python scripts/view_llm_conversation.py --job-id <uuid> --audit --step-type tool_call
 
     # View audit timeline (node transitions)
-    python src/scripts/view_llm_conversation.py --job-id <uuid> --audit --timeline
+    python scripts/view_llm_conversation.py --job-id <uuid> --audit --timeline
 
     # View recent requests across all jobs
-    python src/scripts/view_llm_conversation.py --recent 20
+    python scripts/view_llm_conversation.py --recent 20
 
     # Get statistics for a job
-    python src/scripts/view_llm_conversation.py --job-id <uuid> --stats
+    python scripts/view_llm_conversation.py --job-id <uuid> --stats
 
     # Export conversation to JSON
-    python src/scripts/view_llm_conversation.py --job-id <uuid> --export conv.json
+    python scripts/view_llm_conversation.py --job-id <uuid> --export conv.json
 
     # Show only tool calls
-    python src/scripts/view_llm_conversation.py --job-id <uuid> --tools-only
+    python scripts/view_llm_conversation.py --job-id <uuid> --tools-only
 
     # Export single LLM request as HTML (messenger-style visualization)
-    python src/scripts/view_llm_conversation.py --doc-id <mongodb_objectid>
-    python src/scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --html output.html
+    python scripts/view_llm_conversation.py --doc-id <mongodb_objectid>
+    python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --html output.html
 """
 
 import argparse
@@ -42,7 +42,7 @@ from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
