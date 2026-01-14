@@ -22,7 +22,7 @@ pip install -e ./citation_tool[full]
 cp .env.example .env  # Edit with your API credentials
 
 # Start databases
-podman-compose -f docker-compose.dbs.yml up -d
+podman-compose -f docker-compose.dev.yaml up -d
 
 # Initialize with seed data
 python src/scripts/app_init.py --force-reset --seed
@@ -39,14 +39,14 @@ python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extrac
 # Clone and configure
 git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
 cd Uni-Projekt-Graph-RAG
-cp .env.docker.example .env
+cp .env.example .env
 # Edit .env with your API credentials (OPENAI_API_KEY or LLM_BASE_URL)
 
 # Start all services
 podman-compose up -d
 
 # View logs
-podman-compose logs -f orchestrator
+podman-compose logs -f dashboard
 ```
 
 ### Local Development
@@ -65,7 +65,7 @@ cp .env.example .env
 # Edit .env with your credentials
 
 # Start databases only
-podman-compose -f docker-compose.dbs.yml up -d
+podman-compose -f docker-compose.dev.yaml up -d
 
 # Initialize databases
 python src/scripts/app_init.py --force-reset --seed
@@ -82,8 +82,8 @@ The system uses a **Universal Agent** pattern - a single config-driven agent tha
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          ORCHESTRATOR                               │
-│                    (Job Management & Coordination)                  │
+│                           DASHBOARD                                 │
+│                  (Streamlit UI - Job Management)                    │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
          ┌──────────────────────────┴──────────────────────────┐
