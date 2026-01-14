@@ -35,7 +35,7 @@ python validate_metamodel.py --check A1   # Specific check
 # Start databases only
 podman-compose -f docker-compose.dev.yaml up -d
 
-# Run Universal Agent (config resolution: configs/{name}/ → src/agent/config/{name}.json)
+# Run Universal Agent (config resolution: configs/{name}/ → src/config/{name}.json)
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
 python agent.py --config creator --document-dir ./data/context/ --prompt "Extract all requirements"
 python agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
@@ -80,13 +80,13 @@ python scripts/cancel_job.py --job-id <uuid> --force
 **Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
 **Agent configs:** Two-tier configuration system with inheritance:
-- `src/agent/config/defaults.json` - Framework defaults (LLM, workspace, tools, polling, limits)
+- `src/config/defaults.json` - Framework defaults (LLM, workspace, tools, polling, limits)
 - `configs/{name}/config.json` - Deployment configs that extend defaults via `$extends`
 - `configs/{name}/*.md` - Deployment-specific prompts (override framework prompts)
 
-Config resolution: `--config creator` checks `configs/creator/config.json` first, falls back to `src/agent/config/creator.json`.
+Config resolution: `--config creator` checks `configs/creator/config.json` first, falls back to `src/config/creator.json`.
 
-See `src/agent/config/schema.json` for full spec.
+See `src/config/schema.json` for full spec.
 
 ## Architecture
 
@@ -116,20 +116,20 @@ See `src/agent/config/schema.json` for full spec.
 ```
 
 **Source locations:**
-- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
-- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
-- `src/agent/core/loader.py` - **Config system**: `resolve_config_path()`, `load_and_merge_config()`, `PromptResolver`
-- `src/agent/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
-- `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
-- `src/agent/api/` - FastAPI application for containerized deployment
+- `src/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
+- `src/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
+- `src/core/loader.py` - **Config system**: `resolve_config_path()`, `load_and_merge_config()`, `PromptResolver`
+- `src/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
+- `src/tools/` - Modular tool implementations (registry.py loads tools dynamically)
+- `src/api/` - FastAPI application for containerized deployment
+- `src/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
+- `src/utils/` - Shared utilities (metamodel validator, document processor, citation utils)
+- `src/database/` - PostgreSQL schema and utilities
 - `configs/` - **Deployment configs** (creator/, validator/) with `config.json` + prompt overrides
 - `dashboard/` - **Streamlit Dashboard** for job management (multi-page: app.py, pages/, db.py, agents.py)
 - `scripts/` - CLI tools and init scripts (app_init.py, init_*.py, job_status.py, list_jobs.py, cancel_job.py)
-- `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
-- `src/database/` - PostgreSQL schema and utilities
-- `src/agent/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
 
-**Manager layer:** Task management uses `src/agent/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/agent/graph.py`).
+**Manager layer:** Task management uses `src/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/graph.py`).
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -167,19 +167,19 @@ Schema in `src/database/schema.sql`:
 
 ### Universal Agent Pattern
 
-The Universal Agent (`src/agent/`) is the primary agent implementation with a **nested loop architecture**:
+The Universal Agent (`src/`) is the primary agent implementation with a **nested loop architecture**:
 
 **Key files:**
-- `src/agent/agent.py` - UniversalAgent class with run loop and LLM integration
-- `src/agent/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
-- `src/agent/core/state.py` - UniversalAgentState TypedDict with loop control fields
-- `src/agent/core/context.py` - Context management (ContextManager, token counting, compaction)
-- `src/agent/core/loader.py` - **Config system** with inheritance and prompt resolution
-- `src/agent/core/workspace.py` - Filesystem workspace for agent
-- `src/agent/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
-- `src/agent/api/app.py` - FastAPI application for containerized deployment
+- `src/agent.py` - UniversalAgent class with run loop and LLM integration
+- `src/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
+- `src/core/state.py` - UniversalAgentState TypedDict with loop control fields
+- `src/core/context.py` - Context management (ContextManager, token counting, compaction)
+- `src/core/loader.py` - **Config system** with inheritance and prompt resolution
+- `src/core/workspace.py` - Filesystem workspace for agent
+- `src/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
+- `src/api/app.py` - FastAPI application for containerized deployment
 
-**Manager layer (`src/agent/managers/`):**
+**Manager layer (`src/managers/`):**
 - `todo.py` - **TodoManager** (stateful): Task tracking with add/complete/archive
 - `plan.py` - **PlanManager** (service): Read/write main_plan.md, phase detection
 - `memory.py` - **MemoryManager** (service): Read/write workspace.md, section management
@@ -197,7 +197,7 @@ INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
 
 **Configuration inheritance:**
 ```
-src/agent/config/defaults.json     ← Framework defaults
+src/config/defaults.json           ← Framework defaults
         ↑ $extends
 configs/creator/config.json        ← Deployment overrides (agent_id, tools, polling, etc.)
 configs/creator/instructions.md    ← Deployment prompts (override framework prompts/)
@@ -238,12 +238,12 @@ The nested loop graph creates its own managers inside `build_nested_loop_graph()
    ```
 2. Create `configs/<name>/instructions.md` (task instructions)
 3. Optionally add `configs/<name>/summarization_prompt.md` (override)
-4. Add domain-specific tools to `src/agent/tools/` if needed
-5. Register new tools in `src/agent/tools/registry.py`
+4. Add domain-specific tools to `src/tools/` if needed
+5. Register new tools in `src/tools/registry.py`
 
 ### Tool System
 
-Tools are organized in `src/agent/tools/` and loaded dynamically by the registry:
+Tools are organized in `src/tools/` and loaded dynamically by the registry:
 
 | Category | Source File | Example Tools |
 |----------|-------------|---------------|
@@ -275,7 +275,7 @@ Tools are organized in `src/agent/tools/` and loaded dynamically by the registry
 
 When adding a new tool to the system:
 
-1. **Create the tool function** in the appropriate file in `src/agent/tools/`:
+1. **Create the tool function** in the appropriate file in `src/tools/`:
    - Workspace operations → `workspace_tools.py`
    - Document processing → `document_tools.py`
    - Graph operations → `graph_tools.py`

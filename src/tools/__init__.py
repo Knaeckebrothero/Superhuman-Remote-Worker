@@ -7,7 +7,7 @@ This package provides tools for the workspace-centric agent architecture:
 - Registry: Dynamic tool loading based on configuration
 
 Usage:
-    from src.agents.tools import (
+    from src.tools import (
         ToolContext,
         load_tools,
         create_workspace_tools,
