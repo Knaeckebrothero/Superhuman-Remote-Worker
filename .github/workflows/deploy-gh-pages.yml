@@ -1,0 +1,110 @@
+name: Build and Deploy to GitHub Pages
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Develop Branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Get Commit Info
+        id: commit
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_message=$(git log -1 --pretty=%s)" >> $GITHUB_OUTPUT
+          echo "commit_author=$(git log -1 --pretty=%an)" >> $GITHUB_OUTPUT
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Install Angular CLI
+        run: npm install -g @angular/cli
+
+      - name: Build Angular App
+        run: |
+          echo "Building from develop branch commit: ${{ steps.commit.outputs.sha_short }}"
+          ng build --configuration production --base-href "/Fessi/"
+
+      - name: Verify Build Output
+        run: |
+          echo "Checking build output structure:"
+          ls -la dist/
+          ls -la dist/fessi/
+          # Check if browser subdirectory exists (Angular 17+)
+          if [ -d "dist/fessi/browser" ]; then
+            echo "Found browser subdirectory (Angular 17+ structure)"
+            ls -la dist/fessi/browser/
+          fi
+
+      - name: Checkout GitHub Pages Branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          token: ${{ secrets.DEPLOY_GH_PAGES }}
+          path: gh-pages
+
+      - name: Deploy to GitHub Pages
+        run: |
+          # Clear existing files
+          rm -rf gh-pages/*
+
+          # Copy build files - handle both old and new Angular build structures
+          if [ -d "dist/fessi/browser" ]; then
+            echo "Copying from browser subdirectory (Angular 17+)"
+            cp -r dist/fessi/browser/* gh-pages/
+          else
+            echo "Copying from root dist directory (legacy structure)"
+            cp -r dist/fessi/* gh-pages/
+          fi
+
+          # Create .nojekyll file to prevent Jekyll processing
+          touch gh-pages/.nojekyll
+
+          # Add deployment info
+          echo "Deployed from develop branch" > gh-pages/DEPLOYMENT_INFO.txt
+          echo "Commit: ${{ steps.commit.outputs.sha_short }}" >> gh-pages/DEPLOYMENT_INFO.txt
+          echo "Date: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> gh-pages/DEPLOYMENT_INFO.txt
+          echo "Author: ${{ steps.commit.outputs.commit_author }}" >> gh-pages/DEPLOYMENT_INFO.txt
+
+          # Configure git and commit
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+
+          # Create detailed commit message
+          if git diff --staged --quiet; then
+            echo "No changes to deploy"
+          else
+            git commit -m "Deploy from develop: ${{ steps.commit.outputs.commit_message }}" \
+                       -m "Source commit: ${{ github.repository }}@${{ steps.commit.outputs.sha_short }}" \
+                       -m "Triggered by: ${{ github.actor }}"
+            git push origin gh-pages
+            echo "✅ Successfully deployed to GitHub Pages"
+          fi
+
+      - name: Create Deployment Summary
+        if: success()
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** develop" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** \`${{ steps.commit.outputs.sha_short }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Message:** ${{ steps.commit.outputs.commit_message }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Author:** ${{ steps.commit.outputs.commit_author }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed to:** https://${{ github.repository_owner }}.github.io/Fessi/" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Deployment completed successfully!" >> $GITHUB_STEP_SUMMARY

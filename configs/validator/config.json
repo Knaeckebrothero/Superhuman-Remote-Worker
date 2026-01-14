@@ -1,0 +1,63 @@
+{
+  "$schema": "../../src/agent/config/schema.json",
+  "$extends": "defaults",
+  "agent_id": "validator",
+  "display_name": "Validator Agent",
+  "description": "Autonomous agent for validating requirements from the cache and integrating them into the Neo4j knowledge graph.",
+
+  "workspace": {
+    "structure": [
+      "archive/",
+      "analysis/",
+      "output/",
+      "tools/"
+    ],
+    "instructions_template": "instructions.md"
+  },
+
+  "tools": {
+    "domain": [
+      "execute_cypher_query",
+      "get_database_schema",
+      "find_similar_requirements",
+      "check_for_duplicates",
+      "resolve_business_object",
+      "resolve_message",
+      "validate_schema_compliance",
+      "create_requirement_node",
+      "create_fulfillment_relationship",
+      "generate_requirement_id",
+      "get_entity_relationships",
+      "count_graph_statistics"
+    ]
+  },
+
+  "todo": {
+    "max_items": 20
+  },
+
+  "connections": {
+    "neo4j": true
+  },
+
+  "polling": {
+    "table": "requirements",
+    "status_field": "status",
+    "status_value_processing": "validating",
+    "status_value_complete": "integrated",
+    "interval_seconds": 10,
+    "use_skip_locked": true
+  },
+
+  "context_management": {
+    "summarization_template": "summarization_prompt.md"
+  },
+
+  "validation": {
+    "duplicate_threshold": 0.95,
+    "require_citations": true,
+    "metamodel_validation_strict": true,
+    "fulfillment_confidence_threshold": 0.7,
+    "auto_integrate": false
+  }
+}

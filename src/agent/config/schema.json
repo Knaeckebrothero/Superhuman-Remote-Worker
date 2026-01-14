@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/agent-config.schema.json",
+  "title": "Universal Agent Configuration",
+  "description": "Configuration schema for the Universal Agent in the workspace-centric architecture",
+  "type": "object",
+  "required": ["agent_id", "display_name", "llm", "workspace", "tools", "connections"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference"
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Unique identifier for this agent type",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "examples": ["creator", "validator"]
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Human-readable name for the agent",
+      "examples": ["Creator Agent", "Validator Agent"]
+    },
+    "description": {
+      "type": "string",
+      "description": "Brief description of what this agent does"
+    },
+    "llm": {
+      "type": "object",
+      "description": "LLM configuration",
+      "required": ["model"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model identifier",
+          "examples": ["gpt-oss-120b", "gpt-4o", "claude-3-opus"]
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2,
+          "default": 0.0,
+          "description": "Sampling temperature"
+        },
+        "reasoning_level": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "default": "high",
+          "description": "Reasoning depth for models that support it"
+        },
+        "base_url": {
+          "type": ["string", "null"],
+          "description": "Custom API base URL (null for default)"
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "description": "Workspace configuration",
+      "required": ["structure", "instructions_template"],
+      "properties": {
+        "structure": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Directories to create in the workspace",
+          "examples": [["archive/", "output/", "tools/"]]
+        },
+        "instructions_template": {
+          "type": "string",
+          "description": "Name of the instructions template file"
+        },
+        "initial_files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Files to copy into workspace on initialization. Keys are destination paths, values are source paths relative to src/agent/config/"
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Tool configuration by category",
+      "required": ["workspace", "todo"],
+      "properties": {
+        "workspace": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Workspace tools to enable",
+          "examples": [["read_file", "write_file", "list_files"]]
+        },
+        "todo": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Todo tools to enable",
+          "examples": [["add_todo", "complete_todo", "list_todos"]]
+        },
+        "domain": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Domain-specific tools to enable"
+        }
+      }
+    },
+    "todo": {
+      "type": "object",
+      "description": "TodoManager configuration",
+      "properties": {
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 25,
+          "description": "Maximum number of active todos"
+        },
+        "archive_on_reset": {
+          "type": "boolean",
+          "default": true,
+          "description": "Archive todos when resetting"
+        },
+        "archive_path": {
+          "type": "string",
+          "default": "archive/",
+          "description": "Workspace path for archived todos"
+        }
+      }
+    },
+    "connections": {
+      "type": "object",
+      "description": "Database connections required",
+      "required": ["postgres"],
+      "properties": {
+        "postgres": {
+          "type": "boolean",
+          "description": "Whether PostgreSQL is required"
+        },
+        "neo4j": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether Neo4j is required"
+        }
+      }
+    },
+    "polling": {
+      "type": "object",
+      "description": "Database polling configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable polling mode"
+        },
+        "table": {
+          "type": "string",
+          "description": "Table to poll for work"
+        },
+        "status_field": {
+          "type": "string",
+          "description": "Field containing status"
+        },
+        "status_value_pending": {
+          "type": "string",
+          "default": "pending",
+          "description": "Status value for pending items"
+        },
+        "status_value_processing": {
+          "type": "string",
+          "default": "processing",
+          "description": "Status value for items being processed"
+        },
+        "status_value_complete": {
+          "type": "string",
+          "default": "complete",
+          "description": "Status value for completed items"
+        },
+        "status_value_failed": {
+          "type": "string",
+          "default": "failed",
+          "description": "Status value for failed items"
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Polling interval in seconds"
+        },
+        "use_skip_locked": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use SKIP LOCKED for concurrent processing"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "description": "Execution limits",
+      "properties": {
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 500,
+          "description": "Maximum LLM iterations per job"
+        },
+        "context_threshold_tokens": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 80000,
+          "description": "Token threshold for context compaction"
+        },
+        "tool_retry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Number of retries for failed tool calls"
+        }
+      }
+    },
+    "context_management": {
+      "type": "object",
+      "description": "Context management configuration",
+      "properties": {
+        "compact_on_archive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Trigger context compaction when archiving todos"
+        },
+        "keep_recent_tool_results": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Number of recent tool results to keep in full"
+        },
+        "summarization_template": {
+          "type": "string",
+          "description": "Filename of summarization prompt template (in prompts/ folder)",
+          "default": "summarization_prompt.md"
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}
