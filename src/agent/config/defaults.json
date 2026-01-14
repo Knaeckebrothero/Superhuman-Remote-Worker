@@ -1,0 +1,76 @@
+{
+  "$schema": "schema.json",
+  "$comment": "Framework defaults - deployments extend this via $extends",
+
+  "llm": {
+    "model": "gpt-oss-120b",
+    "temperature": 0.0,
+    "reasoning_level": "high",
+    "base_url": null
+  },
+
+  "workspace": {
+    "structure": [
+      "archive/",
+      "tools/"
+    ],
+    "initial_files": {
+      "workspace.md": "prompts/workspace_template.md"
+    }
+  },
+
+  "tools": {
+    "workspace": [
+      "read_file",
+      "write_file",
+      "append_file",
+      "list_files",
+      "delete_file",
+      "search_files",
+      "file_exists",
+      "get_workspace_summary"
+    ],
+    "todo": [
+      "todo_write",
+      "todo_complete",
+      "todo_rewind",
+      "archive_and_reset"
+    ],
+    "domain": [],
+    "completion": [
+      "mark_complete",
+      "job_complete"
+    ]
+  },
+
+  "todo": {
+    "archive_on_reset": true,
+    "archive_path": "archive/"
+  },
+
+  "connections": {
+    "postgres": true,
+    "neo4j": false
+  },
+
+  "polling": {
+    "enabled": true,
+    "status_value_pending": "pending",
+    "status_value_processing": "processing",
+    "status_value_complete": "complete",
+    "status_value_failed": "failed",
+    "interval_seconds": 30
+  },
+
+  "limits": {
+    "max_iterations": 10000,
+    "context_threshold_tokens": 100000,
+    "tool_retry_count": 3
+  },
+
+  "context_management": {
+    "compact_on_archive": true,
+    "keep_recent_tool_results": 10,
+    "summarization_template": "summarization_prompt.md"
+  }
+}

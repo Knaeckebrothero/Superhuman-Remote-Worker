@@ -1,34 +1,34 @@
-# Core dependencies
 python-dotenv>=1.0.0
 pandas>=2.0.0
-
-# Neo4j database driver
 neo4j>=5.16.0
-
-# LangChain framework for LLM orchestration
+asyncpg>=0.29.0
 langchain>=0.1.0
 langchain-community>=0.0.16
 langchain-openai>=0.0.5
 langchain-experimental>=0.0.49
-
-# LangGraph for agent-based workflows
 langgraph>=0.0.20
 langchain-core>=0.1.0
-
-# Web search for AI agents
+langgraph-checkpoint-postgres>=1.0.0
+psycopg[binary]>=3.1.0
 langchain-tavily>=0.1.0
-
-# LLM providers (OpenAI as default, can be swapped for other providers)
 openai>=1.10.0
-
-# Utilities
 pydantic>=2.5.0
 tiktoken>=0.5.0
-
-# Optional: Additional LLM providers (uncomment if needed)
-# anthropic>=0.18.0  # For Claude models
-# langchain-anthropic>=0.1.0
-# cohere>=4.0.0  # For Cohere models
-
-# Dashboard
 streamlit>=1.30.0
+pdfplumber>=0.10.0
+python-docx>=1.1.0
+beautifulsoup4>=4.12.0
+# Optional: Semantic similarity for advanced duplicate detection
+# sentence-transformers>=2.2.0
+# Vector search for workspace semantic search (Phase 8)
+pgvector>=0.2.0
+langchain-postgres>=0.0.6
+langdetect>=1.0.9
+fastapi>=0.109.0
+uvicorn>=0.27.0
+httpx>=0.26.0
+python-multipart>=0.0.6
+# Optional: MongoDB for LLM request archiving
+pymongo>=4.6.0
+# Install the citation engine from local directory:
+# -e ./citation_tool[full]

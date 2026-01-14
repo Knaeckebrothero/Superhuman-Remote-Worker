@@ -4,237 +4,331 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **Graph-RAG (Retrieval-Augmented Generation) system** for **requirement traceability and compliance checking** in a car rental business context. The system uses LangGraph and LLMs to analyze business requirements against a Neo4j graph database, with focus on GoBD compliance (German accounting principles) and impact analysis.
+Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
-## Quick Start
+**Architecture:** Two-agent autonomous system (Creator + Validator) coordinated by an Orchestrator, unified via the **Universal Agent** pattern. Agent behavior is configured via JSON files in `configs/{name}/` that extend framework defaults via `$extends`.
+
+## Commands
 
 ```bash
-# Install dependencies
+# Setup
 pip install -r requirements.txt
+pip install -e ./citation_tool[full]
+cp .env.example .env
 
-# Copy and configure environment
-cp .env.example .env  # Edit with your credentials
+# Initialize databases with seed data
+python src/scripts/app_init.py --force-reset --seed
 
-# Run the Streamlit application
-streamlit run main.py
+# Run tests
+pytest tests/                            # All tests
+pytest tests/test_graph.py               # Single test file
+pytest tests/ -k "managers"              # Tests matching pattern
 
-# Or run the batch workflow
-python -m src.workflow
+# Metamodel validation
+python validate_metamodel.py              # All checks
+python validate_metamodel.py --check A1   # Specific check
 ```
 
-## Development Commands
-
-### Interactive Application
+### Local Development
 
 ```bash
-streamlit run main.py
+# Start databases only
+podman-compose -f docker-compose.dbs.yml up -d
+
+# Run Universal Agent (config resolution: configs/{name}/ → src/agent/config/{name}.json)
+python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
+python agent.py --config creator --document-dir ./data/context/ --prompt "Extract all requirements"
+python agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
+python agent.py --config validator --port 8002                        # API server mode
+python agent.py --config creator --polling-only                       # Polling loop only
+
+# Stop databases
+podman-compose -f docker-compose.dbs.yml down -v
 ```
 
-The Streamlit application (`main.py`) provides a multi-page interface:
-- **Home**: Database connection settings (defaults from .env)
-- **Agent**: Iterative LangGraph agent with streaming progress display
-- **Chain**: Simple one-shot chain with step-by-step progress
-
-### Batch Workflow
+### Docker Deployment
 
 ```bash
-# Run the LangGraph agent workflow on CSV requirements
-python -m src.workflow
+# Full system
+podman-compose up -d
+podman-compose logs -f creator validator orchestrator
+
+# Database access
+podman-compose exec postgres psql -U graphrag -d graphrag
+podman-compose exec neo4j cypher-shell -u neo4j -p neo4j_password
+
+# Rebuild
+podman-compose build --no-cache creator validator orchestrator
 ```
 
-### Testing
+### Job Management
 
 ```bash
-# Test database connection
-python -c "from src.core.neo4j_utils import create_neo4j_connection; conn = create_neo4j_connection(); conn.connect()"
+python start_orchestrator.py --document-path ./data/doc.pdf --prompt "Extract GoBD requirements" --wait
+python job_status.py --job-id <uuid> --report
+python list_jobs.py --status pending --stats
+python cancel_job.py --job-id <uuid> --cleanup
 ```
 
-### Database Setup
+## Configuration
 
-```bash
-# Import database dump (requires Neo4j stopped)
-neo4j stop
-neo4j-admin database load --from-path=data/ <database-name> --overwrite-destination=true
-neo4j start
-```
+**Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
 
-Schema file: `data/metamodell.cql`
-Database dump: `data/neo4j.dump`
+**Agent configs:** Two-tier configuration system with inheritance:
+- `src/agent/config/defaults.json` - Framework defaults (LLM, workspace, tools, polling, limits)
+- `configs/{name}/config.json` - Deployment configs that extend defaults via `$extends`
+- `configs/{name}/*.md` - Deployment-specific prompts (override framework prompts)
 
-## Environment Configuration
+Config resolution: `--config creator` checks `configs/creator/config.json` first, falls back to `src/agent/config/creator.json`.
 
-Create `.env` from `.env.example`:
-- `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` - Database connection
-- `CSV_FILE_PATH` - Path to requirements CSV (default: `data/requirements.csv`)
-- `OPENAI_API_KEY` - LLM API key (only credentials in .env)
-- `LLM_BASE_URL` - Optional custom endpoint for self-hosted models (gpt-oss, vLLM, llama.cpp)
-- `WORKFLOW_MODE` - "chain" or "agent" for workflow selection
-
-LLM settings (model, temperature, max_iterations, reasoning_level) are in `config/llm_config.json`.
+See `src/agent/config/schema.json` for full spec.
 
 ## Architecture
 
-### Project Structure
-
 ```
-project/
-├── main.py                    # Streamlit entry point
-├── config/                    # Configuration files
-│   ├── llm_config.json        # LLM settings (model, temperature, reasoning_level)
-│   └── prompts/
-│       ├── agent_system.txt   # Agent system prompt
-│       └── chain_domain.txt   # Chain domain context
-├── src/
-│   ├── chain_example.py       # Simple chain demo (for comparison)
-│   ├── workflow.py            # Batch workflow orchestrator
-│   ├── __init__.py            # Package exports
-│   ├── agents/
-│   │   └── graph_agent.py     # LangGraph iterative agent
-│   ├── core/
-│   │   ├── config.py          # Configuration loader utilities
-│   │   ├── neo4j_utils.py     # Neo4j connection layer
-│   │   └── csv_processor.py   # CSV requirement parser
-│   └── ui/
-│       ├── __init__.py        # UI helper functions
-│       ├── home.py            # Home page (connection settings)
-│       ├── agent.py           # Agent analysis page
-│       └── chain.py           # Chain analysis page
-├── data/
-│   ├── metamodell.cql         # Neo4j schema
-│   ├── neo4j.dump             # Database dump
-│   ├── output_schema.json     # Structured output schema
-│   └── requirements.csv       # Input requirements
-└── output/                    # Analysis results
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR (port 8000)                         │
+│               Job Management, Monitoring, Reports                   │
+└─────────────────────────┬───────────────────────────────────────────┘
+                          │
+       ┌──────────────────┴──────────────────┐
+       │                                      │
+       ▼                                      ▼
+┌──────────────────┐                ┌──────────────────┐
+│ CREATOR (8001)   │                │ VALIDATOR (8002) │
+│ (Universal Agent)│                │ (Universal Agent)│
+│                  │                │                  │
+│ Document → Extract  requirements  │ Relevance check  │
+│ Research → Cache │ (PostgreSQL)  │ Fulfillment check│
+│                  │◄──────────────►│ Graph integration│
+└──────────────────┘                └────────┬─────────┘
+                                             │
+                                             ▼
+                                    ┌──────────────────┐
+                                    │     Neo4j        │
+                                    │ (Knowledge Graph)│
+                                    └──────────────────┘
 ```
 
-### Two Approaches
+**Source locations:**
+- `src/agent/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
+- `src/agent/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
+- `src/agent/core/loader.py` - **Config system**: `resolve_config_path()`, `load_and_merge_config()`, `PromptResolver`
+- `src/agent/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
+- `src/agent/tools/` - Modular tool implementations (registry.py loads tools dynamically)
+- `src/agent/api/` - FastAPI application for containerized deployment
+- `configs/` - **Deployment configs** (creator/, validator/) with `config.json` + prompt overrides
+- `src/orchestrator/` - Job manager, monitor, reporter
+- `src/core/` - Neo4j/PostgreSQL utils, metamodel validator, config
+- `src/database/` - PostgreSQL schema and utilities
+- `src/agent/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
 
-| Approach | File | Purpose |
-|----------|------|---------|
-| **Agent** (Main) | `src/agents/graph_agent.py` | LangGraph iterative agent with tools |
-| **Chain** (Demo) | `src/chain_example.py` | Simple one-shot chain for comparison |
+**Manager layer:** Task management uses `src/agent/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/agent/graph.py`).
 
-The **Agent** is the main implementation - it iteratively queries the database, reasons about results, and can refine its approach. The **Chain** is a simple demonstration to show why the agent approach is superior.
-
-### Core Modules
-
-1. **`src/workflow.py`** - Workflow orchestrator
-   - `RequirementWorkflow` class manages the pipeline
-   - Coordinates CSV processor, Neo4j connection, and agent
-   - Entry point: `python -m src.workflow`
-
-2. **`src/agents/graph_agent.py`** - LangGraph Agent
-   - `RequirementGraphAgent` with `AgentState` TypedDict
-   - Tools: `execute_cypher_query`, `get_database_schema`, `count_nodes_by_label`, `find_sample_nodes`
-   - State graph: planner → agent → tools → increment → report
-   - Key method: `process_requirement()` → returns `{plan, queries_executed, iterations, analysis}`
-   - Streaming: `process_requirement_stream()` for dashboard integration
-
-3. **`src/chain_example.py`** - Simple Chain Demo
-   - `SimpleChain` class with 4-step linear flow
-   - Uses Pydantic models for structured output (based on `data/output_schema.json`)
-   - No iteration, no tool calling - demonstrates limitations
-
-4. **`src/core/config.py`** - Configuration utilities
-   - `load_config()` loads JSON from `config/` directory
-   - `load_prompt()` loads prompt text from `config/prompts/`
-   - `get_project_root()` returns project root path
-
-5. **`src/core/neo4j_utils.py`** - Database connection layer
-   - `Neo4jConnection` class: `connect()`, `execute_query()`, `get_database_schema()`, `close()`
-   - Factory: `create_neo4j_connection()` reads from environment
-
-6. **`src/core/csv_processor.py`** - Requirement input handler
-   - `RequirementProcessor` class reads semicolon-delimited CSV (auto-detects delimiter)
-   - Format: `Name;Description` (82 requirements in current dataset)
-
-### Database Metamodel
-
-**Node Types:**
-- `Requirement` - `rid`, `name`, `text`, `type`, `priority`, `status`, `source`, `valueStream`, `goBDRelevant`
-- `BusinessObject` - `boid`, `name`, `description`, `domain`, `owner`
-- `Message` - `mid`, `name`, `description`, `direction`, `format`, `protocol`, `version`
-
-**Relationships:**
-- `Requirement → Requirement`: `REFINES`, `DEPENDS_ON`, `TRACES_TO`
-- `Requirement → BusinessObject`: `RELATES_TO_OBJECT`, `IMPACTS_OBJECT`
-- `Requirement → Message`: `RELATES_TO_MESSAGE`, `IMPACTS_MESSAGE`
-- `Message → BusinessObject`: `USES_OBJECT`, `PRODUCES_OBJECT`
+**Agent data flow:**
+1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
+2. Validator queries `requirements` where `neo4j_id IS NULL` → validates → integrates into Neo4j → sets `neo4j_id`
 
 ## Key Implementation Details
 
-### Agent vs Chain Comparison
+### Metamodel (FINIUS v2.0)
 
-| Aspect | Simple Chain | LangGraph Agent |
-|--------|--------------|-----------------|
-| Query Refinement | None - one shot | Iterative refinement |
-| Error Recovery | None - fails silently | Retries with different approach |
-| Schema Exploration | Static dump | Dynamic tool calls |
-| Reasoning | Linear 3-step | Multi-step with loops |
-| Missing Data | Reports as-is | Explores alternatives |
+**Nodes:** `Requirement`, `BusinessObject`, `Message`
 
-### Prompt Templates
+**Key Relationships:**
+- `FULFILLED_BY_OBJECT`, `NOT_FULFILLED_BY_OBJECT` (Requirement → BusinessObject)
+- `FULFILLED_BY_MESSAGE`, `NOT_FULFILLED_BY_MESSAGE` (Requirement → Message)
+- `REFINES`, `DEPENDS_ON`, `TRACES_TO`, `SUPERSEDES` (Requirement → Requirement)
 
-LLM prompts are stored in `config/prompts/` and are **tightly coupled to the metamodel**. When modifying the database schema:
-1. Update `data/metamodell.cql`
-2. Update `config/prompts/agent_system.txt` (agent system prompt)
-3. Update `config/prompts/chain_domain.txt` (chain domain context)
-4. Update prompts in `src/agents/graph_agent.py` if needed
+Schema: `data/metamodell.cql`. Seed data: `data/seed_data.cypher`.
 
 ### Neo4j Query Guidelines
 
-- Use `elementId(node)` instead of deprecated `id(node)`
-- Prefer property-based queries over ID-based queries
-- Always use `LIMIT` for potentially large result sets
+- Use `elementId(node)` not deprecated `id(node)`
+- Always use `LIMIT` for large result sets
+- Fulfillment query pattern:
+  ```cypher
+  MATCH (r:Requirement)-[rel:FULFILLED_BY_OBJECT|NOT_FULFILLED_BY_OBJECT]->(bo:BusinessObject)
+  RETURN r.rid, type(rel), rel.confidence, bo.name
+  ```
 
-### Output Structure
+### PostgreSQL Schema
 
-Results saved to `output/` directory:
-- **JSON**: `{original_requirement, plan, queries_executed, iterations, analysis}`
-- **TXT**: Human-readable report with formatted sections
+Schema in `src/database/schema.sql`:
+- `jobs` - Job tracking (status, creator_status, validator_status, document_path)
+- `requirements` - Extracted requirements with validation state. Validator queries `WHERE neo4j_id IS NULL` for unprocessed items.
+- `job_summary` - View aggregating requirement counts by status
 
-### Structured Output Schema
+### Universal Agent Pattern
 
-The chain example uses Pydantic models based on `data/output_schema.json`:
-- `Identification` - Requirement text and metadata (entity_name, requirement_type, status, source_origin)
-- `KnowledgeRetrieval` - found_facts (what was found) and missing_elements (what was not found)
-- `Analysis` - compliance_matrix (criteria, result, observation) and risk_assessment (level, justification)
-- `Evaluation` - verdict (Satisfied/Not Satisfied/Partially Satisfied) and summary_reasoning
-- `Recommendations` - action_items list
-- `ConversationalSummary` - user-friendly message
+The Universal Agent (`src/agent/`) is the primary agent implementation with a **nested loop architecture**:
 
-### Error Handling
+**Key files:**
+- `src/agent/agent.py` - UniversalAgent class with run loop and LLM integration
+- `src/agent/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
+- `src/agent/core/state.py` - UniversalAgentState TypedDict with loop control fields
+- `src/agent/core/context.py` - Context management (ContextManager, token counting, compaction)
+- `src/agent/core/loader.py` - **Config system** with inheritance and prompt resolution
+- `src/agent/core/workspace.py` - Filesystem workspace for agent
+- `src/agent/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
+- `src/agent/api/app.py` - FastAPI application for containerized deployment
 
-- Database connection failures caught early in `setup()`
-- Query execution errors logged but don't crash workflow
-- Failed requirements saved with `error` field
-- Agent catches iteration limit and gracefully terminates
+**Manager layer (`src/agent/managers/`):**
+- `todo.py` - **TodoManager** (stateful): Task tracking with add/complete/archive
+- `plan.py` - **PlanManager** (service): Read/write main_plan.md, phase detection
+- `memory.py` - **MemoryManager** (service): Read/write workspace.md, section management
 
-## Common Tasks
+**Nested loop architecture:**
+```
+INITIALIZATION → read_instructions → create_plan → init_todos
+                                        ↓
+OUTER LOOP (strategic) → read_plan → update_memory → create_todos
+                                        ↓
+INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
+                                        ↓
+                            check_goal → END or back to OUTER LOOP
+```
 
-### Adding New Metamodel Nodes/Relationships
+**Configuration inheritance:**
+```
+src/agent/config/defaults.json     ← Framework defaults
+        ↑ $extends
+configs/creator/config.json        ← Deployment overrides (agent_id, tools, polling, etc.)
+configs/creator/instructions.md    ← Deployment prompts (override framework prompts/)
+```
 
-1. Update Neo4j schema in `data/metamodell.cql`
-2. Execute changes in Neo4j Browser
-3. Update prompts in `src/agents/graph_agent.py` and `src/chain_example.py`
+Merge semantics (`deep_merge` in loader.py):
+- Objects (dicts): Recursively merge
+- Arrays (lists): Override replaces entirely
+- Scalars: Override replaces
+- `null` in override: Clears the key
 
-### Processing a New Requirements CSV
+Config fields:
+- `$extends`: Parent config name (resolved via `resolve_config_path()`)
+- `agent_id`, `display_name`: Agent identity
+- `llm`: Model, temperature, reasoning level, base_url
+- `workspace.structure`: Directory layout, `instructions_template`
+- `tools`: Categories (workspace, todo, domain, completion)
+- `polling`: Table, status_field, intervals, use_skip_locked
+- `limits`: max_iterations, context_threshold_tokens
+- `connections`: postgres, neo4j (boolean flags)
 
-1. Place CSV in `data/` directory
-2. Update `CSV_FILE_PATH` in `.env`
-3. Ensure format: `Name;Description` (semicolon-delimited) or comma-delimited with `requirement` column
-4. Run `python -m src.workflow`
+**Key features:**
+- Reads `instructions.md` from workspace to understand task context
+- Uses `main_plan.md` for strategic planning (read at phase transitions)
+- Uses `workspace.md` as persistent memory (injected into system prompt, like CLAUDE.md)
+- TodoManager for tactical execution with `archive()` at phase completion
+- Automatic context compaction when approaching token limits
+- Completion detection via `mark_complete` tool
+- Audit logging via archiver (tracks LLM calls, tool calls, phase transitions)
 
-### Debugging Query Generation
+**Graph execution flow:**
+The nested loop graph creates its own managers inside `build_nested_loop_graph()`. The graph uses an audited tool node (`create_audited_tool_node`) that logs all tool calls and results for debugging and compliance.
 
-1. Check `output/results_*.txt` for generated Cypher queries
-2. Test queries manually in Neo4j Browser (http://localhost:7474)
-3. Verify schema: `CALL db.schema.visualization()` in Neo4j
+**Creating a new agent type:**
+1. Create `configs/<name>/config.json` extending `defaults`:
+   ```json
+   {"$extends": "defaults", "agent_id": "<name>", "display_name": "<Name> Agent", ...}
+   ```
+2. Create `configs/<name>/instructions.md` (task instructions)
+3. Optionally add `configs/<name>/summarization_prompt.md` (override)
+4. Add domain-specific tools to `src/agent/tools/` if needed
+5. Register new tools in `src/agent/tools/registry.py`
 
-### Alternative LLM Providers
+### Tool System
 
-To use Anthropic Claude or other providers:
-1. Install: `pip install anthropic langchain-anthropic`
-2. Add provider API key to `.env` (e.g., `ANTHROPIC_API_KEY`)
-3. Update model name in `config/llm_config.json`
-4. Modify agent initialization in `src/agents/graph_agent.py` to use `ChatAnthropic`
+Tools are organized in `src/agent/tools/` and loaded dynamically by the registry:
+
+| Category | Source File | Example Tools |
+|----------|-------------|---------------|
+| `workspace` | `workspace_tools.py` | read_file, write_file, list_files, search_files, get_workspace_summary |
+| `todo` | `todo_tools.py` | todo_write, archive_and_reset |
+| `domain` | `document_tools.py` | extract_document_text, chunk_document |
+| `domain` | `search_tools.py` | web_search (Tavily) |
+| `domain` | `citation_tools.py` | cite_document, cite_web, list_sources, get_citation |
+| `domain` | `cache_tools.py` | add_requirement, list_requirements, get_requirement |
+| `graph` | `graph_tools.py` | execute_cypher, get_schema, create_requirement_node |
+| `completion` | `completion_tools.py` | mark_complete, job_complete |
+
+**Tool context** (`ToolContext` dataclass in `tools/context.py`) provides tools with access to workspace, todo manager, and database connections.
+
+**On-demand descriptions:** Tools marked with `defer_to_workspace=True` in their metadata use short descriptions in the LLM context, with full documentation generated in `workspace/tools/<name>.md`. See `description_override.py` and `description_generator.py`.
+
+### Service Ports
+
+| Service | Port |
+|---------|------|
+| Orchestrator | 8000 |
+| Creator (Universal Agent) | 8001 |
+| Validator (Universal Agent) | 8002 |
+| Neo4j Bolt | 7687 |
+| Neo4j Browser | 7474 |
+| PostgreSQL | 5432 |
+| Dashboard (Streamlit) | 8501 |
+| Adminer (dev only) | 8080 |
+
+## Adding New Tools
+
+When adding a new tool to the system:
+
+1. **Create the tool function** in the appropriate file in `src/agent/tools/`:
+   - Workspace operations → `workspace_tools.py`
+   - Document processing → `document_tools.py`
+   - Graph operations → `graph_tools.py`
+   - New category → create new `*_tools.py` file
+
+2. **Add metadata** to the module's `*_TOOLS_METADATA` dict:
+   ```python
+   MYTOOLS_METADATA = {
+       "my_tool": {
+           "module": "mytools",
+           "function": "my_tool",
+           "description": "Short description for LLM context",
+           "category": "domain",
+       },
+   }
+   ```
+
+3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`
+
+4. **Add to deployment config** in `configs/<agent>/config.json` under the appropriate category:
+   ```json
+   "tools": {
+       "domain": ["my_tool", ...]
+   }
+   ```
+
+5. **Tool signature**: Tools receive `ToolContext` as first argument, then user parameters:
+   ```python
+   def my_tool(ctx: ToolContext, param1: str, param2: int = 10) -> str:
+       """Tool docstring becomes LLM description."""
+       return "result"
+   ```
+
+## Testing
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test file
+pytest tests/test_graph.py
+
+# Run with verbose output
+pytest tests/ -v
+
+# Run tests matching pattern
+pytest tests/ -k "managers"
+
+# Run with coverage
+pytest tests/ --cov=src
+
+# Manager tests (nested loop architecture)
+pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
+```
+
+**Key test files:**
+- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager
+- `tests/test_graph.py` - Tests for routing functions and graph nodes
+
+Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup.
