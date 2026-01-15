@@ -32,8 +32,8 @@ python validate_metamodel.py --check A1   # Specific check
 ### Local Development
 
 ```bash
-# Start databases only
-podman-compose -f docker-compose.dev.yaml up -d
+# Start databases only (no dev compose file - use main docker-compose.yml with selective up)
+podman-compose up -d postgres neo4j
 
 # Run Universal Agent (config resolution: configs/{name}/ → src/config/{name}.json)
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
@@ -43,7 +43,7 @@ python agent.py --config validator --port 8002                        # API serv
 python agent.py --config creator --polling-only                       # Polling loop only
 
 # Stop databases
-podman-compose -f docker-compose.dev.yaml down -v
+podman-compose down
 ```
 
 ### Docker Deployment
@@ -116,7 +116,7 @@ See `src/config/schema.json` for full spec.
 ```
 
 **Source locations:**
-- `src/` - **Universal Agent**: Config-driven LangGraph workflow (agent.py, graph.py)
+- `src/agent.py`, `src/graph.py` - **Universal Agent**: Config-driven LangGraph workflow
 - `src/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
 - `src/core/loader.py` - **Config system**: `resolve_config_path()`, `load_and_merge_config()`, `PromptResolver`
 - `src/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
@@ -124,10 +124,11 @@ See `src/config/schema.json` for full spec.
 - `src/api/` - FastAPI application for containerized deployment
 - `src/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
 - `src/utils/` - Shared utilities (metamodel validator, document processor, citation utils)
-- `src/database/` - PostgreSQL schema and utilities
+- `src/database/` - Database classes (postgres_db.py, neo4j_db.py, mongo_db.py) and queries/
 - `configs/` - **Deployment configs** (creator/, validator/) with `config.json` + prompt overrides
 - `dashboard/` - **Streamlit Dashboard** for job management (multi-page: app.py, pages/, db.py, agents.py)
 - `scripts/` - CLI tools and init scripts (app_init.py, init_*.py, job_status.py, list_jobs.py, cancel_job.py)
+- `agent.py` - **Entry point**: Top-level script that imports from `src/agent.py`
 
 **Manager layer:** Task management uses `src/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/graph.py`).
 
@@ -160,16 +161,20 @@ Schema: `data/metamodell.cql`. Seed data: `data/seed_data.cypher`.
 
 ### PostgreSQL Schema
 
-Schema in `src/database/schema.sql`:
+Schema in `src/database/queries/postgres/schema.sql`, database class in `src/database/postgres_db.py`:
 - `jobs` - Job tracking (status, creator_status, validator_status, document_path)
 - `requirements` - Extracted requirements with validation state. Validator queries `WHERE neo4j_id IS NULL` for unprocessed items.
 - `job_summary` - View aggregating requirement counts by status
+
+Neo4j database class in `src/database/neo4j_db.py`.
+MongoDB database class in `src/database/mongo_db.py`.
 
 ### Universal Agent Pattern
 
 The Universal Agent (`src/`) is the primary agent implementation with a **nested loop architecture**:
 
 **Key files:**
+- `agent.py` - Top-level entry point (imports from src/)
 - `src/agent.py` - UniversalAgent class with run loop and LLM integration
 - `src/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
 - `src/core/state.py` - UniversalAgentState TypedDict with loop control fields
@@ -285,7 +290,7 @@ When adding a new tool to the system:
    ```python
    MYTOOLS_METADATA = {
        "my_tool": {
-           "module": "mytools",
+           "module": "src.tools.mytools",
            "function": "my_tool",
            "description": "Short description for LLM context",
            "category": "domain",
@@ -304,6 +309,8 @@ When adding a new tool to the system:
 
 5. **Tool signature**: Tools receive `ToolContext` as first argument, then user parameters:
    ```python
+   from src.tools.context import ToolContext
+
    def my_tool(ctx: ToolContext, param1: str, param2: int = 10) -> str:
        """Tool docstring becomes LLM description."""
        return "result"

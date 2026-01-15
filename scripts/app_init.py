@@ -138,7 +138,7 @@ def run_postgres_init(logger: logging.Logger, force_reset: bool = False) -> bool
         True if successful, False otherwise.
     """
     try:
-        from src.scripts.init_db import initialize_postgres
+        from scripts.init_db import initialize_postgres
         return initialize_postgres(logger, force_reset)
     except ImportError as e:
         logger.error(f"  Could not import init_db module: {e}")
@@ -161,7 +161,7 @@ def run_neo4j_init(logger: logging.Logger, force_reset: bool = False, seed: bool
         True if successful, False otherwise.
     """
     try:
-        from src.scripts.init_neo4j import initialize_neo4j
+        from scripts.init_neo4j import initialize_neo4j
         return initialize_neo4j(logger, clear=force_reset, seed=seed)
     except ImportError as e:
         logger.warning(f"  Could not import init_neo4j module: {e}")
@@ -184,7 +184,7 @@ def run_mongodb_init(logger: logging.Logger, force_reset: bool = False) -> bool:
         True if successful, False otherwise.
     """
     try:
-        from src.scripts.init_mongodb import initialize_mongodb
+        from scripts.init_mongodb import initialize_mongodb
         return initialize_mongodb(logger, force_reset)
     except ImportError as e:
         logger.info(f"  MongoDB module not available (optional): {e}")
@@ -205,7 +205,7 @@ def run_neo4j_export(logger: logging.Logger) -> bool:
         True if successful, False otherwise.
     """
     try:
-        from src.scripts.init_neo4j import export_neo4j_data
+        from scripts.init_neo4j import export_neo4j_data
         return export_neo4j_data(logger)
     except ImportError as e:
         logger.error(f"  Could not import init_neo4j module: {e}")

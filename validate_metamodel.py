@@ -11,7 +11,8 @@ import json
 import sys
 from dotenv import load_dotenv
 
-from src.utils import create_neo4j_connection, MetamodelValidator
+from src.database import Neo4jDB
+from src.utils.metamodel_validator import MetamodelValidator
 
 
 def main():
@@ -36,16 +37,14 @@ def main():
 
     # Connect to database
     try:
-        connection = create_neo4j_connection()
-        if not connection.connect():
-            print("Failed to connect to Neo4j database", file=sys.stderr)
-            sys.exit(1)
-    except ValueError as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
+        db = Neo4jDB()
+        db.connect()
+    except Exception as e:
+        print(f"Failed to connect to Neo4j database: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
-        validator = MetamodelValidator(connection)
+        validator = MetamodelValidator(db)
 
         # Run appropriate checks
         if args.check == "all":
@@ -83,7 +82,7 @@ def main():
         sys.exit(0 if report.passed else 1)
 
     finally:
-        connection.close()
+        db.close()
 
 
 if __name__ == "__main__":

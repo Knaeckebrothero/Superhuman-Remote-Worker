@@ -113,12 +113,14 @@ class LLMArchiver:
             collection_name: Collection for LLM requests
             audit_collection_name: Collection for agent audit trail
         """
+        # Import here to avoid circular imports
+        from src.database.mongo_db import MongoDB
+
         self._mongodb_url = mongodb_url
         self._database_name = database_name
         self._collection_name = collection_name
         self._audit_collection_name = audit_collection_name
-        self._client = None
-        self._db = None
+        self._mongo_db = MongoDB(url=mongodb_url) if mongodb_url else None
         self._collection = None
         self._audit_collection = None
         self._connected = False
@@ -161,30 +163,25 @@ class LLMArchiver:
         if self._connection_attempted:
             return False
 
+        if not self._mongo_db:
+            return False
+
         self._connection_attempted = True
 
         try:
-            from pymongo import MongoClient
-            from pymongo.errors import ConnectionFailure
+            # MongoDB class has lazy connection - access db property to trigger connection
+            if self._mongo_db.db is None:
+                logger.warning("MongoDB connection not available")
+                return False
 
-            self._client = MongoClient(
-                self._mongodb_url,
-                serverSelectionTimeoutMS=5000,
-            )
-            # Test connection
-            self._client.admin.command("ping")
-
-            self._db = self._client[self._database_name]
-            self._collection = self._db[self._collection_name]
-            self._audit_collection = self._db[self._audit_collection_name]
+            # Get collections from the underlying database
+            self._collection = self._mongo_db.db[self._collection_name]
+            self._audit_collection = self._mongo_db.db[self._audit_collection_name]
             self._connected = True
 
             logger.info(f"LLM Archiver connected to MongoDB: {self._database_name}")
             return True
 
-        except ImportError:
-            logger.warning("pymongo not installed, LLM archiving disabled")
-            return False
         except Exception as e:
             logger.warning(f"Failed to connect to MongoDB: {e}")
             return False
@@ -669,8 +666,8 @@ class LLMArchiver:
 
     def close(self):
         """Close MongoDB connection."""
-        if self._client:
-            self._client.close()
+        if self._mongo_db:
+            self._mongo_db.close()
             self._connected = False
             logger.debug("LLM Archiver connection closed")
 

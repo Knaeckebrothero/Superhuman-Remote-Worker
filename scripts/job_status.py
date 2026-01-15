@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check status of a job in the Graph-RAG system.
 
-Standalone CLI tool using direct psycopg2 connection.
+Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 
 Usage:
     python scripts/job_status.py --job-id <uuid>
@@ -15,64 +15,48 @@ import os
 import sys
 import uuid as uuid_module
 from datetime import datetime
-from contextlib import contextmanager
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-def get_connection_string() -> str:
-    """Get PostgreSQL connection string from environment."""
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://graphrag:graphrag_password@localhost:5432/graphrag"
-    )
-
-
-@contextmanager
-def get_connection():
-    """Context manager for database connections."""
-    conn = psycopg2.connect(get_connection_string())
-    try:
-        yield conn
-    finally:
-        conn.close()
+from src.database import PostgresDB
 
 
 def get_job(job_id: str) -> dict | None:
     """Get job by ID."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, prompt, document_path, status, creator_status, validator_status,
-                       created_at, updated_at, completed_at, error_message
-                FROM jobs WHERE id = %s
-                """,
-                (job_id,)
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        job_uuid = uuid_module.UUID(job_id)
+        return db.jobs.get_sync(job_uuid)
+    finally:
+        db.close_sync()
 
 
 def get_requirement_counts(job_id: str) -> dict:
     """Get requirement counts by status."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                    COUNT(*) FILTER (WHERE status = 'validating') as validating,
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed
-                FROM requirements WHERE job_id = %s
-                """,
-                (job_id,)
-            )
-            return dict(cur.fetchone())
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        job_uuid = uuid_module.UUID(job_id)
+        row = db.fetchrow_sync(
+            """
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'pending') as pending,
+                COUNT(*) FILTER (WHERE status = 'validating') as validating,
+                COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
+                COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
+                COUNT(*) FILTER (WHERE status = 'failed') as failed
+            FROM requirements WHERE job_id = $1
+            """,
+            job_uuid
+        )
+        return row
+    finally:
+        db.close_sync()
 
 
 def get_job_progress(job_id: str) -> dict:
@@ -83,6 +67,7 @@ def get_job_progress(job_id: str) -> dict:
 
     req_counts = get_requirement_counts(job_id)
 
+    # Calculate progress
     total = req_counts['total']
     processed = req_counts['integrated'] + req_counts['rejected']
     progress_percent = (processed / total * 100) if total > 0 else 0
@@ -97,110 +82,132 @@ def get_job_progress(job_id: str) -> dict:
     eta_seconds = None
     if processed > 0 and total > processed:
         avg_time_per_req = elapsed_seconds / processed
-        eta_seconds = (total - processed) * avg_time_per_req
+        remaining = (total - processed) * avg_time_per_req
+        eta_seconds = remaining
 
     return {
-        "job_id": str(job['id']),
-        "status": job['status'],
-        "creator_status": job['creator_status'],
-        "validator_status": job['validator_status'],
+        "job": job,
         "requirements": req_counts,
         "progress_percent": round(progress_percent, 1),
         "elapsed_seconds": elapsed_seconds,
-        "eta_seconds": eta_seconds,
+        "eta_seconds": eta_seconds
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Check status of a job",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s --job-id 123e4567-e89b-12d3-a456-426614174000
-  %(prog)s --job-id 123e4567-e89b-12d3-a456-426614174000 --json
-  %(prog)s --job-id 123e4567-e89b-12d3-a456-426614174000 --progress
-        """
-    )
+def print_job_status(job: dict, req_counts: dict):
+    """Print job status in a human-readable format."""
+    print("\nJob Status")
+    print("=" * 60)
+    print(f"ID:                {job['id']}")
+    print(f"Prompt:            {job.get('prompt', 'N/A')}")
+    print(f"Document:          {job.get('document_path', 'N/A')}")
+    print(f"Status:            {job['status']}")
+    print(f"Creator Status:    {job['creator_status']}")
+    print(f"Validator Status:  {job['validator_status']}")
+    print(f"Created:           {job['created_at']}")
+    print(f"Updated:           {job['updated_at']}")
+    if job.get('completed_at'):
+        print(f"Completed:         {job['completed_at']}")
+    if job.get('error_message'):
+        print(f"Error:             {job['error_message']}")
 
-    parser.add_argument("--job-id", required=True, help="Job UUID")
+    print("\nRequirements")
+    print("-" * 60)
+    print(f"Total:             {req_counts['total']}")
+    print(f"Pending:           {req_counts['pending']}")
+    print(f"Validating:        {req_counts['validating']}")
+    print(f"Integrated:        {req_counts['integrated']}")
+    print(f"Rejected:          {req_counts['rejected']}")
+    print(f"Failed:            {req_counts['failed']}")
+    print("=" * 60)
+
+
+def print_progress(progress: dict):
+    """Print progress information with ETA."""
+    job = progress['job']
+    req_counts = progress['requirements']
+
+    print("\nJob Progress")
+    print("=" * 60)
+    print(f"ID:                {job['id']}")
+    print(f"Status:            {job['status']}")
+    print(f"Progress:          {progress['progress_percent']:.1f}%")
+    print(f"Elapsed:           {progress['elapsed_seconds']:.0f}s")
+    if progress['eta_seconds']:
+        eta_minutes = progress['eta_seconds'] / 60
+        print(f"ETA:               ~{eta_minutes:.1f} minutes")
+    else:
+        print(f"ETA:               N/A")
+
+    print("\nRequirements:")
+    print(f"  Total:           {req_counts['total']}")
+    print(f"  Pending:         {req_counts['pending']}")
+    print(f"  Validating:      {req_counts['validating']}")
+    print(f"  Integrated:      {req_counts['integrated']}")
+    print(f"  Rejected:        {req_counts['rejected']}")
+    print(f"  Failed:          {req_counts['failed']}")
+    print("=" * 60)
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="Check job status")
+    parser.add_argument("--job-id", "-j", required=True, help="Job ID (UUID)")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--progress", action="store_true", help="Show detailed progress")
+    parser.add_argument("--progress", action="store_true", help="Show progress with ETA")
 
     args = parser.parse_args()
 
-    # Validate job ID
+    # Validate UUID
     try:
-        job_id = str(uuid_module.UUID(args.job_id))
+        uuid_module.UUID(args.job_id)
     except ValueError:
-        print(f"Error: Invalid job ID: {args.job_id}", file=sys.stderr)
+        print(f"Error: Invalid job ID format: {args.job_id}", file=sys.stderr)
         sys.exit(1)
 
-    # Get job
-    job = get_job(job_id)
-    if not job:
-        if args.json:
-            print(json.dumps({"error": "Job not found"}))
+    try:
+        if args.progress:
+            progress = get_job_progress(args.job_id)
+            if "error" in progress:
+                print(f"Error: {progress['error']}", file=sys.stderr)
+                sys.exit(1)
+
+            if args.json:
+                # Convert datetime objects to strings for JSON
+                output = {
+                    "job_id": str(progress['job']['id']),
+                    "status": progress['job']['status'],
+                    "progress_percent": progress['progress_percent'],
+                    "requirements": progress['requirements'],
+                    "elapsed_seconds": progress['elapsed_seconds'],
+                    "eta_seconds": progress['eta_seconds']
+                }
+                print(json.dumps(output, indent=2))
+            else:
+                print_progress(progress)
         else:
-            print(f"Error: Job {job_id} not found", file=sys.stderr)
+            job = get_job(args.job_id)
+            if not job:
+                print(f"Error: Job not found: {args.job_id}", file=sys.stderr)
+                sys.exit(1)
+
+            req_counts = get_requirement_counts(args.job_id)
+
+            if args.json:
+                output = {
+                    "job": {k: str(v) if isinstance(v, datetime) or isinstance(v, uuid_module.UUID) else v
+                            for k, v in job.items()},
+                    "requirements": req_counts
+                }
+                print(json.dumps(output, default=str, indent=2))
+            else:
+                print_job_status(job, req_counts)
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-
-    # Progress view
-    if args.progress:
-        progress = get_job_progress(job_id)
-        if args.json:
-            print(json.dumps(progress, indent=2, default=str))
-        else:
-            print(f"Job: {progress['job_id']}")
-            print(f"Status: {progress['status']}")
-            print(f"Creator: {progress['creator_status']}")
-            print(f"Validator: {progress['validator_status']}")
-            print(f"Progress: {progress['progress_percent']:.1f}%")
-            print()
-            print("Requirements:")
-            for key, value in progress['requirements'].items():
-                print(f"  {key}: {value}")
-            print()
-            print(f"Elapsed: {progress['elapsed_seconds']/3600:.1f} hours")
-            if progress.get('eta_seconds'):
-                print(f"ETA: {progress['eta_seconds']/3600:.1f} hours")
-        return
-
-    # JSON output
-    if args.json:
-        req_counts = get_requirement_counts(job_id)
-        output = {**job, "requirement_counts": req_counts}
-        for key, value in output.items():
-            if isinstance(value, datetime):
-                output[key] = value.isoformat()
-        print(json.dumps(output, indent=2, default=str))
-        return
-
-    # Default text output
-    req_counts = get_requirement_counts(job_id)
-
-    print(f"Job ID:           {job['id']}")
-    print(f"Status:           {job['status']}")
-    print(f"Creator Status:   {job['creator_status']}")
-    print(f"Validator Status: {job['validator_status']}")
-    print(f"Created:          {job['created_at']}")
-
-    if req_counts['total'] > 0:
-        print()
-        print("Requirements:")
-        print(f"  Total:      {req_counts['total']}")
-        print(f"  Integrated: {req_counts['integrated']}")
-        print(f"  Pending:    {req_counts['pending']}")
-        print(f"  Rejected:   {req_counts['rejected']}")
-        print(f"  Failed:     {req_counts['failed']}")
-
-        processed = req_counts['integrated'] + req_counts['rejected']
-        progress = (processed / req_counts['total'] * 100)
-        print(f"  Progress:   {progress:.1f}%")
-
-    if job.get('error_message'):
-        print()
-        print(f"Error: {job['error_message']}")
 
 
 if __name__ == "__main__":
