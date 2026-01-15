@@ -6,9 +6,6 @@ Universal Agent architecture for requirement extraction and validation.
 
 __version__ = "2.0.0"
 
-# Core utilities
-from src.database.neo4j_utils import Neo4jConnection, create_neo4j_connection
-
 # Universal Agent
 from .agent import UniversalAgent
 from .core.state import UniversalAgentState
@@ -53,9 +50,6 @@ from .core.loader import (
 )
 
 __all__ = [
-    # Core
-    'Neo4jConnection',
-    'create_neo4j_connection',
     # Universal Agent
     'UniversalAgent',
     'UniversalAgentState',

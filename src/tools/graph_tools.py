@@ -125,12 +125,18 @@ def create_graph_tools(context: ToolContext) -> List:
     """Create graph tools with injected context.
 
     Args:
-        context: ToolContext with dependencies (must include neo4j_conn)
+        context: ToolContext with dependencies (must include neo4j connection)
 
     Returns:
         List of LangChain tool functions
+
+    Raises:
+        ValueError: If Neo4j database not available in context
     """
-    neo4j = context.neo4j_conn
+    neo4j = context.graph
+    if not neo4j:
+        raise ValueError("Neo4j database not available in context")
+
     config = context.config or {}
     duplicate_threshold = config.get("duplicate_threshold", 0.95)
 
@@ -180,7 +186,8 @@ def create_graph_tools(context: ToolContext) -> List:
     def get_schema() -> Dict:
         nonlocal _schema_cache
         if _schema_cache is None and neo4j:
-            _schema_cache = neo4j.get_database_schema()
+            # Neo4jDB uses get_schema(), old interface uses get_database_schema()
+            _schema_cache = neo4j.get_schema() if hasattr(neo4j, 'get_schema') else neo4j.get_database_schema()
         return _schema_cache or {}
 
     @tool

@@ -1,8 +1,7 @@
 """
-Core utilities for database connectivity and data processing.
+Core utilities for data processing and validation.
 """
 
-from src.database.neo4j_utils import Neo4jConnection, create_neo4j_connection
 from .metamodel_validator import (
     MetamodelValidator,
     ComplianceReport,
@@ -24,23 +23,6 @@ from .document_models import (
 )
 from .config import load_config, load_prompt, get_project_root
 
-# PostgreSQL utilities (optional - requires asyncpg)
-try:
-    from src.database.postgres_utils import (
-        PostgresConnection,
-        create_postgres_connection,
-        create_job,
-        get_job,
-        update_job_status,
-        create_requirement,
-        get_pending_requirement,
-        update_requirement_status,
-        count_requirements_by_status,
-    )
-    _postgres_available = True
-except ImportError:
-    _postgres_available = False
-
 # Citation utilities (optional - requires citation_engine)
 try:
     from .citation_utils import (
@@ -55,9 +37,6 @@ except ImportError:
     _citation_available = False
 
 __all__ = [
-    # Neo4j
-    'Neo4jConnection',
-    'create_neo4j_connection',
     # Metamodel Validation
     'MetamodelValidator',
     'ComplianceReport',
@@ -79,20 +58,6 @@ __all__ = [
     'load_prompt',
     'get_project_root',
 ]
-
-# Add PostgreSQL exports if available
-if _postgres_available:
-    __all__.extend([
-        'PostgresConnection',
-        'create_postgres_connection',
-        'create_job',
-        'get_job',
-        'update_job_status',
-        'create_requirement',
-        'get_pending_requirement',
-        'update_requirement_status',
-        'count_requirements_by_status',
-    ])
 
 # Add citation exports if available
 if _citation_available:

@@ -5,9 +5,14 @@ such as workspace managers, database connections, and configuration.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..core.workspace import WorkspaceManager
+
+# Avoid circular imports with TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..database.postgres_db import PostgresDB
+    from ..database.neo4j_db import Neo4jDB
 
 
 @dataclass
@@ -21,8 +26,8 @@ class ToolContext:
     Attributes:
         workspace_manager: WorkspaceManager for file operations
         todo_manager: TodoManager for task tracking (optional)
-        postgres_conn: PostgreSQL connection for database operations
-        neo4j_conn: Neo4j connection for graph operations
+        postgres_db: PostgresDB instance for database operations
+        neo4j_db: Neo4jDB instance for graph operations
         config: Additional configuration dictionary
         job_id: Override job ID (if not using workspace_manager)
         citation_engine: CitationEngine instance for citation management
@@ -44,8 +49,8 @@ class ToolContext:
 
     workspace_manager: Optional[WorkspaceManager] = None
     todo_manager: Optional[Any] = None  # TodoManager, imported later to avoid circular deps
-    postgres_conn: Optional[Any] = None
-    neo4j_conn: Optional[Any] = None
+    postgres_db: Optional["PostgresDB"] = None
+    neo4j_db: Optional["Neo4jDB"] = None
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
@@ -87,11 +92,29 @@ class ToolContext:
 
     def has_postgres(self) -> bool:
         """Check if PostgreSQL connection is available."""
-        return self.postgres_conn is not None
+        return self.postgres_db is not None
 
     def has_neo4j(self) -> bool:
         """Check if Neo4j connection is available."""
-        return self.neo4j_conn is not None
+        return self.neo4j_db is not None
+
+    @property
+    def db(self) -> Optional["PostgresDB"]:
+        """Get PostgresDB instance.
+
+        Returns:
+            PostgresDB instance if available, None otherwise
+        """
+        return self.postgres_db
+
+    @property
+    def graph(self) -> Optional["Neo4jDB"]:
+        """Get Neo4jDB instance.
+
+        Returns:
+            Neo4jDB instance if available, None otherwise
+        """
+        return self.neo4j_db
 
     def get_config(self, key: str, default: Any = None) -> Any:
         """Get a configuration value.
@@ -189,20 +212,21 @@ class ToolContext:
             self.citation_engine = None
             self._source_registry.clear()
 
-    def update_job_status(
+    async def update_job_status(
         self,
         status: str,
         completed_at: bool = False,
         error_message: Optional[str] = None,
     ) -> bool:
-        """Update job status in PostgreSQL.
+        """Update job status in PostgreSQL (async version).
 
-        This method updates the jobs table with the new status and optionally
-        sets the completed_at timestamp.
+        FIXED: Converted from sync psycopg2-style to async asyncpg.
+        This method now properly uses asyncpg's execute() method instead of
+        the old sync cursor() pattern that was causing runtime errors.
 
         Args:
             status: New status value (e.g., 'completed', 'failed')
-            completed_at: Whether to set completed_at to now()
+            completed_at: Whether to set completed_at to NOW()
             error_message: Optional error message for failed status
 
         Returns:
@@ -221,40 +245,36 @@ class ToolContext:
             import logging
             logger = logging.getLogger(__name__)
 
-            cursor = self.postgres_conn.cursor()
-
-            # Build the update query
+            # Use asyncpg's execute method (no cursor needed)
+            # asyncpg uses $1, $2, $3 placeholders instead of %s
             if completed_at:
                 if error_message:
-                    cursor.execute(
+                    await self.postgres_db.execute(
                         """
                         UPDATE jobs
-                        SET status = %s, completed_at = NOW(), error_message = %s
-                        WHERE id = %s
+                        SET status = $1, completed_at = NOW(), error_message = $2
+                        WHERE id = $3::uuid
                         """,
-                        (status, error_message, self.job_id),
+                        status, error_message, self.job_id,
                     )
                 else:
-                    cursor.execute(
+                    await self.postgres_db.execute(
                         """
                         UPDATE jobs
-                        SET status = %s, completed_at = NOW()
-                        WHERE id = %s
+                        SET status = $1, completed_at = NOW()
+                        WHERE id = $2::uuid
                         """,
-                        (status, self.job_id),
+                        status, self.job_id,
                     )
             else:
-                cursor.execute(
+                await self.postgres_db.execute(
                     """
                     UPDATE jobs
-                    SET status = %s
-                    WHERE id = %s
+                    SET status = $1
+                    WHERE id = $2::uuid
                     """,
-                    (status, self.job_id),
+                    status, self.job_id,
                 )
-
-            self.postgres_conn.commit()
-            cursor.close()
 
             logger.info(f"Updated job {self.job_id} status to '{status}'")
             return True

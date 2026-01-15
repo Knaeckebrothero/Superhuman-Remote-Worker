@@ -1,213 +1,239 @@
 """Database utilities for the Streamlit dashboard.
 
+Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 Enhanced with features salvaged from src/orchestrator/ (monitor.py, reporter.py).
 """
 
+import json
+import sys
 import os
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.database import PostgresDB
+
+# Create module-level PostgresDB instance for dashboard use
+# This uses sync wrappers, so it can be used in Streamlit without async/await
+_db_instance = None
 
 
-def get_connection_string() -> str:
-    """Get PostgreSQL connection string from environment."""
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://graphrag:graphrag_password@localhost:5432/graphrag"
-    )
+def _get_db() -> PostgresDB:
+    """Get or create the PostgresDB instance."""
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = PostgresDB()
+        _db_instance.connect_sync()
+    return _db_instance
 
 
-@contextmanager
-def get_connection():
-    """Context manager for database connections."""
-    conn = psycopg2.connect(get_connection_string())
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# ============================================================================
+# JOB MANAGEMENT
+# ============================================================================
 
 
 def create_job(prompt: str, document_path: str | None = None) -> UUID:
     """Create a new job in the database."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO jobs (prompt, document_path, status, creator_status, validator_status)
-                VALUES (%s, %s, 'created', 'pending', 'pending')
-                RETURNING id
-                """,
-                (prompt, document_path)
-            )
-            result = cur.fetchone()
-            return result[0]
+    db = _get_db()
+    job_id = db.jobs.create_sync(prompt=prompt, document_path=document_path)
+    # Update status to 'created' (default from namespace is 'processing')
+    db.execute_sync(
+        "UPDATE jobs SET status = $1, creator_status = $2, validator_status = $3 WHERE id = $4",
+        'created', 'pending', 'pending', job_id
+    )
+    return job_id
 
 
 def list_jobs(status_filter: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     """List jobs with optional status filter."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if status_filter:
-                cur.execute(
-                    """
-                    SELECT id, prompt, document_path, status, creator_status, validator_status,
-                           created_at, updated_at, completed_at, error_message,
-                           total_tokens_used, total_requests
-                    FROM jobs
-                    WHERE status = %s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (status_filter, limit)
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT id, prompt, document_path, status, creator_status, validator_status,
-                           created_at, updated_at, completed_at, error_message,
-                           total_tokens_used, total_requests
-                    FROM jobs
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,)
-                )
-            return [dict(row) for row in cur.fetchall()]
+    db = _get_db()
+    if status_filter:
+        return db.jobs.list_sync(status=status_filter, limit=limit)
+    else:
+        return db.jobs.list_sync(limit=limit)
 
 
 def get_job(job_id: UUID | str) -> dict[str, Any] | None:
     """Get a specific job by ID."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, prompt, document_path, status, creator_status, validator_status,
-                       created_at, updated_at, completed_at, error_message, error_details,
-                       total_tokens_used, total_requests, context
-                FROM jobs
-                WHERE id = %s
-                """,
-                (str(job_id),)
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    return db.jobs.get_sync(job_id)
 
 
 def delete_job(job_id: UUID | str) -> bool:
     """Delete a job and its requirements (cascade)."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM jobs WHERE id = %s", (str(job_id),))
-            return cur.rowcount > 0
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    result = db.execute_sync("DELETE FROM jobs WHERE id = $1", job_id)
+    return "DELETE" in result
 
 
 def assign_to_creator(job_id: UUID | str) -> bool:
     """Assign a job to the Creator agent for processing."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE jobs
-                SET status = 'processing',
-                    creator_status = 'pending',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND status IN ('created', 'failed')
-                """,
-                (str(job_id),)
-            )
-            return cur.rowcount > 0
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    result = db.execute_sync(
+        """
+        UPDATE jobs
+        SET status = $1,
+            creator_status = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3 AND status IN ('created', 'failed')
+        """,
+        'processing', 'pending', job_id
+    )
+    return "UPDATE 1" in result
 
 
 def assign_to_validator(job_id: UUID | str) -> bool:
     """Assign a job to the Validator agent for processing."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE jobs
-                SET status = 'processing',
-                    validator_status = 'pending',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND creator_status = 'completed'
-                """,
-                (str(job_id),)
-            )
-            return cur.rowcount > 0
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    result = db.execute_sync(
+        """
+        UPDATE jobs
+        SET status = $1,
+            validator_status = $2,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3 AND creator_status = 'completed'
+        """,
+        'processing', 'pending', job_id
+    )
+    return "UPDATE 1" in result
+
+
+# ============================================================================
+# REQUIREMENTS
+# ============================================================================
 
 
 def get_requirements(job_id: UUID | str) -> list[dict[str, Any]]:
     """Get all requirements for a job."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, requirement_id, text, name, type, priority,
-                       source_document, source_location,
-                       gobd_relevant, gdpr_relevant,
-                       status, neo4j_id, rejection_reason,
-                       confidence, created_at, updated_at
-                FROM requirements
-                WHERE job_id = %s
-                ORDER BY created_at
-                """,
-                (str(job_id),)
-            )
-            return [dict(row) for row in cur.fetchall()]
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+    return db.requirements.list_by_job_sync(job_id, limit=10000)
 
 
 def get_requirement_summary(job_id: UUID | str) -> dict[str, int]:
     """Get requirement counts by status for a job."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                    COUNT(*) FILTER (WHERE status = 'validating') as validating,
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-                    COUNT(*) as total
-                FROM requirements
-                WHERE job_id = %s
-                """,
-                (str(job_id),)
-            )
-            row = cur.fetchone()
-            return dict(row) if row else {
-                "pending": 0, "validating": 0, "integrated": 0,
-                "rejected": 0, "failed": 0, "total": 0
-            }
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+
+    row = db.fetchrow_sync(
+        """
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'validating') as validating,
+            COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
+            COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed,
+            COUNT(*) as total
+        FROM requirements
+        WHERE job_id = $1
+        """,
+        job_id
+    )
+    return row if row else {
+        "pending": 0, "validating": 0, "integrated": 0,
+        "rejected": 0, "failed": 0, "total": 0
+    }
+
+
+# ============================================================================
+# STATISTICS
+# ============================================================================
 
 
 def get_job_stats() -> dict[str, Any]:
     """Get overall job statistics."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) as total_jobs,
-                    COUNT(*) FILTER (WHERE status = 'created') as created,
-                    COUNT(*) FILTER (WHERE status = 'processing') as processing,
-                    COUNT(*) FILTER (WHERE status = 'completed') as completed,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
-                FROM jobs
-                """
-            )
-            return dict(cur.fetchone())
+    db = _get_db()
+    return db.fetchrow_sync(
+        """
+        SELECT
+            COUNT(*) as total_jobs,
+            COUNT(*) FILTER (WHERE status = 'created') as created,
+            COUNT(*) FILTER (WHERE status = 'processing') as processing,
+            COUNT(*) FILTER (WHERE status = 'completed') as completed,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed,
+            COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
+        FROM jobs
+        """
+    )
 
 
-# --- Features salvaged from src/orchestrator/monitor.py ---
+def get_daily_statistics(days: int = 7) -> list[dict[str, Any]]:
+    """Get daily job statistics for the past N days.
+
+    Args:
+        days: Number of days to include
+
+    Returns:
+        List of daily statistics dictionaries
+    """
+    db = _get_db()
+    return db.fetch_sync(
+        """
+        SELECT
+            DATE(created_at) as date,
+            COUNT(*) as jobs_created,
+            COUNT(*) FILTER (WHERE status = 'completed') as jobs_completed,
+            COUNT(*) FILTER (WHERE status = 'failed') as jobs_failed
+        FROM jobs
+        WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
+        GROUP BY DATE(created_at)
+        ORDER BY date DESC
+        """,
+        days
+    )
+
+
+def get_requirement_statistics(job_id: UUID | str) -> dict[str, Any]:
+    """Get detailed requirement statistics for a job.
+
+    Args:
+        job_id: Job UUID
+
+    Returns:
+        Dictionary with requirement breakdowns by status, priority, relevance
+    """
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+
+    row = db.fetchrow_sync(
+        """
+        SELECT
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'validating') as validating,
+            COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
+            COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed,
+            COUNT(*) FILTER (WHERE gobd_relevant = true) as gobd_relevant,
+            COUNT(*) FILTER (WHERE gdpr_relevant = true) as gdpr_relevant,
+            COUNT(*) FILTER (WHERE priority = 'high') as high_priority,
+            COUNT(*) FILTER (WHERE priority = 'medium') as medium_priority,
+            COUNT(*) FILTER (WHERE priority = 'low') as low_priority
+        FROM requirements
+        WHERE job_id = $1
+        """,
+        job_id
+    )
+    return row if row else {}
+
+
+# ============================================================================
+# MONITORING (salvaged from src/orchestrator/monitor.py)
+# ============================================================================
 
 
 def detect_stuck_jobs(threshold_minutes: int = 60) -> list[dict[str, Any]]:
@@ -223,29 +249,26 @@ def detect_stuck_jobs(threshold_minutes: int = 60) -> list[dict[str, Any]]:
         List of stuck job dictionaries with stuck reason
     """
     threshold = datetime.utcnow() - timedelta(minutes=threshold_minutes)
+    db = _get_db()
 
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT j.id, j.prompt, j.status, j.creator_status, j.validator_status,
-                       j.created_at, j.updated_at,
-                       COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,
-                       COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements
-                FROM jobs j
-                LEFT JOIN requirements r ON j.id = r.job_id
-                WHERE j.status = 'processing'
-                AND j.updated_at < %s
-                GROUP BY j.id
-                ORDER BY j.updated_at ASC
-                """,
-                (threshold,)
-            )
-            rows = cur.fetchall()
+    rows = db.fetch_sync(
+        """
+        SELECT j.id, j.prompt, j.status, j.creator_status, j.validator_status,
+               j.created_at, j.updated_at,
+               COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,
+               COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements
+        FROM jobs j
+        LEFT JOIN requirements r ON j.id = r.job_id
+        WHERE j.status = 'processing'
+        AND j.updated_at < $1
+        GROUP BY j.id
+        ORDER BY j.updated_at ASC
+        """,
+        threshold
+    )
 
     stuck_jobs = []
-    for row in rows:
-        job = dict(row)
+    for job in rows:
         # Determine stuck reason
         if job['creator_status'] == 'processing' and job['integrated_requirements'] == 0:
             job['stuck_reason'] = "Creator not producing requirements"
@@ -270,37 +293,36 @@ def get_job_progress(job_id: UUID | str) -> dict[str, Any]:
     Returns:
         Dictionary with progress details and estimated time remaining
     """
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Get job info
-            cur.execute(
-                """
-                SELECT id, prompt, status, creator_status, validator_status,
-                       created_at, updated_at, completed_at
-                FROM jobs WHERE id = %s
-                """,
-                (str(job_id),)
-            )
-            job = cur.fetchone()
-            if not job:
-                return {"error": "Job not found"}
-            job = dict(job)
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
 
-            # Get requirement counts
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                    COUNT(*) FILTER (WHERE status = 'validating') as validating,
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed
-                FROM requirements WHERE job_id = %s
-                """,
-                (str(job_id),)
-            )
-            req_counts = dict(cur.fetchone())
+    # Get job info
+    job = db.fetchrow_sync(
+        """
+        SELECT id, prompt, status, creator_status, validator_status,
+               created_at, updated_at, completed_at
+        FROM jobs WHERE id = $1
+        """,
+        job_id
+    )
+    if not job:
+        return {"error": "Job not found"}
+
+    # Get requirement counts
+    req_counts = db.fetchrow_sync(
+        """
+        SELECT
+            COUNT(*) as total,
+            COUNT(*) FILTER (WHERE status = 'pending') as pending,
+            COUNT(*) FILTER (WHERE status = 'validating') as validating,
+            COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
+            COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
+            COUNT(*) FILTER (WHERE status = 'failed') as failed
+        FROM requirements WHERE job_id = $1
+        """,
+        job_id
+    )
 
     # Calculate progress
     total = req_counts['total']
@@ -333,69 +355,9 @@ def get_job_progress(job_id: UUID | str) -> dict[str, Any]:
     }
 
 
-# --- Features salvaged from src/orchestrator/reporter.py ---
-
-
-def get_daily_statistics(days: int = 7) -> list[dict[str, Any]]:
-    """Get daily job statistics for the past N days.
-
-    Args:
-        days: Number of days to include
-
-    Returns:
-        List of daily statistics dictionaries
-    """
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    DATE(created_at) as date,
-                    COUNT(*) as jobs_created,
-                    COUNT(*) FILTER (WHERE status = 'completed') as jobs_completed,
-                    COUNT(*) FILTER (WHERE status = 'failed') as jobs_failed
-                FROM jobs
-                WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '%s days'
-                GROUP BY DATE(created_at)
-                ORDER BY date DESC
-                """,
-                (days,)
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-
-def get_requirement_statistics(job_id: UUID | str) -> dict[str, Any]:
-    """Get detailed requirement statistics for a job.
-
-    Args:
-        job_id: Job UUID
-
-    Returns:
-        Dictionary with requirement breakdowns by status, priority, relevance
-    """
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                    COUNT(*) FILTER (WHERE status = 'validating') as validating,
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE gobd_relevant = true) as gobd_relevant,
-                    COUNT(*) FILTER (WHERE gdpr_relevant = true) as gdpr_relevant,
-                    COUNT(*) FILTER (WHERE priority = 'high') as high_priority,
-                    COUNT(*) FILTER (WHERE priority = 'medium') as medium_priority,
-                    COUNT(*) FILTER (WHERE priority = 'low') as low_priority
-                FROM requirements
-                WHERE job_id = %s
-                """,
-                (str(job_id),)
-            )
-            row = cur.fetchone()
-            return dict(row) if row else {}
+# ============================================================================
+# JOB ACTIONS
+# ============================================================================
 
 
 def cancel_job(job_id: UUID | str) -> bool:
@@ -407,18 +369,20 @@ def cancel_job(job_id: UUID | str) -> bool:
     Returns:
         True if job was cancelled, False if not found or already completed
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE jobs
-                SET status = 'cancelled',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND status NOT IN ('completed', 'cancelled')
-                """,
-                (str(job_id),)
-            )
-            return cur.rowcount > 0
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+
+    result = db.execute_sync(
+        """
+        UPDATE jobs
+        SET status = $1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2 AND status NOT IN ('completed', 'cancelled')
+        """,
+        'cancelled', job_id
+    )
+    return "UPDATE 1" in result
 
 
 def create_creator_job(
@@ -436,8 +400,6 @@ def create_creator_job(
     Returns:
         UUID of the created job
     """
-    import json
-
     # Validate document count
     if document_paths and len(document_paths) > 10:
         raise ValueError("Maximum 10 documents allowed per job")
@@ -448,18 +410,17 @@ def create_creator_job(
         context = context or {}
         context['additional_documents'] = document_paths[1:]
 
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO jobs (prompt, document_path, context, status, creator_status, validator_status)
-                VALUES (%s, %s, %s, 'processing', 'pending', 'pending')
-                RETURNING id
-                """,
-                (prompt, doc_path, json.dumps(context) if context else None)
-            )
-            result = cur.fetchone()
-            return result[0]
+    db = _get_db()
+    job_id = db.fetchval_sync(
+        """
+        INSERT INTO jobs (prompt, document_path, context, status, creator_status, validator_status)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id
+        """,
+        prompt, doc_path, json.dumps(context) if context else None,
+        'processing', 'pending', 'pending'
+    )
+    return job_id
 
 
 def create_validator_job(job_id: UUID | str) -> bool:
@@ -471,18 +432,20 @@ def create_validator_job(job_id: UUID | str) -> bool:
     Returns:
         True if validation was triggered, False otherwise
     """
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE jobs
-                SET validator_status = 'pending',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND creator_status = 'completed'
-                """,
-                (str(job_id),)
-            )
-            return cur.rowcount > 0
+    db = _get_db()
+    if isinstance(job_id, str):
+        job_id = UUID(job_id)
+
+    result = db.execute_sync(
+        """
+        UPDATE jobs
+        SET validator_status = $1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2 AND creator_status = 'completed'
+        """,
+        'pending', job_id
+    )
+    return "UPDATE 1" in result
 
 
 def get_jobs_ready_for_validation() -> list[dict[str, Any]]:
@@ -491,19 +454,17 @@ def get_jobs_ready_for_validation() -> list[dict[str, Any]]:
     Returns:
         List of jobs where creator is done but validator hasn't started
     """
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT j.id, j.prompt, j.document_path, j.created_at, j.updated_at,
-                       COUNT(r.id) as requirement_count
-                FROM jobs j
-                LEFT JOIN requirements r ON j.id = r.job_id
-                WHERE j.creator_status = 'completed'
-                AND j.validator_status IN ('pending', 'failed')
-                AND j.status != 'cancelled'
-                GROUP BY j.id
-                ORDER BY j.updated_at DESC
-                """
-            )
-            return [dict(row) for row in cur.fetchall()]
+    db = _get_db()
+    return db.fetch_sync(
+        """
+        SELECT j.id, j.prompt, j.document_path, j.created_at, j.updated_at,
+               COUNT(r.id) as requirement_count
+        FROM jobs j
+        LEFT JOIN requirements r ON j.id = r.job_id
+        WHERE j.creator_status = 'completed'
+        AND j.validator_status IN ('pending', 'failed')
+        AND j.status != 'cancelled'
+        GROUP BY j.id
+        ORDER BY j.updated_at DESC
+        """
+    )

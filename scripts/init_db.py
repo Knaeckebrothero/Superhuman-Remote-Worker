@@ -27,7 +27,7 @@ except ImportError:
     sys.exit(1)
 
 # Schema file
-SCHEMA_FILE = project_root / "src" / "database" / "schema.sql"
+SCHEMA_FILE = project_root / "src" / "database" / "queries" / "postgres" / "schema.sql"
 
 
 def get_connection_string() -> str:

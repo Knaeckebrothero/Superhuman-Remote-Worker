@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cancel a job in the Graph-RAG system.
 
-Standalone CLI tool using direct psycopg2 connection.
+Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 
 Usage:
     python scripts/cancel_job.py --job-id <uuid>
@@ -13,79 +13,65 @@ import json
 import os
 import sys
 import uuid as uuid_module
-from contextlib import contextmanager
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-def get_connection_string() -> str:
-    """Get PostgreSQL connection string from environment."""
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://graphrag:graphrag_password@localhost:5432/graphrag"
-    )
-
-
-@contextmanager
-def get_connection():
-    """Context manager for database connections."""
-    conn = psycopg2.connect(get_connection_string())
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+from src.database import PostgresDB
 
 
 def get_job(job_id: str) -> dict | None:
     """Get job by ID."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, prompt, status, creator_status, validator_status
-                FROM jobs WHERE id = %s
-                """,
-                (job_id,)
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        job_uuid = uuid_module.UUID(job_id)
+        return db.jobs.get_sync(job_uuid)
+    finally:
+        db.close_sync()
 
 
 def get_requirement_counts(job_id: str) -> dict:
     """Get requirement counts."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending
-                FROM requirements WHERE job_id = %s
-                """,
-                (job_id,)
-            )
-            return dict(cur.fetchone())
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        job_uuid = uuid_module.UUID(job_id)
+        row = db.fetchrow_sync(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
+                COUNT(*) FILTER (WHERE status = 'pending') as pending
+            FROM requirements WHERE job_id = $1
+            """,
+            job_uuid
+        )
+        return row
+    finally:
+        db.close_sync()
 
 
 def cancel_job(job_id: str) -> bool:
     """Cancel a job."""
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE jobs
-                SET status = 'cancelled',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s AND status NOT IN ('completed', 'cancelled')
-                """,
-                (job_id,)
-            )
-            return cur.rowcount > 0
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        job_uuid = uuid_module.UUID(job_id)
+        result = db.execute_sync(
+            """
+            UPDATE jobs
+            SET status = $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $2 AND status NOT IN ('completed', 'cancelled')
+            """,
+            'cancelled', job_uuid
+        )
+        return "UPDATE 1" in result
+    finally:
+        db.close_sync()
 
 
 def main():
