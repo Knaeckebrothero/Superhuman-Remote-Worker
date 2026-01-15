@@ -60,7 +60,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src import UniversalAgent, create_app
-from src.core.workspace import get_workspace_base_path
+from src.core.workspace import get_workspace_base_path, get_logs_path
 from src.database.postgres_db import PostgresDB
 
 
@@ -88,6 +88,7 @@ def setup_logging(verbose: bool = False):
         "pymongo.serverSelection",
         "urllib3",
         "asyncio",
+        "aiosqlite",  # LangGraph checkpointer - very verbose
     ]
     for lib in noisy_libraries:
         logging.getLogger(lib).setLevel(logging.WARNING)
@@ -99,7 +100,7 @@ def setup_logging(verbose: bool = False):
 def setup_job_file_logging(job_id: str, verbose: bool = False) -> Path:
     """Set up file logging for a specific job.
 
-    Creates a log file alongside the job's workspace directory (not inside it,
+    Creates a log file in the logs directory (not inside the job workspace,
     so the agent cannot read its own logs).
 
     Args:
@@ -109,11 +110,10 @@ def setup_job_file_logging(job_id: str, verbose: bool = False) -> Path:
     Returns:
         Path to the log file
     """
-    workspace_base = get_workspace_base_path()
-    workspace_base.mkdir(parents=True, exist_ok=True)
+    logs_dir = get_logs_path()  # Creates workspace/logs/ if needed
 
-    # Log file is alongside the job folder, not inside it
-    log_file = workspace_base / f"job_{job_id}.log"
+    # Log file goes in the logs directory
+    log_file = logs_dir / f"job_{job_id}.log"
 
     # Create file handler
     level = logging.DEBUG if verbose else logging.INFO
