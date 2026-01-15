@@ -333,6 +333,13 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
     iteration = record.get("iteration", "?")
     latency = record.get("latency_ms", "?")
 
+    # Token usage
+    metrics = record.get("metrics", {})
+    token_usage = metrics.get("token_usage", {})
+    prompt_tokens = token_usage.get("prompt_tokens", "-")
+    completion_tokens = token_usage.get("completion_tokens", "-")
+    reasoning_tokens = token_usage.get("reasoning_tokens", "-")
+
     # HTML template
     html_template = '''<!DOCTYPE html>
 <html lang="en">
@@ -486,6 +493,11 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
             <div class="metadata-item"><strong>Latency:</strong> {latency}ms</div>
             <div class="metadata-item"><strong>Time:</strong> {timestamp}</div>
         </div>
+        <div class="metadata-row" style="margin-top: 8px;">
+            <div class="metadata-item"><strong>Prompt Tokens:</strong> {prompt_tokens}</div>
+            <div class="metadata-item"><strong>Completion Tokens:</strong> {completion_tokens}</div>
+            <div class="metadata-item"><strong>Reasoning Tokens:</strong> {reasoning_tokens}</div>
+        </div>
     </div>
 
     <div class="message-count">{message_count} messages in request</div>
@@ -566,6 +578,9 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
         message_count=len(messages),
         messages_html=messages_html,
         response_html=response_html,
+        prompt_tokens=escape(str(prompt_tokens)),
+        completion_tokens=escape(str(completion_tokens)),
+        reasoning_tokens=escape(str(reasoning_tokens)),
     )
 
     # Determine output path
