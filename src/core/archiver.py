@@ -270,6 +270,8 @@ class LLMArchiver:
                 "input_chars": total_input_chars,
                 "output_chars": response_chars,
                 "tool_calls": len(response.tool_calls) if hasattr(response, "tool_calls") and response.tool_calls else 0,
+                # Token usage from response metadata (includes reasoning_tokens for supported models)
+                "token_usage": getattr(response, "response_metadata", {}).get("token_usage", {}),
             }
 
             # Insert

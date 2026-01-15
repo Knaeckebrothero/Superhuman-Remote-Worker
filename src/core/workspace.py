@@ -80,6 +80,36 @@ def get_workspace_base_path() -> Path:
     return get_project_root() / "workspace"
 
 
+def get_checkpoints_path() -> Path:
+    """Get path for LangGraph checkpoint storage.
+
+    Checkpoints are stored in a shared directory outside individual job workspaces:
+        workspace/checkpoints/job_<id>.db
+
+    Returns:
+        Path to checkpoints directory (created if it doesn't exist)
+    """
+    base = get_workspace_base_path()
+    checkpoints_dir = base / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    return checkpoints_dir
+
+
+def get_logs_path() -> Path:
+    """Get path for job log file storage.
+
+    Logs are stored in a shared directory outside individual job workspaces:
+        workspace/logs/job_<id>.log
+
+    Returns:
+        Path to logs directory (created if it doesn't exist)
+    """
+    base = get_workspace_base_path()
+    logs_dir = base / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return logs_dir
+
+
 class WorkspaceManager:
     """Manages file-based workspaces for agent jobs.
 

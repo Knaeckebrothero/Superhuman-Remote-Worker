@@ -32,8 +32,8 @@ python validate_metamodel.py --check A1   # Specific check
 ### Local Development
 
 ```bash
-# Start databases only (no dev compose file - use main docker-compose.yml with selective up)
-podman-compose up -d postgres neo4j
+# Start databases (PostgreSQL, Neo4j, MongoDB for audit logs)
+podman-compose -f docker-compose.dev.yaml up -d
 
 # Run Universal Agent (config resolution: configs/{name}/ → src/config/{name}.json)
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
@@ -43,7 +43,8 @@ python agent.py --config validator --port 8002                        # API serv
 python agent.py --config creator --polling-only                       # Polling loop only
 
 # Stop databases
-podman-compose down
+podman-compose -f docker-compose.dev.yaml down      # Keep data
+podman-compose -f docker-compose.dev.yaml down -v   # Remove data
 ```
 
 ### Docker Deployment
@@ -235,6 +236,28 @@ Config fields:
 
 **Graph execution flow:**
 The nested loop graph creates its own managers inside `build_nested_loop_graph()`. The graph uses an audited tool node (`create_audited_tool_node`) that logs all tool calls and results for debugging and compliance.
+
+**LangGraph checkpointing (crash recovery):**
+The agent uses SQLite-based checkpointing to persist graph state, enabling resume after crashes:
+- Checkpoint files: `workspace/checkpoints/job_<id>.db`
+- Log files: `workspace/logs/job_<id>.log`
+- Checkpointer: `AsyncSqliteSaver` from `langgraph-checkpoint-sqlite`
+- Created per-job in `process_job()`, closed in finally block
+- Resume: Run with same `--job-id` and `--resume` flag
+
+```bash
+# First run (creates checkpoint)
+python agent.py --config creator --job-id abc-123 --document-path doc.pdf
+
+# After crash, resume from last checkpoint
+python agent.py --config creator --job-id abc-123 --resume
+```
+
+Checkpoints and logs are kept after completion for debugging. Manual cleanup:
+```bash
+rm workspace/checkpoints/job_*.db  # Remove checkpoints
+rm workspace/logs/job_*.log        # Remove logs
+```
 
 **Creating a new agent type:**
 1. Create `configs/<name>/config.json` extending `defaults`:

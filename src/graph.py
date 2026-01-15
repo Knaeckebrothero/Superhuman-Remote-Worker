@@ -57,7 +57,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langgraph.graph import StateGraph, END
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .core.state import UniversalAgentState
 from .core.loader import (
@@ -1368,7 +1370,8 @@ def build_nested_loop_graph(
     system_prompt_template: str,
     workspace: WorkspaceManager,
     workspace_template: str = "",
-) -> StateGraph:
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+) -> CompiledStateGraph:
     """Build the nested loop graph for the Universal Agent.
 
     Creates the full nested loop architecture with:
@@ -1385,9 +1388,11 @@ def build_nested_loop_graph(
         system_prompt_template: Raw system prompt template with placeholders
         workspace: WorkspaceManager instance
         workspace_template: Template content for workspace.md
+        checkpointer: Optional LangGraph checkpointer for state persistence.
+            When provided, enables resume after crash using the same thread_id.
 
     Returns:
-        Compiled StateGraph
+        Compiled StateGraph with checkpointing if checkpointer provided
     """
     # Create managers
     todo_manager = TodoManager(workspace)
@@ -1522,7 +1527,7 @@ def build_nested_loop_graph(
         },
     )
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)
 
 
 # =============================================================================
