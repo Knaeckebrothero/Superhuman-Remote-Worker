@@ -61,7 +61,7 @@ load_dotenv()
 
 from src import UniversalAgent, create_app
 from src.core.workspace import get_workspace_base_path
-from src.database.postgres_utils import create_postgres_connection, create_job
+from src.database.postgres_db import PostgresDB
 
 
 def setup_logging(verbose: bool = False):
@@ -255,23 +255,23 @@ async def run_single_job(
             logger.error("Either --job-id or --prompt is required")
             sys.exit(1)
 
-        # Connect to database to create job
-        conn = create_postgres_connection()
-        await conn.connect()
+        # Connect to database to create job using new PostgresDB class
+        db = PostgresDB()
+        await db.connect()
         logger.info("Connected to PostgreSQL")
 
         try:
-            job_id = await create_job(
-                conn=conn,
+            # Use PostgresDB.jobs.create() namespace method
+            job_uuid = await db.jobs.create(
                 prompt=prompt,
                 document_path=primary_document,
                 context=context,
             )
-            job_id = str(job_id)
+            job_id = str(job_uuid)
             logger.info(f"Created job: {job_id}")
         finally:
             # Close connection after job creation - agent will create its own
-            await conn.disconnect()
+            await db.close()
             logger.info("Disconnected from PostgreSQL (job created)")
 
     # Set up file logging for this job

@@ -11,7 +11,7 @@ from enum import Enum
 from typing import Optional
 import time
 
-from src.database.neo4j_utils import Neo4jConnection
+from src.database.neo4j_db import Neo4jDB
 
 
 class Severity(Enum):
@@ -135,19 +135,19 @@ class MetamodelValidator:
 
     ALLOWED_RELATIONSHIP_TYPES = {rel[1] for rel in ALLOWED_RELATIONSHIPS}
 
-    def __init__(self, connection: Neo4jConnection):
+    def __init__(self, db: Neo4jDB):
         """
-        Initialize validator with a Neo4j connection.
+        Initialize validator with a Neo4j database instance.
 
         Args:
-            connection: Connected Neo4jConnection instance
+            db: Connected Neo4jDB instance
         """
-        self.connection = connection
+        self.db = db
 
     def _execute_check(self, query: str, parameters: Optional[dict] = None) -> tuple[list[dict], float]:
         """Execute a query and return results with timing."""
         start = time.time()
-        results = self.connection.execute_query(query, parameters)
+        results = self.db.execute_query(query, parameters)
         elapsed_ms = (time.time() - start) * 1000
         return results, elapsed_ms
 

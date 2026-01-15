@@ -120,10 +120,10 @@ This starts PostgreSQL, Neo4j, and MongoDB (for optional LLM request logging).
 
 ```bash
 # First time setup with sample data
-python src/scripts/app_init.py --seed
+python scripts/app_init.py --seed
 
 # Reset everything (deletes all data)
-python src/scripts/app_init.py --force-reset --seed
+python scripts/app_init.py --force-reset --seed
 ```
 
 ### 5. Run Agents Locally
@@ -140,6 +140,9 @@ python agent.py --config validator --port 8002
 
 # Run with streaming output
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+
+# Perform a full scale test
+python agent.py --config creator --document-dir ./data/example_data/ --prompt "Identify possible requirements for a medium sized car rental company based on the provided GoBD document." --stream --verbose
 ```
 
 ### 6. Database Management

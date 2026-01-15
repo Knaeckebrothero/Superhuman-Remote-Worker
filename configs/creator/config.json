@@ -1,5 +1,5 @@
 {
-  "$schema": "../../src/agent/config/schema.json",
+  "$schema": "../../src/config/schema.json",
   "$extends": "defaults",
   "agent_id": "creator",
   "display_name": "Creator Agent",
