@@ -13,9 +13,6 @@ env/
 # Local environment
 .env
 
-# Yaml
-*.yaml
-
 # SQLite database files
 *.db
 
