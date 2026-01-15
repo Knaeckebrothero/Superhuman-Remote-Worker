@@ -32,7 +32,7 @@ def create_completion_tools(context: ToolContext) -> List:
     workspace = context.workspace_manager
 
     @tool
-    def mark_complete(
+    async def mark_complete(
         summary: str,
         deliverables: List[str],
         confidence: float = 1.0,
@@ -86,7 +86,7 @@ def create_completion_tools(context: ToolContext) -> List:
             return f"Error marking complete: {str(e)}"
 
     @tool
-    def job_complete(
+    async def job_complete(
         summary: str,
         deliverables: List[str],
         confidence: float = 1.0,
@@ -141,7 +141,7 @@ def create_completion_tools(context: ToolContext) -> List:
             db_updated = False
             if context.has_postgres():
                 try:
-                    db_updated = context.update_job_status(
+                    db_updated = await context.update_job_status(
                         status="completed",
                         completed_at=True,
                     )
