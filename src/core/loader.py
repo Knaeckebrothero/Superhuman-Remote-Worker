@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.language_models import BaseChatModel
-from langchain_openai import ChatOpenAI
+
+from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 
 logger = logging.getLogger(__name__)
@@ -500,7 +501,7 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
 
-    llm = ChatOpenAI(**llm_kwargs)
+    llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
         f"Created LLM: model={config.model}, temp={config.temperature}, "
