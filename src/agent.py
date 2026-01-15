@@ -21,9 +21,32 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+import aiosqlite
 from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from .core.workspace import WorkspaceManager, WorkspaceManagerConfig
+from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkpoints_path
+
+
+class _AiosqliteConnectionWrapper:
+    """Wrapper for aiosqlite.Connection that adds is_alive() method.
+
+    langgraph-checkpoint-sqlite 3.x expects connections to have is_alive(),
+    but aiosqlite.Connection doesn't provide it. This wrapper adds compatibility.
+    """
+
+    def __init__(self, conn: aiosqlite.Connection):
+        self._conn = conn
+
+    def is_alive(self) -> bool:
+        """Check if connection is alive (always True for established connections)."""
+        return True
+
+    def __getattr__(self, name):
+        """Delegate all other attributes to the wrapped connection."""
+        return getattr(self._conn, name)
+
+
 from .managers import TodoManager
 from .tools import ToolContext, load_tools
 
@@ -82,6 +105,8 @@ class UniversalAgent:
         self._llm_with_tools: Optional[BaseChatModel] = None
         self._tools: Optional[List] = None
         self._graph = None
+        self._checkpointer: Optional[AsyncSqliteSaver] = None
+        self._checkpoint_conn: Optional[aiosqlite.Connection] = None
 
         # Current job state
         self._workspace_manager: Optional[WorkspaceManager] = None
@@ -161,32 +186,43 @@ class UniversalAgent:
         logger.info(f"{self.config.display_name} initialized successfully")
 
     async def _setup_connections(self) -> None:
-        """Set up required database connections."""
+        """Set up required database connections using new DB classes.
+
+        Uses PostgresDB and Neo4jDB from Phase 1 refactoring.
+        Falls back to environment variables for configuration.
+        """
         # PostgreSQL connection (always required for job management)
         if self.postgres_conn is None and self.config.connections.postgres:
-            from src.database.postgres_utils import create_postgres_connection
+            from src.database.postgres_db import PostgresDB
+
             db_url = os.getenv("DATABASE_URL")
             if db_url:
-                self.postgres_conn = create_postgres_connection(db_url)
+                self.postgres_conn = PostgresDB(connection_string=db_url)
                 await self.postgres_conn.connect()
-                logger.info("PostgreSQL connection established")
+                logger.info("PostgreSQL connection established (PostgresDB)")
             else:
                 logger.warning("DATABASE_URL not set, PostgreSQL unavailable")
 
         # Neo4j connection (optional, based on config)
         if self.neo4j_conn is None and self.config.connections.neo4j:
-            from src.database.neo4j_utils import Neo4jConnection
+            from src.database.neo4j_db import Neo4jDB
+
             neo4j_uri = os.getenv("NEO4J_URI")
-            neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+            neo4j_username = os.getenv("NEO4J_USERNAME", "neo4j")
             neo4j_password = os.getenv("NEO4J_PASSWORD")
 
             if neo4j_uri and neo4j_password:
-                self.neo4j_conn = Neo4jConnection(
+                self.neo4j_conn = Neo4jDB(
                     uri=neo4j_uri,
-                    user=neo4j_user,
+                    username=neo4j_username,
                     password=neo4j_password,
                 )
-                logger.info("Neo4j connection established")
+                # Neo4jDB.connect() is sync and returns bool
+                if self.neo4j_conn.connect():
+                    logger.info("Neo4j connection established (Neo4jDB)")
+                else:
+                    logger.error("Neo4j connection failed")
+                    self.neo4j_conn = None
             else:
                 logger.warning("Neo4j credentials not set")
 
@@ -234,6 +270,14 @@ class UniversalAgent:
             # Load tools for this job
             await self._setup_job_tools()
 
+            # Create checkpointer for this job (enables resume after crash)
+            checkpoint_path = self._get_checkpoint_path(job_id)
+            self._checkpoint_conn = await aiosqlite.connect(checkpoint_path)
+            # Wrap connection to add is_alive() for langgraph-checkpoint-sqlite 3.x compatibility
+            wrapped_conn = _AiosqliteConnectionWrapper(self._checkpoint_conn)
+            self._checkpointer = AsyncSqliteSaver(wrapped_conn)
+            logger.info(f"Checkpointer initialized at {checkpoint_path}")
+
             # Build graph for this job
             system_prompt_template = load_system_prompt_template()
 
@@ -248,6 +292,7 @@ class UniversalAgent:
                 system_prompt_template=system_prompt_template,
                 workspace=self._workspace_manager,
                 workspace_template=workspace_template,
+                checkpointer=self._checkpointer,
             )
 
             # Create initial state with updated metadata (workspace-relative paths)
@@ -266,17 +311,24 @@ class UniversalAgent:
             }
 
             if stream:
+                # For streaming, cleanup happens inside the generator
                 return self._process_job_streaming(initial_state, thread_config)
             else:
-                final_state = await self._graph.ainvoke(
-                    initial_state,
-                    config=thread_config,
-                )
-                self._jobs_processed += 1
-                return dict(final_state)
+                try:
+                    final_state = await self._graph.ainvoke(
+                        initial_state,
+                        config=thread_config,
+                    )
+                    self._jobs_processed += 1
+                    return dict(final_state)
+                finally:
+                    self._current_job_id = None
+                    await self._cleanup_checkpointer()
 
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
+            await self._cleanup_checkpointer()
+            self._current_job_id = None
             error_state = {
                 "job_id": job_id,
                 "error": {
@@ -291,8 +343,15 @@ class UniversalAgent:
                 return self._yield_error_state(error_state)
             return error_state
 
-        finally:
-            self._current_job_id = None
+    async def _cleanup_checkpointer(self) -> None:
+        """Clean up checkpointer connection."""
+        if self._checkpoint_conn:
+            try:
+                await self._checkpoint_conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing checkpointer connection: {e}")
+            self._checkpoint_conn = None
+            self._checkpointer = None
 
     async def _yield_error_state(self, error_state: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """Yield a single error state for streaming mode."""
@@ -304,12 +363,17 @@ class UniversalAgent:
         config: Dict[str, Any],
     ) -> AsyncIterator[Dict[str, Any]]:
         """Process job with streaming state updates."""
-        async for state in run_graph_with_streaming(
-            self._graph, initial_state, config
-        ):
-            yield state
+        try:
+            async for state in run_graph_with_streaming(
+                self._graph, initial_state, config
+            ):
+                yield state
 
-        self._jobs_processed += 1
+            self._jobs_processed += 1
+        finally:
+            # Clean up after streaming completes (or errors)
+            self._current_job_id = None
+            await self._cleanup_checkpointer()
 
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
@@ -478,8 +542,8 @@ class UniversalAgent:
         context = ToolContext(
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
-            postgres_conn=self.postgres_conn,
-            neo4j_conn=self.neo4j_conn,
+            postgres_db=self.postgres_conn,
+            neo4j_db=self.neo4j_conn,
             config=tool_config,
             _job_id=self._current_job_id,
         )
@@ -510,6 +574,17 @@ class UniversalAgent:
         self._llm_with_tools = self._llm.bind_tools(self._tools)
 
         logger.debug(f"Loaded {len(self._tools)} tools")
+
+    def _get_checkpoint_path(self, job_id: str) -> Path:
+        """Get SQLite checkpoint file path for a job.
+
+        Args:
+            job_id: Unique job identifier
+
+        Returns:
+            Path to SQLite checkpoint file (e.g., workspace/checkpoints/job_<id>.db)
+        """
+        return get_checkpoints_path() / f"job_{job_id}.db"
 
     async def start_polling(self) -> None:
         """Start the polling loop for jobs.
@@ -671,12 +746,14 @@ class UniversalAgent:
         # Close database connections
         if self.postgres_conn:
             try:
-                await self.postgres_conn.disconnect()
+                # PostgresDB uses close() not disconnect()
+                await self.postgres_conn.close()
             except Exception as e:
                 logger.warning(f"Error closing PostgreSQL: {e}")
 
         if self.neo4j_conn:
             try:
+                # Neo4jDB uses close() (sync)
                 self.neo4j_conn.close()
             except Exception as e:
                 logger.warning(f"Error closing Neo4j: {e}")

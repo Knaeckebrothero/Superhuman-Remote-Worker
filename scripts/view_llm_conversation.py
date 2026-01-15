@@ -32,12 +32,17 @@ Usage:
     # Export single LLM request as HTML (messenger-style visualization)
     python scripts/view_llm_conversation.py --doc-id <mongodb_objectid>
     python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --html output.html
+
+    # Open HTML in browser using temp file (no permanent file saved)
+    python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --temp
 """
 
 import argparse
 import json
 import os
 import sys
+import tempfile
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 
@@ -291,12 +296,13 @@ def export_conversation(job_id, output_path):
     client.close()
 
 
-def export_html_conversation(doc_id: str, output_path: str = None) -> None:
+def export_html_conversation(doc_id: str, output_path: str = None, temp_mode: bool = False) -> None:
     """Export a single LLM request document as HTML messenger view.
 
     Args:
         doc_id: MongoDB document _id (ObjectId string)
         output_path: Output HTML file path (default: conversation_<id>.html)
+        temp_mode: If True, create temp file and open in browser
     """
     from bson import ObjectId
     import html as html_lib
@@ -332,6 +338,17 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
     timestamp = format_timestamp(record.get("timestamp"))
     iteration = record.get("iteration", "?")
     latency = record.get("latency_ms", "?")
+
+    # Token usage
+    metrics = record.get("metrics", {})
+    token_usage = metrics.get("token_usage", {})
+    prompt_tokens = token_usage.get("prompt_tokens", "-")
+    completion_tokens = token_usage.get("completion_tokens", "-")
+    reasoning_tokens = token_usage.get("reasoning_tokens", "-")
+
+    # Reasoning content
+    additional_kwargs = response.get("additional_kwargs", {})
+    reasoning_content = additional_kwargs.get("reasoning_content", "")
 
     # HTML template
     html_template = '''<!DOCTYPE html>
@@ -470,6 +487,29 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
             font-size: 0.85em;
             margin-bottom: 15px;
         }}
+        .reasoning-section {{
+            background-color: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+        }}
+        .reasoning-section summary {{
+            cursor: pointer;
+            font-weight: bold;
+            color: #856404;
+        }}
+        .reasoning-content {{
+            white-space: pre-wrap;
+            font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+            font-size: 0.9em;
+            margin-top: 10px;
+            padding: 10px;
+            background: #fffbf0;
+            border-radius: 4px;
+            max-height: 500px;
+            overflow-y: auto;
+        }}
     </style>
 </head>
 <body>
@@ -486,12 +526,19 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
             <div class="metadata-item"><strong>Latency:</strong> {latency}ms</div>
             <div class="metadata-item"><strong>Time:</strong> {timestamp}</div>
         </div>
+        <div class="metadata-row" style="margin-top: 8px;">
+            <div class="metadata-item"><strong>Prompt Tokens:</strong> {prompt_tokens}</div>
+            <div class="metadata-item"><strong>Completion Tokens:</strong> {completion_tokens}</div>
+            <div class="metadata-item"><strong>Reasoning Tokens:</strong> {reasoning_tokens}</div>
+        </div>
     </div>
 
     <div class="message-count">{message_count} messages in request</div>
     <div class="messages">
 {messages_html}
     </div>
+
+{reasoning_html}
 
     <div class="response-section">
         <h2>LLM Response</h2>
@@ -554,6 +601,15 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
     # Render response
     response_html = render_message(response) if response else '<div class="message assistant"><em>No response</em></div>'
 
+    # Build reasoning HTML if present
+    if reasoning_content:
+        reasoning_html = f'''    <details class="reasoning-section">
+        <summary>Reasoning Content ({len(reasoning_content)} chars)</summary>
+        <div class="reasoning-content">{escape(reasoning_content)}</div>
+    </details>'''
+    else:
+        reasoning_html = ''
+
     # Fill template
     html_content = html_template.format(
         doc_id=escape(doc_id),
@@ -566,19 +622,40 @@ def export_html_conversation(doc_id: str, output_path: str = None) -> None:
         message_count=len(messages),
         messages_html=messages_html,
         response_html=response_html,
+        prompt_tokens=escape(str(prompt_tokens)),
+        completion_tokens=escape(str(completion_tokens)),
+        reasoning_tokens=escape(str(reasoning_tokens)),
+        reasoning_html=reasoning_html,
     )
 
-    # Determine output path
-    if not output_path:
-        output_path = f"conversation_{doc_id}.html"
+    # Handle output
+    if temp_mode:
+        # Create temp file and open in browser
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".html",
+            prefix=f"llm_conv_{doc_id[:8]}_",
+            delete=False,
+            encoding="utf-8",
+        ) as f:
+            f.write(html_content)
+            temp_path = f.name
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
+        print(f"Opening in browser: {temp_path}")
+        print(f"  Messages: {len(messages)} | Job: {job_id} | Model: {model}")
+        webbrowser.open(f"file://{temp_path}")
+    else:
+        # Determine output path
+        if not output_path:
+            output_path = f"conversation_{doc_id}.html"
 
-    print(f"Exported conversation to: {output_path}")
-    print(f"  Messages: {len(messages)}")
-    print(f"  Job: {job_id}")
-    print(f"  Model: {model}")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        print(f"Exported conversation to: {output_path}")
+        print(f"  Messages: {len(messages)}")
+        print(f"  Job: {job_id}")
+        print(f"  Model: {model}")
 
     client.close()
 
@@ -996,13 +1073,18 @@ def main():
         "--html", "-H",
         help="Output HTML file path (use with --doc-id, default: conversation_<id>.html)",
     )
+    parser.add_argument(
+        "--temp", "-T",
+        action="store_true",
+        help="Open HTML in browser using temp file (use with --doc-id)",
+    )
 
     args = parser.parse_args()
 
     try:
         if args.doc_id:
             # HTML export of single document
-            export_html_conversation(args.doc_id, args.html)
+            export_html_conversation(args.doc_id, args.html, temp_mode=args.temp)
         elif args.list:
             list_jobs()
         elif args.recent > 0:

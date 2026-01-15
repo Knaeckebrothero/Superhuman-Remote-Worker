@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """List jobs in the Graph-RAG system.
 
-Standalone CLI tool using direct psycopg2 connection.
+Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 
 Usage:
     python scripts/list_jobs.py
@@ -14,181 +14,161 @@ import argparse
 import json
 import os
 import sys
-from contextlib import contextmanager
 from datetime import datetime
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
-def get_connection_string() -> str:
-    """Get PostgreSQL connection string from environment."""
-    return os.environ.get(
-        "DATABASE_URL",
-        "postgresql://graphrag:graphrag_password@localhost:5432/graphrag"
-    )
-
-
-@contextmanager
-def get_connection():
-    """Context manager for database connections."""
-    conn = psycopg2.connect(get_connection_string())
-    try:
-        yield conn
-    finally:
-        conn.close()
+from src.database import PostgresDB
 
 
 def list_jobs(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
     """List jobs with optional filtering."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            if status:
-                cur.execute(
-                    """
-                    SELECT j.id, j.prompt, j.status, j.creator_status, j.validator_status,
-                           j.created_at, j.updated_at,
-                           COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements,
-                           COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements
-                    FROM jobs j
-                    LEFT JOIN requirements r ON j.id = r.job_id
-                    WHERE j.status = %s
-                    GROUP BY j.id
-                    ORDER BY j.created_at DESC
-                    LIMIT %s OFFSET %s
-                    """,
-                    (status, limit, offset)
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT j.id, j.prompt, j.status, j.creator_status, j.validator_status,
-                           j.created_at, j.updated_at,
-                           COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements,
-                           COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements
-                    FROM jobs j
-                    LEFT JOIN requirements r ON j.id = r.job_id
-                    GROUP BY j.id
-                    ORDER BY j.created_at DESC
-                    LIMIT %s OFFSET %s
-                    """,
-                    (limit, offset)
-                )
-            return [dict(row) for row in cur.fetchall()]
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        rows = db.fetch_sync(
+            """
+            SELECT j.id, j.prompt, j.status, j.creator_status, j.validator_status,
+                   j.created_at, j.updated_at,
+                   COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements,
+                   COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements
+            FROM jobs j
+            LEFT JOIN requirements r ON j.id = r.job_id
+            """ + ("WHERE j.status = $1" if status else "") + """
+            GROUP BY j.id
+            ORDER BY j.created_at DESC
+            LIMIT $""" + ("2" if status else "1") + """ OFFSET $""" + ("3" if status else "2") + """
+            """,
+            *(([status, limit, offset] if status else [limit, offset]))
+        )
+        return rows
+    finally:
+        db.close_sync()
 
 
 def get_daily_statistics(days: int = 7) -> list[dict]:
-    """Get daily job statistics."""
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT
-                    DATE(created_at) as date,
-                    COUNT(*) as jobs_created,
-                    COUNT(*) FILTER (WHERE status = 'completed') as jobs_completed,
-                    COUNT(*) FILTER (WHERE status = 'failed') as jobs_failed
-                FROM jobs
-                WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '%s days'
-                GROUP BY DATE(created_at)
-                ORDER BY date DESC
-                """,
-                (days,)
-            )
-            return [dict(row) for row in cur.fetchall()]
+    """Get daily statistics for the past N days."""
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        return db.fetch_sync(
+            """
+            SELECT
+                DATE(created_at) as date,
+                COUNT(*) as jobs_created,
+                COUNT(*) FILTER (WHERE status = 'completed') as jobs_completed,
+                COUNT(*) FILTER (WHERE status = 'failed') as jobs_failed,
+                COUNT(*) FILTER (WHERE status = 'processing') as jobs_processing
+            FROM jobs
+            WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '1 day' * $1
+            GROUP BY DATE(created_at)
+            ORDER BY date DESC
+            """,
+            days
+        )
+    finally:
+        db.close_sync()
+
+
+def get_status_counts() -> dict:
+    """Get counts of jobs by status."""
+    db = PostgresDB()
+    db.connect_sync()
+
+    try:
+        row = db.fetchrow_sync(
+            """
+            SELECT
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'created') as created,
+                COUNT(*) FILTER (WHERE status = 'processing') as processing,
+                COUNT(*) FILTER (WHERE status = 'completed') as completed,
+                COUNT(*) FILTER (WHERE status = 'failed') as failed,
+                COUNT(*) FILTER (WHERE status = 'cancelled') as cancelled
+            FROM jobs
+            """
+        )
+        return row
+    finally:
+        db.close_sync()
+
+
+def print_jobs_table(jobs: list[dict]):
+    """Print jobs in a formatted table."""
+    if not jobs:
+        print("No jobs found.")
+        return
+
+    print(f"\n{'ID':<38} {'Status':<12} {'Creator':<12} {'Validator':<12} {'Reqs':<8} {'Created':<20}")
+    print("-" * 120)
+    for job in jobs:
+        created = job['created_at'].strftime('%Y-%m-%d %H:%M:%S') if job['created_at'] else 'N/A'
+        integrated = job.get('integrated_requirements', 0)
+        pending = job.get('pending_requirements', 0)
+        reqs_str = f"{integrated}i/{pending}p"
+
+        print(f"{job['id']!s:<38} {job['status']:<12} {job['creator_status']:<12} "
+              f"{job['validator_status']:<12} {reqs_str:<8} {created:<20}")
+
+
+def print_statistics(stats: list[dict]):
+    """Print daily statistics."""
+    if not stats:
+        print("No statistics available.")
+        return
+
+    print(f"\n{'Date':<12} {'Created':<10} {'Completed':<10} {'Failed':<10} {'Processing':<10}")
+    print("-" * 60)
+    for day in stats:
+        date_str = day['date'].strftime('%Y-%m-%d') if hasattr(day['date'], 'strftime') else str(day['date'])
+        print(f"{date_str:<12} {day['jobs_created']:<10} {day['jobs_completed']:<10} "
+              f"{day['jobs_failed']:<10} {day.get('jobs_processing', 0):<10}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="List jobs in the Graph-RAG system",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s                           # List all jobs
-  %(prog)s --status processing       # Filter by status
-  %(prog)s --limit 10                # Limit results
-  %(prog)s --json                    # JSON output
-  %(prog)s --stats                   # Show daily statistics
-        """
-    )
-
-    parser.add_argument(
-        "--status",
-        choices=["created", "processing", "completed", "failed", "cancelled"],
-        help="Filter by job status"
-    )
-    parser.add_argument("--limit", type=int, default=50, help="Maximum jobs to show")
+    """Main entry point."""
+    parser = argparse.ArgumentParser(description="List jobs in the Graph-RAG system")
+    parser.add_argument("--status", help="Filter by status (e.g., processing, completed)")
+    parser.add_argument("--limit", type=int, default=50, help="Maximum number of jobs to show")
     parser.add_argument("--offset", type=int, default=0, help="Number of jobs to skip")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--stats", action="store_true", help="Show daily statistics")
-    parser.add_argument("--days", type=int, default=7, help="Days for statistics")
+    parser.add_argument("--stats", action="store_true", help="Show daily statistics instead of job list")
 
     args = parser.parse_args()
 
-    # Daily statistics
-    if args.stats:
-        stats = get_daily_statistics(args.days)
-        if args.json:
-            print(json.dumps(stats, indent=2, default=str))
+    try:
+        if args.stats:
+            stats = get_daily_statistics()
+            if args.json:
+                print(json.dumps(stats, default=str, indent=2))
+            else:
+                print_statistics(stats)
         else:
-            print(f"Daily Statistics (last {args.days} days)")
-            print("=" * 60)
-            print(f"{'Date':<12} {'Created':<10} {'Completed':<12} {'Failed':<10}")
-            print("-" * 60)
-            for day in stats:
-                print(f"{str(day['date']):<12} "
-                      f"{day['jobs_created']:<10} "
-                      f"{day['jobs_completed']:<12} "
-                      f"{day['jobs_failed']:<10}")
-        return
+            jobs = list_jobs(status=args.status, limit=args.limit, offset=args.offset)
+            if args.json:
+                print(json.dumps(jobs, default=str, indent=2))
+            else:
+                # Print status summary
+                counts = get_status_counts()
+                print("\nJob Status Summary:")
+                print(f"  Total: {counts['total']}")
+                print(f"  Created: {counts['created']}")
+                print(f"  Processing: {counts['processing']}")
+                print(f"  Completed: {counts['completed']}")
+                print(f"  Failed: {counts['failed']}")
+                print(f"  Cancelled: {counts['cancelled']}")
 
-    # List jobs
-    jobs = list_jobs(status=args.status, limit=args.limit, offset=args.offset)
+                print_jobs_table(jobs)
 
-    if args.json:
-        for job in jobs:
-            for key, value in job.items():
-                if isinstance(value, datetime):
-                    job[key] = value.isoformat()
-        print(json.dumps(jobs, indent=2, default=str))
-        return
+                if args.limit and len(jobs) == args.limit:
+                    print(f"\n(Showing {args.limit} jobs, use --limit to show more)")
 
-    if not jobs:
-        print("No jobs found")
-        return
-
-    # Table output
-    print(f"{'Job ID':<36} {'Status':<12} {'Creator':<10} {'Validator':<10} "
-          f"{'Integrated':<10} {'Pending':<8} {'Created':<20}")
-    print("=" * 120)
-
-    for job in jobs:
-        job_id = str(job['id'])
-        status = job['status']
-        creator = job.get('creator_status', '-')
-        validator = job.get('validator_status', '-')
-        integrated = job.get('integrated_requirements', 0)
-        pending = job.get('pending_requirements', 0)
-
-        created = job['created_at']
-        created_str = created.strftime('%Y-%m-%d %H:%M') if isinstance(created, datetime) else str(created)[:16]
-
-        # ANSI colors
-        status_colors = {
-            'completed': '\033[92m',   # Green
-            'processing': '\033[93m',  # Yellow
-            'failed': '\033[91m',      # Red
-            'cancelled': '\033[90m',   # Gray
-        }
-        reset = '\033[0m'
-        color = status_colors.get(status, '')
-        status_display = f"{color}{status:<12}{reset}" if color else f"{status:<12}"
-
-        print(f"{job_id:<36} {status_display} {creator:<10} {validator:<10} "
-              f"{integrated:<10} {pending:<8} {created_str:<20}")
-
-    print()
-    print(f"Showing {len(jobs)} jobs (offset: {args.offset}, limit: {args.limit})")
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
