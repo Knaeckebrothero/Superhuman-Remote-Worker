@@ -1,0 +1,236 @@
+# Neo4j Deployment for Enterprise Edition (using AGPLv3 License)
+# Namespace configuration
+namespace: uni-neo4j
+
+neo4j:
+  name: uni-neo4j
+  edition: "enterprise"
+  acceptLicenseAgreement: "yes"  # AGPLv3 license acceptance
+
+  # Password from secret
+  passwordFromSecret: "neo4j-auth"  # Name of the secret containing password
+
+  # Minimum cluster size (1 for standalone, 3+ for clustering)
+  minimumClusterSize: 1
+
+  # Resource allocation
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "8"
+      memory: "16Gi"
+
+# Neo4j configuration (neo4j.conf settings) - MUST be at root level!
+config:
+  # Explicit memory configuration for Neo4j 5.x (optimized for 16Gi pod limit)
+  # Formula: heap + pagecache + 1GB OS overhead < 16GB
+  # Pagecache sized larger for better graph traversal performance
+  # See: https://neo4j.com/docs/operations-manual/current/performance/memory-configuration/
+  server.memory.heap.initial_size: "4G"
+  server.memory.heap.max_size: "5G"
+  server.memory.pagecache.size: "10G"
+  db.memory.transaction.total.max: "512m"
+
+  # Connection settings
+  dbms.connector.bolt.thread_pool_min_size: "5"
+  dbms.connector.bolt.thread_pool_max_size: "400"
+
+  # Query timeout and limits
+  #db.transaction.timeout: "60s"
+  # TODO: I don't think it's a good idea to have such a short query timeout
+
+  # Logging
+  dbms.logs.query.enabled: "INFO"
+  dbms.logs.query.threshold: "1s"
+
+  # Security settings
+  dbms.security.auth_enabled: "true"
+  dbms.security.allow_csv_import_from_file_urls: "false"
+
+  # Performance
+  dbms.checkpoint.interval.time: "15m"
+  dbms.checkpoint.interval.tx: "100000"
+
+  # Default database
+  dbms.default_database: "neo4j"
+
+  # APOC and Graph Data Science procedures (Enterprise features)
+  dbms.security.procedures.unrestricted: "apoc.*,gds.*"
+  dbms.security.procedures.allowlist: "apoc.*,gds.*"
+
+  # Bloom configuration (Enterprise visualization tool)
+  dbms.bloom.auth_enabled: "false"
+
+  # CRITICAL FIX: Advertised addresses for Cloudflare Tunnel
+  # Both Bolt and HTTP use main domain - Bolt connects via WebSocket at /bolt path
+  # Cloudflare routes wss://<DOMAIN>/bolt to Bolt port 7687
+  server.bolt.advertised_address: "<DOMAIN>:443"
+  server.http.advertised_address: "<DOMAIN>:443"
+  server.default_advertised_address: "<DOMAIN>"
+
+  # Enable Bolt connections with WebSocket support
+  server.bolt.enabled: "true"
+  server.bolt.listen_address: "0.0.0.0:7687"
+
+  # CRITICAL: Allow connections without TLS for internal cluster communication
+  # Cloudflare handles TLS termination externally
+  dbms.connector.bolt.tls_level: "OPTIONAL"
+
+  # Enable WebSocket for Bolt (critical for browser connections through Cloudflare)
+  dbms.connector.bolt.websocket_enabled: "true"
+  dbms.connector.bolt.websocket.compression: "false"
+
+  # CORS settings - Allow browser to connect from Cloudflare domain
+  dbms.browser.allow_outgoing_connections: "true"
+  dbms.security.http_auth_allowlist: "<DOMAIN>,.*\\.<DOMAIN>\\.com"
+
+  # HTTP settings
+  server.http.enabled: "true"
+  server.http.listen_address: "0.0.0.0:7474"
+
+# Persistent volumes - Using Longhorn storage
+volumes:
+  data:
+    mode: "dynamic"
+    dynamic:
+      storageClassName: "longhorn"
+      requests:
+        storage: 16Gi
+      accessModes:
+        - ReadWriteOnce
+
+  # Separate volume for logs
+  # TODO: Do we really need a seperate log volume?
+  logs:
+    mode: "dynamic"
+    dynamic:
+      storageClassName: "longhorn"
+      requests:
+        storage: 4Gi
+      accessModes:
+        - ReadWriteOnce
+
+# SSL/TLS Configuration
+ssl:
+  bolt:
+    privateKey:
+      secretName: neo4j-bolt-tls
+      subPath: tls.key
+    publicCertificate:
+      secretName: neo4j-bolt-tls
+      subPath: tls.crt
+
+# Services configuration
+services:
+  neo4j:
+    enabled: true
+    spec:
+      type: ClusterIP  # Using ClusterIP - external access via MetalLB service and Ingress
+    ports:
+      http:
+        enabled: true  # Neo4j Browser on port 7474
+      https:
+        enabled: true  # HTTPS on port 7473 (if SSL configured)
+      bolt:
+        enabled: true  # Bolt protocol on port 7687
+      backup:
+        enabled: true  # Backup port 6362 (Enterprise feature)
+
+  # Admin service for ops tasks (always available, even if DB not ready)
+  admin:
+    enabled: true
+    spec:
+      type: ClusterIP
+
+# Pod specifications
+podSpec:
+  # Node selector - Can be used to pin to specific nodes
+  nodeSelector: {}
+  # Example: Uncomment to run only on nodes with SSD
+  #   storage: "ssd"
+
+  # Tolerations for node taints
+  tolerations: []
+
+  # Anti-affinity to avoid multiple pods on same node (for future HA)
+  # Disabled for standalone deployment - enable when running cluster mode
+  # podAntiAffinity:
+  #   requiredDuringSchedulingIgnoredDuringExecution:
+  #     - labelSelector:
+  #         matchExpressions:
+  #           - key: app
+  #             operator: In
+  #             values:
+  #               - neo4j
+  #       topologyKey: kubernetes.io/hostname
+
+# Security context
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 7474
+  runAsGroup: 7474
+  fsGroup: 7474
+  fsGroupChangePolicy: "Always"
+
+# Startup probe - Gives DB time to initialize
+startupProbe:
+  failureThreshold: 1000
+  periodSeconds: 5
+
+# Liveness probe - Restarts pod if DB becomes unresponsive
+livenessProbe:
+  enabled: true
+  failureThreshold: 3
+  timeoutSeconds: 10
+  periodSeconds: 10
+
+# Readiness probe - Controls traffic routing
+readinessProbe:
+  enabled: true
+  failureThreshold: 3
+  timeoutSeconds: 10
+  periodSeconds: 5
+
+# JVM configuration for Enterprise Edition
+jvm:
+  additionalJvmArguments:
+    # GC settings for better performance
+    - "-XX:+UseG1GC"
+    - "-XX:+ExplicitGCInvokesConcurrent"
+    - "-XX:+ParallelRefProcEnabled"
+    - "-XX:+UseStringDeduplication"
+    # Heap dump on OOM
+    - "-XX:+HeapDumpOnOutOfMemoryError"
+    - "-XX:HeapDumpPath=/logs/neo4j.hprof"
+    # Improved startup
+    - "-XX:+UnlockExperimentalVMOptions"
+    - "-XX:+TrustFinalNonStaticFields"
+
+# Pod disruption budget for HA (future proofing)
+podDisruptionBudget:
+  enabled: false  # Enable when running cluster mode
+  minAvailable: 1
+
+# Environment variables
+env:
+  NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+
+# Labels for organization
+labels:
+  app: neo4j
+  environment: production
+  component: database
+
+# Annotations
+annotations:
+  description: "Neo4j Enterprise Edition - Production Deployment"
+
+# Priority class for important workloads
+priorityClassName: ""  # Set if you have priority classes defined
+
+# Image configuration (uses official Neo4j Enterprise image)
+image:
+  imagePullPolicy: IfNotPresent
+  # Using default 2025.x version - browser has issues but database works
