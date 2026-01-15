@@ -120,10 +120,10 @@ This starts PostgreSQL, Neo4j, and MongoDB (for optional LLM request logging).
 
 ```bash
 # First time setup with sample data
-python src/scripts/app_init.py --seed
+python scripts/app_init.py --seed
 
 # Reset everything (deletes all data)
-python src/scripts/app_init.py --force-reset --seed
+python scripts/app_init.py --force-reset --seed
 ```
 
 ### 5. Run Agents Locally
@@ -140,27 +140,65 @@ python agent.py --config validator --port 8002
 
 # Run with streaming output
 python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+
+# Perform a full scale test
+python agent.py --config creator --document-dir ./data/example_data/ --prompt "Identify possible requirements for a medium sized car rental company based on the provided GoBD document." --stream --verbose
 ```
 
-### 6. Database Management
+### 6. Crash Recovery & Checkpointing
+
+The agent automatically creates checkpoints during execution, enabling resume after crashes:
+
+```bash
+# Start a job with explicit job ID (for later resume)
+python agent.py --config creator --job-id my-job-123 --document-path ./data/doc.pdf --prompt "Extract requirements"
+
+# If the agent crashes, resume from the last checkpoint
+python agent.py --config creator --job-id my-job-123 --resume
+
+# Resume with streaming output
+python agent.py --config creator --job-id my-job-123 --resume --stream --verbose
+```
+
+**How it works:**
+- Checkpoints: `workspace/checkpoints/job_<id>.db` (SQLite)
+- Logs: `workspace/logs/job_<id>.log`
+- LangGraph saves state after every graph node execution
+- Resuming with the same `--job-id` continues from the last checkpoint
+- Checkpoints and logs are kept after completion for debugging
+
+**Cleanup:**
+```bash
+# Remove all checkpoint files
+rm workspace/checkpoints/job_*.db
+
+# Remove all log files
+rm workspace/logs/job_*.log
+
+# Remove files for specific job
+rm workspace/checkpoints/job_my-job-123.db
+rm workspace/logs/job_my-job-123.log
+```
+
+### 7. Database Management
 
 ```bash
 # Reset PostgreSQL only
-python src/scripts/app_init.py --only-postgres --force-reset
+python scripts/app_init.py --only-postgres --force-reset
 
 # Reset Neo4j with seed data
-python src/scripts/app_init.py --only-neo4j --force-reset --seed
+python scripts/app_init.py --only-neo4j --force-reset --seed
 
 # View init script options
-python src/scripts/app_init.py --help
+python scripts/app_init.py --help
 
 # Nuclear option: remove all Docker volumes and reinitialize
 podman-compose -f docker-compose.dev.yaml down -v
 podman-compose -f docker-compose.dev.yaml up -d
-python src/scripts/app_init.py --seed
+python scripts/app_init.py --seed
 ```
 
-### 7. Stop Databases
+### 8. Stop Databases
 
 ```bash
 podman-compose -f docker-compose.dev.yaml down      # Keep data

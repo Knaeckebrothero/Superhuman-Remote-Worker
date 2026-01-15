@@ -83,7 +83,7 @@ def create_cache_tools(context: ToolContext) -> List:
 
         Args:
             text: Full requirement text
-            name: Short name/title (max 80 chars)
+            name: Short name/title (max 500 chars)
             req_type: Type (functional, compliance, constraint, non_functional)
             priority: Priority (high, medium, low)
             gobd_relevant: GoBD relevance flag
@@ -100,7 +100,8 @@ def create_cache_tools(context: ToolContext) -> List:
             "ok: {uuid}" on success, "error: {reason}" on failure
         """
         try:
-            if not context.postgres_conn:
+            # Use new PostgresDB namespace method
+            if not context.db:
                 return "error: no database connection"
 
             if not context.job_id:
@@ -111,58 +112,28 @@ def create_cache_tools(context: ToolContext) -> List:
             object_list = [o.strip() for o in (mentioned_objects or "").split(",") if o.strip()]
             message_list = [m.strip() for m in (mentioned_messages or "").split(",") if m.strip()]
 
-            # Generate requirement ID
-            req_id = str(uuid.uuid4())
+            # Parse source_location into structured format
+            source_location_dict = {"section": source_location} if source_location else None
 
-            # Insert into requirements table
-            query = """
-                INSERT INTO requirements (
-                    id, job_id, text, name, type, priority,
-                    source_document, source_location,
-                    gobd_relevant, gdpr_relevant,
-                    citations, mentioned_objects, mentioned_messages,
-                    reasoning, confidence, status,
-                    created_at
-                ) VALUES (
-                    $1::uuid, $2::uuid, $3, $4, $5, $6,
-                    $7, $8,
-                    $9, $10,
-                    $11, $12, $13,
-                    $14, $15, 'pending',
-                    NOW()
-                )
-                RETURNING id
-            """
-
-            # Serialize JSONB fields - asyncpg requires JSON strings for JSONB columns
-            source_location_json = json.dumps({"section": source_location}) if source_location else None
-            citations_json = json.dumps(citation_list)
-            objects_json = json.dumps(object_list)
-            messages_json = json.dumps(message_list)
-
-            result = await context.postgres_conn.fetchrow(
-                query,
-                req_id,
-                context.job_id,
-                text,
-                name[:80],  # Ensure name fits
-                req_type,
-                priority,
-                source_document,
-                source_location_json,
-                gobd_relevant,
-                gdpr_relevant,
-                citations_json,
-                objects_json,
-                messages_json,
-                reasoning,
-                confidence,
+            # Use PostgresDB.requirements.create()
+            req_uuid = await context.db.requirements.create(
+                job_id=uuid.UUID(context.job_id),
+                text=text,
+                name=name,
+                req_type=req_type,
+                priority=priority,
+                source_document=source_document,
+                source_location=source_location_dict,
+                gobd_relevant=gobd_relevant,
+                gdpr_relevant=gdpr_relevant,
+                citations=citation_list,
+                mentioned_objects=object_list,
+                mentioned_messages=message_list,
+                reasoning=reasoning,
+                confidence=confidence,
             )
 
-            if result:
-                return f"ok: {req_id}"
-            else:
-                return "error: requirement not created"
+            return f"ok: {req_uuid}"
 
         except Exception as e:
             logger.error(f"Error adding requirement: {e}")
@@ -190,7 +161,8 @@ def create_cache_tools(context: ToolContext) -> List:
             Formatted list of requirements with key fields
         """
         try:
-            if not context.postgres_conn:
+            # Use new PostgresDB connection
+            if not context.db:
                 return "Error: No database connection available"
 
             # Build query with filters
@@ -225,7 +197,7 @@ def create_cache_tools(context: ToolContext) -> List:
             """
             params.extend([limit, offset])
 
-            rows = await context.postgres_conn.fetch(query, *params)
+            rows = await context.db.fetch(query, *params)
 
             if not rows:
                 filter_desc = []
@@ -272,24 +244,14 @@ def create_cache_tools(context: ToolContext) -> List:
             Complete requirement details including text, source, and validation status
         """
         try:
-            if not context.postgres_conn:
+            # Use new PostgresDB namespace method
+            if not context.db:
                 return "Error: No database connection available"
 
-            if not context.job_id:
-                return "Error: No job context available"
+            # Use PostgresDB.requirements.get()
+            requirement = await context.db.requirements.get(uuid.UUID(requirement_id))
 
-            query = """
-                SELECT *
-                FROM requirements
-                WHERE id = $1::uuid AND job_id = $2::uuid
-                LIMIT 1
-            """
-
-            row = await context.postgres_conn.fetchrow(
-                query, requirement_id, context.job_id
-            )
-
-            if not row:
+            if not requirement:
                 return f"Requirement not found: {requirement_id}"
 
             # Format the output
@@ -297,41 +259,41 @@ def create_cache_tools(context: ToolContext) -> List:
 {'=' * 50}
 
 Identification:
-  ID: {row['id']}
-  Job ID: {row['job_id']}
-  Created: {row['created_at']}
-  Updated: {row.get('updated_at', 'N/A')}
+  ID: {requirement['id']}
+  Job ID: {requirement['job_id']}
+  Created: {requirement['created_at']}
+  Updated: {requirement.get('updated_at', 'N/A')}
 
 Content:
-  Name: {row['name']}
-  Type: {row['type']}
-  Priority: {row['priority']}
-  Confidence: {row['confidence']:.2f}
+  Name: {requirement['name']}
+  Type: {requirement['type']}
+  Priority: {requirement['priority']}
+  Confidence: {requirement['confidence']:.2f}
 
 Full Text:
-{row['text']}
+{requirement['text']}
 
 Source:
-  Document: {row.get('source_document', 'N/A')}
-  Location: {row.get('source_location', 'N/A')}
+  Document: {requirement.get('source_document', 'N/A')}
+  Location: {requirement.get('source_location', 'N/A')}
 
 Compliance:
-  GoBD Relevant: {row['gobd_relevant']}
-  GDPR Relevant: {row['gdpr_relevant']}
+  GoBD Relevant: {requirement['gobd_relevant']}
+  GDPR Relevant: {requirement['gdpr_relevant']}
 
 Extraction:
-  Reasoning: {row.get('reasoning', 'N/A')}
-  Citations: {row.get('citations', '[]')}
-  Mentioned Objects: {row.get('mentioned_objects', '[]')}
-  Mentioned Messages: {row.get('mentioned_messages', '[]')}
+  Reasoning: {requirement.get('reasoning', 'N/A')}
+  Citations: {requirement.get('citations', '[]')}
+  Mentioned Objects: {requirement.get('mentioned_objects', '[]')}
+  Mentioned Messages: {requirement.get('mentioned_messages', '[]')}
 
 Validation:
-  Status: {row['status']}
-  Neo4j ID: {row.get('neo4j_id', 'Not integrated')}
-  Validated At: {row.get('validated_at', 'N/A')}
-  Validation Result: {row.get('validation_result', 'N/A')}
-  Rejection Reason: {row.get('rejection_reason', 'N/A')}
-  Retry Count: {row.get('retry_count', 0)}
+  Status: {requirement['status']}
+  Neo4j ID: {requirement.get('neo4j_id', 'Not integrated')}
+  Validated At: {requirement.get('validated_at', 'N/A')}
+  Validation Result: {requirement.get('validation_result', 'N/A')}
+  Rejection Reason: {requirement.get('rejection_reason', 'N/A')}
+  Retry Count: {requirement.get('retry_count', 0)}
 """
 
             return result
