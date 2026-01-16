@@ -77,7 +77,7 @@ class UniversalAgent:
 
     Architecture:
     - Strategic Planning: Filesystem-based plans in workspace/plans/
-    - Tactical Execution: TodoManager with archive_and_reset()
+    - Tactical Execution: TodoManager with next_phase_todos()
     - Context Management: Automatic compaction and summarization
     - Tool Loading: Dynamic based on config.tools
     """

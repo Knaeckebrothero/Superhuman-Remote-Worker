@@ -198,11 +198,11 @@ def load_tools_for_phase(
         ```python
         # Load all configured tools, but only those available in strategic phase
         tools = load_tools_for_phase(
-            ["read_file", "write_file", "todo_write", "extract_document_text"],
+            ["read_file", "write_file", "next_phase_todos", "extract_document_text"],
             phase="strategic",
             context=ctx
         )
-        # Result: Only read_file, write_file, todo_write (extract_document_text is tactical-only)
+        # Result: Only read_file, write_file, next_phase_todos (extract_document_text is tactical-only)
         ```
     """
     filtered_names = filter_tools_by_phase(tool_names, phase)
