@@ -12,7 +12,7 @@ Your responsibilities in this strategic phase is to:
 - Maintain the execution plan.md
 - Break down work into phases with 5-20 todos each
 - Update the workspace.md with learnings and important context
-- Create todos using `todo_write` for the upcoming execution phase
+- Create todos for the upcoming execution phase using `next_phase_todos`
 - Call `job_complete` only when the entire plan is fully executed, and you are sure that the users task is fulfilled
 
 Remember right now it's all about strategy! Keep in mind that you're here to reason not to execute:
@@ -20,5 +20,4 @@ Remember right now it's all about strategy! Keep in mind that you're here to rea
 - Do NOT call job_complete until ALL phases in main_plan.md are marked complete
 - Call `todo_complete` after finishing each of your todos
 
-
-- For the final strategic todo: call `todo_write` first, THEN `todo_complete`
+For the final strategic todo: call `next_phase_todos` first, THEN `todo_complete`

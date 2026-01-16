@@ -108,15 +108,27 @@ class TodoManager:
         ```
     """
 
-    def __init__(self, workspace: "WorkspaceManager"):
+    def __init__(
+        self,
+        workspace: "WorkspaceManager",
+        min_todos: int = 5,
+        max_todos: int = 20,
+    ):
         """Initialize todo manager.
 
         Args:
             workspace: WorkspaceManager for archive operations
+            min_todos: Minimum todos required for tactical phases (default: 5)
+            max_todos: Maximum todos allowed for tactical phases (default: 20)
         """
         self._workspace = workspace
         self._todos: List[TodoItem] = []
         self._next_id = 1
+        self._min_todos = min_todos
+        self._max_todos = max_todos
+        # Staging for next phase todos
+        self._staged_todos: List[TodoItem] = []
+        self._staged_phase_name: str = ""
 
     def add(self, content: str, priority: str = "medium") -> TodoItem:
         """Add a new todo item.
@@ -351,6 +363,119 @@ class TodoManager:
         self._todos = []
         self._next_id = 1
         logger.info(f"Cleared {count} todos without archiving")
+
+    # =========================================================================
+    # Staging methods for next phase todos
+    # =========================================================================
+
+    def stage_tactical_todos(
+        self,
+        todos: List[str],
+        phase_name: str = "",
+    ) -> str:
+        """Stage todos for the next tactical phase.
+
+        This method validates the todos and stores them in a staging area.
+        The staged todos will be applied when transitioning to tactical phase.
+
+        Args:
+            todos: List of task descriptions (min 10 chars each)
+            phase_name: Optional name for the phase
+
+        Returns:
+            Success message or error message if validation fails
+
+        Raises:
+            ValueError: If validation fails
+        """
+        # Validate count
+        if len(todos) < self._min_todos:
+            raise ValueError(
+                f"Too few todos: {len(todos)} < {self._min_todos}. "
+                f"Create more detailed, actionable tasks."
+            )
+        if len(todos) > self._max_todos:
+            raise ValueError(
+                f"Too many todos: {len(todos)} > {self._max_todos}. "
+                f"Split into multiple phases."
+            )
+
+        # Validate each todo content
+        for i, content in enumerate(todos):
+            if not isinstance(content, str):
+                raise ValueError(f"Todo #{i + 1}: content must be a string")
+            if len(content.strip()) < 10:
+                raise ValueError(
+                    f"Todo #{i + 1}: content too short ({len(content.strip())} chars). "
+                    f"Provide a meaningful task description."
+                )
+
+        # Create staged todo items
+        self._staged_todos = []
+        for i, content in enumerate(todos):
+            item = TodoItem(
+                id=f"todo_{i + 1}",
+                content=content.strip(),
+                priority="medium",
+                status=TodoStatus.PENDING,
+            )
+            self._staged_todos.append(item)
+
+        self._staged_phase_name = phase_name
+
+        logger.info(f"Staged {len(self._staged_todos)} todos for next phase")
+        return (
+            f"Staged {len(self._staged_todos)} todos for the next tactical phase"
+            + (f" ({phase_name})" if phase_name else "")
+            + "."
+        )
+
+    def has_staged_todos(self) -> bool:
+        """Check if there are staged todos for the next phase.
+
+        Returns:
+            True if there are staged todos waiting to be applied
+        """
+        return len(self._staged_todos) > 0
+
+    def get_staged_phase_name(self) -> str:
+        """Get the name of the staged phase.
+
+        Returns:
+            Phase name or empty string if not set
+        """
+        return self._staged_phase_name
+
+    def apply_staged_todos(self) -> None:
+        """Apply staged todos to the active todo list.
+
+        Moves todos from the staging area to the active list,
+        clearing the current todos and staging area.
+        """
+        if not self._staged_todos:
+            logger.warning("No staged todos to apply")
+            return
+
+        # Clear current todos and apply staged
+        self._todos = self._staged_todos.copy()
+        self._next_id = len(self._todos) + 1
+
+        count = len(self._todos)
+        phase_name = self._staged_phase_name
+
+        # Clear staging
+        self._staged_todos = []
+        self._staged_phase_name = ""
+
+        logger.info(f"Applied {count} staged todos" + (f" ({phase_name})" if phase_name else ""))
+
+    def clear_staged_todos(self) -> None:
+        """Clear staged todos without applying them."""
+        count = len(self._staged_todos)
+        self._staged_todos = []
+        self._staged_phase_name = ""
+        if count > 0:
+            logger.info(f"Cleared {count} staged todos")
 
     def log_state(self) -> None:
         """Log current todo state for monitoring."""
