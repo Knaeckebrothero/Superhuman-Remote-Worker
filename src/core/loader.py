@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
 from langchain_core.language_models import BaseChatModel
 
 from src.llm.reasoning_chat import ReasoningChatOpenAI
@@ -533,95 +534,6 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
     return llm
 
 
-def load_system_prompt_template(config_dir: Optional[str] = None) -> str:
-    """Load the raw system prompt template without substitution.
-
-    Args:
-        config_dir: Base directory for config files (default: src/agent/config)
-
-    Returns:
-        Raw template string with placeholders
-    """
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    system_prompt_path = config_dir / "prompts" / "01_system_prompt.txt"
-
-    if not system_prompt_path.exists():
-        raise FileNotFoundError(f"System prompt not found: {system_prompt_path}")
-
-    with open(system_prompt_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def render_system_prompt(
-    template: str,
-    config: AgentConfig,
-    todos_content: str = "",
-    workspace_content: str = "",
-) -> str:
-    """Render system prompt template with current values.
-
-    Args:
-        template: Raw template string with placeholders
-        config: Agent configuration
-        todos_content: Formatted todo list string
-        workspace_content: Contents of workspace.md
-
-    Returns:
-        Rendered system prompt string
-    """
-    oss_reasoning_level = config.llm.reasoning_level or "high"
-
-    return template.format(
-        agent_display_name=config.display_name,
-        oss_reasoning_level=oss_reasoning_level,
-        todos_content=todos_content,
-        workspace_content=workspace_content,
-    )
-
-
-def load_system_prompt(
-    config: AgentConfig,
-    config_dir: Optional[str] = None,
-    workspace_manager: Optional[Any] = None,
-    todos_content: str = "",
-) -> str:
-    """Load and format the system prompt for the agent.
-
-    This is a convenience function that combines load_system_prompt_template()
-    and render_system_prompt() for backwards compatibility.
-
-    Args:
-        config: Agent configuration
-        config_dir: Base directory for config files (default: src/agent/config)
-        workspace_manager: Optional workspace manager for reading workspace.md
-        todos_content: Formatted todo list string
-
-    Returns:
-        Formatted system prompt string
-    """
-    template = load_system_prompt_template(config_dir)
-
-    # Read workspace.md content if available
-    workspace_content = ""
-    if workspace_manager:
-        try:
-            if workspace_manager.exists("workspace.md"):
-                workspace_content = workspace_manager.read_file("workspace.md")
-        except Exception as e:
-            logger.debug(f"Could not read workspace.md: {e}")
-
-    return render_system_prompt(
-        template=template,
-        config=config,
-        todos_content=todos_content,
-        workspace_content=workspace_content,
-    )
-
-
 # =============================================================================
 # Phase-Aware System Prompts
 # =============================================================================
@@ -896,76 +808,6 @@ Conversation:
 """
 
 
-def load_planning_prompt(config_dir: Optional[str] = None) -> str:
-    """Load the planning prompt template.
-
-    Args:
-        config_dir: Base directory for config files
-
-    Returns:
-        Planning prompt content
-    """
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / "planning_prompt.md"
-
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"Planning prompt not found: {prompt_path}")
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def load_todo_extraction_prompt(config_dir: Optional[str] = None) -> str:
-    """Load the todo extraction prompt template.
-
-    Template variables: {current_phase}, {plan_content}
-
-    Args:
-        config_dir: Base directory for config files
-
-    Returns:
-        Todo extraction prompt content
-    """
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / "todo_extraction_prompt.md"
-
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"Todo extraction prompt not found: {prompt_path}")
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def load_memory_update_prompt(config_dir: Optional[str] = None) -> str:
-    """Load the memory update prompt template.
-
-    Template variable: {current_memory}
-
-    Args:
-        config_dir: Base directory for config files
-
-    Returns:
-        Memory update prompt content
-    """
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / "memory_update_prompt.md"
-
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"Memory update prompt not found: {prompt_path}")
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
 def get_all_tool_names(config: AgentConfig) -> List[str]:
     """Get all tool names from configuration.
 
@@ -1024,3 +866,282 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
 
     # Return framework path even if it doesn't exist (let caller handle error)
     return (str(framework_config), None)
+
+
+# =============================================================================
+# Strategic Todos Template Loaders
+# =============================================================================
+
+
+class StrategicTodosValidationError(Exception):
+    """Raised when strategic todos template validation fails."""
+
+    def __init__(self, message: str, errors: Optional[List[str]] = None):
+        super().__init__(message)
+        self.errors = errors or [message]
+
+
+def _parse_strategic_todos_yaml(path: Path) -> List[Dict[str, Any]]:
+    """Parse and validate a strategic todos YAML template.
+
+    Expected schema:
+    ```yaml
+    todos:
+      - id: 1
+        content: "First task description"
+      - id: 2
+        content: "Second task description"
+    ```
+
+    Args:
+        path: Path to the YAML template file
+
+    Returns:
+        List of todo dicts with 'id' and 'content' keys
+
+    Raises:
+        StrategicTodosValidationError: If validation fails
+    """
+    errors: List[str] = []
+
+    # Read file
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise StrategicTodosValidationError(
+            f"Failed to read strategic todos template: {path}",
+            [str(e)],
+        )
+
+    # Parse YAML
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        raise StrategicTodosValidationError(
+            f"Invalid YAML syntax in {path}: {e}",
+            [f"YAML parse error: {e}"],
+        )
+
+    if data is None:
+        raise StrategicTodosValidationError(
+            f"Empty strategic todos template: {path}",
+            ["File is empty or contains only whitespace"],
+        )
+
+    if not isinstance(data, dict):
+        raise StrategicTodosValidationError(
+            f"Strategic todos template must be a YAML mapping: {path}",
+            [f"Expected mapping, got {type(data).__name__}"],
+        )
+
+    # Check required 'todos' key
+    if "todos" not in data:
+        raise StrategicTodosValidationError(
+            f"Missing required 'todos' key in {path}",
+            ["Strategic todos template must have a 'todos' key with a list of todo items"],
+        )
+
+    todos_raw = data["todos"]
+    if not isinstance(todos_raw, list):
+        raise StrategicTodosValidationError(
+            f"'todos' must be a list in {path}",
+            [f"Expected list for 'todos', got {type(todos_raw).__name__}"],
+        )
+
+    # Validate each todo item
+    validated_todos: List[Dict[str, Any]] = []
+    seen_ids: set = set()
+
+    for i, item in enumerate(todos_raw):
+        if not isinstance(item, dict):
+            errors.append(f"Todo #{i + 1}: Expected mapping, got {type(item).__name__}")
+            continue
+
+        # Validate 'id'
+        todo_id = item.get("id")
+        if todo_id is None:
+            errors.append(f"Todo #{i + 1}: Missing required 'id' field")
+        elif not isinstance(todo_id, int):
+            errors.append(
+                f"Todo #{i + 1}: 'id' must be an integer, got {type(todo_id).__name__}"
+            )
+        elif todo_id in seen_ids:
+            errors.append(f"Todo #{i + 1}: Duplicate id '{todo_id}'")
+        else:
+            seen_ids.add(todo_id)
+
+        # Validate 'content'
+        content_val = item.get("content")
+        if content_val is None:
+            errors.append(f"Todo #{i + 1}: Missing required 'content' field")
+        elif not isinstance(content_val, str):
+            errors.append(
+                f"Todo #{i + 1}: 'content' must be a string, "
+                f"got {type(content_val).__name__}"
+            )
+        elif len(content_val.strip()) < 10:
+            errors.append(
+                f"Todo #{i + 1}: 'content' too short ({len(content_val.strip())} chars). "
+                f"Provide a meaningful task description."
+            )
+
+        # If valid so far, add to validated list
+        if todo_id is not None and content_val is not None and not errors:
+            validated_todos.append({
+                "id": todo_id,
+                "content": content_val.strip(),
+            })
+
+    if errors:
+        raise StrategicTodosValidationError(
+            f"Strategic todos validation failed with {len(errors)} error(s)",
+            errors,
+        )
+
+    logger.debug(f"Parsed strategic todos template: {len(validated_todos)} todos from {path}")
+    return validated_todos
+
+
+def load_strategic_todos_template(
+    template_name: str,
+    deployment_dir: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load a strategic todos template with deployment override support.
+
+    Checks deployment directory first, then falls back to framework templates.
+    This allows deployments to override strategic todos for customization.
+
+    Args:
+        template_name: Name of the template file (e.g., "strategic_todos_initial.yaml")
+        deployment_dir: Path to deployment directory (e.g., configs/creator).
+                       If None, only framework templates are used.
+
+    Returns:
+        List of todo dicts with 'id' and 'content' keys
+
+    Raises:
+        FileNotFoundError: If template not found in either location
+        StrategicTodosValidationError: If template is invalid
+
+    Example:
+        ```python
+        todos = load_strategic_todos_template(
+            "strategic_todos_initial.yaml",
+            deployment_dir="configs/creator"
+        )
+        # Returns: [{"id": 1, "content": "..."}, {"id": 2, "content": "..."}, ...]
+        ```
+    """
+    # Check deployment directory first
+    if deployment_dir:
+        deployment_path = Path(deployment_dir) / template_name
+        if deployment_path.exists():
+            logger.debug(f"Loading strategic todos from deployment: {deployment_path}")
+            return _parse_strategic_todos_yaml(deployment_path)
+
+    # Fall back to framework directory
+    framework_dir = Path(__file__).parent.parent / "config"
+    framework_path = framework_dir / template_name
+
+    if framework_path.exists():
+        logger.debug(f"Loading strategic todos from framework: {framework_path}")
+        return _parse_strategic_todos_yaml(framework_path)
+
+    raise FileNotFoundError(
+        f"Strategic todos template not found: {template_name} "
+        f"(checked: {deployment_dir}, {framework_dir})"
+    )
+
+
+def get_initial_strategic_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+) -> List[Dict[str, Any]]:
+    """Get initial strategic todos for job start.
+
+    Loads from strategic_todos_initial.yaml template with deployment override support.
+
+    Args:
+        config: Agent configuration (for deployment directory). If None, uses
+               framework defaults only.
+
+    Returns:
+        List of todo dicts ready for TodoManager.set_todos_from_list():
+        [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
+
+    Example:
+        ```python
+        todos = get_initial_strategic_todos_from_config(config)
+        todo_manager.set_todos_from_list(todos)
+        ```
+    """
+    deployment_dir = config._deployment_dir if config else None
+
+    try:
+        raw_todos = load_strategic_todos_template(
+            "strategic_todos_initial.yaml",
+            deployment_dir=deployment_dir,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            "strategic_todos_initial.yaml not found, using empty list. "
+            "Create src/config/strategic_todos_initial.yaml or deployment override."
+        )
+        return []
+
+    # Convert to TodoManager format
+    return [
+        {
+            "id": f"todo_{t['id']}",
+            "content": t["content"],
+            "status": "pending",
+            "priority": "medium",
+        }
+        for t in raw_todos
+    ]
+
+
+def get_transition_strategic_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+) -> List[Dict[str, Any]]:
+    """Get strategic todos for phase transitions.
+
+    Loads from strategic_todos_transition.yaml template with deployment override support.
+
+    Args:
+        config: Agent configuration (for deployment directory). If None, uses
+               framework defaults only.
+
+    Returns:
+        List of todo dicts ready for TodoManager.set_todos_from_list():
+        [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
+
+    Example:
+        ```python
+        todos = get_transition_strategic_todos_from_config(config)
+        todo_manager.set_todos_from_list(todos)
+        ```
+    """
+    deployment_dir = config._deployment_dir if config else None
+
+    try:
+        raw_todos = load_strategic_todos_template(
+            "strategic_todos_transition.yaml",
+            deployment_dir=deployment_dir,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            "strategic_todos_transition.yaml not found, using empty list. "
+            "Create src/config/strategic_todos_transition.yaml or deployment override."
+        )
+        return []
+
+    # Convert to TodoManager format
+    return [
+        {
+            "id": f"todo_{t['id']}",
+            "content": t["content"],
+            "status": "pending",
+            "priority": "medium",
+        }
+        for t in raw_todos
+    ]
