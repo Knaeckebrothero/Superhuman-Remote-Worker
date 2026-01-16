@@ -171,6 +171,77 @@ def create_todo_tools(context: ToolContext) -> List:
             return f"Error updating todos: {str(e)}"
 
     @tool
+    def next_phase_todos(todos: List[str], phase_name: str = "") -> str:
+        """Create todos for the next tactical execution phase.
+
+        This tool stages todos for the upcoming tactical phase. Unlike todo_write,
+        this tool takes a simple list of task strings and stages them directly
+        in the TodoManager without writing to a file.
+
+        Use this to:
+        - Create actionable tasks for the next execution phase
+        - Prepare work items after strategic planning is complete
+
+        The tool validates:
+        - Todo count (5-20 items required)
+        - Each todo content (minimum 10 characters)
+
+        After calling this tool, complete your current strategic todo with
+        todo_complete(). The phase transition will apply the staged todos.
+
+        Args:
+            todos: List of task descriptions. Each must be at least 10 characters.
+                   Example: ["Extract document text from PDF", "Chunk document into segments"]
+            phase_name: Optional name for the phase (e.g., "Phase 1: Document Processing")
+
+        Returns:
+            Success message confirming todos were staged, or error if validation fails.
+
+        Example:
+            next_phase_todos(
+                todos=[
+                    "Extract document text from uploaded PDF",
+                    "Chunk document into processable segments",
+                    "Identify requirements in each chunk",
+                    "Validate extracted requirements",
+                    "Write requirements to database"
+                ],
+                phase_name="Phase 1: Document Processing"
+            )
+        """
+        try:
+            # Convert to list if it's a string (JSON)
+            if isinstance(todos, str):
+                import json
+                todos = json.loads(todos)
+
+            if not isinstance(todos, list):
+                return "Error: todos must be a list of task descriptions"
+
+            # Validate each item is a string
+            for i, item in enumerate(todos):
+                if not isinstance(item, str):
+                    return f"Error: todo at index {i} must be a string, got {type(item).__name__}"
+
+            # Use TodoManager's staging method which handles validation
+            result = todo_mgr.stage_tactical_todos(todos, phase_name)
+
+            # Check if all other strategic todos are complete
+            remaining = [t for t in todo_mgr.list_pending()]
+            if len(remaining) <= 1:
+                # Only the current todo (create todos) remains
+                return f"{result}\n\nAll strategic todos complete. Call todo_complete() to transition to tactical phase."
+            else:
+                remaining_list = "\n".join(f"  - {t.content}" for t in remaining)
+                return f"{result}\n\nRemaining strategic todos before transition:\n{remaining_list}"
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"next_phase_todos error: {e}")
+            return f"Error staging todos: {str(e)}"
+
+    @tool
     def archive_and_reset(phase_name: str = "") -> str:
         """Archive completed todos and reset for next phase.
 
@@ -298,8 +369,9 @@ def create_todo_tools(context: ToolContext) -> List:
             return f"Error during rewind: {str(e)}"
 
     # Return all todo tools
+    # Note: todo_write is deprecated in favor of next_phase_todos
     return [
-        todo_write,
+        next_phase_todos,
         archive_and_reset,
         todo_complete,
         todo_rewind,
@@ -312,12 +384,20 @@ def create_todo_tools(context: ToolContext) -> List:
 #   - "tactical": Available only in tactical mode (execution)
 #   - "both": Available in both modes
 TODO_TOOLS_METADATA = {
+    "next_phase_todos": {
+        "module": "todo_tools",
+        "function": "next_phase_todos",
+        "description": "Stage todos for the next tactical phase",
+        "category": "todo",
+        "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
+    },
     "todo_write": {
         "module": "todo_tools",
         "function": "todo_write",
-        "description": "Write todos for the next tactical phase to todos.yaml",
+        "description": "[DEPRECATED] Use next_phase_todos instead",
         "category": "todo",
-        "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
+        "phases": ["strategic"],  # Deprecated - kept for backward compatibility
+        "deprecated": True,
     },
     "archive_and_reset": {
         "module": "todo_tools",
