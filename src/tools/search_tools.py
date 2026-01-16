@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
+# Phase availability: domain tools are tactical-only
 SEARCH_TOOLS_METADATA = {
     "web_search": {
         "module": "search_tools",
@@ -22,6 +23,7 @@ SEARCH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Search the web via Tavily for context and research.",
+        "phases": ["tactical"],
     },
 }
 

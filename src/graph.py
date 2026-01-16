@@ -1,47 +1,46 @@
 """
-Universal Agent - Nested Loop Graph for Universal Agent.
+Universal Agent - Phase Alternation Graph.
 
-Implements the nested loop graph architecture with:
-- Initialization flow (runs once)
-- Outer loop (strategic planning at phase transitions)
-- Inner loop (tactical execution with ReAct)
-- Goal check for termination
+Implements a single ReAct loop with phase alternation between:
+- Strategic mode: Planning, memory updates, todo creation
+- Tactical mode: Domain-specific execution
 
 Graph Structure:
 ```
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                         INITIALIZATION (runs once)                        ║
 ║                                                                           ║
-║   init_workspace → read_instructions → create_plan → init_todos           ║
+║   init_workspace → init_strategic_todos (predefined todos)                ║
 ║                                                                           ║
 ╠═══════════════════════════════════════════════════════════════════════════╣
-║                         OUTER LOOP (Strategic)                            ║
+║                         SINGLE REACT LOOP                                 ║
 ║                                                                           ║
 ║   ┌─────────────────────────────────────────────────────────────────┐     ║
-║   │                      PLAN PHASE                                 │     ║
-║   │   read_plan → update_memory → create_todos                      │     ║
-║   └─────────────────────────────────────────────────────────────────┘     ║
-║                                    ↓                                      ║
-║   ┌─────────────────────────────────────────────────────────────────┐     ║
-║   │                     EXECUTE PHASE (inner loop)                  │     ║
-║   │                                                                 │     ║
-║   │         ┌────────────────────────────────────────┐              │     ║
 ║   │         ↓                                        │              │     ║
 ║   │      execute ─→ check_todos ─→ todos done? ──no──┘              │     ║
 ║   │      (ReAct)           │                                        │     ║
 ║   │                       yes                                       │     ║
 ║   │                        ↓                                        │     ║
 ║   │                  archive_phase                                  │     ║
+║   │                        ↓                                        │     ║
+║   │                handle_transition                                │     ║
+║   │       (strategic↔tactical, clears messages, loads todos)        │     ║
 ║   └─────────────────────────────────────────────────────────────────┘     ║
 ║                                    ↓                                      ║
 ║                               check_goal                                  ║
 ║                              ↓          ↓                                 ║
-║                             no         yes                                ║
+║                       continue        done                                ║
 ║                              ↓          ↓                                 ║
-║                       back to PLAN     END                                ║
+║                       back to LOOP     END                                ║
 ║                                                                           ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
 ```
+
+Phase Alternation:
+- Strategic phases use predefined todos for planning/reflection
+- Tactical phases use todos.yaml written by the strategic agent
+- Messages are cleared at each phase transition
+- workspace.md persists across phases for long-term memory
 """
 
 import logging
@@ -64,15 +63,18 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from .core.state import UniversalAgentState
 from .core.loader import (
     AgentConfig,
-    load_planning_prompt,
-    load_todo_extraction_prompt,
-    load_memory_update_prompt,
     load_summarization_prompt,
     render_system_prompt,
+    get_phase_system_prompt,
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
 from .core.context import ContextManager, ContextConfig, find_safe_slice_start
+from .core.phase import (
+    handle_phase_transition,
+    TransitionResult,
+    get_initial_strategic_todos,
+)
 from .managers import TodoManager, PlanManager, MemoryManager
 
 logger = logging.getLogger(__name__)
@@ -186,596 +188,79 @@ def create_init_workspace_node(
     return init_workspace
 
 
-def create_read_instructions_node(
+def create_init_strategic_todos_node(
     workspace: WorkspaceManager,
+    todo_manager: TodoManager,
     config: AgentConfig,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the read_instructions node.
+    """Create the init_strategic_todos node for phase alternation.
 
-    This node reads instructions.md and adds it to the conversation.
+    This node initializes the job with predefined strategic todos,
+    enabling the agent to use tools for planning rather than relying
+    on a toolless LLM.
+
+    Used when use_phase_alternation=True.
     """
 
-    def read_instructions(state: UniversalAgentState) -> Dict[str, Any]:
-        """Read instructions.md into context."""
+    def init_strategic_todos(state: UniversalAgentState) -> Dict[str, Any]:
+        """Load predefined strategic todos and instructions context."""
         job_id = state.get("job_id", "unknown")
-        logger.info(f"[{job_id}] Reading instructions")
+        logger.info(f"[{job_id}] Initializing strategic todos for phase alternation")
 
+        # Read instructions for context
         try:
             instructions = workspace.read_file("instructions.md")
         except FileNotFoundError:
             instructions = "No instructions.md found. Please create a plan based on job metadata."
             logger.warning(f"[{job_id}] instructions.md not found")
 
-        # Audit instructions read
+        # Load predefined strategic todos
+        strategic_todos = get_initial_strategic_todos()
+        todo_list = [todo.to_dict() for todo in strategic_todos]
+        todo_manager.set_todos_from_list(todo_list)
+
+        logger.info(
+            f"[{job_id}] Loaded {len(strategic_todos)} predefined strategic todos"
+        )
+
+        # Audit initialization
         auditor = get_archiver()
         if auditor:
             auditor.audit_step(
                 job_id=job_id,
                 agent_type=config.agent_id,
                 step_type="initialize",
-                node_name="read_instructions",
+                node_name="init_strategic_todos",
                 iteration=0,
-                data={"instructions": {"length": len(instructions)}},
+                data={
+                    "phase_alternation": True,
+                    "strategic_todos": len(strategic_todos),
+                    "instructions_length": len(instructions),
+                },
                 metadata=state.get("metadata"),
             )
 
-        # Add instructions as a human message
+        # Add instructions as initial context for the strategic agent
         message = HumanMessage(
-            content=f"## Instructions\n\n{instructions}\n\nPlease create a plan to accomplish this task."
-        )
-
-        return {
-            "messages": [message],
-        }
-
-    return read_instructions
-
-
-def create_create_plan_node(
-    llm: BaseChatModel,
-    plan_manager: PlanManager,
-    config: AgentConfig,
-    planning_prompt: str = "",
-) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the create_plan node.
-
-    This node uses the LLM to create main_plan.md from instructions.
-
-    Args:
-        llm: LLM instance for plan generation
-        plan_manager: Plan manager for reading/writing plans
-        config: Agent configuration
-        planning_prompt: Prompt template for plan creation (loaded from file)
-    """
-
-    def create_plan(state: UniversalAgentState) -> Dict[str, Any]:
-        """LLM creates main_plan.md from instructions."""
-        job_id = state.get("job_id", "unknown")
-        logger.info(f"[{job_id}] Creating plan")
-
-        # Check if plan already exists (resuming job)
-        if plan_manager.exists():
-            logger.info(f"[{job_id}] Plan already exists, skipping creation")
-            plan_content = plan_manager.read()
-            # Add message indicating plan exists
-            message = AIMessage(
-                content=f"I found an existing plan. Let me review it:\n\n{plan_content[:1000]}..."
-            )
-            return {"messages": [message]}
-
-        messages = state.get("messages", [])
-
-        # Format planning prompt with reasoning level
-        oss_reasoning_level = config.llm.reasoning_level or "high"
-        prompt_text = planning_prompt.format(oss_reasoning_level=oss_reasoning_level)
-
-        # Call LLM to create plan
-        plan_messages = messages + [HumanMessage(content=prompt_text)]
-
-        # Audit LLM call
-        auditor = get_archiver()
-        if auditor:
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_call",
-                node_name="create_plan",
-                iteration=0,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "input_message_count": len(plan_messages),
-                    }
-                },
-                metadata=state.get("metadata"),
-            )
-
-        start_time = time.time()
-        response = llm.invoke(plan_messages)
-        latency_ms = int((time.time() - start_time) * 1000)
-
-        # Archive full LLM request/response
-        if auditor:
-            auditor.archive(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                messages=plan_messages,
-                response=response,
-                model=config.llm.model,
-                latency_ms=latency_ms,
-                iteration=0,
-                metadata=state.get("metadata"),
-            )
-
-            # Audit LLM response
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_response",
-                node_name="create_plan",
-                iteration=0,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "response_content_preview": response.content[:500] if response.content else "",
-                        "metrics": {
-                            "output_chars": len(response.content) if response.content else 0,
-                        }
-                    }
-                },
-                latency_ms=latency_ms,
-                metadata=state.get("metadata"),
-            )
-
-        # Extract plan content from response, cleaning up any markdown wrappers
-        plan_content = _extract_markdown_content(response.content)
-
-        # Write plan to workspace
-        plan_manager.write(plan_content)
-        logger.info(f"[{job_id}] Created main_plan.md ({len(plan_content)} chars)")
-
-        return {
-            "messages": [response],
-        }
-
-    return create_plan
-
-
-def create_init_todos_node(
-    llm: BaseChatModel,
-    plan_manager: PlanManager,
-    todo_manager: TodoManager,
-    config: AgentConfig,
-    todo_extraction_prompt: str = "",
-) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the init_todos node.
-
-    This node extracts todos for the first phase from the plan.
-
-    Args:
-        llm: LLM instance for todo extraction
-        plan_manager: Plan manager for reading plan
-        todo_manager: Todo manager for writing todos
-        config: Agent configuration
-        todo_extraction_prompt: Prompt template with {current_phase} and {plan_content} vars
-    """
-
-    def init_todos(state: UniversalAgentState) -> Dict[str, Any]:
-        """Extract todos for first phase from plan."""
-        job_id = state.get("job_id", "unknown")
-        logger.info(f"[{job_id}] Initializing todos from plan")
-
-        plan_content = plan_manager.read()
-        current_phase = plan_manager.get_current_phase()
-
-        if not current_phase:
-            current_phase = "Phase 1"
-
-        # Format with reasoning level
-        oss_reasoning_level = config.llm.reasoning_level or "high"
-        extraction_prompt = todo_extraction_prompt.format(
-            current_phase=current_phase,
-            plan_content=plan_content,
-            oss_reasoning_level=oss_reasoning_level,
-        )
-
-        messages = state.get("messages", [])
-        todo_messages = messages + [HumanMessage(content=extraction_prompt)]
-
-        # Audit LLM call
-        auditor = get_archiver()
-        if auditor:
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_call",
-                node_name="init_todos",
-                iteration=0,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "input_message_count": len(todo_messages),
-                    },
-                    "phase": {"current": current_phase},
-                },
-                metadata=state.get("metadata"),
-            )
-
-        start_time = time.time()
-        response = llm.invoke(todo_messages)
-        latency_ms = int((time.time() - start_time) * 1000)
-
-        # Archive full LLM request/response
-        if auditor:
-            auditor.archive(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                messages=todo_messages,
-                response=response,
-                model=config.llm.model,
-                latency_ms=latency_ms,
-                iteration=0,
-                metadata=state.get("metadata"),
-            )
-
-            # Audit LLM response
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_response",
-                node_name="init_todos",
-                iteration=0,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "response_content_preview": response.content[:500] if response.content else "",
-                        "metrics": {
-                            "output_chars": len(response.content) if response.content else 0,
-                        }
-                    }
-                },
-                latency_ms=latency_ms,
-                metadata=state.get("metadata"),
-            )
-
-        # Parse todos from response
-        import json
-        import re
-
-        try:
-            # Extract JSON from response
-            json_match = re.search(r'\[.*\]', response.content, re.DOTALL)
-            if json_match:
-                todos_data = json.loads(json_match.group())
-            else:
-                # Fallback: create a generic first todo
-                todos_data = [{"content": f"Complete {current_phase}", "priority": "high"}]
-        except json.JSONDecodeError:
-            todos_data = [{"content": f"Complete {current_phase}", "priority": "high"}]
-            logger.warning(f"[{job_id}] Failed to parse todos, using fallback")
-
-        # Add todos to manager
-        todo_manager.clear()
-        for todo_data in todos_data:
-            todo_manager.add(
-                content=todo_data.get("content", "Unknown task"),
-                priority=todo_data.get("priority", "medium"),
-            )
-
-        logger.info(f"[{job_id}] Created {len(todos_data)} todos for {current_phase}")
-
-        # Create confirmation message
-        todo_list = todo_manager.format_for_display()
-        message = AIMessage(
-            content=f"I've created todos for {current_phase}:\n\n{todo_list}\n\nLet me start working on these."
+            content=f"## Task Instructions\n\n{instructions}\n\n"
+            "You are starting in strategic mode. Work through the predefined todos "
+            "to understand the task, create a plan, and prepare todos for execution."
         )
 
         return {
             "messages": [message],
             "initialized": True,
+            "is_strategic_phase": True,
+            "phase_number": 0,
             "phase_complete": False,
             "goal_achieved": False,
         }
 
-    return init_todos
+    return init_strategic_todos
 
 
 # =============================================================================
-# PLAN PHASE NODES (Outer Loop)
-# =============================================================================
-
-
-def create_read_plan_node(
-    plan_manager: PlanManager,
-    memory_manager: MemoryManager,
-    config: AgentConfig,
-) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the read_plan node.
-
-    This node reads main_plan.md at the start of each phase.
-    """
-
-    def read_plan(state: UniversalAgentState) -> Dict[str, Any]:
-        """Read plan and memory at phase transition."""
-        job_id = state.get("job_id", "unknown")
-        iteration = state.get("iteration", 0)
-        logger.info(f"[{job_id}] Reading plan for new phase")
-
-        plan_content = plan_manager.read()
-        current_phase = plan_manager.get_current_phase()
-
-        # Also refresh workspace memory
-        workspace_memory = memory_manager.read()
-
-        # Audit phase transition
-        auditor = get_archiver()
-        if auditor:
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="phase_transition",
-                node_name="read_plan",
-                iteration=iteration,
-                data={"phase": {"current": current_phase}},
-                metadata=state.get("metadata"),
-            )
-
-        # Add phase context message
-        message = HumanMessage(
-            content=f"## Phase Transition\n\nCurrent phase: {current_phase or 'Unknown'}\n\nReview the plan and prepare todos for this phase."
-        )
-
-        return {
-            "messages": [message],
-            "workspace_memory": workspace_memory,
-            "phase_complete": False,  # Reset for new phase
-        }
-
-    return read_plan
-
-
-def create_update_memory_node(
-    llm: BaseChatModel,
-    memory_manager: MemoryManager,
-    config: AgentConfig,
-    memory_update_prompt: str = "",
-) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the update_memory node.
-
-    This node has the LLM update workspace.md with learnings.
-
-    Args:
-        llm: LLM instance for memory updates
-        memory_manager: Memory manager for reading/writing workspace.md
-        config: Agent configuration
-        memory_update_prompt: Prompt template with {current_memory} var
-    """
-
-    def update_memory(state: UniversalAgentState) -> Dict[str, Any]:
-        """LLM updates workspace.md with learnings from last phase."""
-        job_id = state.get("job_id", "unknown")
-        iteration = state.get("iteration", 0)
-        logger.info(f"[{job_id}] Updating workspace memory")
-
-        current_memory = memory_manager.read()
-        messages = state.get("messages", [])
-
-        # Format with reasoning level
-        oss_reasoning_level = config.llm.reasoning_level or "high"
-        update_prompt = memory_update_prompt.format(
-            current_memory=current_memory,
-            oss_reasoning_level=oss_reasoning_level,
-        )
-
-        # Include all messages (excluding system messages) for full context
-        memory_messages = [m for m in messages if not isinstance(m, SystemMessage)] + [HumanMessage(content=update_prompt)]
-
-        # Audit LLM call
-        auditor = get_archiver()
-        if auditor:
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_call",
-                node_name="update_memory",
-                iteration=iteration,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "input_message_count": len(memory_messages),
-                    }
-                },
-                metadata=state.get("metadata"),
-            )
-
-        start_time = time.time()
-        response = llm.invoke(memory_messages)
-        latency_ms = int((time.time() - start_time) * 1000)
-
-        # Archive full LLM request/response
-        if auditor:
-            auditor.archive(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                messages=memory_messages,
-                response=response,
-                model=config.llm.model,
-                latency_ms=latency_ms,
-                iteration=iteration,
-                metadata=state.get("metadata"),
-            )
-
-            # Audit LLM response
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_response",
-                node_name="update_memory",
-                iteration=iteration,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "response_content_preview": response.content[:500] if response.content else "",
-                        "metrics": {
-                            "output_chars": len(response.content) if response.content else 0,
-                        }
-                    }
-                },
-                latency_ms=latency_ms,
-                metadata=state.get("metadata"),
-            )
-
-        # Update memory file
-        new_memory = response.content
-        memory_manager.write(new_memory)
-        logger.info(f"[{job_id}] Updated workspace.md")
-
-        return {
-            "workspace_memory": new_memory,
-        }
-
-    return update_memory
-
-
-def create_create_todos_node(
-    llm: BaseChatModel,
-    plan_manager: PlanManager,
-    todo_manager: TodoManager,
-    config: AgentConfig,
-    todo_extraction_prompt: str = "",
-) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the create_todos node.
-
-    This node extracts todos for the current phase.
-
-    Args:
-        llm: LLM instance for todo extraction
-        plan_manager: Plan manager for reading plan
-        todo_manager: Todo manager for writing todos
-        config: Agent configuration
-        todo_extraction_prompt: Prompt template with {current_phase} and {plan_content} vars
-    """
-
-    def create_todos(state: UniversalAgentState) -> Dict[str, Any]:
-        """Extract todos for current phase from plan."""
-        job_id = state.get("job_id", "unknown")
-        iteration = state.get("iteration", 0)
-        logger.info(f"[{job_id}] Creating todos for current phase")
-
-        plan_content = plan_manager.read()
-        current_phase = plan_manager.get_current_phase()
-
-        if not current_phase:
-            logger.info(f"[{job_id}] No more phases found, goal achieved")
-            return {
-                "goal_achieved": True,
-            }
-
-        # Format with reasoning level
-        oss_reasoning_level = config.llm.reasoning_level or "high"
-        extraction_prompt = todo_extraction_prompt.format(
-            current_phase=current_phase,
-            plan_content=plan_content,
-            oss_reasoning_level=oss_reasoning_level,
-        )
-
-        messages = state.get("messages", [])
-        # Include all messages (excluding system messages) for full context
-        todo_messages = [m for m in messages if not isinstance(m, SystemMessage)] + [HumanMessage(content=extraction_prompt)]
-
-        # Audit LLM call
-        auditor = get_archiver()
-        if auditor:
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_call",
-                node_name="create_todos",
-                iteration=iteration,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "input_message_count": len(todo_messages),
-                    },
-                    "phase": {"current": current_phase},
-                },
-                metadata=state.get("metadata"),
-            )
-
-        start_time = time.time()
-        response = llm.invoke(todo_messages)
-        latency_ms = int((time.time() - start_time) * 1000)
-
-        # Archive full LLM request/response
-        if auditor:
-            auditor.archive(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                messages=todo_messages,
-                response=response,
-                model=config.llm.model,
-                latency_ms=latency_ms,
-                iteration=iteration,
-                metadata=state.get("metadata"),
-            )
-
-            # Audit LLM response
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="llm_response",
-                node_name="create_todos",
-                iteration=iteration,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "response_content_preview": response.content[:500] if response.content else "",
-                        "metrics": {
-                            "output_chars": len(response.content) if response.content else 0,
-                        }
-                    }
-                },
-                latency_ms=latency_ms,
-                metadata=state.get("metadata"),
-            )
-
-        # Parse todos
-        import json
-        import re
-
-        try:
-            json_match = re.search(r'\[.*\]', response.content, re.DOTALL)
-            if json_match:
-                todos_data = json.loads(json_match.group())
-            else:
-                todos_data = [{"content": f"Complete {current_phase}", "priority": "high"}]
-        except json.JSONDecodeError:
-            todos_data = [{"content": f"Complete {current_phase}", "priority": "high"}]
-
-        # Add todos
-        todo_manager.clear()
-        for todo_data in todos_data:
-            todo_manager.add(
-                content=todo_data.get("content", "Unknown task"),
-                priority=todo_data.get("priority", "medium"),
-            )
-
-        logger.info(f"[{job_id}] Created {len(todos_data)} todos for {current_phase}")
-
-        todo_list = todo_manager.format_for_display()
-        message = AIMessage(
-            content=f"Todos for {current_phase}:\n\n{todo_list}"
-        )
-
-        return {
-            "messages": [message],
-        }
-
-    return create_todos
-
-
-# =============================================================================
-# EXECUTE PHASE NODES (Inner Loop)
+# EXECUTE PHASE NODES (ReAct Loop)
 # =============================================================================
 
 
@@ -787,10 +272,21 @@ def create_execute_node(
     system_prompt_template: str,
     config: AgentConfig,
     context_mgr: ContextManager,
+    use_phase_prompts: bool = False,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node.
 
     This is the main ReAct execution node that processes todos.
+
+    Args:
+        llm_with_tools: LLM with tools bound for execution
+        todo_manager: TodoManager for task tracking
+        memory_manager: MemoryManager for workspace.md access
+        workspace_manager: WorkspaceManager for file operations
+        system_prompt_template: Legacy system prompt template (used if use_phase_prompts=False)
+        config: Agent configuration
+        context_mgr: ContextManager for context window management
+        use_phase_prompts: If True, use phase-aware prompts (strategic/tactical)
     """
 
     def execute(state: UniversalAgentState) -> Dict[str, Any]:
@@ -810,13 +306,29 @@ def create_execute_node(
         if workspace_manager.exists("workspace.md"):
             workspace_content = workspace_manager.read_file("workspace.md")
 
-        # Render system prompt with current todos and workspace
-        full_system = render_system_prompt(
-            template=system_prompt_template,
-            config=config,
-            todos_content=todos_content,
-            workspace_content=workspace_content,
-        )
+        # Get system prompt - use phase-aware if enabled
+        if use_phase_prompts:
+            is_strategic = state.get("is_strategic_phase", True)
+            phase_number = state.get("phase_number", 0)
+            full_system = get_phase_system_prompt(
+                config=config,
+                is_strategic=is_strategic,
+                phase_number=phase_number,
+                todos_content=todos_content,
+                workspace_content=workspace_content,
+            )
+            logger.debug(
+                f"[{job_id}] Using {'strategic' if is_strategic else 'tactical'} "
+                f"prompt for phase {phase_number}"
+            )
+        else:
+            # Legacy: use the pre-loaded template
+            full_system = render_system_prompt(
+                template=system_prompt_template,
+                config=config,
+                todos_content=todos_content,
+                workspace_content=workspace_content,
+            )
         prepared_messages.append(SystemMessage(content=full_system))
 
         # Always clear old tool results, keep last 10
@@ -1115,6 +627,83 @@ def create_archive_phase_node(
     return archive_phase
 
 
+def create_handle_transition_node(
+    workspace: WorkspaceManager,
+    todo_manager: TodoManager,
+    config: AgentConfig,
+    min_todos: int = 5,
+    max_todos: int = 20,
+) -> Callable[[UniversalAgentState], Dict[str, Any]]:
+    """Create the handle_transition node.
+
+    This node handles phase transitions between strategic and tactical modes.
+    It validates todos.yaml for strategic->tactical transitions and archives
+    todos for tactical->strategic transitions.
+
+    Args:
+        workspace: WorkspaceManager for file access
+        todo_manager: TodoManager for todo operations
+        config: Agent configuration
+        min_todos: Minimum todos for strategic->tactical transition
+        max_todos: Maximum todos for strategic->tactical transition
+    """
+
+    def handle_transition(state: UniversalAgentState) -> Dict[str, Any]:
+        """Handle phase transition based on current mode."""
+        job_id = state.get("job_id", "unknown")
+        iteration = state.get("iteration", 0)
+        is_strategic = state.get("is_strategic_phase", True)
+
+        logger.info(
+            f"[{job_id}] Handling phase transition from "
+            f"{'strategic' if is_strategic else 'tactical'} phase"
+        )
+
+        # Call transition handler
+        result = handle_phase_transition(
+            state=state,
+            workspace=workspace,
+            todo_manager=todo_manager,
+            min_todos=min_todos,
+            max_todos=max_todos,
+        )
+
+        # Audit transition attempt
+        auditor = get_archiver()
+        if auditor:
+            auditor.audit_step(
+                job_id=job_id,
+                agent_type=config.agent_id,
+                step_type="phase_transition",
+                node_name="handle_transition",
+                iteration=iteration,
+                data={
+                    "transition": {
+                        "from_phase": "strategic" if is_strategic else "tactical",
+                        "to_phase": "tactical" if is_strategic else "strategic",
+                        "success": result.success,
+                        "error": result.error_message,
+                        "new_phase_number": result.state_updates.get("phase_number"),
+                    }
+                },
+                metadata=state.get("metadata"),
+            )
+
+        if result.success:
+            logger.info(
+                f"[{job_id}] Phase transition successful: "
+                f"phase_number={result.state_updates.get('phase_number')}"
+            )
+        else:
+            logger.warning(
+                f"[{job_id}] Phase transition rejected: {result.error_message}"
+            )
+
+        return result.state_updates
+
+    return handle_transition
+
+
 # =============================================================================
 # GOAL CHECK NODE
 # =============================================================================
@@ -1122,11 +711,13 @@ def create_archive_phase_node(
 
 def create_check_goal_node(
     plan_manager: PlanManager,
+    workspace: WorkspaceManager,
     config: AgentConfig,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the check_goal node.
 
     This node checks if the overall goal is achieved.
+    Supports both legacy plan completion and phase alternation job_complete.
     """
 
     def check_goal(state: UniversalAgentState) -> Dict[str, Any]:
@@ -1134,7 +725,37 @@ def create_check_goal_node(
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
 
-        # Check if plan is complete
+        # Phase alternation: check if job_complete was called
+        # (writes output/job_completion.json)
+        job_completion_path = workspace.get_path("output/job_completion.json")
+        if job_completion_path.exists():
+            logger.info(f"[{job_id}] Goal achieved - job_complete called")
+
+            # Audit goal achieved
+            auditor = get_archiver()
+            if auditor:
+                auditor.audit_step(
+                    job_id=job_id,
+                    agent_type=config.agent_id,
+                    step_type="check",
+                    node_name="check_goal",
+                    iteration=iteration,
+                    data={
+                        "check": {
+                            "decision": "goal_achieved",
+                            "goal_achieved": True,
+                            "reason": "job_complete_called",
+                        }
+                    },
+                    metadata=state.get("metadata"),
+                )
+
+            return {
+                "goal_achieved": True,
+                "should_stop": True,
+            }
+
+        # Legacy: Check if plan is complete
         is_complete = plan_manager.is_complete()
 
         if is_complete:
@@ -1226,12 +847,6 @@ def create_check_goal_node(
 # =============================================================================
 
 
-def route_after_init(state: UniversalAgentState) -> Literal["read_plan", "execute"]:
-    """Route after initialization based on whether we have todos."""
-    # After init, go directly to execute (todos already created)
-    return "execute"
-
-
 def route_after_execute(state: UniversalAgentState) -> Literal["tools", "check_todos"]:
     """Route from execute based on tool calls."""
     messages = state.get("messages", [])
@@ -1255,18 +870,41 @@ def route_after_check_todos(state: UniversalAgentState) -> Literal["execute", "a
     return "execute"
 
 
-def route_after_check_goal(state: UniversalAgentState) -> Literal["read_plan", "end"]:
-    """Route based on whether goal is achieved."""
-    if state.get("goal_achieved", False) or state.get("should_stop", False):
-        return "end"
-    return "read_plan"
+def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "execute"]:
+    """Route at entry based on initialization state.
 
-
-def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "read_plan"]:
-    """Route at entry based on initialization state."""
+    If already initialized (resume), go directly to execute.
+    Otherwise, start initialization flow.
+    """
     if state.get("initialized", False):
-        return "read_plan"
+        return "execute"
     return "init_workspace"
+
+
+def route_after_transition(
+    state: UniversalAgentState,
+) -> Literal["execute", "check_goal"]:
+    """Route after phase transition based on success/failure.
+
+    If transition was rejected (messages contain error), go back to execute
+    so the agent can fix the issue. If transition succeeded (messages cleared),
+    proceed to check_goal.
+    """
+    messages = state.get("messages", [])
+
+    # If messages is empty, transition succeeded and cleared history
+    if not messages:
+        return "check_goal"
+
+    # If messages exist, check if it's a rejection error
+    if messages:
+        last_msg = messages[-1]
+        content = getattr(last_msg, "content", "") or ""
+        if "[TRANSITION_REJECTED]" in content:
+            return "execute"
+
+    # Default: proceed to goal check
+    return "check_goal"
 
 
 # =============================================================================
@@ -1362,8 +1000,7 @@ def create_audited_tool_node(
 # =============================================================================
 
 
-def build_nested_loop_graph(
-    llm: BaseChatModel,
+def build_phase_alternation_graph(
     llm_with_tools: BaseChatModel,
     tools: List[Any],
     config: AgentConfig,
@@ -1371,17 +1008,20 @@ def build_nested_loop_graph(
     workspace: WorkspaceManager,
     workspace_template: str = "",
     checkpointer: Optional[BaseCheckpointSaver] = None,
+    summarization_llm: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
-    """Build the nested loop graph for the Universal Agent.
+    """Build the phase alternation graph for the Universal Agent.
 
-    Creates the full nested loop architecture with:
-    - Initialization flow (first run only)
-    - Outer loop (plan phase transitions)
-    - Inner loop (ReAct execution)
-    - Goal check
+    Creates a single ReAct loop that alternates between strategic and tactical
+    phases. The strategic agent uses tools to plan and create todos, while the
+    tactical agent executes domain-specific work.
+
+    Graph structure:
+    - Initialization: init_workspace -> init_strategic_todos
+    - ReAct loop: execute -> tools -> check_todos -> archive_phase -> handle_transition
+    - Goal check: check_goal -> END or back to execute
 
     Args:
-        llm: LLM for planning/memory updates (no tools)
         llm_with_tools: LLM with tools bound for execution
         tools: List of tool objects
         config: Agent configuration
@@ -1390,6 +1030,8 @@ def build_nested_loop_graph(
         workspace_template: Template content for workspace.md
         checkpointer: Optional LangGraph checkpointer for state persistence.
             When provided, enables resume after crash using the same thread_id.
+        summarization_llm: Optional LLM for context summarization at phase boundaries.
+            If not provided, uses llm_with_tools for summarization.
 
     Returns:
         Compiled StateGraph with checkpointing if checkpointer provided
@@ -1408,92 +1050,68 @@ def build_nested_loop_graph(
     )
     context_mgr = ContextManager(config=context_config, model=config.llm.model)
 
-    # Load prompts from files
-    planning_prompt = load_planning_prompt()
-    todo_extraction_prompt = load_todo_extraction_prompt()
-    memory_update_prompt = load_memory_update_prompt()
+    # Load summarization prompt
     summarization_prompt = load_summarization_prompt(config)
 
     if not workspace_template:
         raise ValueError("workspace_template is required")
 
+    # Use provided summarization LLM or fall back to main LLM
+    llm_for_summarization = summarization_llm or llm_with_tools
+
     # Create graph
     workflow = StateGraph(UniversalAgentState)
 
     # Create nodes
-    # Initialization
     init_workspace = create_init_workspace_node(memory_manager, workspace_template, config)
-    read_instructions = create_read_instructions_node(workspace, config)
-    create_plan = create_create_plan_node(llm, plan_manager, config, planning_prompt)
-    init_todos = create_init_todos_node(llm, plan_manager, todo_manager, config, todo_extraction_prompt)
+    init_strategic_todos = create_init_strategic_todos_node(workspace, todo_manager, config)
 
-    # Plan phase
-    read_plan = create_read_plan_node(plan_manager, memory_manager, config)
-    update_memory = create_update_memory_node(llm, memory_manager, config, memory_update_prompt)
-    create_todos = create_create_todos_node(llm, plan_manager, todo_manager, config, todo_extraction_prompt)
-
-    # Execute phase
     execute = create_execute_node(
         llm_with_tools, todo_manager, memory_manager, workspace,
-        system_prompt_template, config, context_mgr
+        system_prompt_template, config, context_mgr,
+        use_phase_prompts=True,
     )
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(
         todo_manager, plan_manager, config,
-        context_mgr, llm, summarization_prompt
+        context_mgr, llm_for_summarization, summarization_prompt
     )
 
-    # Goal check
-    check_goal = create_check_goal_node(plan_manager, config)
+    handle_transition = create_handle_transition_node(
+        workspace, todo_manager, config,
+        min_todos=config.phase_settings.min_todos,
+        max_todos=config.phase_settings.max_todos,
+    )
 
-    # Tools node (with audit logging)
+    check_goal = create_check_goal_node(plan_manager, workspace, config)
     tool_node = create_audited_tool_node(tools, config)
 
     # Add nodes to graph
     workflow.add_node("init_workspace", init_workspace)
-    workflow.add_node("read_instructions", read_instructions)
-    workflow.add_node("create_plan", create_plan)
-    workflow.add_node("init_todos", init_todos)
-
-    workflow.add_node("read_plan", read_plan)
-    workflow.add_node("update_memory", update_memory)
-    workflow.add_node("create_todos", create_todos)
-
+    workflow.add_node("init_strategic_todos", init_strategic_todos)
     workflow.add_node("execute", execute)
     workflow.add_node("tools", tool_node)
     workflow.add_node("check_todos", check_todos)
     workflow.add_node("archive_phase", archive_phase)
-
+    workflow.add_node("handle_transition", handle_transition)
     workflow.add_node("check_goal", check_goal)
+
+    logger.info("Building phase alternation graph")
 
     # Set conditional entry point
     workflow.set_conditional_entry_point(
         route_entry,
         {
             "init_workspace": "init_workspace",
-            "read_plan": "read_plan",
-        },
-    )
-
-    # Wire initialization sequence
-    workflow.add_edge("init_workspace", "read_instructions")
-    workflow.add_edge("read_instructions", "create_plan")
-    workflow.add_edge("create_plan", "init_todos")
-    workflow.add_edge("init_todos", "execute")  # Go directly to execute after init
-
-    # Wire plan phase (outer loop entry)
-    workflow.add_edge("read_plan", "update_memory")
-    workflow.add_edge("update_memory", "create_todos")
-    workflow.add_conditional_edges(
-        "create_todos",
-        lambda s: "check_goal" if s.get("goal_achieved") else "execute",
-        {
             "execute": "execute",
-            "check_goal": "check_goal",
         },
     )
 
-    # Wire execute phase (inner loop)
+    # Wire initialization: init_workspace -> init_strategic_todos -> execute
+    workflow.add_edge("init_workspace", "init_strategic_todos")
+    workflow.add_edge("init_strategic_todos", "execute")
+
+    # Wire ReAct loop
     workflow.add_conditional_edges(
         "execute",
         route_after_execute,
@@ -1502,9 +1120,7 @@ def build_nested_loop_graph(
             "check_todos": "check_todos",
         },
     )
-
     workflow.add_edge("tools", "check_todos")
-
     workflow.add_conditional_edges(
         "check_todos",
         route_after_check_todos,
@@ -1514,20 +1130,77 @@ def build_nested_loop_graph(
         },
     )
 
-    # Wire phase completion to goal check
-    workflow.add_edge("archive_phase", "check_goal")
+    # Wire phase transition
+    workflow.add_edge("archive_phase", "handle_transition")
+    workflow.add_conditional_edges(
+        "handle_transition",
+        route_after_transition,
+        {
+            "execute": "execute",  # Transition rejected, agent fixes issue
+            "check_goal": "check_goal",  # Transition succeeded
+        },
+    )
 
-    # Wire goal check (outer loop exit or continue)
+    # Wire goal check
     workflow.add_conditional_edges(
         "check_goal",
-        route_after_check_goal,
+        lambda s: "end" if s.get("goal_achieved") or s.get("should_stop") else "execute",
         {
-            "read_plan": "read_plan",
+            "execute": "execute",
             "end": END,
         },
     )
 
     return workflow.compile(checkpointer=checkpointer)
+
+
+# Backward compatibility alias
+def build_nested_loop_graph(
+    llm: BaseChatModel,
+    llm_with_tools: BaseChatModel,
+    tools: List[Any],
+    config: AgentConfig,
+    system_prompt_template: str,
+    workspace: WorkspaceManager,
+    workspace_template: str = "",
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+    use_phase_alternation: bool = True,
+) -> CompiledStateGraph:
+    """Build the graph for the Universal Agent (deprecated).
+
+    This function is deprecated. Use build_phase_alternation_graph() instead.
+    The `llm` and `use_phase_alternation` parameters are now ignored.
+
+    Args:
+        llm: Deprecated - ignored (was for planning/memory updates)
+        llm_with_tools: LLM with tools bound for execution
+        tools: List of tool objects
+        config: Agent configuration
+        system_prompt_template: Raw system prompt template with placeholders
+        workspace: WorkspaceManager instance
+        workspace_template: Template content for workspace.md
+        checkpointer: Optional LangGraph checkpointer
+        use_phase_alternation: Deprecated - ignored (always True)
+
+    Returns:
+        Compiled StateGraph
+    """
+    import warnings
+    warnings.warn(
+        "build_nested_loop_graph is deprecated, use build_phase_alternation_graph instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return build_phase_alternation_graph(
+        llm_with_tools=llm_with_tools,
+        tools=tools,
+        config=config,
+        system_prompt_template=system_prompt_template,
+        workspace=workspace,
+        workspace_template=workspace_template,
+        checkpointer=checkpointer,
+        summarization_llm=llm,  # Use old llm param for summarization
+    )
 
 
 # =============================================================================

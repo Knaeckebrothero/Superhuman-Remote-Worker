@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
+# Phase availability: domain tools are tactical-only
 GRAPH_TOOLS_METADATA = {
     "execute_cypher_query": {
         "module": "graph_tools",
@@ -29,6 +30,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Execute Cypher query against Neo4j database.",
+        "phases": ["tactical"],
     },
     "get_database_schema": {
         "module": "graph_tools",
@@ -37,6 +39,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Get Neo4j schema (labels, relationships, properties).",
+        "phases": ["tactical"],
     },
     "find_similar_requirements": {
         "module": "graph_tools",
@@ -45,6 +48,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Find similar requirements by text similarity.",
+        "phases": ["tactical"],
     },
     "check_for_duplicates": {
         "module": "graph_tools",
@@ -53,6 +57,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Check if requirement is a duplicate (95% threshold).",
+        "phases": ["tactical"],
     },
     "resolve_business_object": {
         "module": "graph_tools",
@@ -61,6 +66,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Resolve mention to existing BusinessObject node.",
+        "phases": ["tactical"],
     },
     "resolve_message": {
         "module": "graph_tools",
@@ -69,6 +75,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Resolve mention to existing Message node.",
+        "phases": ["tactical"],
     },
     "validate_schema_compliance": {
         "module": "graph_tools",
@@ -77,6 +84,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Run metamodel compliance checks (structural/relationships/quality).",
+        "phases": ["tactical"],
     },
     "create_requirement_node": {
         "module": "graph_tools",
@@ -85,6 +93,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Create new Requirement node in Neo4j graph.",
+        "phases": ["tactical"],
     },
     "create_fulfillment_relationship": {
         "module": "graph_tools",
@@ -93,6 +102,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Create fulfillment relationship (FULFILLED_BY_*, etc.).",
+        "phases": ["tactical"],
     },
     "generate_requirement_id": {
         "module": "graph_tools",
@@ -101,6 +111,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Generate new unique R-XXXX requirement ID.",
+        "phases": ["tactical"],
     },
     "get_entity_relationships": {
         "module": "graph_tools",
@@ -109,6 +120,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Get all relationships for a BusinessObject or Message.",
+        "phases": ["tactical"],
     },
     "count_graph_statistics": {
         "module": "graph_tools",
@@ -117,6 +129,7 @@ GRAPH_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Get node and relationship counts in the graph.",
+        "phases": ["tactical"],
     },
 }
 

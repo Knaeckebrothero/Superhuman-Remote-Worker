@@ -293,6 +293,18 @@ class ContextManagementConfig:
 
 
 @dataclass
+class PhaseSettings:
+    """Phase alternation settings.
+
+    Controls the strategic/tactical phase transitions.
+    """
+
+    min_todos: int = 5  # Minimum todos required for strategic->tactical transition
+    max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
+    archive_on_transition: bool = True  # Archive todos on tactical->strategic transition
+
+
+@dataclass
 class AgentConfig:
     """Complete agent configuration.
 
@@ -312,6 +324,7 @@ class AgentConfig:
     context_management: ContextManagementConfig = field(
         default_factory=ContextManagementConfig
     )
+    phase_settings: PhaseSettings = field(default_factory=PhaseSettings)
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -435,10 +448,18 @@ def load_agent_config(
         ),
     )
 
+    phase_data = data.get("phase_settings", {})
+    phase_config = PhaseSettings(
+        min_todos=phase_data.get("min_todos", 5),
+        max_todos=phase_data.get("max_todos", 20),
+        archive_on_transition=phase_data.get("archive_on_transition", True),
+    )
+
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
-        "tools", "todo", "connections", "polling", "limits", "context_management"
+        "tools", "todo", "connections", "polling", "limits", "context_management",
+        "phase_settings"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -454,6 +475,7 @@ def load_agent_config(
         polling=polling_config,
         limits=limits_config,
         context_management=context_config,
+        phase_settings=phase_config,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -595,6 +617,152 @@ def load_system_prompt(
     return render_system_prompt(
         template=template,
         config=config,
+        todos_content=todos_content,
+        workspace_content=workspace_content,
+    )
+
+
+# =============================================================================
+# Phase-Aware System Prompts
+# =============================================================================
+
+
+def load_strategic_prompt_template(config_dir: Optional[str] = None) -> str:
+    """Load the strategic phase system prompt template.
+
+    Args:
+        config_dir: Base directory for config files (default: src/config)
+
+    Returns:
+        Raw template string with placeholders
+    """
+    if config_dir is None:
+        config_dir = Path(__file__).parent.parent / "config"
+    else:
+        config_dir = Path(config_dir)
+
+    prompt_path = config_dir / "prompts" / "strategic_system.md"
+
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Strategic prompt not found: {prompt_path}")
+
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_tactical_prompt_template(config_dir: Optional[str] = None) -> str:
+    """Load the tactical phase system prompt template.
+
+    Args:
+        config_dir: Base directory for config files (default: src/config)
+
+    Returns:
+        Raw template string with placeholders
+    """
+    if config_dir is None:
+        config_dir = Path(__file__).parent.parent / "config"
+    else:
+        config_dir = Path(config_dir)
+
+    prompt_path = config_dir / "prompts" / "tactical_system.md"
+
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Tactical prompt not found: {prompt_path}")
+
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_phase_prompt_template(
+    is_strategic: bool,
+    config_dir: Optional[str] = None,
+) -> str:
+    """Load the system prompt template for the current phase.
+
+    Args:
+        is_strategic: True for strategic phase, False for tactical
+        config_dir: Base directory for config files
+
+    Returns:
+        Raw template string with placeholders
+    """
+    if is_strategic:
+        return load_strategic_prompt_template(config_dir)
+    else:
+        return load_tactical_prompt_template(config_dir)
+
+
+def render_phase_prompt(
+    template: str,
+    config: AgentConfig,
+    phase_number: int = 0,
+    todos_content: str = "",
+    workspace_content: str = "",
+) -> str:
+    """Render phase system prompt template with current values.
+
+    Args:
+        template: Raw template string with placeholders
+        config: Agent configuration
+        phase_number: Current phase number
+        todos_content: Formatted todo list string
+        workspace_content: Contents of workspace.md
+
+    Returns:
+        Rendered system prompt string
+    """
+    oss_reasoning_level = config.llm.reasoning_level or "high"
+
+    return template.format(
+        agent_display_name=config.display_name,
+        oss_reasoning_level=oss_reasoning_level,
+        phase_number=phase_number,
+        todos_content=todos_content,
+        workspace_content=workspace_content,
+    )
+
+
+def get_phase_system_prompt(
+    config: AgentConfig,
+    is_strategic: bool,
+    phase_number: int = 0,
+    todos_content: str = "",
+    workspace_content: str = "",
+    config_dir: Optional[str] = None,
+) -> str:
+    """Get the complete system prompt for the current phase.
+
+    This is the main entry point for phase-aware prompts. It loads the
+    appropriate template (strategic or tactical) and renders it with
+    the current state.
+
+    Args:
+        config: Agent configuration
+        is_strategic: True for strategic phase, False for tactical
+        phase_number: Current phase number
+        todos_content: Formatted todo list string
+        workspace_content: Contents of workspace.md
+        config_dir: Base directory for config files
+
+    Returns:
+        Fully rendered system prompt string
+
+    Example:
+        ```python
+        prompt = get_phase_system_prompt(
+            config=config,
+            is_strategic=True,
+            phase_number=1,
+            todos_content="- Explore workspace\\n- Create plan",
+            workspace_content="## Overview\\n...",
+        )
+        ```
+    """
+    template = load_phase_prompt_template(is_strategic, config_dir)
+    return render_phase_prompt(
+        template=template,
+        config=config,
+        phase_number=phase_number,
         todos_content=todos_content,
         workspace_content=workspace_content,
     )

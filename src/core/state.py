@@ -43,6 +43,10 @@ class UniversalAgentState(TypedDict):
         iteration: Current iteration count (safety limit)
         max_iterations: Maximum iterations before forced stop
 
+        # Phase alternation (strategic/tactical mode)
+        is_strategic_phase: True = strategic mode (planning), False = tactical mode (execution)
+        phase_number: Increments at each phase transition (for tracking/logging)
+
         # File-based context
         workspace_memory: Contents of workspace.md for system prompt
 
@@ -75,6 +79,10 @@ class UniversalAgentState(TypedDict):
     goal_achieved: bool                  # Outer loop exit: plan complete
     iteration: int                       # Current iteration count
     max_iterations: int                  # Safety limit
+
+    # Phase alternation (strategic/tactical mode)
+    is_strategic_phase: bool             # True = strategic mode, False = tactical mode
+    phase_number: int                    # Increments at each phase transition
 
     # File-based context (read from workspace into state)
     workspace_memory: str                # Contents of workspace.md
@@ -148,6 +156,10 @@ def create_initial_state(
         goal_achieved=False,
         iteration=0,
         max_iterations=max_iterations,
+
+        # Phase alternation (start in strategic mode)
+        is_strategic_phase=True,
+        phase_number=0,
 
         # File-based context
         workspace_memory="",
