@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
+# Phase availability: domain tools are tactical-only
 CITATION_TOOLS_METADATA = {
     "cite_document": {
         "module": "citation_tools",
@@ -26,6 +27,7 @@ CITATION_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Create verified citation for document content.",
+        "phases": ["tactical"],
     },
     "cite_web": {
         "module": "citation_tools",
@@ -34,6 +36,7 @@ CITATION_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Create verified citation for web content.",
+        "phases": ["tactical"],
     },
     "list_sources": {
         "module": "citation_tools",
@@ -42,6 +45,7 @@ CITATION_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "List all registered citation sources.",
+        "phases": ["tactical"],
     },
     "get_citation": {
         "module": "citation_tools",
@@ -50,6 +54,7 @@ CITATION_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Get details about a specific citation by ID.",
+        "phases": ["tactical"],
     },
 }
 

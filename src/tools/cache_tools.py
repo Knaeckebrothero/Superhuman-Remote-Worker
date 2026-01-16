@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
+# Phase availability: domain tools are tactical-only
 CACHE_TOOLS_METADATA = {
     "add_requirement": {
         "module": "cache_tools",
@@ -30,6 +31,7 @@ CACHE_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Submit a finalized requirement for validation by the Validator Agent.",
+        "phases": ["tactical"],
     },
     "list_requirements": {
         "module": "cache_tools",
@@ -38,6 +40,7 @@ CACHE_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "List requirements with filters (status, job_id, limit).",
+        "phases": ["tactical"],
     },
     "get_requirement": {
         "module": "cache_tools",
@@ -46,6 +49,7 @@ CACHE_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Get complete details of a requirement by ID.",
+        "phases": ["tactical"],
     },
 }
 
