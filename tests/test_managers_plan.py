@@ -25,12 +25,12 @@ def _import_module_directly(module_path: Path, module_name: str):
 
 
 # Import workspace manager first (dependency)
-workspace_path = project_root / "src" / "agent" / "core" / "workspace.py"
+workspace_path = project_root / "src" / "core" / "workspace.py"
 workspace_module = _import_module_directly(workspace_path, "test_plan_workspace_mgr")
 WorkspaceManager = workspace_module.WorkspaceManager
 
 # Import the plan module
-plan_path = project_root / "src" / "agent" / "managers" / "plan.py"
+plan_path = project_root / "src" / "managers" / "plan.py"
 plan_module = _import_module_directly(plan_path, "test_plan_manager")
 PlanManager = plan_module.PlanManager
 
@@ -64,7 +64,7 @@ class TestPlanManagerBasics:
 
     def test_plan_file_constant(self):
         """Test that plan file constant is set correctly."""
-        assert PlanManager.PLAN_FILE == "main_plan.md"
+        assert PlanManager.PLAN_FILE == "plan.md"
 
     def test_exists_false_initially(self, plan_manager):
         """Test that plan doesn't exist initially."""

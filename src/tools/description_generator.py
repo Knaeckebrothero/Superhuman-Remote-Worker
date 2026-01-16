@@ -78,7 +78,7 @@ Creates parent directories automatically if they don't exist.
 Overwrites the file if it already exists.
 
 **Use this to:**
-- Create plans (main_plan.md)
+- Create plans (plan.md)
 - Save research notes (research.md, document_analysis.md)
 - Write intermediate results (candidates/candidates.md)
 - Store processed data (chunks/chunk_001.md)

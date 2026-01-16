@@ -8,6 +8,7 @@ A Graph-RAG system for requirement traceability and compliance checking. Uses La
 - [Production Deployment](#production-deployment)
 - [Development Setup](#development-setup)
 - [Architecture](#architecture)
+- [Debugging](#debugging)
 - [License](#license)
 
 ## Prerequisites
@@ -251,6 +252,66 @@ Configs live in `configs/{name}/` and extend framework defaults via `$extends`. 
 2. Validator queries pending requirements → validates → integrates into Neo4j
 
 For detailed configuration, API reference, and development guidelines, see [CLAUDE.md](CLAUDE.md).
+
+## Debugging
+
+### Workspace Files and Logs
+
+Per-job files are stored in the workspace directory:
+- **Workspace files**: `workspace/job_<uuid>/` - Contains `workspace.md`, `todos.yaml`, `plan.md`, and subdirectories
+- **Checkpoints**: `workspace/checkpoints/job_<id>.db` - SQLite checkpoint for resume capability
+- **Logs**: `workspace/logs/job_<id>.log` - Agent execution logs
+
+```bash
+# Clean up checkpoint/log files for a specific job
+rm workspace/checkpoints/job_<id>.db workspace/logs/job_<id>.log
+
+# Clean up all checkpoints and logs
+rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
+```
+
+### MongoDB Conversation Viewer
+
+MongoDB stores LLM request/response history and agent audit trails for debugging. Enable by setting `MONGODB_URL` in `.env`:
+
+```bash
+MONGODB_URL=mongodb://localhost:27017/graphrag_logs
+```
+
+Use `scripts/view_llm_conversation.py` to inspect agent behavior:
+
+```bash
+# List all jobs with records
+python scripts/view_llm_conversation.py --list
+
+# View LLM conversation for a job
+python scripts/view_llm_conversation.py --job-id <uuid>
+
+# View job statistics (token usage, latency, duration)
+python scripts/view_llm_conversation.py --job-id <uuid> --stats
+
+# View complete agent audit trail (all steps)
+python scripts/view_llm_conversation.py --job-id <uuid> --audit
+
+# View only tool calls in audit trail
+python scripts/view_llm_conversation.py --job-id <uuid> --audit --step-type tool_call
+
+# View audit as timeline visualization
+python scripts/view_llm_conversation.py --job-id <uuid> --audit --timeline
+
+# Export conversation to JSON
+python scripts/view_llm_conversation.py --job-id <uuid> --export conversation.json
+
+# View single LLM request as HTML (opens in browser)
+python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --temp
+
+# View recent requests across all jobs
+python scripts/view_llm_conversation.py --recent 20
+```
+
+MongoDB collections:
+- `llm_requests` - Full LLM request/response with messages, model, latency, token usage
+- `agent_audit` - Step-by-step execution trace (tool calls, phase transitions, routing decisions)
 
 ## License
 

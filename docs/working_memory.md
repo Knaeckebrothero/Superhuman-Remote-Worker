@@ -256,7 +256,7 @@ The graph is built with the template **before** execution starts. The `init_work
 - Then proceeds to planning with full context
 
 **Pros**:
-- Agent has context before creating main_plan.md
+- Agent has context before creating plan.md
 - Still part of initialization sequence
 - Logical flow: read task → explore workspace → plan
 
