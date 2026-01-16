@@ -13,13 +13,6 @@ Track your current position in the plan and overall progress.
 - **Progress**: (brief progress indicator)
 - **Blocked**: (any blockers, or "none")
 
-## Accomplishments
-
-Record completed milestones. Focus on outcomes, not individual steps.
-This helps you (and reviewers) understand what has been achieved.
-
-(Example: "Completed Phase 1 - extracted 23 requirements from 45 pages")
-
 ## Key Decisions
 
 Document decisions AND their reasoning. Future-you needs to understand WHY.
@@ -33,10 +26,3 @@ Track resolved entity IDs, names, and relationships. This is your reference tabl
 for anything you'll need to look up repeatedly.
 
 (Example: "Customer: BO-042 | Invoice: BO-015 | Payment: BO-023")
-
-## Notes
-
-Working observations, reminders, and anything that doesn't fit above.
-Keep this section lean - move stable information to appropriate sections.
-
-(Example: "Page 12 has OCR issues - interpreted 'Aufbewahrungsfrist' manually")

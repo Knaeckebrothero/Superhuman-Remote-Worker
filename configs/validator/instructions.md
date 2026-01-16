@@ -11,7 +11,7 @@ Analyze requirement candidates, check relevance and duplicates, assess fulfillme
 <tool_categories>
 **Workspace**: `read_file`, `write_file`, `append_file`, `list_files`, `search_files`, `file_exists`, `get_workspace_summary`
 
-**Todos**: `todo_write`, `todo_complete`, `todo_rewind`, `archive_and_reset`
+**Todos**: `next_phase_todos`, `todo_complete`, `todo_rewind`
 
 **Graph Exploration**: `execute_cypher_query`, `get_database_schema`, `count_graph_statistics`
 

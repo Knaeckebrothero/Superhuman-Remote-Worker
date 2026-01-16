@@ -512,7 +512,7 @@ class TodoManager:
     def set_todos_from_list(self, todo_list: List[Dict[str, Any]]) -> str:
         """Replace all todos with items from a list of dictionaries.
 
-        This is used by the todo_write tool to atomically replace the
+        This is used by the next_phase_todos tool to atomically replace the
         entire todo list.
 
         Args:
@@ -579,7 +579,7 @@ class TodoManager:
         return (
             f"Archived {count} todos to {archive_path}.\n"
             f"Todo list cleared. Ready for new phase.\n"
-            f"Use todo_write to add new tasks."
+            f"Use next_phase_todos to add new tasks."
         )
 
     def complete_first_pending_sync(self) -> Dict[str, Any]:

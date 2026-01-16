@@ -509,10 +509,9 @@ def on_tactical_phase_complete(
     """Handle transition from tactical phase to strategic phase.
 
     This function is called when all tactical todos are completed.
-    It archives the completed todos and transitions to strategic phase.
+    It transitions to strategic phase with predefined todos.
 
     On success:
-    - Archives completed todos to workspace/archive/
     - Clears conversation history
     - Loads predefined strategic todos
     - Flips to strategic phase
@@ -530,11 +529,7 @@ def on_tactical_phase_complete(
     job_id = state.get("job_id", "unknown")
     phase_number = state.get("phase_number", 0)
 
-    logger.info(f"[{job_id}] Tactical phase complete, archiving and transitioning")
-
-    # Archive completed todos
-    archive_path = todo_manager.archive(f"phase_{phase_number}")
-    logger.info(f"[{job_id}] Archived todos to {archive_path}")
+    logger.info(f"[{job_id}] Tactical phase complete, transitioning to strategic")
 
     # Load predefined strategic todos (from config template or defaults)
     strategic_todos = get_transition_strategic_todos(config)

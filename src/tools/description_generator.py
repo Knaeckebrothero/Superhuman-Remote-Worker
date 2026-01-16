@@ -258,23 +258,6 @@ Shows completion statistics to track phase progress.
 
 **Returns:** Progress summary with counts and percentage""",
 
-        "archive_and_reset": """Archive completed todos and reset for next phase.
-
-This tool:
-1. Saves all current todos to workspace/archive/todos_<phase>_<timestamp>.md
-2. Clears the todo list
-3. Returns confirmation prompting you to add new todos
-
-**Use this when:**
-- Completing a phase of work
-- Before transitioning to a different type of task
-- When instructed to archive progress
-
-**Arguments:**
-- `phase_name` (str, optional): Name for the archived phase (e.g., "phase_1_extraction")
-
-**Returns:** Confirmation with archive path or error message""",
-
         "get_next_todo": """Get the next pending task to work on.
 
 Returns the highest priority pending todo.

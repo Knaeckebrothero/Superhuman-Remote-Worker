@@ -11,7 +11,7 @@ Read the source document, identify requirement statements, create citations for 
 <tool_categories>
 **Workspace**: `read_file`, `write_file`, `append_file`, `list_files`, `search_files`, `file_exists`, `get_workspace_summary`
 
-**Todos**: `todo_write`, `todo_complete`, `todo_rewind`, `archive_and_reset`
+**Todos**: `next_phase_todos`, `todo_complete`, `todo_rewind`
 
 **Documents**: `get_document_info`, `read_file` (supports PDF pagination)
 

@@ -9,7 +9,6 @@ attempts (e.g., '../') are blocked by the underlying WorkspaceManager.
 """
 
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -26,8 +25,6 @@ FILE_PURPOSE_MAP = {
     "plan.md": "Execution plan",
     "instructions.md": "Task instructions",
     "workspace_summary.md": "Workspace state snapshot",
-    "accomplishments.md": "Completed milestones",
-    "notes.md": "Working notes",
     "research.md": "Research findings",
     "document_analysis.md": "Document analysis",
     "extraction_results.md": "Extraction results",
@@ -595,93 +592,6 @@ def create_workspace_tools(context: ToolContext) -> List:
             logger.error(f"get_document_info error for {path}: {e}")
             return f"Error: {str(e)}"
 
-    @tool
-    def add_accomplishment(accomplishment: str) -> str:
-        """Record an accomplishment to the accomplishments log.
-
-        Use this tool to track significant milestones and completed work.
-        Accomplishments are displayed in the workspace_summary.md and serve
-        as a high-level record of what has been achieved.
-
-        Good accomplishments are:
-        - Specific and measurable (e.g., "Extracted 23 requirements from sections 1-6")
-        - Milestone-focused (e.g., "Completed document analysis phase")
-        - Meaningful progress indicators (e.g., "Validated all high-priority requirements")
-
-        Args:
-            accomplishment: Description of the accomplishment (without leading "- ")
-
-        Returns:
-            Confirmation message
-
-        Example:
-            add_accomplishment("Extracted 47 requirements from GoBD document")
-            add_accomplishment("Completed Phase 1: Document Analysis")
-        """
-        try:
-            if not accomplishment or not accomplishment.strip():
-                return "Error: accomplishment cannot be empty"
-
-            # Normalize the accomplishment text
-            text = accomplishment.strip()
-
-            # Remove leading bullet if present
-            if text.startswith("- ") or text.startswith("* "):
-                text = text[2:]
-
-            # Format as bullet point
-            line = f"- {text}\n"
-
-            # Append to accomplishments.md (creates if doesn't exist)
-            workspace.append_file("accomplishments.md", line)
-
-            return f"Recorded: {text}"
-
-        except Exception as e:
-            logger.error(f"add_accomplishment error: {e}")
-            return f"Error recording accomplishment: {str(e)}"
-
-    @tool
-    def add_note(note: str) -> str:
-        """Add a note to the working notes log.
-
-        Use this tool to record observations, issues, or information that
-        might be useful later. Notes are displayed in workspace_summary.md.
-
-        Args:
-            note: The note to record (without leading "- ")
-
-        Returns:
-            Confirmation message
-
-        Example:
-            add_note("Document uses non-standard formatting in section 4")
-            add_note("Some requirements span multiple pages")
-        """
-        try:
-            if not note or not note.strip():
-                return "Error: note cannot be empty"
-
-            # Normalize the note text
-            text = note.strip()
-
-            # Remove leading bullet if present
-            if text.startswith("- ") or text.startswith("* "):
-                text = text[2:]
-
-            # Format as bullet point with timestamp
-            timestamp = datetime.now(timezone.utc).strftime("%H:%M")
-            line = f"- [{timestamp}] {text}\n"
-
-            # Append to notes.md (creates if doesn't exist)
-            workspace.append_file("notes.md", line)
-
-            return f"Noted: {text}"
-
-        except Exception as e:
-            logger.error(f"add_note error: {e}")
-            return f"Error adding note: {str(e)}"
-
     # Return all workspace tools
     return [
         read_file,
@@ -693,8 +603,6 @@ def create_workspace_tools(context: ToolContext) -> List:
         file_exists,
         get_workspace_summary,
         get_document_info,
-        add_accomplishment,
-        add_note,
     ]
 
 
@@ -764,20 +672,6 @@ WORKSPACE_TOOLS_METADATA = {
         "category": "workspace",
         "defer_to_workspace": True,
         "short_description": "Get PDF/document metadata (pages, size) for planning access.",
-        "phases": ["strategic", "tactical"],
-    },
-    "add_accomplishment": {
-        "module": "workspace_tools",
-        "function": "add_accomplishment",
-        "description": "Record an accomplishment milestone to accomplishments.md",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "add_note": {
-        "module": "workspace_tools",
-        "function": "add_note",
-        "description": "Add a working note to notes.md",
-        "category": "workspace",
         "phases": ["strategic", "tactical"],
     },
 }
