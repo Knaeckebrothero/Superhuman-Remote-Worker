@@ -300,7 +300,7 @@ class TestCheckGoalNode:
         """Test when plan is not complete."""
         managers["plan"].write("## Phase 1\n\n- [ ] Task 1")
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config)
+        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -311,7 +311,7 @@ class TestCheckGoalNode:
         """Test when plan is marked complete."""
         managers["plan"].write("# Plan\n\n# Complete\n\nAll done.")
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config)
+        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -328,7 +328,7 @@ class TestCheckGoalNode:
 - [x] Done
 """)
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config)
+        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -354,7 +354,7 @@ class TestCheckGoalNode:
             json.dumps(completion_data)
         )
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config)
+        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -755,7 +755,7 @@ todos:
 
         # Create check_goal node
         check_goal = create_check_goal_node(
-            managers["plan"], managers["workspace"], mock_config
+            managers["plan"], managers["workspace"], mock_config, managers["todo"]
         )
 
         state = {"job_id": "test-123", "iteration": 50}
