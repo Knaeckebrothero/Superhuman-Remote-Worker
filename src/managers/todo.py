@@ -234,8 +234,10 @@ class TodoManager:
         """Check if all todos are complete.
 
         Returns:
-            True if all todos are completed (or list is empty)
+            True if all todos are completed, False if empty or incomplete
         """
+        if not self._todos:
+            return False
         return all(t.status == TodoStatus.COMPLETED for t in self._todos)
 
     def format_for_display(self) -> str:
@@ -606,7 +608,7 @@ class TodoManager:
                 return {
                     "message": "No pending tasks to complete.",
                     "completed_id": None,
-                    "is_last_task": True,
+                    "is_last_task": self.all_complete(),  # False if empty, True only if todos exist and all complete
                 }
             target = pending[0]
 
