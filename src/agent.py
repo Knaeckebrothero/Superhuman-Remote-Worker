@@ -285,6 +285,7 @@ class UniversalAgent:
                 tools=self._tools,
                 config=self.config,
                 workspace=self._workspace_manager,
+                todo_manager=self._todo_manager,
                 workspace_template=workspace_template,
                 checkpointer=self._checkpointer,
                 summarization_llm=self._llm,  # Use base LLM for context summarization

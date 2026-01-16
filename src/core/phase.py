@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import yaml
+from langchain_core.messages import RemoveMessage
 
 if TYPE_CHECKING:
     from ..core.loader import AgentConfig
@@ -375,6 +376,22 @@ def load_todos_from_yaml(
 # =============================================================================
 
 
+def _create_clear_messages_list(state: "UniversalAgentState") -> List[RemoveMessage]:
+    """Create RemoveMessage entries to clear all messages.
+
+    LangGraph's add_messages reducer requires explicit RemoveMessage
+    entries to remove messages from state.
+
+    Args:
+        state: Current agent state containing messages to clear
+
+    Returns:
+        List of RemoveMessage entries for all messages with IDs
+    """
+    messages = state.get("messages", [])
+    return [RemoveMessage(id=msg.id) for msg in messages if hasattr(msg, 'id') and msg.id]
+
+
 @dataclass
 class TransitionResult:
     """Result of a phase transition attempt.
@@ -492,7 +509,7 @@ def on_strategic_phase_complete(
     return TransitionResult(
         success=True,
         state_updates={
-            "messages": [],  # Clear conversation history
+            "messages": _create_clear_messages_list(state),
             "is_strategic_phase": False,
             "phase_number": phase_number + 1,
             "phase_complete": False,
@@ -544,7 +561,7 @@ def on_tactical_phase_complete(
     return TransitionResult(
         success=True,
         state_updates={
-            "messages": [],  # Clear conversation history
+            "messages": _create_clear_messages_list(state),
             "is_strategic_phase": True,
             "phase_number": phase_number + 1,
             "phase_complete": False,

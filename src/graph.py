@@ -513,6 +513,12 @@ def create_check_todos_node(
                 },
             }
 
+        # Validate todos exist before checking completion
+        todos = todo_manager.list_all()
+        if not todos:
+            logger.warning(f"[{job_id}] No todos loaded - phase cannot be complete")
+            return {"phase_complete": False}
+
         # Check todos
         all_complete = todo_manager.all_complete()
         todo_manager.log_state()
@@ -723,6 +729,7 @@ def create_check_goal_node(
     plan_manager: PlanManager,
     workspace: WorkspaceManager,
     config: AgentConfig,
+    todo_manager: TodoManager,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the check_goal node.
 
@@ -795,10 +802,16 @@ def create_check_goal_node(
                 "should_stop": True,
             }
 
-        # Check if there's a next phase
+        # Check if there are pending todos - if so, goal is NOT achieved
+        pending_todos = todo_manager.list_pending()
+        if pending_todos:
+            logger.info(f"[{job_id}] Goal not achieved - {len(pending_todos)} pending todos")
+            return {"goal_achieved": False}
+
+        # Check if there's a next phase (legacy)
         next_phase = plan_manager.get_current_phase()
         if not next_phase:
-            logger.info(f"[{job_id}] No more phases - goal achieved")
+            logger.info(f"[{job_id}] No more phases and no pending todos - goal achieved")
 
             # Audit goal achieved (no more phases)
             auditor = get_archiver()
@@ -1015,6 +1028,7 @@ def build_phase_alternation_graph(
     tools: List[Any],
     config: AgentConfig,
     workspace: WorkspaceManager,
+    todo_manager: TodoManager,
     workspace_template: str = "",
     checkpointer: Optional[BaseCheckpointSaver] = None,
     summarization_llm: Optional[BaseChatModel] = None,
@@ -1035,6 +1049,7 @@ def build_phase_alternation_graph(
         tools: List of tool objects
         config: Agent configuration
         workspace: WorkspaceManager instance
+        todo_manager: TodoManager instance (must be the same one used by tools)
         workspace_template: Template content for workspace.md
         checkpointer: Optional LangGraph checkpointer for state persistence.
             When provided, enables resume after crash using the same thread_id.
@@ -1044,8 +1059,7 @@ def build_phase_alternation_graph(
     Returns:
         Compiled StateGraph with checkpointing if checkpointer provided
     """
-    # Create managers
-    todo_manager = TodoManager(workspace)
+    # Create managers (todo_manager is passed in to ensure it's the same instance used by tools)
     plan_manager = PlanManager(workspace)
     memory_manager = MemoryManager(workspace)
 
@@ -1093,7 +1107,7 @@ def build_phase_alternation_graph(
         max_todos=config.phase_settings.max_todos,
     )
 
-    check_goal = create_check_goal_node(plan_manager, workspace, config)
+    check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)
     tool_node = create_audited_tool_node(tools, config)
 
     # Add nodes to graph
@@ -1172,6 +1186,7 @@ def build_nested_loop_graph(
     config: AgentConfig,
     system_prompt_template: str,
     workspace: WorkspaceManager,
+    todo_manager: TodoManager,
     workspace_template: str = "",
     checkpointer: Optional[BaseCheckpointSaver] = None,
     use_phase_alternation: bool = True,
@@ -1189,6 +1204,7 @@ def build_nested_loop_graph(
         config: Agent configuration
         system_prompt_template: Deprecated - ignored (phase prompts used instead)
         workspace: WorkspaceManager instance
+        todo_manager: TodoManager instance (must be same one used by tools)
         workspace_template: Template content for workspace.md
         checkpointer: Optional LangGraph checkpointer
         use_phase_alternation: Deprecated - ignored (always True)
@@ -1207,6 +1223,7 @@ def build_nested_loop_graph(
         tools=tools,
         config=config,
         workspace=workspace,
+        todo_manager=todo_manager,
         workspace_template=workspace_template,
         checkpointer=checkpointer,
         summarization_llm=llm,  # Use old llm param for summarization
