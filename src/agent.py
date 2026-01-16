@@ -291,13 +291,6 @@ class UniversalAgent:
                 summarization_llm=self._llm,  # Use base LLM for context summarization
             )
 
-            # Create initial state with updated metadata (workspace-relative paths)
-            initial_state = create_initial_state(
-                job_id=job_id,
-                workspace_path=str(self._workspace_manager.path),
-                metadata=updated_metadata,
-            )
-
             # Execute graph
             thread_config = {
                 "configurable": {
@@ -306,13 +299,42 @@ class UniversalAgent:
                 "recursion_limit": self.config.limits.max_iterations * 2,
             }
 
+            # Check if we should resume from checkpoint or start fresh
+            # When resuming, pass None to continue from checkpoint state
+            # When starting fresh, pass initial_state to initialize
+            graph_input = None
+            if resume:
+                # Check if checkpoint exists
+                checkpoint_state = await self._graph.aget_state(thread_config)
+                if checkpoint_state and checkpoint_state.values:
+                    logger.info(
+                        f"Resuming from checkpoint: iteration={checkpoint_state.values.get('iteration', 0)}, "
+                        f"phase={checkpoint_state.values.get('phase_number', 0)}, "
+                        f"initialized={checkpoint_state.values.get('initialized', False)}"
+                    )
+                    graph_input = None  # Continue from checkpoint
+                else:
+                    logger.warning(f"Resume requested but no checkpoint found for job {job_id}, starting fresh")
+                    graph_input = create_initial_state(
+                        job_id=job_id,
+                        workspace_path=str(self._workspace_manager.path),
+                        metadata=updated_metadata,
+                    )
+            else:
+                # Fresh start - create initial state
+                graph_input = create_initial_state(
+                    job_id=job_id,
+                    workspace_path=str(self._workspace_manager.path),
+                    metadata=updated_metadata,
+                )
+
             if stream:
                 # For streaming, cleanup happens inside the generator
-                return self._process_job_streaming(initial_state, thread_config)
+                return self._process_job_streaming(graph_input, thread_config)
             else:
                 try:
                     final_state = await self._graph.ainvoke(
-                        initial_state,
+                        graph_input,
                         config=thread_config,
                     )
                     self._jobs_processed += 1
@@ -355,13 +377,18 @@ class UniversalAgent:
 
     async def _process_job_streaming(
         self,
-        initial_state: UniversalAgentState,
+        graph_input: Optional[UniversalAgentState],
         config: Dict[str, Any],
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Process job with streaming state updates."""
+        """Process job with streaming state updates.
+
+        Args:
+            graph_input: Initial state for new jobs, or None to resume from checkpoint
+            config: LangGraph config with thread_id
+        """
         try:
             async for state in run_graph_with_streaming(
-                self._graph, initial_state, config
+                self._graph, graph_input, config
             ):
                 yield state
 
@@ -433,6 +460,12 @@ class UniversalAgent:
 
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(workspace=self._workspace_manager)
+
+            # Try to restore todo state from saved file
+            if self._todo_manager.load_state():
+                logger.info("Restored todo state from saved checkpoint")
+            else:
+                logger.debug("No saved todo state found, starting fresh")
 
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
             return metadata or {}

@@ -137,6 +137,8 @@ class ContextConfig:
     Attributes:
         compaction_threshold_tokens: Trigger compaction when context exceeds this
         summarization_threshold_tokens: Trigger summarization when exceeds this
+        message_count_threshold: Message count threshold for alternate summarization trigger
+        message_count_min_tokens: Minimum tokens required when using message count threshold
         keep_recent_tool_results: Number of recent tool results to keep in full
         keep_recent_messages: Number of recent messages to preserve
         max_tool_result_length: Max chars for truncated tool results
@@ -146,6 +148,8 @@ class ContextConfig:
     """
     compaction_threshold_tokens: int = 100_000
     summarization_threshold_tokens: int = 100_000
+    message_count_threshold: int = 200
+    message_count_min_tokens: int = 30_000
     keep_recent_tool_results: int = 10
     keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
@@ -307,7 +311,10 @@ class ContextManager:
     def should_summarize(self, messages: List[BaseMessage]) -> bool:
         """Check if summarization is needed.
 
-        Summarization is a heavier operation, only triggered at higher threshold.
+        Summarization is triggered when:
+        1. Token count exceeds summarization_threshold_tokens, OR
+        2. Message count exceeds message_count_threshold AND
+           token count exceeds message_count_min_tokens
 
         Args:
             messages: Current message history
@@ -315,7 +322,19 @@ class ContextManager:
         Returns:
             True if summarization threshold exceeded
         """
-        return self.get_token_count(messages) > self.config.summarization_threshold_tokens
+        token_count = self.get_token_count(messages)
+        message_count = len(messages)
+
+        # Original threshold: high token count
+        if token_count > self.config.summarization_threshold_tokens:
+            return True
+
+        # New: message count threshold with minimum token requirement
+        if (message_count > self.config.message_count_threshold and
+                token_count > self.config.message_count_min_tokens):
+            return True
+
+        return False
 
     def clear_old_tool_results(
         self,

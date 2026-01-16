@@ -541,6 +541,12 @@ def create_check_todos_node(
                 metadata=state.get("metadata"),
             )
 
+        # Save todo state for crash recovery (runs after every iteration)
+        try:
+            todo_manager.save_state()
+        except Exception as e:
+            logger.warning(f"[{job_id}] Failed to save todo state: {e}")
+
         if all_complete:
             logger.info(f"[{job_id}] All todos complete")
             return {"phase_complete": True}
@@ -574,6 +580,9 @@ def create_archive_phase_node(
 
         # Archive todos
         archive_path = todo_manager.archive(current_phase or "phase")
+
+        # Clear saved state file since todos are now archived
+        todo_manager.clear_saved_state()
 
         # Mark phase complete in plan
         if current_phase:
@@ -1237,7 +1246,7 @@ def build_nested_loop_graph(
 
 async def run_graph_with_streaming(
     graph: StateGraph,
-    initial_state: UniversalAgentState,
+    graph_input: Optional[UniversalAgentState],
     config: Dict[str, Any],
 ):
     """Run the graph with streaming output.
@@ -1246,13 +1255,13 @@ async def run_graph_with_streaming(
 
     Args:
         graph: Compiled graph
-        initial_state: Initial state
+        graph_input: Initial state for new jobs, or None to resume from checkpoint
         config: LangGraph config (thread_id, recursion_limit, etc.)
 
     Yields:
         State updates from each node
     """
-    async for state in graph.astream(initial_state, config=config):
+    async for state in graph.astream(graph_input, config=config):
         yield state
 
 
