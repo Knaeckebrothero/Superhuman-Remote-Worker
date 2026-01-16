@@ -18,7 +18,6 @@
   "tools": {
     "domain": [
       "extract_document_text",
-      "get_document_info",
       "web_search",
       "cite_document",
       "cite_web",

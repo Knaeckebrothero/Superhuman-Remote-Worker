@@ -3,7 +3,7 @@
   "$comment": "Framework defaults - deployments extend this via $extends",
 
   "llm": {
-    "model": "gpt-oss-120b",
+    "model": "openai/gpt-oss-120b",
     "temperature": 0.0,
     "reasoning_level": "high",
     "base_url": null
@@ -14,11 +14,12 @@
       "archive/",
       "tools/"
     ],
+    "instructions_template": "instructions.md",
     "initial_files": {
       "workspace.md": "prompts/workspace_template.md"
-    }
+    },
+    "max_read_size": 50000
   },
-
   "tools": {
     "workspace": [
       "read_file",
@@ -28,7 +29,8 @@
       "delete_file",
       "search_files",
       "file_exists",
-      "get_workspace_summary"
+      "get_workspace_summary",
+      "get_document_info"
     ],
     "todo": [
       "todo_write",
@@ -72,5 +74,27 @@
     "compact_on_archive": true,
     "keep_recent_tool_results": 10,
     "summarization_template": "summarization_prompt.md"
+  },
+
+  "document_processing": {
+    "chunking_strategy": "general",
+    "max_chunk_size": 1000,
+    "chunk_overlap": 200,
+    "extraction_mode": "balanced",
+    "min_confidence_threshold": 0.5
+  },
+
+  "research": {
+    "web_search_enabled": false,
+    "graph_search_enabled": false,
+    "research_depth": "standard"
+  },
+
+  "validation": {
+    "duplicate_threshold": 0.9,
+    "require_citations": false,
+    "metamodel_validation_strict": false,
+    "fulfillment_confidence_threshold": 0.5,
+    "auto_integrate": false
   }
 }

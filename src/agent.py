@@ -55,7 +55,6 @@ from .core.loader import (
     AgentConfig,
     load_agent_config,
     create_llm,
-    load_system_prompt_template,
     load_instructions,
     get_all_tool_names,
     resolve_config_path,
@@ -279,16 +278,12 @@ class UniversalAgent:
             logger.info(f"Checkpointer initialized at {checkpoint_path}")
 
             # Build graph for this job
-            system_prompt_template = load_system_prompt_template()
-
-            # Load workspace template for nested loop graph
             workspace_template = self._load_workspace_template()
 
             self._graph = build_phase_alternation_graph(
                 llm_with_tools=self._llm_with_tools,
                 tools=self._tools,
                 config=self.config,
-                system_prompt_template=system_prompt_template,
                 workspace=self._workspace_manager,
                 workspace_template=workspace_template,
                 checkpointer=self._checkpointer,
@@ -381,8 +376,8 @@ class UniversalAgent:
         Returns:
             Template content for workspace.md
         """
-        # Template is at src/agent/config/prompts/workspace_template.md
-        config_dir = Path(__file__).parent / "config" / "prompts"
+        # Template is at src/config/workspace_template.md
+        config_dir = Path(__file__).parent / "config"
         template_path = config_dir / "workspace_template.md"
 
         if not template_path.exists():

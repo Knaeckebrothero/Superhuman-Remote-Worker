@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import yaml
 
 if TYPE_CHECKING:
+    from ..core.loader import AgentConfig
     from ..core.state import UniversalAgentState
     from ..core.workspace import WorkspaceManager
     from ..managers.todo import TodoManager
@@ -47,15 +48,41 @@ class PredefinedTodo:
         }
 
 
-def get_initial_strategic_todos() -> List[PredefinedTodo]:
+def get_initial_strategic_todos(
+    config: Optional["AgentConfig"] = None,
+) -> List[PredefinedTodo]:
     """Get todos for the first strategic phase (job start).
 
     These todos guide the agent through initial workspace setup,
     plan creation, and first phase todo generation.
 
+    Loads from strategic_todos_initial.yaml template with deployment override support.
+    Falls back to hardcoded defaults if template not found.
+
+    Args:
+        config: Agent configuration for deployment directory. If None, uses
+               framework defaults only.
+
     Returns:
         List of PredefinedTodo items for job initialization
     """
+    from ..core.loader import get_initial_strategic_todos_from_config
+
+    # Try to load from template
+    todo_list = get_initial_strategic_todos_from_config(config)
+
+    if todo_list:
+        # Convert from TodoManager format to PredefinedTodo
+        return [
+            PredefinedTodo(
+                id=int(t["id"].replace("todo_", "")),
+                content=t["content"],
+            )
+            for t in todo_list
+        ]
+
+    # Fallback to hardcoded defaults (for backward compatibility)
+    logger.warning("Using hardcoded initial strategic todos (template not found)")
     return [
         PredefinedTodo(
             id=1,
@@ -89,15 +116,41 @@ def get_initial_strategic_todos() -> List[PredefinedTodo]:
     ]
 
 
-def get_transition_strategic_todos() -> List[PredefinedTodo]:
+def get_transition_strategic_todos(
+    config: Optional["AgentConfig"] = None,
+) -> List[PredefinedTodo]:
     """Get todos for strategic phases between tactical phases.
 
     These todos guide the agent through summarizing the previous
     phase, updating memory, and planning the next phase.
 
+    Loads from strategic_todos_transition.yaml template with deployment override support.
+    Falls back to hardcoded defaults if template not found.
+
+    Args:
+        config: Agent configuration for deployment directory. If None, uses
+               framework defaults only.
+
     Returns:
         List of PredefinedTodo items for phase transitions
     """
+    from ..core.loader import get_transition_strategic_todos_from_config
+
+    # Try to load from template
+    todo_list = get_transition_strategic_todos_from_config(config)
+
+    if todo_list:
+        # Convert from TodoManager format to PredefinedTodo
+        return [
+            PredefinedTodo(
+                id=int(t["id"].replace("todo_", "")),
+                content=t["content"],
+            )
+            for t in todo_list
+        ]
+
+    # Fallback to hardcoded defaults (for backward compatibility)
+    logger.warning("Using hardcoded transition strategic todos (template not found)")
     return [
         PredefinedTodo(
             id=1,
@@ -476,6 +529,7 @@ def on_tactical_phase_complete(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
     todo_manager: "TodoManager",
+    config: Optional["AgentConfig"] = None,
 ) -> TransitionResult:
     """Handle transition from tactical phase to strategic phase.
 
@@ -493,6 +547,7 @@ def on_tactical_phase_complete(
         state: Current agent state
         workspace: WorkspaceManager for file access
         todo_manager: TodoManager for archiving and loading todos
+        config: Agent configuration for loading strategic todos from template
 
     Returns:
         TransitionResult with state updates for strategic phase
@@ -506,8 +561,8 @@ def on_tactical_phase_complete(
     archive_path = todo_manager.archive(f"phase_{phase_number}")
     logger.info(f"[{job_id}] Archived todos to {archive_path}")
 
-    # Load predefined strategic todos
-    strategic_todos = get_transition_strategic_todos()
+    # Load predefined strategic todos (from config template or defaults)
+    strategic_todos = get_transition_strategic_todos(config)
     todo_list = [todo.to_dict() for todo in strategic_todos]
     todo_manager.set_todos_from_list(todo_list)
 
@@ -533,6 +588,7 @@ def handle_phase_transition(
     todo_manager: "TodoManager",
     min_todos: int = 5,
     max_todos: int = 20,
+    config: Optional["AgentConfig"] = None,
 ) -> TransitionResult:
     """Route to the appropriate phase transition handler.
 
@@ -545,6 +601,7 @@ def handle_phase_transition(
         todo_manager: TodoManager for todo operations
         min_todos: Minimum todos for strategic->tactical transition
         max_todos: Maximum todos for strategic->tactical transition
+        config: Agent configuration for loading strategic todos from template
 
     Returns:
         TransitionResult from the appropriate handler
@@ -556,4 +613,4 @@ def handle_phase_transition(
             state, workspace, todo_manager, min_todos, max_todos
         )
     else:
-        return on_tactical_phase_complete(state, workspace, todo_manager)
+        return on_tactical_phase_complete(state, workspace, todo_manager, config)
