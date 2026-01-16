@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
+# Phase availability: domain tools are tactical-only
 DOCUMENT_TOOLS_METADATA = {
     "extract_document_text": {
         "module": "document_tools",
@@ -25,6 +26,7 @@ DOCUMENT_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Extract text from PDF/DOCX/TXT/HTML documents.",
+        "phases": ["tactical"],
     },
     "chunk_document": {
         "module": "document_tools",
@@ -33,6 +35,7 @@ DOCUMENT_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Split document into chunks (legal/technical/general strategies).",
+        "phases": ["tactical"],
     },
     "identify_requirement_candidates": {
         "module": "document_tools",
@@ -41,6 +44,7 @@ DOCUMENT_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "Find requirement-like statements in text.",
+        "phases": ["tactical"],
     },
 }
 

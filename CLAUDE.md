@@ -131,7 +131,7 @@ See `src/config/schema.json` for full spec.
 - `scripts/` - CLI tools and init scripts (app_init.py, init_*.py, job_status.py, list_jobs.py, cancel_job.py)
 - `agent.py` - **Entry point**: Top-level script that imports from `src/agent.py`
 
-**Manager layer:** Task management uses `src/managers/` (todo.py, plan.py, memory.py) for the nested loop graph architecture (`src/graph.py`).
+**Manager layer:** Task management uses `src/managers/` (todo.py, plan.py, memory.py) for the phase alternation architecture (`src/graph.py`).
 
 **Agent data flow:**
 1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
@@ -172,17 +172,18 @@ MongoDB database class in `src/database/mongo_db.py`.
 
 ### Universal Agent Pattern
 
-The Universal Agent (`src/`) is the primary agent implementation with a **nested loop architecture**:
+The Universal Agent (`src/`) is the primary agent implementation with a **phase alternation architecture**:
 
 **Key files:**
 - `agent.py` - Top-level entry point (imports from src/)
 - `src/agent.py` - UniversalAgent class with run loop and LLM integration
-- `src/graph.py` - **Nested loop graph** (initialization → outer loop → inner loop)
-- `src/core/state.py` - UniversalAgentState TypedDict with loop control fields
+- `src/graph.py` - **Phase alternation graph** (single ReAct loop alternating between strategic/tactical)
+- `src/core/state.py` - UniversalAgentState TypedDict with phase control fields
 - `src/core/context.py` - Context management (ContextManager, token counting, compaction)
 - `src/core/loader.py` - **Config system** with inheritance and prompt resolution
 - `src/core/workspace.py` - Filesystem workspace for agent
 - `src/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
+- `src/core/phase.py` - **Phase logic**: Predefined todos, validation, transitions
 - `src/api/app.py` - FastAPI application for containerized deployment
 
 **Manager layer (`src/managers/`):**
@@ -190,16 +191,35 @@ The Universal Agent (`src/`) is the primary agent implementation with a **nested
 - `plan.py` - **PlanManager** (service): Read/write main_plan.md, phase detection
 - `memory.py` - **MemoryManager** (service): Read/write workspace.md, section management
 
-**Nested loop architecture:**
+**Phase alternation architecture:**
 ```
-INITIALIZATION → read_instructions → create_plan → init_todos
+INITIALIZATION → init_workspace → init_strategic_todos (predefined todos)
                                         ↓
-OUTER LOOP (strategic) → read_plan → update_memory → create_todos
-                                        ↓
-INNER LOOP (tactical) → execute (ReAct) → check_todos → archive_phase
-                                        ↓
-                            check_goal → END or back to OUTER LOOP
+SINGLE REACT LOOP → execute ─→ tools ─→ check_todos
+                       │                    │
+                       │              (todos done?)
+                       │                    │
+                       │             archive_phase
+                       │                    │
+                       │            handle_transition
+                       │         (strategic ↔ tactical)
+                       │                    │
+                       │              check_goal
+                       │             ↓         ↓
+                       │          continue    END
+                       │             │
+                       └─────────────┘
 ```
+
+**Phase modes:**
+- **Strategic mode**: Planning, exploration, creating todos for tactical execution
+  - Predefined todos guide the agent through planning workflow
+  - Uses `todo_write` to create tactical todos in `todos.yaml`
+  - Uses `job_complete` when entire task is done
+- **Tactical mode**: Domain-specific execution with configured tools
+  - Loads todos from `todos.yaml` (5-20 items)
+  - Uses `todo_complete` to mark tasks done
+  - Transitions back to strategic after all todos complete
 
 **Configuration inheritance:**
 ```
@@ -227,15 +247,23 @@ Config fields:
 
 **Key features:**
 - Reads `instructions.md` from workspace to understand task context
-- Uses `main_plan.md` for strategic planning (read at phase transitions)
-- Uses `workspace.md` as persistent memory (injected into system prompt, like CLAUDE.md)
-- TodoManager for tactical execution with `archive()` at phase completion
+- Uses `workspace.md` as persistent memory (survives phase transitions, injected into system prompt)
+- Phase-aware prompts via `src/config/prompts/strategic_system.md` and `tactical_system.md`
+- Predefined strategic todos guide planning workflow (see `src/core/phase.py`)
+- TodoManager for execution with `archive()` at phase completion
 - Automatic context compaction when approaching token limits
-- Completion detection via `mark_complete` tool
+- Messages cleared at phase transitions to manage context
 - Audit logging via archiver (tracks LLM calls, tool calls, phase transitions)
 
 **Graph execution flow:**
-The nested loop graph creates its own managers inside `build_nested_loop_graph()`. The graph uses an audited tool node (`create_audited_tool_node`) that logs all tool calls and results for debugging and compliance.
+The phase alternation graph is built via `build_phase_alternation_graph()`. Key nodes:
+- `init_workspace` - Creates workspace structure, initializes `workspace.md`
+- `init_strategic_todos` - Loads predefined strategic todos on job start
+- `execute` - ReAct loop with phase-aware system prompt
+- `check_todos` - Routes to archive when all todos complete
+- `archive_phase` - Archives completed todos, optionally summarizes context
+- `handle_transition` - Validates and loads todos for next phase, clears messages
+- `check_goal` - Detects `job_complete` or continues to next phase
 
 **LangGraph checkpointing (crash recovery):**
 The agent uses SQLite-based checkpointing to persist graph state, enabling resume after crashes:
@@ -276,7 +304,7 @@ Tools are organized in `src/tools/` and loaded dynamically by the registry:
 | Category | Source File | Example Tools |
 |----------|-------------|---------------|
 | `workspace` | `workspace_tools.py` | read_file, write_file, list_files, search_files, get_workspace_summary |
-| `todo` | `todo_tools.py` | todo_write, archive_and_reset |
+| `todo` | `todo_tools.py` | todo_write, todo_complete, archive_and_reset |
 | `domain` | `document_tools.py` | extract_document_text, chunk_document |
 | `domain` | `search_tools.py` | web_search (Tavily) |
 | `domain` | `citation_tools.py` | cite_document, cite_web, list_sources, get_citation |
@@ -357,12 +385,12 @@ pytest tests/ -k "managers"
 # Run with coverage
 pytest tests/ --cov=src
 
-# Manager tests (nested loop architecture)
+# Manager tests (phase alternation architecture)
 pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
 ```
 
 **Key test files:**
 - `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager
-- `tests/test_graph.py` - Tests for routing functions and graph nodes
+- `tests/test_graph.py` - Tests for routing functions, phase transitions, and graph nodes
 
 Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup.

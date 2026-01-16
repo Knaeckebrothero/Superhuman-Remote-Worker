@@ -44,9 +44,13 @@ from .graph_tools import create_graph_tools
 from .registry import (
     TOOL_REGISTRY,
     load_tools,
+    load_tools_for_phase,
     get_available_tools,
     get_tools_by_category,
     load_tools_by_category,
+    filter_tools_by_phase,
+    get_tools_for_phase,
+    get_phase_tool_summary,
 )
 from .description_generator import (
     generate_workspace_tool_docs,
@@ -75,9 +79,14 @@ __all__ = [
     # Registry
     "TOOL_REGISTRY",
     "load_tools",
+    "load_tools_for_phase",
     "get_available_tools",
     "get_tools_by_category",
     "load_tools_by_category",
+    # Phase-aware tool filtering
+    "filter_tools_by_phase",
+    "get_tools_for_phase",
+    "get_phase_tool_summary",
     # Description generator
     "generate_workspace_tool_docs",
     "generate_tool_description",

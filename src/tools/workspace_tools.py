@@ -650,54 +650,63 @@ def create_workspace_tools(context: ToolContext) -> List:
 
 
 # Tool metadata for registry
+# Phase availability: workspace tools are available in both strategic and tactical modes
 WORKSPACE_TOOLS_METADATA = {
     "read_file": {
         "module": "workspace_tools",
         "function": "read_file",
         "description": "Read content from a file in the workspace",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "write_file": {
         "module": "workspace_tools",
         "function": "write_file",
         "description": "Write content to a file in the workspace",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "append_file": {
         "module": "workspace_tools",
         "function": "append_file",
         "description": "Append content to a file in the workspace",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "list_files": {
         "module": "workspace_tools",
         "function": "list_files",
         "description": "List files and directories in the workspace",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "delete_file": {
         "module": "workspace_tools",
         "function": "delete_file",
         "description": "Delete a file or empty directory",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "search_files": {
         "module": "workspace_tools",
         "function": "search_files",
         "description": "Search for text content in workspace files",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "file_exists": {
         "module": "workspace_tools",
         "function": "file_exists",
         "description": "Check if a file or directory exists",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "get_workspace_summary": {
         "module": "workspace_tools",
         "function": "get_workspace_summary",
         "description": "Get a summary of workspace contents",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "get_document_info": {
         "module": "workspace_tools",
@@ -706,17 +715,20 @@ WORKSPACE_TOOLS_METADATA = {
         "category": "workspace",
         "defer_to_workspace": True,
         "short_description": "Get PDF/document metadata (pages, size) for planning access.",
+        "phases": ["strategic", "tactical"],
     },
     "add_accomplishment": {
         "module": "workspace_tools",
         "function": "add_accomplishment",
         "description": "Record an accomplishment milestone to accomplishments.md",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
     "add_note": {
         "module": "workspace_tools",
         "function": "add_note",
         "description": "Add a working note to notes.md",
         "category": "workspace",
+        "phases": ["strategic", "tactical"],
     },
 }

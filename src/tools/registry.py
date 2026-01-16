@@ -28,18 +28,24 @@ from .graph_tools import create_graph_tools, GRAPH_TOOLS_METADATA
 from .completion_tools import create_completion_tools
 
 # Completion tools metadata
+# Phase availability:
+#   - "strategic": Only in strategic mode (planning)
+#   - "tactical": Only in tactical mode (execution)
+#   - Both: Available in both modes (default if not specified)
 COMPLETION_TOOLS_METADATA = {
     "mark_complete": {
         "module": "completion_tools",
         "function": "mark_complete",
         "description": "Signal task/phase completion with structured report",
         "category": "completion",
+        "phases": ["strategic", "tactical"],  # Both modes
     },
     "job_complete": {
         "module": "completion_tools",
         "function": "job_complete",
         "description": "Signal FINAL job completion - call when all phases are done",
         "category": "completion",
+        "phases": ["strategic"],  # Strategic-only: prevents premature termination
     },
 }
 
@@ -98,6 +104,112 @@ def get_categories() -> Set[str]:
         Set of category names
     """
     return {meta.get("category", "unknown") for meta in TOOL_REGISTRY.values()}
+
+
+def filter_tools_by_phase(tool_names: List[str], phase: str) -> List[str]:
+    """Filter tool names to only those available in the given phase.
+
+    Tools without a 'phases' field are assumed to be available in both phases.
+
+    Args:
+        tool_names: List of tool names to filter
+        phase: Phase to filter for ("strategic" or "tactical")
+
+    Returns:
+        Filtered list of tool names available in the phase
+    """
+    filtered = []
+    for name in tool_names:
+        if name not in TOOL_REGISTRY:
+            continue
+        meta = TOOL_REGISTRY[name]
+        phases = meta.get("phases", ["strategic", "tactical"])  # Default: both
+        if phase in phases:
+            filtered.append(name)
+    return filtered
+
+
+def get_tools_for_phase(phase: str) -> List[str]:
+    """Get all tool names available in a given phase.
+
+    Args:
+        phase: Phase to get tools for ("strategic" or "tactical")
+
+    Returns:
+        List of tool names available in the phase
+    """
+    return [
+        name for name, meta in TOOL_REGISTRY.items()
+        if phase in meta.get("phases", ["strategic", "tactical"])
+        and not meta.get("placeholder", False)
+    ]
+
+
+def get_phase_tool_summary() -> Dict[str, Dict[str, List[str]]]:
+    """Get a summary of tools by phase and category.
+
+    Returns:
+        Dictionary with structure:
+        {
+            "strategic": {"workspace": [...], "todo": [...], ...},
+            "tactical": {"workspace": [...], "domain": [...], ...}
+        }
+    """
+    summary = {
+        "strategic": {},
+        "tactical": {},
+    }
+
+    for name, meta in TOOL_REGISTRY.items():
+        if meta.get("placeholder", False):
+            continue
+
+        phases = meta.get("phases", ["strategic", "tactical"])
+        category = meta.get("category", "unknown")
+
+        for phase in phases:
+            if phase not in summary:
+                continue
+            if category not in summary[phase]:
+                summary[phase][category] = []
+            summary[phase][category].append(name)
+
+    return summary
+
+
+def load_tools_for_phase(
+    tool_names: List[str],
+    phase: str,
+    context: ToolContext,
+) -> List[Any]:
+    """Load tools filtered by phase availability.
+
+    Convenience function that filters tools by phase and then loads them.
+
+    Args:
+        tool_names: List of tool names to potentially load
+        phase: Phase to filter for ("strategic" or "tactical")
+        context: ToolContext with dependencies
+
+    Returns:
+        List of loaded tools available in the specified phase
+
+    Example:
+        ```python
+        # Load all configured tools, but only those available in strategic phase
+        tools = load_tools_for_phase(
+            ["read_file", "write_file", "todo_write", "extract_document_text"],
+            phase="strategic",
+            context=ctx
+        )
+        # Result: Only read_file, write_file, todo_write (extract_document_text is tactical-only)
+        ```
+    """
+    filtered_names = filter_tools_by_phase(tool_names, phase)
+    if not filtered_names:
+        logger.warning(f"No tools available for phase '{phase}' from: {tool_names}")
+        return []
+    return load_tools(filtered_names, context)
 
 
 def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:

@@ -62,7 +62,7 @@ from .core.loader import (
 )
 from .tools.description_generator import generate_workspace_tool_docs
 from .tools.description_override import apply_description_overrides
-from .graph import build_nested_loop_graph, run_graph_with_streaming
+from .graph import build_phase_alternation_graph, run_graph_with_streaming
 
 
 logger = logging.getLogger(__name__)
@@ -284,8 +284,7 @@ class UniversalAgent:
             # Load workspace template for nested loop graph
             workspace_template = self._load_workspace_template()
 
-            self._graph = build_nested_loop_graph(
-                llm=self._llm,
+            self._graph = build_phase_alternation_graph(
                 llm_with_tools=self._llm_with_tools,
                 tools=self._tools,
                 config=self.config,
@@ -293,6 +292,7 @@ class UniversalAgent:
                 workspace=self._workspace_manager,
                 workspace_template=workspace_template,
                 checkpointer=self._checkpointer,
+                summarization_llm=self._llm,  # Use base LLM for context summarization
             )
 
             # Create initial state with updated metadata (workspace-relative paths)
