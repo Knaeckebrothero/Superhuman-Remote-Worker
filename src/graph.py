@@ -64,12 +64,11 @@ from .core.state import UniversalAgentState
 from .core.loader import (
     AgentConfig,
     load_summarization_prompt,
-    render_system_prompt,
     get_phase_system_prompt,
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
-from .core.context import ContextManager, ContextConfig, find_safe_slice_start
+from .core.context import ContextManager, ContextConfig, ToolRetryManager, find_safe_slice_start
 from .core.phase import (
     handle_phase_transition,
     TransitionResult,
@@ -214,8 +213,8 @@ def create_init_strategic_todos_node(
             instructions = "No instructions.md found. Please create a plan based on job metadata."
             logger.warning(f"[{job_id}] instructions.md not found")
 
-        # Load predefined strategic todos
-        strategic_todos = get_initial_strategic_todos()
+        # Load predefined strategic todos from config template
+        strategic_todos = get_initial_strategic_todos(config)
         todo_list = [todo.to_dict() for todo in strategic_todos]
         todo_manager.set_todos_from_list(todo_list)
 
@@ -269,10 +268,9 @@ def create_execute_node(
     todo_manager: TodoManager,
     memory_manager: MemoryManager,
     workspace_manager: WorkspaceManager,
-    system_prompt_template: str,
     config: AgentConfig,
     context_mgr: ContextManager,
-    use_phase_prompts: bool = False,
+    retry_manager: ToolRetryManager,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node.
 
@@ -283,10 +281,9 @@ def create_execute_node(
         todo_manager: TodoManager for task tracking
         memory_manager: MemoryManager for workspace.md access
         workspace_manager: WorkspaceManager for file operations
-        system_prompt_template: Legacy system prompt template (used if use_phase_prompts=False)
         config: Agent configuration
         context_mgr: ContextManager for context window management
-        use_phase_prompts: If True, use phase-aware prompts (strategic/tactical)
+        retry_manager: ToolRetryManager for LLM call retry logic
     """
 
     def execute(state: UniversalAgentState) -> Dict[str, Any]:
@@ -306,29 +303,20 @@ def create_execute_node(
         if workspace_manager.exists("workspace.md"):
             workspace_content = workspace_manager.read_file("workspace.md")
 
-        # Get system prompt - use phase-aware if enabled
-        if use_phase_prompts:
-            is_strategic = state.get("is_strategic_phase", True)
-            phase_number = state.get("phase_number", 0)
-            full_system = get_phase_system_prompt(
-                config=config,
-                is_strategic=is_strategic,
-                phase_number=phase_number,
-                todos_content=todos_content,
-                workspace_content=workspace_content,
-            )
-            logger.debug(
-                f"[{job_id}] Using {'strategic' if is_strategic else 'tactical'} "
-                f"prompt for phase {phase_number}"
-            )
-        else:
-            # Legacy: use the pre-loaded template
-            full_system = render_system_prompt(
-                template=system_prompt_template,
-                config=config,
-                todos_content=todos_content,
-                workspace_content=workspace_content,
-            )
+        # Get phase-aware system prompt
+        is_strategic = state.get("is_strategic_phase", True)
+        phase_number = state.get("phase_number", 0)
+        full_system = get_phase_system_prompt(
+            config=config,
+            is_strategic=is_strategic,
+            phase_number=phase_number,
+            todos_content=todos_content,
+            workspace_content=workspace_content,
+        )
+        logger.debug(
+            f"[{job_id}] Using {'strategic' if is_strategic else 'tactical'} "
+            f"prompt for phase {phase_number}"
+        )
         prepared_messages.append(SystemMessage(content=full_system))
 
         # Always clear old tool results, keep last 10
@@ -367,93 +355,114 @@ def create_execute_node(
                 metadata=state.get("metadata"),
             )
 
-        try:
-            start_time = time.time()
-            response = llm_with_tools.invoke(prepared_messages)
-            latency_ms = int((time.time() - start_time) * 1000)
+        # Retry loop for LLM call with exponential backoff
+        attempt = 0
+        last_error = None
 
-            tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
-            logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
+        while True:
+            try:
+                start_time = time.time()
+                response = llm_with_tools.invoke(prepared_messages)
+                latency_ms = int((time.time() - start_time) * 1000)
 
-            # Archive full LLM request/response
-            if auditor:
-                auditor.archive(
-                    job_id=job_id,
-                    agent_type=config.agent_id,
-                    messages=prepared_messages,
-                    response=response,
-                    model=config.llm.model,
-                    latency_ms=latency_ms,
-                    iteration=iteration,
-                    metadata=state.get("metadata"),
-                )
+                tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
+                logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
 
-                # Build tool calls preview
-                tool_calls_preview = []
-                if hasattr(response, 'tool_calls') and response.tool_calls:
-                    for tc in response.tool_calls:
-                        tool_calls_preview.append({
-                            "name": tc.get("name", "unknown"),
-                            "call_id": tc.get("id", ""),
-                        })
+                # Archive full LLM request/response
+                if auditor:
+                    auditor.archive(
+                        job_id=job_id,
+                        agent_type=config.agent_id,
+                        messages=prepared_messages,
+                        response=response,
+                        model=config.llm.model,
+                        latency_ms=latency_ms,
+                        iteration=iteration,
+                        metadata=state.get("metadata"),
+                    )
 
-                # Audit LLM response
-                auditor.audit_step(
-                    job_id=job_id,
-                    agent_type=config.agent_id,
-                    step_type="llm_response",
-                    node_name="execute",
-                    iteration=iteration,
-                    data={
-                        "llm": {
-                            "model": config.llm.model,
-                            "response_content_preview": response.content[:500] if response.content else "",
-                            "tool_calls": tool_calls_preview,
-                            "metrics": {
-                                "output_chars": len(response.content) if response.content else 0,
-                                "tool_call_count": tool_calls_count,
+                    # Build tool calls preview
+                    tool_calls_preview = []
+                    if hasattr(response, 'tool_calls') and response.tool_calls:
+                        for tc in response.tool_calls:
+                            tool_calls_preview.append({
+                                "name": tc.get("name", "unknown"),
+                                "call_id": tc.get("id", ""),
+                            })
+
+                    # Audit LLM response
+                    auditor.audit_step(
+                        job_id=job_id,
+                        agent_type=config.agent_id,
+                        step_type="llm_response",
+                        node_name="execute",
+                        iteration=iteration,
+                        data={
+                            "llm": {
+                                "model": config.llm.model,
+                                "response_content_preview": response.content[:500] if response.content else "",
+                                "tool_calls": tool_calls_preview,
+                                "metrics": {
+                                    "output_chars": len(response.content) if response.content else 0,
+                                    "tool_call_count": tool_calls_count,
+                                }
                             }
-                        }
+                        },
+                        latency_ms=latency_ms,
+                        metadata=state.get("metadata"),
+                    )
+
+                return {
+                    "messages": [response],
+                    "iteration": iteration + 1,
+                    "error": None,
+                }
+
+            except Exception as e:
+                last_error = e
+                retry_manager.record_failure("llm_invoke")
+
+                if retry_manager.should_retry("llm_invoke", attempt):
+                    delay = retry_manager.get_retry_delay(attempt)
+                    logger.warning(
+                        f"[{job_id}] LLM error (attempt {attempt + 1}/{retry_manager.max_retries}), "
+                        f"retrying in {delay:.1f}s: {e}"
+                    )
+                    retry_manager.record_retry()
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+
+                # Max retries exceeded
+                logger.error(f"[{job_id}] LLM error after {attempt + 1} attempts: {e}")
+
+                # Audit error
+                if auditor:
+                    auditor.audit_step(
+                        job_id=job_id,
+                        agent_type=config.agent_id,
+                        step_type="error",
+                        node_name="execute",
+                        iteration=iteration,
+                        data={
+                            "error": {
+                                "type": "llm_error",
+                                "message": str(e)[:500],
+                                "recoverable": True,
+                                "attempts": attempt + 1,
+                            }
+                        },
+                        metadata=state.get("metadata"),
+                    )
+
+                return {
+                    "error": {
+                        "message": str(e),
+                        "type": "llm_error",
+                        "recoverable": True,
                     },
-                    latency_ms=latency_ms,
-                    metadata=state.get("metadata"),
-                )
-
-            return {
-                "messages": [response],
-                "iteration": iteration + 1,
-                "error": None,
-            }
-
-        except Exception as e:
-            logger.error(f"[{job_id}] LLM error: {e}")
-
-            # Audit error
-            if auditor:
-                auditor.audit_step(
-                    job_id=job_id,
-                    agent_type=config.agent_id,
-                    step_type="error",
-                    node_name="execute",
-                    iteration=iteration,
-                    data={
-                        "error": {
-                            "type": "llm_error",
-                            "message": str(e)[:500],
-                            "recoverable": True,
-                        }
-                    },
-                    metadata=state.get("metadata"),
-                )
-
-            return {
-                "error": {
-                    "message": str(e),
-                    "type": "llm_error",
-                    "recoverable": True,
-                },
-                "iteration": iteration + 1,
-            }
+                    "iteration": iteration + 1,
+                }
 
     return execute
 
@@ -666,6 +675,7 @@ def create_handle_transition_node(
             todo_manager=todo_manager,
             min_todos=min_todos,
             max_todos=max_todos,
+            config=config,
         )
 
         # Audit transition attempt
@@ -1004,7 +1014,6 @@ def build_phase_alternation_graph(
     llm_with_tools: BaseChatModel,
     tools: List[Any],
     config: AgentConfig,
-    system_prompt_template: str,
     workspace: WorkspaceManager,
     workspace_template: str = "",
     checkpointer: Optional[BaseCheckpointSaver] = None,
@@ -1025,7 +1034,6 @@ def build_phase_alternation_graph(
         llm_with_tools: LLM with tools bound for execution
         tools: List of tool objects
         config: Agent configuration
-        system_prompt_template: Raw system prompt template with placeholders
         workspace: WorkspaceManager instance
         workspace_template: Template content for workspace.md
         checkpointer: Optional LangGraph checkpointer for state persistence.
@@ -1050,6 +1058,9 @@ def build_phase_alternation_graph(
     )
     context_mgr = ContextManager(config=context_config, model=config.llm.model)
 
+    # Create retry manager for LLM call retries
+    retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)
+
     # Load summarization prompt
     summarization_prompt = load_summarization_prompt(config)
 
@@ -1068,8 +1079,7 @@ def build_phase_alternation_graph(
 
     execute = create_execute_node(
         llm_with_tools, todo_manager, memory_manager, workspace,
-        system_prompt_template, config, context_mgr,
-        use_phase_prompts=True,
+        config, context_mgr, retry_manager,
     )
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(
@@ -1169,14 +1179,15 @@ def build_nested_loop_graph(
     """Build the graph for the Universal Agent (deprecated).
 
     This function is deprecated. Use build_phase_alternation_graph() instead.
-    The `llm` and `use_phase_alternation` parameters are now ignored.
+    The `llm`, `system_prompt_template`, and `use_phase_alternation` parameters
+    are now ignored.
 
     Args:
         llm: Deprecated - ignored (was for planning/memory updates)
         llm_with_tools: LLM with tools bound for execution
         tools: List of tool objects
         config: Agent configuration
-        system_prompt_template: Raw system prompt template with placeholders
+        system_prompt_template: Deprecated - ignored (phase prompts used instead)
         workspace: WorkspaceManager instance
         workspace_template: Template content for workspace.md
         checkpointer: Optional LangGraph checkpointer
@@ -1195,7 +1206,6 @@ def build_nested_loop_graph(
         llm_with_tools=llm_with_tools,
         tools=tools,
         config=config,
-        system_prompt_template=system_prompt_template,
         workspace=workspace,
         workspace_template=workspace_template,
         checkpointer=checkpointer,

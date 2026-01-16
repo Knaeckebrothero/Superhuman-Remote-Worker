@@ -19,15 +19,17 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenAI's Triton kernels (MXFP4 MoE optimization)
-RUN pip install --no-cache-dir git+https://github.com/openai/triton.git#subdirectory=python/triton_kernels
+# Install Triton kernels for MXFP4 MoE optimization (must use triton-lang repo @ v3.5.0)
+# See: https://github.com/vllm-project/vllm/issues/26582
+RUN pip install --no-cache-dir "triton_kernels @ git+https://github.com/triton-lang/triton.git@v3.5.0#subdirectory=python/triton_kernels"
 
 # Install harmony format support (REQUIRED for tool calling)
 RUN pip install --no-cache-dir openai-harmony
 
 # Verify installation
 RUN python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')" \
-    && python3 -c "import openai_harmony; print('openai-harmony installed')"
+    && python3 -c "import openai_harmony; print('openai-harmony installed')" \
+    && python3 -c "from triton_kernels import matmul_ogs; print('triton_kernels.matmul_ogs available')"
 
 # Copy entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh
