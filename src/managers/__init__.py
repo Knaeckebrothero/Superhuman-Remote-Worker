@@ -6,7 +6,7 @@ nested loop workflow:
 - **TodoManager**: Stateful manager for task tracking within the
   inner execution loop. Holds todos in memory until archived.
 
-- **PlanManager**: Service for main_plan.md operations. Reads the
+- **PlanManager**: Service for plan.md operations. Reads the
   strategic plan at phase transitions.
 
 - **MemoryManager**: Service for workspace.md operations. Provides

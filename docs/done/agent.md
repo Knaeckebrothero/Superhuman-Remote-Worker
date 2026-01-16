@@ -109,7 +109,7 @@ workspace/
   documents/                  # Source documents being processed
   tools/                      # Auto-generated tool documentation
   instructions.md             # What the agent should do
-  main_plan.md               # The strategic plan (high-level goals)
+  plan.md               # The strategic plan (high-level goals)
   workspace.md               # Persistent memory / notes
   workspace_summary.md       # Current workspace state
   document_analysis.md       # Notes from analyzing documents
@@ -124,7 +124,7 @@ workspace/
   output/                     # Final outputs
   tools/                      # Auto-generated tool documentation
   instructions.md             # Validation instructions
-  main_plan.md               # Strategic plan
+  plan.md               # Strategic plan
 ```
 
 ---
@@ -145,7 +145,7 @@ On every generation, the LLM receives this information in order:
 │    - Task completion protocol                           │
 ├─────────────────────────────────────────────────────────┤
 │ 2. PROTECTED CONTEXT (refreshed every iteration)        │
-│    - Strategic plan from main_plan.md                   │
+│    - Strategic plan from plan.md                   │
 │    - Current todo list with markers:                    │
 │      [x] Completed task                                 │
 │      [ ] Pending task ← CURRENT                         │

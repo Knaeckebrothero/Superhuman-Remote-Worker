@@ -95,7 +95,7 @@ def get_initial_strategic_todos(
             id=2,
             content=(
                 "Read the instructions.md file and create an execution plan in "
-                "main_plan.md. The plan should outline the phases needed to "
+                "plan.md. The plan should outline the phases needed to "
                 "complete the task."
             ),
         ),
@@ -169,7 +169,7 @@ def get_transition_strategic_todos(
         PredefinedTodo(
             id=3,
             content=(
-                "Update main_plan.md to mark completed phases and adjust "
+                "Update plan.md to mark completed phases and adjust "
                 "upcoming phases if needed based on learnings."
             ),
         ),

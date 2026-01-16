@@ -169,7 +169,7 @@ The architecture uses a **hybrid approach** combining filesystem-based strategic
 │  ├── instructions.md          # Task-specific guidance (from template)│
 │  │                                                                  │
 │  ├── plans/                   # Strategic planning documents        │
-│  │   ├── main_plan.md         # High-level plan with phases         │
+│  │   ├── plan.md         # High-level plan with phases         │
 │  │   └── research_notes.md    # Brainstorming, exploration          │
 │  │                                                                  │
 │  ├── archive/                 # Archived todo lists (auto-saved)    │
@@ -469,7 +469,7 @@ The agent first creates a strategic plan on the filesystem. This follows the pat
 
 ```
 1. Agent reads instructions.md - understands the task
-2. Agent creates main_plan.md with:
+2. Agent creates plan.md with:
    - Problem statement
    - Brainstormed approaches
    - Chosen approach with reasoning
@@ -477,7 +477,7 @@ The agent first creates a strategic plan on the filesystem. This follows the pat
 3. Agent refines the plan until satisfied
 ```
 
-**Example `main_plan.md`:**
+**Example `plan.md`:**
 
 ```markdown
 # Requirement Extraction Plan
@@ -513,7 +513,7 @@ Two-pass approach because:
 For each phase, the agent uses TodoManager for concrete steps:
 
 ```
-4. Agent reads current phase from main_plan.md
+4. Agent reads current phase from plan.md
 5. Agent calls add_todo() for each step in current phase:
    - add_todo("Extract text from document")
    - add_todo("Chunk document into sections")
@@ -527,7 +527,7 @@ For each phase, the agent uses TodoManager for concrete steps:
    - ...
 7. When all todos complete:
    - Calls archive_and_reset("phase_1_document_processing")
-   - Updates main_plan.md to mark phase complete
+   - Updates plan.md to mark phase complete
    - [Context compaction happens at this natural boundary]
 8. Agent loads next phase, adds new todos, continues
 ```
@@ -539,7 +539,7 @@ For each phase, the agent uses TodoManager for concrete steps:
 │  STRATEGIC PLANNING (Filesystem)                                    │
 │                                                                     │
 │  1. read_file("instructions.md")                                    │
-│  2. write_file("main_plan.md", brainstormed_plan)            │
+│  2. write_file("plan.md", brainstormed_plan)            │
 │  3. Refine plan until satisfied                                     │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -550,7 +550,7 @@ For each phase, the agent uses TodoManager for concrete steps:
 │  4. add_todo("Extract text") → add_todo("Chunk") → ...             │
 │  5. Execute todos, complete_todo() after each                       │
 │  6. archive_and_reset("phase_1")                                   │
-│  7. Update main_plan.md: Phase 1 ✓                           │
+│  7. Update plan.md: Phase 1 ✓                           │
 │  8. [Context compaction]                                            │
 └─────────────────────────────────────────────────────────────────────┘
                               │
@@ -558,7 +558,7 @@ For each phase, the agent uses TodoManager for concrete steps:
 ┌─────────────────────────────────────────────────────────────────────┐
 │  PHASE 2 EXECUTION (TodoManager)                                    │
 │                                                                     │
-│  9. read_file("main_plan.md") - see Phase 2 is next          │
+│  9. read_file("plan.md") - see Phase 2 is next          │
 │  10. add_todo("Scan chunk 1 for requirements") → ...               │
 │  11. Execute todos, complete_todo() after each                      │
 │  12. archive_and_reset("phase_2")                                  │
@@ -583,7 +583,7 @@ For each phase, the agent uses TodoManager for concrete steps:
 
 ```bash
 # Watch agent's strategic plan
-$ cat /workspace/job_abc123/main_plan.md
+$ cat /workspace/job_abc123/plan.md
 
 # See current todos (if agent is mid-phase)
 $ # TodoManager is in-memory, but you can watch agent's tool calls

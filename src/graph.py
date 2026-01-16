@@ -104,7 +104,7 @@ def _extract_markdown_content(content: str) -> str:
     """Extract clean markdown content from LLM response.
 
     LLMs sometimes wrap their output in markdown code blocks or add file headers like:
-        **File: `main_plan.md`**
+        **File: `plan.md`**
         ```markdown
         ...actual content...
         ```

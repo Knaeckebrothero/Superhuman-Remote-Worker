@@ -17,7 +17,7 @@ def build_nested_loop_graph(
 ```
 
 The `llm` (without tools) is used by:
-- `create_plan` - Creates main_plan.md
+- `create_plan` - Creates plan.md
 - `init_todos` - Extracts initial todos
 - `update_memory` - Updates workspace.md
 - `create_todos` - Extracts phase todos
@@ -127,7 +127,7 @@ JOB START
 │ Predefined todos:                       │
 │ □ Summarize previous session            │
 │ □ Update workspace.md with learnings    │
-│ □ Update main_plan.md (mark progress)   │
+│ □ Update plan.md (mark progress)   │
 │ □ Write todos for next phase → todos.yaml
 │   (or call job_complete if done)        │
 │                                         │
@@ -264,7 +264,7 @@ def get_initial_strategic_todos() -> list[Todo]:
     """Todos for the first strategic phase (job start)."""
     return [
         Todo(id=1, content="Explore the workspace and populate workspace.md with an overview of the environment, available tools, and any existing context."),
-        Todo(id=2, content="Read the instructions.md file and create an execution plan in main_plan.md. The plan should outline the phases needed to complete the task."),
+        Todo(id=2, content="Read the instructions.md file and create an execution plan in plan.md. The plan should outline the phases needed to complete the task."),
         Todo(id=3, content="Divide the plan into phases, where each phase contains 5-20 concrete, actionable todos."),
         Todo(id=4, content="Write the todos for the first phase to todos.yaml using the todo_write tool."),
     ]
@@ -275,7 +275,7 @@ def get_transition_strategic_todos() -> list[Todo]:
     return [
         Todo(id=1, content="Summarize what was accomplished in the previous tactical phase. Note any issues encountered, decisions made, or discoveries."),
         Todo(id=2, content="Update workspace.md with new learnings, patterns discovered, or important context for future phases."),
-        Todo(id=3, content="Update main_plan.md to mark completed phases and adjust upcoming phases if needed based on learnings."),
+        Todo(id=3, content="Update plan.md to mark completed phases and adjust upcoming phases if needed based on learnings."),
         Todo(id=4, content="Write todos for the next phase to todos.yaml, or call job_complete if the plan is fully executed."),
     ]
 ```
@@ -471,7 +471,7 @@ Each phase is a **separate conversation** with fresh message history. Context pa
 | Component | Persists Across Phases? | Mechanism |
 |-----------|-------------------------|-----------|
 | `workspace.md` | **Yes** | File on disk, injected into system prompt |
-| `main_plan.md` | **Yes** | File on disk, read/updated by strategic agent |
+| `plan.md` | **Yes** | File on disk, read/updated by strategic agent |
 | `todos.yaml` | **Temporary** | Written by strategic, consumed by tactical |
 | `archive/` | **Yes** | Historical todos stored per phase |
 | Conversation history | **No** | Fresh `[]` each phase |
@@ -486,7 +486,7 @@ Each phase is a **separate conversation** with fresh message history. Context pa
 │                      (persists across job)                      │
 │                                                                 │
 │  workspace.md    - Accumulated learnings, patterns, decisions  │
-│  main_plan.md    - Overall strategy, phase structure            │
+│  plan.md    - Overall strategy, phase structure            │
 │  archive/        - Historical todos and phase summaries         │
 │  artifacts/      - Files created during execution               │
 │                                                                 │

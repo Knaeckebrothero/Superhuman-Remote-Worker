@@ -122,7 +122,7 @@ Three focused managers built on WorkspaceManager:
 | File | Purpose | Injection |
 |------|---------|-----------|
 | `workspace.md` | Long-term memory (like CLAUDE.md) | Always in system prompt |
-| `main_plan.md` | Strategic direction | Read only at phase transitions |
+| `plan.md` | Strategic direction | Read only at phase transitions |
 | `instructions.md` | Task instructions | Read once at initialization |
 | `archive/` | Completed todos by phase | Written on phase completion |
 
@@ -177,9 +177,9 @@ Tasks:
 
 ```python
 class PlanManager:
-    """Service for main_plan.md operations."""
+    """Service for plan.md operations."""
 
-    PLAN_FILE = "main_plan.md"
+    PLAN_FILE = "plan.md"
 
     def __init__(self, workspace: WorkspaceManager):
         self._workspace = workspace
@@ -292,7 +292,7 @@ Build the new graph structure with initialization and nested loops.
 Nodes:
 - `init_workspace` - Create workspace.md from template
 - `read_instructions` - Read instructions.md into context
-- `create_plan` - LLM creates main_plan.md from instructions
+- `create_plan` - LLM creates plan.md from instructions
 - `init_todos` - Extract first phase todos from plan
 - `clear_history` - Wipe message history for fresh start
 
@@ -309,7 +309,7 @@ Tasks:
 **File:** `src/agent/graph.py`
 
 Nodes:
-- `read_plan` - Read main_plan.md via PlanManager
+- `read_plan` - Read plan.md via PlanManager
 - `update_memory` - LLM updates workspace.md with learnings
 - `create_todos` - LLM extracts todos for current phase
 
@@ -477,7 +477,7 @@ src/agent/
 
 1. Agent completes multi-phase jobs without wandering
 2. workspace.md is always in the system prompt (like CLAUDE.md)
-3. main_plan.md is read at the start of every phase
+3. plan.md is read at the start of every phase
 4. Context wipes don't cause agent to lose progress (file-based memory)
 5. Phase transitions happen automatically at correct times
 6. No hidden injection magic - all workflow visible in graph

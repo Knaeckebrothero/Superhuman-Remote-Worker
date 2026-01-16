@@ -172,7 +172,7 @@ Then call `mark_complete` with your summary.
 
 ## Planning Template
 
-Use this structure for `main_plan.md`:
+Use this structure for `plan.md`:
 
 ```markdown
 # Extraction Plan

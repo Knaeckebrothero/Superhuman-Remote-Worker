@@ -9,7 +9,7 @@ todos:
   - id: 2
     content: >-
       Read the instructions.md file and create an execution plan in
-      main_plan.md. The plan should outline the phases needed to
+      plan.md. The plan should outline the phases needed to
       complete the task.
   - id: 3
     content: >-

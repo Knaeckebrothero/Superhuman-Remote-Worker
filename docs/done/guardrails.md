@@ -15,7 +15,7 @@ Current agent behavior exhibits several issues:
 
 The guardrails system introduces:
 1. **Manager architecture** - Dedicated managers for todos, plans, and memory
-2. **Two-tier planning** - Strategy (`main_plan.md`) vs Tactics (todo list)
+2. **Two-tier planning** - Strategy (`plan.md`) vs Tactics (todo list)
 3. **File-based memory** - `workspace.md` as persistent long-term memory (like CLAUDE.md)
 4. **Phase-based execution** - Work divided into 5-20 step phases
 5. **Nested loop graph architecture** - Graph ENFORCES the workflow, not hopes the agent follows it
@@ -31,7 +31,7 @@ The agent uses three manager classes to handle different aspects of state:
 src/agent/
 ├── managers/
 │   ├── todo.py      # TodoManager - STATEFUL (holds todo list)
-│   ├── plan.py      # PlanManager - SERVICE (main_plan.md operations)
+│   ├── plan.py      # PlanManager - SERVICE (plan.md operations)
 │   └── memory.py    # MemoryManager - SERVICE (workspace.md operations)
 │
 ├── core/
@@ -101,13 +101,13 @@ class TodoManager:
 
 ### PlanManager (Service)
 
-Service class for `main_plan.md` operations. Does not hold state - operates on filesystem.
+Service class for `plan.md` operations. Does not hold state - operates on filesystem.
 
 ```python
 class PlanManager:
-    """Service class for main_plan.md operations."""
+    """Service class for plan.md operations."""
 
-    PLAN_FILE = "main_plan.md"
+    PLAN_FILE = "plan.md"
 
     def __init__(self, workspace: WorkspaceManager):
         self._workspace = workspace
@@ -163,7 +163,7 @@ class MemoryManager:
 **Memory lives in files, not conversation history.**
 
 If you wipe the conversation entirely, the agent can recover because:
-- `main_plan.md` has the strategic direction
+- `plan.md` has the strategic direction
 - `workspace.md` has learnings, decisions, and context
 - Both are read at the start of every outer loop iteration
 
@@ -221,7 +221,7 @@ This structure is **suggested, not enforced**. The agent can organize it however
 | **Decisions** | Why certain approaches were chosen |
 | **Notes** | Anything else worth remembering |
 
-### main_plan.md (Strategic Direction)
+### plan.md (Strategic Direction)
 
 The execution plan. Read at phase transitions, not continuously.
 
@@ -283,7 +283,7 @@ Instead of hoping the agent follows the workflow, the graph **makes** it happen:
 ║                           (runs once per job)                             ║
 ║                                                                           ║
 ║   create         read            create         create        clear       ║
-║   workspace.md → instructions → main_plan.md → first todos → history     ║
+║   workspace.md → instructions → plan.md → first todos → history     ║
 ║                                                                           ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
                                       ↓
@@ -359,7 +359,7 @@ Before entering the main loop, the graph runs initialization (once per job):
 
 This ensures the agent starts with:
 - A populated workspace.md (from template)
-- A plan in main_plan.md (LLM-generated)
+- A plan in plan.md (LLM-generated)
 - Todos for the first phase
 - A clean conversation history
 
@@ -383,7 +383,7 @@ from langgraph.prebuilt import create_react_agent
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     workspace_memory: str       # Contents of workspace.md
-    plan_content: str           # Contents of main_plan.md (read at phase transitions)
+    plan_content: str           # Contents of plan.md (read at phase transitions)
     todos: list[TodoItem]       # Current phase todos
     current_todo_idx: int
     phase_complete: bool
@@ -401,7 +401,7 @@ graph = StateGraph(AgentState)
 # INITIALIZATION (runs once)
 # ═══════════════════════════════════════════════════════════════════
 graph.add_node("init_workspace", init_workspace)      # Create workspace.md
-graph.add_node("create_plan", create_plan)            # LLM creates main_plan.md
+graph.add_node("create_plan", create_plan)            # LLM creates plan.md
 graph.add_node("init_todos", init_todos)              # Create first todos
 
 graph.add_edge(START, "init_workspace")
@@ -463,7 +463,7 @@ graph.add_conditional_edges(
 
 ## Two-Tier Planning
 
-### Strategic Layer: `main_plan.md`
+### Strategic Layer: `plan.md`
 
 The execution plan defines the "grand picture":
 - Overall approach to the task
@@ -502,7 +502,7 @@ The agent's context window is structured in layers:
 └─────────────────────────────┘
 ```
 
-**Note:** `workspace.md` is always in the system prompt. `main_plan.md` is only read at phase transitions (not continuously present).
+**Note:** `workspace.md` is always in the system prompt. `plan.md` is only read at phase transitions (not continuously present).
 
 ### Layer Details
 
@@ -667,7 +667,7 @@ The guardrails system keeps agents focused through:
 
 **Memory lives in files, not conversation history.**
 
-If you wipe the conversation entirely, who cares? The agent reads `main_plan.md` and `workspace.md` at the start of every outer loop iteration. The graph structure forces this—no hooks, no injection, no hoping the agent remembers.
+If you wipe the conversation entirely, who cares? The agent reads `plan.md` and `workspace.md` at the start of every outer loop iteration. The graph structure forces this—no hooks, no injection, no hoping the agent remembers.
 
 The managers encapsulate the complexity:
 - `TodoManager` handles the todo list state
@@ -776,7 +776,7 @@ The nested loop graph (`src/agent/graph.py`) includes:
 **Initialization nodes:**
 - `init_workspace` - Creates workspace.md from template
 - `read_instructions` - Reads instructions.md into context
-- `create_plan` - LLM creates main_plan.md
+- `create_plan` - LLM creates plan.md
 - `init_todos` - Extracts todos from first phase
 
 **Plan phase nodes:**

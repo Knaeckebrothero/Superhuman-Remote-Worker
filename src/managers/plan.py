@@ -1,7 +1,7 @@
 """Plan manager for nested loop graph architecture.
 
 This module provides the PlanManager for reading and writing the
-main plan file (main_plan.md). The plan contains the strategic
+main plan file (plan.md). The plan contains the strategic
 direction for the job and is read at phase transitions.
 
 The PlanManager is a service (stateless) - it reads/writes directly
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class PlanManager:
-    """Service for main_plan.md operations.
+    """Service for plan.md operations.
 
     The PlanManager provides access to the strategic plan file.
     The plan is created during initialization and read at each
@@ -52,7 +52,7 @@ class PlanManager:
         ```
     """
 
-    PLAN_FILE = "main_plan.md"
+    PLAN_FILE = "plan.md"
 
     def __init__(self, workspace: "WorkspaceManager"):
         """Initialize plan manager.
@@ -66,7 +66,7 @@ class PlanManager:
         """Check if the plan file exists.
 
         Returns:
-            True if main_plan.md exists in workspace
+            True if plan.md exists in workspace
         """
         return self._workspace.exists(self.PLAN_FILE)
 

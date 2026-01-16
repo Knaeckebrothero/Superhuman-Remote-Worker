@@ -4,393 +4,201 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Graph-RAG system for **requirement traceability and compliance checking** in a car rental business context (FINIUS). Uses LangGraph + LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
-
-**Architecture:** Two-agent autonomous system (Creator + Validator) with a Streamlit Dashboard for job management, unified via the **Universal Agent** pattern. Agent behavior is configured via JSON files in `configs/{name}/` that extend framework defaults via `$extends`.
+Graph-RAG system for requirement traceability and compliance checking. Uses LangGraph and LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
 
 ## Commands
 
+### Development Setup
 ```bash
-# Setup
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 pip install -e ./citation_tool[full]
-cp .env.example .env
-
-# Initialize databases with seed data
-python scripts/app_init.py --force-reset --seed
-
-# Run tests
-pytest tests/                            # All tests
-pytest tests/test_graph.py               # Single test file
-pytest tests/ -k "managers"              # Tests matching pattern
-
-# Metamodel validation
-python validate_metamodel.py              # All checks
-python validate_metamodel.py --check A1   # Specific check
+cp .env.example .env  # Then configure API keys
 ```
 
-### Local Development
-
+### Database Management
 ```bash
-# Start databases (PostgreSQL, Neo4j, MongoDB for audit logs)
+# Start databases (development)
 podman-compose -f docker-compose.dev.yaml up -d
 
-# Run Universal Agent (config resolution: configs/{name}/ → src/config/{name}.json)
-python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
-python agent.py --config creator --document-dir ./data/context/ --prompt "Extract all requirements"
-python agent.py --config creator --job-id <uuid> --stream --verbose  # Resume with streaming
-python agent.py --config validator --port 8002                        # API server mode
-python agent.py --config creator --polling-only                       # Polling loop only
+# Initialize with sample data
+python scripts/app_init.py --seed
 
-# Stop databases
-podman-compose -f docker-compose.dev.yaml down      # Keep data
-podman-compose -f docker-compose.dev.yaml down -v   # Remove data
+# Reset databases
+python scripts/app_init.py --force-reset --seed
+python scripts/app_init.py --only-postgres --force-reset
+python scripts/app_init.py --only-neo4j --force-reset
 ```
 
-### Docker Deployment
-
+### Running Agents
 ```bash
-# Full system
-podman-compose up -d
-podman-compose logs -f creator validator dashboard
+# Process document
+python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
 
-# Database access
-podman-compose exec postgres psql -U graphrag -d graphrag
-podman-compose exec neo4j cypher-shell -u neo4j -p neo4j_password
+# Process directory
+python agent.py --config creator --document-dir ./data/example_data/ --prompt "Extract requirements" --stream --verbose
 
-# Rebuild
-podman-compose build --no-cache creator validator dashboard
+# Start as API server
+python agent.py --config creator --port 8001
+python agent.py --config validator --port 8002
+
+# Resume from checkpoint
+python agent.py --config creator --job-id <id> --resume
 ```
 
-### Job Management
-
-Jobs are managed via the **Streamlit Dashboard** (http://localhost:8501) or CLI scripts:
-
+### Testing
 ```bash
-# Dashboard (primary interface)
-cd dashboard && streamlit run app.py
-
-# CLI debugging tools (in scripts/)
-python scripts/job_status.py --job-id <uuid> --progress
-python scripts/list_jobs.py --status pending --stats
-python scripts/cancel_job.py --job-id <uuid> --force
+pytest tests/                    # All tests
+pytest tests/test_graph.py -v    # Single test file
+pytest tests/ --cov=src          # With coverage
 ```
 
-## Configuration
-
-**Environment (`.env`):** `NEO4J_URI`, `NEO4J_PASSWORD`, `DATABASE_URL`, `OPENAI_API_KEY`, `LLM_BASE_URL` (optional), `TAVILY_API_KEY`
-
-**Agent configs:** Two-tier configuration system with inheritance:
-- `src/config/defaults.json` - Framework defaults (LLM, workspace, tools, polling, limits)
-- `configs/{name}/config.json` - Deployment configs that extend defaults via `$extends`
-- `configs/{name}/*.md` - Deployment-specific prompts (override framework prompts)
-
-Config resolution: `--config creator` checks `configs/creator/config.json` first, falls back to `src/config/creator.json`.
-
-See `src/config/schema.json` for full spec.
+### Validation
+```bash
+python validate_metamodel.py --check all --json
+```
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      DASHBOARD (port 8501)                          │
-│                 Streamlit UI - Job Management                       │
-└─────────────────────────┬───────────────────────────────────────────┘
-                          │
-       ┌──────────────────┴──────────────────┐
-       │                                      │
-       ▼                                      ▼
-┌──────────────────┐                ┌──────────────────┐
-│ CREATOR (8001)   │                │ VALIDATOR (8002) │
-│ (Universal Agent)│                │ (Universal Agent)│
-│                  │                │                  │
-│ Document → Extract  requirements  │ Relevance check  │
-│ Research → Cache │ (PostgreSQL)  │ Fulfillment check│
-│                  │◄──────────────►│ Graph integration│
-└──────────────────┘                └────────┬─────────┘
-                                             │
-                                             ▼
-                                    ┌──────────────────┐
-                                    │     Neo4j        │
-                                    │ (Knowledge Graph)│
-                                    └──────────────────┘
-```
-
-**Source locations:**
-- `src/agent.py`, `src/graph.py` - **Universal Agent**: Config-driven LangGraph workflow
-- `src/core/` - Agent internals (state.py, context.py, loader.py, workspace.py, archiver.py)
-- `src/core/loader.py` - **Config system**: `resolve_config_path()`, `load_and_merge_config()`, `PromptResolver`
-- `src/managers/` - **Manager layer** (todo.py, plan.py, memory.py) for nested loop architecture
-- `src/tools/` - Modular tool implementations (registry.py loads tools dynamically)
-- `src/api/` - FastAPI application for containerized deployment
-- `src/config/` - Framework defaults (defaults.json) and prompts (Markdown in `prompts/`)
-- `src/utils/` - Shared utilities (metamodel validator, document processor, citation utils)
-- `src/database/` - Database classes (postgres_db.py, neo4j_db.py, mongo_db.py) and queries/
-- `configs/` - **Deployment configs** (creator/, validator/) with `config.json` + prompt overrides
-- `dashboard/` - **Streamlit Dashboard** for job management (multi-page: app.py, pages/, db.py, agents.py)
-- `scripts/` - CLI tools and init scripts (app_init.py, init_*.py, job_status.py, list_jobs.py, cancel_job.py)
-- `agent.py` - **Entry point**: Top-level script that imports from `src/agent.py`
-
-**Manager layer:** Task management uses `src/managers/` (todo.py, plan.py, memory.py) for the phase alternation architecture (`src/graph.py`).
-
-**Agent data flow:**
-1. Creator polls `jobs` table → processes document → writes to `requirements` table (status: pending)
-2. Validator queries `requirements` where `neo4j_id IS NULL` → validates → integrates into Neo4j → sets `neo4j_id`
-
-## Key Implementation Details
-
-### Metamodel (FINIUS v2.0)
-
-**Nodes:** `Requirement`, `BusinessObject`, `Message`
-
-**Key Relationships:**
-- `FULFILLED_BY_OBJECT`, `NOT_FULFILLED_BY_OBJECT` (Requirement → BusinessObject)
-- `FULFILLED_BY_MESSAGE`, `NOT_FULFILLED_BY_MESSAGE` (Requirement → Message)
-- `REFINES`, `DEPENDS_ON`, `TRACES_TO`, `SUPERSEDES` (Requirement → Requirement)
-
-Schema: `data/metamodell.cql`. Seed data: `data/seed_data.cypher`.
-
-### Neo4j Query Guidelines
-
-- Use `elementId(node)` not deprecated `id(node)`
-- Always use `LIMIT` for large result sets
-- Fulfillment query pattern:
-  ```cypher
-  MATCH (r:Requirement)-[rel:FULFILLED_BY_OBJECT|NOT_FULFILLED_BY_OBJECT]->(bo:BusinessObject)
-  RETURN r.rid, type(rel), rel.confidence, bo.name
-  ```
-
-### PostgreSQL Schema
-
-Schema in `src/database/queries/postgres/schema.sql`, database class in `src/database/postgres_db.py`:
-- `jobs` - Job tracking (status, creator_status, validator_status, document_path)
-- `requirements` - Extracted requirements with validation state. Validator queries `WHERE neo4j_id IS NULL` for unprocessed items.
-- `job_summary` - View aggregating requirement counts by status
-
-Neo4j database class in `src/database/neo4j_db.py`.
-MongoDB database class in `src/database/mongo_db.py`.
-
 ### Universal Agent Pattern
 
-The Universal Agent (`src/`) is the primary agent implementation with a **phase alternation architecture**:
+Single codebase configured for different roles via JSON configs in `configs/`:
 
-**Key files:**
-- `agent.py` - Top-level entry point (imports from src/)
-- `src/agent.py` - UniversalAgent class with run loop and LLM integration
-- `src/graph.py` - **Phase alternation graph** (single ReAct loop alternating between strategic/tactical)
-- `src/core/state.py` - UniversalAgentState TypedDict with phase control fields
-- `src/core/context.py` - Context management (ContextManager, token counting, compaction)
-- `src/core/loader.py` - **Config system** with inheritance and prompt resolution
-- `src/core/workspace.py` - Filesystem workspace for agent
-- `src/core/archiver.py` - Audit logging for graph execution (MongoDB-backed)
-- `src/core/phase.py` - **Phase logic**: Predefined todos, validation, transitions
-- `src/api/app.py` - FastAPI application for containerized deployment
+| Config | Purpose | Polls | Key Tools |
+|--------|---------|-------|-----------|
+| `creator` | Extract requirements from documents | `jobs` table | document, search, citation, cache |
+| `validator` | Validate and integrate into Neo4j | `requirements` table | graph, cypher, validation |
 
-**Manager layer (`src/managers/`):**
-- `todo.py` - **TodoManager** (stateful): Task tracking with add/complete/archive
-- `plan.py` - **PlanManager** (service): Read/write main_plan.md, phase detection
-- `memory.py` - **MemoryManager** (service): Read/write workspace.md, section management
+Data flow: Creator → `requirements` table → Validator → Neo4j
 
-**Phase alternation architecture:**
-```
-INITIALIZATION → init_workspace → init_strategic_todos (predefined todos)
-                                        ↓
-SINGLE REACT LOOP → execute ─→ tools ─→ check_todos
-                       │                    │
-                       │              (todos done?)
-                       │                    │
-                       │             archive_phase
-                       │                    │
-                       │            handle_transition
-                       │         (strategic ↔ tactical)
-                       │                    │
-                       │              check_goal
-                       │             ↓         ↓
-                       │          continue    END
-                       │             │
-                       └─────────────┘
+### Phase Alternation Model
+
+The agent uses a single ReAct loop alternating between phases:
+
+1. **Strategic Phase**: Planning, memory updates, todo creation from YAML templates
+2. **Tactical Phase**: Domain-specific execution of todos
+3. **Archive**: Save artifacts, clear messages, update workspace.md
+4. Repeat until goal achieved
+
+Key files per phase:
+- `workspace.md` - Long-term memory (persists across phases)
+- `plan.md` - Strategic plan
+- `todos.yaml` - Current task list
+
+### Configuration Inheritance
+
+Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`:
+
+```json
+{
+  "$extends": "defaults",
+  "agent_id": "creator",
+  "tools": { "domain": ["extract_document_text", "web_search", ...] }
+}
 ```
 
-**Phase modes:**
-- **Strategic mode**: Planning, exploration, creating todos for tactical execution
-  - Predefined todos guide the agent through planning workflow
-  - Uses `todo_write` to create tactical todos in `todos.yaml`
-  - Uses `job_complete` when entire task is done
-- **Tactical mode**: Domain-specific execution with configured tools
-  - Loads todos from `todos.yaml` (5-20 items)
-  - Uses `todo_complete` to mark tasks done
-  - Transitions back to strategic after all todos complete
+### Workspace Structure
 
-**Configuration inheritance:**
+Per-job directory: `workspace/job_<uuid>/`
+- `archive/` - Phase artifacts
+- `documents/` - Input documents
+- `tools/` - Tool outputs
+- Checkpoints: `workspace/checkpoints/job_<id>.db`
+
+## Key Source Directories
+
+- `src/core/` - State management, workspace, context, phase transitions
+- `src/managers/` - TodoManager, MemoryManager, PlanManager
+- `src/tools/` - Tool implementations and registry
+- `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
+- `src/api/` - FastAPI application
+- `configs/` - Agent-specific configurations
+- `dashboard/` - Streamlit UI
+
+## Graph Structure (src/graph.py)
+
 ```
-src/config/defaults.json           ← Framework defaults
-        ↑ $extends
-configs/creator/config.json        ← Deployment overrides (agent_id, tools, polling, etc.)
-configs/creator/instructions.md    ← Deployment prompts (override framework prompts/)
-```
-
-Merge semantics (`deep_merge` in loader.py):
-- Objects (dicts): Recursively merge
-- Arrays (lists): Override replaces entirely
-- Scalars: Override replaces
-- `null` in override: Clears the key
-
-Config fields:
-- `$extends`: Parent config name (resolved via `resolve_config_path()`)
-- `agent_id`, `display_name`: Agent identity
-- `llm`: Model, temperature, reasoning level, base_url
-- `workspace.structure`: Directory layout, `instructions_template`
-- `tools`: Categories (workspace, todo, domain, completion)
-- `polling`: Table, status_field, intervals, use_skip_locked
-- `limits`: max_iterations, context_threshold_tokens
-- `connections`: postgres, neo4j (boolean flags)
-
-**Key features:**
-- Reads `instructions.md` from workspace to understand task context
-- Uses `workspace.md` as persistent memory (survives phase transitions, injected into system prompt)
-- Phase-aware prompts via `src/config/prompts/strategic_system.md` and `tactical_system.md`
-- Predefined strategic todos guide planning workflow (see `src/core/phase.py`)
-- TodoManager for execution with `archive()` at phase completion
-- Automatic context compaction when approaching token limits
-- Messages cleared at phase transitions to manage context
-- Audit logging via archiver (tracks LLM calls, tool calls, phase transitions)
-
-**Graph execution flow:**
-The phase alternation graph is built via `build_phase_alternation_graph()`. Key nodes:
-- `init_workspace` - Creates workspace structure, initializes `workspace.md`
-- `init_strategic_todos` - Loads predefined strategic todos on job start
-- `execute` - ReAct loop with phase-aware system prompt
-- `check_todos` - Routes to archive when all todos complete
-- `archive_phase` - Archives completed todos, optionally summarizes context
-- `handle_transition` - Validates and loads todos for next phase, clears messages
-- `check_goal` - Detects `job_complete` or continues to next phase
-
-**LangGraph checkpointing (crash recovery):**
-The agent uses SQLite-based checkpointing to persist graph state, enabling resume after crashes:
-- Checkpoint files: `workspace/checkpoints/job_<id>.db`
-- Log files: `workspace/logs/job_<id>.log`
-- Checkpointer: `AsyncSqliteSaver` from `langgraph-checkpoint-sqlite`
-- Created per-job in `process_job()`, closed in finally block
-- Resume: Run with same `--job-id` and `--resume` flag
-
-```bash
-# First run (creates checkpoint)
-python agent.py --config creator --job-id abc-123 --document-path doc.pdf
-
-# After crash, resume from last checkpoint
-python agent.py --config creator --job-id abc-123 --resume
+init_workspace → read_instructions → create_plan
+       ↓
+execute (ReAct) → check_todos → archive_phase → handle_transition → check_goal
 ```
 
-Checkpoints and logs are kept after completion for debugging. Manual cleanup:
-```bash
-rm workspace/checkpoints/job_*.db  # Remove checkpoints
-rm workspace/logs/job_*.log        # Remove logs
-```
+## Environment Variables
 
-**Creating a new agent type:**
-1. Create `configs/<name>/config.json` extending `defaults`:
-   ```json
-   {"$extends": "defaults", "agent_id": "<name>", "display_name": "<Name> Agent", ...}
-   ```
-2. Create `configs/<name>/instructions.md` (task instructions)
-3. Optionally add `configs/<name>/summarization_prompt.md` (override)
-4. Add domain-specific tools to `src/tools/` if needed
-5. Register new tools in `src/tools/registry.py`
+Required in `.env`:
+- `OPENAI_API_KEY` - LLM API key
+- `LLM_BASE_URL` - Custom endpoint (optional, for vLLM/Ollama)
+- `TAVILY_API_KEY` - Web search (Creator agent)
+- Database URLs configured in `.env.example`
 
-### Tool System
-
-Tools are organized in `src/tools/` and loaded dynamically by the registry:
-
-| Category | Source File | Example Tools |
-|----------|-------------|---------------|
-| `workspace` | `workspace_tools.py` | read_file, write_file, list_files, search_files, get_workspace_summary |
-| `todo` | `todo_tools.py` | todo_write, todo_complete, archive_and_reset |
-| `domain` | `document_tools.py` | extract_document_text, chunk_document |
-| `domain` | `search_tools.py` | web_search (Tavily) |
-| `domain` | `citation_tools.py` | cite_document, cite_web, list_sources, get_citation |
-| `domain` | `cache_tools.py` | add_requirement, list_requirements, get_requirement |
-| `graph` | `graph_tools.py` | execute_cypher, get_schema, create_requirement_node |
-| `completion` | `completion_tools.py` | mark_complete, job_complete |
-
-**Tool context** (`ToolContext` dataclass in `tools/context.py`) provides tools with access to workspace, todo manager, and database connections.
-
-**On-demand descriptions:** Tools marked with `defer_to_workspace=True` in their metadata use short descriptions in the LLM context, with full documentation generated in `workspace/tools/<name>.md`. See `description_override.py` and `description_generator.py`.
-
-### Service Ports
+## Service Ports
 
 | Service | Port |
 |---------|------|
-| Dashboard (Streamlit) | 8501 |
-| Creator (Universal Agent) | 8001 |
-| Validator (Universal Agent) | 8002 |
+| Dashboard | 8501 |
+| Creator API | 8001 |
+| Validator API | 8002 |
 | Neo4j Bolt | 7687 |
-| Neo4j Browser | 7474 |
+| Neo4j HTTP | 7474 |
 | PostgreSQL | 5432 |
+| MongoDB | 27017 |
 
-## Adding New Tools
+## Debugging
 
-When adding a new tool to the system:
+### Workspace Files and Logs
 
-1. **Create the tool function** in the appropriate file in `src/tools/`:
-   - Workspace operations → `workspace_tools.py`
-   - Document processing → `document_tools.py`
-   - Graph operations → `graph_tools.py`
-   - New category → create new `*_tools.py` file
-
-2. **Add metadata** to the module's `*_TOOLS_METADATA` dict:
-   ```python
-   MYTOOLS_METADATA = {
-       "my_tool": {
-           "module": "src.tools.mytools",
-           "function": "my_tool",
-           "description": "Short description for LLM context",
-           "category": "domain",
-       },
-   }
-   ```
-
-3. **Register in registry.py** by importing and updating `TOOL_REGISTRY`
-
-4. **Add to deployment config** in `configs/<agent>/config.json` under the appropriate category:
-   ```json
-   "tools": {
-       "domain": ["my_tool", ...]
-   }
-   ```
-
-5. **Tool signature**: Tools receive `ToolContext` as first argument, then user parameters:
-   ```python
-   from src.tools.context import ToolContext
-
-   def my_tool(ctx: ToolContext, param1: str, param2: int = 10) -> str:
-       """Tool docstring becomes LLM description."""
-       return "result"
-   ```
-
-## Testing
+Per-job files are stored in the workspace directory:
+- **Workspace files**: `workspace/job_<uuid>/` - Contains `workspace.md`, `todos.yaml`, `plan.md`, and subdirectories
+- **Checkpoints**: `workspace/checkpoints/job_<id>.db` - SQLite checkpoint for resume capability
+- **Logs**: `workspace/logs/job_<id>.log` - Agent execution logs
 
 ```bash
-# Run all tests
-pytest tests/
+# Clean up checkpoint/log files for a specific job
+rm workspace/checkpoints/job_<id>.db workspace/logs/job_<id>.log
 
-# Run specific test file
-pytest tests/test_graph.py
-
-# Run with verbose output
-pytest tests/ -v
-
-# Run tests matching pattern
-pytest tests/ -k "managers"
-
-# Run with coverage
-pytest tests/ --cov=src
-
-# Manager tests (phase alternation architecture)
-pytest tests/test_managers_todo.py tests/test_managers_plan.py tests/test_managers_memory.py -v
+# Clean up all checkpoints and logs
+rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 ```
 
-**Key test files:**
-- `tests/test_managers_*.py` - Tests for TodoManager, PlanManager, MemoryManager
-- `tests/test_graph.py` - Tests for routing functions, phase transitions, and graph nodes
+### MongoDB Conversation Viewer
 
-Test files follow the pattern `tests/test_<module>.py`. Use `pytest.fixture` for common setup.
+MongoDB stores LLM request/response history and agent audit trails for debugging. Enable by setting `MONGODB_URL` in `.env`:
+
+```bash
+MONGODB_URL=mongodb://localhost:27017/graphrag_logs
+```
+
+Use `scripts/view_llm_conversation.py` to inspect agent behavior:
+
+```bash
+# List all jobs with records
+python scripts/view_llm_conversation.py --list
+
+# View LLM conversation for a job
+python scripts/view_llm_conversation.py --job-id <uuid>
+
+# View job statistics (token usage, latency, duration)
+python scripts/view_llm_conversation.py --job-id <uuid> --stats
+
+# View complete agent audit trail (all steps)
+python scripts/view_llm_conversation.py --job-id <uuid> --audit
+
+# View only tool calls in audit trail
+python scripts/view_llm_conversation.py --job-id <uuid> --audit --step-type tool_call
+
+# View audit as timeline visualization
+python scripts/view_llm_conversation.py --job-id <uuid> --audit --timeline
+
+# Export conversation to JSON
+python scripts/view_llm_conversation.py --job-id <uuid> --export conversation.json
+
+# View single LLM request as HTML (opens in browser)
+python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --temp
+
+# View recent requests across all jobs
+python scripts/view_llm_conversation.py --recent 20
+```
+
+MongoDB collections:
+- `llm_requests` - Full LLM request/response with messages, model, latency, token usage
+- `agent_audit` - Step-by-step execution trace (tool calls, phase transitions, routing decisions)
