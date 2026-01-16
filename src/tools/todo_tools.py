@@ -263,8 +263,8 @@ def create_todo_tools(context: ToolContext) -> List:
         2. Clear the todo list
 
         After calling this, you should:
-        1. Read main_plan.md to review overall strategy
-        2. Update main_plan.md if needed
+        1. Read plan.md to review overall strategy
+        2. Update plan.md if needed
         3. Create new todos with todo_write()
 
         Args:
@@ -286,8 +286,8 @@ def create_todo_tools(context: ToolContext) -> List:
             return (
                 f"{result}\n\n"
                 "To recover, please:\n"
-                "1. Read main_plan.md to review the overall strategy\n"
-                "2. Update main_plan.md if the approach needs to change\n"
+                "1. Read plan.md to review the overall strategy\n"
+                "2. Update plan.md if the approach needs to change\n"
                 "3. Create new todos with todo_write()"
             )
 

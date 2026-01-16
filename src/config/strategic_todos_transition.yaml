@@ -12,7 +12,7 @@ todos:
       or important context for future phases.
   - id: 3
     content: >-
-      Update main_plan.md to mark completed phases and adjust
+      Update plan.md to mark completed phases and adjust
       upcoming phases if needed based on learnings.
   - id: 4
     content: >-

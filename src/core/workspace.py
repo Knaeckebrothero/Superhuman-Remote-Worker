@@ -128,7 +128,7 @@ class WorkspaceManager:
         output_file = ws.get_path("output/results.json")
 
         # Read/write files
-        content = ws.read_file("main_plan.md")
+        content = ws.read_file("plan.md")
         ws.write_file("research.md", "# Research Notes\\n...")
 
         # List contents

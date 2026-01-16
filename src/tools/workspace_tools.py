@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # File purpose heuristics for workspace_summary.md
 FILE_PURPOSE_MAP = {
-    "main_plan.md": "Execution plan",
+    "plan.md": "Execution plan",
     "instructions.md": "Task instructions",
     "workspace_summary.md": "Workspace state snapshot",
     "accomplishments.md": "Completed milestones",
@@ -207,7 +207,7 @@ def create_workspace_tools(context: ToolContext) -> List:
         Overwrites the file if it already exists.
 
         Use this to:
-        - Create plans (main_plan.md)
+        - Create plans (plan.md)
         - Save research notes (research.md, document_analysis.md)
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
@@ -258,19 +258,62 @@ def create_workspace_tools(context: ToolContext) -> List:
             return f"Error appending to file: {str(e)}"
 
     @tool
-    def list_files(path: str = "", pattern: str = "*") -> str:
-        """List files and directories in a workspace path.
+    def list_files(path: str = "", pattern: str = "*", depth: int = 1) -> str:
+        """List files and directories in a workspace path with optional depth.
 
-        Directories are shown with a trailing slash.
-        Use this to explore your workspace structure.
+        Directories are shown with a trailing slash. By default shows one level
+        of subdirectory contents to help navigate the workspace structure.
 
         Args:
             path: Relative directory path (empty for workspace root)
             pattern: Glob pattern to filter files (e.g., "*.md", "*.json")
+            depth: How many levels deep to show (0=flat, 1=show subdir contents,
+                   max 3). Default is 1.
 
         Returns:
             List of files and directories, or message if empty
+
+        Example output (depth=1):
+            Contents of /:
+
+            Directories:
+              archive/
+                phase_1_strategic/
+              documents/
+                report.pdf
+
+            Files:
+              instructions.md
+              workspace.md
         """
+        # Cap depth at 3 to prevent excessive output
+        depth = max(0, min(3, depth))
+
+        def list_recursive(dir_path: str, current_depth: int, indent: str) -> list[str]:
+            """Recursively list directory contents up to specified depth."""
+            lines = []
+            try:
+                items = workspace.list_files(dir_path, pattern=pattern)
+            except Exception:
+                return lines
+
+            dirs = sorted([i for i in items if i.endswith("/")])
+            files = sorted([i for i in items if not i.endswith("/")])
+
+            # Add files at this level
+            for f in files:
+                lines.append(f"{indent}{f}")
+
+            # Add directories and optionally their contents
+            for d in dirs:
+                lines.append(f"{indent}{d}")
+                if current_depth < depth:
+                    subdir_path = f"{dir_path}/{d.rstrip('/')}" if dir_path else d.rstrip("/")
+                    sub_lines = list_recursive(subdir_path, current_depth + 1, indent + "  ")
+                    lines.extend(sub_lines)
+
+            return lines
+
         try:
             items = workspace.list_files(path, pattern=pattern)
 
@@ -279,20 +322,26 @@ def create_workspace_tools(context: ToolContext) -> List:
                     f" matching '{pattern}'" if pattern != "*" else ""
                 )
 
-            # Format output
+            # Format output header
             header = f"Contents of {path or '/'}:"
             if pattern != "*":
                 header += f" (pattern: {pattern})"
 
-            # Separate directories and files
+            # Separate directories and files at root level
             dirs = sorted([i for i in items if i.endswith("/")])
             files = sorted([i for i in items if not i.endswith("/")])
 
             lines = [header, ""]
+
             if dirs:
                 lines.append("Directories:")
                 for d in dirs:
                     lines.append(f"  {d}")
+                    if depth > 0:
+                        subdir_path = f"{path}/{d.rstrip('/')}" if path else d.rstrip("/")
+                        sub_lines = list_recursive(subdir_path, 1, "    ")
+                        lines.extend(sub_lines)
+
             if files:
                 if dirs:
                     lines.append("")

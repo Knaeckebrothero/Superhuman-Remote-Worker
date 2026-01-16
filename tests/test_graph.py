@@ -185,7 +185,7 @@ class TestGetManagersFromWorkspace:
         assert workspace_manager.exists("workspace.md")
 
         plan.write("# Plan")
-        assert workspace_manager.exists("main_plan.md")
+        assert workspace_manager.exists("plan.md")
 
 
 class TestInitWorkspaceNode:
@@ -468,7 +468,7 @@ class TestPredefinedTodos:
         contents = [t.content for t in todos]
         assert any("summarize" in c.lower() for c in contents)
         assert any("workspace.md" in c.lower() for c in contents)
-        assert any("main_plan.md" in c.lower() for c in contents)
+        assert any("plan.md" in c.lower() for c in contents)
         assert any("todos.yaml" in c.lower() or "job_complete" in c.lower() for c in contents)
 
 

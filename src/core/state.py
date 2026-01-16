@@ -6,7 +6,7 @@ The state supports:
 - Outer loop (strategic planning at phase transitions)
 - Inner loop (tactical execution with todos)
 
-File-based memory (workspace.md, main_plan.md) provides persistence
+File-based memory (workspace.md, plan.md) provides persistence
 across context compaction, while state fields control loop flow.
 """
 
@@ -28,7 +28,7 @@ class UniversalAgentState(TypedDict):
 
     File-based context:
     - workspace.md: Long-term memory, always in system prompt
-    - main_plan.md: Strategic direction, read at phase transitions
+    - plan.md: Strategic direction, read at phase transitions
     - archive/: Completed todos by phase
 
     Attributes:

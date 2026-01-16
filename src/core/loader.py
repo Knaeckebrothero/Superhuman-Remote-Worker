@@ -539,99 +539,51 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
 # =============================================================================
 
 
-def load_strategic_prompt_template(config_dir: Optional[str] = None) -> str:
-    """Load the strategic phase system prompt template.
-
-    Args:
-        config_dir: Base directory for config files (default: src/config)
-
-    Returns:
-        Raw template string with placeholders
-    """
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / "strategic_system.md"
-
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"Strategic prompt not found: {prompt_path}")
-
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def load_tactical_prompt_template(config_dir: Optional[str] = None) -> str:
-    """Load the tactical phase system prompt template.
-
-    Args:
-        config_dir: Base directory for config files (default: src/config)
-
-    Returns:
-        Raw template string with placeholders
-    """
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / "tactical_system.md"
-
-    if not prompt_path.exists():
-        raise FileNotFoundError(f"Tactical prompt not found: {prompt_path}")
-
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def load_phase_prompt_template(
-    is_strategic: bool,
-    config_dir: Optional[str] = None,
+def load_base_system_prompt(
+    deployment_dir: Optional[str] = None,
 ) -> str:
-    """Load the system prompt template for the current phase.
+    """Load the base system prompt template (systemprompt.txt).
+
+    Uses PromptResolver to check deployment directory first if available,
+    allowing deployments to override the base template.
+
+    Args:
+        deployment_dir: Path to deployment directory (e.g., configs/creator).
+                       If None, only framework templates are used.
+
+    Returns:
+        Raw template string with placeholders ({prompt_content}, {todos_content}, etc.)
+
+    Raises:
+        FileNotFoundError: If template not found in either location
+    """
+    resolver = PromptResolver(deployment_dir)
+    return resolver.load("systemprompt.txt")
+
+
+def load_phase_component(
+    is_strategic: bool,
+    deployment_dir: Optional[str] = None,
+) -> str:
+    """Load the phase-specific component (strategic.txt or tactical.txt).
+
+    Uses PromptResolver to check deployment directory first if available,
+    allowing deployments to override phase components.
 
     Args:
         is_strategic: True for strategic phase, False for tactical
-        config_dir: Base directory for config files
+        deployment_dir: Path to deployment directory (e.g., configs/creator).
+                       If None, only framework templates are used.
 
     Returns:
-        Raw template string with placeholders
+        Raw template string with {phase_number} placeholder
+
+    Raises:
+        FileNotFoundError: If template not found in either location
     """
-    if is_strategic:
-        return load_strategic_prompt_template(config_dir)
-    else:
-        return load_tactical_prompt_template(config_dir)
-
-
-def render_phase_prompt(
-    template: str,
-    config: AgentConfig,
-    phase_number: int = 0,
-    todos_content: str = "",
-    workspace_content: str = "",
-) -> str:
-    """Render phase system prompt template with current values.
-
-    Args:
-        template: Raw template string with placeholders
-        config: Agent configuration
-        phase_number: Current phase number
-        todos_content: Formatted todo list string
-        workspace_content: Contents of workspace.md
-
-    Returns:
-        Rendered system prompt string
-    """
-    oss_reasoning_level = config.llm.reasoning_level or "high"
-
-    return template.format(
-        agent_display_name=config.display_name,
-        oss_reasoning_level=oss_reasoning_level,
-        phase_number=phase_number,
-        todos_content=todos_content,
-        workspace_content=workspace_content,
-    )
+    resolver = PromptResolver(deployment_dir)
+    template_name = "strategic.txt" if is_strategic else "tactical.txt"
+    return resolver.load(template_name)
 
 
 def get_phase_system_prompt(
@@ -644,9 +596,13 @@ def get_phase_system_prompt(
 ) -> str:
     """Get the complete system prompt for the current phase.
 
-    This is the main entry point for phase-aware prompts. It loads the
-    appropriate template (strategic or tactical) and renders it with
-    the current state.
+    This is the main entry point for phase-aware prompts. It uses a
+    component-based system:
+    1. Load base template (systemprompt.txt)
+    2. Load phase component (strategic.txt or tactical.txt)
+    3. Render phase component's {phase_number} placeholder
+    4. Inject rendered component into base template's {prompt_content}
+    5. Render remaining placeholders ({todos_content}, {workspace_content}, etc.)
 
     Args:
         config: Agent configuration
@@ -654,7 +610,7 @@ def get_phase_system_prompt(
         phase_number: Current phase number
         todos_content: Formatted todo list string
         workspace_content: Contents of workspace.md
-        config_dir: Base directory for config files
+        config_dir: Base directory for config files (deprecated, uses deployment_dir)
 
     Returns:
         Fully rendered system prompt string
@@ -670,11 +626,24 @@ def get_phase_system_prompt(
         )
         ```
     """
-    template = load_phase_prompt_template(is_strategic, config_dir)
-    return render_phase_prompt(
-        template=template,
-        config=config,
-        phase_number=phase_number,
+    deployment_dir = config._deployment_dir
+
+    # 1. Load base template
+    base_template = load_base_system_prompt(deployment_dir)
+
+    # 2. Load phase component
+    phase_component = load_phase_component(is_strategic, deployment_dir)
+
+    # 3. Render phase component's {phase_number} placeholder
+    rendered_component = phase_component.format(phase_number=phase_number)
+
+    # 4. & 5. Inject component and render remaining placeholders
+    oss_reasoning_level = config.llm.reasoning_level or "high"
+
+    return base_template.format(
+        oss_reasoning_level=oss_reasoning_level,
+        agent_display_name=config.display_name,
+        prompt_content=rendered_component,
         todos_content=todos_content,
         workspace_content=workspace_content,
     )
@@ -738,7 +707,7 @@ Domain tools: {', '.join(config.tools.domain)}
 
 ## How to Work
 
-1. Create a plan in `main_plan.md`
+1. Create a plan in `plan.md`
 2. Use todos to track immediate steps
 3. Write results to files as you go
 4. When complete, write status to `output/completion.json`
