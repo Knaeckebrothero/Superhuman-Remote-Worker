@@ -109,8 +109,8 @@ def get_initial_strategic_todos(
         PredefinedTodo(
             id=4,
             content=(
-                "Write the todos for the first phase to todos.yaml using the "
-                "todo_write tool."
+                "Create todos for the first tactical phase using the "
+                "next_phase_todos tool."
             ),
         ),
     ]
@@ -176,8 +176,8 @@ def get_transition_strategic_todos(
         PredefinedTodo(
             id=4,
             content=(
-                "Write todos for the next phase to todos.yaml, or call "
-                "job_complete if the plan is fully executed."
+                "Create todos for the next tactical phase using next_phase_todos, "
+                "or call job_complete if the plan is fully executed."
             ),
         ),
     ]
@@ -437,18 +437,16 @@ def on_strategic_phase_complete(
     """Handle transition from strategic phase to tactical phase.
 
     This function is called when the last strategic todo is completed.
-    It validates todos.yaml and, if valid, transitions to tactical phase.
+    It checks for staged todos and, if present, transitions to tactical phase.
 
-    Validation checks:
-    1. todos.yaml exists in workspace
-    2. Content is valid YAML
-    3. Has 'todos' key with a list value
-    4. Contains min_todos to max_todos items
-    5. Each todo has 'id' (int) and 'content' (str)
+    The new flow uses staged todos instead of todos.yaml:
+    1. Agent calls next_phase_todos() to stage todos
+    2. Agent calls todo_complete() to finish strategic phase
+    3. This function checks for staged todos and applies them
 
     On success:
     - Clears conversation history
-    - Loads todos from todos.yaml into TodoManager
+    - Applies staged todos to TodoManager
     - Flips to tactical phase
     - Increments phase_number
 
@@ -460,8 +458,8 @@ def on_strategic_phase_complete(
         state: Current agent state
         workspace: WorkspaceManager for file access
         todo_manager: TodoManager for loading todos
-        min_todos: Minimum todos required (default: 5)
-        max_todos: Maximum todos allowed (default: 20)
+        min_todos: Minimum todos required (default: 5, used by staging)
+        max_todos: Maximum todos allowed (default: 20, used by staging)
 
     Returns:
         TransitionResult indicating success/failure with state updates
@@ -469,49 +467,26 @@ def on_strategic_phase_complete(
     job_id = state.get("job_id", "unknown")
     phase_number = state.get("phase_number", 0)
 
-    logger.info(f"[{job_id}] Strategic phase complete, validating todos.yaml")
+    logger.info(f"[{job_id}] Strategic phase complete, checking for staged todos")
 
-    # Check 1: File exists
-    todos_path = workspace.path / "todos.yaml"
-    if not todos_path.exists():
+    # Check if there are staged todos
+    if not todo_manager.has_staged_todos():
         return reject_transition(
             state,
-            "todos.yaml not found. Use todo_write tool to create it with 5-20 tasks.",
+            "No todos staged for the next phase. "
+            "Use next_phase_todos tool to create 5-20 tasks first.",
         )
 
-    # Check 2-5: Validate content
-    try:
-        metadata, todos = validate_todos_yaml(
-            todos_path.read_text(),
-            min_todos=min_todos,
-            max_todos=max_todos,
-        )
-    except TodosYamlValidationError as e:
-        error_details = "\n".join(f"  - {err}" for err in e.errors)
-        return reject_transition(
-            state,
-            f"todos.yaml validation failed:\n{error_details}\n\n"
-            f"Use todo_write to fix and resubmit.",
-        )
+    # Get phase name from staged todos
+    phase_name = todo_manager.get_staged_phase_name() or f"Phase {phase_number + 1}"
 
-    # All checks passed - load todos into TodoManager
-    todo_list = [
-        {
-            "id": f"todo_{t['id']}",
-            "content": t["content"],
-            "status": "pending",
-            "priority": "medium",
-        }
-        for t in todos
-    ]
-    todo_manager.set_todos_from_list(todo_list)
-
-    # Get phase name from metadata if available
-    phase_name = metadata.get("phase", f"Phase {phase_number + 1}")
+    # Apply staged todos to the active todo list
+    todo_manager.apply_staged_todos()
+    todo_count = len(todo_manager.list_all())
 
     logger.info(
         f"[{job_id}] Transitioning to tactical phase: {phase_name} "
-        f"({len(todos)} todos)"
+        f"({todo_count} todos)"
     )
 
     return TransitionResult(

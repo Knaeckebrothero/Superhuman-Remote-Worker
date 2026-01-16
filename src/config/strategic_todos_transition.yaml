@@ -16,5 +16,5 @@ todos:
       upcoming phases if needed based on learnings.
   - id: 4
     content: >-
-      Write todos for the next phase to todos.yaml, or call
-      job_complete if the plan is fully executed.
+      Create todos for the next tactical phase using next_phase_todos,
+      or call job_complete if the plan is fully executed.

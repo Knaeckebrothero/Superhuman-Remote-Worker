@@ -17,5 +17,5 @@ todos:
       concrete, actionable todos.
   - id: 4
     content: >-
-      Write the todos for the first phase to todos.yaml using the
-      todo_write tool.
+      Create todos for the first tactical phase using the
+      next_phase_todos tool.
