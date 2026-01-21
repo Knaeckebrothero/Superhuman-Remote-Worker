@@ -96,16 +96,18 @@ async def run_schema(connection_string: str, schema_file: Path, name: str) -> bo
 async def verify_tables(connection_string: str) -> bool:
     """Verify required tables exist.
 
-    Note: The schema now only contains 2 tables:
+    Tables:
     - jobs: Job tracking and orchestration
     - requirements: Primary storage for extracted requirements
+    - sources: Document sources for citations (citation_tool)
+    - citations: Citation records (citation_tool)
 
     Other data is stored elsewhere:
     - LLM logging: MongoDB (via llm_archiver.py)
     - Agent checkpointing: LangGraph's AsyncPostgresSaver (creates its own tables)
     - Agent workspace: Filesystem (workspace_manager.py)
     """
-    required = ['jobs', 'requirements']
+    required = ['jobs', 'requirements', 'sources', 'citations']
 
     conn = await asyncpg.connect(connection_string)
     try:
