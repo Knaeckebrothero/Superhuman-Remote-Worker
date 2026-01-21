@@ -1,10 +1,10 @@
 # Project-specific contents go here
-.mcp.json
-
+backups/*
 workspace/*
+output/*
 
-# Output directory for workflow results
-output/
+# MCP configuration files
+.mcp.json
 
 # Python virtual environment
 venv/

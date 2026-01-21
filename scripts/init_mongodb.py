@@ -24,9 +24,11 @@ import logging
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -250,6 +252,143 @@ def initialize_mongodb(logger: logging.Logger, force_reset: bool = False) -> boo
 
     finally:
         client.close()
+
+
+def _parse_mongodb_url(url: str) -> dict:
+    """Parse MongoDB URL into components for mongodump/mongorestore."""
+    parsed = urlparse(url)
+    return {
+        "host": parsed.hostname or "localhost",
+        "port": str(parsed.port or 27017),
+        "database": parsed.path.lstrip('/').split('?')[0] or "graphrag_logs",
+        "username": parsed.username,
+        "password": parsed.password,
+    }
+
+
+def backup_mongodb(backup_dir: Path, logger: logging.Logger) -> bool:
+    """
+    Backup MongoDB using mongodump.
+
+    Args:
+        backup_dir: Path to write the backup directory.
+        logger: Logger instance.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    mongo_url = os.getenv("MONGODB_URL")
+    if not mongo_url:
+        logger.info("  MongoDB not configured (MONGODB_URL not set)")
+        return True  # Not an error if not configured
+
+    params = _parse_mongodb_url(mongo_url)
+
+    # Build mongodump command
+    cmd = [
+        "mongodump",
+        "--host", params["host"],
+        "--port", params["port"],
+        "--db", params["database"],
+        "--out", str(backup_dir),
+    ]
+
+    if params["username"] and params["password"]:
+        cmd.extend(["--username", params["username"]])
+        cmd.extend(["--password", params["password"]])
+        cmd.extend(["--authenticationDatabase", "admin"])
+
+    logger.info(f"  Running mongodump for database: {params['database']}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        logger.info(f"  Backup created: {backup_dir}")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"  mongodump failed: {e.stderr}")
+        return False
+    except FileNotFoundError:
+        logger.error("  mongodump not found. Is MongoDB tools installed?")
+        return False
+
+
+def restore_mongodb(backup_dir: Path, logger: logging.Logger) -> bool:
+    """
+    Restore MongoDB using mongorestore.
+
+    Args:
+        backup_dir: Path to the backup directory.
+        logger: Logger instance.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    mongo_url = os.getenv("MONGODB_URL")
+    if not mongo_url:
+        logger.info("  MongoDB not configured (MONGODB_URL not set)")
+        return True  # Not an error if not configured
+
+    params = _parse_mongodb_url(mongo_url)
+
+    # The backup directory contains a subdirectory with the database name
+    db_backup_dir = backup_dir / params["database"]
+    if not db_backup_dir.exists():
+        # Try looking for any subdirectory
+        subdirs = [d for d in backup_dir.iterdir() if d.is_dir()]
+        if subdirs:
+            db_backup_dir = subdirs[0]
+        else:
+            logger.warning(f"  No MongoDB backup data found in: {backup_dir}")
+            return True
+
+    # First, clear existing data
+    logger.info(f"  Clearing database: {params['database']}")
+    try:
+        from pymongo import MongoClient
+        client = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)
+        db = client[params["database"]]
+        for collection_name in db.list_collection_names():
+            db[collection_name].delete_many({})
+        client.close()
+    except Exception as e:
+        logger.warning(f"  Could not clear database: {e}")
+
+    # Build mongorestore command
+    cmd = [
+        "mongorestore",
+        "--host", params["host"],
+        "--port", params["port"],
+        "--db", params["database"],
+        "--drop",  # Drop collections before restoring
+        str(db_backup_dir),
+    ]
+
+    if params["username"] and params["password"]:
+        cmd.extend(["--username", params["username"]])
+        cmd.extend(["--password", params["password"]])
+        cmd.extend(["--authenticationDatabase", "admin"])
+
+    logger.info(f"  Running mongorestore for database: {params['database']}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 and "error" in result.stderr.lower():
+            logger.warning(f"  mongorestore warnings: {result.stderr[:200]}")
+
+        logger.info(f"  Restore completed from: {backup_dir}")
+        return True
+    except FileNotFoundError:
+        logger.error("  mongorestore not found. Is MongoDB tools installed?")
+        return False
 
 
 def main():
