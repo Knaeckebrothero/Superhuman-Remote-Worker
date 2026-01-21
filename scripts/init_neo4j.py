@@ -533,7 +533,7 @@ Examples:
         driver.close()
 
 
-def initialize_neo4j(logger: logging.Logger, clear: bool = False, seed: bool = False) -> bool:
+def initialize_neo4j(logger: logging.Logger, clear: bool = False, seed: bool = False, seed_file: Path | None = None) -> bool:
     """
     Initialize Neo4j database (called by app_init.py).
 
@@ -541,6 +541,7 @@ def initialize_neo4j(logger: logging.Logger, clear: bool = False, seed: bool = F
         logger: Logger instance.
         clear: If True, clear all data before initializing.
         seed: If True, load seed data.
+        seed_file: Optional path to seed file (overrides default).
 
     Returns:
         True if successful, False otherwise.
@@ -560,7 +561,9 @@ def initialize_neo4j(logger: logging.Logger, clear: bool = False, seed: bool = F
 
     try:
         schema_file = project_root / "data" / "metamodell.cql"
-        seed_file = project_root / "data" / "seed_data.cypher"
+        # Use provided seed_file or default
+        if seed_file is None:
+            seed_file = project_root / "data" / "seed_data.cypher"
 
         # Show current state
         stats = get_stats(driver)
@@ -579,7 +582,7 @@ def initialize_neo4j(logger: logging.Logger, clear: bool = False, seed: bool = F
 
         # Load seed data if requested
         if seed and seed_file.exists():
-            logger.info("  Loading seed data...")
+            logger.info(f"  Loading seed data from {seed_file.name}...")
             count = load_seed_data(driver, seed_file)
             logger.info(f"  Loaded {count} statements")
         elif seed:
