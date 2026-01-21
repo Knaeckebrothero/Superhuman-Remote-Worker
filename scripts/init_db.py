@@ -223,7 +223,9 @@ def backup_postgres(backup_file: Path, logger: logging.Logger) -> bool:
 
 async def export_seed_data(connection_string: str, output_file: Path) -> int:
     """
-    Export jobs and requirements tables as INSERT statements for seeding.
+    Export all application tables as INSERT statements for seeding.
+
+    Exports: jobs, requirements, sources, citations (in dependency order).
 
     Returns:
         Number of rows exported.
@@ -238,7 +240,8 @@ async def export_seed_data(connection_string: str, output_file: Path) -> int:
             f.write(f"-- Exported: {__import__('datetime').datetime.now().isoformat()}\n")
             f.write("--\n")
             f.write("-- This file contains INSERT statements for seeding the database.\n")
-            f.write("-- Run after schema.sql to populate with test data.\n\n")
+            f.write("-- Run after schema.sql to populate with test data.\n")
+            f.write("-- Tables: jobs, requirements, sources, citations\n\n")
 
             # Export jobs table
             f.write("-- ============================================================================\n")
@@ -272,7 +275,50 @@ async def export_seed_data(connection_string: str, output_file: Path) -> int:
                 f.write(f"INSERT INTO requirements ({', '.join(cols)}) VALUES ({', '.join(vals)});\n")
                 rows_exported += 1
 
-            f.write(f"\n-- {len(reqs)} requirement(s) exported\n")
+            f.write(f"\n-- {len(reqs)} requirement(s) exported\n\n")
+
+            # Export sources table (from citation_tool)
+            # Check if table exists first
+            sources_exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'sources')"
+            )
+            if sources_exists:
+                f.write("-- ============================================================================\n")
+                f.write("-- SOURCES (citation_tool)\n")
+                f.write("-- ============================================================================\n\n")
+
+                sources = await conn.fetch("SELECT * FROM sources ORDER BY id")
+                for src in sources:
+                    cols = []
+                    vals = []
+                    for key, value in dict(src).items():
+                        cols.append(f'"{key}"')
+                        vals.append(_format_pg_value(value))
+                    f.write(f"INSERT INTO sources ({', '.join(cols)}) VALUES ({', '.join(vals)});\n")
+                    rows_exported += 1
+
+                f.write(f"\n-- {len(sources)} source(s) exported\n\n")
+
+            # Export citations table (from citation_tool)
+            citations_exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'citations')"
+            )
+            if citations_exists:
+                f.write("-- ============================================================================\n")
+                f.write("-- CITATIONS (citation_tool)\n")
+                f.write("-- ============================================================================\n\n")
+
+                citations = await conn.fetch("SELECT * FROM citations ORDER BY id")
+                for cit in citations:
+                    cols = []
+                    vals = []
+                    for key, value in dict(cit).items():
+                        cols.append(f'"{key}"')
+                        vals.append(_format_pg_value(value))
+                    f.write(f"INSERT INTO citations ({', '.join(cols)}) VALUES ({', '.join(vals)});\n")
+                    rows_exported += 1
+
+                f.write(f"\n-- {len(citations)} citation(s) exported\n")
 
         return rows_exported
     finally:

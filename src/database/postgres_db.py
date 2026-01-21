@@ -268,12 +268,27 @@ class PostgresDB:
     # SYNC WRAPPERS (for dashboard, scripts, and other sync contexts)
     # =========================================================================
 
-    @staticmethod
-    def _run_async(coro):
+    # Class-level event loop for sync wrappers (shared across all instances)
+    _sync_loop = None
+
+    @classmethod
+    def _get_sync_loop(cls):
+        """Get or create a persistent event loop for sync operations.
+
+        Returns the same event loop across all calls, allowing asyncpg
+        connection pools to persist between sync wrapper calls.
+        """
+        import asyncio
+        if cls._sync_loop is None or cls._sync_loop.is_closed():
+            cls._sync_loop = asyncio.new_event_loop()
+        return cls._sync_loop
+
+    @classmethod
+    def _run_async(cls, coro):
         """Helper to run async coroutines in sync context.
 
-        Uses asyncio.run() to execute the coroutine in a new event loop.
-        This allows sync code (like Streamlit dashboard) to use PostgresDB.
+        Uses a persistent event loop to execute coroutines, allowing
+        asyncpg connection pools to persist between calls.
 
         Args:
             coro: Async coroutine to execute
@@ -283,18 +298,18 @@ class PostgresDB:
         """
         import asyncio
         try:
-            # Try to get the current event loop
-            loop = asyncio.get_event_loop()
+            # Check if we're already in an async context
+            loop = asyncio.get_running_loop()
             if loop.is_running():
-                # We're already in an async context, can't use asyncio.run()
                 raise RuntimeError(
                     "Cannot use sync wrapper inside async context. "
                     "Use async methods directly instead."
                 )
         except RuntimeError:
-            pass  # No event loop, that's fine
+            pass  # No running loop, that's fine
 
-        return asyncio.run(coro)
+        loop = cls._get_sync_loop()
+        return loop.run_until_complete(coro)
 
     def connect_sync(self) -> None:
         """Synchronous wrapper for connect().
