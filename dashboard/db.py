@@ -11,6 +11,9 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
 # Add project root to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

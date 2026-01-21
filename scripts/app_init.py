@@ -47,6 +47,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv()
 
+# Seed profiles directory
+SEED_PROFILES_DIR = PROJECT_ROOT / "data" / "seed"
+
 
 def setup_logging(verbose: bool = False) -> logging.Logger:
     """Configure logging for application initialization."""
@@ -89,8 +92,10 @@ Backup/Restore commands:
     )
     parser.add_argument(
         "--seed",
-        action="store_true",
-        help="Load seed/sample data after initialization",
+        nargs="?",
+        const="list",
+        metavar="PROFILE",
+        help="Load seed data from profile (creator, validator). Use --seed without argument to list profiles.",
     )
     parser.add_argument(
         "--skip-postgres",
@@ -147,20 +152,62 @@ Backup/Restore commands:
     return parser.parse_args()
 
 
-def run_postgres_init(logger: logging.Logger, force_reset: bool = False) -> bool:
+def list_seed_profiles() -> list[dict]:
+    """List available seed profiles with their contents."""
+    profiles = []
+    if not SEED_PROFILES_DIR.exists():
+        return profiles
+
+    for profile_dir in sorted(SEED_PROFILES_DIR.iterdir()):
+        if profile_dir.is_dir():
+            profile = {
+                "name": profile_dir.name,
+                "path": profile_dir,
+                "has_neo4j": (profile_dir / "neo4j.cypher").exists(),
+                "has_postgres": (profile_dir / "postgres.sql").exists(),
+            }
+            profiles.append(profile)
+    return profiles
+
+
+def get_seed_profile(name: str) -> dict | None:
+    """Get a specific seed profile by name."""
+    profile_dir = SEED_PROFILES_DIR / name
+    if not profile_dir.exists():
+        return None
+    return {
+        "name": name,
+        "path": profile_dir,
+        "has_neo4j": (profile_dir / "neo4j.cypher").exists(),
+        "has_postgres": (profile_dir / "postgres.sql").exists(),
+    }
+
+
+def run_postgres_init(logger: logging.Logger, force_reset: bool = False, seed_profile: dict | None = None) -> bool:
     """
     Run PostgreSQL database initialization.
 
     Args:
         logger: Logger instance.
         force_reset: If True, drop all tables and recreate.
+        seed_profile: Optional seed profile dict with postgres.sql path.
 
     Returns:
         True if successful, False otherwise.
     """
     try:
-        from scripts.init_db import initialize_postgres
-        return initialize_postgres(logger, force_reset)
+        from scripts.init_db import initialize_postgres, seed_postgres
+        if not initialize_postgres(logger, force_reset):
+            return False
+
+        # Load seed data if profile has postgres.sql
+        if seed_profile and seed_profile.get("has_postgres"):
+            seed_file = seed_profile["path"] / "postgres.sql"
+            logger.info(f"  Loading PostgreSQL seed data from {seed_profile['name']}...")
+            if not seed_postgres(seed_file, logger):
+                logger.warning("  PostgreSQL seeding had issues")
+
+        return True
     except ImportError as e:
         logger.error(f"  Could not import init_db module: {e}")
         return False
@@ -169,21 +216,28 @@ def run_postgres_init(logger: logging.Logger, force_reset: bool = False) -> bool
         return False
 
 
-def run_neo4j_init(logger: logging.Logger, force_reset: bool = False, seed: bool = False) -> bool:
+def run_neo4j_init(logger: logging.Logger, force_reset: bool = False, seed_profile: dict | None = None) -> bool:
     """
     Run Neo4j knowledge graph initialization.
 
     Args:
         logger: Logger instance.
         force_reset: If True, clear all data and re-seed.
-        seed: If True, load seed data.
+        seed_profile: Optional seed profile dict with neo4j.cypher path.
 
     Returns:
         True if successful, False otherwise.
     """
     try:
         from scripts.init_neo4j import initialize_neo4j
-        return initialize_neo4j(logger, clear=force_reset, seed=seed)
+
+        # Determine seed file from profile
+        seed_file = None
+        if seed_profile and seed_profile.get("has_neo4j"):
+            seed_file = seed_profile["path"] / "neo4j.cypher"
+            logger.info(f"  Using Neo4j seed data from {seed_profile['name']}...")
+
+        return initialize_neo4j(logger, clear=force_reset, seed=seed_profile is not None, seed_file=seed_file)
     except ImportError as e:
         logger.warning(f"  Could not import init_neo4j module: {e}")
         return True  # Don't fail if Neo4j module not available
@@ -691,12 +745,45 @@ def main() -> int:
         success = run_neo4j_export(logger)
         return 0 if success else 1
 
+    # Handle seed profile selection
+    seed_profile = None
+    if args.seed:
+        if args.seed == "list":
+            # List available profiles
+            logger.info("")
+            logger.info("Available seed profiles:")
+            logger.info("")
+            profiles = list_seed_profiles()
+            if not profiles:
+                logger.info("  No profiles found in data/seed/")
+                logger.info("  Create profiles by adding directories with neo4j.cypher and/or postgres.sql")
+            else:
+                for p in profiles:
+                    components = []
+                    if p["has_neo4j"]:
+                        components.append("neo4j.cypher")
+                    if p["has_postgres"]:
+                        components.append("postgres.sql")
+                    logger.info(f"  {p['name']:15} [{', '.join(components)}]")
+            logger.info("")
+            logger.info("Usage: python scripts/app_init.py --seed <profile> [--force-reset]")
+            return 0
+        else:
+            # Get specific profile
+            seed_profile = get_seed_profile(args.seed)
+            if not seed_profile:
+                logger.error(f"Seed profile not found: {args.seed}")
+                logger.info("Use --seed without argument to list available profiles")
+                return 1
+
     logger.info("")
     logger.info("=" * 60)
     logger.info("Graph-RAG Application Initialization")
     logger.info("=" * 60)
     if args.force_reset:
         logger.warning("WARNING: Force reset mode - all data will be deleted!")
+    if seed_profile:
+        logger.info(f"Seed profile: {seed_profile['name']}")
     logger.info("")
 
     # Calculate steps
@@ -732,7 +819,9 @@ def main() -> int:
         if name == "Workspace":
             success = init_func(logger)
         elif name == "Neo4j":
-            success = init_func(logger, args.force_reset, args.seed)
+            success = init_func(logger, args.force_reset, seed_profile)
+        elif name == "PostgreSQL":
+            success = init_func(logger, args.force_reset, seed_profile)
         else:
             success = init_func(logger, args.force_reset)
 
