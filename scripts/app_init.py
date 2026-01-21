@@ -30,9 +30,13 @@ Usage:
     python scripts/app_init.py --export-neo4j
 """
 import argparse
+import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
@@ -71,6 +75,11 @@ Examples:
 
 Database reset commands (development):
   python scripts/app_init.py --force-reset --seed  # Fresh start with seed data
+
+Backup/Restore commands:
+  python scripts/app_init.py --create-backup                  # Create backup with auto-name
+  python scripts/app_init.py --create-backup my_backup        # Create backup with custom name
+  python scripts/app_init.py --restore-backup backups/20260117_001  # Restore from backup
         """,
     )
     parser.add_argument(
@@ -122,6 +131,18 @@ Database reset commands (development):
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose output",
+    )
+    parser.add_argument(
+        "--create-backup",
+        nargs="?",
+        const=True,
+        metavar="NAME",
+        help="Create backup of current state (optional: provide name)",
+    )
+    parser.add_argument(
+        "--restore-backup",
+        metavar="PATH",
+        help="Restore from backup directory",
     )
     return parser.parse_args()
 
@@ -325,10 +346,331 @@ def verify_setup(logger: logging.Logger, skip_postgres: bool, skip_neo4j: bool, 
     return all_ok
 
 
+def _get_git_commit() -> str:
+    """Get current git commit hash."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()[:8]
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _generate_backup_dir_name(name: str | None) -> Path:
+    """Generate backup directory name with date and sequence number."""
+    backups_dir = PROJECT_ROOT / "backups"
+    backups_dir.mkdir(exist_ok=True)
+
+    date_str = datetime.now().strftime("%Y%m%d")
+
+    # Find next sequence number for today
+    existing = list(backups_dir.glob(f"{date_str}_*"))
+    seq_numbers = []
+    for d in existing:
+        parts = d.name.split("_")
+        if len(parts) >= 2:
+            try:
+                seq_numbers.append(int(parts[1]))
+            except ValueError:
+                pass
+
+    next_seq = max(seq_numbers, default=0) + 1
+
+    if name and name is not True:
+        dir_name = f"{date_str}_{next_seq:03d}_{name}"
+    else:
+        dir_name = f"{date_str}_{next_seq:03d}"
+
+    return backups_dir / dir_name
+
+
+def create_backup(logger: logging.Logger, name: str | None = None) -> bool:
+    """
+    Create a backup of the current application state.
+
+    Args:
+        logger: Logger instance.
+        name: Optional name to append to backup directory.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    backup_dir = _generate_backup_dir_name(name)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Creating backup: {backup_dir}")
+    logger.info("")
+
+    success = True
+    backup_info = {
+        "timestamp": datetime.now().isoformat(),
+        "git_commit": _get_git_commit(),
+        "components": {},
+    }
+
+    # 1. Backup PostgreSQL
+    logger.info("[1/4] Backing up PostgreSQL...")
+    try:
+        from scripts.init_db import backup_postgres
+        postgres_file = backup_dir / "postgres.dump"
+        if backup_postgres(postgres_file, logger):
+            backup_info["components"]["postgres"] = {"file": "postgres.dump", "success": True}
+        else:
+            backup_info["components"]["postgres"] = {"success": False}
+            success = False
+    except ImportError as e:
+        logger.warning(f"  Could not import init_db: {e}")
+        backup_info["components"]["postgres"] = {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"  PostgreSQL backup failed: {e}")
+        backup_info["components"]["postgres"] = {"success": False, "error": str(e)}
+        success = False
+    logger.info("")
+
+    # 2. Backup Neo4j
+    logger.info("[2/4] Backing up Neo4j...")
+    try:
+        from scripts.init_neo4j import backup_neo4j
+        neo4j_file = backup_dir / "neo4j_export.cypher"
+        if backup_neo4j(neo4j_file, logger):
+            backup_info["components"]["neo4j"] = {"file": "neo4j_export.cypher", "success": True}
+        else:
+            backup_info["components"]["neo4j"] = {"success": False}
+    except ImportError as e:
+        logger.warning(f"  Could not import init_neo4j: {e}")
+        backup_info["components"]["neo4j"] = {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.warning(f"  Neo4j backup failed: {e}")
+        backup_info["components"]["neo4j"] = {"success": False, "error": str(e)}
+    logger.info("")
+
+    # 3. Backup MongoDB
+    logger.info("[3/4] Backing up MongoDB...")
+    try:
+        from scripts.init_mongodb import backup_mongodb
+        mongodb_dir = backup_dir / "mongodb"
+        mongodb_dir.mkdir(exist_ok=True)
+        if backup_mongodb(mongodb_dir, logger):
+            backup_info["components"]["mongodb"] = {"directory": "mongodb", "success": True}
+        else:
+            backup_info["components"]["mongodb"] = {"success": False}
+    except ImportError as e:
+        logger.info(f"  MongoDB module not available: {e}")
+        backup_info["components"]["mongodb"] = {"success": True, "skipped": True}
+    except Exception as e:
+        logger.warning(f"  MongoDB backup failed: {e}")
+        backup_info["components"]["mongodb"] = {"success": False, "error": str(e)}
+    logger.info("")
+
+    # 4. Backup workspace
+    logger.info("[4/4] Backing up workspace...")
+    workspace_path = os.getenv("WORKSPACE_PATH")
+    if workspace_path:
+        src_workspace = PROJECT_ROOT / workspace_path
+    else:
+        src_workspace = PROJECT_ROOT / "workspace"
+
+    if src_workspace.exists() and any(src_workspace.iterdir()):
+        dest_workspace = backup_dir / "workspace"
+        try:
+            shutil.copytree(src_workspace, dest_workspace)
+            # Count items
+            job_count = len(list(dest_workspace.glob("job_*")))
+            checkpoint_count = len(list((dest_workspace / "checkpoints").glob("*.db"))) if (dest_workspace / "checkpoints").exists() else 0
+            logger.info(f"  Copied workspace: {job_count} jobs, {checkpoint_count} checkpoints")
+            backup_info["components"]["workspace"] = {
+                "directory": "workspace",
+                "success": True,
+                "jobs": job_count,
+                "checkpoints": checkpoint_count,
+            }
+        except Exception as e:
+            logger.warning(f"  Workspace backup failed: {e}")
+            backup_info["components"]["workspace"] = {"success": False, "error": str(e)}
+    else:
+        logger.info("  Workspace is empty or does not exist")
+        backup_info["components"]["workspace"] = {"success": True, "empty": True}
+    logger.info("")
+
+    # Write backup info
+    info_file = backup_dir / "backup_info.json"
+    with open(info_file, "w") as f:
+        json.dump(backup_info, f, indent=2)
+    logger.info(f"Backup info written to: {info_file}")
+
+    return success
+
+
+def restore_backup(logger: logging.Logger, backup_path: str) -> bool:
+    """
+    Restore application state from a backup.
+
+    Args:
+        logger: Logger instance.
+        backup_path: Path to the backup directory.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    backup_dir = Path(backup_path)
+    if not backup_dir.is_absolute():
+        backup_dir = PROJECT_ROOT / backup_path
+
+    if not backup_dir.exists():
+        logger.error(f"Backup directory not found: {backup_dir}")
+        return False
+
+    # Read backup info
+    info_file = backup_dir / "backup_info.json"
+    if info_file.exists():
+        with open(info_file) as f:
+            backup_info = json.load(f)
+        logger.info(f"Restoring backup from: {backup_info.get('timestamp', 'unknown')}")
+        logger.info(f"Git commit: {backup_info.get('git_commit', 'unknown')}")
+    else:
+        logger.warning("No backup_info.json found, proceeding anyway")
+        backup_info = {}
+
+    logger.info("")
+    success = True
+
+    # 1. Restore PostgreSQL
+    logger.info("[1/4] Restoring PostgreSQL...")
+    postgres_file = backup_dir / "postgres.dump"
+    if postgres_file.exists():
+        try:
+            from scripts.init_db import restore_postgres
+            if not restore_postgres(postgres_file, logger):
+                logger.warning("  PostgreSQL restore had issues")
+        except ImportError as e:
+            logger.warning(f"  Could not import init_db: {e}")
+        except Exception as e:
+            logger.error(f"  PostgreSQL restore failed: {e}")
+            success = False
+    else:
+        logger.info("  No PostgreSQL backup found")
+    logger.info("")
+
+    # 2. Restore Neo4j
+    logger.info("[2/4] Restoring Neo4j...")
+    neo4j_file = backup_dir / "neo4j_export.cypher"
+    if neo4j_file.exists():
+        try:
+            from scripts.init_neo4j import restore_neo4j
+            if not restore_neo4j(neo4j_file, logger):
+                logger.warning("  Neo4j restore had issues")
+        except ImportError as e:
+            logger.warning(f"  Could not import init_neo4j: {e}")
+        except Exception as e:
+            logger.warning(f"  Neo4j restore failed: {e}")
+    else:
+        logger.info("  No Neo4j backup found")
+    logger.info("")
+
+    # 3. Restore MongoDB
+    logger.info("[3/4] Restoring MongoDB...")
+    mongodb_dir = backup_dir / "mongodb"
+    if mongodb_dir.exists() and any(mongodb_dir.iterdir()):
+        try:
+            from scripts.init_mongodb import restore_mongodb
+            if not restore_mongodb(mongodb_dir, logger):
+                logger.warning("  MongoDB restore had issues")
+        except ImportError as e:
+            logger.info(f"  MongoDB module not available: {e}")
+        except Exception as e:
+            logger.warning(f"  MongoDB restore failed: {e}")
+    else:
+        logger.info("  No MongoDB backup found")
+    logger.info("")
+
+    # 4. Restore workspace
+    logger.info("[4/4] Restoring workspace...")
+    src_workspace = backup_dir / "workspace"
+    if src_workspace.exists():
+        workspace_path = os.getenv("WORKSPACE_PATH")
+        if workspace_path:
+            dest_workspace = PROJECT_ROOT / workspace_path
+        else:
+            dest_workspace = PROJECT_ROOT / "workspace"
+
+        try:
+            # Remove existing workspace contents
+            if dest_workspace.exists():
+                for item in dest_workspace.iterdir():
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+
+            # Copy from backup
+            dest_workspace.mkdir(exist_ok=True)
+            for item in src_workspace.iterdir():
+                dest_item = dest_workspace / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest_item)
+                else:
+                    shutil.copy2(item, dest_item)
+
+            job_count = len(list(dest_workspace.glob("job_*")))
+            logger.info(f"  Restored workspace: {job_count} jobs")
+        except Exception as e:
+            logger.warning(f"  Workspace restore failed: {e}")
+    else:
+        logger.info("  No workspace backup found")
+    logger.info("")
+
+    return success
+
+
 def main() -> int:
     """Main entry point for application initialization."""
     args = parse_args()
     logger = setup_logging(args.verbose)
+
+    # Handle backup mode
+    if args.create_backup is not None:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Graph-RAG Application Backup")
+        logger.info("=" * 60)
+        logger.info("")
+
+        name = args.create_backup if args.create_backup is not True else None
+        success = create_backup(logger, name)
+
+        logger.info("")
+        logger.info("=" * 60)
+        if success:
+            logger.info("Backup Complete!")
+        else:
+            logger.warning("Backup completed with some issues")
+        logger.info("=" * 60)
+        return 0 if success else 1
+
+    # Handle restore mode
+    if args.restore_backup:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("Graph-RAG Application Restore")
+        logger.info("=" * 60)
+        logger.info("")
+
+        success = restore_backup(logger, args.restore_backup)
+
+        logger.info("")
+        logger.info("=" * 60)
+        if success:
+            logger.info("Restore Complete!")
+        else:
+            logger.warning("Restore completed with some issues")
+        logger.info("=" * 60)
+        return 0 if success else 1
 
     # Handle --only-* flags
     if args.only_postgres:

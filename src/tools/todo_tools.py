@@ -111,16 +111,19 @@ def create_todo_tools(context: ToolContext) -> List:
             return f"Error staging todos: {str(e)}"
 
     @tool
-    def todo_complete() -> str:
-        """Mark the current task as complete.
+    def todo_complete(todo_id: str = "") -> str:
+        """Mark a task as complete.
 
-        Call this tool AFTER you have finished working on a task. It finds the
-        first incomplete task (in_progress first, then highest-priority pending)
-        and marks it as completed.
+        Call this tool AFTER you have finished working on a task.
+
+        Args:
+            todo_id: Optional. The ID of the todo to complete (e.g., "todo_1", "todo_2").
+                     If not provided, completes the first incomplete task
+                     (in_progress first, then highest-priority pending).
 
         This is the primary rhythm of work:
         1. Work on the current task
-        2. Call todo_complete() when done
+        2. Call todo_complete() or todo_complete(todo_id="todo_X") when done
         3. Read the response to see what's next
         4. Repeat
 
@@ -139,13 +142,48 @@ def create_todo_tools(context: ToolContext) -> List:
         Note:
             The response includes "PHASE_COMPLETE" when all tasks are done.
             This is detected by the graph to trigger phase transitions.
+
+        Examples:
+            todo_complete()  # Complete first pending task
+            todo_complete(todo_id="todo_1")  # Complete specific task
+            todo_complete(todo_id="todo_3")  # Complete task 3 specifically
         """
         try:
-            result = todo_mgr.complete_first_pending_sync()
-            message = result["message"]
+            if todo_id and todo_id.strip():
+                # Complete specific todo by ID
+                todo = todo_mgr.complete(todo_id.strip())
+                if not todo:
+                    # List available todos to help the agent
+                    available = todo_mgr.list_all()
+                    if available:
+                        todo_list = ", ".join(t.id for t in available)
+                        return f"Error: Todo '{todo_id}' not found. Available todos: {todo_list}"
+                    return f"Error: Todo '{todo_id}' not found. No todos in the list."
+
+                # Build response message
+                remaining = todo_mgr.list_pending()
+                is_last = todo_mgr.all_complete()
+
+                if is_last:
+                    message = (
+                        f"Completed: {todo.content}\n"
+                        f"All tasks complete! Ready for phase transition."
+                    )
+                else:
+                    next_task = remaining[0] if remaining else None
+                    next_str = f"\nNext: {next_task.content}" if next_task else ""
+                    message = (
+                        f"Completed: {todo.content}\n"
+                        f"Remaining: {len(remaining)} tasks{next_str}"
+                    )
+            else:
+                # Original behavior: complete first pending task
+                result = todo_mgr.complete_first_pending_sync()
+                message = result["message"]
+                is_last = result.get("is_last_task", False)
 
             # Add phase transition signal if this was the last task
-            if result.get("is_last_task", False):
+            if is_last:
                 message += "\n\n[PHASE_COMPLETE] All tasks in this phase are done."
                 logger.info("Last task completed - phase transition signal sent")
 
@@ -154,6 +192,47 @@ def create_todo_tools(context: ToolContext) -> List:
         except Exception as e:
             logger.error(f"todo_complete error: {e}")
             return f"Error completing task: {str(e)}"
+
+    @tool
+    def todo_list() -> str:
+        """List all current todos with their IDs and status.
+
+        Use this tool to see:
+        - All todo IDs (for use with todo_complete)
+        - Current status of each todo
+        - Overall progress
+
+        Returns:
+            Formatted list of all todos with IDs and status.
+
+        Example output:
+            Current Todos (2/5 complete):
+            - [x] todo_1: Extract document text (completed)
+            - [x] todo_2: Chunk document (completed)
+            - [ ] todo_3: Identify requirements (pending)
+            - [ ] todo_4: Validate requirements (pending)
+            - [ ] todo_5: Write to database (pending)
+        """
+        try:
+            todos = todo_mgr.list_all()
+            if not todos:
+                return "No todos in the current list."
+
+            completed = sum(1 for t in todos if t.status.value == "completed")
+            total = len(todos)
+
+            lines = [f"Current Todos ({completed}/{total} complete):"]
+            for todo in todos:
+                status_mark = "x" if todo.status.value == "completed" else " "
+                status_text = f"({todo.status.value})"
+                priority_mark = " [!]" if todo.priority == "high" else ""
+                lines.append(f"- [{status_mark}] {todo.id}: {todo.content}{priority_mark} {status_text}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"todo_list error: {e}")
+            return f"Error listing todos: {str(e)}"
 
     @tool
     def todo_rewind(issue: str) -> str:
@@ -212,6 +291,7 @@ def create_todo_tools(context: ToolContext) -> List:
     return [
         next_phase_todos,
         todo_complete,
+        todo_list,
         todo_rewind,
     ]
 
@@ -232,9 +312,16 @@ TODO_TOOLS_METADATA = {
     "todo_complete": {
         "module": "todo_tools",
         "function": "todo_complete",
-        "description": "Mark the current task as complete and show next task",
+        "description": "Mark a task as complete (optionally by ID)",
         "category": "todo",
         "phases": ["strategic", "tactical"],  # Both: used in all phases
+    },
+    "todo_list": {
+        "module": "todo_tools",
+        "function": "todo_list",
+        "description": "List all todos with IDs and status",
+        "category": "todo",
+        "phases": ["strategic", "tactical"],  # Both: helps see current state
     },
     "todo_rewind": {
         "module": "todo_tools",

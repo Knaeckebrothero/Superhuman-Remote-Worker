@@ -516,6 +516,14 @@ def create_check_todos_node(
         # Validate todos exist before checking completion
         todos = todo_manager.list_all()
         if not todos:
+            # Check if we're in tactical phase with no todos - this is a stuck state
+            # (can happen after resume if todo state wasn't persisted)
+            is_strategic = state.get("is_strategic_phase", True)
+            if not is_strategic:
+                logger.warning(
+                    f"[{job_id}] No todos in tactical phase - forcing phase complete to recover"
+                )
+                return {"phase_complete": True}
             logger.warning(f"[{job_id}] No todos loaded - phase cannot be complete")
             return {"phase_complete": False}
 

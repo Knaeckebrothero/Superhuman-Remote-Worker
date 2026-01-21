@@ -262,7 +262,7 @@ class TodoManager:
             lines.append("")
             lines.append("**In Progress:**")
             for todo in in_progress:
-                lines.append(f"  - {todo.content}")
+                lines.append(f"  - [{todo.id}] {todo.content}")
 
         # Pending
         pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
@@ -275,8 +275,8 @@ class TodoManager:
                 pending, key=lambda t: priority_order.get(t.priority, 1)
             )
             for todo in pending_sorted:
-                marker = "[!]" if todo.priority == "high" else ""
-                lines.append(f"  - {marker}{todo.content}")
+                marker = "[!] " if todo.priority == "high" else ""
+                lines.append(f"  - [{todo.id}] {marker}{todo.content}")
 
         # Completed count
         completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]

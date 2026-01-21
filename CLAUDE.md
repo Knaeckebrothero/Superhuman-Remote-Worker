@@ -28,6 +28,13 @@ python scripts/app_init.py --seed
 python scripts/app_init.py --force-reset --seed
 python scripts/app_init.py --only-postgres --force-reset
 python scripts/app_init.py --only-neo4j --force-reset
+
+# Create backup of current state
+python scripts/app_init.py --create-backup                  # Auto-named: backups/YYYYMMDD_NNN/
+python scripts/app_init.py --create-backup my_backup        # Named: backups/YYYYMMDD_NNN_my_backup/
+
+# Restore from backup
+python scripts/app_init.py --restore-backup backups/20260117_001_my_backup
 ```
 
 ### Running Agents
@@ -48,9 +55,11 @@ python agent.py --config creator --job-id <id> --resume
 
 ### Testing
 ```bash
-pytest tests/                    # All tests
-pytest tests/test_graph.py -v    # Single test file
-pytest tests/ --cov=src          # With coverage
+pytest tests/                              # All tests
+pytest tests/test_graph.py -v              # Single file
+pytest tests/test_graph.py::test_name -v   # Single test
+pytest tests/ -k "todo"                    # Tests matching pattern
+pytest tests/ --cov=src                    # With coverage
 ```
 
 ### Validation
@@ -73,17 +82,43 @@ Data flow: Creator → `requirements` table → Validator → Neo4j
 
 ### Phase Alternation Model
 
-The agent uses a single ReAct loop alternating between phases:
+The agent uses a single ReAct loop alternating between strategic and tactical phases:
 
-1. **Strategic Phase**: Planning, memory updates, todo creation from YAML templates
-2. **Tactical Phase**: Domain-specific execution of todos
-3. **Archive**: Save artifacts, clear messages, update workspace.md
-4. Repeat until goal achieved
+```
+init_workspace → init_strategic_todos
+       ↓
+    execute ─→ tools ─→ check_todos ──→ todos done? ──no──┐
+       ↑                                                   │
+       └───────────────────────────────────────────────────┘
+                           │ yes
+                           ↓
+                    archive_phase → handle_transition → check_goal
+                                                            │
+                                   ┌──── goal achieved? ────┤
+                                   ↓ no                     ↓ yes
+                            back to execute                END
+```
 
-Key files per phase:
-- `workspace.md` - Long-term memory (persists across phases)
-- `plan.md` - Strategic plan
-- `todos.yaml` - Current task list
+**Strategic Phase** (planning mode):
+- Reviews instructions and creates plan
+- Updates workspace.md (long-term memory)
+- Creates todos for tactical execution via `next_phase_todos`
+- Has access to `job_complete` tool (tactical does not)
+
+**Tactical Phase** (execution mode):
+- Executes domain-specific work using todos
+- Uses `todo_complete` to mark items done
+- Transitions back to strategic when all todos complete
+
+### Key Todo Tools
+
+| Tool | Phase | Purpose |
+|------|-------|---------|
+| `next_phase_todos` | Strategic | Stage todos for next tactical phase |
+| `todo_complete` | Both | Mark current todo complete with notes |
+| `todo_rewind` | Both | Roll back to re-execute failed todo |
+| `mark_complete` | Both | Signal phase/task completion |
+| `job_complete` | Strategic only | Signal final job completion |
 
 ### Configuration Inheritance
 
@@ -97,31 +132,34 @@ Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`:
 }
 ```
 
+Tool categories in config:
+- `workspace`: File operations (read_file, write_file, etc.)
+- `todo`: Task management (next_phase_todos, todo_complete, todo_rewind)
+- `domain`: Agent-specific tools (set per config)
+- `completion`: Phase/job signaling (mark_complete, job_complete)
+
 ### Workspace Structure
 
 Per-job directory: `workspace/job_<uuid>/`
-- `archive/` - Phase artifacts
+- `workspace.md` - Long-term memory (persists across phases)
+- `plan.md` - Strategic plan
+- `todos.yaml` - Current task list (managed by TodoManager)
+- `archive/` - Phase artifacts and archived todos
 - `documents/` - Input documents
 - `tools/` - Tool outputs
 - Checkpoints: `workspace/checkpoints/job_<id>.db`
 
 ## Key Source Directories
 
+- `src/graph.py` - LangGraph state machine (phase alternation graph)
 - `src/core/` - State management, workspace, context, phase transitions
 - `src/managers/` - TodoManager, MemoryManager, PlanManager
 - `src/tools/` - Tool implementations and registry
+- `src/tools/registry.py` - Tool loading with phase filtering
 - `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
 - `src/api/` - FastAPI application
 - `configs/` - Agent-specific configurations
 - `dashboard/` - Streamlit UI
-
-## Graph Structure (src/graph.py)
-
-```
-init_workspace → read_instructions → create_plan
-       ↓
-execute (ReAct) → check_todos → archive_phase → handle_transition → check_goal
-```
 
 ## Environment Variables
 
@@ -145,60 +183,21 @@ Required in `.env`:
 
 ## Debugging
 
-### Workspace Files and Logs
+**Workspace files**: `workspace/job_<uuid>/` (workspace.md, todos.yaml, plan.md)
 
-Per-job files are stored in the workspace directory:
-- **Workspace files**: `workspace/job_<uuid>/` - Contains `workspace.md`, `todos.yaml`, `plan.md`, and subdirectories
-- **Checkpoints**: `workspace/checkpoints/job_<id>.db` - SQLite checkpoint for resume capability
-- **Logs**: `workspace/logs/job_<id>.log` - Agent execution logs
+**Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite for resume)
+
+**Logs**: `workspace/logs/job_<id>.log`
 
 ```bash
-# Clean up checkpoint/log files for a specific job
-rm workspace/checkpoints/job_<id>.db workspace/logs/job_<id>.log
-
-# Clean up all checkpoints and logs
+# Clean up checkpoint/log files
 rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 ```
 
-### MongoDB Conversation Viewer
-
-MongoDB stores LLM request/response history and agent audit trails for debugging. Enable by setting `MONGODB_URL` in `.env`:
-
+**MongoDB LLM Viewer** (requires `MONGODB_URL` in .env):
 ```bash
-MONGODB_URL=mongodb://localhost:27017/graphrag_logs
+python scripts/view_llm_conversation.py --list                    # List jobs
+python scripts/view_llm_conversation.py --job-id <uuid>           # View conversation
+python scripts/view_llm_conversation.py --job-id <uuid> --stats   # Token usage stats
+python scripts/view_llm_conversation.py --job-id <uuid> --audit   # Full audit trail
 ```
-
-Use `scripts/view_llm_conversation.py` to inspect agent behavior:
-
-```bash
-# List all jobs with records
-python scripts/view_llm_conversation.py --list
-
-# View LLM conversation for a job
-python scripts/view_llm_conversation.py --job-id <uuid>
-
-# View job statistics (token usage, latency, duration)
-python scripts/view_llm_conversation.py --job-id <uuid> --stats
-
-# View complete agent audit trail (all steps)
-python scripts/view_llm_conversation.py --job-id <uuid> --audit
-
-# View only tool calls in audit trail
-python scripts/view_llm_conversation.py --job-id <uuid> --audit --step-type tool_call
-
-# View audit as timeline visualization
-python scripts/view_llm_conversation.py --job-id <uuid> --audit --timeline
-
-# Export conversation to JSON
-python scripts/view_llm_conversation.py --job-id <uuid> --export conversation.json
-
-# View single LLM request as HTML (opens in browser)
-python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --temp
-
-# View recent requests across all jobs
-python scripts/view_llm_conversation.py --recent 20
-```
-
-MongoDB collections:
-- `llm_requests` - Full LLM request/response with messages, model, latency, token usage
-- `agent_audit` - Step-by-step execution trace (tool calls, phase transitions, routing decisions)
