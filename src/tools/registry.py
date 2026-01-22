@@ -380,8 +380,8 @@ def _load_domain_tools(tool_names: Set[str], context: ToolContext) -> List[Any]:
 
     # Load graph tools if needed
     if graph_tools_needed:
-        if not context.neo4j_conn:
-            logger.warning("Graph tools require neo4j_conn in ToolContext")
+        if not context.has_neo4j():
+            logger.warning("Graph tools require neo4j_db in ToolContext")
         else:
             try:
                 grph_tools = create_graph_tools(context)
