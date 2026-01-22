@@ -62,6 +62,14 @@ pytest tests/ -k "todo"                    # Tests matching pattern
 pytest tests/ --cov=src                    # With coverage
 ```
 
+### Linting (citation_tool only)
+```bash
+cd citation_tool
+ruff check src/ tests/          # Lint
+ruff format src/ tests/         # Format
+mypy src/                       # Type check
+```
+
 ### Validation
 ```bash
 python validate_metamodel.py --check all --json
@@ -122,7 +130,7 @@ init_workspace → init_strategic_todos
 
 ### Configuration Inheritance
 
-Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`:
+Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`. Deep merge applies - set value to `null` to clear inherited defaults.
 
 ```json
 {
@@ -138,28 +146,53 @@ Tool categories in config:
 - `domain`: Agent-specific tools (set per config)
 - `completion`: Phase/job signaling (mark_complete, job_complete)
 
+### Multi-Database Architecture
+
+| Database | Purpose | Connection |
+|----------|---------|------------|
+| PostgreSQL | Jobs, requirements, citations | Async with asyncpg, namespace pattern: `db.jobs.create()` |
+| Neo4j | Knowledge graph | Session-based, namespace pattern: `db.requirements.create()` |
+| MongoDB | LLM request logging (optional) | Audit trail and token tracking |
+
 ### Workspace Structure
 
 Per-job directory: `workspace/job_<uuid>/`
-- `workspace.md` - Long-term memory (persists across phases)
+- `workspace.md` - Long-term memory (always in system prompt, persists across context compaction)
 - `plan.md` - Strategic plan
 - `todos.yaml` - Current task list (managed by TodoManager)
-- `archive/` - Phase artifacts and archived todos
+- `archive/` - Phase artifacts and archived todos (`todos_phase_{n}.yaml`)
 - `documents/` - Input documents
 - `tools/` - Tool outputs
-- Checkpoints: `workspace/checkpoints/job_<id>.db`
+- Checkpoints: `workspace/checkpoints/job_<id>.db` (SQLite)
+
+### Context Management
+
+Token limits trigger automatic summarization:
+- `context_threshold_tokens`: 80000 (default)
+- `message_count_threshold`: 200 messages
+- `keep_recent_tool_results`: 10 most recent preserved during compaction
 
 ## Key Source Directories
 
 - `src/graph.py` - LangGraph state machine (phase alternation graph)
+- `src/agent.py` - UniversalAgent main class
 - `src/core/` - State management, workspace, context, phase transitions
+  - `state.py` - UniversalAgentState TypedDict
+  - `workspace.py` - WorkspaceManager for job directories
+  - `loader.py` - Config loading, LLM creation, tool registry
+  - `context.py` - ContextManager for token counting/compaction
 - `src/managers/` - TodoManager, MemoryManager, PlanManager
 - `src/tools/` - Tool implementations and registry
-- `src/tools/registry.py` - Tool loading with phase filtering
+  - `registry.py` - Tool metadata registry with phase filtering
+  - `context.py` - ToolContext dependency injection
 - `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
+  - `postgres_db.py` - Async PostgreSQL with namespaces
+  - `neo4j_db.py` - Neo4j session-based with namespaces
+  - `schema.sql` - PostgreSQL schema
 - `src/api/` - FastAPI application
-- `configs/` - Agent-specific configurations
+- `configs/` - Agent-specific configurations (`creator/`, `validator/`)
 - `dashboard/` - Streamlit UI
+- `citation_tool/` - Separate installable package for citation management
 
 ## Environment Variables
 

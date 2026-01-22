@@ -461,12 +461,6 @@ class UniversalAgent:
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
-            # Try to restore todo state from saved file
-            if self._todo_manager.load_state():
-                logger.info("Restored todo state from saved checkpoint")
-            else:
-                logger.debug("No saved todo state found, starting fresh")
-
             logger.debug(f"Resumed workspace at {self._workspace_manager.path}")
             return metadata or {}
 
