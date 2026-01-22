@@ -549,12 +549,6 @@ def create_check_todos_node(
                 metadata=state.get("metadata"),
             )
 
-        # Save todo state for crash recovery (runs after every iteration)
-        try:
-            todo_manager.save_state()
-        except Exception as e:
-            logger.warning(f"[{job_id}] Failed to save todo state: {e}")
-
         if all_complete:
             logger.info(f"[{job_id}] All todos complete")
             return {"phase_complete": True}
@@ -588,9 +582,6 @@ def create_archive_phase_node(
 
         # Archive todos
         archive_path = todo_manager.archive(current_phase or "phase")
-
-        # Clear saved state file since todos are now archived
-        todo_manager.clear_saved_state()
 
         # Mark phase complete in plan
         if current_phase:
