@@ -84,7 +84,7 @@ Single codebase configured for different roles via JSON configs in `configs/`:
 | Config | Purpose | Polls | Key Tools |
 |--------|---------|-------|-----------|
 | `creator` | Extract requirements from documents | `jobs` table | document, search, citation, cache |
-| `validator` | Validate and integrate into Neo4j | `requirements` table | graph, cypher, validation |
+| `validator` | Validate and integrate into Neo4j | `requirements` table | execute_cypher_query, get_database_schema, validate_schema_compliance |
 
 Data flow: Creator → `requirements` table → Validator → Neo4j
 
@@ -162,7 +162,8 @@ Per-job directory: `workspace/job_<uuid>/`
 - `todos.yaml` - Current task list (managed by TodoManager)
 - `archive/` - Phase artifacts and archived todos (`todos_phase_{n}.yaml`)
 - `documents/` - Input documents
-- `tools/` - Tool outputs
+- `tools/` - Auto-generated tool documentation (one `.md` file per tool)
+- `analysis/` - Validator working files (e.g., `requirement_input.md`)
 - Checkpoints: `workspace/checkpoints/job_<id>.db` (SQLite)
 
 ### Context Management
@@ -185,6 +186,8 @@ Token limits trigger automatic summarization:
 - `src/tools/` - Tool implementations and registry
   - `registry.py` - Tool metadata registry with phase filtering
   - `context.py` - ToolContext dependency injection
+  - `graph_tools.py` - Neo4j tools (execute_cypher_query, get_database_schema, validate_schema_compliance)
+  - `description_generator.py` - Generates tool documentation for workspace
 - `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
   - `postgres_db.py` - Async PostgreSQL with namespaces
   - `neo4j_db.py` - Neo4j session-based with namespaces

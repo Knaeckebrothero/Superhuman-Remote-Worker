@@ -19,16 +19,7 @@
     "domain": [
       "execute_cypher_query",
       "get_database_schema",
-      "find_similar_requirements",
-      "check_for_duplicates",
-      "resolve_business_object",
-      "resolve_message",
-      "validate_schema_compliance",
-      "create_requirement_node",
-      "create_fulfillment_relationship",
-      "generate_requirement_id",
-      "get_entity_relationships",
-      "count_graph_statistics"
+      "validate_schema_compliance"
     ]
   },
 
