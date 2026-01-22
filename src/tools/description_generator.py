@@ -523,37 +523,6 @@ execute_cypher_query("MATCH (r:Requirement) RETURN r.rid, r.name LIMIT 10")
 
 **Returns:** Schema information with node labels, relationship types, and properties""",
 
-        "find_similar_requirements": """Find existing requirements similar to the given text.
-
-**Arguments:**
-- `text` (str): Requirement text to compare
-- `threshold` (float, optional): Minimum similarity score 0.0-1.0 (default: 0.7)
-
-**Returns:** List of similar requirements with similarity scores""",
-
-        "check_for_duplicates": """Check if a requirement text is a duplicate.
-
-Uses high-threshold similarity (95%) to identify near-exact duplicates.
-
-**Arguments:**
-- `text` (str): Requirement text to check
-
-**Returns:** Duplicate check result with recommendation (REJECT if duplicate found)""",
-
-        "resolve_business_object": """Resolve a business object mention to an existing graph entity.
-
-**Arguments:**
-- `mention` (str): Text mention of a business object (e.g., "Customer", "Invoice")
-
-**Returns:** Matched entity details (BOID, name, domain) or no match message""",
-
-        "resolve_message": """Resolve a message mention to an existing graph entity.
-
-**Arguments:**
-- `mention` (str): Text mention of a message (e.g., "CreateOrderRequest")
-
-**Returns:** Matched entity details (MID, name, direction) or no match message""",
-
         "validate_schema_compliance": """Run metamodel compliance checks against the graph.
 
 **Arguments:**
@@ -564,48 +533,6 @@ Uses high-threshold similarity (95%) to identify near-exact duplicates.
   - "quality": Quality gates (C1-C5)
 
 **Returns:** Compliance report with pass/fail status and violations""",
-
-        "create_requirement_node": """Create a new Requirement node in the Neo4j graph.
-
-**Arguments:**
-- `rid` (str): Requirement ID (e.g., "R-0042")
-- `name` (str): Short descriptive name
-- `text` (str): Full requirement text
-- `req_type` (str, optional): Type - functional, non_functional, constraint, compliance (default: functional)
-- `priority` (str, optional): Priority - high, medium, low (default: medium)
-- `gobd_relevant` (bool, optional): GoBD relevance flag (default: False)
-- `gdpr_relevant` (bool, optional): GDPR relevance flag (default: False)
-- `compliance_status` (str, optional): Status - open, partial, fulfilled (default: open)
-
-**Returns:** Creation result with node ID""",
-
-        "create_fulfillment_relationship": """Create a fulfillment relationship between a Requirement and an entity.
-
-**Arguments:**
-- `requirement_rid` (str): Source requirement RID (e.g., "R-0042")
-- `entity_id` (str): Target entity ID (boid for BusinessObject, mid for Message)
-- `entity_type` (str): "BusinessObject" or "Message"
-- `relationship_type` (str): FULFILLED_BY_OBJECT, NOT_FULFILLED_BY_OBJECT, FULFILLED_BY_MESSAGE, NOT_FULFILLED_BY_MESSAGE
-- `confidence` (float, optional): Confidence score 0.0-1.0 (default: 0.5)
-- `evidence` (str, optional): Evidence text for the relationship
-
-**Returns:** Creation result""",
-
-        "generate_requirement_id": """Generate a new unique requirement ID.
-
-**Returns:** New RID following the R-XXXX pattern (e.g., "R-0042")""",
-
-        "get_entity_relationships": """Get all relationships for a BusinessObject or Message.
-
-**Arguments:**
-- `entity_id` (str): Entity ID (boid or mid)
-- `entity_type` (str): "BusinessObject" or "Message"
-
-**Returns:** List of relationships involving the entity""",
-
-        "count_graph_statistics": """Get statistics about the current graph state.
-
-**Returns:** Counts of nodes and relationships by type""",
     }
 
 

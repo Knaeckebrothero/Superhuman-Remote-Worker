@@ -541,6 +541,15 @@ class UniversalAgent:
             else:
                 logger.warning(f"Document not found: {source_path}")
 
+        # Write requirement data to workspace if provided (for validator agent)
+        if metadata.get("requirement_data"):
+            req = metadata["requirement_data"]
+            requirement_md = self._format_requirement_as_markdown(req)
+            analysis_dir = self._workspace_manager.get_path("analysis")
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            self._workspace_manager.write_file("analysis/requirement_input.md", requirement_md)
+            logger.info(f"Wrote requirement to analysis/requirement_input.md")
+
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
@@ -743,14 +752,28 @@ class UniversalAgent:
             await self.postgres_conn.execute(query, status, job_id)
 
     def _extract_job_metadata(self, job: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract metadata from a job record for processing."""
-        # Common fields to extract
+        """Extract metadata from a job record for processing.
+
+        Handles both:
+        - Jobs table rows (for Creator): extracts document_path, prompt, etc.
+        - Requirements table rows (for Validator): wraps as requirement_data
+        """
+        metadata = {}
+
+        # Check if this is a requirements table row (has 'text' field but no 'prompt')
+        # Requirements have: id, text, name, type, priority, gobd_relevant, etc.
+        if "text" in job and "prompt" not in job:
+            # This is a requirement row from polling - wrap it as requirement_data
+            metadata["requirement_data"] = job
+            logger.debug(f"Extracted requirement data: {job.get('name', job.get('id', 'unknown'))}")
+            return metadata
+
+        # Otherwise, handle as jobs table row
         metadata_fields = [
             "document_path", "prompt", "requirement_id", "requirement_data",
             "source_document", "config", "options",
         ]
 
-        metadata = {}
         for field in metadata_fields:
             if field in job:
                 metadata[field] = job[field]
@@ -760,6 +783,107 @@ class UniversalAgent:
             metadata.update(job["data"])
 
         return metadata
+
+    def _format_requirement_as_markdown(self, req: Dict[str, Any]) -> str:
+        """Format requirement data as markdown for the workspace.
+
+        Creates a structured markdown document from requirement data
+        for the validator agent to read from analysis/requirement_input.md.
+
+        Args:
+            req: Requirement dictionary from PostgreSQL
+
+        Returns:
+            Formatted markdown string
+        """
+        import json
+
+        lines = [
+            "# Requirement Input",
+            "",
+            f"**ID:** `{req.get('id', 'N/A')}`",
+            f"**Name:** {req.get('name', 'Unnamed')}",
+            "",
+            "## Text",
+            "",
+            req.get('text', '(No text provided)'),
+            "",
+            "## Metadata",
+            "",
+            f"- **Type:** {req.get('type', 'N/A')}",
+            f"- **Priority:** {req.get('priority', 'N/A')}",
+            f"- **GoBD Relevant:** {req.get('gobd_relevant', False)}",
+            f"- **GDPR Relevant:** {req.get('gdpr_relevant', False)}",
+            f"- **Confidence:** {req.get('confidence', 'N/A')}",
+            "",
+            "## Source",
+            "",
+            f"- **Document:** {req.get('source_document', 'N/A')}",
+        ]
+
+        # Handle source_location which may be JSON string or dict
+        source_location = req.get('source_location')
+        if source_location:
+            if isinstance(source_location, str):
+                try:
+                    source_location = json.loads(source_location)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            lines.append(f"- **Location:** {source_location}")
+        else:
+            lines.append("- **Location:** N/A")
+
+        lines.append("")
+
+        # Handle mentioned_objects (may be JSON string or list)
+        mentioned_objects = req.get('mentioned_objects')
+        if mentioned_objects:
+            if isinstance(mentioned_objects, str):
+                try:
+                    mentioned_objects = json.loads(mentioned_objects)
+                except (json.JSONDecodeError, TypeError):
+                    mentioned_objects = []
+            if mentioned_objects:
+                lines.extend([
+                    "## Mentioned Business Objects",
+                    "",
+                    *[f"- {obj}" for obj in mentioned_objects],
+                    "",
+                ])
+
+        # Handle mentioned_messages (may be JSON string or list)
+        mentioned_messages = req.get('mentioned_messages')
+        if mentioned_messages:
+            if isinstance(mentioned_messages, str):
+                try:
+                    mentioned_messages = json.loads(mentioned_messages)
+                except (json.JSONDecodeError, TypeError):
+                    mentioned_messages = []
+            if mentioned_messages:
+                lines.extend([
+                    "## Mentioned Messages",
+                    "",
+                    *[f"- {msg}" for msg in mentioned_messages],
+                    "",
+                ])
+
+        if req.get('reasoning'):
+            lines.extend([
+                "## Extraction Reasoning",
+                "",
+                req['reasoning'],
+                "",
+            ])
+
+        if req.get('research_notes'):
+            lines.extend([
+                "## Research Notes",
+                "",
+                req['research_notes'],
+                "",
+            ])
+
+        return "\n".join(lines)
 
     async def shutdown(self) -> None:
         """Shutdown the agent and cleanup resources."""

@@ -48,8 +48,10 @@ import json
 import logging
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import uvicorn
 
@@ -133,6 +135,104 @@ def setup_job_file_logging(job_id: str, verbose: bool = False) -> Path:
     return log_file
 
 
+def _extract_field_from_markdown(content: str, *field_names: str) -> Optional[str]:
+    """Extract a field value from markdown content.
+
+    Looks for patterns like "RID: R-0042" or "**RID:** R-0042" or "Created requirement R-0042".
+
+    Args:
+        content: Markdown content to search
+        *field_names: Field names to look for
+
+    Returns:
+        Extracted value or None
+    """
+    import re
+    for field in field_names:
+        patterns = [
+            rf"{field}:\s*[`]?([R]-\d+)[`]?",
+            rf"\*\*{field}:\*\*\s*[`]?([R]-\d+)[`]?",
+            rf"{field}\s+([R]-\d+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                return match.group(1)
+    return None
+
+
+async def _update_requirement_after_validation(
+    requirement_uuid: uuid.UUID,
+    workspace_path: Path,
+) -> bool:
+    """Update PostgreSQL requirement after Validator completes.
+
+    Reads the integration result from the workspace and updates
+    the requirement record with neo4j_id, status, etc.
+
+    Args:
+        requirement_uuid: The PostgreSQL UUID of the requirement
+        workspace_path: Path to the job workspace
+
+    Returns:
+        True if update succeeded, False otherwise
+    """
+    logger = logging.getLogger(__name__)
+
+    # Look for integration result file (prefer JSON, fall back to markdown)
+    result_file = workspace_path / "output" / "integration_result.json"
+    if not result_file.exists():
+        result_file = workspace_path / "output" / "integration_result.md"
+        if not result_file.exists():
+            logger.warning(f"No integration result file found in {workspace_path}/output/")
+            return False
+
+    try:
+        content = result_file.read_text()
+
+        # Parse the result based on file type
+        if result_file.suffix == ".json":
+            result = json.loads(content)
+            neo4j_id = result.get("neo4j_id") or result.get("rid")
+            status = result.get("status", "integrated")
+            rejection_reason = result.get("rejection_reason")
+            validation_result = result
+        else:
+            # Parse markdown - look for key fields
+            neo4j_id = _extract_field_from_markdown(content, "RID", "neo4j_id", "Created requirement")
+            status = "integrated" if neo4j_id else "rejected"
+            if "rejected" in content.lower() or "rejection" in content.lower():
+                status = "rejected"
+            rejection_reason = None
+            validation_result = {"raw_output": content}
+
+        # If we think it's integrated but have no ID, mark as failed
+        if not neo4j_id and status == "integrated":
+            logger.warning("No neo4j_id found in integration result, marking as failed")
+            status = "failed"
+
+        # Update PostgreSQL
+        db = PostgresDB()
+        await db.connect()
+        try:
+            await db.requirements.update(
+                requirement_uuid=requirement_uuid,
+                neo4j_id=neo4j_id,
+                status=status,
+                validation_result=validation_result,
+                rejection_reason=rejection_reason,
+                validated_at=True,
+            )
+            logger.info(f"Updated requirement {requirement_uuid}: neo4j_id={neo4j_id}, status={status}")
+            return True
+        finally:
+            await db.close()
+
+    except Exception as e:
+        logger.error(f"Failed to update requirement after validation: {e}")
+        return False
+
+
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -187,6 +287,10 @@ def parse_args():
         help="Processing prompt for Creator agent",
     )
     parser.add_argument(
+        "--requirement-id", "-r",
+        help="Requirement UUID to validate (fetches from PostgreSQL, writes to workspace)",
+    )
+    parser.add_argument(
         "--context",
         help="Additional context as JSON string (e.g., '{\"domain\": \"car_rental\"}')",
     )
@@ -221,9 +325,10 @@ def parse_args():
 async def run_single_job(
     config_path: str,
     job_id: str = None,
-    document_paths: list = None,
-    prompt: str = None,
-    context: dict = None,
+    document_paths: Optional[List[str]] = None,
+    prompt: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+    requirement_data: Optional[Dict[str, Any]] = None,
     stream: bool = False,
     resume: bool = False,
     verbose: bool = False,
@@ -239,6 +344,7 @@ async def run_single_job(
         document_paths: List of document paths to include
         prompt: Processing prompt
         context: Additional context dictionary
+        requirement_data: Requirement data fetched from PostgreSQL (for validator)
         stream: Enable streaming output
         resume: Resume existing job
         verbose: Enable verbose logging
@@ -285,6 +391,8 @@ async def run_single_job(
         metadata["prompt"] = prompt
     if context:
         metadata.update(context)
+    if requirement_data:
+        metadata["requirement_data"] = requirement_data
 
     # Create and initialize agent (it will create its own DB connection)
     agent = UniversalAgent.from_config(config_path)
@@ -330,6 +438,18 @@ async def run_single_job(
             print(f"Status:       COMPLETED")
             print(f"Should stop:  {result.get('should_stop', False)}")
             print("=" * 60)
+
+            # Update PostgreSQL requirement if this was a validation job
+            if requirement_data:
+                workspace_path = Path(get_workspace_base_path()) / f"job_{job_id}"
+                updated = await _update_requirement_after_validation(
+                    requirement_uuid=requirement_data["id"],
+                    workspace_path=workspace_path,
+                )
+                if updated:
+                    print(f"PostgreSQL:   Requirement updated")
+                else:
+                    print(f"PostgreSQL:   Update skipped (no integration result found)")
 
     finally:
         await agent.shutdown()
@@ -406,14 +526,41 @@ def main():
             logger.error(f"Invalid JSON in --context: {e}")
             sys.exit(1)
 
-    # Single job mode (either by job_id or by document+prompt)
-    if args.job_id or args.prompt:
+    # Validate and fetch requirement if --requirement-id provided
+    requirement_data = None
+    if args.requirement_id:
+        try:
+            req_uuid = uuid.UUID(args.requirement_id)
+        except ValueError:
+            logger.error(f"Invalid requirement ID (not a valid UUID): {args.requirement_id}")
+            sys.exit(1)
+
+        # Fetch requirement from database (run in async context)
+        async def fetch_requirement():
+            db = PostgresDB()
+            await db.connect()
+            try:
+                return await db.requirements.get(req_uuid)
+            finally:
+                await db.close()
+
+        requirement_data = asyncio.run(fetch_requirement())
+
+        if not requirement_data:
+            logger.error(f"Requirement not found: {args.requirement_id}")
+            sys.exit(1)
+
+        logger.info(f"Fetched requirement: {requirement_data.get('name', 'unnamed')}")
+
+    # Single job mode (either by job_id or by document+prompt or by requirement_id)
+    if args.job_id or args.prompt or args.requirement_id:
         asyncio.run(run_single_job(
             config_path=config_path,
             job_id=args.job_id,
             document_paths=document_paths if document_paths else None,
             prompt=args.prompt,
             context=context,
+            requirement_data=requirement_data,
             stream=args.stream,
             resume=args.resume,
             verbose=args.verbose,

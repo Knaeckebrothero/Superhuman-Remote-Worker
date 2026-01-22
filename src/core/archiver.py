@@ -39,6 +39,7 @@ Usage:
 
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -51,6 +52,21 @@ from langchain_core.messages import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _serialize_for_mongo(obj: Any) -> Any:
+    """Recursively serialize objects for MongoDB storage.
+
+    Converts uuid.UUID objects to strings since pymongo requires explicit
+    UUID representation configuration otherwise.
+    """
+    if isinstance(obj, uuid.UUID):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: _serialize_for_mongo(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_serialize_for_mongo(item) for item in obj]
+    return obj
 
 
 def _message_to_dict(msg: BaseMessage) -> Dict[str, Any]:
@@ -257,7 +273,7 @@ class LLMArchiver:
                 doc["iteration"] = iteration
 
             if metadata:
-                doc["metadata"] = metadata
+                doc["metadata"] = _serialize_for_mongo(metadata)
 
             # Count tokens approximately
             total_input_chars = sum(
@@ -446,11 +462,11 @@ class LLMArchiver:
                 doc["latency_ms"] = latency_ms
 
             if metadata:
-                doc["metadata"] = metadata
+                doc["metadata"] = _serialize_for_mongo(metadata)
 
             # Merge step-specific data
             if data:
-                doc.update(data)
+                doc.update(_serialize_for_mongo(data))
 
             result = self._audit_collection.insert_one(doc)
             doc_id = str(result.inserted_id)
