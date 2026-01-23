@@ -1,0 +1,99 @@
+/* Catppuccin Mocha Dark Theme */
+:root {
+  /* Base colors */
+  --app-bg: #1e1e2e;
+  --panel-bg: #181825;
+  --panel-header-bg: #1e1e2e;
+  --timeline-bg: #11111b;
+  --surface-0: #313244;
+  --surface-1: #45475a;
+  --surface-2: #585b70;
+
+  /* Border */
+  --border-color: #313244;
+
+  /* Text */
+  --text-primary: #cdd6f4;
+  --text-secondary: #a6adc8;
+  --text-muted: #6c7086;
+
+  /* Accent */
+  --accent-color: #cba6f7;
+  --accent-hover: #b4befe;
+
+  /* Track */
+  --track-bg: #313244;
+
+  /* Gutter */
+  --gutter-color: #313244;
+  --gutter-hover: #45475a;
+}
+
+/* Reset */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: var(--app-bg);
+  color: var(--text-primary);
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Angular-split gutter styling */
+.as-split-gutter {
+  background: var(--gutter-color) !important;
+  transition: background 0.15s ease;
+}
+
+.as-split-gutter:hover {
+  background: var(--gutter-hover) !important;
+}
+
+.as-split-gutter-icon {
+  display: none !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--panel-bg);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--surface-1);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--surface-2);
+}
+
+/* Selection */
+::selection {
+  background: var(--accent-color);
+  color: var(--timeline-bg);
+}
