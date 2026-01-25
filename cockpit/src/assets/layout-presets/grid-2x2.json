@@ -1,0 +1,30 @@
+{
+  "id": "grid-2x2",
+  "name": "2x2 Grid",
+  "description": "Four equal panels in a grid",
+  "config": {
+    "type": "split",
+    "direction": "horizontal",
+    "sizes": [50, 50],
+    "children": [
+      {
+        "type": "split",
+        "direction": "vertical",
+        "sizes": [50, 50],
+        "children": [
+          { "type": "component", "component": "agent-activity" },
+          { "type": "component", "component": "request-viewer" }
+        ]
+      },
+      {
+        "type": "split",
+        "direction": "vertical",
+        "sizes": [50, 50],
+        "children": [
+          { "type": "component", "component": "db-table" },
+          { "type": "component", "component": "agent-activity" }
+        ]
+      }
+    ]
+  }
+}

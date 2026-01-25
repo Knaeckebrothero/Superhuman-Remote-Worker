@@ -472,6 +472,96 @@ def create_workspace_tools(context: ToolContext) -> List:
             return f"Error: {str(e)}"
 
     @tool
+    def move_file(source: str, dest: str) -> str:
+        """Move or rename a file/directory in the workspace.
+
+        Creates parent directories for destination if they don't exist.
+        Works for both files and directories.
+
+        Examples:
+        - move_file("todos.yaml", "archive/todos_phase_1.yaml")  # move to subdir
+        - move_file("draft.md", "final.md")  # rename in place
+
+        Args:
+            source: Source path relative to workspace root
+            dest: Destination path relative to workspace root
+
+        Returns:
+            Confirmation message with source and destination paths
+        """
+        try:
+            workspace.move_file(source, dest)
+            return f"Moved: {source} -> {dest}"
+
+        except FileNotFoundError:
+            return f"Error: Source not found: {source}"
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"move_file error for {source} -> {dest}: {e}")
+            return f"Error moving file: {str(e)}"
+
+    @tool
+    def rename_file(path: str, new_name: str) -> str:
+        """Rename a file or directory (keeps it in the same location).
+
+        Simpler interface when you just want to change the name without
+        moving to a different directory.
+
+        Example: rename_file("documents/report.md", "final_report.md")
+        Result: documents/report.md -> documents/final_report.md
+
+        Args:
+            path: Current path relative to workspace root
+            new_name: New filename (not a path, just the name)
+
+        Returns:
+            Confirmation message with old and new paths
+        """
+        try:
+            # Extract directory from original path and combine with new name
+            from pathlib import Path as PurePath
+            original = PurePath(path)
+            new_path = str(original.parent / new_name) if original.parent != PurePath(".") else new_name
+
+            workspace.move_file(path, new_path)
+            return f"Renamed: {path} -> {new_path}"
+
+        except FileNotFoundError:
+            return f"Error: File not found: {path}"
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"rename_file error for {path} -> {new_name}: {e}")
+            return f"Error renaming file: {str(e)}"
+
+    @tool
+    def copy_file(source: str, dest: str) -> str:
+        """Copy a file within the workspace.
+
+        Creates parent directories for destination if they don't exist.
+        Only works for files, not directories.
+
+        Args:
+            source: Source file path relative to workspace root
+            dest: Destination path relative to workspace root
+
+        Returns:
+            Confirmation message with source and destination paths
+        """
+        try:
+            workspace.copy_file(source, dest)
+            return f"Copied: {source} -> {dest}"
+
+        except FileNotFoundError:
+            return f"Error: Source not found: {source}"
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"copy_file error for {source} -> {dest}: {e}")
+            return f"Error copying file: {str(e)}"
+
+    @tool
     def get_workspace_summary() -> str:
         """Get a summary of the current workspace state.
 
@@ -601,6 +691,9 @@ def create_workspace_tools(context: ToolContext) -> List:
         delete_file,
         search_files,
         file_exists,
+        move_file,
+        rename_file,
+        copy_file,
         get_workspace_summary,
         get_document_info,
     ]
@@ -655,6 +748,27 @@ WORKSPACE_TOOLS_METADATA = {
         "module": "workspace_tools",
         "function": "file_exists",
         "description": "Check if a file or directory exists",
+        "category": "workspace",
+        "phases": ["strategic", "tactical"],
+    },
+    "move_file": {
+        "module": "workspace_tools",
+        "function": "move_file",
+        "description": "Move or rename a file/directory in the workspace",
+        "category": "workspace",
+        "phases": ["strategic", "tactical"],
+    },
+    "rename_file": {
+        "module": "workspace_tools",
+        "function": "rename_file",
+        "description": "Rename a file or directory (keeps it in the same location)",
+        "category": "workspace",
+        "phases": ["strategic", "tactical"],
+    },
+    "copy_file": {
+        "module": "workspace_tools",
+        "function": "copy_file",
+        "description": "Copy a file within the workspace",
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },

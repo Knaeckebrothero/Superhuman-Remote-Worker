@@ -2,7 +2,12 @@
 
 This module provides two completion tools:
 - mark_complete: Signals that a task/phase is complete (used by phase transitions)
-- job_complete: Signals that the entire job is finished (final completion)
+- job_complete: Freezes the job for human review (requires approval to complete)
+
+The job_complete tool implements a human-in-the-loop checkpoint:
+1. Rejects the call if there are pending todos (agent must complete all work first)
+2. Freezes the job with status 'pending_review' instead of completing it
+3. Human operator can then approve (mark completed) or resume with feedback
 """
 
 import json
@@ -92,13 +97,13 @@ def create_completion_tools(context: ToolContext) -> List:
         confidence: float = 1.0,
         notes: Optional[str] = None,
     ) -> str:
-        """Signal that the ENTIRE JOB is complete and the agent should stop.
+        """Signal that the job is complete and ready for human review.
 
-        This is the final completion signal - call this only when ALL phases
-        of the execution plan are complete and all deliverables are ready.
+        This tool freezes the job for human review rather than completing it directly.
+        A human operator must approve the job before it is marked as truly complete.
 
-        This differs from mark_complete which signals phase/task completion.
-        job_complete signals the end of the entire job.
+        IMPORTANT: All todos must be completed before calling this tool.
+        If there are pending todos, this tool will return an error.
 
         Args:
             summary: Brief description of what was accomplished across all phases (2-5 sentences)
@@ -107,15 +112,38 @@ def create_completion_tools(context: ToolContext) -> List:
             notes: Optional notes about limitations, edge cases, or recommendations
 
         Returns:
-            Confirmation message indicating job completion
+            Confirmation that job is frozen for review, or error if todos remain
         """
         try:
+            # Check for pending todos - reject if any exist
+            if context.has_todo():
+                pending = context.todo_manager.list_pending()
+                if pending:
+                    pending_count = len(pending)
+                    pending_list = "\n".join(
+                        f"  - [{t.id}] {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
+                        for t in pending[:5]
+                    )
+                    more_msg = ""
+                    if pending_count > 5:
+                        more_msg = f"\n  ... and {pending_count - 5} more"
+
+                    logger.warning(
+                        f"job_complete rejected: {pending_count} pending todos remain"
+                    )
+                    return (
+                        f"ERROR: Cannot complete job - {pending_count} todo(s) still pending.\n\n"
+                        f"Pending todos:\n{pending_list}{more_msg}\n\n"
+                        f"Please complete all todos using `todo_complete` before calling `job_complete`.\n"
+                        f"If a todo is no longer needed, you can use `todo_rewind` to reconsider it."
+                    )
+
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
 
-            # Build final job completion report
-            completion_data = {
-                "status": "job_completed",
+            # Build freeze report (job awaiting human review)
+            freeze_data = {
+                "status": "pending_review",
                 "timestamp": datetime.now().isoformat(),
                 "summary": summary,
                 "deliverables": deliverables,
@@ -124,49 +152,50 @@ def create_completion_tools(context: ToolContext) -> List:
             }
 
             if notes:
-                completion_data["notes"] = notes
+                freeze_data["notes"] = notes
 
-            # Write to output/job_completion.json
-            output_path = "output/job_completion.json"
+            # Write to output/job_frozen.json (NOT job_completion.json)
+            output_path = "output/job_frozen.json"
             workspace.write_file(
                 output_path,
-                json.dumps(completion_data, indent=2, ensure_ascii=False)
+                json.dumps(freeze_data, indent=2, ensure_ascii=False)
             )
 
-            logger.info(f"JOB COMPLETE: {summary}")
-            logger.info(f"Final deliverables: {deliverables}")
+            logger.info(f"JOB FROZEN for review: {summary}")
+            logger.info(f"Deliverables: {deliverables}")
             logger.info(f"Confidence: {confidence}")
 
-            # Update job status in PostgreSQL database
+            # Update job status to pending_review (not completed)
             db_updated = False
             if context.has_postgres():
                 try:
                     db_updated = await context.update_job_status(
-                        status="completed",
-                        completed_at=True,
+                        status="pending_review",
+                        completed_at=False,
                     )
                     if db_updated:
-                        logger.info(f"Updated job {context.job_id} status to 'completed' in database")
+                        logger.info(f"Updated job {context.job_id} status to 'pending_review' in database")
                     else:
-                        logger.warning(f"Failed to update job status in database")
+                        logger.warning("Failed to update job status in database")
                 except Exception as e:
                     logger.error(f"Error updating job status in database: {e}")
             else:
                 logger.debug("No PostgreSQL connection available, skipping database status update")
 
-            # Return message that triggers final completion detection
-            # The agent loop should detect "JOB COMPLETE" and terminate
-            db_status = " Database updated." if db_updated else ""
+            db_status = " Database updated to 'pending_review'." if db_updated else ""
             return (
-                f"JOB COMPLETE - Wrote: output/job_completion.json{db_status}\n"
+                f"JOB FROZEN - Awaiting human review.{db_status}\n"
+                f"Wrote: output/job_frozen.json\n"
                 f"Summary: {summary}\n"
                 f"Deliverables: {len(deliverables)} files\n"
-                f"Confidence: {confidence:.0%}\n"
-                f"The job has finished. No further action required."
+                f"Confidence: {confidence:.0%}\n\n"
+                f"The job has been paused for human review. A human operator can:\n"
+                f"  - Approve: python agent.py --config <config> --job-id {context.job_id} --approve\n"
+                f"  - Resume:  python agent.py --config <config> --job-id {context.job_id} --resume --feedback '...'\n"
             )
 
         except Exception as e:
-            logger.error(f"Failed to complete job: {e}")
-            return f"Error completing job: {str(e)}"
+            logger.error(f"Failed to freeze job: {e}")
+            return f"Error freezing job: {str(e)}"
 
     return [mark_complete, job_complete]

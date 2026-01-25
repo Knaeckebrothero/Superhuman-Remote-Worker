@@ -26,6 +26,7 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkpoints_path
+from .core.phase_snapshot import PhaseSnapshotManager
 
 
 class _AiosqliteConnectionWrapper:
@@ -231,6 +232,7 @@ class UniversalAgent:
         metadata: Optional[Dict[str, Any]] = None,
         stream: bool = False,
         resume: bool = False,
+        feedback: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Process a single job.
 
@@ -241,6 +243,8 @@ class UniversalAgent:
             job_id: Unique job identifier
             metadata: Job-specific data (document_path, requirement_id, etc.)
             stream: If True, return an async iterator of state updates
+            resume: If True, resume from checkpoint (if exists)
+            feedback: Optional feedback message to inject when resuming a frozen job
 
         Returns:
             Final state dictionary with results
@@ -266,6 +270,37 @@ class UniversalAgent:
             # This also copies documents to workspace and returns updated metadata
             updated_metadata = await self._setup_job_workspace(job_id, metadata, resume=resume)
 
+            # Handle frozen job resume
+            if resume:
+                frozen_path = self._workspace_manager.get_path("output/job_frozen.json")
+                if frozen_path.exists():
+                    logger.info(f"Resuming frozen job {job_id}")
+                    # Remove the frozen marker so the graph can continue
+                    frozen_path.unlink()
+                    logger.info(f"Removed job_frozen.json to allow continuation")
+
+                    # Inject feedback if provided
+                    if feedback:
+                        feedback_section = (
+                            f"\n\n## Human Feedback on Resume\n\n"
+                            f"The job was previously frozen for review. "
+                            f"A human operator has provided the following feedback:\n\n"
+                            f"{feedback}\n"
+                        )
+                        self._workspace_manager.append_file("instructions.md", feedback_section)
+                        logger.info(f"Injected human feedback into instructions.md")
+
+                    # Update database status back to processing
+                    if self.postgres_conn:
+                        try:
+                            await self.postgres_conn.execute(
+                                "UPDATE jobs SET status = 'processing' WHERE id = $1::uuid",
+                                job_id
+                            )
+                            logger.info(f"Updated job status to 'processing' for resumed frozen job")
+                        except Exception as e:
+                            logger.warning(f"Failed to update job status: {e}")
+
             # Load tools for this job
             await self._setup_job_tools()
 
@@ -276,6 +311,9 @@ class UniversalAgent:
             wrapped_conn = _AiosqliteConnectionWrapper(self._checkpoint_conn)
             self._checkpointer = AsyncSqliteSaver(wrapped_conn)
             logger.info(f"Checkpointer initialized at {checkpoint_path}")
+
+            # Create snapshot manager for phase recovery
+            snapshot_manager = PhaseSnapshotManager(job_id)
 
             # Build graph for this job
             workspace_template = self._load_workspace_template()
@@ -289,6 +327,7 @@ class UniversalAgent:
                 workspace_template=workspace_template,
                 checkpointer=self._checkpointer,
                 summarization_llm=self._llm,  # Use base LLM for context summarization
+                snapshot_manager=snapshot_manager,  # Enable phase snapshots for recovery
             )
 
             # Execute graph
@@ -296,7 +335,7 @@ class UniversalAgent:
                 "configurable": {
                     "thread_id": f"{self.config.agent_id}_{job_id}",
                 },
-                "recursion_limit": self.config.limits.max_iterations * 2,
+                "recursion_limit": 1000000,  # Effectively unlimited
             }
 
             # Check if we should resume from checkpoint or start fresh
@@ -885,6 +924,86 @@ class UniversalAgent:
 
         return "\n".join(lines)
 
+    async def approve_frozen_job(self, job_id: str) -> Dict[str, Any]:
+        """Approve a frozen job, marking it as truly completed.
+
+        This method is called when a human operator reviews a frozen job
+        and decides it is ready to be marked as completed.
+
+        It performs the following:
+        1. Reads the frozen job data from job_frozen.json
+        2. Converts it to job_completion.json (marks as truly completed)
+        3. Removes the job_frozen.json file
+        4. Updates the database status to 'completed'
+
+        Args:
+            job_id: The job ID to approve
+
+        Returns:
+            Dict with approval result
+
+        Raises:
+            ValueError: If job is not frozen or workspace doesn't exist
+        """
+        import json
+        from datetime import datetime
+
+        # Set up workspace for this job (existing workspace)
+        workspace_manager = WorkspaceManager(
+            job_id=job_id,
+            config=WorkspaceManagerConfig(
+                structure=self.config.workspace.structure,
+            )
+        )
+
+        if not workspace_manager.path.exists():
+            raise ValueError(f"Workspace for job {job_id} does not exist")
+
+        frozen_path = workspace_manager.get_path("output/job_frozen.json")
+        completion_path = workspace_manager.get_path("output/job_completion.json")
+
+        if not frozen_path.exists():
+            raise ValueError(f"Job {job_id} is not frozen (no job_frozen.json found)")
+
+        # Read frozen data
+        frozen_data = json.loads(frozen_path.read_text())
+
+        # Convert to completion data
+        completion_data = {
+            **frozen_data,
+            "status": "job_completed",
+            "approved_at": datetime.now().isoformat(),
+            "approved_by": "human_operator",
+        }
+
+        # Write completion file
+        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        completion_path.write_text(json.dumps(completion_data, indent=2, ensure_ascii=False))
+        logger.info(f"Wrote job_completion.json for job {job_id}")
+
+        # Remove frozen file
+        frozen_path.unlink()
+        logger.info(f"Removed job_frozen.json for job {job_id}")
+
+        # Update database status to completed
+        if self.postgres_conn:
+            try:
+                await self.postgres_conn.execute(
+                    "UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1::uuid",
+                    job_id
+                )
+                logger.info(f"Updated job {job_id} status to 'completed' in database")
+            except Exception as e:
+                logger.warning(f"Failed to update job status in database: {e}")
+
+        return {
+            "job_id": job_id,
+            "status": "approved",
+            "summary": completion_data.get("summary", ""),
+            "deliverables": completion_data.get("deliverables", []),
+            "approved_at": completion_data["approved_at"],
+        }
+
     async def shutdown(self) -> None:
         """Shutdown the agent and cleanup resources."""
         logger.info(f"Shutting down {self.config.display_name}...")
@@ -926,7 +1045,6 @@ class UniversalAgent:
             },
             "config": {
                 "polling_enabled": self.config.polling.enabled,
-                "max_iterations": self.config.limits.max_iterations,
                 "model": self.config.llm.model,
             },
         }

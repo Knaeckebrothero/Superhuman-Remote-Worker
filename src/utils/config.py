@@ -70,7 +70,7 @@ def get_env_int(env_var: str, config_path: list[str], default: int) -> int:
 
     Args:
         env_var: Environment variable name
-        config_path: Path in llm_config.json (e.g., ["creator_agent", "max_iterations_per_candidate"])
+        config_path: Path in llm_config.json (e.g., ["creator_agent", "polling_interval"])
         default: Default value if neither env nor config is set
 
     Returns:
@@ -169,46 +169,6 @@ def get_env_str(env_var: str, config_path: list[str], default: str) -> str:
         return str(value)
 
     return default
-
-
-# =============================================================================
-# Agent Iteration Limits
-# =============================================================================
-
-def get_creator_max_iterations() -> int:
-    """Get max iterations for Creator agent (default: 500)."""
-    return get_env_int(
-        "CREATOR_MAX_ITERATIONS",
-        ["creator_agent", "max_iterations_per_candidate"],
-        500
-    )
-
-
-def get_validator_max_iterations() -> int:
-    """Get max iterations for Validator agent (default: 500)."""
-    return get_env_int(
-        "VALIDATOR_MAX_ITERATIONS",
-        ["validator_agent", "max_iterations_per_requirement"],
-        500
-    )
-
-
-def get_creator_recursion_limit() -> int:
-    """Get LangGraph recursion limit for Creator agent (default: 500)."""
-    return get_env_int(
-        "CREATOR_RECURSION_LIMIT",
-        ["creator_agent", "recursion_limit"],
-        500
-    )
-
-
-def get_validator_recursion_limit() -> int:
-    """Get LangGraph recursion limit for Validator agent (default: 200)."""
-    return get_env_int(
-        "VALIDATOR_RECURSION_LIMIT",
-        ["validator_agent", "recursion_limit"],
-        200
-    )
 
 
 # =============================================================================

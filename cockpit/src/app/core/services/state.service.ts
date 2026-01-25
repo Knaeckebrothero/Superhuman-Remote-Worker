@@ -24,9 +24,9 @@ export class StateService {
   readonly isLoading = signal<boolean>(false);
   readonly error = signal<string | null>(null);
 
-  // Pagination state
+  // Pagination state (page=-1 requests last page from API)
   readonly pagination = signal<PaginationState>({
-    page: 1,
+    page: -1,
     pageSize: 50,
     total: 0,
   });
@@ -70,7 +70,7 @@ export class StateService {
   }
 
   /**
-   * Select a table and load its data.
+   * Select a table and load its data (starting from the last page).
    */
   selectTable(tableName: string): void {
     if (tableName === this.selectedTable() && this.tableData().length > 0) {
@@ -78,7 +78,7 @@ export class StateService {
     }
 
     this.selectedTable.set(tableName);
-    this.pagination.update((p) => ({ ...p, page: 1 }));
+    this.pagination.update((p) => ({ ...p, page: -1 })); // Request last page
     this.loadTableData();
   }
 
@@ -141,6 +141,20 @@ export class StateService {
     if (this.hasPreviousPage()) {
       this.setPage(this.pagination().page - 1);
     }
+  }
+
+  /**
+   * Go to first page.
+   */
+  firstPage(): void {
+    this.setPage(1);
+  }
+
+  /**
+   * Go to last page.
+   */
+  lastPage(): void {
+    this.setPage(this.totalPages());
   }
 
   /**

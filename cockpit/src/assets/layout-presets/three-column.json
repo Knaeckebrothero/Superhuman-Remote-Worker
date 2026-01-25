@@ -1,0 +1,15 @@
+{
+  "id": "three-column",
+  "name": "Three Columns",
+  "description": "Default layout with request viewer, agent activity, and database",
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [25, 50, 25],
+    "children": [
+      { "type": "component", "component": "request-viewer" },
+      { "type": "component", "component": "agent-activity" },
+      { "type": "component", "component": "db-table" }
+    ]
+  }
+}
