@@ -76,7 +76,7 @@ from .core.phase import (
     get_initial_strategic_todos,
     get_transition_strategic_todos,
 )
-from .managers import TodoManager, PlanManager, MemoryManager
+from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -585,8 +585,8 @@ def create_archive_phase_node(
         if snapshot_manager:
             try:
                 # Get todo stats for snapshot metadata
-                todos = todo_manager.get_todos()
-                todos_completed = sum(1 for t in todos if t.get("status") == "done")
+                todos = todo_manager.list_all()
+                todos_completed = sum(1 for t in todos if t.status == TodoStatus.COMPLETED)
                 todos_total = len(todos)
 
                 snapshot_manager.create_snapshot(
