@@ -11,8 +11,8 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 # Filter category to step_type mapping
 FILTER_MAPPINGS: dict[str, list[str]] = {
     "all": [],  # Empty means no filtering
-    "messages": ["llm_call", "llm_response"],
-    "tools": ["tool_call", "tool_result"],
+    "messages": ["llm"],
+    "tools": ["tool"],
     "errors": ["error"],
 }
 

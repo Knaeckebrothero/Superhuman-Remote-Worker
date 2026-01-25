@@ -131,6 +131,19 @@ class TodoManager:
         # Staging for next phase todos
         self._staged_todos: List[TodoItem] = []
         self._staged_phase_name: str = ""
+        # Phase state tracking (for job_complete validation)
+        self._is_strategic_phase: bool = True
+
+    @property
+    def is_strategic_phase(self) -> bool:
+        """Check if currently in strategic phase."""
+        return self._is_strategic_phase
+
+    @is_strategic_phase.setter
+    def is_strategic_phase(self, value: bool) -> None:
+        """Set the current phase state."""
+        self._is_strategic_phase = value
+        logger.debug(f"Phase state updated: is_strategic={value}")
 
     def add(self, content: str, priority: str = "medium") -> TodoItem:
         """Add a new todo item.

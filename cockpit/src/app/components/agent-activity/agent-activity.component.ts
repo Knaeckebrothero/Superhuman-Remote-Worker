@@ -100,6 +100,9 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                   {{ getStepBadge(entry.step_type) }}
                 </span>
                 <span class="node-name">{{ entry.node_name }}</span>
+                @if (isPending(entry)) {
+                  <span class="pending-indicator">pending...</span>
+                }
                 @if (entry.latency_ms) {
                   <span class="latency">{{ formatLatency(entry.latency_ms) }}</span>
                 }
@@ -137,12 +140,24 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                     }
                   }
 
-                  <!-- LLM Response Details -->
-                  @if (entry.step_type === 'llm_response' && entry.llm) {
+                  <!-- LLM Details (combined call + response) -->
+                  @if (entry.step_type === 'llm' && entry.llm) {
                     @if (entry.llm.model) {
                       <div class="detail-section">
                         <span class="detail-label">Model:</span>
                         <span class="detail-value mono">{{ entry.llm.model }}</span>
+                      </div>
+                    }
+                    @if (getInputMessageCount(entry)) {
+                      <div class="detail-section">
+                        <span class="detail-label">Input:</span>
+                        <span class="detail-value mono">{{ getInputMessageCount(entry) }} messages</span>
+                      </div>
+                    }
+                    @if (getStateMessageCount(entry)) {
+                      <div class="detail-section">
+                        <span class="detail-label">Context:</span>
+                        <span class="detail-value mono">{{ getStateMessageCount(entry) }} messages in state</span>
                       </div>
                     }
                     @if (getRequestId(entry)) {
@@ -161,6 +176,11 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                       <div class="detail-section">
                         <span class="detail-label">Response:</span>
                         <span class="detail-value response-preview">{{ entry.llm.response_content_preview }}</span>
+                      </div>
+                    } @else if (isPending(entry)) {
+                      <div class="detail-section">
+                        <span class="detail-label">Response:</span>
+                        <span class="detail-value pending">Waiting for LLM response...</span>
                       </div>
                     }
                     @if (entry.llm.tool_calls && entry.llm.tool_calls.length > 0) {
@@ -181,30 +201,8 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                     }
                   }
 
-                  <!-- LLM Call Details -->
-                  @if (entry.step_type === 'llm_call' && entry.llm) {
-                    @if (entry.llm.model) {
-                      <div class="detail-section">
-                        <span class="detail-label">Model:</span>
-                        <span class="detail-value mono">{{ entry.llm.model }}</span>
-                      </div>
-                    }
-                    @if (getInputMessageCount(entry)) {
-                      <div class="detail-section">
-                        <span class="detail-label">Messages:</span>
-                        <span class="detail-value mono">{{ getInputMessageCount(entry) }} input messages</span>
-                      </div>
-                    }
-                    @if (getStateMessageCount(entry)) {
-                      <div class="detail-section">
-                        <span class="detail-label">State:</span>
-                        <span class="detail-value mono">{{ getStateMessageCount(entry) }} messages in context</span>
-                      </div>
-                    }
-                  }
-
-                  <!-- Tool Call Details -->
-                  @if (entry.step_type === 'tool_call' && entry.tool) {
+                  <!-- Tool Details (combined call + result) -->
+                  @if (entry.step_type === 'tool' && entry.tool) {
                     <div class="detail-section">
                       <span class="detail-label">Tool:</span>
                       <span class="detail-value mono">{{ entry.tool.name }}</span>
@@ -215,20 +213,17 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                         <pre class="detail-json">{{ formatJson(entry.tool.arguments) }}</pre>
                       </div>
                     }
-                  }
-
-                  <!-- Tool Result Details -->
-                  @if (entry.step_type === 'tool_result' && entry.tool) {
-                    <div class="detail-section">
-                      <span class="detail-label">Tool:</span>
-                      <span class="detail-value mono">{{ entry.tool.name }}</span>
-                    </div>
-                    @if (entry.tool.success !== undefined) {
+                    @if (entry.tool.success !== undefined && entry.tool.success !== null) {
                       <div class="detail-section">
                         <span class="detail-label">Status:</span>
                         <span class="detail-value" [class.success]="entry.tool.success" [class.failure]="!entry.tool.success">
                           {{ entry.tool.success ? 'Success' : 'Failed' }}
                         </span>
+                      </div>
+                    } @else if (isPending(entry)) {
+                      <div class="detail-section">
+                        <span class="detail-label">Status:</span>
+                        <span class="detail-value pending">Executing...</span>
                       </div>
                     }
                     @if (entry.tool.result_preview) {
@@ -728,6 +723,23 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         color: #b4befe;
         text-decoration-style: solid;
       }
+
+      .pending-indicator {
+        font-size: 10px;
+        color: #f9e2af;
+        font-style: italic;
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.5; }
+      }
+
+      .detail-value.pending {
+        color: #f9e2af;
+        font-style: italic;
+      }
     `,
   ],
 })
@@ -745,10 +757,8 @@ export class AgentActivityComponent implements OnInit {
   // Step type color mapping
   private readonly stepColors: Record<AuditStepType, string> = {
     initialize: '#89b4fa',    // Blue
-    llm_call: '#f9e2af',      // Yellow
-    llm_response: '#a6e3a1',  // Green
-    tool_call: '#cba6f7',     // Purple
-    tool_result: '#89dceb',   // Cyan
+    llm: '#a6e3a1',           // Green (combined LLM call+response)
+    tool: '#cba6f7',          // Purple (combined tool call+result)
     check: '#fab387',         // Peach
     routing: '#94e2d5',       // Teal
     phase_complete: '#74c7ec',// Sapphire
@@ -758,10 +768,8 @@ export class AgentActivityComponent implements OnInit {
   // Step type badge labels
   private readonly stepBadges: Record<AuditStepType, string> = {
     initialize: 'INIT',
-    llm_call: 'LLM',
-    llm_response: 'LLM',
-    tool_call: 'TOOL',
-    tool_result: 'TOOL',
+    llm: 'LLM',
+    tool: 'TOOL',
     check: 'CHECK',
     routing: 'ROUTE',
     phase_complete: 'PHASE',
@@ -854,7 +862,11 @@ export class AgentActivityComponent implements OnInit {
 
   getRoutingData(entry: AuditEntry): Record<string, unknown> | undefined {
     // Routing entries may have various fields - return any non-standard fields
-    const known = new Set(['_id', 'job_id', 'step_number', 'step_type', 'node_name', 'timestamp', 'latency_ms', 'iteration', 'phase', 'metadata', 'agent_type', 'llm', 'tool', 'error']);
+    const known = new Set([
+      '_id', 'job_id', 'step_number', 'step_type', 'node_name', 'timestamp',
+      'latency_ms', 'iteration', 'phase', 'metadata', 'agent_type', 'llm',
+      'tool', 'error', 'state', 'started_at', 'completed_at'
+    ]);
     const extra: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(entry)) {
       if (!known.has(key) && value !== undefined) {
@@ -870,5 +882,16 @@ export class AgentActivityComponent implements OnInit {
 
   onRequestIdClick(requestId: string): void {
     this.requestService.loadRequest(requestId);
+  }
+
+  /**
+   * Check if an entry is still pending (completed_at is explicitly null).
+   * Only applies to entries that have the started_at field (new combined format).
+   */
+  isPending(entry: AuditEntry): boolean {
+    // Only consider as pending if it has started_at (new format) and completed_at is null
+    const hasStartedAt = this.asAny(entry)['started_at'] !== undefined;
+    const completedAtIsNull = this.asAny(entry)['completed_at'] === null;
+    return hasStartedAt && completedAtIsNull;
   }
 }
