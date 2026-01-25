@@ -1,0 +1,55 @@
+# GBNF Grammar for OpenAI Harmony Format (gpt-oss models)
+#
+# This grammar enforces valid Harmony format output, preventing parsing failures
+# that occur with vLLM's post-generation parsing approach.
+#
+# Harmony Format Structure:
+#   <|start|>assistant<|channel|>channel_name<|message|>content<|end|>
+#
+# Channels:
+#   - analysis: Internal reasoning (not shown to user)
+#   - commentary: Explanation of actions
+#   - tool: Tool/function calls in JSON format
+#   - final: Final response to user
+#
+# Tool Call Format:
+#   <|start|>assistant<|channel|>tool<|message|>{"name":"fn","arguments":{...}}<|end|>
+
+# Root rule - a response is one or more blocks
+root ::= block+
+
+# A block is a start tag, channel, message content, and end tag
+block ::= start-tag channel-section message-section end-tag
+
+# Start tag
+start-tag ::= "<|start|>assistant"
+
+# End tag
+end-tag ::= "<|end|>"
+
+# Channel section - one of the valid channels
+channel-section ::= "<|channel|>" channel-name
+
+channel-name ::= "analysis" | "commentary" | "tool" | "final"
+
+# Message section
+message-section ::= "<|message|>" message-content
+
+# Message content varies by channel type
+# For simplicity, we allow any characters except the end tag sequence
+message-content ::= content-char*
+
+# Content characters - anything except <|end|>
+# We need to be careful not to match partial end tags
+content-char ::= [^<] | "<" [^|] | "<|" [^e] | "<|e" [^n] | "<|en" [^d] | "<|end" [^|] | "<|end|" [^>]
+
+# Alternative: JSON-specific content for tool channel
+# Uncomment if you want stricter JSON validation for tool calls
+# tool-content ::= json-object
+# json-object ::= "{" ws (json-member (ws "," ws json-member)*)? ws "}"
+# json-member ::= json-string ws ":" ws json-value
+# json-value ::= json-string | json-number | json-object | json-array | "true" | "false" | "null"
+# json-string ::= "\"" ([^"\\] | "\\" .)* "\""
+# json-number ::= "-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [+-]? [0-9]+)?
+# json-array ::= "[" ws (json-value (ws "," ws json-value)*)? ws "]"
+# ws ::= [ \t\n\r]*
