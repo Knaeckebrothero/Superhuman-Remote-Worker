@@ -180,6 +180,8 @@ def create_init_workspace_node(
                 iteration=0,
                 data={"workspace": {"created": workspace_created}},
                 metadata=state.get("metadata"),
+                phase="strategic",
+                phase_number=0,
             )
 
         return {
@@ -242,6 +244,8 @@ def create_init_strategic_todos_node(
                     "instructions_length": len(instructions),
                 },
                 metadata=state.get("metadata"),
+                phase="strategic",
+                phase_number=0,
             )
 
         # Add instructions as initial context for the strategic agent
@@ -346,6 +350,7 @@ def create_execute_node(
         # Audit LLM call (will be updated with response via update_llm_response)
         auditor = get_archiver()
         llm_audit_id = None
+        phase_str = "strategic" if is_strategic else "tactical"
         if auditor:
             llm_audit_id = auditor.audit_llm_call(
                 job_id=job_id,
@@ -355,6 +360,8 @@ def create_execute_node(
                 input_message_count=len(prepared_messages),
                 state_message_count=len(messages),
                 metadata=state.get("metadata"),
+                phase=phase_str,
+                phase_number=phase_number,
             )
 
         # Retry loop for LLM call with exponential backoff
@@ -445,6 +452,8 @@ def create_execute_node(
                             }
                         },
                         metadata=state.get("metadata"),
+                        phase=phase_str,
+                        phase_number=phase_number,
                     )
 
                 return {
@@ -510,24 +519,6 @@ def create_check_todos_node(
         all_complete = todo_manager.all_complete()
         todo_manager.log_state()
 
-        # Audit check decision
-        auditor = get_archiver()
-        if auditor:
-            auditor.audit_step(
-                job_id=job_id,
-                agent_type=config.agent_id,
-                step_type="check",
-                node_name="check_todos",
-                iteration=iteration,
-                data={
-                    "check": {
-                        "decision": "phase_complete" if all_complete else "continue",
-                        "todos_complete": all_complete,
-                    }
-                },
-                metadata=state.get("metadata"),
-            )
-
         if all_complete:
             logger.info(f"[{job_id}] All todos complete")
             return {"phase_complete": True}
@@ -592,6 +583,7 @@ def create_archive_phase_node(
             plan_manager.mark_phase_complete(current_phase)
 
         # Audit phase completion
+        phase_str = "strategic" if is_strategic else "tactical"
         auditor = get_archiver()
         if auditor:
             auditor.audit_step(
@@ -607,6 +599,8 @@ def create_archive_phase_node(
                     }
                 },
                 metadata=state.get("metadata"),
+                phase=phase_str,
+                phase_number=phase_number,
             )
 
         message = AIMessage(
@@ -697,6 +691,8 @@ def create_handle_transition_node(
         )
 
         # Audit transition attempt
+        phase_number = state.get("phase_number", 0)
+        phase_str = "strategic" if is_strategic else "tactical"
         auditor = get_archiver()
         if auditor:
             auditor.audit_step(
@@ -715,6 +711,8 @@ def create_handle_transition_node(
                     }
                 },
                 metadata=state.get("metadata"),
+                phase=phase_str,
+                phase_number=phase_number,
             )
 
         if result.success:
@@ -759,6 +757,9 @@ def create_check_goal_node(
         """Check if overall goal is achieved."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
+        is_strategic = state.get("is_strategic_phase", True)
+        phase_number = state.get("phase_number", 0)
+        phase_str = "strategic" if is_strategic else "tactical"
 
         # Check for frozen state (job awaiting human review)
         # job_complete now writes job_frozen.json instead of job_completion.json
@@ -784,6 +785,8 @@ def create_check_goal_node(
                         }
                     },
                     metadata=state.get("metadata"),
+                    phase=phase_str,
+                    phase_number=phase_number,
                 )
 
             return {
@@ -814,6 +817,8 @@ def create_check_goal_node(
                         }
                     },
                     metadata=state.get("metadata"),
+                    phase=phase_str,
+                    phase_number=phase_number,
                 )
 
             return {
@@ -852,6 +857,8 @@ def create_check_goal_node(
                         }
                     },
                     metadata=state.get("metadata"),
+                    phase=phase_str,
+                    phase_number=phase_number,
                 )
 
             return {
@@ -881,6 +888,8 @@ def create_check_goal_node(
                         }
                     },
                     metadata=state.get("metadata"),
+                    phase=phase_str,
+                    phase_number=phase_number,
                 )
 
             return {
@@ -907,6 +916,8 @@ def create_check_goal_node(
                     }
                 },
                 metadata=state.get("metadata"),
+                phase=phase_str,
+                phase_number=phase_number,
             )
 
         return {
@@ -1009,6 +1020,9 @@ def create_audited_tool_node(
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
         messages = state.get("messages", [])
+        is_strategic = state.get("is_strategic_phase", True)
+        phase_number = state.get("phase_number", 0)
+        phase_str = "strategic" if is_strategic else "tactical"
 
         # Extract tool calls from last message
         tool_calls_info = []
@@ -1035,6 +1049,8 @@ def create_audited_tool_node(
                     call_id=tc_info["call_id"],
                     arguments=tc_info["args"],
                     metadata=state.get("metadata"),
+                    phase=phase_str,
+                    phase_number=phase_number,
                 )
                 if doc_id:
                     audit_ids[tc_info["call_id"]] = doc_id
