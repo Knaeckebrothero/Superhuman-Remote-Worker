@@ -92,6 +92,8 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
             <div
               class="entry-item"
               [class.expanded]="audit.isExpanded(entry._id)"
+              [class.phase-strategic]="entry.phase === 'strategic'"
+              [class.phase-tactical]="entry.phase === 'tactical'"
               [style.border-left-color]="getStepColor(entry.step_type)"
             >
               <div class="entry-header" (click)="audit.toggleExpanded(entry._id)">
@@ -272,7 +274,7 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                   @if (entry.phase) {
                     <div class="detail-section">
                       <span class="detail-label">Phase:</span>
-                      <span class="detail-value">{{ entry.phase }}</span>
+                      <span class="detail-value">{{ entry.phase }}@if (entry.phase_number !== undefined) { ({{ entry.phase_number }})}</span>
                     </div>
                   }
 
@@ -525,6 +527,23 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
 
       .entry-item:hover {
         background: var(--panel-header-bg, #1e1e2e);
+      }
+
+      /* Phase-based background tinting */
+      .entry-item.phase-strategic {
+        background: rgba(203, 166, 247, 0.06);
+      }
+
+      .entry-item.phase-strategic:hover {
+        background: rgba(203, 166, 247, 0.10);
+      }
+
+      .entry-item.phase-tactical {
+        background: rgba(166, 227, 161, 0.06);
+      }
+
+      .entry-item.phase-tactical:hover {
+        background: rgba(166, 227, 161, 0.10);
       }
 
       .entry-header {
