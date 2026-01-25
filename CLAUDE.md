@@ -212,6 +212,8 @@ Required in `.env`:
 | Dashboard | 8501 |
 | Creator API | 8001 |
 | Validator API | 8002 |
+| Cockpit Frontend | 4000 |
+| Cockpit API | 8080 |
 | Neo4j Bolt | 7687 |
 | Neo4j HTTP | 7474 |
 | PostgreSQL | 5432 |

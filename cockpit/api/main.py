@@ -72,10 +72,15 @@ app = FastAPI(
     default_response_class=CustomJSONResponse,
 )
 
-# CORS for Angular frontend
+# CORS for Angular frontend (dev server on 4200, production/SSR on 4000)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200", "http://127.0.0.1:4200"],
+    allow_origins=[
+        "http://localhost:4200",
+        "http://127.0.0.1:4200",
+        "http://localhost:4000",
+        "http://127.0.0.1:4000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
