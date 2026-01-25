@@ -70,7 +70,8 @@ export interface AuditEntry {
   timestamp: string;
   latency_ms?: number;
   iteration: number;
-  phase?: string;
+  phase?: string;           // "strategic" | "tactical"
+  phase_number?: number;    // 0, 1, 2, ...
   tool?: AuditToolInfo;
   llm?: AuditLLMInfo;
   error?: AuditErrorInfo;

@@ -425,6 +425,8 @@ class LLMArchiver:
         data: Optional[Dict[str, Any]] = None,
         latency_ms: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        phase: Optional[str] = None,
+        phase_number: Optional[int] = None,
     ) -> Optional[str]:
         """Audit any step in the agent workflow.
 
@@ -458,6 +460,12 @@ class LLMArchiver:
                 "timestamp": datetime.now(timezone.utc),
             }
 
+            # Add phase info if provided
+            if phase is not None:
+                doc["phase"] = phase
+            if phase_number is not None:
+                doc["phase_number"] = phase_number
+
             if latency_ms is not None:
                 doc["latency_ms"] = latency_ms
 
@@ -490,6 +498,8 @@ class LLMArchiver:
         call_id: str,
         arguments: Dict[str, Any],
         metadata: Optional[Dict[str, Any]] = None,
+        phase: Optional[str] = None,
+        phase_number: Optional[int] = None,
     ) -> Optional[str]:
         """Audit a tool call before execution.
 
@@ -540,6 +550,8 @@ class LLMArchiver:
                 "completed_at": None,
             },
             metadata=metadata,
+            phase=phase,
+            phase_number=phase_number,
         )
 
     def update_tool_result(
@@ -603,6 +615,8 @@ class LLMArchiver:
         input_message_count: int,
         state_message_count: int,
         metadata: Optional[Dict[str, Any]] = None,
+        phase: Optional[str] = None,
+        phase_number: Optional[int] = None,
     ) -> Optional[str]:
         """Audit an LLM call before execution.
 
@@ -644,6 +658,8 @@ class LLMArchiver:
                 "completed_at": None,
             },
             metadata=metadata,
+            phase=phase,
+            phase_number=phase_number,
         )
 
     def update_llm_response(
