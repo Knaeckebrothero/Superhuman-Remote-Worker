@@ -3,10 +3,8 @@
  */
 export type AuditStepType =
   | 'initialize'
-  | 'llm_call'
-  | 'llm_response'
-  | 'tool_call'
-  | 'tool_result'
+  | 'llm'           // Combined: replaces llm_call + llm_response
+  | 'tool'          // Combined: replaces tool_call + tool_result
   | 'check'
   | 'routing'
   | 'phase_complete'
@@ -19,24 +17,36 @@ export type AuditFilterCategory = 'all' | 'messages' | 'tools' | 'errors';
 
 /**
  * Tool execution details within an audit entry.
+ * Contains both call info (arguments) and result info (result_preview, success).
+ * Result fields are null while the tool is executing.
  */
 export interface AuditToolInfo {
   name: string;
+  call_id?: string;
   arguments?: Record<string, unknown>;
-  result_preview?: string;
-  success?: boolean;
-  error?: string;
+  // Result fields - null while pending
+  result_preview?: string | null;
+  result_size_bytes?: number | null;
+  success?: boolean | null;
+  error?: string | null;
 }
 
 /**
  * LLM interaction details within an audit entry.
+ * Contains both call info (model, input_message_count) and response info.
+ * Response fields are null while waiting for LLM response.
  */
 export interface AuditLLMInfo {
   model?: string;
-  response_content_preview?: string;
-  tool_calls?: Array<{ name: string; arguments?: Record<string, unknown> }>;
-  input_tokens?: number;
-  output_tokens?: number;
+  input_message_count?: number;
+  // Response fields - null while pending
+  request_id?: string | null;
+  response_content_preview?: string | null;
+  tool_calls?: Array<{ name: string; call_id?: string }> | null;
+  metrics?: {
+    output_chars?: number;
+    tool_call_count?: number;
+  } | null;
 }
 
 /**
@@ -64,7 +74,10 @@ export interface AuditEntry {
   tool?: AuditToolInfo;
   llm?: AuditLLMInfo;
   error?: AuditErrorInfo;
-  state_snapshot?: Record<string, unknown>;
+  state?: Record<string, unknown>;
+  // Timing fields for combined events
+  started_at?: string;
+  completed_at?: string | null;  // null = in progress
 }
 
 /**

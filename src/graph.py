@@ -220,6 +220,9 @@ def create_init_strategic_todos_node(
         todo_list = [todo.to_dict() for todo in strategic_todos]
         todo_manager.set_todos_from_list(todo_list)
 
+        # Initialize phase state on TodoManager for tool access
+        todo_manager.is_strategic_phase = True
+
         logger.info(
             f"[{job_id}] Loaded {len(strategic_todos)} predefined strategic todos"
         )
@@ -340,24 +343,17 @@ def create_execute_node(
                     HumanMessage(content="Continue with the current task.")
                 )
 
-        # Audit LLM call
+        # Audit LLM call (will be updated with response via update_llm_response)
         auditor = get_archiver()
+        llm_audit_id = None
         if auditor:
-            auditor.audit_step(
+            llm_audit_id = auditor.audit_llm_call(
                 job_id=job_id,
                 agent_type=config.agent_id,
-                step_type="llm_call",
-                node_name="execute",
                 iteration=iteration,
-                data={
-                    "llm": {
-                        "model": config.llm.model,
-                        "input_message_count": len(prepared_messages),
-                    },
-                    "state": {
-                        "message_count": len(messages),
-                    }
-                },
+                model=config.llm.model,
+                input_message_count=len(prepared_messages),
+                state_message_count=len(messages),
                 metadata=state.get("metadata"),
             )
 
@@ -374,7 +370,7 @@ def create_execute_node(
                 tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
                 logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
 
-                # Archive full LLM request/response
+                # Archive full LLM request/response to llm_requests collection
                 request_id = None
                 if auditor:
                     request_id = auditor.archive(
@@ -397,28 +393,16 @@ def create_execute_node(
                                 "call_id": tc.get("id", ""),
                             })
 
-                    # Audit LLM response with link to full request
-                    auditor.audit_step(
-                        job_id=job_id,
-                        agent_type=config.agent_id,
-                        step_type="llm_response",
-                        node_name="execute",
-                        iteration=iteration,
-                        data={
-                            "llm": {
-                                "model": config.llm.model,
-                                "request_id": request_id,  # Link to llm_requests collection
-                                "response_content_preview": response.content[:500] if response.content else "",
-                                "tool_calls": tool_calls_preview,
-                                "metrics": {
-                                    "output_chars": len(response.content) if response.content else 0,
-                                    "tool_call_count": tool_calls_count,
-                                }
-                            }
-                        },
-                        latency_ms=latency_ms,
-                        metadata=state.get("metadata"),
-                    )
+                    # Update the LLM audit document with response data
+                    if llm_audit_id:
+                        auditor.update_llm_response(
+                            audit_doc_id=llm_audit_id,
+                            request_id=request_id,
+                            response_preview=response.content[:500] if response.content else "",
+                            tool_calls=tool_calls_preview,
+                            output_chars=len(response.content) if response.content else 0,
+                            latency_ms=latency_ms,
+                        )
 
                 return {
                     "messages": [response],
@@ -738,6 +722,9 @@ def create_handle_transition_node(
                 f"[{job_id}] Phase transition successful: "
                 f"phase_number={result.state_updates.get('phase_number')}"
             )
+            # Update phase state on TodoManager for tool access
+            new_is_strategic = result.state_updates.get("is_strategic_phase", is_strategic)
+            todo_manager.is_strategic_phase = new_is_strategic
         else:
             logger.warning(
                 f"[{job_id}] Phase transition rejected: {result.error_message}"
@@ -1035,11 +1022,12 @@ def create_audited_tool_node(
                         "args": tc.get("args", {}),
                     })
 
-        # Audit tool calls before execution
+        # Audit tool calls before execution (will be updated with results via update_tool_result)
         auditor = get_archiver()
+        audit_ids: Dict[str, str] = {}  # call_id -> audit_doc_id
         if auditor:
             for tc_info in tool_calls_info:
-                auditor.audit_tool_call(
+                doc_id = auditor.audit_tool_call(
                     job_id=job_id,
                     agent_type=config.agent_id,
                     iteration=iteration,
@@ -1048,34 +1036,31 @@ def create_audited_tool_node(
                     arguments=tc_info["args"],
                     metadata=state.get("metadata"),
                 )
+                if doc_id:
+                    audit_ids[tc_info["call_id"]] = doc_id
 
         # Execute tools with timing (use ainvoke for async tool support)
         start_time = time.time()
         result = await tool_node.ainvoke(state)
         execution_time_ms = int((time.time() - start_time) * 1000)
 
-        # Audit tool results
+        # Update tool audit documents with results
         if auditor and "messages" in result:
-            call_id_to_info = {tc["call_id"]: tc for tc in tool_calls_info}
             for msg in result["messages"]:
                 if isinstance(msg, ToolMessage):
                     call_id = getattr(msg, "tool_call_id", "")
-                    tc_info = call_id_to_info.get(call_id, {})
-                    content = msg.content if msg.content else ""
-                    is_error = _is_tool_error(content)
+                    audit_doc_id = audit_ids.get(call_id)
+                    if audit_doc_id:
+                        content = msg.content if msg.content else ""
+                        is_error = _is_tool_error(content)
 
-                    auditor.audit_tool_result(
-                        job_id=job_id,
-                        agent_type=config.agent_id,
-                        iteration=iteration,
-                        tool_name=tc_info.get("name", getattr(msg, "name", "unknown")),
-                        call_id=call_id,
-                        result=content,
-                        success=not is_error,
-                        latency_ms=execution_time_ms // max(len(tool_calls_info), 1),
-                        error=content[:500] if is_error else None,
-                        metadata=state.get("metadata"),
-                    )
+                        auditor.update_tool_result(
+                            audit_doc_id=audit_doc_id,
+                            result=content,
+                            success=not is_error,
+                            latency_ms=execution_time_ms // max(len(tool_calls_info), 1),
+                            error=content[:500] if is_error else None,
+                        )
 
         return result
 
