@@ -2,6 +2,9 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable, catchError, of } from 'rxjs';
 import { TableInfo, TableDataResponse, ColumnDef } from '../models/api.model';
+import { JobSummary, AuditResponse, AuditFilterCategory } from '../models/audit.model';
+import { LLMRequest } from '../models/request.model';
+import { GraphChangeResponse } from '../models/graph.model';
 
 /**
  * HTTP client service for the cockpit API.
@@ -61,6 +64,80 @@ export class ApiService {
         catchError((error) => {
           console.error(`Failed to fetch schema for table ${tableName}:`, error);
           return of([]);
+        }),
+      );
+  }
+
+  /**
+   * Get list of jobs with optional status filter.
+   */
+  getJobs(status?: string, limit: number = 100): Observable<JobSummary[]> {
+    let params = new HttpParams().set('limit', limit.toString());
+    if (status) {
+      params = params.set('status', status);
+    }
+
+    return this.http.get<JobSummary[]>(`${this.baseUrl}/jobs`, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch jobs:', error);
+        return of([]);
+      }),
+    );
+  }
+
+  /**
+   * Get paginated audit entries for a job from MongoDB.
+   */
+  getJobAudit(
+    jobId: string,
+    page: number = 1,
+    pageSize: number = 50,
+    filter: AuditFilterCategory = 'all',
+  ): Observable<AuditResponse> {
+    const params = new HttpParams()
+      .set('page', page.toString())
+      .set('pageSize', pageSize.toString())
+      .set('filter', filter);
+
+    return this.http
+      .get<AuditResponse>(`${this.baseUrl}/jobs/${jobId}/audit`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch audit for job ${jobId}:`, error);
+          return of({
+            entries: [],
+            total: 0,
+            page: 1,
+            pageSize: 50,
+            hasMore: false,
+            error: error.message || 'Failed to fetch audit data',
+          });
+        }),
+      );
+  }
+
+  /**
+   * Get a single LLM request by MongoDB document ID.
+   */
+  getRequest(docId: string): Observable<LLMRequest | null> {
+    return this.http.get<LLMRequest>(`${this.baseUrl}/requests/${docId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch request ${docId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get graph changes for a job (Neo4j operations from audit trail).
+   */
+  getGraphChanges(jobId: string): Observable<GraphChangeResponse> {
+    return this.http
+      .get<GraphChangeResponse>(`${this.baseUrl}/graph/changes/${jobId}`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch graph changes for job ${jobId}:`, error);
+          throw error;
         }),
       );
   }

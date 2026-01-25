@@ -14,7 +14,7 @@ import { ComponentHostComponent } from '../component-host/component-host.compone
   imports: [AngularSplitModule, ComponentHostComponent],
   template: `
     @if (config().type === 'component' && config().component) {
-      <app-component-host [componentType]="config().component!" />
+      <app-component-host [componentType]="config().component!" [path]="path()" />
     } @else if (config().type === 'split' && config().children) {
       <as-split
         [direction]="config().direction === 'horizontal' ? 'vertical' : 'horizontal'"

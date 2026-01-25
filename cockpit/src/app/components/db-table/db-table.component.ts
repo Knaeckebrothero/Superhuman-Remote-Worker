@@ -90,8 +90,17 @@ import { ColumnDef } from '../../core/models/api.model';
           <div class="page-controls">
             <button
               class="page-btn"
+              (click)="state.firstPage()"
+              [disabled]="!state.hasPreviousPage()"
+              title="First page"
+            >
+              &lt;&lt;
+            </button>
+            <button
+              class="page-btn"
               (click)="state.previousPage()"
               [disabled]="!state.hasPreviousPage()"
+              title="Previous page"
             >
               &lt; Prev
             </button>
@@ -102,8 +111,17 @@ import { ColumnDef } from '../../core/models/api.model';
               class="page-btn"
               (click)="state.nextPage()"
               [disabled]="!state.hasNextPage()"
+              title="Next page"
             >
               Next &gt;
+            </button>
+            <button
+              class="page-btn"
+              (click)="state.lastPage()"
+              [disabled]="!state.hasNextPage()"
+              title="Last page"
+            >
+              &gt;&gt;
             </button>
           </div>
         </div>

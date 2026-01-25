@@ -203,12 +203,6 @@
       "type": "object",
       "description": "Execution limits",
       "properties": {
-        "max_iterations": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 500,
-          "description": "Maximum LLM iterations per job"
-        },
         "context_threshold_tokens": {
           "type": "integer",
           "minimum": 1000,

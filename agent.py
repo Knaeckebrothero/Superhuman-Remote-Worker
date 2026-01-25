@@ -40,6 +40,18 @@ Examples:
 
     # Resume an existing job
     python run_universal_agent.py --config creator --job-id abc123 --resume
+
+    # Resume a frozen job with feedback
+    python run_universal_agent.py --config validator --job-id abc123 --resume --feedback "Please also check X"
+
+    # Approve a frozen job (marks as completed)
+    python run_universal_agent.py --config validator --job-id abc123 --approve
+
+    # List available phase snapshots for recovery
+    python agent.py --config validator --job-id abc123 --list-phases
+
+    # Recover to a specific phase and resume
+    python agent.py --config validator --job-id abc123 --recover-phase 2 --resume
 """
 
 import argparse
@@ -63,6 +75,7 @@ load_dotenv()
 
 from src import UniversalAgent, create_app
 from src.core.workspace import get_workspace_base_path, get_logs_path
+from src.core.phase_snapshot import PhaseSnapshotManager, format_snapshots_table
 from src.database.postgres_db import PostgresDB
 
 
@@ -299,6 +312,28 @@ def parse_args():
         action="store_true",
         help="Resume an existing job (requires --job-id)",
     )
+    parser.add_argument(
+        "--feedback",
+        help="Feedback message to inject when resuming a frozen job",
+    )
+    parser.add_argument(
+        "--approve",
+        action="store_true",
+        help="Approve a frozen job (marks as completed, requires --job-id)",
+    )
+
+    # Phase recovery options
+    parser.add_argument(
+        "--list-phases",
+        action="store_true",
+        help="List available phase snapshots for recovery (requires --job-id)",
+    )
+    parser.add_argument(
+        "--recover-phase",
+        type=int,
+        metavar="N",
+        help="Recover to phase N before resuming (requires --job-id and --resume)",
+    )
 
     # Polling options
     parser.add_argument(
@@ -331,6 +366,7 @@ async def run_single_job(
     requirement_data: Optional[Dict[str, Any]] = None,
     stream: bool = False,
     resume: bool = False,
+    feedback: Optional[str] = None,
     verbose: bool = False,
 ):
     """Run a single job and exit.
@@ -347,6 +383,7 @@ async def run_single_job(
         requirement_data: Requirement data fetched from PostgreSQL (for validator)
         stream: Enable streaming output
         resume: Resume existing job
+        feedback: Feedback message to inject when resuming a frozen job
         verbose: Enable verbose logging
     """
     logger = logging.getLogger(__name__)
@@ -404,7 +441,7 @@ async def run_single_job(
             final_state = None
             # process_job returns an async generator when stream=True
             # We need to await the coroutine first to get the generator
-            streaming_gen = await agent.process_job(job_id, metadata, stream=True, resume=resume)
+            streaming_gen = await agent.process_job(job_id, metadata, stream=True, resume=resume, feedback=feedback)
             async for state in streaming_gen:
                 final_state = state
                 # Print streaming updates
@@ -415,7 +452,7 @@ async def run_single_job(
             result = final_state or {}
         else:
             logger.info(f"Processing job {job_id}...")
-            result = await agent.process_job(job_id, metadata, resume=resume)
+            result = await agent.process_job(job_id, metadata, resume=resume, feedback=feedback)
 
         elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -453,6 +490,128 @@ async def run_single_job(
 
     finally:
         await agent.shutdown()
+
+
+async def approve_frozen_job(config_path: str, job_id: str):
+    """Approve a frozen job, marking it as truly completed.
+
+    Args:
+        config_path: Path to agent configuration
+        job_id: The job ID to approve
+    """
+    logger = logging.getLogger(__name__)
+
+    # Create and initialize agent
+    agent = UniversalAgent.from_config(config_path)
+    await agent.initialize()
+
+    try:
+        result = await agent.approve_frozen_job(job_id)
+
+        print("\n" + "=" * 60)
+        print("JOB APPROVED")
+        print("=" * 60)
+        print(f"Job ID:       {result['job_id']}")
+        print(f"Status:       {result['status']}")
+        print(f"Summary:      {result['summary']}")
+        print(f"Deliverables: {len(result['deliverables'])} files")
+        print(f"Approved at:  {result['approved_at']}")
+        print("=" * 60)
+
+    except ValueError as e:
+        logger.error(str(e))
+        print(f"\nError: {e}")
+        sys.exit(1)
+    finally:
+        await agent.shutdown()
+
+
+def list_phase_snapshots(job_id: str):
+    """List available phase snapshots for a job.
+
+    Args:
+        job_id: Job identifier
+    """
+    snapshot_mgr = PhaseSnapshotManager(job_id)
+    snapshots = snapshot_mgr.list_snapshots()
+
+    print(format_snapshots_table(snapshots))
+
+    if snapshots:
+        print(f"To recover: python agent.py --config <cfg> --job-id {job_id} --recover-phase N --resume")
+        print("")
+
+
+async def recover_and_resume(
+    config_path: str,
+    job_id: str,
+    phase_number: int,
+    document_paths: Optional[List[str]] = None,
+    prompt: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+    requirement_data: Optional[Dict[str, Any]] = None,
+    stream: bool = False,
+    verbose: bool = False,
+):
+    """Recover to a specific phase and resume execution.
+
+    Args:
+        config_path: Path to agent configuration
+        job_id: Job identifier
+        phase_number: Phase number to recover to
+        document_paths: List of document paths (for metadata)
+        prompt: Processing prompt (for metadata)
+        context: Additional context dictionary
+        requirement_data: Requirement data (for validator)
+        stream: Enable streaming output
+        verbose: Enable verbose logging
+    """
+    logger = logging.getLogger(__name__)
+
+    # Get snapshot info first
+    snapshot_mgr = PhaseSnapshotManager(job_id)
+    snapshot = snapshot_mgr.get_snapshot(phase_number)
+
+    if not snapshot:
+        print(f"\nError: No snapshot found for phase {phase_number}")
+        print("Use --list-phases to see available snapshots.")
+        sys.exit(1)
+
+    # Show recovery info
+    print("\n" + "=" * 60)
+    print(f"RECOVERING TO PHASE {phase_number}")
+    print("=" * 60)
+    print(f"Type:         {'strategic' if snapshot.is_strategic_phase else 'tactical'}")
+    print(f"Iteration:    {snapshot.iteration}")
+    print(f"Messages:     {snapshot.message_count}")
+    print(f"Timestamp:    {snapshot.timestamp[:19].replace('T', ' ')}")
+    print("=" * 60)
+
+    # Perform recovery
+    if not snapshot_mgr.recover_to_phase(phase_number):
+        print("\nError: Recovery failed")
+        sys.exit(1)
+
+    # Delete stale snapshots after the recovery point
+    deleted = snapshot_mgr.delete_snapshots_after(phase_number)
+    if deleted > 0:
+        print(f"Deleted {deleted} stale snapshot(s) from phases after {phase_number}")
+
+    print("Recovery complete. Resuming execution...\n")
+
+    # Resume execution
+    await run_single_job(
+        config_path=config_path,
+        job_id=job_id,
+        document_paths=document_paths,
+        prompt=prompt,
+        context=context,
+        requirement_data=requirement_data,
+        stream=stream,
+        resume=True,  # Always resume after recovery
+        feedback=None,
+        verbose=verbose,
+    )
 
 
 async def run_polling_loop(config_path: str):
@@ -552,6 +711,43 @@ def main():
 
         logger.info(f"Fetched requirement: {requirement_data.get('name', 'unnamed')}")
 
+    # Approve frozen job mode
+    if args.approve:
+        if not args.job_id:
+            logger.error("--approve requires --job-id")
+            sys.exit(1)
+        asyncio.run(approve_frozen_job(config_path, args.job_id))
+        return
+
+    # List phase snapshots mode
+    if args.list_phases:
+        if not args.job_id:
+            logger.error("--list-phases requires --job-id")
+            sys.exit(1)
+        list_phase_snapshots(args.job_id)
+        return
+
+    # Recover to phase mode
+    if args.recover_phase is not None:
+        if not args.job_id:
+            logger.error("--recover-phase requires --job-id")
+            sys.exit(1)
+        if not args.resume:
+            logger.error("--recover-phase requires --resume")
+            sys.exit(1)
+        asyncio.run(recover_and_resume(
+            config_path=config_path,
+            job_id=args.job_id,
+            phase_number=args.recover_phase,
+            document_paths=document_paths if document_paths else None,
+            prompt=args.prompt,
+            context=context,
+            requirement_data=requirement_data,
+            stream=args.stream,
+            verbose=args.verbose,
+        ))
+        return
+
     # Single job mode (either by job_id or by document+prompt or by requirement_id)
     if args.job_id or args.prompt or args.requirement_id:
         asyncio.run(run_single_job(
@@ -563,6 +759,7 @@ def main():
             requirement_data=requirement_data,
             stream=args.stream,
             resume=args.resume,
+            feedback=args.feedback,
             verbose=args.verbose,
         ))
         return

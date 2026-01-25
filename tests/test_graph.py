@@ -228,7 +228,7 @@ class TestCheckTodosNode:
 
         node = create_check_todos_node(managers["todo"], mock_config)
 
-        state = {"job_id": "test-123", "iteration": 0, "max_iterations": 500}
+        state = {"job_id": "test-123", "iteration": 0}
         result = node(state)
 
         assert result.get("phase_complete") is False
@@ -240,23 +240,10 @@ class TestCheckTodosNode:
 
         node = create_check_todos_node(managers["todo"], mock_config)
 
-        state = {"job_id": "test-123", "iteration": 0, "max_iterations": 500}
+        state = {"job_id": "test-123", "iteration": 0}
         result = node(state)
 
         assert result.get("phase_complete") is True
-
-    def test_max_iterations_reached(self, managers, mock_config):
-        """Test that max iterations triggers stop."""
-        managers["todo"].add("Task 1")
-
-        node = create_check_todos_node(managers["todo"], mock_config)
-
-        state = {"job_id": "test-123", "iteration": 500, "max_iterations": 500}
-        result = node(state)
-
-        assert result.get("should_stop") is True
-        assert result.get("error") is not None
-        assert "iteration_limit" in result["error"]["type"]
 
 
 class TestArchivePhaseNode:

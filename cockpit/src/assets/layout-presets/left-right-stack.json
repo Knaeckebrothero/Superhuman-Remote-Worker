@@ -1,0 +1,22 @@
+{
+  "id": "left-right-stack",
+  "name": "Left + Right Stack",
+  "description": "Left panel with two stacked on right",
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [50, 50],
+    "children": [
+      { "type": "component", "component": "agent-activity" },
+      {
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [50, 50],
+        "children": [
+          { "type": "component", "component": "request-viewer" },
+          { "type": "component", "component": "db-table" }
+        ]
+      }
+    ]
+  }
+}

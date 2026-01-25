@@ -1,0 +1,14 @@
+{
+  "id": "two-row",
+  "name": "Two Rows",
+  "description": "50/50 horizontal split (top/bottom)",
+  "config": {
+    "type": "split",
+    "direction": "horizontal",
+    "sizes": [50, 50],
+    "children": [
+      { "type": "component", "component": "agent-activity" },
+      { "type": "component", "component": "db-table" }
+    ]
+  }
+}

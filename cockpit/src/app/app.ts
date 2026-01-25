@@ -7,6 +7,9 @@ import { PlaceholderAComponent } from './components/placeholders/placeholder-a.c
 import { PlaceholderBComponent } from './components/placeholders/placeholder-b.component';
 import { PlaceholderCComponent } from './components/placeholders/placeholder-c.component';
 import { DbTableComponent } from './components/db-table/db-table.component';
+import { AgentActivityComponent } from './components/agent-activity/agent-activity.component';
+import { RequestViewerComponent } from './components/request-viewer/request-viewer.component';
+import { GraphTimelineComponent } from './components/graph-timeline/graph-timeline.component';
 
 @Component({
   selector: 'app-root',
@@ -73,6 +76,24 @@ export class App implements OnInit {
       type: 'db-table',
       displayName: 'PostgreSQL Tables',
       component: DbTableComponent,
+    });
+
+    this.registry.register({
+      type: 'agent-activity',
+      displayName: 'Agent Activity',
+      component: AgentActivityComponent,
+    });
+
+    this.registry.register({
+      type: 'request-viewer',
+      displayName: 'Request Viewer',
+      component: RequestViewerComponent,
+    });
+
+    this.registry.register({
+      type: 'graph-timeline',
+      displayName: 'Graph Timeline',
+      component: GraphTimelineComponent,
     });
   }
 }

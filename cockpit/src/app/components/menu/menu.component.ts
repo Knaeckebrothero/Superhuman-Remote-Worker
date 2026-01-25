@@ -1,4 +1,5 @@
 import { Component, signal, HostListener, ElementRef, inject } from '@angular/core';
+import { LayoutService } from '../../core/services/layout.service';
 
 interface MenuLink {
   label: string;
@@ -59,6 +60,30 @@ interface MenuSection {
             </div>
           }
 
+          <!-- Layout Presets Section -->
+          <div class="menu-section">
+            <h3 class="section-title">Layouts</h3>
+            @for (preset of layoutService.availablePresets(); track preset.id) {
+              <button class="menu-item" (click)="applyPreset(preset.id)">
+                <span class="item-icon">📐</span>
+                <div class="item-content">
+                  <span class="item-label">{{ preset.name }}</span>
+                  @if (preset.description) {
+                    <span class="item-description">{{ preset.description }}</span>
+                  }
+                </div>
+              </button>
+            }
+            @if (layoutService.availablePresets().length === 0) {
+              <div class="menu-item settings-item">
+                <span class="item-icon">⏳</span>
+                <div class="item-content">
+                  <span class="item-description">Loading presets...</span>
+                </div>
+              </div>
+            }
+          </div>
+
           <div class="menu-section">
             <h3 class="section-title">Settings</h3>
             <div class="menu-item settings-item">
@@ -69,7 +94,7 @@ interface MenuSection {
               </div>
             </div>
             <button class="menu-item" (click)="resetLayout()">
-              <span class="item-icon">📐</span>
+              <span class="item-icon">🔄</span>
               <div class="item-content">
                 <span class="item-label">Reset Layout</span>
                 <span class="item-description">Restore default panel arrangement</span>
@@ -120,12 +145,13 @@ interface MenuSection {
         top: calc(100% + 8px);
         left: 0;
         width: 280px;
+        max-height: 80vh;
+        overflow-y: auto;
         background: var(--panel-bg, #181825);
         border: 1px solid var(--border-color, #313244);
         border-radius: 8px;
         box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
         z-index: 1000;
-        overflow: hidden;
       }
 
       .menu-section {
@@ -219,6 +245,7 @@ interface MenuSection {
 })
 export class MenuComponent {
   private readonly elementRef = inject(ElementRef);
+  readonly layoutService = inject(LayoutService);
 
   readonly isOpen = signal(false);
 
@@ -285,8 +312,13 @@ export class MenuComponent {
     this.isOpen.set(false);
   }
 
+  applyPreset(presetId: string): void {
+    this.layoutService.applyPreset(presetId);
+    this.closeMenu();
+  }
+
   resetLayout(): void {
-    localStorage.removeItem('cockpit-layout');
-    window.location.reload();
+    this.layoutService.resetLayout();
+    this.closeMenu();
   }
 }

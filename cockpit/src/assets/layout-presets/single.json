@@ -1,0 +1,9 @@
+{
+  "id": "single",
+  "name": "Single Panel",
+  "description": "One full-width panel",
+  "config": {
+    "type": "component",
+    "component": "agent-activity"
+  }
+}

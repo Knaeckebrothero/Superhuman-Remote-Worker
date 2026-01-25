@@ -1,0 +1,14 @@
+{
+  "id": "two-column",
+  "name": "Two Columns",
+  "description": "50/50 vertical split",
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [50, 50],
+    "children": [
+      { "type": "component", "component": "agent-activity" },
+      { "type": "component", "component": "request-viewer" }
+    ]
+  }
+}
