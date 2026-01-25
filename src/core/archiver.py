@@ -493,6 +493,9 @@ class LLMArchiver:
     ) -> Optional[str]:
         """Audit a tool call before execution.
 
+        Creates a document with result fields set to null, to be updated
+        via update_tool_result() after execution completes.
+
         Args:
             job_id: Job identifier
             agent_type: Agent type
@@ -519,7 +522,7 @@ class LLMArchiver:
         return self.audit_step(
             job_id=job_id,
             agent_type=agent_type,
-            step_type="tool_call",
+            step_type="tool",
             node_name="tools",
             iteration=iteration,
             data={
@@ -527,61 +530,177 @@ class LLMArchiver:
                     "name": tool_name,
                     "call_id": call_id,
                     "arguments": args_preview,
-                }
+                    # Result fields - null until update_tool_result() is called
+                    "result_preview": None,
+                    "result_size_bytes": None,
+                    "success": None,
+                    "error": None,
+                },
+                "started_at": datetime.now(timezone.utc),
+                "completed_at": None,
             },
             metadata=metadata,
         )
 
-    def audit_tool_result(
+    def update_tool_result(
         self,
-        job_id: str,
-        agent_type: str,
-        iteration: int,
-        tool_name: str,
-        call_id: str,
+        audit_doc_id: str,
         result: str,
         success: bool,
         latency_ms: int,
         error: Optional[str] = None,
+    ) -> bool:
+        """Update a tool audit document with execution result.
+
+        Args:
+            audit_doc_id: The document ID returned by audit_tool_call()
+            result: Tool result content
+            success: Whether tool succeeded
+            latency_ms: Tool execution time
+            error: Error message if failed
+
+        Returns:
+            True if update succeeded, False otherwise.
+        """
+        if not self._ensure_connected():
+            return False
+
+        try:
+            from bson import ObjectId
+
+            update_data = {
+                "tool.result_preview": self._truncate_string(result, 500),
+                "tool.result_size_bytes": len(result) if result else 0,
+                "tool.success": success,
+                "completed_at": datetime.now(timezone.utc),
+                "latency_ms": latency_ms,
+            }
+            if error:
+                update_data["tool.error"] = self._truncate_string(error, 500)
+
+            result_obj = self._audit_collection.update_one(
+                {"_id": ObjectId(audit_doc_id)},
+                {"$set": update_data}
+            )
+
+            if result_obj.modified_count > 0:
+                logger.debug(f"[AUDIT] Updated tool result: {audit_doc_id[-8:]}")
+                return True
+            else:
+                logger.warning(f"[AUDIT] No document updated for tool result: {audit_doc_id}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"Failed to update tool result: {e}")
+            return False
+
+    def audit_llm_call(
+        self,
+        job_id: str,
+        agent_type: str,
+        iteration: int,
+        model: str,
+        input_message_count: int,
+        state_message_count: int,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
-        """Audit a tool result after execution.
+        """Audit an LLM call before execution.
+
+        Creates a document with response fields set to null, to be updated
+        via update_llm_response() after the LLM responds.
 
         Args:
             job_id: Job identifier
             agent_type: Agent type
             iteration: Current iteration number
-            tool_name: Name of the tool that executed
-            call_id: Tool call ID
-            result: Tool result content
-            success: Whether tool succeeded
-            latency_ms: Tool execution time
-            error: Error message if failed
+            model: Model name
+            input_message_count: Number of messages sent to LLM
+            state_message_count: Total messages in conversation state
             metadata: Additional metadata
 
         Returns:
             Inserted document ID, or None if audit failed.
         """
-        tool_data = {
-            "name": tool_name,
-            "call_id": call_id,
-            "result_preview": self._truncate_string(result, 500),
-            "result_size_bytes": len(result) if result else 0,
-            "success": success,
-        }
-        if error:
-            tool_data["error"] = self._truncate_string(error, 500)
-
         return self.audit_step(
             job_id=job_id,
             agent_type=agent_type,
-            step_type="tool_result",
-            node_name="tools",
+            step_type="llm",
+            node_name="execute",
             iteration=iteration,
-            data={"tool": tool_data},
-            latency_ms=latency_ms,
+            data={
+                "llm": {
+                    "model": model,
+                    "input_message_count": input_message_count,
+                    # Response fields - null until update_llm_response() is called
+                    "request_id": None,
+                    "response_content_preview": None,
+                    "tool_calls": None,
+                    "metrics": None,
+                },
+                "state": {
+                    "message_count": state_message_count,
+                },
+                "started_at": datetime.now(timezone.utc),
+                "completed_at": None,
+            },
             metadata=metadata,
         )
+
+    def update_llm_response(
+        self,
+        audit_doc_id: str,
+        request_id: Optional[str],
+        response_preview: str,
+        tool_calls: List[Dict[str, Any]],
+        output_chars: int,
+        latency_ms: int,
+    ) -> bool:
+        """Update an LLM audit document with response data.
+
+        Args:
+            audit_doc_id: The document ID returned by audit_llm_call()
+            request_id: ID linking to llm_requests collection
+            response_preview: First 500 chars of response content
+            tool_calls: List of tool calls in response
+            output_chars: Total response character count
+            latency_ms: LLM response time
+
+        Returns:
+            True if update succeeded, False otherwise.
+        """
+        if not self._ensure_connected():
+            return False
+
+        try:
+            from bson import ObjectId
+
+            update_data = {
+                "llm.request_id": request_id,
+                "llm.response_content_preview": response_preview,
+                "llm.tool_calls": tool_calls,
+                "llm.metrics": {
+                    "output_chars": output_chars,
+                    "tool_call_count": len(tool_calls) if tool_calls else 0,
+                },
+                "completed_at": datetime.now(timezone.utc),
+                "latency_ms": latency_ms,
+            }
+
+            result = self._audit_collection.update_one(
+                {"_id": ObjectId(audit_doc_id)},
+                {"$set": update_data}
+            )
+
+            if result.modified_count > 0:
+                logger.debug(f"[AUDIT] Updated LLM response: {audit_doc_id[-8:]}")
+                return True
+            else:
+                logger.warning(f"[AUDIT] No document updated for LLM response: {audit_doc_id}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"Failed to update LLM response: {e}")
+            return False
 
     def get_job_audit_trail(
         self,

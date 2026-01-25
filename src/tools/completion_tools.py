@@ -115,28 +115,47 @@ def create_completion_tools(context: ToolContext) -> List:
             Confirmation that job is frozen for review, or error if todos remain
         """
         try:
-            # Check for pending todos - reject if any exist
+            # Check for pending todos with special handling for strategic phase
             if context.has_todo():
                 pending = context.todo_manager.list_pending()
                 if pending:
                     pending_count = len(pending)
-                    pending_list = "\n".join(
-                        f"  - [{t.id}] {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
-                        for t in pending[:5]
-                    )
-                    more_msg = ""
-                    if pending_count > 5:
-                        more_msg = f"\n  ... and {pending_count - 5} more"
+                    is_strategic = context.todo_manager.is_strategic_phase
 
-                    logger.warning(
-                        f"job_complete rejected: {pending_count} pending todos remain"
-                    )
-                    return (
-                        f"ERROR: Cannot complete job - {pending_count} todo(s) still pending.\n\n"
-                        f"Pending todos:\n{pending_list}{more_msg}\n\n"
-                        f"Please complete all todos using `todo_complete` before calling `job_complete`.\n"
-                        f"If a todo is no longer needed, you can use `todo_rewind` to reconsider it."
-                    )
+                    # Special case: In strategic phase with only todo_4 pending
+                    # This is the "call job_complete OR next_phase_todos" todo
+                    # Auto-complete it since we're completing the job
+                    if is_strategic and pending_count == 1 and pending[0].id == "todo_4":
+                        context.todo_manager.complete(
+                            "todo_4",
+                            notes=["Auto-completed by job_complete: plan fully executed"]
+                        )
+                        logger.info("Auto-completed todo_4 (last strategic todo) for job completion")
+                    else:
+                        # Standard rejection
+                        pending_list = "\n".join(
+                            f"  - [{t.id}] {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
+                            for t in pending[:5]
+                        )
+                        more_msg = f"\n  ... and {pending_count - 5} more" if pending_count > 5 else ""
+
+                        if not is_strategic:
+                            error_detail = (
+                                "job_complete can only be called during a strategic phase.\n"
+                                "Complete all tactical todos first, then wait for the strategic phase."
+                            )
+                        else:
+                            error_detail = (
+                                "Please complete all todos using `todo_complete` before calling `job_complete`.\n"
+                                "If a todo is no longer needed, you can use `todo_rewind` to reconsider it."
+                            )
+
+                        logger.warning(f"job_complete rejected: {pending_count} pending todos remain")
+                        return (
+                            f"ERROR: Cannot complete job - {pending_count} todo(s) still pending.\n\n"
+                            f"Pending todos:\n{pending_list}{more_msg}\n\n"
+                            f"{error_detail}"
+                        )
 
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
