@@ -1,6 +1,7 @@
-import { Component, signal, computed } from '@angular/core';
+import { Component, inject, computed } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MenuComponent } from '../menu/menu.component';
+import { TimeService } from '../../core/services/time.service';
 
 /**
  * Timeline scrubber component for playback control.
@@ -15,7 +16,12 @@ import { MenuComponent } from '../menu/menu.component';
 
       <div class="divider"></div>
 
-      <button class="play-button" (click)="togglePlay()" [attr.aria-label]="isPlaying() ? 'Pause' : 'Play'">
+      <button
+        class="play-button"
+        (click)="togglePlay()"
+        [attr.aria-label]="isPlaying() ? 'Pause' : 'Play'"
+        [disabled]="!hasTimeRange()"
+      >
         @if (isPlaying()) {
           <svg viewBox="0 0 24 24" fill="currentColor">
             <rect x="6" y="4" width="4" height="16" />
@@ -30,7 +36,7 @@ import { MenuComponent } from '../menu/menu.component';
 
       <span class="time-display">{{ formattedCurrentTime() }}</span>
 
-      <div class="scrubber-container">
+      <div class="scrubber-container" [class.disabled]="!hasTimeRange()">
         <input
           type="range"
           class="scrubber"
@@ -39,6 +45,7 @@ import { MenuComponent } from '../menu/menu.component';
           [ngModel]="currentTime()"
           (ngModelChange)="seek($event)"
           [attr.aria-label]="'Timeline position'"
+          [disabled]="!hasTimeRange()"
         />
         <div class="scrubber-track">
           <div class="scrubber-progress" [style.width.%]="progressPercent()"></div>
@@ -81,6 +88,17 @@ import { MenuComponent } from '../menu/menu.component';
 
       .play-button:active {
         transform: scale(0.95);
+      }
+
+      .play-button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .play-button:disabled:hover {
+        background: var(--accent-color, #cba6f7);
+        transform: none;
       }
 
       .play-button svg {
@@ -137,6 +155,11 @@ import { MenuComponent } from '../menu/menu.component';
         background: var(--accent-hover, #b4befe);
       }
 
+      .scrubber-container.disabled {
+        opacity: 0.4;
+        pointer-events: none;
+      }
+
       .divider {
         width: 1px;
         height: 24px;
@@ -146,24 +169,24 @@ import { MenuComponent } from '../menu/menu.component';
   ],
 })
 export class TimelineComponent {
-  readonly isPlaying = signal(false);
-  readonly currentTime = signal(323); // 5:23 in seconds
-  readonly duration = signal(767); // 12:47 in seconds
+  readonly time = inject(TimeService);
 
-  readonly progressPercent = computed(() => {
-    const dur = this.duration();
-    return dur > 0 ? (this.currentTime() / dur) * 100 : 0;
-  });
+  // Convert ms to seconds for display
+  readonly currentTime = computed(() => Math.floor(this.time.currentOffsetMs() / 1000));
+  readonly duration = computed(() => Math.floor(this.time.durationMs() / 1000));
+  readonly isPlaying = computed(() => this.time.isPlaying());
+  readonly progressPercent = computed(() => this.time.progressPercent());
+  readonly hasTimeRange = computed(() => this.time.hasTimeRange());
 
   readonly formattedCurrentTime = computed(() => this.formatTime(this.currentTime()));
   readonly formattedDuration = computed(() => this.formatTime(this.duration()));
 
   togglePlay(): void {
-    this.isPlaying.update((v) => !v);
+    this.time.togglePlay();
   }
 
-  seek(time: number): void {
-    this.currentTime.set(time);
+  seek(seconds: number): void {
+    this.time.seek(seconds * 1000);
   }
 
   private formatTime(seconds: number): string {

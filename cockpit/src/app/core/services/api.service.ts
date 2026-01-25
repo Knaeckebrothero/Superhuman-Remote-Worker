@@ -141,4 +141,22 @@ export class ApiService {
         }),
       );
   }
+
+  /**
+   * Get the time range (first/last timestamps) for a job's audit entries.
+   */
+  getAuditTimeRange(
+    jobId: string,
+  ): Observable<{ start: string; end: string } | null> {
+    return this.http
+      .get<{ start: string; end: string } | null>(
+        `${this.baseUrl}/jobs/${jobId}/audit/timerange`,
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch audit time range for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
 }

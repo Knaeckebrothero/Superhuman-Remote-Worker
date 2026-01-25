@@ -240,3 +240,19 @@ async def get_request(doc_id: str) -> dict[str, Any]:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/audit/timerange")
+async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
+    """Get first and last timestamps for job audit entries.
+
+    Returns:
+        Dict with 'start' and 'end' ISO timestamps, or null if no entries/MongoDB unavailable
+    """
+    if not mongodb_service.is_available:
+        return None
+
+    try:
+        return await mongodb_service.get_audit_time_range(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e

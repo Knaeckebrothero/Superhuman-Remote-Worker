@@ -1,5 +1,6 @@
-import { Injectable, inject, signal, computed } from '@angular/core';
+import { Injectable, inject, signal, computed, effect } from '@angular/core';
 import { ApiService } from './api.service';
+import { TimeService } from './time.service';
 import {
   JobSummary,
   AuditEntry,
@@ -14,6 +15,7 @@ import {
 @Injectable({ providedIn: 'root' })
 export class AuditService {
   private readonly api = inject(ApiService);
+  private readonly time = inject(TimeService);
 
   // Core state signals
   readonly jobs = signal<JobSummary[]>([]);
@@ -21,6 +23,27 @@ export class AuditService {
   readonly entries = signal<AuditEntry[]>([]);
   readonly activeFilter = signal<AuditFilterCategory>('all');
   readonly expandedIds = signal<Set<string>>(new Set());
+
+  // Scroll target index (set by global time changes)
+  readonly targetEntryIndex = signal<number | null>(null);
+
+  constructor() {
+    // Watch global time and compute scroll target
+    effect(() => {
+      const timestamp = this.time.currentTimestamp();
+      if (!timestamp) {
+        this.targetEntryIndex.set(null);
+        return;
+      }
+      const entries = this.entries();
+      if (entries.length === 0) {
+        this.targetEntryIndex.set(null);
+        return;
+      }
+      const index = this.findEntryIndexAtTimestamp(timestamp, entries);
+      this.targetEntryIndex.set(index);
+    });
+  }
 
   // Pagination state
   readonly currentPage = signal<number>(1);
@@ -82,6 +105,7 @@ export class AuditService {
 
   /**
    * Select a job and load its audit entries (starting from the last page).
+   * Also loads the time range for the global timeline.
    */
   selectJob(jobId: string | null): void {
     if (jobId === this.selectedJobId()) {
@@ -91,13 +115,18 @@ export class AuditService {
     this.selectedJobId.set(jobId);
     this.currentPage.set(-1); // Request last page (most recent entries)
     this.expandedIds.set(new Set());
+    this.targetEntryIndex.set(null);
 
     if (jobId) {
       this.loadAuditEntries();
+      // Load time range for global timeline
+      this.time.loadTimeRange(jobId);
     } else {
       this.entries.set([]);
       this.totalEntries.set(0);
       this.hasMore.set(false);
+      // Clear time service when no job selected
+      this.time.clear();
     }
   }
 
@@ -232,5 +261,29 @@ export class AuditService {
           this.isLoading.set(false);
         },
       });
+  }
+
+  /**
+   * Find the entry index at or after a given timestamp.
+   * Returns the index of the first entry with timestamp >= target.
+   */
+  private findEntryIndexAtTimestamp(
+    targetIso: string,
+    entries: AuditEntry[],
+  ): number {
+    if (entries.length === 0) return 0;
+
+    const targetMs = new Date(targetIso).getTime();
+
+    // Linear scan since entries are sorted by step_number
+    for (let i = 0; i < entries.length; i++) {
+      const entryMs = new Date(entries[i].timestamp).getTime();
+      if (entryMs >= targetMs) {
+        return i;
+      }
+    }
+
+    // If target is after all entries, return last index
+    return entries.length - 1;
   }
 }
