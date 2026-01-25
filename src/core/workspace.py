@@ -350,6 +350,72 @@ class WorkspaceManager:
 
         return False
 
+    def move_file(self, source: str, dest: str) -> Path:
+        """Move a file or directory within the workspace.
+
+        Creates parent directories for destination if needed.
+        Can also be used to rename files.
+
+        Args:
+            source: Source path relative to workspace root
+            dest: Destination path relative to workspace root
+
+        Returns:
+            Absolute path to the moved file/directory
+
+        Raises:
+            FileNotFoundError: If source doesn't exist
+            ValueError: If paths escape workspace boundary
+        """
+        source_path = self.get_path(source)
+        dest_path = self.get_path(dest)
+
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source not found: {source}")
+
+        # Create parent directories for destination
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use shutil.move for the actual operation
+        shutil.move(str(source_path), str(dest_path))
+        logger.debug(f"Moved: {source} -> {dest}")
+
+        return dest_path
+
+    def copy_file(self, source: str, dest: str) -> Path:
+        """Copy a file within the workspace.
+
+        Creates parent directories for destination if needed.
+
+        Args:
+            source: Source path relative to workspace root
+            dest: Destination path relative to workspace root
+
+        Returns:
+            Absolute path to the copied file
+
+        Raises:
+            FileNotFoundError: If source doesn't exist
+            ValueError: If paths escape workspace boundary or source is a directory
+        """
+        source_path = self.get_path(source)
+        dest_path = self.get_path(dest)
+
+        if not source_path.exists():
+            raise FileNotFoundError(f"Source not found: {source}")
+
+        if source_path.is_dir():
+            raise ValueError(f"Cannot copy directory: {source}. Use move_file for directories.")
+
+        # Create parent directories for destination
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use shutil.copy2 to preserve metadata
+        shutil.copy2(str(source_path), str(dest_path))
+        logger.debug(f"Copied: {source} -> {dest}")
+
+        return dest_path
+
     def list_files(self, relative_path: str = "", pattern: str = "*") -> List[str]:
         """List files in a workspace directory.
 

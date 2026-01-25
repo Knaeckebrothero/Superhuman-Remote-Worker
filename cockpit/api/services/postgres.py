@@ -1,7 +1,9 @@
 """PostgreSQL service for the cockpit API."""
 
+import math
 import os
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 
@@ -106,14 +108,18 @@ class PostgresService:
         page: int = 1,
         page_size: int = 50,
     ) -> dict[str, Any]:
-        """Get paginated data from a table."""
+        """Get paginated data from a table.
+
+        Args:
+            table_name: Name of table to query
+            page: Page number (1-indexed). Use -1 to request the last page.
+            page_size: Number of rows per page
+        """
         if table_name not in ALLOWED_TABLES:
             raise ValueError(f"Table '{table_name}' not allowed")
 
         if not self._pool:
             raise RuntimeError("Database not connected")
-
-        offset = (page - 1) * page_size
 
         async with self._pool.acquire() as conn:
             # Get total count
@@ -121,6 +127,12 @@ class PostgresService:
                 f"SELECT COUNT(*) as total FROM {table_name}"  # noqa: S608
             )
             total = count_row["total"] if count_row else 0
+
+            # Handle last page request (page=-1)
+            if page == -1:
+                page = max(1, math.ceil(total / page_size))
+
+            offset = (page - 1) * page_size
 
             # Get schema for type info
             columns = await self.get_table_schema(table_name)
@@ -151,6 +163,79 @@ class PostgresService:
             "page": page,
             "pageSize": page_size,
         }
+
+    async def get_jobs(
+        self,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Get list of jobs with optional status filter.
+
+        Args:
+            status: Optional status filter (e.g., 'completed', 'processing')
+            limit: Maximum number of jobs to return
+
+        Returns:
+            List of job dicts with id, status, creator_status, validator_status, created_at
+        """
+        if not self._pool:
+            raise RuntimeError("Database not connected")
+
+        async with self._pool.acquire() as conn:
+            if status:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, status, creator_status, validator_status, created_at
+                    FROM jobs
+                    WHERE status = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    status,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, status, creator_status, validator_status, created_at
+                    FROM jobs
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+
+        return [dict(row) for row in rows]
+
+    async def get_job(self, job_id: str) -> dict[str, Any] | None:
+        """Get a single job by ID.
+
+        Args:
+            job_id: The job UUID as string
+
+        Returns:
+            Job dict or None if not found
+        """
+        if not self._pool:
+            raise RuntimeError("Database not connected")
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return None
+
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, status, creator_status, validator_status,
+                       created_at, updated_at, prompt
+                FROM jobs
+                WHERE id = $1
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
 
 
 # Singleton instance

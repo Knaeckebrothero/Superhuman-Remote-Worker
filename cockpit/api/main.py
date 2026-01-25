@@ -9,6 +9,10 @@ Or from cockpit/api directory:
 
 import json
 from contextlib import asynccontextmanager
+
+from dotenv import find_dotenv, load_dotenv
+
+load_dotenv(find_dotenv())
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -18,7 +22,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from services.mongodb import FilterCategory, mongodb_service
 from services.postgres import ALLOWED_TABLES, postgres_service
+from graph_routes import router as graph_router
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -52,7 +58,9 @@ class CustomJSONResponse(JSONResponse):
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     await postgres_service.connect()
+    await mongodb_service.connect()
     yield
+    await mongodb_service.disconnect()
     await postgres_service.disconnect()
 
 
@@ -73,6 +81,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include routers
+app.include_router(graph_router)
+
 
 @app.get("/api/tables")
 async def list_tables() -> list[dict[str, Any]]:
@@ -83,10 +94,10 @@ async def list_tables() -> list[dict[str, Any]]:
 @app.get("/api/tables/{table_name}")
 async def get_table_data(
     table_name: str,
-    page: int = Query(default=1, ge=1),
+    page: int = Query(default=1, ge=-1),
     page_size: int = Query(default=50, ge=1, le=500, alias="pageSize"),
 ) -> dict[str, Any]:
-    """Get paginated table data."""
+    """Get paginated table data. Use page=-1 to request the last page."""
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
 
@@ -112,3 +123,115 @@ async def get_table_schema(table_name: str) -> list[dict[str, Any]]:
 async def health_check() -> dict[str, str]:
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/api/jobs")
+async def list_jobs(
+    status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """List jobs with optional status filter.
+
+    Returns jobs enriched with audit_count from MongoDB if available.
+    """
+    try:
+        jobs = await postgres_service.get_jobs(status=status, limit=limit)
+
+        # Enrich with audit counts if MongoDB is available
+        if mongodb_service.is_available:
+            for job in jobs:
+                job_id = str(job["id"])
+                job["audit_count"] = await mongodb_service.get_audit_count(job_id)
+        else:
+            for job in jobs:
+                job["audit_count"] = None
+
+        return jobs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job(job_id: str) -> dict[str, Any]:
+    """Get a single job by ID."""
+    try:
+        job = await postgres_service.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        # Enrich with audit count if MongoDB is available
+        if mongodb_service.is_available:
+            job["audit_count"] = await mongodb_service.get_audit_count(job_id)
+        else:
+            job["audit_count"] = None
+
+        return job
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/audit")
+async def get_job_audit(
+    job_id: str,
+    page: int = Query(default=1, ge=-1),
+    page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
+    filter: FilterCategory = Query(default="all"),
+) -> dict[str, Any]:
+    """Get paginated audit entries for a job from MongoDB.
+
+    Query params:
+        page: Page number (1-indexed). Use -1 to request the last page.
+        pageSize: Number of entries per page (max 200)
+        filter: Filter category - all, messages, tools, or errors
+    """
+    if not mongodb_service.is_available:
+        return {
+            "entries": [],
+            "total": 0,
+            "page": page,
+            "pageSize": page_size,
+            "hasMore": False,
+            "error": "MongoDB not available",
+        }
+
+    try:
+        return await mongodb_service.get_job_audit(
+            job_id=job_id,
+            page=page,
+            page_size=page_size,
+            filter_category=filter,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/requests/{doc_id}")
+async def get_request(doc_id: str) -> dict[str, Any]:
+    """Get a single LLM request by MongoDB document ID.
+
+    Args:
+        doc_id: MongoDB ObjectId as string (24 hex characters)
+
+    Returns:
+        Full LLM request document with messages and response
+    """
+    if not mongodb_service.is_available:
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB not available",
+        )
+
+    try:
+        request = await mongodb_service.get_request(doc_id)
+        if request is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Request '{doc_id}' not found",
+            )
+        return request
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e

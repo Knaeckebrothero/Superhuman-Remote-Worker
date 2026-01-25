@@ -40,8 +40,7 @@ class UniversalAgentState(TypedDict):
         initialized: Whether initialization has completed
         phase_complete: Inner loop exit condition (all todos done)
         goal_achieved: Outer loop exit condition (plan complete)
-        iteration: Current iteration count (safety limit)
-        max_iterations: Maximum iterations before forced stop
+        iteration: Current iteration count (for tracking/logging)
 
         # Phase alternation (strategic/tactical mode)
         is_strategic_phase: True = strategic mode (planning), False = tactical mode (execution)
@@ -78,7 +77,6 @@ class UniversalAgentState(TypedDict):
     phase_complete: bool                 # Inner loop exit: all todos done
     goal_achieved: bool                  # Outer loop exit: plan complete
     iteration: int                       # Current iteration count
-    max_iterations: int                  # Safety limit
 
     # Phase alternation (strategic/tactical mode)
     is_strategic_phase: bool             # True = strategic mode, False = tactical mode
@@ -115,7 +113,6 @@ def create_initial_state(
     job_id: str,
     workspace_path: str,
     metadata: Optional[Dict[str, Any]] = None,
-    max_iterations: int = 500,
 ) -> UniversalAgentState:
     """Create an initial state for a new job.
 
@@ -129,7 +126,6 @@ def create_initial_state(
         job_id: Unique job identifier
         workspace_path: Path to job workspace
         metadata: Optional job-specific data
-        max_iterations: Safety limit for iterations (default: 500)
 
     Returns:
         Initial UniversalAgentState ready for graph invocation
@@ -155,7 +151,6 @@ def create_initial_state(
         phase_complete=False,
         goal_achieved=False,
         iteration=0,
-        max_iterations=max_iterations,
 
         # Phase alternation (start in strategic mode)
         is_strategic_phase=True,

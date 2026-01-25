@@ -279,7 +279,6 @@ class PollingConfig:
 class LimitsConfig:
     """Execution limits configuration."""
 
-    max_iterations: int = 500
     context_threshold_tokens: int = 80000
     tool_retry_count: int = 3
 
@@ -434,7 +433,6 @@ def load_agent_config(
 
     limits_data = data.get("limits", {})
     limits_config = LimitsConfig(
-        max_iterations=limits_data.get("max_iterations", 500),
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
     )

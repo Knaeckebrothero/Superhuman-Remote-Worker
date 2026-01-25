@@ -107,6 +107,51 @@ def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int
     return adjusted_start
 
 
+def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
+    """Remove orphaned ToolMessages that lack a parent AIMessage with tool_calls.
+
+    This function repairs corrupted message histories where a ToolMessage
+    appears without a preceding AIMessage that made the corresponding tool call.
+    Such corruption can occur from improper message slicing during context compaction.
+
+    Args:
+        messages: Message list that may contain orphaned ToolMessages
+
+    Returns:
+        Sanitized message list with orphaned ToolMessages removed
+    """
+    if not messages:
+        return messages
+
+    # Build a set of valid tool_call_ids from AIMessages
+    valid_tool_call_ids = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tc_id = tc.get('id')
+                if tc_id:
+                    valid_tool_call_ids.add(tc_id)
+
+    # Filter out orphaned ToolMessages
+    result = []
+    orphaned_count = 0
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tool_call_id = getattr(msg, 'tool_call_id', None)
+            if tool_call_id and tool_call_id not in valid_tool_call_ids:
+                # This ToolMessage is orphaned - skip it
+                orphaned_count += 1
+                continue
+        result.append(msg)
+
+    if orphaned_count > 0:
+        logger.warning(
+            f"Removed {orphaned_count} orphaned ToolMessages from message history"
+        )
+
+    return result
+
+
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken
@@ -644,9 +689,13 @@ Summary:"""
         if len(conversation) <= self.config.keep_recent_messages:
             return messages
 
-        # Messages to summarize (older ones)
-        messages_to_summarize = conversation[:-self.config.keep_recent_messages]
-        recent_messages = conversation[-self.config.keep_recent_messages:]
+        # Find safe slice point that doesn't orphan ToolMessages
+        target_start = len(conversation) - self.config.keep_recent_messages
+        safe_start = find_safe_slice_start(conversation, target_start)
+
+        # Messages to summarize (older ones) and recent messages to keep
+        messages_to_summarize = conversation[:safe_start]
+        recent_messages = conversation[safe_start:]
 
         # Generate summary
         summary = await self.summarize_conversation(

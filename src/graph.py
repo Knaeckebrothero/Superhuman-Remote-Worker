@@ -68,11 +68,13 @@ from .core.loader import (
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
-from .core.context import ContextManager, ContextConfig, ToolRetryManager, find_safe_slice_start
+from .core.context import ContextManager, ContextConfig, ToolRetryManager, find_safe_slice_start, sanitize_message_history
+from .core.phase_snapshot import PhaseSnapshotManager
 from .core.phase import (
     handle_phase_transition,
     TransitionResult,
     get_initial_strategic_todos,
+    get_transition_strategic_todos,
 )
 from .managers import TodoManager, PlanManager, MemoryManager
 
@@ -322,6 +324,10 @@ def create_execute_node(
         # Always clear old tool results, keep last 10
         messages = context_mgr.clear_old_tool_results(messages)
 
+        # Sanitize message history to remove orphaned ToolMessages
+        # (can occur from improper context compaction or checkpoint corruption)
+        messages = sanitize_message_history(messages)
+
         # Add full conversation history (excluding system messages)
         for msg in messages:
             if not isinstance(msg, SystemMessage):
@@ -369,8 +375,9 @@ def create_execute_node(
                 logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
 
                 # Archive full LLM request/response
+                request_id = None
                 if auditor:
-                    auditor.archive(
+                    request_id = auditor.archive(
                         job_id=job_id,
                         agent_type=config.agent_id,
                         messages=prepared_messages,
@@ -390,7 +397,7 @@ def create_execute_node(
                                 "call_id": tc.get("id", ""),
                             })
 
-                    # Audit LLM response
+                    # Audit LLM response with link to full request
                     auditor.audit_step(
                         job_id=job_id,
                         agent_type=config.agent_id,
@@ -400,6 +407,7 @@ def create_execute_node(
                         data={
                             "llm": {
                                 "model": config.llm.model,
+                                "request_id": request_id,  # Link to llm_requests collection
                                 "response_content_preview": response.content[:500] if response.content else "",
                                 "tool_calls": tool_calls_preview,
                                 "metrics": {
@@ -480,38 +488,6 @@ def create_check_todos_node(
         """Check if all todos are complete."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
-        max_iterations = state.get("max_iterations", 500)
-
-        # Check iteration limit
-        if iteration >= max_iterations:
-            logger.warning(f"[{job_id}] Max iterations reached")
-
-            # Audit iteration limit error
-            auditor = get_archiver()
-            if auditor:
-                auditor.audit_step(
-                    job_id=job_id,
-                    agent_type=config.agent_id,
-                    step_type="error",
-                    node_name="check_todos",
-                    iteration=iteration,
-                    data={
-                        "error": {
-                            "type": "iteration_limit",
-                            "message": f"Max iterations ({max_iterations}) reached",
-                            "recoverable": False,
-                        }
-                    },
-                    metadata=state.get("metadata"),
-                )
-
-            return {
-                "should_stop": True,
-                "error": {
-                    "message": f"Max iterations ({max_iterations}) reached",
-                    "type": "iteration_limit",
-                },
-            }
 
         # Validate todos exist before checking completion
         todos = todo_manager.list_all()
@@ -524,7 +500,26 @@ def create_check_todos_node(
                     f"[{job_id}] No todos in tactical phase - forcing phase complete to recover"
                 )
                 return {"phase_complete": True}
-            logger.warning(f"[{job_id}] No todos loaded - phase cannot be complete")
+
+            # Strategic phase with no todos (likely after resume)
+            # Reload appropriate predefined todos to recover
+            phase_number = state.get("phase_number", 0)
+            if phase_number == 0:
+                # Initial strategic phase
+                strategic_todos = get_initial_strategic_todos(config)
+            else:
+                # Transition strategic phase (between tactical phases)
+                strategic_todos = get_transition_strategic_todos(config)
+
+            if strategic_todos:
+                todo_list = [todo.to_dict() for todo in strategic_todos]
+                todo_manager.set_todos_from_list(todo_list)
+                logger.warning(
+                    f"[{job_id}] Reloaded {len(strategic_todos)} strategic todos after resume (phase {phase_number})"
+                )
+                return {"phase_complete": False}  # Continue with reloaded todos
+
+            logger.warning(f"[{job_id}] No todos loaded and no predefined todos available")
             return {"phase_complete": False}
 
         # Check todos
@@ -565,20 +560,45 @@ def create_archive_phase_node(
     context_mgr: ContextManager,
     llm: BaseChatModel,
     summarization_prompt: str,
+    snapshot_manager: Optional[PhaseSnapshotManager] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
     This node archives completed todos and marks phase complete.
     Also performs context compaction if configured.
+    Creates phase snapshots for recovery if snapshot_manager is provided.
     """
 
     def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
         """Archive todos and mark phase complete in plan."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
+        phase_number = state.get("phase_number", 0)
+        is_strategic = state.get("is_strategic_phase", True)
+        messages = state.get("messages", [])
 
         current_phase = plan_manager.get_current_phase()
         logger.info(f"[{job_id}] Archiving phase: {current_phase}")
+
+        # Create phase snapshot BEFORE any modifications
+        # This captures the clean state at end of phase for recovery
+        if snapshot_manager:
+            try:
+                # Get todo stats for snapshot metadata
+                todos = todo_manager.get_todos()
+                todos_completed = sum(1 for t in todos if t.get("status") == "done")
+                todos_total = len(todos)
+
+                snapshot_manager.create_snapshot(
+                    phase_number=phase_number,
+                    iteration=iteration,
+                    message_count=len(messages),
+                    is_strategic_phase=is_strategic,
+                    todos_completed=todos_completed,
+                    todos_total=todos_total,
+                )
+            except Exception as e:
+                logger.warning(f"[{job_id}] Failed to create phase snapshot: {e}")
 
         # Archive todos
         archive_path = todo_manager.archive(current_phase or "phase")
@@ -742,7 +762,10 @@ def create_check_goal_node(
     """Create the check_goal node.
 
     This node checks if the overall goal is achieved.
-    Supports both legacy plan completion and phase alternation job_complete.
+    Supports:
+    - Frozen state: job_frozen.json exists -> stop for human review (goal_achieved=False, should_stop=True)
+    - Completed state: job_completion.json exists -> truly done (goal_achieved=True, should_stop=True)
+    - Legacy plan completion
     """
 
     def check_goal(state: UniversalAgentState) -> Dict[str, Any]:
@@ -750,11 +773,42 @@ def create_check_goal_node(
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
 
-        # Phase alternation: check if job_complete was called
-        # (writes output/job_completion.json)
+        # Check for frozen state (job awaiting human review)
+        # job_complete now writes job_frozen.json instead of job_completion.json
+        job_frozen_path = workspace.get_path("output/job_frozen.json")
+        if job_frozen_path.exists():
+            logger.info(f"[{job_id}] Job frozen for human review - stopping gracefully")
+
+            # Audit frozen state
+            auditor = get_archiver()
+            if auditor:
+                auditor.audit_step(
+                    job_id=job_id,
+                    agent_type=config.agent_id,
+                    step_type="check",
+                    node_name="check_goal",
+                    iteration=iteration,
+                    data={
+                        "check": {
+                            "decision": "frozen",
+                            "goal_achieved": False,
+                            "should_stop": True,
+                            "reason": "job_frozen_for_review",
+                        }
+                    },
+                    metadata=state.get("metadata"),
+                )
+
+            return {
+                "goal_achieved": False,  # Not truly achieved yet
+                "should_stop": True,     # But stop the loop for human review
+            }
+
+        # Check if job was approved (job_completion.json created by --approve command)
+        # This file is only created when a human approves a frozen job
         job_completion_path = workspace.get_path("output/job_completion.json")
         if job_completion_path.exists():
-            logger.info(f"[{job_id}] Goal achieved - job_complete called")
+            logger.info(f"[{job_id}] Goal achieved - job approved by human")
 
             # Audit goal achieved
             auditor = get_archiver()
@@ -769,7 +823,7 @@ def create_check_goal_node(
                         "check": {
                             "decision": "goal_achieved",
                             "goal_achieved": True,
-                            "reason": "job_complete_called",
+                            "reason": "job_approved_by_human",
                         }
                     },
                     metadata=state.get("metadata"),
@@ -779,6 +833,14 @@ def create_check_goal_node(
                 "goal_achieved": True,
                 "should_stop": True,
             }
+
+        # Check if there are pending todos - if so, goal is NOT achieved
+        # This check MUST come before plan completion check to prevent
+        # early exit when todos have been staged but plan appears complete
+        pending_todos = todo_manager.list_pending()
+        if pending_todos:
+            logger.info(f"[{job_id}] Goal not achieved - {len(pending_todos)} pending todos")
+            return {"goal_achieved": False}
 
         # Legacy: Check if plan is complete
         is_complete = plan_manager.is_complete()
@@ -809,12 +871,6 @@ def create_check_goal_node(
                 "goal_achieved": True,
                 "should_stop": True,
             }
-
-        # Check if there are pending todos - if so, goal is NOT achieved
-        pending_todos = todo_manager.list_pending()
-        if pending_todos:
-            logger.info(f"[{job_id}] Goal not achieved - {len(pending_todos)} pending todos")
-            return {"goal_achieved": False}
 
         # Check if there's a next phase (legacy)
         next_phase = plan_manager.get_current_phase()
@@ -1040,6 +1096,7 @@ def build_phase_alternation_graph(
     workspace_template: str = "",
     checkpointer: Optional[BaseCheckpointSaver] = None,
     summarization_llm: Optional[BaseChatModel] = None,
+    snapshot_manager: Optional[PhaseSnapshotManager] = None,
 ) -> CompiledStateGraph:
     """Build the phase alternation graph for the Universal Agent.
 
@@ -1063,6 +1120,8 @@ def build_phase_alternation_graph(
             When provided, enables resume after crash using the same thread_id.
         summarization_llm: Optional LLM for context summarization at phase boundaries.
             If not provided, uses llm_with_tools for summarization.
+        snapshot_manager: Optional PhaseSnapshotManager for creating phase snapshots.
+            When provided, enables recovery to previous phases after corruption.
 
     Returns:
         Compiled StateGraph with checkpointing if checkpointer provided
@@ -1106,7 +1165,8 @@ def build_phase_alternation_graph(
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(
         todo_manager, plan_manager, config,
-        context_mgr, llm_for_summarization, summarization_prompt
+        context_mgr, llm_for_summarization, summarization_prompt,
+        snapshot_manager=snapshot_manager,
     )
 
     handle_transition = create_handle_transition_node(
