@@ -20,13 +20,23 @@
 FROM vllm/vllm-openai:v0.10.2
 
 ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install SSH server for tunnel access (bypasses Cloudflare timeouts on RunPod)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config \
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config \
+    && echo 'PermitEmptyPasswords no' >> /etc/ssh/sshd_config
 
 # Multi-architecture CUDA support: L40S (sm_89), A100 (sm_80), H100/H200 (sm_90)
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0+PTX"
 
-# vLLM attention backend - set at runtime based on GPU detection
-# Default to FLASH_ATTN, entrypoint will override for Ampere GPUs
-ENV VLLM_ATTENTION_BACKEND=FLASH_ATTN
+# vLLM attention backend - set dynamically at runtime by entrypoint.sh
+# based on GPU detection (Ampere/Ada need TRITON_ATTN, Hopper uses FLASH_ATTN)
+# Do NOT set VLLM_ATTENTION_BACKEND here - let entrypoint handle it
 ENV VLLM_USE_TRITON_FLASH_ATTN=1
 
 WORKDIR /app
@@ -35,10 +45,10 @@ WORKDIR /app
 # Pin version for reproducibility
 RUN pip install --no-cache-dir openai-harmony==0.0.8
 
-# Pin Triton to 3.1.0 for vLLM v0.10.2 compatibility
-# Note: v3.5.0 deprecated the `routing` module which breaks vLLM's MoE kernels
-# vLLM uses Triton's matmul_ogs kernels internally for MXFP4 - no separate install needed
-RUN pip install --no-cache-dir triton==3.1.0
+# Triton 3.4.0 required for gpt-oss on Ampere GPUs (A100)
+# - Enables TRITON_ATTN_VLLM_V1 backend which supports attention sinks
+# - v3.5.0+ deprecated `routing` module which breaks vLLM's MoE kernels
+RUN pip install --no-cache-dir triton==3.4.0
 
 # Verify installation
 RUN python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')" \
@@ -53,6 +63,6 @@ RUN chmod +x /app/entrypoint.sh
 HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-EXPOSE 8000
+EXPOSE 8000 22
 
 ENTRYPOINT ["/app/entrypoint.sh"]
