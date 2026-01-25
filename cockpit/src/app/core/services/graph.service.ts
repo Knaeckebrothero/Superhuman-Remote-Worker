@@ -1,6 +1,7 @@
-import { Injectable, inject, signal, computed } from '@angular/core';
+import { Injectable, inject, signal, computed, effect } from '@angular/core';
 import { ApiService } from './api.service';
 import { AuditService } from './audit.service';
+import { TimeService } from './time.service';
 import {
   GraphChangeResponse,
   GraphSnapshot,
@@ -20,6 +21,7 @@ import {
 export class GraphService {
   private readonly api = inject(ApiService);
   private readonly audit = inject(AuditService);
+  private readonly time = inject(TimeService);
 
   // Raw data from API
   readonly changes = signal<GraphChangeResponse | null>(null);
@@ -29,9 +31,35 @@ export class GraphService {
   // Current position in timeline (tool call index)
   readonly currentIndex = signal(0);
 
+  // Whether to sync with global time (disabled on manual graph slider interaction)
+  readonly syncToGlobalTime = signal(true);
+
   // Last seek timestamp for velocity calculation
   private lastSeekTime = 0;
   private lastSeekIndex = 0;
+
+  constructor() {
+    // Re-enable sync when global slider is used
+    effect(() => {
+      // Just reading globalSeekVersion is enough to trigger this effect
+      const version = this.time.globalSeekVersion();
+      if (version > 0) {
+        this.syncToGlobalTime.set(true);
+      }
+    });
+
+    // Sync graph index when global time changes
+    effect(() => {
+      if (!this.syncToGlobalTime()) return;
+      const timestamp = this.time.currentTimestamp();
+      if (!timestamp || !this.hasData()) return;
+      const index = this.findIndexAtTimestamp(timestamp);
+      // Only update if the index actually changed to avoid triggering extra renders
+      if (index !== this.currentIndex()) {
+        this.currentIndex.set(index);
+      }
+    });
+  }
 
   // Computed values
   readonly hasData = computed(() => {
@@ -164,10 +192,14 @@ export class GraphService {
   /**
    * Seek to a specific tool call index.
    * Uses velocity-based rendering: fast scrub jumps to snapshot, slow scrub applies deltas.
+   * Disables global time sync when called (manual override).
    */
   seekTo(index: number): void {
     const data = this.changes();
     if (!data) return;
+
+    // Disable global time sync when user manually interacts with graph slider
+    this.syncToGlobalTime.set(false);
 
     // Clamp index
     const clampedIndex = Math.max(0, Math.min(index, data.deltas.length - 1));
@@ -185,6 +217,39 @@ export class GraphService {
     // Velocity is used by the component to decide rendering strategy
     // Fast seeks (>500 ops/sec) should use snapshot rendering
     // Slow seeks should apply deltas incrementally
+  }
+
+  /**
+   * Re-enable sync with global time (called when global slider is used).
+   */
+  enableGlobalSync(): void {
+    this.syncToGlobalTime.set(true);
+  }
+
+  /**
+   * Find the delta index at or before a given timestamp.
+   * Uses binary search for efficiency.
+   */
+  findIndexAtTimestamp(targetIso: string): number {
+    const deltas = this.changes()?.deltas ?? [];
+    if (deltas.length === 0) return 0;
+
+    const targetMs = new Date(targetIso).getTime();
+    let left = 0;
+    let right = deltas.length - 1;
+
+    // Binary search for the last delta with timestamp <= target
+    while (left < right) {
+      const mid = Math.floor((left + right + 1) / 2);
+      const deltaMs = new Date(deltas[mid].timestamp).getTime();
+      if (deltaMs <= targetMs) {
+        left = mid;
+      } else {
+        right = mid - 1;
+      }
+    }
+
+    return left;
   }
 
   /**
@@ -396,5 +461,6 @@ export class GraphService {
     this.changes.set(null);
     this.currentIndex.set(0);
     this.error.set(null);
+    this.syncToGlobalTime.set(true);
   }
 }

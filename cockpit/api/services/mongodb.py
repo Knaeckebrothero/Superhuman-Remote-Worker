@@ -180,6 +180,39 @@ class MongoDBService:
         doc["_id"] = str(doc["_id"])
         return doc
 
+    async def get_audit_time_range(self, job_id: str) -> dict[str, str] | None:
+        """Get first and last timestamps for a job's audit entries.
+
+        Args:
+            job_id: The job UUID to query
+
+        Returns:
+            Dict with 'start' and 'end' ISO timestamps, or None if no entries
+        """
+        if not self._available or self._db is None:
+            return None
+
+        collection = self._db["agent_audit"]
+
+        # Get first entry (sorted by step_number asc)
+        first = await collection.find_one(
+            {"job_id": job_id},
+            sort=[("step_number", 1)],
+            projection={"timestamp": 1},
+        )
+
+        # Get last entry (sorted by step_number desc)
+        last = await collection.find_one(
+            {"job_id": job_id},
+            sort=[("step_number", -1)],
+            projection={"timestamp": 1},
+        )
+
+        if not first or not last:
+            return None
+
+        return {"start": first["timestamp"], "end": last["timestamp"]}
+
 
 # Singleton instance
 mongodb_service = MongoDBService()

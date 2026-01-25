@@ -1,4 +1,12 @@
-import { Component, inject, OnInit } from '@angular/core';
+import {
+  Component,
+  inject,
+  OnInit,
+  effect,
+  ElementRef,
+  viewChildren,
+  AfterViewInit,
+} from '@angular/core';
 import { AuditService } from '../../core/services/audit.service';
 import { RequestService } from '../../core/services/request.service';
 import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/models/audit.model';
@@ -87,13 +95,15 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
 
       <!-- Entry List -->
       @if (audit.entries().length > 0) {
-        <div class="entry-list">
-          @for (entry of audit.entries(); track entry._id) {
+        <div class="entry-list" #entryList>
+          @for (entry of audit.entries(); track entry._id; let i = $index) {
             <div
+              #entryItem
               class="entry-item"
               [class.expanded]="audit.isExpanded(entry._id)"
               [class.phase-strategic]="entry.phase === 'strategic'"
               [class.phase-tactical]="entry.phase === 'tactical'"
+              [class.scroll-target]="audit.targetEntryIndex() === i"
               [style.border-left-color]="getStepColor(entry.step_type)"
             >
               <div class="entry-header" (click)="audit.toggleExpanded(entry._id)">
@@ -546,6 +556,10 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         background: rgba(166, 227, 161, 0.10);
       }
 
+      .entry-item.scroll-target {
+        box-shadow: inset 0 0 0 2px var(--accent-color, #cba6f7);
+      }
+
       .entry-header {
         display: flex;
         align-items: center;
@@ -766,12 +780,40 @@ export class AgentActivityComponent implements OnInit {
   readonly audit = inject(AuditService);
   private readonly requestService = inject(RequestService);
 
+  // Query all entry items for scrolling
+  readonly entryItems = viewChildren<ElementRef<HTMLElement>>('entryItem');
+
   readonly filters: { label: string; value: AuditFilterCategory }[] = [
     { label: 'All', value: 'all' },
     { label: 'Messages', value: 'messages' },
     { label: 'Tools', value: 'tools' },
     { label: 'Errors', value: 'errors' },
   ];
+
+  // Track last scrolled index to avoid redundant scrolls
+  private lastScrolledIndex: number | null = null;
+
+  constructor() {
+    // Auto-scroll to target entry when global time changes
+    effect(() => {
+      const targetIndex = this.audit.targetEntryIndex();
+      if (targetIndex === null || targetIndex === this.lastScrolledIndex) {
+        return;
+      }
+
+      const items = this.entryItems();
+      if (targetIndex >= 0 && targetIndex < items.length) {
+        this.lastScrolledIndex = targetIndex;
+        // Use requestAnimationFrame to ensure DOM is ready
+        requestAnimationFrame(() => {
+          items[targetIndex].nativeElement.scrollIntoView({
+            behavior: 'smooth',
+            block: 'center',
+          });
+        });
+      }
+    });
+  }
 
   // Step type color mapping
   private readonly stepColors: Record<AuditStepType, string> = {
