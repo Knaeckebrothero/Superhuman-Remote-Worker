@@ -13,9 +13,22 @@ HUGGING_FACE_HUB_TOKEN=hf_xxx
 MODEL=openai/gpt-oss-120b
 MAX_MODEL_LEN=131072
 SHOW_LOADING_PROGRESS=true
+API_KEY=your-secret-key        # Optional: enables authentication
 ```
 
 Auto-translates `openai/gpt-oss-120b` to GGUF equivalent.
+
+### API Key Authentication
+
+Set `API_KEY` to require authentication for all requests. If not set, the server accepts unauthenticated requests.
+
+```bash
+# Request with API key
+curl http://<pod-ip>:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer your-secret-key" \
+    -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"Hello"}]}'
+```
 
 ### Pod Configuration
 

@@ -228,7 +228,7 @@ if [ "${NO_MMAP}" = "true" ]; then
     CMD="${CMD} --no-mmap"
 fi
 
-# Enable Jinja templating (required for tool calling)
+# Enable Jinja templating for chat templates
 CMD="${CMD} --jinja"
 
 # Grammar for tool calling (GBNF enforces valid Harmony format)

@@ -1,7 +1,8 @@
-import { Component, inject, computed } from '@angular/core';
+import { Component, inject, computed, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MenuComponent } from '../menu/menu.component';
 import { TimeService } from '../../core/services/time.service';
+import { AuditService } from '../../core/services/audit.service';
 
 /**
  * Timeline scrubber component for playback control.
@@ -13,6 +14,32 @@ import { TimeService } from '../../core/services/time.service';
   template: `
     <div class="timeline">
       <app-menu />
+
+      <div class="divider"></div>
+
+      <select
+        class="job-selector"
+        [value]="audit.selectedJobId() || ''"
+        (change)="onJobSelect($event)"
+      >
+        <option value="">Select a job...</option>
+        @for (job of audit.jobs(); track job.id) {
+          <option [value]="job.id">
+            {{ job.id.slice(0, 8) }}... | {{ job.status }}
+            @if (job.audit_count !== null) {
+              ({{ job.audit_count }} steps)
+            }
+          </option>
+        }
+      </select>
+      <button
+        class="refresh-btn"
+        (click)="audit.refresh()"
+        [disabled]="audit.isLoading()"
+        title="Refresh jobs"
+      >
+        &#x21bb;
+      </button>
 
       <div class="divider"></div>
 
@@ -165,11 +192,54 @@ import { TimeService } from '../../core/services/time.service';
         height: 24px;
         background: var(--border-color, #313244);
       }
+
+      .job-selector {
+        padding: 6px 12px;
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 4px;
+        background: var(--panel-bg, #181825);
+        color: var(--text-primary, #cdd6f4);
+        font-size: 12px;
+        font-family: 'JetBrains Mono', monospace;
+        cursor: pointer;
+        min-width: 200px;
+      }
+
+      .job-selector:hover {
+        border-color: var(--text-muted, #6c7086);
+      }
+
+      .job-selector:focus {
+        outline: none;
+        border-color: var(--accent-color, #cba6f7);
+      }
+
+      .refresh-btn {
+        padding: 6px 10px;
+        border: none;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--text-secondary, #a6adc8);
+        font-size: 14px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .refresh-btn:hover:not(:disabled) {
+        background: var(--surface-0, #313244);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .refresh-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
     `,
   ],
 })
-export class TimelineComponent {
+export class TimelineComponent implements OnInit {
   readonly time = inject(TimeService);
+  readonly audit = inject(AuditService);
 
   // Convert ms to seconds for display
   readonly currentTime = computed(() => Math.floor(this.time.currentOffsetMs() / 1000));
@@ -180,6 +250,15 @@ export class TimelineComponent {
 
   readonly formattedCurrentTime = computed(() => this.formatTime(this.currentTime()));
   readonly formattedDuration = computed(() => this.formatTime(this.duration()));
+
+  ngOnInit(): void {
+    this.audit.loadJobs();
+  }
+
+  onJobSelect(event: Event): void {
+    const value = (event.target as HTMLSelectElement).value;
+    this.audit.selectJob(value || null);
+  }
 
   togglePlay(): void {
     this.time.togglePlay();

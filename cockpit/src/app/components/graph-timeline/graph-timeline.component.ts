@@ -1,10 +1,8 @@
 import {
   Component,
-  OnInit,
   OnDestroy,
   inject,
   signal,
-  computed,
   effect,
   ElementRef,
   viewChild,
@@ -35,23 +33,11 @@ let cytoscape: any;
       <!-- Header with controls -->
       <div class="header">
         <div class="left-controls">
-          <select
-            class="job-selector"
-            [value]="audit.selectedJobId() || ''"
-            (change)="onJobSelect($event)"
-          >
-            <option value="">Select a job...</option>
-            @for (job of audit.jobs(); track job.id) {
-              <option [value]="job.id">
-                {{ job.id.slice(0, 8) }}... | {{ job.status }}
-              </option>
-            }
-          </select>
           <button
             class="btn"
             (click)="loadGraphChanges()"
             [disabled]="graph.loading() || !audit.selectedJobId()"
-            title="Load graph changes"
+            title="Load graph changes for selected job"
           >
             Load Graph
           </button>
@@ -177,8 +163,8 @@ let cytoscape: any;
       @if (!audit.selectedJobId() && !graph.loading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
-          <span>Select a job to visualize</span>
-          <span class="empty-hint">Graph operations will be shown here</span>
+          <span>Select a job from the timeline bar</span>
+          <span class="empty-hint">Then click "Load Graph" to visualize operations</span>
         </div>
       }
 
@@ -236,23 +222,6 @@ let cytoscape: any;
       display: flex;
       gap: 8px;
       align-items: center;
-    }
-
-    .job-selector {
-      padding: 6px 10px;
-      border: 1px solid var(--border-color, #45475a);
-      border-radius: 4px;
-      background: var(--panel-bg, #181825);
-      color: var(--text-primary, #cdd6f4);
-      font-size: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      cursor: pointer;
-      min-width: 180px;
-    }
-
-    .job-selector:focus {
-      outline: none;
-      border-color: var(--accent-color, #cba6f7);
     }
 
     .btn {
@@ -524,7 +493,7 @@ let cytoscape: any;
     }
   `],
 })
-export class GraphTimelineComponent implements OnInit, OnDestroy {
+export class GraphTimelineComponent implements OnDestroy {
   private readonly ngZone = inject(NgZone);
   private readonly destroyRef = inject(DestroyRef);
   readonly graph = inject(GraphService);
@@ -577,11 +546,6 @@ export class GraphTimelineComponent implements OnInit, OnDestroy {
         this.renderer.seekTo(index);
       }
     });
-  }
-
-  ngOnInit(): void {
-    // Load jobs list
-    this.audit.loadJobs();
   }
 
   ngOnDestroy(): void {
@@ -685,19 +649,6 @@ export class GraphTimelineComponent implements OnInit, OnDestroy {
 
     this.cy.on('tap', bgTapHandler);
     this.cyListeners.push(() => this.cy?.off('tap', bgTapHandler));
-  }
-
-  /**
-   * Handle job selection.
-   */
-  onJobSelect(event: Event): void {
-    const select = event.target as HTMLSelectElement;
-    const jobId = select.value || null;
-    this.audit.selectJob(jobId);
-
-    // Clear existing graph data
-    this.graph.clear();
-    this.cy?.elements().remove();
   }
 
   /**

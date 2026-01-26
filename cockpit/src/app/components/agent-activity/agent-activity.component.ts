@@ -20,33 +20,6 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
   standalone: true,
   template: `
     <div class="activity-container">
-      <!-- Header: Job Selector -->
-      <div class="header">
-        <select
-          class="job-selector"
-          [value]="audit.selectedJobId() || ''"
-          (change)="onJobSelect($event)"
-        >
-          <option value="">Select a job...</option>
-          @for (job of audit.jobs(); track job.id) {
-            <option [value]="job.id">
-              {{ job.id.slice(0, 8) }}... | {{ job.status }}
-              @if (job.audit_count !== null) {
-                ({{ job.audit_count }} steps)
-              }
-            </option>
-          }
-        </select>
-        <button
-          class="refresh-btn"
-          (click)="audit.refresh()"
-          [disabled]="audit.isLoading()"
-          title="Refresh"
-        >
-          &#x21bb;
-        </button>
-      </div>
-
       <!-- Filter Bar -->
       <div class="filter-bar">
         @for (filter of filters; track filter.value) {
@@ -88,8 +61,8 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
       @if (!audit.selectedJobId() && !audit.isLoading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
-          <span>Select a job to view activity</span>
-          <span class="empty-hint">Jobs are loaded from PostgreSQL, audit from MongoDB</span>
+          <span>Select a job from the timeline bar</span>
+          <span class="empty-hint">Use the job dropdown at the top to select a job</span>
         </div>
       }
 
@@ -359,54 +332,6 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         height: 100%;
         background: var(--panel-bg, #181825);
         position: relative;
-      }
-
-      /* Header */
-      .header {
-        display: flex;
-        gap: 8px;
-        padding: 8px;
-        background: var(--surface-0, #313244);
-        border-bottom: 1px solid var(--border-color, #313244);
-        flex-shrink: 0;
-      }
-
-      .job-selector {
-        flex: 1;
-        padding: 6px 10px;
-        border: 1px solid var(--border-color, #45475a);
-        border-radius: 4px;
-        background: var(--panel-bg, #181825);
-        color: var(--text-primary, #cdd6f4);
-        font-size: 12px;
-        font-family: 'JetBrains Mono', monospace;
-        cursor: pointer;
-      }
-
-      .job-selector:focus {
-        outline: none;
-        border-color: var(--accent-color, #cba6f7);
-      }
-
-      .refresh-btn {
-        padding: 6px 10px;
-        border: none;
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 14px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .refresh-btn:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .refresh-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
       }
 
       /* Filter Bar */
@@ -839,12 +764,6 @@ export class AgentActivityComponent implements OnInit {
 
   ngOnInit(): void {
     this.audit.loadJobs();
-  }
-
-  onJobSelect(event: Event): void {
-    const select = event.target as HTMLSelectElement;
-    const jobId = select.value || null;
-    this.audit.selectJob(jobId);
   }
 
   getStepColor(stepType: AuditStepType): string {

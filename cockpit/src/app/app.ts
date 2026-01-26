@@ -10,6 +10,7 @@ import { DbTableComponent } from './components/db-table/db-table.component';
 import { AgentActivityComponent } from './components/agent-activity/agent-activity.component';
 import { RequestViewerComponent } from './components/request-viewer/request-viewer.component';
 import { GraphTimelineComponent } from './components/graph-timeline/graph-timeline.component';
+import { TodoListComponent } from './components/todo-list/todo-list.component';
 
 @Component({
   selector: 'app-root',
@@ -94,6 +95,12 @@ export class App implements OnInit {
       type: 'graph-timeline',
       displayName: 'Graph Timeline',
       component: GraphTimelineComponent,
+    });
+
+    this.registry.register({
+      type: 'todo-list',
+      displayName: 'Todo List',
+      component: TodoListComponent,
     });
   }
 }

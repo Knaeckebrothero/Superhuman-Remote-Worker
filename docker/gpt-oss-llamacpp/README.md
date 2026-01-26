@@ -138,8 +138,29 @@ The container automatically translates vLLM model names to GGUF equivalents:
 |----------|---------|-------------|
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8000` | API port (same as vLLM for drop-in compatibility) |
-| `API_KEY` | (none) | Optional API key for authentication |
+| `API_KEY` | *(none)* | Optional API key for authentication (see below) |
 | `VERBOSE` | `false` | Enable verbose logging |
+
+### API Key Authentication
+
+When `API_KEY` is set, all requests must include the key in the `Authorization` header:
+
+```bash
+# Run with API key
+docker run --gpus all -p 8000:8000 \
+    -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
+    -e MODEL=openai/gpt-oss-120b \
+    -e API_KEY=your-secret-key \
+    gpt-oss-llamacpp:latest
+
+# Request with API key
+curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer your-secret-key" \
+    -d '{"model":"gpt-oss-120b","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+If `API_KEY` is not set, the server accepts unauthenticated requests.
 
 ### SSH Access (for RunPod/Cloud)
 
@@ -295,7 +316,7 @@ Update your `.env`:
 
 ```bash
 LLM_BASE_URL=http://localhost:8000/v1
-OPENAI_API_KEY=dummy  # or your API_KEY if set
+OPENAI_API_KEY=your-secret-key  # Must match API_KEY if set, or use "dummy" if no API key
 ```
 
 In agent config:
