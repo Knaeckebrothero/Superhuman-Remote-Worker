@@ -28,19 +28,21 @@ The key advantage is **GBNF grammar constraints**: instead of hoping the model p
 
 | GPU | VRAM | Compatible | Context Length | Est. tok/s | Notes |
 |-----|------|------------|----------------|------------|-------|
-| H200-141GB | 141GB | Yes | 128K | ~45 | Optimal, plenty headroom |
+| B200-192GB | 192GB | Yes | 128K+ | ~60+ | Cutting edge (CUDA 12.8+) |
+| H200-141GB | 141GB | Yes | 128K+ | ~45 | Optimal, plenty headroom |
 | H100-80GB | 80GB | Yes | 128K | ~35-40 | Recommended |
-| A100-80GB | 80GB | Yes | 128K | ~25-30 | Good performance |
+| A100-80GB | 80GB | Yes | 128K | ~25-30 | **Best cost/perf** (~$1.5/h) |
 | L40S-48GB | 48GB | Marginal | 32K | ~20 | Reduced context only |
 
-**Note:** Performance estimates are for single-stream decode. vLLM is generally 20-50% faster for the same configuration.
+**Note:** Performance estimates are for single-stream decode. vLLM is generally 20-50% faster for the same configuration. For agent workloads with sequential requests, A100 at ~$1.5/h offers the best value.
 
 ## Quick Start
 
 ### Use pre-built image (when available)
 
 ```bash
-# gpt-oss-120b on H100/A100 (128K context) - same env vars as vLLM
+# gpt-oss-120b on A100/H100 (128K context) - same env vars as vLLM
+# All optimizations (SWA_FULL, CACHE_REUSE, batch sizes) are baked into defaults
 docker run --gpus all -p 8000:8000 \
     -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
     -e MODEL=openai/gpt-oss-120b \
@@ -54,7 +56,7 @@ docker run --gpus all -p 8000:8000 \
 ```bash
 cd docker/gpt-oss-llamacpp
 
-# Build (compiles llama.cpp from source)
+# Build (compiles llama.cpp from source with CUDA 12.8)
 docker build -t gpt-oss-llamacpp:latest .
 
 # Run (same env vars as vLLM)
@@ -106,9 +108,10 @@ The container automatically translates vLLM model names to GGUF equivalents:
 |----------|---------|-------------|
 | `CACHE_TYPE_K` | `q8_0` | KV cache key quantization |
 | `CACHE_TYPE_V` | `q8_0` | KV cache value quantization |
-| `CACHE_REUSE` | `0` | Reuse KV cache between requests (0 = disabled, 1 = enabled) |
-| `BATCH_SIZE` | `2048` | Batch size for prompt processing |
-| `UBATCH_SIZE` | `512` | Micro-batch size for memory efficiency |
+| `CACHE_REUSE` | `256` | Reuse KV cache between requests (tokens to preserve) |
+| `SWA_FULL` | `true` | **CRITICAL**: Enable full sliding window attention (required for cache reuse) |
+| `BATCH_SIZE` | `4096` | Batch size for prompt processing (optimized for datacenter GPUs) |
+| `UBATCH_SIZE` | `4096` | Micro-batch size (optimized for MoE expert reuse) |
 
 **KV Cache Options:**
 - `f16`: Full precision (most memory, best quality)
@@ -120,9 +123,23 @@ The container automatically translates vLLM model names to GGUF equivalents:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FLASH_ATTN` | `true` | Enable Flash Attention for faster inference |
-| `MLOCK` | `false` | Lock model in RAM (prevents swapping) |
-| `NO_MMAP` | `false` | Disable memory mapping (use for AMD GPUs) |
+| `MLOCK` | `true` | Lock model in RAM (prevents swapping, recommended for datacenter) |
+| `NO_MMAP` | `true` | Disable memory mapping (recommended for datacenter workloads) |
 | `N_PARALLEL` | `1` | Number of parallel sequences (for batched inference) |
+| `THREADS` | `16` | CPU threads for inference |
+| `THREADS_BATCH` | `32` | CPU threads for prompt processing (can be higher) |
+
+### Multi-GPU Support
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPLIT_MODE` | *(none)* | GPU split mode: `row` for NVLink, `layer` for PCIe |
+| `TENSOR_SPLIT` | *(none)* | GPU memory split ratio, e.g., `1,1` for 2 GPUs equal |
+
+Example for 2x A100 with NVLink:
+```bash
+-e SPLIT_MODE=row -e TENSOR_SPLIT=1,1
+```
 
 ### Grammar/Tool Calling
 
@@ -186,40 +203,53 @@ The entrypoint automatically detects your GPU and logs the architecture:
 | A100 | Ampere | sm_80 | Standard CUDA, stable |
 | L40S | Ada | sm_89 | Good performance |
 | H100/H200 | Hopper | sm_90 | Optimal performance |
-| B100/B200 | Blackwell | sm_100 | Cutting edge |
+| B100/B200 | Blackwell | sm_120 | Cutting edge (requires CUDA 12.8+) |
 
 ## Critical Build Flags
 
 The Dockerfile includes critical flags that fix known issues:
 
 ```dockerfile
--DGGML_CUDA_FORCE_CUBLAS=OFF \  # Fixes gibberish output on Hopper
--DGGML_CUDA_F16=OFF \           # Prevents FP16 accumulation overflow
+-DGGML_CUDA_FORCE_CUBLAS=OFF \         # Fixes gibberish output on Hopper
+-DGGML_CUDA_F16=OFF \                  # Prevents FP16 accumulation overflow
+-DGGML_CUDA_ENABLE_UNIFIED_MEMORY=0 \  # Improves performance on datacenter GPUs
 ```
+
+The entrypoint also sets `GGML_CUDA_ENABLE_UNIFIED_MEMORY=0` at runtime.
 
 **Do not remove these flags** - they fix known bugs that cause incorrect output on certain GPU architectures.
 
 ## Deployment Examples
 
-### H100-80GB (128K context)
+### A100/H100-80GB (128K context, recommended)
 
 ```bash
+# Optimized defaults are baked in - minimal config needed
 docker run --gpus all -p 8000:8000 \
     -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
     -e MODEL=openai/gpt-oss-120b \
     -e MAX_MODEL_LEN=131072 \
-    -e FLASH_ATTN=true \
     -e SHOW_LOADING_PROGRESS=true \
     gpt-oss-llamacpp:latest
 ```
 
-### A100-80GB (128K context)
+The following are already set by default (no need to specify):
+- `SWA_FULL=true` (required for cache reuse)
+- `CACHE_REUSE=256` (KV cache reuse enabled)
+- `BATCH_SIZE=4096`, `UBATCH_SIZE=4096` (optimized for datacenter)
+- `MLOCK=true`, `NO_MMAP=true` (datacenter memory settings)
+
+### H200-141GB (extended context or parallel requests)
 
 ```bash
+# H200 has extra VRAM for larger context or more parallelism
 docker run --gpus all -p 8000:8000 \
     -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
     -e MODEL=openai/gpt-oss-120b \
-    -e MAX_MODEL_LEN=131072 \
+    -e MAX_MODEL_LEN=196608 \
+    -e N_PARALLEL=4 \
+    -e CACHE_TYPE_K=f16 \
+    -e CACHE_TYPE_V=f16 \
     -e SHOW_LOADING_PROGRESS=true \
     gpt-oss-llamacpp:latest
 ```
@@ -234,6 +264,19 @@ docker run --gpus all -p 8000:8000 \
     -e MAX_MODEL_LEN=32768 \
     -e CACHE_TYPE_K=q4_0 \
     -e CACHE_TYPE_V=q4_0 \
+    -e SHOW_LOADING_PROGRESS=true \
+    gpt-oss-llamacpp:latest
+```
+
+### Multi-GPU (2x A100 with NVLink)
+
+```bash
+docker run --gpus all -p 8000:8000 \
+    -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
+    -e MODEL=openai/gpt-oss-120b \
+    -e MAX_MODEL_LEN=131072 \
+    -e SPLIT_MODE=row \
+    -e TENSOR_SPLIT=1,1 \
     -e SHOW_LOADING_PROGRESS=true \
     gpt-oss-llamacpp:latest
 ```

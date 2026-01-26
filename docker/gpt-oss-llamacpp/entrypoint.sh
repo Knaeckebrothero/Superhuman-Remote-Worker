@@ -129,16 +129,32 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 # Memory management - Q8_0 KV cache recommended for quality/memory balance
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
-CACHE_REUSE="${CACHE_REUSE:-0}"  # Reuse KV cache between requests (0 = disabled)
+CACHE_REUSE="${CACHE_REUSE:-256}"  # Reuse KV cache between requests (works with --swa-full)
 
-# Batch settings
-BATCH_SIZE="${BATCH_SIZE:-2048}"
-UBATCH_SIZE="${UBATCH_SIZE:-512}"
+# Sliding Window Full - CRITICAL for long context stability with cache reuse
+# Without this flag, llama.cpp prints "cache_reuse is not supported" warning
+SWA_FULL="${SWA_FULL:-true}"
+
+# Batch settings - tuned for datacenter GPUs (A100/H100/H200)
+# Larger batches improve MoE expert reuse and throughput
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+UBATCH_SIZE="${UBATCH_SIZE:-4096}"
+
+# Thread settings
+THREADS="${THREADS:-16}"
+THREADS_BATCH="${THREADS_BATCH:-32}"  # Prefill can use more threads
+
+# Multi-GPU support
+SPLIT_MODE="${SPLIT_MODE:-}"       # "row" for NVLink, "layer" for PCIe
+TENSOR_SPLIT="${TENSOR_SPLIT:-}"   # e.g., "1,1" for 2 GPUs equal split
 
 # Performance flags
 FLASH_ATTN="${FLASH_ATTN:-true}"
-MLOCK="${MLOCK:-false}"
-NO_MMAP="${NO_MMAP:-false}"
+MLOCK="${MLOCK:-true}"             # Lock memory for datacenter stability
+NO_MMAP="${NO_MMAP:-true}"         # Avoid mmap for datacenter workloads
+
+# Disable unified memory at runtime (improves performance)
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=0
 
 # Grammar/Tool calling
 USE_GRAMMAR="${USE_GRAMMAR:-true}"
@@ -181,7 +197,8 @@ case "${GPU_ARCH}" in
 esac
 
 # Adjust context based on available memory
-if [ "${GPU_MEM_GB}" -lt 80 ]; then
+# Use 75GB threshold to handle integer division rounding (80GB GPUs may report as 79GB)
+if [ "${GPU_MEM_GB}" -lt 75 ]; then
     if [ "${CTX_SIZE}" -gt 65536 ]; then
         echo "Warning: GPU has ${GPU_MEM_GB}GB, reducing CTX_SIZE to 65536"
         CTX_SIZE=65536
@@ -216,6 +233,23 @@ fi
 # Batch settings
 CMD="${CMD} --batch-size ${BATCH_SIZE}"
 CMD="${CMD} --ubatch-size ${UBATCH_SIZE}"
+
+# Thread settings
+CMD="${CMD} --threads ${THREADS}"
+CMD="${CMD} --threads-batch ${THREADS_BATCH}"
+
+# Sliding Window Full (CRITICAL for cache reuse to work properly)
+if [ "${SWA_FULL}" = "true" ]; then
+    CMD="${CMD} --swa-full"
+fi
+
+# Multi-GPU support
+if [ -n "${SPLIT_MODE}" ]; then
+    CMD="${CMD} --split-mode ${SPLIT_MODE}"
+fi
+if [ -n "${TENSOR_SPLIT}" ]; then
+    CMD="${CMD} --tensor-split ${TENSOR_SPLIT}"
+fi
 
 # Performance flags
 if [ "${FLASH_ATTN}" = "true" ]; then
@@ -284,12 +318,21 @@ echo "Context size:       ${CTX_SIZE}"
 echo "GPU layers:         ${N_GPU_LAYERS}"
 echo "KV cache type:      K=${CACHE_TYPE_K}, V=${CACHE_TYPE_V}"
 echo "Cache reuse:        ${CACHE_REUSE}"
+echo "SWA full:           ${SWA_FULL}"
 echo "Batch size:         ${BATCH_SIZE}"
 echo "Micro-batch:        ${UBATCH_SIZE}"
+echo "Threads:            ${THREADS} (batch: ${THREADS_BATCH})"
+if [ -n "${SPLIT_MODE}" ]; then
+echo "Split mode:         ${SPLIT_MODE}"
+fi
+if [ -n "${TENSOR_SPLIT}" ]; then
+echo "Tensor split:       ${TENSOR_SPLIT}"
+fi
 echo ""
 echo "Flash attention:    ${FLASH_ATTN}"
 echo "Memory lock:        ${MLOCK}"
 echo "No mmap:            ${NO_MMAP}"
+echo "Unified memory:     disabled"
 echo "Grammar:            ${USE_GRAMMAR}"
 echo "Parallel requests:  ${N_PARALLEL}"
 echo ""

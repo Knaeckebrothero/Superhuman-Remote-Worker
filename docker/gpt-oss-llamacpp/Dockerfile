@@ -1,5 +1,5 @@
 # Optimized llama.cpp image for gpt-oss-120b GGUF model
-# Supports: A100-80GB, H100-80GB, H200, L40S
+# Supports: A100-80GB, H100-80GB, H200, L40S, B200 (CUDA 12.8+)
 #
 # Build: docker build -t gpt-oss-llamacpp:latest .
 # Run:   docker run --gpus all -p 8080:8080 gpt-oss-llamacpp:latest
@@ -20,7 +20,7 @@
 # ==============================================================================
 # Stage 1: Build llama.cpp from source
 # ==============================================================================
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -41,18 +41,18 @@ RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp.git
 WORKDIR /build/llama.cpp
 
 # Build with multi-architecture CUDA support and critical bug fixes
-# - CMAKE_CUDA_ARCHITECTURES: A100 (80), L40S (89), H100/H200 (90)
+# - CMAKE_CUDA_ARCHITECTURES: A100 (80), L40S (89), H100/H200 (90), Blackwell (120)
 # - GGML_CUDA_FORCE_CUBLAS=OFF: CRITICAL - Fixes gibberish on Hopper GPUs
 # - GGML_CUDA_F16=OFF: CRITICAL - Prevents FP16 overflow causing bad output
-# - LLAMA_CURL=ON: Enable HuggingFace model downloads via --hf flag
+# - GGML_CUDA_ENABLE_UNIFIED_MEMORY=0: Disable unified memory for better performance
 # - Link against CUDA stubs during build (actual runtime libs provided by host)
 ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
 RUN cmake -B build \
     -DGGML_CUDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="80;89;90" \
+    -DCMAKE_CUDA_ARCHITECTURES="80;89;90;120" \
     -DGGML_CUDA_FORCE_CUBLAS=OFF \
     -DGGML_CUDA_F16=OFF \
-    -DLLAMA_CURL=ON \
+    -DGGML_CUDA_ENABLE_UNIFIED_MEMORY=0 \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=OFF \
     && cmake --build build --config Release -j$(nproc)
@@ -60,7 +60,7 @@ RUN cmake -B build \
 # ==============================================================================
 # Stage 2: Runtime image
 # ==============================================================================
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
