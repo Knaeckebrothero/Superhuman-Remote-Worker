@@ -5,6 +5,7 @@ import { TableInfo, TableDataResponse, ColumnDef } from '../models/api.model';
 import { JobSummary, AuditResponse, AuditFilterCategory } from '../models/audit.model';
 import { LLMRequest } from '../models/request.model';
 import { GraphChangeResponse } from '../models/graph.model';
+import { ChatHistoryResponse } from '../models/chat.model';
 
 /**
  * HTTP client service for the cockpit API.
@@ -156,6 +157,36 @@ export class ApiService {
         catchError((error) => {
           console.error(`Failed to fetch audit time range for job ${jobId}:`, error);
           return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Get paginated chat history for a job from MongoDB.
+   * Returns a clean sequential view of conversation turns.
+   */
+  getChatHistory(
+    jobId: string,
+    page: number = 1,
+    pageSize: number = 50,
+  ): Observable<ChatHistoryResponse> {
+    const params = new HttpParams()
+      .set('page', page.toString())
+      .set('pageSize', pageSize.toString());
+
+    return this.http
+      .get<ChatHistoryResponse>(`${this.baseUrl}/jobs/${jobId}/chat`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch chat history for job ${jobId}:`, error);
+          return of({
+            entries: [],
+            total: 0,
+            page: 1,
+            pageSize: 50,
+            hasMore: false,
+            error: error.message || 'Failed to fetch chat history',
+          });
         }),
       );
   }

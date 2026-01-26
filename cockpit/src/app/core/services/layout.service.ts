@@ -53,6 +53,7 @@ export class LayoutService {
     'three-column',
     'left-right-stack',
     'grid-2x2',
+    'chat-focused',
   ];
 
   constructor() {

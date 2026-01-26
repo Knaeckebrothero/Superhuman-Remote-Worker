@@ -1,0 +1,15 @@
+{
+  "id": "chat-focused",
+  "name": "Chat Focused",
+  "description": "Chat history with agent activity and request viewer",
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [30, 40, 30],
+    "children": [
+      { "type": "component", "component": "request-viewer" },
+      { "type": "component", "component": "agent-chat" },
+      { "type": "component", "component": "agent-activity" }
+    ]
+  }
+}

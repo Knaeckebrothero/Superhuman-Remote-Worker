@@ -389,6 +389,8 @@ def create_execute_node(
                         latency_ms=latency_ms,
                         iteration=iteration,
                         metadata=state.get("metadata"),
+                        phase=phase_str,
+                        phase_number=phase_number,
                     )
 
                     # Build tool calls preview
@@ -966,30 +968,52 @@ def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "execut
     return "init_workspace"
 
 
-def route_after_transition(
-    state: UniversalAgentState,
-) -> Literal["execute", "check_goal"]:
-    """Route after phase transition based on success/failure.
+def create_route_after_transition(
+    workspace: WorkspaceManager,
+) -> Callable[[UniversalAgentState], Literal["execute", "check_goal"]]:
+    """Create route_after_transition with workspace access for frozen job detection.
 
-    If transition was rejected (messages contain error), go back to execute
-    so the agent can fix the issue. If transition succeeded (messages cleared),
-    proceed to check_goal.
+    Args:
+        workspace: WorkspaceManager for checking job_frozen.json
+
+    Returns:
+        Routing function that checks for frozen jobs before routing
     """
-    messages = state.get("messages", [])
 
-    # If messages is empty, transition succeeded and cleared history
-    if not messages:
+    def route_after_transition(
+        state: UniversalAgentState,
+    ) -> Literal["execute", "check_goal"]:
+        """Route after phase transition based on success/failure.
+
+        IMPORTANT: If job is frozen (job_complete was called), always go to
+        check_goal so the frozen state can be detected and the graph can stop.
+
+        If transition was rejected (messages contain error), go back to execute
+        so the agent can fix the issue. If transition succeeded (messages cleared),
+        proceed to check_goal.
+        """
+        # Check if job is frozen - must go to check_goal to detect and stop
+        job_frozen_path = workspace.get_path("output/job_frozen.json")
+        if job_frozen_path.exists():
+            return "check_goal"
+
+        messages = state.get("messages", [])
+
+        # If messages is empty, transition succeeded and cleared history
+        if not messages:
+            return "check_goal"
+
+        # If messages exist, check if it's a rejection error
+        if messages:
+            last_msg = messages[-1]
+            content = getattr(last_msg, "content", "") or ""
+            if "[TRANSITION_REJECTED]" in content:
+                return "execute"
+
+        # Default: proceed to goal check
         return "check_goal"
 
-    # If messages exist, check if it's a rejection error
-    if messages:
-        last_msg = messages[-1]
-        content = getattr(last_msg, "content", "") or ""
-        if "[TRANSITION_REJECTED]" in content:
-            return "execute"
-
-    # Default: proceed to goal check
-    return "check_goal"
+    return route_after_transition
 
 
 # =============================================================================
@@ -1224,13 +1248,16 @@ def build_phase_alternation_graph(
     )
 
     # Wire phase transition
+    # Create routing function with workspace access for frozen job detection
+    route_after_transition_fn = create_route_after_transition(workspace)
+
     workflow.add_edge("archive_phase", "handle_transition")
     workflow.add_conditional_edges(
         "handle_transition",
-        route_after_transition,
+        route_after_transition_fn,
         {
             "execute": "execute",  # Transition rejected, agent fixes issue
-            "check_goal": "check_goal",  # Transition succeeded
+            "check_goal": "check_goal",  # Transition succeeded or job frozen
         },
     )
 

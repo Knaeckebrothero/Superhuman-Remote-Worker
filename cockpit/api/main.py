@@ -259,6 +259,42 @@ async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/jobs/{job_id}/chat")
+async def get_job_chat_history(
+    job_id: str,
+    page: int = Query(default=1, ge=-1),
+    page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
+) -> dict[str, Any]:
+    """Get paginated chat history for a job.
+
+    Returns a clean sequential view of conversation turns without duplicates.
+    Each entry contains the input message(s) that triggered an LLM response
+    and the response itself.
+
+    Query params:
+        page: Page number (1-indexed). Use -1 to request the last page.
+        pageSize: Number of entries per page (max 200)
+    """
+    if not mongodb_service.is_available:
+        return {
+            "entries": [],
+            "total": 0,
+            "page": page,
+            "pageSize": page_size,
+            "hasMore": False,
+            "error": "MongoDB not available",
+        }
+
+    try:
+        return await mongodb_service.get_chat_history(
+            job_id=job_id,
+            page=page,
+            page_size=page_size,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 # =============================================================================
 # Workspace / Todo Endpoints
 # =============================================================================
