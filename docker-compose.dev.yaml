@@ -117,6 +117,18 @@ services:
       timeout: 5s
       retries: 5
 
+  cockpit-mcp:
+    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit-mcp:${COCKPIT_IMAGE_TAG:-latest}
+    container_name: graphrag-cockpit-mcp-dev
+    environment:
+      COCKPIT_API_URL: http://cockpit-api:8085
+    depends_on:
+      cockpit-api:
+        condition: service_healthy
+    # For stdio transport: keep container alive with stdin open
+    stdin_open: true
+    tty: true
+
 volumes:
   postgres_dev_data:
     name: graphrag_postgres_dev_data

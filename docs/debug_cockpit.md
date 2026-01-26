@@ -6,7 +6,7 @@ A flexible, composable Angular dashboard framework for debugging and visualizing
 
 ## Current Status
 
-**Phase 5 Complete** - All MVP components implemented. Graph timeline visualization and todo viewer added.
+**Phase 5 Complete** - All MVP components implemented. Graph timeline, todo viewer, and chat history added.
 
 Run the app:
 ```bash
@@ -76,6 +76,15 @@ Current features:
   - Expandable notes and failure reasons
   - Phase metadata display (timestamps, summary)
   - Auto-loads when job is selected
+- **Chat History Viewer** (ChatHistoryComponent):
+  - Clean sequential view of conversation turns (input → response)
+  - Shows only the delta per LLM call (no duplicates)
+  - Messenger-style UI with phase badges and latency
+  - Collapsible reasoning sections (for models with reasoning tokens)
+  - Tool call badges with truncated arguments
+  - Clickable request_id to load full request in Request Viewer
+  - Pagination support
+  - Auto-syncs with selected job
 
 ## Data Architecture
 
@@ -87,7 +96,7 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │  ┌─────────────────────────────────────────────────┐    │
 │  │              Visual Components                   │    │
 │  │  (RequestViewer, AgentActivity, DbTable,        │    │
-│  │   GraphTimeline, TodoList)                      │    │
+│  │   GraphTimeline, TodoList, ChatHistory)         │    │
 │  └──────────────────────┬──────────────────────────┘    │
 │                         │ subscribe to signals           │
 │  ┌──────────────────────▼──────────────────────────┐    │
@@ -98,12 +107,14 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │  │  - TimeService: timeline synchronization         │    │
 │  │  - GraphService: graph timeline state            │    │
 │  │  - TodoService: todo list state                  │    │
+│  │  - ChatService: chat history state               │    │
 │  └──────────────────────┬──────────────────────────┘    │
 │                         │ HTTP calls                     │
 │  ┌──────────────────────▼──────────────────────────┐    │
 │  │              ApiService                          │    │
 │  │  - getJobs(): Observable<Job[]>                  │    │
 │  │  - getJobAudit(jobId, page, filter)             │    │
+│  │  - getChatHistory(jobId, page, pageSize)        │    │
 │  │  - getRequest(docId): Observable<LLMRequest>    │    │
 │  │  - getAuditTimeRange(jobId)                     │    │
 │  │  - getGraphChanges(jobId)                       │    │
@@ -118,6 +129,7 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │  GET  /api/jobs/{id}                → PostgreSQL         │
 │  GET  /api/jobs/{id}/audit          → MongoDB            │
 │  GET  /api/jobs/{id}/audit/timerange → MongoDB           │
+│  GET  /api/jobs/{id}/chat           → MongoDB            │
 │  GET  /api/requests/{doc_id}        → MongoDB            │
 │  GET  /api/graph/changes/{job_id}   → MongoDB            │
 │  GET  /api/jobs/{id}/todos          → Filesystem         │
@@ -155,7 +167,8 @@ cockpit/src/app/
 │   │   ├── audit.model.ts            # AuditEntry, AuditResponse, JobSummary ✅
 │   │   ├── request.model.ts          # LLMRequest, LLMMessage, LLMToolCall ✅
 │   │   ├── graph.model.ts            # GraphChanges, GraphDelta, GraphSnapshot ✅
-│   │   └── todo.model.ts             # TodoItem, CurrentTodos, JobTodos ✅
+│   │   ├── todo.model.ts             # TodoItem, CurrentTodos, JobTodos ✅
+│   │   └── chat.model.ts             # ChatEntry, ChatInput, ChatResponse ✅
 │   └── services/
 │       ├── layout.service.ts         # Layout state, split/close, presets ✅
 │       ├── component-registry.service.ts  # Component registration ✅
@@ -165,7 +178,8 @@ cockpit/src/app/
 │       ├── request.service.ts        # Signals state for request-viewer ✅
 │       ├── time.service.ts           # Global time synchronization ✅
 │       ├── graph.service.ts          # Graph timeline state ✅
-│       └── todo.service.ts           # Todo list state ✅
+│       ├── todo.service.ts           # Todo list state ✅
+│       └── chat.service.ts           # Chat history state ✅
 ├── layout/
 │   ├── split-panel/
 │   │   └── split-panel.component.ts  # Recursive split renderer ✅
@@ -190,6 +204,8 @@ cockpit/src/app/
 │   │   └── timeline-renderer.ts      # Snapshot/delta rendering logic ✅
 │   ├── todo-list/
 │   │   └── todo-list.component.ts    # Todo list viewer ✅
+│   ├── chat-history/
+│   │   └── chat-history.component.ts # Chat history viewer ✅
 │   └── placeholders/
 │       ├── placeholder-a.component.ts  # "Workspace" placeholder
 │       ├── placeholder-b.component.ts  # "Agent Chat" placeholder
@@ -207,7 +223,8 @@ cockpit/src/
         ├── two-row.json              # 50/50 horizontal split
         ├── three-column.json         # Default 25/50/25 layout
         ├── left-right-stack.json     # Left + stacked right
-        └── grid-2x2.json             # 2x2 grid layout
+        ├── grid-2x2.json             # 2x2 grid layout
+        └── chat-focused.json         # Chat history focused layout
 ```
 
 ### FastAPI Backend (Implemented)
@@ -237,6 +254,7 @@ cockpit/api/
 | `/api/jobs/{id}` | GET | PostgreSQL + MongoDB | Single job details |
 | `/api/jobs/{id}/audit` | GET | MongoDB | Paginated audit entries (filter: all/messages/tools/errors) |
 | `/api/jobs/{id}/audit/timerange` | GET | MongoDB | First/last timestamps for job |
+| `/api/jobs/{id}/chat` | GET | MongoDB | Paginated chat history (clean conversation view) |
 | `/api/requests/{doc_id}` | GET | MongoDB | Single LLM request document |
 | `/api/graph/changes/{job_id}` | GET | MongoDB | Parsed Cypher operations with snapshots/deltas |
 | `/api/jobs/{job_id}/todos` | GET | Filesystem | All todos (current + archives) |
@@ -343,9 +361,10 @@ type ComponentType =
   | 'request-viewer'   // LLM request/response viewer ✅
   | 'graph-timeline'   // Neo4j graph visualization ✅
   | 'todo-list'        // Todo list viewer ✅
+  | 'agent-chat'       // Chat history viewer ✅
   | 'placeholder-a'    // Workspace (placeholder)
-  | 'placeholder-b'    // Agent Chat (placeholder)
-  | 'placeholder-c'    // Database (placeholder)
+  | 'placeholder-b'    // Placeholder
+  | 'placeholder-c'    // Placeholder
   | 'workspace'        // File tree + file viewer (planned)
   | 'metrics'          // Token usage, latency stats (planned)
   | 'logs'             // Raw log viewer (planned)
@@ -376,6 +395,7 @@ type ComponentType =
 | `request-viewer` | LLM request/response conversation viewer | MongoDB `llm_requests` | ✅ |
 | `graph-timeline` | Neo4j graph visualization with timeline | MongoDB (Cypher parsing) | ✅ |
 | `todo-list` | Todo list viewer (current + archived) | Filesystem `todos.yaml` | ✅ |
+| `agent-chat` | Clean chat history (input → response turns) | MongoDB `chat_history` | ✅ |
 | `workspace` | File tree + content viewer | Filesystem API | ⬜ Planned |
 | `metrics` | Token usage, latency, cost stats | MongoDB `agent_audit` | ⬜ Planned |
 | `logs` | Raw log file viewer | Filesystem `workspace/logs/` | ⬜ Planned |
@@ -387,6 +407,7 @@ type ComponentType =
 |--------|------------------|---------|
 | MongoDB | `agent_audit` | Audit trail: LLM calls, tool executions, phase transitions |
 | MongoDB | `llm_requests` | Full LLM request/response conversations with messages |
+| MongoDB | `chat_history` | Clean conversation view: input → response turns (no duplicates) |
 | PostgreSQL | `jobs` | Job metadata (id, status, config, timestamps) |
 | PostgreSQL | `requirements` | Extracted/validated requirements |
 | Filesystem | `workspace/job_<id>/` | workspace.md, todos.yaml, plan.md, analysis/* |
@@ -425,6 +446,7 @@ type ComponentType =
 | `TimeService` | ✅ | Global time synchronization (start/end times, current offset, playhead) |
 | `GraphService` | ✅ | Graph timeline state (deltas, snapshots, current index) |
 | `TodoService` | ✅ | Todo list state (current todos, archives, selected phase) |
+| `ChatService` | ✅ | Chat history state (entries, pagination) |
 
 ### Pluggable Panel Components
 
@@ -435,8 +457,9 @@ type ComponentType =
 | `RequestViewerComponent` | ✅ | LLM request/response viewer with messenger-style messages |
 | `GraphTimelineComponent` | ✅ | Cytoscape graph visualization with timeline scrubbing |
 | `TodoListComponent` | ✅ | Todo list viewer with phase selection |
+| `ChatHistoryComponent` | ✅ | Clean chat history viewer (input → response turns) |
 | `PlaceholderAComponent` | Placeholder | Will become WorkspaceComponent |
-| `PlaceholderBComponent` | Placeholder | Will become AgentChatComponent |
+| `PlaceholderBComponent` | Placeholder | Future use |
 | `PlaceholderCComponent` | Placeholder | Future use |
 | `WorkspaceComponent` | ⬜ Planned | File tree + file viewer |
 | `MetricsComponent` | ⬜ Planned | Token usage, latency charts |
@@ -492,6 +515,7 @@ type ComponentType =
 - [x] `DbTableComponent` - PostgreSQL table browser with pagination
 - [x] `GraphTimelineComponent` - Cytoscape graph visualization with timeline
 - [x] `TodoListComponent` - Todo list viewer with phase selection
+- [x] `ChatHistoryComponent` - clean conversation view (input → response turns)
 
 ### Phase 6: Panel Components (Extended)
 - [ ] `WorkspaceComponent` - file tree + viewer
@@ -646,6 +670,62 @@ interface LLMMessage {
 }
 ```
 
+## MongoDB chat_history Schema
+
+The `chat_history` collection provides a clean sequential view of conversations without duplicates. Each entry represents one conversation turn (input → response).
+
+```typescript
+interface ChatEntry {
+  _id: ObjectId;
+  job_id: string;
+  agent_type: string;           // "creator", "validator"
+  sequence_number: number;      // Per-job ordering
+  timestamp: Date;
+  iteration?: number;
+  phase?: string;               // "strategic" | "tactical"
+  phase_number?: number;
+  model: string;
+  latency_ms?: number;
+
+  // New input(s) that triggered this response
+  inputs: Array<{
+    type: 'human' | 'tool';
+    content: string;
+    content_preview: string;    // First 500 chars
+    tool_call_id?: string;      // For tool results
+    tool_name?: string;
+  }>;
+
+  // LLM response
+  response: {
+    content: string;
+    content_preview: string;    // First 500 chars
+    tool_calls?: Array<{
+      id: string;
+      name: string;
+      args_preview: string;     // Truncated args
+    }>;
+    has_tool_calls: boolean;
+  };
+
+  // Reasoning (for models that support it)
+  reasoning?: {
+    content: string;
+    content_preview: string;
+  };
+
+  // Link to full request
+  request_id: string;           // ObjectId of llm_requests doc
+}
+```
+
+The `chat_history` collection is populated automatically by the `LLMArchiver` when archiving LLM requests. It extracts only the **delta** per call:
+- Input messages after the last AIMessage (new messages that triggered this response)
+- The LLM response (content + tool calls)
+- Reasoning content (if the model provides it)
+
+This enables following a conversation without seeing repeated messages or dealing with context compaction artifacts.
+
 ### Linking Audit Entries to Requests
 
 The `llm_response` audit entries include a `request_id` field that links to the `llm_requests` collection:
@@ -690,6 +770,7 @@ Presets are loaded from JSON files in `cockpit/src/assets/layout-presets/`. User
 | `three-column` | Default 25/50/25 layout |
 | `left-right-stack` | Left panel + two stacked on right |
 | `grid-2x2` | Four equal panels in a 2x2 grid |
+| `chat-focused` | Chat history with request viewer and agent activity |
 
 ### `three-column` (Default)
 ```
@@ -734,6 +815,18 @@ Presets are loaded from JSON files in `cockpit/src/assets/layout-presets/`. User
 ├───────────────────┼────────────────────┤
 │     DB Table      │  Agent Activity    │
 ├───────────────────┴────────────────────┤
+│              Timeline                  │
+└────────────────────────────────────────┘
+```
+
+### `chat-focused`
+```
+┌──────────┬─────────────────┬──────────┐
+│          │                 │          │
+│ Request  │  Chat History   │  Agent   │
+│ Viewer   │      40%        │ Activity │
+│   30%    │                 │   30%    │
+├──────────┴─────────────────┴──────────┤
 │              Timeline                  │
 └────────────────────────────────────────┘
 ```

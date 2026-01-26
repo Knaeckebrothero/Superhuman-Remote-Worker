@@ -23,7 +23,7 @@ from src.graph import (
     route_entry,
     route_after_execute,
     route_after_check_todos,
-    route_after_transition,
+    create_route_after_transition,
     create_init_workspace_node,
     create_init_strategic_todos_node,
     create_check_todos_node,
@@ -358,14 +358,16 @@ class TestCheckGoalNode:
 class TestRouteAfterTransition:
     """Tests for route_after_transition routing function."""
 
-    def test_route_after_transition_success_empty_messages(self):
+    def test_route_after_transition_success_empty_messages(self, workspace_manager):
         """Test routing when transition succeeded (messages cleared)."""
+        route_after_transition = create_route_after_transition(workspace_manager)
         state = {"messages": []}
         result = route_after_transition(state)
         assert result == "check_goal"
 
-    def test_route_after_transition_rejected(self):
+    def test_route_after_transition_rejected(self, workspace_manager):
         """Test routing when transition was rejected."""
+        route_after_transition = create_route_after_transition(workspace_manager)
         from langchain_core.messages import ToolMessage
         error_msg = ToolMessage(
             content="[TRANSITION_REJECTED] todos.yaml validation failed",
@@ -375,13 +377,39 @@ class TestRouteAfterTransition:
         result = route_after_transition(state)
         assert result == "execute"
 
-    def test_route_after_transition_other_messages(self):
+    def test_route_after_transition_other_messages(self, workspace_manager):
         """Test routing with other types of messages."""
+        route_after_transition = create_route_after_transition(workspace_manager)
         from langchain_core.messages import HumanMessage
         state = {"messages": [HumanMessage(content="Some message")]}
         result = route_after_transition(state)
         # Other messages go to check_goal
         assert result == "check_goal"
+
+    def test_route_after_transition_job_frozen(self, workspace_manager):
+        """Test routing when job is frozen (job_complete was called).
+
+        When job_frozen.json exists, should always route to check_goal
+        even if transition was rejected (no todos staged).
+        """
+        route_after_transition = create_route_after_transition(workspace_manager)
+
+        # Create job_frozen.json to simulate job_complete having been called
+        import json
+        workspace_manager.write_file(
+            "output/job_frozen.json",
+            json.dumps({"status": "frozen", "summary": "Test"})
+        )
+
+        # Even with rejection message, should route to check_goal
+        from langchain_core.messages import ToolMessage
+        error_msg = ToolMessage(
+            content="[TRANSITION_REJECTED] No todos staged",
+            tool_call_id="phase_transition",
+        )
+        state = {"messages": [error_msg]}
+        result = route_after_transition(state)
+        assert result == "check_goal"  # NOT execute, because job is frozen
 
 
 class TestInitStrategicTodosNode:
@@ -763,6 +791,9 @@ todos:
             managers["workspace"], managers["todo"], mock_config,
             min_todos=5, max_todos=20
         )
+
+        # Create the routing function with workspace access
+        route_after_transition = create_route_after_transition(managers["workspace"])
 
         # First attempt: no todos.yaml
         state = {
