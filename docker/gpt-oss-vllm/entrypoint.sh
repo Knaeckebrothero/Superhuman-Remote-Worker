@@ -181,7 +181,12 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 # Safe to enable on v0.10.2, but test thoroughly before production use
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-false}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
-ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-true}"
+# IMPORTANT: Chunked prefill is INCOMPATIBLE with prefix caching
+# See vLLM Issue #14069 - causes "State-Cache Impedance Mismatch"
+# When both are enabled, chunked prefill breaks cache token alignment,
+# causing cache misses and degraded performance. Disable chunked prefill
+# when using prefix caching (which we do for agent workloads).
+ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-false}"
 
 # Tool calling - REQUIRED for gpt-oss harmony format
 ENABLE_AUTO_TOOL_CHOICE="${ENABLE_AUTO_TOOL_CHOICE:-true}"
@@ -265,8 +270,11 @@ CMD="${CMD} $@"
 # Print configuration and start
 # =============================================================================
 
+# Get vLLM version dynamically
+VLLM_VERSION=$(python3 -c "import vllm; print(vllm.__version__)" 2>/dev/null || echo "unknown")
+
 echo "=============================================="
-echo "  gpt-oss-vllm (vLLM v0.10.2)"
+echo "  gpt-oss-vllm (vLLM ${VLLM_VERSION})"
 echo "=============================================="
 echo ""
 echo "GPU Architecture:   ${GPU_ARCH}"

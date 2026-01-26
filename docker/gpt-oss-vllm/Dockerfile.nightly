@@ -1,0 +1,38 @@
+# vLLM v0.10.2 for gpt-oss models (recommended stable version)
+# Based on research.md findings - v0.10.2 is most stable for gpt-oss
+#
+# Build: docker build -f Dockerfile.nightly -t gpt-oss-vllm:stable .
+# Run:   docker run --gpus all -p 8000:8000 --ipc=host gpt-oss-vllm:stable
+#
+# Note: v0.11.0 has critical tool calling bugs (#26480), v0.10.2 recommended
+
+FROM vllm/vllm-openai:v0.10.2
+
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install SSH server for tunnel access (RunPod)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config \
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config \
+    && echo 'PermitEmptyPasswords no' >> /etc/ssh/sshd_config
+
+# Install harmony format support (REQUIRED for gpt-oss tool calling)
+RUN pip install --no-cache-dir openai-harmony==0.0.8
+
+WORKDIR /app
+
+# Copy entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000 22
+
+ENTRYPOINT ["/app/entrypoint.sh"]

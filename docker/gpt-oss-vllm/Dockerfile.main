@@ -1,0 +1,82 @@
+# vLLM built from main branch for gpt-oss models
+# Use this to get latest fixes (stale cache, harmony format, tool calling)
+#
+# Build: docker build -f Dockerfile.main -t gpt-oss-vllm:main .
+# Run:   docker run --gpus all -p 8000:8000 --ipc=host gpt-oss-vllm:main
+#
+# NOTE: Building from source takes 30-60 minutes. Use Dockerfile.nightly for pre-built wheels.
+# WARNING: Main branch may be unstable. Test thoroughly before production use.
+
+# CUDA 12.8 required for gpt-oss MXFP4 triton_kernels
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# Install build and runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    git \
+    wget \
+    curl \
+    build-essential \
+    cmake \
+    ninja-build \
+    ccache \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd \
+    && echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config \
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config \
+    && echo 'PermitEmptyPasswords no' >> /etc/ssh/sshd_config
+
+# Set Python 3.12 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Upgrade pip and install uv
+RUN python3 -m pip install --upgrade pip setuptools wheel uv
+
+# Set CUDA architecture targets for gpt-oss supported GPUs
+# A100 (sm_80), L40S (sm_89), H100/H200 (sm_90)
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0+PTX"
+ENV MAX_JOBS=8
+ENV VLLM_USE_TRITON_FLASH_ATTN=1
+
+WORKDIR /build
+
+# Install PyTorch for CUDA 12.8 first (required for vLLM build)
+RUN uv pip install --system --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# Clone vLLM from main branch
+RUN git clone --depth 1 https://github.com/vllm-project/vllm.git
+
+# Build and install vLLM (triton_kernels fetched automatically via CMake)
+WORKDIR /build/vllm
+RUN pip install -e ".[all]" --verbose
+
+WORKDIR /app
+
+# Install harmony format support (REQUIRED for gpt-oss tool calling)
+RUN pip install --no-cache-dir openai-harmony==0.0.8
+
+# Verify installation
+RUN python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')" \
+    && python3 -c "from triton_kernels import matmul_ogs; print('triton_kernels.matmul_ogs installed')" \
+    && python3 -c "import openai_harmony; print('openai-harmony installed')"
+
+# Copy entrypoint script
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+EXPOSE 8000 22
+
+ENTRYPOINT ["/app/entrypoint.sh"]

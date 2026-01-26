@@ -118,6 +118,7 @@ class CitationEngine:
         self.llm_url = os.getenv("CITATION_LLM_URL")
         self.llm_model = os.getenv("CITATION_LLM_MODEL", "gpt-4o-mini")
         self.llm_api_key = os.getenv("OPENAI_API_KEY", "")
+        self.reasoning_level = os.getenv("CITATION_REASONING_LEVEL", "high")
 
         # Reasoning requirement configuration
         reasoning_config = os.getenv("CITATION_REASONING_REQUIRED", "low")
@@ -1284,6 +1285,9 @@ class CitationEngine:
             kwargs = {
                 "model": self.llm_model,
                 "temperature": 0.0,  # Deterministic verification
+                "timeout": 600,  # 10 minutes - prevent infinite hangs
+                "max_retries": 3,  # Retry on transient failures
+                "max_tokens": 65536,  # 64K max response tokens
             }
 
             if self.llm_url:
