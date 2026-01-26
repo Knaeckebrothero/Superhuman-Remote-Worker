@@ -135,7 +135,9 @@ class CitationEngine:
         self._llm_client = None
 
         log.info(
-            f"CitationEngine initialized: mode={mode}, reasoning_required={self.reasoning_required}"
+            f"CitationEngine initialized: mode={mode}, "
+            f"reasoning_required={self.reasoning_required}, "
+            f"reasoning_level={self.reasoning_level}"
         )
 
     def __enter__(self):
@@ -1281,6 +1283,11 @@ class CitationEngine:
         try:
             from langchain_openai import ChatOpenAI
 
+            # Build model_kwargs for reasoning
+            model_kwargs = {}
+            if self.reasoning_level and self.reasoning_level != "none":
+                model_kwargs["reasoning_effort"] = self.reasoning_level
+
             # Build kwargs for ChatOpenAI
             kwargs = {
                 "model": self.llm_model,
@@ -1289,6 +1296,10 @@ class CitationEngine:
                 "max_retries": 3,  # Retry on transient failures
                 "max_tokens": 65536,  # 64K max response tokens
             }
+
+            # Add model_kwargs if non-empty
+            if model_kwargs:
+                kwargs["model_kwargs"] = model_kwargs
 
             if self.llm_url:
                 kwargs["base_url"] = self.llm_url
@@ -1382,7 +1393,9 @@ class CitationEngine:
 
     def _get_verification_system_prompt(self) -> str:
         """Return the system prompt for the verification LLM."""
-        return """You are a citation verification assistant. Your job is to verify that:
+        return f"""Reasoning: {self.reasoning_level}
+
+You are a citation verification assistant. Your job is to verify that:
 1. The quoted text (or similar text) exists in the provided source content
 2. The quoted text actually supports the claim being made
 
