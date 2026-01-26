@@ -1,10 +1,10 @@
 """FastAPI backend for the Debug Cockpit.
 
 Run with:
-    uvicorn cockpit.api.main:app --reload --port 8080
+    uvicorn cockpit.api.main:app --reload --port 8085
 
 Or from cockpit/api directory:
-    uvicorn main:app --reload --port 8080
+    uvicorn main:app --reload --port 8085
 """
 
 import json

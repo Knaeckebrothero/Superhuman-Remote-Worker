@@ -50,7 +50,7 @@ import { ColumnDef } from '../../core/models/api.model';
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C2;</span>
           <span>No data in {{ state.selectedTable() }}</span>
-          <span class="empty-hint">Start the backend: uvicorn main:app --port 8080</span>
+          <span class="empty-hint">Start the backend: uvicorn main:app --port 8085</span>
         </div>
       }
 
