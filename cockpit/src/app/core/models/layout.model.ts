@@ -19,7 +19,8 @@ export type ComponentType =
   | 'job-selector'
   | 'metrics'
   | 'logs'
-  | 'json-viewer';
+  | 'json-viewer'
+  | 'todo-list';
 
 /**
  * Layout configuration for the tiling system.

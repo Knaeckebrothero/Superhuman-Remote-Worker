@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 
 from services.mongodb import FilterCategory, mongodb_service
 from services.postgres import ALLOWED_TABLES, postgres_service
+from services.workspace import workspace_service
 from graph_routes import router as graph_router
 
 
@@ -256,3 +257,68 @@ async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
         return await mongodb_service.get_audit_time_range(job_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Workspace / Todo Endpoints
+# =============================================================================
+
+
+@app.get("/api/jobs/{job_id}/todos")
+async def get_job_todos(job_id: str) -> dict[str, Any]:
+    """Get all todos for a job (current + archives).
+
+    Returns:
+        Dict with:
+        - job_id: Job UUID
+        - current: Current todos from todos.yaml (if exists)
+        - archives: List of archived todo files
+        - has_workspace: Whether workspace directory exists
+    """
+    return workspace_service.get_all_todos(job_id)
+
+
+@app.get("/api/jobs/{job_id}/todos/current")
+async def get_current_todos(job_id: str) -> dict[str, Any]:
+    """Get current active todos from todos.yaml.
+
+    Returns:
+        Dict with todos list and metadata, or 404 if not found
+    """
+    result = workspace_service.get_current_todos(job_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No current todos found for job '{job_id}'"
+        )
+    return result
+
+
+@app.get("/api/jobs/{job_id}/todos/archives")
+async def list_todo_archives(job_id: str) -> list[dict[str, Any]]:
+    """List all archived todo files for a job.
+
+    Returns:
+        List of archive metadata (filename, phase_name, timestamp)
+    """
+    return workspace_service.list_archived_todos(job_id)
+
+
+@app.get("/api/jobs/{job_id}/todos/archives/{filename}")
+async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
+    """Get parsed content of an archived todo file.
+
+    Args:
+        job_id: Job UUID
+        filename: Archive filename (e.g., "todos_phase1_20260124_183618.md")
+
+    Returns:
+        Dict with parsed todos, summary, and metadata
+    """
+    result = workspace_service.get_archived_todos(job_id, filename)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Archive '{filename}' not found for job '{job_id}'"
+        )
+    return result
