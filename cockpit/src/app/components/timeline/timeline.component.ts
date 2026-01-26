@@ -74,9 +74,6 @@ import { AuditService } from '../../core/services/audit.service';
           [attr.aria-label]="'Timeline position'"
           [disabled]="!hasTimeRange()"
         />
-        <div class="scrubber-track">
-          <div class="scrubber-progress" [style.width.%]="progressPercent()"></div>
-        </div>
       </div>
 
       <span class="time-display">{{ formattedDuration() }}</span>
@@ -149,37 +146,59 @@ import { AuditService } from '../../core/services/audit.service';
       }
 
       .scrubber {
-        position: absolute;
         width: 100%;
-        height: 100%;
-        opacity: 0;
+        height: 6px;
+        -webkit-appearance: none;
+        appearance: none;
+        background: var(--track-bg, #313244);
+        border-radius: 3px;
         cursor: pointer;
-        z-index: 2;
         margin: 0;
       }
 
-      .scrubber-track {
-        position: absolute;
-        width: 100%;
-        height: 4px;
-        background: var(--track-bg, #313244);
-        border-radius: 2px;
-        overflow: hidden;
-      }
-
-      .scrubber-progress {
-        height: 100%;
+      .scrubber::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 14px;
+        height: 14px;
         background: var(--accent-color, #cba6f7);
-        border-radius: 2px;
-        transition: width 0.05s linear;
+        border-radius: 50%;
+        cursor: pointer;
+        border: 2px solid var(--timeline-bg, #11111b);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
       }
 
-      .scrubber:hover + .scrubber-track {
-        height: 6px;
+      .scrubber::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+        background: var(--accent-color, #cba6f7);
+        border-radius: 50%;
+        cursor: pointer;
+        border: 2px solid var(--timeline-bg, #11111b);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
       }
 
-      .scrubber:hover + .scrubber-track .scrubber-progress {
+      .scrubber:hover::-webkit-slider-thumb {
         background: var(--accent-hover, #b4befe);
+        transform: scale(1.1);
+      }
+
+      .scrubber:hover::-moz-range-thumb {
+        background: var(--accent-hover, #b4befe);
+        transform: scale(1.1);
+      }
+
+      .scrubber:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
+      .scrubber:disabled::-webkit-slider-thumb {
+        cursor: not-allowed;
+      }
+
+      .scrubber:disabled::-moz-range-thumb {
+        cursor: not-allowed;
       }
 
       .scrubber-container.disabled {

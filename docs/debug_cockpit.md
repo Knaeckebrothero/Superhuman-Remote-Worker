@@ -6,7 +6,7 @@ A flexible, composable Angular dashboard framework for debugging and visualizing
 
 ## Current Status
 
-**Phase 4 In Progress** - FastAPI backend with PostgreSQL and MongoDB, three real components implemented.
+**Phase 5 Complete** - All MVP components implemented. Graph timeline visualization and todo viewer added.
 
 Run the app:
 ```bash
@@ -22,8 +22,12 @@ cd cockpit && npm start
 
 Current features:
 - Dark themed UI (Catppuccin Mocha)
-- Timeline scrubber bar at top (60px) with play/pause button
-- Hamburger menu with database links, layout presets, and settings
+- **Timeline bar (60px)** with:
+  - Hamburger menu with database links, layout presets, and settings
+  - **Centralized job selector** (single source of truth for job selection)
+  - Refresh button for job list
+  - Play/pause button (placeholder for future playback)
+  - Time display and scrubber (synced to job audit time range)
 - **Fully configurable layout system:**
   - Drag handles between panels for resizing
   - **Component switcher dropdown** in each panel header (click title to swap components)
@@ -38,7 +42,6 @@ Current features:
   - Loading spinner and error states
   - Works offline (shows empty state with backend hint)
 - **Agent Activity Viewer** (AgentActivityComponent):
-  - Job selector dropdown populated from PostgreSQL
   - Audit trail from MongoDB `agent_audit` collection
   - Filter buttons: All, Messages, Tools, Errors
   - Expandable entries with step-type specific details
@@ -58,6 +61,21 @@ Current features:
   - Collapsible reasoning section (for models with reasoning tokens)
   - Loading spinner and error states
   - Auto-load via clicking request_id in Agent Activity
+- **Graph Timeline** (GraphTimelineComponent):
+  - Cytoscape.js visualization with fcose layout
+  - Timeline scrubber to step through graph operations
+  - Summary bar: total operations, nodes created/modified/deleted
+  - Current Cypher query display
+  - Legend for node states (created, modified, deleted)
+  - Snapshot/delta optimization for fast seeking
+  - Fit and re-layout controls
+- **Todo List Viewer** (TodoListComponent):
+  - Dropdown to select current phase or archived phases
+  - Progress bar showing completed/total todos
+  - Todo list with status icons (pending, in_progress, completed)
+  - Expandable notes and failure reasons
+  - Phase metadata display (timestamps, summary)
+  - Auto-loads when job is selected
 
 ## Data Architecture
 
@@ -68,7 +86,8 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │                    Angular Frontend                      │
 │  ┌─────────────────────────────────────────────────┐    │
 │  │              Visual Components                   │    │
-│  │  (RequestViewer, AgentActivity, DbTable, etc.)  │    │
+│  │  (RequestViewer, AgentActivity, DbTable,        │    │
+│  │   GraphTimeline, TodoList)                      │    │
 │  └──────────────────────┬──────────────────────────┘    │
 │                         │ subscribe to signals           │
 │  ┌──────────────────────▼──────────────────────────┐    │
@@ -76,16 +95,19 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │  │  - StateService: db-table state                  │    │
 │  │  - AuditService: agent-activity state            │    │
 │  │  - RequestService: request-viewer state          │    │
-│  │  - handles buffering/windowing for large runs   │    │
+│  │  - TimeService: timeline synchronization         │    │
+│  │  - GraphService: graph timeline state            │    │
+│  │  - TodoService: todo list state                  │    │
 │  └──────────────────────┬──────────────────────────┘    │
 │                         │ HTTP calls                     │
 │  ┌──────────────────────▼──────────────────────────┐    │
 │  │              ApiService                          │    │
 │  │  - getJobs(): Observable<Job[]>                  │    │
-│  │  - getAuditWindow(jobId, from, to)              │    │
+│  │  - getJobAudit(jobId, page, filter)             │    │
 │  │  - getRequest(docId): Observable<LLMRequest>    │    │
-│  │  - getWorkspaceFile(jobId, path)                │    │
-│  │  - queryCypher(query), querySQL(query)          │    │
+│  │  - getAuditTimeRange(jobId)                     │    │
+│  │  - getGraphChanges(jobId)                       │    │
+│  │  - getJobTodos(jobId)                           │    │
 │  └──────────────────────┬──────────────────────────┘    │
 └─────────────────────────┼───────────────────────────────┘
                           │ HTTP :8085
@@ -95,41 +117,29 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │  GET  /api/jobs                     → PostgreSQL         │
 │  GET  /api/jobs/{id}                → PostgreSQL         │
 │  GET  /api/jobs/{id}/audit          → MongoDB            │
-│       ?from=<ts>&to=<ts>              (windowed query)   │
+│  GET  /api/jobs/{id}/audit/timerange → MongoDB           │
 │  GET  /api/requests/{doc_id}        → MongoDB            │
-│                                        (llm_requests)    │
-│  GET  /api/jobs/{id}/workspace      → Filesystem         │
-│  GET  /api/jobs/{id}/workspace/{path} → Filesystem       │
-│  GET  /api/jobs/{id}/requirements   → PostgreSQL         │
-│  POST /api/cypher                   → Neo4j              │
-│  POST /api/sql                      → PostgreSQL         │
+│  GET  /api/graph/changes/{job_id}   → MongoDB            │
+│  GET  /api/jobs/{id}/todos          → Filesystem         │
+│  GET  /api/jobs/{id}/todos/current  → Filesystem         │
+│  GET  /api/jobs/{id}/todos/archives → Filesystem         │
+│  GET  /api/tables                   → PostgreSQL         │
+│  GET  /api/tables/{name}            → PostgreSQL         │
 │                                                          │
 └────────────┬────────────┬────────────┬──────────────────┘
              │            │            │
              ▼            ▼            ▼
-         PostgreSQL    MongoDB      Neo4j
-          :5432        :27017       :7687
+         PostgreSQL    MongoDB      Filesystem
+          :5432        :27017     workspace/job_*
 ```
 
 ### Buffering Strategy for Large Runs
 
-For long-running jobs (e.g., 20+ hours), loading the entire audit trail would consume too much memory. The `StateService` implements windowed loading:
+For long-running jobs (e.g., 20+ hours), loading the entire audit trail would consume too much memory. The `AuditService` implements pagination:
 
-1. **Time Window**: Only fetch audit entries within ±N minutes of current timeline position
-2. **Lazy Expansion**: As user scrubs, request new windows and merge into buffer
-3. **Memory Cap**: When buffer exceeds threshold, drop entries furthest from current position
-4. **Backend Support**: `/api/jobs/{id}/audit?from=<timestamp>&to=<timestamp>` returns only entries in range
-
-```typescript
-// StateService windowing example
-const WINDOW_SIZE_MS = 5 * 60 * 1000; // ±5 minutes
-
-async loadAuditWindow(position: number) {
-  const from = position - WINDOW_SIZE_MS;
-  const to = position + WINDOW_SIZE_MS;
-  const entries = await this.api.getAuditWindow(this.currentJob().id, from, to);
-  this.mergeIntoBuffer(entries);
-}
+1. **Pagination**: Loads audit entries page by page (50 per page default)
+2. **Filtering**: Server-side filtering by step type category (all/messages/tools/errors)
+3. **Time Range**: `TimeService` fetches job start/end times for scrubber positioning
 
 ## File Structure
 
@@ -143,41 +153,53 @@ cockpit/src/app/
 │   │   ├── layout-preset.model.ts    # LayoutPreset interface ✅
 │   │   ├── api.model.ts              # TableInfo, ColumnDef, TableDataResponse ✅
 │   │   ├── audit.model.ts            # AuditEntry, AuditResponse, JobSummary ✅
-│   │   └── request.model.ts          # LLMRequest, LLMMessage, LLMToolCall ✅
+│   │   ├── request.model.ts          # LLMRequest, LLMMessage, LLMToolCall ✅
+│   │   ├── graph.model.ts            # GraphChanges, GraphDelta, GraphSnapshot ✅
+│   │   └── todo.model.ts             # TodoItem, CurrentTodos, JobTodos ✅
 │   └── services/
 │       ├── layout.service.ts         # Layout state, split/close, presets ✅
 │       ├── component-registry.service.ts  # Component registration ✅
 │       ├── api.service.ts            # HTTP client for backend ✅
 │       ├── state.service.ts          # Signals state for db-table ✅
 │       ├── audit.service.ts          # Signals state for agent-activity ✅
-│       └── request.service.ts        # Signals state for request-viewer ✅
+│       ├── request.service.ts        # Signals state for request-viewer ✅
+│       ├── time.service.ts           # Global time synchronization ✅
+│       ├── graph.service.ts          # Graph timeline state ✅
+│       └── todo.service.ts           # Todo list state ✅
 ├── layout/
 │   ├── split-panel/
-│   │   └── split-panel.component.ts  # Recursive split renderer
+│   │   └── split-panel.component.ts  # Recursive split renderer ✅
 │   ├── component-host/
-│   │   └── component-host.component.ts # Dynamic component loader
+│   │   └── component-host.component.ts # Dynamic component loader ✅
 │   └── panel-header/
-│       └── panel-header.component.ts # Panel title bar
+│       └── panel-header.component.ts # Panel title bar ✅
 ├── components/
 │   ├── menu/
-│   │   └── menu.component.ts         # Hamburger menu with links/settings
+│   │   └── menu.component.ts         # Hamburger menu with links/settings ✅
 │   ├── timeline/
-│   │   └── timeline.component.ts     # Top scrubber bar
+│   │   └── timeline.component.ts     # Top bar with job selector + scrubber ✅
 │   ├── db-table/
 │   │   └── db-table.component.ts     # PostgreSQL table viewer ✅
 │   ├── agent-activity/
 │   │   └── agent-activity.component.ts # MongoDB audit trail viewer ✅
 │   ├── request-viewer/
 │   │   └── request-viewer.component.ts # LLM request/response viewer ✅
+│   ├── graph-timeline/
+│   │   ├── graph-timeline.component.ts # Cytoscape graph viewer ✅
+│   │   ├── graph-styles.ts           # Cytoscape style definitions ✅
+│   │   └── timeline-renderer.ts      # Snapshot/delta rendering logic ✅
+│   ├── todo-list/
+│   │   └── todo-list.component.ts    # Todo list viewer ✅
 │   └── placeholders/
 │       ├── placeholder-a.component.ts  # "Workspace" placeholder
-│       └── placeholder-b.component.ts  # "Agent Chat" placeholder
-├── app.ts                            # Root frame component
-├── app.config.ts                     # App configuration (+ provideHttpClient)
+│       ├── placeholder-b.component.ts  # "Agent Chat" placeholder
+│       └── placeholder-c.component.ts  # "Database" placeholder
+├── app.ts                            # Root frame component ✅
+├── app.config.ts                     # App configuration (+ provideHttpClient) ✅
 └── app.routes.ts                     # Routing (unused for now)
 
 cockpit/src/
-├── styles.scss                       # Dark theme CSS variables
+├── styles.scss                       # Dark theme CSS variables ✅
 └── assets/
     └── layout-presets/               # JSON preset files ✅
         ├── single.json               # Single full-width panel
@@ -193,38 +215,58 @@ cockpit/src/
 ```
 cockpit/api/
 ├── __init__.py                       # ✅
-├── main.py                           # FastAPI app, CORS, all endpoints ✅
+├── main.py                           # FastAPI app, CORS, endpoints ✅
+├── graph_routes.py                   # /api/graph/* endpoints ✅
 ├── requirements.txt                  # fastapi, uvicorn, asyncpg, motor ✅
 ├── .env                              # DATABASE_URL, MONGODB_URL
-├── config.py                         # Environment variables, DB URLs (planned)
-├── routes/                           # (planned - currently in main.py)
-│   ├── __init__.py
-│   ├── jobs.py                       # GET /api/jobs, /api/jobs/{id}
-│   ├── audit.py                      # GET /api/jobs/{id}/audit
-│   ├── workspace.py                  # GET /api/jobs/{id}/workspace/*
-│   └── query.py                      # POST /api/cypher, /api/sql
-├── services/
-│   ├── __init__.py                   # ✅
-│   ├── postgres.py                   # asyncpg connection pool ✅
-│   ├── mongodb.py                    # motor async client ✅
-│   └── neo4j.py                      # neo4j async driver (planned)
-└── models/
-    ├── __init__.py
-    └── schemas.py                    # Pydantic models (planned)
+└── services/
+    ├── __init__.py                   # ✅
+    ├── postgres.py                   # asyncpg connection pool ✅
+    ├── mongodb.py                    # motor async client ✅
+    └── workspace.py                  # Workspace file access ✅
 ```
 
 **Current API Endpoints:**
-- `GET /api/tables` - List available tables with row counts
-- `GET /api/tables/{name}` - Paginated table data with columns
-- `GET /api/tables/{name}/schema` - Column definitions
-- `GET /api/jobs` - List jobs with audit counts (PostgreSQL + MongoDB)
-- `GET /api/jobs/{id}` - Single job details with audit count
-- `GET /api/jobs/{id}/audit` - Paginated audit entries (MongoDB)
-  - Query params: `page`, `pageSize`, `filter` (all/messages/tools/errors)
-- `GET /api/requests/{doc_id}` - Single LLM request document (MongoDB `llm_requests`)
-- `GET /api/health` - Health check
+
+| Endpoint | Method | Source | Description |
+|----------|--------|--------|-------------|
+| `/api/tables` | GET | PostgreSQL | List available tables with row counts |
+| `/api/tables/{name}` | GET | PostgreSQL | Paginated table data with columns |
+| `/api/tables/{name}/schema` | GET | PostgreSQL | Column definitions |
+| `/api/jobs` | GET | PostgreSQL + MongoDB | List jobs with audit counts |
+| `/api/jobs/{id}` | GET | PostgreSQL + MongoDB | Single job details |
+| `/api/jobs/{id}/audit` | GET | MongoDB | Paginated audit entries (filter: all/messages/tools/errors) |
+| `/api/jobs/{id}/audit/timerange` | GET | MongoDB | First/last timestamps for job |
+| `/api/requests/{doc_id}` | GET | MongoDB | Single LLM request document |
+| `/api/graph/changes/{job_id}` | GET | MongoDB | Parsed Cypher operations with snapshots/deltas |
+| `/api/jobs/{job_id}/todos` | GET | Filesystem | All todos (current + archives) |
+| `/api/jobs/{job_id}/todos/current` | GET | Filesystem | Current todos.yaml |
+| `/api/jobs/{job_id}/todos/archives` | GET | Filesystem | List archived todo files |
+| `/api/jobs/{job_id}/todos/archives/{filename}` | GET | Filesystem | Specific archived todo file |
+| `/api/health` | GET | - | Health check |
 
 ## Architecture
+
+### Timeline Bar Layout
+
+The top bar provides centralized controls for job selection and time navigation:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ [☰] │ [Job Dropdown ▼] [↻] │ [▶] [00:00] [═══════════════] [03:45]    │
+│      │                      │                                          │
+│ Menu │   Job Selection      │           Playback Controls              │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+| Control | Description |
+|---------|-------------|
+| ☰ Menu | Database links, layout presets, settings |
+| Job Dropdown | Select job to view (fetches from `/api/jobs`) |
+| ↻ Refresh | Reload job list |
+| ▶ Play/Pause | Toggle playback (placeholder) |
+| Time Display | Current position / total duration |
+| Scrubber | Drag to seek through time range |
 
 ### Panel Header Controls
 
@@ -296,15 +338,18 @@ interface LayoutConfig {
 }
 
 type ComponentType =
-  | 'agent-activity'  // Job selector + audit trail (implemented ✅)
-  | 'db-table'        // PostgreSQL table viewer (implemented ✅)
-  | 'request-viewer'  // LLM request/response viewer (implemented ✅)
-  | 'workspace'       // File tree + file viewer
-  | 'graph'           // Neo4j visualization
-  | 'timeline'        // Timeline scrubber
-  | 'metrics'         // Token usage, latency stats
-  | 'logs'            // Raw log viewer
-  | 'json-viewer';    // Generic JSON explorer
+  | 'agent-activity'   // Audit trail viewer ✅
+  | 'db-table'         // PostgreSQL table viewer ✅
+  | 'request-viewer'   // LLM request/response viewer ✅
+  | 'graph-timeline'   // Neo4j graph visualization ✅
+  | 'todo-list'        // Todo list viewer ✅
+  | 'placeholder-a'    // Workspace (placeholder)
+  | 'placeholder-b'    // Agent Chat (placeholder)
+  | 'placeholder-c'    // Database (placeholder)
+  | 'workspace'        // File tree + file viewer (planned)
+  | 'metrics'          // Token usage, latency stats (planned)
+  | 'logs'             // Raw log viewer (planned)
+  | 'json-viewer';     // Generic JSON explorer (planned)
 ```
 
 ### Example Configuration (Current Default)
@@ -326,16 +371,15 @@ type ComponentType =
 
 | Component | Description | Data Source | Status |
 |-----------|-------------|-------------|--------|
-| `agent-activity` | Job selector + audit trail with expandable steps | PostgreSQL + MongoDB | ✅ |
-| `db-table` | PostgreSQL table browser (jobs, requirements, etc.) | PostgreSQL | ✅ |
+| `agent-activity` | Audit trail with expandable steps | MongoDB `agent_audit` | ✅ |
+| `db-table` | PostgreSQL table browser | PostgreSQL | ✅ |
 | `request-viewer` | LLM request/response conversation viewer | MongoDB `llm_requests` | ✅ |
-| `workspace` | File tree + content viewer | Filesystem API | ⬜ |
-| `graph` | Neo4j knowledge graph visualization | Neo4j | ⬜ |
-| `timeline` | Scrubber to navigate through time | All sources (timestamp filter) | ✅ (basic) |
-| `metrics` | Token usage, latency, cost stats | MongoDB `agent_audit` | ⬜ |
-| `logs` | Raw log file viewer | Filesystem `workspace/logs/` | ⬜ |
-| `json-viewer` | Generic expandable JSON tree | Any JSON data | ⬜ |
-| `todos` | Todo list state over time | Filesystem `todos.yaml` | ⬜ |
+| `graph-timeline` | Neo4j graph visualization with timeline | MongoDB (Cypher parsing) | ✅ |
+| `todo-list` | Todo list viewer (current + archived) | Filesystem `todos.yaml` | ✅ |
+| `workspace` | File tree + content viewer | Filesystem API | ⬜ Planned |
+| `metrics` | Token usage, latency, cost stats | MongoDB `agent_audit` | ⬜ Planned |
+| `logs` | Raw log file viewer | Filesystem `workspace/logs/` | ⬜ Planned |
+| `json-viewer` | Generic expandable JSON tree | Any JSON data | ⬜ Planned |
 
 ## Data Sources
 
@@ -346,22 +390,7 @@ type ComponentType =
 | PostgreSQL | `jobs` | Job metadata (id, status, config, timestamps) |
 | PostgreSQL | `requirements` | Extracted/validated requirements |
 | Filesystem | `workspace/job_<id>/` | workspace.md, todos.yaml, plan.md, analysis/* |
-
-## Components to Migrate from Advanced-LLM-Chat
-
-### Required Components
-
-| Component | Source Path | Purpose |
-|-----------|-------------|---------|
-| `agent-steps` | `src/app/chat-ui/chat-ui-message/agent-steps/` | Expandable reasoning step panels |
-| `message` model | `src/app/data/objects/message.ts` | `AgentStep`, `AgentContent` types |
-
-### Optional Components (nice-to-have)
-
-| Component | Source Path | Purpose |
-|-----------|-------------|---------|
-| `chat-ui-message` | `src/app/chat-ui/chat-ui-message/` | Message bubble styling |
-| `marked` integration | Uses `ngx-markdown` | Markdown rendering in steps |
+| Filesystem | `workspace/job_<id>/archive/` | Archived todos (todos_phase*.md) |
 
 ## Component Architecture
 
@@ -369,145 +398,50 @@ type ComponentType =
 
 | Component | Status | Purpose |
 |-----------|--------|---------|
-| `App` | ✅ Implemented | Root component with timeline header + split-panel main |
-| `SplitPanelComponent` | ✅ Implemented | Recursive split container with angular-split |
-| `ComponentHostComponent` | ✅ Implemented | Dynamic component loader with path tracking |
-| `PanelHeaderComponent` | ✅ Implemented | Header bar with dropdown, split, and close buttons |
-| `TimelineComponent` | ✅ Implemented | Top scrubber bar (60px) with play/pause |
+| `App` | ✅ | Root component with timeline header + split-panel main |
+| `SplitPanelComponent` | ✅ | Recursive split container with angular-split |
+| `ComponentHostComponent` | ✅ | Dynamic component loader with path tracking |
+| `PanelHeaderComponent` | ✅ | Header bar with dropdown, split, and close buttons |
+| `TimelineComponent` | ✅ | Top bar with job selector, play/pause, scrubber |
+| `MenuComponent` | ✅ | Hamburger menu with links/settings |
 
 ### Services
 
-**Layout Services (Implemented)**
+**Layout Services**
 
 | Service | Status | Purpose |
 |---------|--------|---------|
-| `LayoutService` | ✅ Implemented | Layout state, split/close panels, preset loading, localStorage persistence |
-| `ComponentRegistryService` | ✅ Implemented | Register components, get metadata by type |
+| `LayoutService` | ✅ | Layout state, split/close panels, preset loading, localStorage persistence |
+| `ComponentRegistryService` | ✅ | Register components, get metadata by type |
 
-**LayoutService Methods:**
-- `setLayout(config)` - Set layout configuration
-- `resetLayout()` - Restore default layout
-- `updateSizes(path, sizes)` - Update split sizes at path
-- `updateComponent(path, type)` - Change component at path
-- `splitPanel(path, direction)` - Split panel into two (horizontal/vertical)
-- `closePanel(path)` - Remove panel and redistribute space
-- `getPanelCount()` - Count total panels
-- `applyPreset(presetId)` - Apply a preset layout
-- `availablePresets` - Signal with loaded presets from JSON files
-
-**Data Services (Implemented)**
+**Data Services**
 
 | Service | Status | Purpose |
 |---------|--------|---------|
-| `ApiService` | ✅ Implemented | HTTP client for tables, jobs, audit, requests endpoints |
-| `StateService` | ✅ Implemented | Signals-based state for db-table (selected table, pagination, loading) |
-| `AuditService` | ✅ Implemented | Signals-based state for agent-activity (jobs, entries, filters, pagination) |
-| `RequestService` | ✅ Implemented | Signals-based state for request-viewer (current request, loading, error) |
-
-The `StateService` exposes signals that components subscribe to:
-```typescript
-@Injectable({ providedIn: 'root' })
-export class StateService {
-  // Current context
-  readonly currentJob = signal<Job | null>(null);
-  readonly timelinePosition = signal<number>(0);        // ms from job start
-  readonly timelineDuration = signal<number>(0);        // total job duration
-  readonly isPlaying = signal<boolean>(false);
-
-  // Buffered data (windowed around timeline position)
-  readonly auditEntries = signal<AuditEntry[]>([]);
-  readonly workspaceTree = signal<FileNode[]>([]);
-  readonly selectedFile = signal<FileContent | null>(null);
-
-  // Computed
-  readonly visibleEntries = computed(() =>
-    this.auditEntries().filter(e => e.timestamp <= this.timelinePosition())
-  );
-}
-```
+| `ApiService` | ✅ | HTTP client for all backend endpoints |
+| `StateService` | ✅ | Signals-based state for db-table |
+| `AuditService` | ✅ | Signals-based state for agent-activity (jobs, entries, filters, pagination) |
+| `RequestService` | ✅ | Signals-based state for request-viewer |
+| `TimeService` | ✅ | Global time synchronization (start/end times, current offset, playhead) |
+| `GraphService` | ✅ | Graph timeline state (deltas, snapshots, current index) |
+| `TodoService` | ✅ | Todo list state (current todos, archives, selected phase) |
 
 ### Pluggable Panel Components
 
 | Component | Status | Purpose |
 |-----------|--------|---------|
-| `PlaceholderAComponent` | ✅ Placeholder | Will become WorkspaceComponent |
-| `PlaceholderBComponent` | ✅ Placeholder | Will become AgentChatComponent |
-| `DbTableComponent` | ✅ Implemented | PostgreSQL table browser with pagination |
-| `AgentActivityComponent` | ✅ Implemented | MongoDB audit trail with job selector, filters, expandable steps |
-| `RequestViewerComponent` | ✅ Implemented | LLM request/response viewer with messenger-style messages |
+| `DbTableComponent` | ✅ | PostgreSQL table browser with pagination |
+| `AgentActivityComponent` | ✅ | MongoDB audit trail with filters, expandable steps |
+| `RequestViewerComponent` | ✅ | LLM request/response viewer with messenger-style messages |
+| `GraphTimelineComponent` | ✅ | Cytoscape graph visualization with timeline scrubbing |
+| `TodoListComponent` | ✅ | Todo list viewer with phase selection |
+| `PlaceholderAComponent` | Placeholder | Will become WorkspaceComponent |
+| `PlaceholderBComponent` | Placeholder | Will become AgentChatComponent |
+| `PlaceholderCComponent` | Placeholder | Future use |
 | `WorkspaceComponent` | ⬜ Planned | File tree + file viewer |
-| `GraphComponent` | ⬜ Planned | Neo4j visualization (optional: vis.js or d3) |
 | `MetricsComponent` | ⬜ Planned | Token usage, latency charts |
 | `LogViewerComponent` | ⬜ Planned | Raw log file with search |
 | `JsonViewerComponent` | ⬜ Planned | Expandable JSON tree |
-| `TodosComponent` | ⬜ Planned | Todo list state viewer |
-
-## FastAPI Debug Backend
-
-A dedicated FastAPI backend (`cockpit/api/`) that wraps database access for the Angular frontend.
-
-### Endpoints
-
-```
-# Jobs (PostgreSQL)
-GET  /api/jobs                         # List all jobs
-GET  /api/jobs/{job_id}                # Job details + metadata
-
-# Audit Trail (MongoDB) - supports windowed queries
-GET  /api/jobs/{job_id}/audit          # Full audit trail
-GET  /api/jobs/{job_id}/audit?from=<ts>&to=<ts>  # Windowed by timestamp
-
-# LLM Requests (MongoDB) - full request/response conversations
-GET  /api/requests/{doc_id}            # Single request by ObjectId
-
-# Workspace Files (Filesystem)
-GET  /api/jobs/{job_id}/workspace      # List workspace file tree
-GET  /api/jobs/{job_id}/workspace/{path}  # Read specific file content
-
-# Requirements (PostgreSQL)
-GET  /api/jobs/{job_id}/requirements   # Requirements for job
-
-# Direct Queries (for advanced panels)
-POST /api/cypher                       # Execute Cypher query on Neo4j
-     Body: { "query": "MATCH (n) RETURN n LIMIT 10" }
-
-POST /api/sql                          # Execute SQL query on PostgreSQL
-     Body: { "query": "SELECT * FROM jobs LIMIT 10" }
-```
-
-### File Structure
-
-```
-cockpit/
-├── api/
-│   ├── __init__.py
-│   ├── main.py              # FastAPI app, CORS setup
-│   ├── routes/
-│   │   ├── jobs.py          # /api/jobs/* endpoints
-│   │   ├── audit.py         # /api/jobs/{id}/audit endpoints
-│   │   ├── workspace.py     # /api/jobs/{id}/workspace/* endpoints
-│   │   └── query.py         # /api/cypher, /api/sql endpoints
-│   ├── services/
-│   │   ├── postgres.py      # PostgreSQL connection + queries
-│   │   ├── mongodb.py       # MongoDB connection + queries
-│   │   └── neo4j.py         # Neo4j connection + queries
-│   └── models/
-│       └── schemas.py       # Pydantic models for request/response
-└── src/                     # Angular frontend
-```
-
-### Running the Backend
-
-```bash
-cd cockpit/api
-pip install -r requirements.txt  # fastapi, uvicorn, asyncpg
-uvicorn main:app --reload --port 8085
-
-# Verify with:
-curl http://localhost:8085/api/tables
-curl http://localhost:8085/api/tables/jobs
-curl http://localhost:8085/api/requests/<doc_id>  # Get a doc_id from llm_requests
-```
 
 ## Implementation Phases
 
@@ -537,45 +471,47 @@ curl http://localhost:8085/api/requests/<doc_id>  # Get a doc_id from llm_reques
 - [x] Create MongoDB service (motor) - async with graceful degradation
 - [x] Implement `/api/jobs` endpoints (list, single with audit counts)
 - [x] Implement `/api/jobs/{id}/audit` with pagination and filtering
-- [ ] Create Neo4j service (neo4j driver)
-- [ ] Implement `/api/jobs/{id}/workspace` endpoints
-- [ ] Implement `/api/cypher` and `/api/sql` pass-through
+- [x] Implement `/api/jobs/{id}/audit/timerange` for scrubber
+- [x] Implement `/api/graph/changes/{job_id}` for graph timeline
+- [x] Create workspace service for todo file access
+- [x] Implement `/api/jobs/{id}/todos/*` endpoints
 
-### Phase 4: Angular Data Services (In Progress)
-- [x] Create `ApiService` (HTTP client for table endpoints)
+### Phase 4: Angular Data Services ✅
+- [x] Create `ApiService` (HTTP client for all endpoints)
 - [x] Create `StateService` (signals-based state for db-table)
-- [x] Extend `ApiService` for jobs, audit endpoints
 - [x] Create `AuditService` for job/audit state management
-- [ ] Extend `ApiService` for workspace endpoints
-- [ ] Implement buffering/windowing logic for large audit trails
-- [ ] Connect `TimelineComponent` to `StateService`
+- [x] Create `RequestService` for LLM request state
+- [x] Create `TimeService` for global time synchronization
+- [x] Create `GraphService` for graph timeline state
+- [x] Create `TodoService` for todo list state
+- [x] Centralize job selection in TimelineComponent
 
-### Phase 5: Panel Components (MVP)
-- [x] `AgentActivityComponent` - job selector + audit entries with expandable steps
+### Phase 5: Panel Components (MVP) ✅
+- [x] `AgentActivityComponent` - audit entries with expandable steps
 - [x] `RequestViewerComponent` - LLM request/response viewer with messenger-style messages
-- [ ] `WorkspaceComponent` - file tree + viewer
-- [ ] `JsonViewerComponent` - generic expandable JSON tree
-- [ ] Wire all components to StateService signals
+- [x] `DbTableComponent` - PostgreSQL table browser with pagination
+- [x] `GraphTimelineComponent` - Cytoscape graph visualization with timeline
+- [x] `TodoListComponent` - Todo list viewer with phase selection
 
 ### Phase 6: Panel Components (Extended)
-- [x] `DbTableComponent` - PostgreSQL table browser with pagination
-- [ ] `GraphComponent` - Neo4j visualization (uses /api/cypher)
+- [ ] `WorkspaceComponent` - file tree + viewer
 - [ ] `MetricsComponent` - token/latency charts from audit data
 - [ ] `LogViewerComponent` - raw logs with search
-- [ ] `TodosComponent` - todo state over time
+- [ ] `JsonViewerComponent` - generic expandable JSON tree
 
-### Phase 7: Copy & Adapt Chat Components (Optional)
-- [ ] Copy `agent-steps` component from Advanced-LLM-Chat
-- [ ] Adapt for Angular 21 standalone components
-- [ ] Integrate into `AgentChatComponent`
+### Phase 7: Backend Extensions
+- [ ] Create Neo4j service (neo4j driver) for direct queries
+- [ ] Implement `/api/cypher` pass-through
+- [ ] Implement `/api/sql` pass-through
+- [ ] Implement `/api/jobs/{id}/workspace` file browser endpoints
 
 ### Phase 8: Polish & Presets
-- [x] Preset layouts loaded from JSON files (single, two-column, two-row, three-column, left-right-stack, grid-2x2)
+- [x] Preset layouts loaded from JSON files
 - [x] Component switcher dropdown in panel headers
 - [x] Split/close panel buttons for dynamic layout building
 - [ ] URL-based layout sharing (?layout=preset-name)
 - [ ] Keyboard shortcuts for timeline (space=play/pause, arrows=scrub)
-- [ ] Add Angular Material for dropdowns/inputs (optional)
+- [ ] Playback implementation (auto-advance through timeline)
 
 ### Phase 9: Docker Integration
 - [ ] Create `cockpit/Dockerfile` (multi-stage: Angular build + Python API)
@@ -619,6 +555,7 @@ interface AuditEntry {
   // For step_type="llm_response"
   llm?: {
     model: string;
+    request_id: string;         // Links to llm_requests._id
     response_content_preview: string;  // First 500 chars
     tool_calls: Array<{ name: string; call_id: string }>;
     metrics: { output_chars: number; tool_call_count: number };
@@ -739,75 +676,6 @@ The API supports filtering audit entries by category:
 | `tools` | `tool_call`, `tool_result` |
 | `errors` | `error` |
 
-## Mapping: AuditEntry → AgentStep
-
-```typescript
-function auditToStep(entry: AuditEntry): AgentStep {
-  switch (entry.type) {
-    case 'request':
-      return {
-        id: entry._id.toString(),
-        title: `LLM Request (${entry.model})`,
-        content: entry.messages?.map(m => `${m.role}: ${m.content}`).join('\n'),
-        type: 'thought',
-        metadata: { model: entry.model }
-      };
-    case 'tool_call':
-      return {
-        id: entry._id.toString(),
-        title: `Tool: ${entry.tool_name}`,
-        content: JSON.stringify(entry.tool_input, null, 2),
-        type: 'tool_call',
-        metadata: entry.tool_input
-      };
-    case 'tool_result':
-      return {
-        id: entry._id.toString(),
-        title: `Result: ${entry.tool_name}`,
-        content: JSON.stringify(entry.tool_output, null, 2),
-        type: 'tool_result',
-        metadata: entry.tool_output
-      };
-    // ...
-  }
-}
-```
-
-## Docker Configuration
-
-### Dockerfile
-
-```dockerfile
-# Build stage
-FROM node:22-alpine AS build
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-
-# Production stage
-FROM nginx:alpine
-COPY --from=build /app/dist/cockpit/browser /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-EXPOSE 80
-```
-
-### docker-compose.dev.yaml addition
-
-```yaml
-services:
-  debug-cockpit:
-    build: ./cockpit
-    ports:
-      - "4200:80"
-    depends_on:
-      - mongodb
-      - postgres
-    environment:
-      - API_URL=http://host.docker.internal:8001
-```
-
 ## Preset Layouts
 
 Presets are loaded from JSON files in `cockpit/src/assets/layout-presets/`. Users can select them from the hamburger menu under "Layouts".
@@ -896,9 +764,30 @@ Then add the filename (without `.json`) to the `presetFiles` array in `layout.se
 ## Decisions Made
 
 1. **Backend API location**: ✅ Separate FastAPI backend in `cockpit/api/` (not added to existing agents)
-2. **Data flow**: ✅ StateService (signals) → ApiService (HTTP) → FastAPI → Databases
-3. **Large runs**: ✅ Windowed loading with buffering (±5 min around timeline position)
-4. **Layout editor**: ✅ Split/close buttons + component dropdown for dynamic layouts, plus JSON presets for quick setup
+2. **Data flow**: ✅ Services (signals) → ApiService (HTTP) → FastAPI → Databases
+3. **Job selection**: ✅ Centralized in TimelineComponent (single source of truth)
+4. **Graph visualization**: ✅ Cytoscape.js with snapshot/delta optimization
+5. **Todo access**: ✅ Direct filesystem access via workspace service (not in MongoDB)
+6. **Layout editor**: ✅ Split/close buttons + component dropdown for dynamic layouts, plus JSON presets for quick setup
+
+## What's Still Missing
+
+### High Priority
+- [ ] **WorkspaceComponent** - File browser for workspace.md, plan.md, analysis files
+- [ ] **Playback implementation** - Auto-advance through timeline
+- [ ] **Keyboard shortcuts** - Space=play/pause, arrows=scrub
+
+### Medium Priority
+- [ ] **MetricsComponent** - Token usage, latency charts, cost tracking
+- [ ] **Neo4j direct queries** - `/api/cypher` endpoint
+- [ ] **SQL direct queries** - `/api/sql` endpoint
+
+### Lower Priority
+- [ ] **LogViewerComponent** - Raw log file viewing with search
+- [ ] **JsonViewerComponent** - Generic expandable JSON tree
+- [ ] **Docker integration** - Dockerfile, nginx config, compose service
+- [ ] **URL-based layout sharing** - `?layout=preset-name`
+- [ ] **Real-time updates** - WebSocket or polling for running jobs
 
 ## Open Questions
 
