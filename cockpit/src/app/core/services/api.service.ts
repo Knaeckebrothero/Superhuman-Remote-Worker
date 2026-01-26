@@ -12,7 +12,7 @@ import { GraphChangeResponse } from '../models/graph.model';
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
-  private readonly baseUrl = 'http://localhost:8080/api';
+  private readonly baseUrl = 'http://localhost:8085/api';
 
   /**
    * Get list of available tables with row counts.

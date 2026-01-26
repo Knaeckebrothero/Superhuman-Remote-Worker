@@ -8,7 +8,7 @@
 #   docker build -t graphrag-cockpit-api -f docker/Dockerfile.cockpit-api .
 #
 # Run:
-#   docker run -p 8080:8080 \
+#   docker run -p 8085:8085 \
 #     -e DATABASE_URL=postgresql://... \
 #     -e MONGODB_URL=mongodb://... \
 #     graphrag-cockpit-api
@@ -37,7 +37,7 @@ LABEL description="Debug Cockpit FastAPI Backend"
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    PORT=8080
+    PORT=8085
 
 WORKDIR /app
 
@@ -60,9 +60,9 @@ RUN groupadd -r graphrag && useradd -r -g graphrag graphrag && \
 
 USER graphrag
 
-EXPOSE 8080
+EXPOSE 8085
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:${PORT}/api/health || exit 1
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8085"]

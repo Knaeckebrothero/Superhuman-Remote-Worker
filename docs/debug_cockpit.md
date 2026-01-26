@@ -13,7 +13,7 @@ Run the app:
 # Terminal 1: Start FastAPI backend
 cd cockpit/api
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8080
+uvicorn main:app --reload --port 8085
 
 # Terminal 2: Start Angular frontend
 cd cockpit && npm start
@@ -88,7 +88,7 @@ The cockpit uses a three-layer architecture to fetch and manage agent state:
 │  │  - queryCypher(query), querySQL(query)          │    │
 │  └──────────────────────┬──────────────────────────┘    │
 └─────────────────────────┼───────────────────────────────┘
-                          │ HTTP :8080
+                          │ HTTP :8085
 ┌─────────────────────────▼───────────────────────────────┐
 │              FastAPI Debug Backend                       │
 │                                                          │
@@ -501,12 +501,12 @@ cockpit/
 ```bash
 cd cockpit/api
 pip install -r requirements.txt  # fastapi, uvicorn, asyncpg
-uvicorn main:app --reload --port 8080
+uvicorn main:app --reload --port 8085
 
 # Verify with:
-curl http://localhost:8080/api/tables
-curl http://localhost:8080/api/tables/jobs
-curl http://localhost:8080/api/requests/<doc_id>  # Get a doc_id from llm_requests
+curl http://localhost:8085/api/tables
+curl http://localhost:8085/api/tables/jobs
+curl http://localhost:8085/api/requests/<doc_id>  # Get a doc_id from llm_requests
 ```
 
 ## Implementation Phases

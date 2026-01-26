@@ -1,59 +1,84 @@
-# Cockpit
+# Debug Cockpit
 
-This project was generated using [Angular CLI](https://github.com/angular/angular-cli) version 21.1.1.
+Angular dashboard for debugging and visualizing Graph-RAG agent execution. Features a tiling layout system with pluggable components for viewing audit trails, graph changes, database tables, and LLM requests.
 
-## Development server
-
-To start a local development server, run:
+## Quick Start
 
 ```bash
-ng serve
+# Terminal 1: Start FastAPI backend
+cd cockpit/api
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8085
+
+# Terminal 2: Start Angular frontend
+cd cockpit
+npm install
+npm start
+# Open http://localhost:4200
 ```
 
-Once the server is running, open your browser and navigate to `http://localhost:4200/`. The application will automatically reload whenever you modify any of the source files.
+## Architecture
 
-## Code scaffolding
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Angular Frontend                         │
+│                    http://localhost:4200                     │
+├─────────────────────────────────────────────────────────────┤
+│                     FastAPI Backend                          │
+│                    http://localhost:8085                     │
+├──────────────────┬──────────────────┬───────────────────────┤
+│    PostgreSQL    │     MongoDB      │        Neo4j          │
+│   (jobs, reqs)   │  (audit trail)   │   (graph changes)     │
+└──────────────────┴──────────────────┴───────────────────────┘
+```
 
-Angular CLI includes powerful code scaffolding tools. To generate a new component, run:
+## Features
+
+- Dark themed UI (Catppuccin Mocha)
+- Timeline scrubber with global time synchronization
+- Resizable panel layout with drag handles
+- Component switcher dropdown in each panel
+- Split buttons to divide panels
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| Agent Activity | MongoDB audit trail with filtering and pagination |
+| Graph Viewer | Neo4j graph visualization with timeline playback |
+| DB Table | PostgreSQL table browser |
+| Request Viewer | Full LLM request/response inspector |
+
+## Development
 
 ```bash
-ng generate component component-name
+# Start dev server
+npm start
+
+# Build for production
+npm run build
+
+# Run tests
+npm test
 ```
 
-For a complete list of available schematics (such as `components`, `directives`, or `pipes`), run:
+## API Endpoints
 
-```bash
-ng generate --help
-```
+The backend runs on port **8085** and provides:
 
-## Building
+- `GET /api/tables` - List available PostgreSQL tables
+- `GET /api/tables/{name}` - Get paginated table data
+- `GET /api/jobs` - List jobs with audit counts
+- `GET /api/jobs/{id}/audit` - Get paginated audit entries
+- `GET /api/jobs/{id}/audit/timerange` - Get time bounds for timeline
+- `GET /api/graph/changes/{id}` - Get graph deltas for visualization
+- `GET /api/requests/{doc_id}` - Get full LLM request document
 
-To build the project run:
+## Environment
 
-```bash
-ng build
-```
+The backend requires these environment variables (see `.env.example`):
 
-This will compile your project and store the build artifacts in the `dist/` directory. By default, the production build optimizes your application for performance and speed.
-
-## Running unit tests
-
-To execute unit tests with the [Vitest](https://vitest.dev/) test runner, use the following command:
-
-```bash
-ng test
-```
-
-## Running end-to-end tests
-
-For end-to-end (e2e) testing, run:
-
-```bash
-ng e2e
-```
-
-Angular CLI does not come with an end-to-end testing framework by default. You can choose one that suits your needs.
-
-## Additional Resources
-
-For more information on using the Angular CLI, including detailed command references, visit the [Angular CLI Overview and Command Reference](https://angular.dev/tools/cli) page.
+- `DATABASE_URL` - PostgreSQL connection string
+- `MONGODB_URL` - MongoDB connection string (optional)
+- `NEO4J_URI` - Neo4j Bolt URI
+- `NEO4J_USERNAME` / `NEO4J_PASSWORD` - Neo4j credentials

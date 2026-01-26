@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     libcurl4-openssl-dev \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Clone llama.cpp (use specific commit for reproducibility)
@@ -69,6 +70,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libcurl4 \
+    libgomp1 \
+    libssl3 \
     openssh-server \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd \
