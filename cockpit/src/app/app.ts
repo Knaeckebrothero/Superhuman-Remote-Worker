@@ -11,6 +11,7 @@ import { AgentActivityComponent } from './components/agent-activity/agent-activi
 import { RequestViewerComponent } from './components/request-viewer/request-viewer.component';
 import { GraphTimelineComponent } from './components/graph-timeline/graph-timeline.component';
 import { TodoListComponent } from './components/todo-list/todo-list.component';
+import { ChatHistoryComponent } from './components/chat-history/chat-history.component';
 
 @Component({
   selector: 'app-root',
@@ -101,6 +102,12 @@ export class App implements OnInit {
       type: 'todo-list',
       displayName: 'Todo List',
       component: TodoListComponent,
+    });
+
+    this.registry.register({
+      type: 'agent-chat',
+      displayName: 'Chat History',
+      component: ChatHistoryComponent,
     });
   }
 }

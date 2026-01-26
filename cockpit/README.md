@@ -30,6 +30,8 @@ npm start
 │    PostgreSQL    │     MongoDB      │        Neo4j          │
 │   (jobs, reqs)   │  (audit trail)   │   (graph changes)     │
 └──────────────────┴──────────────────┴───────────────────────┘
+        │
+        └──── MCP Server (stdio) ← Claude Code
 ```
 
 ## Features
@@ -82,3 +84,51 @@ The backend requires these environment variables (see `.env.example`):
 - `MONGODB_URL` - MongoDB connection string (optional)
 - `NEO4J_URI` - Neo4j Bolt URI
 - `NEO4J_USERNAME` / `NEO4J_PASSWORD` - Neo4j credentials
+
+## MCP Server
+
+The MCP (Model Context Protocol) server exposes cockpit metrics to LLMs like Claude Code, enabling AI-assisted debugging of agent jobs.
+
+### Setup
+
+**Local development:**
+```bash
+cd cockpit/mcp
+pip install -r requirements.txt
+python run.py
+```
+
+**Docker:**
+```bash
+podman-compose -f docker-compose.dev.yaml up -d cockpit-mcp
+docker exec -i graphrag-cockpit-mcp-dev python run.py
+```
+
+### Claude Code Configuration
+
+The project includes `.mcp.json` with the MCP server configuration. Claude Code will prompt you to enable it.
+
+For containerized setup, create or update `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "cockpit-debug": {
+      "command": "docker",
+      "args": ["exec", "-i", "graphrag-cockpit-mcp-dev", "python", "run.py"]
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `list_jobs` | List jobs with status filter |
+| `get_job` | Get job details by ID |
+| `get_audit_trail` | Get paginated audit entries |
+| `get_chat_history` | Get conversation turns |
+| `get_todos` | Get current and archived todos |
+| `get_graph_changes` | Get Neo4j graph mutations timeline |
+| `get_llm_request` | Get full LLM request/response |
+| `search_audit` | Search audit entries by pattern |

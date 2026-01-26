@@ -139,9 +139,11 @@ class LLMArchiver:
         self._mongo_db = MongoDB(url=mongodb_url) if mongodb_url else None
         self._collection = None
         self._audit_collection = None
+        self._chat_history_collection = None
         self._connected = False
         self._connection_attempted = False
         self._step_counters: Dict[str, int] = {}  # Per-job step counters
+        self._chat_sequence_counters: Dict[str, int] = {}  # Per-job chat sequence
 
     @classmethod
     def from_env(cls) -> Optional["LLMArchiver"]:
@@ -193,6 +195,7 @@ class LLMArchiver:
             # Get collections from the underlying database
             self._collection = self._mongo_db.db[self._collection_name]
             self._audit_collection = self._mongo_db.db[self._audit_collection_name]
+            self._chat_history_collection = self._mongo_db.db["chat_history"]
             self._connected = True
 
             logger.info(f"LLM Archiver connected to MongoDB: {self._database_name}")
@@ -216,6 +219,20 @@ class LLMArchiver:
         self._step_counters[job_id] += 1
         return self._step_counters[job_id]
 
+    def _get_next_chat_sequence(self, job_id: str) -> int:
+        """Get the next chat sequence number for a job.
+
+        Args:
+            job_id: Job identifier
+
+        Returns:
+            Next sequential chat sequence number for this job.
+        """
+        if job_id not in self._chat_sequence_counters:
+            self._chat_sequence_counters[job_id] = 0
+        self._chat_sequence_counters[job_id] += 1
+        return self._chat_sequence_counters[job_id]
+
     def _truncate_string(self, s: str, max_length: int = 500) -> str:
         """Truncate a string to max_length with ellipsis indicator."""
         if not s or len(s) <= max_length:
@@ -232,6 +249,8 @@ class LLMArchiver:
         latency_ms: Optional[int] = None,
         iteration: Optional[int] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        phase: Optional[str] = None,
+        phase_number: Optional[int] = None,
     ) -> Optional[str]:
         """Archive an LLM request/response.
 
@@ -244,6 +263,8 @@ class LLMArchiver:
             latency_ms: Request latency in milliseconds
             iteration: Current iteration number
             metadata: Additional metadata to store
+            phase: Current phase ("strategic" or "tactical")
+            phase_number: Current phase number
 
         Returns:
             Inserted document ID, or None if archiving failed.
@@ -304,6 +325,21 @@ class LLMArchiver:
                 f"[LLM] {doc_id[-8:]} | job={job_id[:8]}... | {iter_str} | "
                 f"{latency_str} | {tool_str}"
             )
+
+            # Also write to chat_history collection for clean conversation view
+            self._archive_chat_entry(
+                job_id=job_id,
+                agent_type=agent_type,
+                messages=messages,
+                response=response,
+                model=model,
+                latency_ms=latency_ms,
+                iteration=iteration,
+                request_id=doc_id,
+                phase=phase,
+                phase_number=phase_number,
+            )
+
             return doc_id
 
         except Exception as e:
@@ -381,6 +417,125 @@ class LLMArchiver:
         except Exception as e:
             logger.warning(f"Failed to get job stats: {e}")
             return {}
+
+    def _archive_chat_entry(
+        self,
+        job_id: str,
+        agent_type: str,
+        messages: Sequence[BaseMessage],
+        response: AIMessage,
+        model: str,
+        latency_ms: Optional[int],
+        iteration: Optional[int],
+        request_id: str,
+        phase: Optional[str],
+        phase_number: Optional[int],
+    ) -> None:
+        """Extract delta and write to chat_history collection.
+
+        This stores only the new messages (inputs that triggered this response)
+        and the LLM response, enabling a clean sequential view of conversations.
+
+        Args:
+            job_id: Job identifier
+            agent_type: Agent type
+            messages: Full message list sent to LLM
+            response: LLM response (AIMessage)
+            model: Model name used
+            latency_ms: Request latency in milliseconds
+            iteration: Current iteration number
+            request_id: ID linking to llm_requests collection
+            phase: Current phase ("strategic" or "tactical")
+            phase_number: Current phase number
+        """
+        if self._chat_history_collection is None:
+            return
+
+        try:
+            # Find new inputs: messages after the last AIMessage
+            # These are the messages that triggered this response
+            last_ai_idx = -1
+            for i, msg in enumerate(messages):
+                if isinstance(msg, AIMessage):
+                    last_ai_idx = i
+
+            # New inputs are everything after last AI message (excluding system)
+            new_inputs = []
+            start_idx = last_ai_idx + 1 if last_ai_idx >= 0 else 0
+            for msg in messages[start_idx:]:
+                if isinstance(msg, SystemMessage):
+                    continue
+
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+
+                input_entry: Dict[str, Any] = {
+                    "type": "human" if isinstance(msg, HumanMessage) else "tool",
+                    "content": content,
+                    "content_preview": self._truncate_string(content, 500),
+                }
+
+                # Add tool-specific fields
+                if isinstance(msg, ToolMessage):
+                    input_entry["tool_call_id"] = getattr(msg, "tool_call_id", None)
+                    input_entry["tool_name"] = getattr(msg, "name", None)
+
+                new_inputs.append(input_entry)
+
+            # Extract response
+            resp_content = response.content if isinstance(response.content, str) else str(response.content)
+            response_data: Dict[str, Any] = {
+                "content": resp_content,
+                "content_preview": self._truncate_string(resp_content, 500),
+                "has_tool_calls": bool(response.tool_calls) if hasattr(response, "tool_calls") else False,
+            }
+
+            # Add tool calls if present
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                response_data["tool_calls"] = [
+                    {
+                        "id": tc.get("id", ""),
+                        "name": tc.get("name", ""),
+                        "args_preview": self._truncate_string(str(tc.get("args", {})), 200),
+                    }
+                    for tc in response.tool_calls
+                ]
+
+            # Extract reasoning (DeepSeek-style models with reasoning_content)
+            reasoning = None
+            if hasattr(response, "additional_kwargs") and response.additional_kwargs:
+                reasoning_content = response.additional_kwargs.get("reasoning_content")
+                if reasoning_content:
+                    reasoning = {
+                        "content": reasoning_content,
+                        "content_preview": self._truncate_string(reasoning_content, 500),
+                    }
+
+            # Build document
+            doc: Dict[str, Any] = {
+                "job_id": job_id,
+                "agent_type": agent_type,
+                "sequence_number": self._get_next_chat_sequence(job_id),
+                "timestamp": datetime.now(timezone.utc),
+                "iteration": iteration,
+                "model": model,
+                "latency_ms": latency_ms,
+                "inputs": new_inputs,
+                "response": response_data,
+                "request_id": request_id,
+            }
+
+            if phase:
+                doc["phase"] = phase
+            if phase_number is not None:
+                doc["phase_number"] = phase_number
+            if reasoning:
+                doc["reasoning"] = reasoning
+
+            self._chat_history_collection.insert_one(doc)
+            logger.debug(f"[CHAT] Archived chat entry for job {job_id[:8]}...")
+
+        except Exception as e:
+            logger.warning(f"Failed to archive chat entry: {e}")
 
     def get_recent_requests(
         self,
@@ -850,6 +1005,8 @@ def archive_llm_request(
     latency_ms: Optional[int] = None,
     iteration: Optional[int] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    phase: Optional[str] = None,
+    phase_number: Optional[int] = None,
 ) -> Optional[str]:
     """Convenience function to archive an LLM request using default archiver.
 
@@ -866,5 +1023,7 @@ def archive_llm_request(
             latency_ms=latency_ms,
             iteration=iteration,
             metadata=metadata,
+            phase=phase,
+            phase_number=phase_number,
         )
     return None

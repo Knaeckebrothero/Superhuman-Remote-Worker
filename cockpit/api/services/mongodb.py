@@ -219,6 +219,78 @@ class MongoDBService:
 
         return {"start": start_str, "end": end_str}
 
+    async def get_chat_history(
+        self,
+        job_id: str,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> dict[str, Any]:
+        """Get paginated chat history for a job.
+
+        Returns a clean sequential view of conversation turns (input -> response).
+
+        Args:
+            job_id: The job UUID to query
+            page: Page number (1-indexed). Use -1 to request the last page.
+            page_size: Number of entries per page
+
+        Returns:
+            Dict with entries, total count, pagination info
+        """
+        if not self._available or self._db is None:
+            return {
+                "entries": [],
+                "total": 0,
+                "page": max(1, page),
+                "pageSize": page_size,
+                "hasMore": False,
+            }
+
+        collection = self._db["chat_history"]
+        query = {"job_id": job_id}
+
+        # Get total count for pagination
+        total = await collection.count_documents(query)
+
+        # Handle last page request (page=-1)
+        if page == -1:
+            page = max(1, math.ceil(total / page_size))
+
+        # Calculate skip and check if there are more pages
+        skip = (page - 1) * page_size
+        has_more = (skip + page_size) < total
+
+        # Fetch paginated entries, sorted by sequence_number
+        cursor = collection.find(query).sort("sequence_number", 1).skip(skip).limit(page_size)
+
+        entries = []
+        async for doc in cursor:
+            # Convert ObjectId to string for JSON serialization
+            doc["_id"] = str(doc["_id"])
+            entries.append(doc)
+
+        return {
+            "entries": entries,
+            "total": total,
+            "page": page,
+            "pageSize": page_size,
+            "hasMore": has_more,
+        }
+
+    async def get_chat_history_count(self, job_id: str) -> int:
+        """Get total chat history entries for a job.
+
+        Args:
+            job_id: The job UUID to query
+
+        Returns:
+            Number of chat history entries for the job
+        """
+        if not self._available or self._db is None:
+            return 0
+
+        return await self._db["chat_history"].count_documents({"job_id": job_id})
+
 
 # Singleton instance
 mongodb_service = MongoDBService()
