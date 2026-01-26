@@ -194,11 +194,11 @@ fi
 CMD="/app/llama-server"
 
 # Model source - use HuggingFace download
-CMD="${CMD} --hf ${MODEL}"
+CMD="${CMD} --hf-repo ${MODEL}"
 
 # If specific model file requested
 if [ -n "${MODEL_FILE}" ]; then
-    CMD="${CMD} --model-file ${MODEL_FILE}"
+    CMD="${CMD} --hf-file ${MODEL_FILE}"
 fi
 
 # Context and layers
@@ -215,7 +215,9 @@ CMD="${CMD} --ubatch-size ${UBATCH_SIZE}"
 
 # Performance flags
 if [ "${FLASH_ATTN}" = "true" ]; then
-    CMD="${CMD} --flash-attn"
+    CMD="${CMD} --flash-attn on"
+elif [ "${FLASH_ATTN}" = "false" ]; then
+    CMD="${CMD} --flash-attn off"
 fi
 
 if [ "${MLOCK}" = "true" ]; then
@@ -226,7 +228,7 @@ if [ "${NO_MMAP}" = "true" ]; then
     CMD="${CMD} --no-mmap"
 fi
 
-# Enable Jinja templating for chat templates
+# Enable Jinja templating (required for tool calling)
 CMD="${CMD} --jinja"
 
 # Grammar for tool calling (GBNF enforces valid Harmony format)
