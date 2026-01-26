@@ -134,8 +134,7 @@ def create_citation_tools(engine: CitationEngine) -> list:
     except ImportError as e:
         log.error("langchain-core not installed, cannot create citation tools")
         raise ImportError(
-            "langchain-core is required for tool creation. "
-            "Install with: pip install langchain-core"
+            "langchain-core is required for tool creation. Install with: pip install langchain-core"
         ) from e
 
     @tool(args_schema=CitationInput)
@@ -178,8 +177,7 @@ def create_citation_tools(engine: CitationEngine) -> list:
         valid_types = ("document", "website", "database", "custom")
         if source_type not in valid_types:
             error_msg = (
-                f"Invalid source_type: '{source_type}'. "
-                f"Must be one of: {', '.join(valid_types)}"
+                f"Invalid source_type: '{source_type}'. Must be one of: {', '.join(valid_types)}"
             )
             log.warning(error_msg)
             return f"Error: {error_msg}"
@@ -299,8 +297,7 @@ def create_citation_tools(engine: CitationEngine) -> list:
         valid_types = ("document", "website", "database", "custom")
         if source_type not in valid_types:
             error_msg = (
-                f"Invalid source_type: '{source_type}'. "
-                f"Must be one of: {', '.join(valid_types)}"
+                f"Invalid source_type: '{source_type}'. Must be one of: {', '.join(valid_types)}"
             )
             log.warning(error_msg)
             return f"Error: {error_msg}"
@@ -434,7 +431,10 @@ def create_citation_tools(engine: CitationEngine) -> list:
             lines.append(f"  Similarity: {citation.similarity_score:.2f}")
 
         # Add verification notes if failed
-        if citation.verification_status == VerificationStatus.FAILED and citation.verification_notes:
+        if (
+            citation.verification_status == VerificationStatus.FAILED
+            and citation.verification_notes
+        ):
             notes = citation.verification_notes
             if len(notes) > 150:
                 notes = notes[:147] + "..."
@@ -683,8 +683,7 @@ class CitationTool:
             raise ValueError(f"Unknown source type: {source_type}")
 
         log.info(
-            f"Created citation [{result.citation_id}]: "
-            f"status={result.verification_status.value}"
+            f"Created citation [{result.citation_id}]: status={result.verification_status.value}"
         )
         return result
 

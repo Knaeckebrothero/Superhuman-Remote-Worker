@@ -14,14 +14,16 @@ from typing import Any
 
 class SourceType(str, Enum):
     """Types of sources that can be registered and cited."""
+
     DOCUMENT = "document"  # PDFs, markdown, txt, json, csv, images
-    WEBSITE = "website"    # Web pages (archived at registration)
+    WEBSITE = "website"  # Web pages (archived at registration)
     DATABASE = "database"  # SQL, NoSQL, graph DB records
-    CUSTOM = "custom"      # AI-generated artifacts (matrices, plots, computed results)
+    CUSTOM = "custom"  # AI-generated artifacts (matrices, plots, computed results)
 
 
 class VerificationStatus(str, Enum):
     """Status of citation verification."""
+
     PENDING = "pending"
     VERIFIED = "verified"
     FAILED = "failed"
@@ -30,15 +32,17 @@ class VerificationStatus(str, Enum):
 
 class ExtractionMethod(str, Enum):
     """How the information was extracted from the source."""
-    DIRECT_QUOTE = "direct_quote"   # Exact text quoted
-    PARAPHRASE = "paraphrase"       # Rephrased in agent's words
-    INFERENCE = "inference"         # Conclusion drawn from source
-    AGGREGATION = "aggregation"     # Combined from multiple data points
-    NEGATIVE = "negative"           # Source was checked but doesn't support claim
+
+    DIRECT_QUOTE = "direct_quote"  # Exact text quoted
+    PARAPHRASE = "paraphrase"  # Rephrased in agent's words
+    INFERENCE = "inference"  # Conclusion drawn from source
+    AGGREGATION = "aggregation"  # Combined from multiple data points
+    NEGATIVE = "negative"  # Source was checked but doesn't support claim
 
 
 class Confidence(str, Enum):
     """Agent's self-assessment of citation confidence."""
+
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
@@ -63,6 +67,7 @@ class Source:
         content_hash: SHA-256 hash of content for integrity
         created_at: When the source was registered
     """
+
     id: int
     type: SourceType
     identifier: str
@@ -114,6 +119,7 @@ class Citation:
         matched_location: Where the quote was found during verification
         created_by: Agent/session identifier for audit trails
     """
+
     id: int
     claim: str
     quote_context: str
@@ -137,7 +143,9 @@ class Citation:
             "id": self.id,
             "claim": self.claim,
             "verbatim_quote": self.verbatim_quote,
-            "quote_context": self.quote_context[:200] + "..." if len(self.quote_context) > 200 else self.quote_context,
+            "quote_context": self.quote_context[:200] + "..."
+            if len(self.quote_context) > 200
+            else self.quote_context,
             "quote_language": self.quote_language,
             "relevance_reasoning": self.relevance_reasoning,
             "confidence": self.confidence.value,
@@ -171,6 +179,7 @@ class CitationResult:
         summary_note: Short note for context window management
         verification_notes: Explanation if verification failed
     """
+
     citation_id: int
     verification_status: VerificationStatus
     similarity_score: float | None = None
@@ -214,6 +223,7 @@ class VerificationResult:
         reasoning: Explanation of verification decision
         error: Error message if verification failed
     """
+
     is_verified: bool
     similarity_score: float = 0.0
     matched_text: str | None = None
@@ -246,6 +256,7 @@ class CitationContext:
         user_id: On whose behalf the citation was made
         project_id: Which project (Fessi, GoBD, SLR, etc.)
     """
+
     session_id: str
     agent_id: str | None = None
     user_id: str | None = None
@@ -266,6 +277,7 @@ class CitationError:
         suggestion: How to fix the error
         partial_result: Any data captured before failure
     """
+
     error_type: str
     message: str
     suggestion: str | None = None

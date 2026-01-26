@@ -119,6 +119,7 @@ class CitationEngine:
         self.llm_model = os.getenv("CITATION_LLM_MODEL", "gpt-4o-mini")
         self.llm_api_key = os.getenv("OPENAI_API_KEY", "")
         self.reasoning_level = os.getenv("CITATION_REASONING_LEVEL", "high")
+        self.skip_verification = os.getenv("CITATION_SKIP_VERIFICATION", "false").lower() == "true"
 
         # Reasoning requirement configuration
         reasoning_config = os.getenv("CITATION_REASONING_REQUIRED", "low")
@@ -137,7 +138,8 @@ class CitationEngine:
         log.info(
             f"CitationEngine initialized: mode={mode}, "
             f"reasoning_required={self.reasoning_required}, "
-            f"reasoning_level={self.reasoning_level}"
+            f"reasoning_level={self.reasoning_level}, "
+            f"skip_verification={self.skip_verification}"
         )
 
     def __enter__(self):
@@ -332,7 +334,11 @@ class CitationEngine:
             log.error(f"Query execution failed: {e}")
             log.debug(f"Failed query: {query[:200]}...")
             if params:
-                log.debug(f"Query params: {params[:5]}..." if len(params) > 5 else f"Query params: {params}")
+                log.debug(
+                    f"Query params: {params[:5]}..."
+                    if len(params) > 5
+                    else f"Query params: {params}"
+                )
             raise
 
     def _query(
@@ -798,8 +804,7 @@ class CitationEngine:
         except ImportError as e:
             log.error("PyMuPDF not installed, cannot extract PDF content")
             raise ImportError(
-                "PyMuPDF is required for PDF extraction. "
-                "Install it with: pip install pymupdf"
+                "PyMuPDF is required for PDF extraction. Install it with: pip install pymupdf"
             ) from e
 
     def _fetch_web_content(self, url: str) -> tuple[str, dict[str, Any]]:
@@ -1135,7 +1140,7 @@ class CitationEngine:
 
         # Perform synchronous verification
         verification = self._verify_citation(
-            citation_id, source, quote_context, verbatim_quote, claim
+            citation_id, source, quote_context, verbatim_quote, claim, locator
         )
 
         # Update citation with verification result
@@ -1292,9 +1297,9 @@ class CitationEngine:
             kwargs = {
                 "model": self.llm_model,
                 "temperature": 0.0,  # Deterministic verification
-                "timeout": 600,  # 10 minutes - prevent infinite hangs
-                "max_retries": 3,  # Retry on transient failures
-                "max_tokens": 65536,  # 64K max response tokens
+                "timeout": 120,  # 2 min - verification of 3 pages should be fast
+                "max_retries": 1,  # 1 retry only - avoid long waits on failures
+                "max_tokens": 4096,  # Verification response is small JSON
             }
 
             # Add model_kwargs if non-empty
@@ -1303,13 +1308,29 @@ class CitationEngine:
 
             if self.llm_url:
                 kwargs["base_url"] = self.llm_url
-                log.info(f"Using custom LLM endpoint: {self.llm_url}")
 
             if self.llm_api_key:
                 kwargs["api_key"] = self.llm_api_key
 
-            self._llm_client = ChatOpenAI(**kwargs)
-            log.debug(f"Verification LLM client initialized with model: {self.llm_model}")
+            base_client = ChatOpenAI(**kwargs)
+
+            # Use structured output so the model knows when to stop
+            from pydantic import BaseModel, Field
+
+            class VerificationResponse(BaseModel):
+                """Structured response for citation verification."""
+
+                verified: bool = Field(description="Whether the citation is valid")
+                similarity_score: float = Field(
+                    description="How closely the quote matches the source (0-1)"
+                )
+                matched_text: str | None = Field(
+                    default=None, description="The actual text found in the source"
+                )
+                reasoning: str = Field(description="Brief explanation of the decision")
+
+            self._llm_client = base_client.with_structured_output(VerificationResponse)
+            log.debug(f"Verification LLM client initialized: {self.llm_model}")
 
         except ImportError as e:
             log.warning("langchain-openai not installed, verification will be limited")
@@ -1325,6 +1346,7 @@ class CitationEngine:
         quote_context: str,
         verbatim_quote: str | None,
         claim: str,
+        locator: dict | None = None,
     ) -> VerificationResult:
         """
         Verify a citation using the verification LLM.
@@ -1337,11 +1359,23 @@ class CitationEngine:
             quote_context: The context provided by the agent
             verbatim_quote: The exact quote (if any)
             claim: The claim being supported
+            locator: Optional locator dict with page/section info
 
         Returns:
             VerificationResult with verification status
         """
         log.debug(f"Verifying citation [{citation_id}] against source [{source.id}]")
+
+        # Skip verification if configured (for development/testing)
+        if self.skip_verification:
+            log.info(
+                f"Skipping verification for citation [{citation_id}] (CITATION_SKIP_VERIFICATION=true)"
+            )
+            return VerificationResult(
+                is_verified=True,
+                similarity_score=1.0,
+                reasoning="Verification skipped (CITATION_SKIP_VERIFICATION=true)",
+            )
 
         try:
             self._setup_llm_client()
@@ -1354,33 +1388,45 @@ class CitationEngine:
                 error=str(e),
             )
 
+        # Extract relevant portion of source content based on locator
+        source_content = self._extract_relevant_content(source.content, locator)
+
         # Build verification prompt
         prompt = self._build_verification_prompt(
-            source_content=source.content,
+            source_content=source_content,
             quote_context=quote_context,
             verbatim_quote=verbatim_quote,
             claim=claim,
         )
 
         try:
+            import time
+
             from langchain_core.messages import HumanMessage, SystemMessage
 
+            system_prompt = self._get_verification_system_prompt()
             messages = [
-                SystemMessage(content=self._get_verification_system_prompt()),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=prompt),
             ]
 
+            # Invoke with structured output
+            start_time = time.time()
             log.debug("Sending verification request to LLM...")
-            response = self._llm_client.invoke(messages)
-            log.debug("Received verification response from LLM")
 
-            # Parse the response
-            result = self._parse_verification_response(response.content)
+            response = self._llm_client.invoke(messages)
+
+            elapsed_ms = int((time.time() - start_time) * 1000)
             log.debug(
-                f"Verification result: verified={result.is_verified}, "
-                f"score={result.similarity_score:.2f}"
+                f"Verification complete in {elapsed_ms}ms: "
+                f"verified={response.verified}, score={response.similarity_score:.2f}"
             )
-            return result
+
+            return VerificationResult(
+                is_verified=response.verified,
+                similarity_score=response.similarity_score,
+                reasoning=response.reasoning,
+            )
 
         except Exception as e:
             log.error(f"Verification failed for citation [{citation_id}]: {e}")
@@ -1408,6 +1454,69 @@ Respond in JSON format with these fields:
 
 Be strict but fair. Minor paraphrasing is acceptable if the meaning is preserved.
 If the quote cannot be found or doesn't support the claim, explain why."""
+
+    def _extract_relevant_content(
+        self,
+        full_content: str,
+        locator: dict | None,
+    ) -> str:
+        """
+        Extract the relevant portion of source content based on locator.
+
+        For PDFs with page markers, extracts just the cited page plus
+        adjacent pages for context. This dramatically reduces LLM context
+        and speeds up verification.
+
+        Args:
+            full_content: Full source content (may include page markers)
+            locator: Locator dict with page/section info, or None
+
+        Returns:
+            Relevant content portion, or full content if no locator
+        """
+        if not locator or "page" not in locator:
+            log.debug("No page locator, using full content")
+            return full_content
+
+        page_num = locator["page"]
+        log.debug(f"Extracting content for page {page_num}")
+
+        # Split content by page markers
+        import re
+
+        page_pattern = r"--- Page (\d+) ---"
+        pages = re.split(page_pattern, full_content)
+
+        # pages list: ['', '1', 'content1', '2', 'content2', ...]
+        # Build page_num -> content mapping
+        page_contents = {}
+        for i in range(1, len(pages), 2):
+            if i + 1 < len(pages):
+                try:
+                    num = int(pages[i])
+                    page_contents[num] = pages[i + 1].strip()
+                except ValueError:
+                    continue
+
+        if not page_contents:
+            log.debug("No page markers found in content, using full content")
+            return full_content
+
+        # Extract target page plus adjacent pages for context
+        context_pages = 1  # Include 1 page before and after
+        extracted_parts = []
+
+        for p in range(page_num - context_pages, page_num + context_pages + 1):
+            if p in page_contents:
+                extracted_parts.append(f"--- Page {p} ---\n{page_contents[p]}")
+
+        if not extracted_parts:
+            log.warning(f"Page {page_num} not found in source, using full content")
+            return full_content
+
+        extracted = "\n\n".join(extracted_parts)
+        log.debug(f"Extracted {len(extracted)} chars for page {page_num}")
+        return extracted
 
     def _build_verification_prompt(
         self,
@@ -1768,7 +1877,7 @@ Respond in JSON format."""
 
             return f"""@{entry_type}{{cite{citation.id},
     title = {{{source.name}}},
-    year = {{{source.version or 'n.d.'}}},
+    year = {{{source.version or "n.d."}}},
     note = {{{source.identifier}}}
 }}"""
 
@@ -1778,8 +1887,7 @@ Respond in JSON format."""
 
         else:
             raise ValueError(
-                f"Unknown citation style: {style}. "
-                "Supported: inline, harvard, ieee, bibtex, apa"
+                f"Unknown citation style: {style}. Supported: inline, harvard, ieee, bibtex, apa"
             )
 
     def export_bibliography(
@@ -1849,8 +1957,12 @@ Respond in JSON format."""
             query = "SELECT verification_status, COUNT(*) as count FROM citations GROUP BY verification_status"
 
         results = self._query(query)
-        stats["citations"]["by_status"] = {row["verification_status"]: row["count"] for row in results}
+        stats["citations"]["by_status"] = {
+            row["verification_status"]: row["count"] for row in results
+        }
         stats["citations"]["total"] = sum(stats["citations"]["by_status"].values())
 
-        log.debug(f"Statistics: {stats['sources']['total']} sources, {stats['citations']['total']} citations")
+        log.debug(
+            f"Statistics: {stats['sources']['total']} sources, {stats['citations']['total']} citations"
+        )
         return stats
