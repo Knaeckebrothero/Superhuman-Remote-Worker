@@ -4,8 +4,13 @@ Provides access to:
 - Current todos (todos.yaml)
 - Archived todos (archive/todos_*.md)
 - Workspace metadata
+
+Configuration:
+    Set WORKSPACE_PATH environment variable to override the default workspace location.
+    This is useful when running the API in a container with a mounted workspace volume.
 """
 
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -20,13 +25,28 @@ class WorkspaceService:
         """Initialize workspace service.
 
         Args:
-            workspace_base: Base path for workspaces. If None, uses default location.
+            workspace_base: Base path for workspaces. Priority:
+                1. Explicit workspace_base argument
+                2. WORKSPACE_PATH environment variable
+                3. Default: ../../../workspace relative to this file
         """
         if workspace_base:
             self._base = Path(workspace_base)
+        elif os.environ.get("WORKSPACE_PATH"):
+            self._base = Path(os.environ["WORKSPACE_PATH"])
         else:
             # Default: relative to project root
             self._base = Path(__file__).parent.parent.parent.parent / "workspace"
+
+    @property
+    def base_path(self) -> Path:
+        """Get the configured workspace base path."""
+        return self._base
+
+    @property
+    def is_available(self) -> bool:
+        """Check if workspace directory exists and is accessible."""
+        return self._base.exists() and self._base.is_dir()
 
     def _get_job_path(self, job_id: str) -> Path | None:
         """Get the workspace path for a job.

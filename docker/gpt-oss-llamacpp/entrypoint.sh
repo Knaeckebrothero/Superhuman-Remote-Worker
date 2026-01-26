@@ -129,6 +129,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 # Memory management - Q8_0 KV cache recommended for quality/memory balance
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
+CACHE_REUSE="${CACHE_REUSE:-0}"  # Reuse KV cache between requests (0 = disabled)
 
 # Batch settings
 BATCH_SIZE="${BATCH_SIZE:-2048}"
@@ -208,6 +209,9 @@ CMD="${CMD} --n-gpu-layers ${N_GPU_LAYERS}"
 # Memory management - Q8 KV cache recommended for quality/memory balance
 CMD="${CMD} --cache-type-k ${CACHE_TYPE_K}"
 CMD="${CMD} --cache-type-v ${CACHE_TYPE_V}"
+if [ "${CACHE_REUSE}" -gt 0 ]; then
+    CMD="${CMD} --cache-reuse ${CACHE_REUSE}"
+fi
 
 # Batch settings
 CMD="${CMD} --batch-size ${BATCH_SIZE}"
@@ -279,6 +283,7 @@ echo "Model (GGUF):       ${MODEL}"
 echo "Context size:       ${CTX_SIZE}"
 echo "GPU layers:         ${N_GPU_LAYERS}"
 echo "KV cache type:      K=${CACHE_TYPE_K}, V=${CACHE_TYPE_V}"
+echo "Cache reuse:        ${CACHE_REUSE}"
 echo "Batch size:         ${BATCH_SIZE}"
 echo "Micro-batch:        ${UBATCH_SIZE}"
 echo ""

@@ -1,6 +1,8 @@
 /**
  * Chat history models for the chat_history MongoDB collection.
  * Provides a clean sequential view of conversations without duplicates.
+ *
+ * Note: Field names match MongoDB snake_case convention.
  */
 
 /**
@@ -9,9 +11,9 @@
 export interface ChatInput {
   type: 'human' | 'tool' | 'system';
   content: string;
-  contentPreview: string;
-  toolCallId?: string;
-  toolName?: string;
+  content_preview: string;
+  tool_call_id?: string;
+  tool_name?: string;
 }
 
 /**
@@ -20,7 +22,7 @@ export interface ChatInput {
 export interface ChatToolCall {
   id: string;
   name: string;
-  argsPreview: string;
+  args_preview: string;
 }
 
 /**
@@ -28,9 +30,9 @@ export interface ChatToolCall {
  */
 export interface ChatResponse {
   content: string;
-  contentPreview: string;
-  toolCalls?: ChatToolCall[];
-  hasToolCalls: boolean;
+  content_preview: string;
+  tool_calls?: ChatToolCall[];
+  has_tool_calls: boolean;
 }
 
 /**
@@ -38,7 +40,7 @@ export interface ChatResponse {
  */
 export interface ChatReasoning {
   content: string;
-  contentPreview: string;
+  content_preview: string;
 }
 
 /**
@@ -46,19 +48,19 @@ export interface ChatReasoning {
  */
 export interface ChatEntry {
   _id: string;
-  jobId: string;
-  agentType: string;
-  sequenceNumber: number;
+  job_id: string;
+  agent_type: string;
+  sequence_number: number;
   timestamp: string;
   iteration: number;
   phase?: string;
-  phaseNumber?: number;
+  phase_number?: number;
   model: string;
-  latencyMs?: number;
+  latency_ms?: number;
   inputs: ChatInput[];
   response: ChatResponse;
   reasoning?: ChatReasoning;
-  requestId: string;
+  request_id?: string;
 }
 
 /**

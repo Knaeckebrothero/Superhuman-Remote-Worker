@@ -1,291 +1,255 @@
 """MCP server exposing debug cockpit tools.
 
 Provides tools to inspect agent jobs, audit trails, todos, and graph changes
-via the Model Context Protocol.
+via the Model Context Protocol using FastMCP 2.0.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from fastmcp import FastMCP
+from starlette.responses import JSONResponse
 
 try:
-    from .client import CockpitClient
+    from .client import AsyncCockpitClient
 except ImportError:
-    from client import CockpitClient  # type: ignore[no-redef]
+    from client import AsyncCockpitClient  # type: ignore[no-redef]
 
 
-def create_server() -> Server:
-    """Create and configure the MCP server with all tools."""
-    app = Server("cockpit-debug")
-    client = CockpitClient()
+# Create the MCP server instance
+mcp = FastMCP("cockpit-debug", stateless_http=True)
 
-    @app.list_tools()
-    async def list_tools() -> list[Tool]:
-        """Return the list of available tools."""
-        return [
-            Tool(
-                name="list_jobs",
-                description=(
-                    "List agent jobs with optional status filter. "
-                    "Returns job ID, status, config name, timestamps, and audit entry count. "
-                    "Use this to find jobs to investigate."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "status": {
-                            "type": "string",
-                            "description": "Filter by status: pending, running, completed, failed",
-                            "enum": ["pending", "running", "completed", "failed"],
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum number of jobs to return",
-                            "default": 20,
-                            "minimum": 1,
-                            "maximum": 100,
-                        },
-                    },
-                },
-            ),
-            Tool(
-                name="get_job",
-                description=(
-                    "Get detailed information about a specific job by ID. "
-                    "Returns full job details including prompt, config, status, "
-                    "timestamps, and audit count."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "job_id": {
-                            "type": "string",
-                            "description": "Job UUID to retrieve",
-                        },
-                    },
-                    "required": ["job_id"],
-                },
-            ),
-            Tool(
-                name="get_audit_trail",
-                description=(
-                    "Get paginated audit entries for a job's execution. "
-                    "Shows LLM messages, tool calls, and errors. "
-                    "Use filter to narrow results. Page -1 returns the last page."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "job_id": {
-                            "type": "string",
-                            "description": "Job UUID to get audit for",
-                        },
-                        "page": {
-                            "type": "integer",
-                            "description": "Page number (1-indexed, -1 for last page)",
-                            "default": 1,
-                        },
-                        "page_size": {
-                            "type": "integer",
-                            "description": "Entries per page (max 200)",
-                            "default": 20,
-                            "minimum": 1,
-                            "maximum": 200,
-                        },
-                        "filter": {
-                            "type": "string",
-                            "description": "Filter category",
-                            "enum": ["all", "messages", "tools", "errors"],
-                            "default": "all",
-                        },
-                    },
-                    "required": ["job_id"],
-                },
-            ),
-            Tool(
-                name="get_chat_history",
-                description=(
-                    "Get paginated chat history for a job showing conversation turns. "
-                    "Returns clean sequential view of input/response pairs without duplicates. "
-                    "Use this to understand the agent's reasoning flow."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "job_id": {
-                            "type": "string",
-                            "description": "Job UUID to get chat history for",
-                        },
-                        "page": {
-                            "type": "integer",
-                            "description": "Page number (1-indexed, -1 for last page)",
-                            "default": 1,
-                        },
-                        "page_size": {
-                            "type": "integer",
-                            "description": "Entries per page (max 200)",
-                            "default": 20,
-                            "minimum": 1,
-                            "maximum": 200,
-                        },
-                    },
-                    "required": ["job_id"],
-                },
-            ),
-            Tool(
-                name="get_todos",
-                description=(
-                    "Get all todos for a job including current active todos and archives. "
-                    "Shows task planning and execution progress across phases."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "job_id": {
-                            "type": "string",
-                            "description": "Job UUID to get todos for",
-                        },
-                    },
-                    "required": ["job_id"],
-                },
-            ),
-            Tool(
-                name="get_graph_changes",
-                description=(
-                    "Get timeline of Neo4j graph mutations for a job. "
-                    "Returns parsed Cypher queries showing nodes/relationships "
-                    "created, modified, and deleted. Includes summary statistics."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "job_id": {
-                            "type": "string",
-                            "description": "Job UUID to get graph changes for",
-                        },
-                    },
-                    "required": ["job_id"],
-                },
-            ),
-            Tool(
-                name="get_llm_request",
-                description=(
-                    "Get full LLM request/response by MongoDB document ID. "
-                    "Returns complete message history, model response, and token usage. "
-                    "Use document IDs from audit trail entries."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "doc_id": {
-                            "type": "string",
-                            "description": "MongoDB ObjectId (24 hex characters)",
-                        },
-                    },
-                    "required": ["doc_id"],
-                },
-            ),
-            Tool(
-                name="search_audit",
-                description=(
-                    "Search audit entries by content pattern. "
-                    "Searches across message content, tool names, and arguments. "
-                    "Returns matching entries with context."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "job_id": {
-                            "type": "string",
-                            "description": "Job UUID to search within",
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "Search string (case-insensitive substring match)",
-                        },
-                        "limit": {
-                            "type": "integer",
-                            "description": "Maximum results to return",
-                            "default": 20,
-                            "minimum": 1,
-                            "maximum": 100,
-                        },
-                    },
-                    "required": ["job_id", "query"],
-                },
-            ),
-        ]
-
-    @app.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-        """Handle tool calls by dispatching to appropriate client methods."""
-        try:
-            result = _handle_tool(client, name, arguments)
-            return [TextContent(type="text", text=result)]
-        except Exception as e:
-            error_msg = f"Error calling {name}: {e}"
-            return [TextContent(type="text", text=error_msg)]
-
-    return app
+# Global client instance (initialized lazily)
+_client: AsyncCockpitClient | None = None
 
 
-def _handle_tool(client: CockpitClient, name: str, args: dict[str, Any]) -> str:
-    """Dispatch tool call to client and format result."""
-    if name == "list_jobs":
-        jobs = client.list_jobs(
-            status=args.get("status"),
-            limit=args.get("limit", 20),
-        )
-        return _format_jobs(jobs)
+def _get_client() -> AsyncCockpitClient:
+    """Get or create the async client instance."""
+    global _client
+    if _client is None:
+        _client = AsyncCockpitClient()
+    return _client
 
-    elif name == "get_job":
-        job = client.get_job(args["job_id"])
-        return _format_job_detail(job)
 
-    elif name == "get_audit_trail":
-        audit = client.get_audit_trail(
-            job_id=args["job_id"],
-            page=args.get("page", 1),
-            page_size=args.get("page_size", 20),
-            filter_category=args.get("filter", "all"),
-        )
-        return _format_audit(audit)
+# =============================================================================
+# Health Check Endpoint
+# =============================================================================
 
-    elif name == "get_chat_history":
-        chat = client.get_chat_history(
-            job_id=args["job_id"],
-            page=args.get("page", 1),
-            page_size=args.get("page_size", 20),
-        )
-        return _format_chat_history(chat)
 
-    elif name == "get_todos":
-        todos = client.get_todos(args["job_id"])
-        return _format_todos(todos)
-
-    elif name == "get_graph_changes":
-        changes = client.get_graph_changes(args["job_id"])
-        return _format_graph_changes(changes)
-
-    elif name == "get_llm_request":
-        request = client.get_llm_request(args["doc_id"])
-        return _format_llm_request(request)
-
-    elif name == "search_audit":
-        return _search_audit(
-            client,
-            job_id=args["job_id"],
-            query=args["query"],
-            limit=args.get("limit", 20),
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Kubernetes health probe endpoint."""
+    try:
+        client = _get_client()
+        await client.health_check()
+        return JSONResponse({"status": "healthy", "backend": "connected"})
+    except Exception as e:
+        return JSONResponse(
+            {"status": "degraded", "error": str(e)},
+            status_code=503,
         )
 
-    else:
-        return f"Unknown tool: {name}"
+
+# =============================================================================
+# MCP Tools
+# =============================================================================
+
+
+@mcp.tool
+async def list_jobs(
+    status: Literal["pending", "running", "completed", "failed"] | None = None,
+    limit: int = 20,
+) -> str:
+    """List agent jobs with optional status filter.
+
+    Returns job ID, status, config name, timestamps, and audit entry count.
+    Use this to find jobs to investigate.
+
+    Args:
+        status: Filter by status (pending, running, completed, failed)
+        limit: Maximum jobs to return (1-100, default 20)
+
+    Returns:
+        Formatted list of jobs with ID, status, config, timestamps
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 100:
+        limit = 100
+
+    client = _get_client()
+    jobs = await client.list_jobs(status=status, limit=limit)
+    return _format_jobs(jobs)
+
+
+@mcp.tool
+async def get_job(job_id: str) -> str:
+    """Get detailed information about a specific job by ID.
+
+    Returns full job details including prompt, config, status,
+    timestamps, and audit count.
+
+    Args:
+        job_id: Job UUID to retrieve
+
+    Returns:
+        Formatted job details
+    """
+    client = _get_client()
+    job = await client.get_job(job_id)
+    return _format_job_detail(job)
+
+
+@mcp.tool
+async def get_audit_trail(
+    job_id: str,
+    page: int = 1,
+    page_size: int = 20,
+    filter: Literal["all", "messages", "tools", "errors"] = "all",
+) -> str:
+    """Get paginated audit entries for a job's execution.
+
+    Shows LLM messages, tool calls, and errors.
+    Use filter to narrow results. Page -1 returns the last page.
+
+    Args:
+        job_id: Job UUID to get audit for
+        page: Page number (1-indexed, -1 for last page)
+        page_size: Entries per page (max 200, default 20)
+        filter: Filter category (all, messages, tools, errors)
+
+    Returns:
+        Formatted audit trail entries
+    """
+    if page_size < 1:
+        page_size = 1
+    elif page_size > 200:
+        page_size = 200
+
+    client = _get_client()
+    audit = await client.get_audit_trail(
+        job_id=job_id,
+        page=page,
+        page_size=page_size,
+        filter_category=filter,
+    )
+    return _format_audit(audit)
+
+
+@mcp.tool
+async def get_chat_history(
+    job_id: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> str:
+    """Get paginated chat history for a job showing conversation turns.
+
+    Returns clean sequential view of input/response pairs without duplicates.
+    Use this to understand the agent's reasoning flow.
+
+    Args:
+        job_id: Job UUID to get chat history for
+        page: Page number (1-indexed, -1 for last page)
+        page_size: Entries per page (max 200, default 20)
+
+    Returns:
+        Formatted chat history
+    """
+    if page_size < 1:
+        page_size = 1
+    elif page_size > 200:
+        page_size = 200
+
+    client = _get_client()
+    chat = await client.get_chat_history(
+        job_id=job_id,
+        page=page,
+        page_size=page_size,
+    )
+    return _format_chat_history(chat)
+
+
+@mcp.tool
+async def get_todos(job_id: str) -> str:
+    """Get all todos for a job including current active todos and archives.
+
+    Shows task planning and execution progress across phases.
+
+    Args:
+        job_id: Job UUID to get todos for
+
+    Returns:
+        Formatted todos with current and archived phases
+    """
+    client = _get_client()
+    todos = await client.get_todos(job_id)
+    return _format_todos(todos)
+
+
+@mcp.tool
+async def get_graph_changes(job_id: str) -> str:
+    """Get timeline of Neo4j graph mutations for a job.
+
+    Returns parsed Cypher queries showing nodes/relationships
+    created, modified, and deleted. Includes summary statistics.
+
+    Args:
+        job_id: Job UUID to get graph changes for
+
+    Returns:
+        Formatted graph changes timeline with summary
+    """
+    client = _get_client()
+    changes = await client.get_graph_changes(job_id)
+    return _format_graph_changes(changes)
+
+
+@mcp.tool
+async def get_llm_request(doc_id: str) -> str:
+    """Get full LLM request/response by MongoDB document ID.
+
+    Returns complete message history, model response, and token usage.
+    Use document IDs from audit trail entries.
+
+    Args:
+        doc_id: MongoDB ObjectId (24 hex characters)
+
+    Returns:
+        Formatted LLM request with messages and response
+    """
+    client = _get_client()
+    request = await client.get_llm_request(doc_id)
+    return _format_llm_request(request)
+
+
+@mcp.tool
+async def search_audit(
+    job_id: str,
+    query: str,
+    limit: int = 20,
+) -> str:
+    """Search audit entries by content pattern.
+
+    Searches across message content, tool names, and arguments.
+    Returns matching entries with context.
+
+    Args:
+        job_id: Job UUID to search within
+        query: Search string (case-insensitive substring match)
+        limit: Maximum results to return (1-100, default 20)
+
+    Returns:
+        Formatted search results
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 100:
+        limit = 100
+
+    client = _get_client()
+    return await _search_audit(client, job_id=job_id, query=query, limit=limit)
 
 
 # =============================================================================
@@ -346,7 +310,6 @@ def _format_audit(audit: dict[str, Any]) -> str:
     entries = audit.get("entries", [])
     total = audit.get("total", 0)
     page = audit.get("page", 1)
-    page_size = audit.get("pageSize", 50)
     has_more = audit.get("hasMore", False)
 
     if audit.get("error"):
@@ -578,8 +541,8 @@ def _format_llm_request(request: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _search_audit(
-    client: CockpitClient,
+async def _search_audit(
+    client: AsyncCockpitClient,
     job_id: str,
     query: str,
     limit: int = 20,
@@ -591,7 +554,7 @@ def _search_audit(
     # Fetch pages until we have enough matches or run out
     page = 1
     while len(matches) < limit:
-        audit = client.get_audit_trail(
+        audit = await client.get_audit_trail(
             job_id=job_id,
             page=page,
             page_size=100,
@@ -664,10 +627,3 @@ def _entry_matches(entry: dict[str, Any], query: str) -> bool:
         return True
 
     return False
-
-
-async def main() -> None:
-    """Run the MCP server."""
-    app = create_server()
-    async with stdio_server() as (read, write):
-        await app.run(read, write, app.create_initialization_options())

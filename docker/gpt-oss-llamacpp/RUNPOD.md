@@ -14,6 +14,7 @@ MODEL=openai/gpt-oss-120b
 MAX_MODEL_LEN=131072
 SHOW_LOADING_PROGRESS=true
 API_KEY=your-secret-key        # Optional: enables authentication
+CACHE_REUSE=1                  # Optional: reuse KV cache between requests
 ```
 
 Auto-translates `openai/gpt-oss-120b` to GGUF equivalent.
