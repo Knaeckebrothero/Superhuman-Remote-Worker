@@ -59,33 +59,31 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
       <!-- Chat Messages -->
       @if (chat.entries().length > 0) {
         <div class="chat-list">
-          @for (entry of chat.entries(); track entry._id) {
+          @for (entry of chat.entries(); track entry._id; let idx = $index) {
             <div class="chat-turn">
               <!-- Turn Header -->
               <div class="turn-header">
-                <span class="turn-number">#{{ entry.sequenceNumber }}</span>
+                <span class="turn-number">#{{ entry.sequence_number }}</span>
                 <span class="phase-badge" [class.strategic]="entry.phase === 'strategic'" [class.tactical]="entry.phase === 'tactical'">
                   {{ entry.phase || 'unknown' }}
                 </span>
                 <span class="iteration">iter {{ entry.iteration }}</span>
-                @if (entry.latencyMs) {
-                  <span class="latency">{{ formatLatency(entry.latencyMs) }}</span>
+                @if (entry.latency_ms) {
+                  <span class="latency">{{ formatLatency(entry.latency_ms) }}</span>
                 }
                 <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
               </div>
 
-              <!-- Input Messages -->
+              <!-- Human Input Messages only (tool results are shown with tool calls below) -->
               @for (input of entry.inputs; track $index) {
-                <div class="message input-message" [class.tool-result]="input.type === 'tool'">
-                  <div class="message-header">
-                    @if (input.type === 'tool') {
-                      <span class="message-type tool">&#x1F527; {{ input.toolName || 'tool' }}</span>
-                    } @else {
+                @if (input.type === 'human') {
+                  <div class="message input-message">
+                    <div class="message-header">
                       <span class="message-type human">&#x1F464; Human</span>
-                    }
+                    </div>
+                    <div class="message-content">{{ input.content_preview || input.content }}</div>
                   </div>
-                  <div class="message-content">{{ input.contentPreview || input.content }}</div>
-                </div>
+                }
               }
 
               <!-- Reasoning (if present) -->
@@ -95,34 +93,52 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
                     <span class="reasoning-icon">&#x1F9E0;</span>
                     <span>Reasoning</span>
                   </summary>
-                  <div class="reasoning-content">{{ entry.reasoning.contentPreview || entry.reasoning.content }}</div>
+                  <div class="reasoning-content">{{ entry.reasoning.content_preview || entry.reasoning.content }}</div>
                 </details>
               }
 
-              <!-- Response Message -->
-              <div class="message response-message">
-                <div class="message-header">
-                  <span class="message-type assistant">&#x1F916; Assistant</span>
-                  <span
-                    class="request-link"
-                    (click)="onRequestIdClick(entry.requestId)"
-                    title="View full request"
-                  >
-                    {{ entry.requestId.slice(0, 8) }}...
-                  </span>
-                </div>
-                <div class="message-content">{{ entry.response.contentPreview || entry.response.content }}</div>
-
-                <!-- Tool Calls -->
-                @if (entry.response.hasToolCalls && entry.response.toolCalls) {
-                  <div class="tool-calls">
-                    <span class="tool-calls-label">Tool calls:</span>
-                    @for (tc of entry.response.toolCalls; track tc.id) {
-                      <span class="tool-chip" [title]="tc.argsPreview">{{ tc.name }}</span>
+              <!-- Response Message (only show if there's content or tool calls) -->
+              @if (entry.response.content_preview || entry.response.content || (entry.response.tool_calls && entry.response.tool_calls.length > 0)) {
+                <div class="message response-message">
+                  <div class="message-header">
+                    <span class="message-type assistant">&#x1F916; Assistant</span>
+                    @if (entry.request_id) {
+                      <span
+                        class="request-link"
+                        (click)="onRequestIdClick(entry.request_id)"
+                        title="View full request"
+                      >
+                        {{ entry.request_id.slice(0, 8) }}...
+                      </span>
                     }
                   </div>
-                }
-              </div>
+                  @if (entry.response.content_preview || entry.response.content) {
+                    <div class="message-content">{{ entry.response.content_preview || entry.response.content }}</div>
+                  }
+
+                  <!-- Tool Calls with Results -->
+                  @if (entry.response.tool_calls && entry.response.tool_calls.length > 0) {
+                    <div class="tool-calls-section">
+                      @for (tc of entry.response.tool_calls; track tc.id) {
+                        <details class="tool-call-item">
+                          <summary class="tool-call-header">
+                            <span class="tool-icon">&#x1F527;</span>
+                            <span class="tool-name">{{ tc.name }}</span>
+                            <span class="tool-args-preview">{{ tc.args_preview }}</span>
+                          </summary>
+                          <div class="tool-call-result">
+                            @if (getToolResult(idx, tc.id); as result) {
+                              {{ result }}
+                            } @else {
+                              <span class="no-result">Result pending or not available</span>
+                            }
+                          </div>
+                        </details>
+                      }
+                    </div>
+                  }
+                </div>
+              }
             </div>
           }
         </div>
@@ -381,11 +397,6 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
         margin-right: 40px;
       }
 
-      .input-message.tool-result {
-        background: rgba(203, 166, 247, 0.1);
-        border-left: 3px solid #cba6f7;
-      }
-
       .response-message {
         background: rgba(166, 227, 161, 0.1);
         border-left: 3px solid #a6e3a1;
@@ -428,30 +439,74 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
         overflow-y: auto;
       }
 
-      /* Tool Calls */
-      .tool-calls {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 10px;
-        background: rgba(0, 0, 0, 0.1);
+      /* Tool Calls Section */
+      .tool-calls-section {
         border-top: 1px solid rgba(255, 255, 255, 0.05);
       }
 
-      .tool-calls-label {
-        font-size: 11px;
-        color: var(--text-muted, #6c7086);
+      .tool-call-item {
+        background: rgba(203, 166, 247, 0.1);
+        border-left: 3px solid #cba6f7;
+        margin: 0;
       }
 
-      .tool-chip {
-        padding: 2px 8px;
-        border-radius: 3px;
-        background: var(--accent-color, #cba6f7);
-        color: var(--timeline-bg, #11111b);
+      .tool-call-item + .tool-call-item {
+        border-top: 1px solid rgba(255, 255, 255, 0.05);
+      }
+
+      .tool-call-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
         font-size: 11px;
+        color: #cba6f7;
+        cursor: pointer;
+        user-select: none;
+        background: rgba(0, 0, 0, 0.1);
+      }
+
+      .tool-call-header:hover {
+        background: rgba(0, 0, 0, 0.2);
+      }
+
+      .tool-icon {
+        font-size: 14px;
+        flex-shrink: 0;
+      }
+
+      .tool-name {
         font-family: 'JetBrains Mono', monospace;
-        cursor: help;
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+
+      .tool-args-preview {
+        color: var(--text-muted, #6c7086);
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 10px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+        min-width: 0;
+      }
+
+      .tool-call-result {
+        padding: 10px;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--text-primary, #cdd6f4);
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 300px;
+        overflow-y: auto;
+        background: rgba(0, 0, 0, 0.05);
+      }
+
+      .no-result {
+        color: var(--text-muted, #6c7086);
+        font-style: italic;
       }
 
       /* Reasoning */
@@ -596,5 +651,26 @@ export class ChatHistoryComponent {
 
   onRequestIdClick(requestId: string): void {
     this.requestService.loadRequest(requestId);
+  }
+
+  /**
+   * Get the result of a tool call by looking at the next entry's inputs.
+   * Tool results appear as inputs in the following entry with matching tool_call_id.
+   */
+  getToolResult(currentIndex: number, toolCallId: string): string | null {
+    const entries = this.chat.entries();
+    const nextEntry = entries[currentIndex + 1];
+    if (!nextEntry) {
+      return null;
+    }
+
+    const toolResult = nextEntry.inputs.find(
+      input => input.type === 'tool' && input.tool_call_id === toolCallId
+    );
+
+    if (toolResult) {
+      return toolResult.content_preview || toolResult.content;
+    }
+    return null;
   }
 }

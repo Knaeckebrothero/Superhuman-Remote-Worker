@@ -106,6 +106,7 @@ The container automatically translates vLLM model names to GGUF equivalents:
 |----------|---------|-------------|
 | `CACHE_TYPE_K` | `q8_0` | KV cache key quantization |
 | `CACHE_TYPE_V` | `q8_0` | KV cache value quantization |
+| `CACHE_REUSE` | `0` | Reuse KV cache between requests (0 = disabled, 1 = enabled) |
 | `BATCH_SIZE` | `2048` | Batch size for prompt processing |
 | `UBATCH_SIZE` | `512` | Micro-batch size for memory efficiency |
 

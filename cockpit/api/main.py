@@ -131,6 +131,39 @@ async def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/workspace/status")
+async def workspace_status() -> dict[str, Any]:
+    """Get workspace configuration status for debugging.
+
+    Returns:
+        Dict with workspace path, availability, and sample job directories
+    """
+    import os
+
+    base_path = workspace_service.base_path
+    is_available = workspace_service.is_available
+
+    # List job directories if available
+    job_dirs = []
+    if is_available:
+        try:
+            job_dirs = [
+                d.name for d in base_path.iterdir()
+                if d.is_dir() and d.name.startswith("job_")
+            ][:10]  # Limit to 10 for display
+        except Exception:
+            pass
+
+    return {
+        "configured_path": str(base_path),
+        "resolved_path": str(base_path.resolve()) if base_path.exists() else None,
+        "is_available": is_available,
+        "env_workspace_path": os.environ.get("WORKSPACE_PATH"),
+        "job_directories": job_dirs,
+        "job_count": len(job_dirs) if is_available else 0,
+    }
+
+
 @app.get("/api/jobs")
 async def list_jobs(
     status: str | None = Query(default=None),
