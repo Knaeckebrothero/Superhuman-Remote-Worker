@@ -212,13 +212,17 @@ export class AuditService {
   }
 
   /**
-   * Refresh audit entries for the current job.
+   * Refresh jobs list and audit entries for the current job.
    */
   refresh(): void {
+    // Always reload jobs list
+    this.loadJobs();
+
+    // Also reload entries if a job is selected
     if (this.selectedJobId()) {
       this.loadAuditEntries();
-    } else {
-      this.loadJobs();
+      // Refresh time range as well
+      this.time.loadTimeRange(this.selectedJobId()!);
     }
   }
 

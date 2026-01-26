@@ -211,7 +211,13 @@ class MongoDBService:
         if not first or not last:
             return None
 
-        return {"start": first["timestamp"], "end": last["timestamp"]}
+        # Convert datetime objects to ISO strings
+        start_ts = first["timestamp"]
+        end_ts = last["timestamp"]
+        start_str = start_ts.isoformat() if hasattr(start_ts, 'isoformat') else str(start_ts)
+        end_str = end_ts.isoformat() if hasattr(end_ts, 'isoformat') else str(end_ts)
+
+        return {"start": start_str, "end": end_str}
 
 
 # Singleton instance
