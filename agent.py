@@ -353,6 +353,11 @@ def parse_args():
         action="store_true",
         help="Stream state updates (for --job-id)",
     )
+    parser.add_argument(
+        "--debug-llm-stream",
+        action="store_true",
+        help="Print live tail of LLM token stream to stderr (debug)",
+    )
 
     return parser.parse_args()
 
@@ -649,6 +654,10 @@ def main():
     """Main entry point."""
     args = parse_args()
     setup_logging(args.verbose)
+
+    # Propagate --debug-llm-stream to the env var before any LLM is created
+    if args.debug_llm_stream:
+        os.environ["DEBUG_LLM_STREAM"] = "1"
 
     logger = logging.getLogger(__name__)
 
