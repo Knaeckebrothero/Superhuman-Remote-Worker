@@ -30,13 +30,19 @@ class WorkspaceService:
                 2. WORKSPACE_PATH environment variable
                 3. Default: ../../../workspace relative to this file
         """
+        # Project root: four levels up from this file
+        # (services/workspace.py -> services/ -> api/ -> cockpit/ -> project root)
+        project_root = Path(__file__).parent.parent.parent.parent
+
         if workspace_base:
-            self._base = Path(workspace_base)
+            raw = Path(workspace_base)
         elif os.environ.get("WORKSPACE_PATH"):
-            self._base = Path(os.environ["WORKSPACE_PATH"])
+            raw = Path(os.environ["WORKSPACE_PATH"])
         else:
-            # Default: relative to project root
-            self._base = Path(__file__).parent.parent.parent.parent / "workspace"
+            raw = project_root / "workspace"
+
+        # Resolve relative paths against the project root, not the cwd
+        self._base = raw if raw.is_absolute() else project_root / raw
 
     @property
     def base_path(self) -> Path:
