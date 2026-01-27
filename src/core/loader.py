@@ -280,6 +280,8 @@ class LimitsConfig:
     """Execution limits configuration."""
 
     context_threshold_tokens: int = 80000
+    message_count_threshold: int = 200
+    message_count_min_tokens: int = 30000
     tool_retry_count: int = 3
 
 
@@ -288,8 +290,11 @@ class ContextManagementConfig:
     """Context management configuration."""
 
     compact_on_archive: bool = True
-    keep_recent_tool_results: int = 5
-    summarization_template: str = "summarization_prompt.md"
+    keep_recent_tool_results: int = 10
+    keep_recent_messages: int = 10
+    summarization_template: str = "summarization_prompt.txt"
+    reasoning_level: str = "high"
+    max_summary_length: int = 10000
 
 
 @dataclass
@@ -434,17 +439,22 @@ def load_agent_config(
     limits_data = data.get("limits", {})
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
+        message_count_threshold=limits_data.get("message_count_threshold", 200),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
     )
 
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 5),
+        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 10),
+        keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
             "summarization_template",
-            "summarization_prompt.md"
+            "summarization_prompt.txt"
         ),
+        reasoning_level=context_data.get("reasoning_level", "high"),
+        max_summary_length=context_data.get("max_summary_length", 10000),
     )
 
     phase_data = data.get("phase_settings", {})
@@ -730,7 +740,7 @@ def load_summarization_prompt(
         Summarization prompt content
     """
     # Determine template name
-    template_name = "summarization_prompt.md"
+    template_name = "summarization_prompt.txt"
     if config and config.context_management.summarization_template:
         template_name = config.context_management.summarization_template
 

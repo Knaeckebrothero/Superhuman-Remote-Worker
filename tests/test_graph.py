@@ -249,7 +249,8 @@ class TestCheckTodosNode:
 class TestArchivePhaseNode:
     """Tests for archive_phase node."""
 
-    def test_archives_todos(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_archives_todos(self, managers, mock_config):
         """Test that todos are archived."""
         managers["todo"].add("Task 1")
         managers["todo"].complete("todo_1")
@@ -272,7 +273,7 @@ class TestArchivePhaseNode:
         )
 
         state = {"job_id": "test-123", "messages": []}
-        result = node(state)
+        result = await node(state)
 
         assert "messages" in result
         assert "Phase complete" in result["messages"][0].content

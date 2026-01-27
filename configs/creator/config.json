@@ -23,6 +23,7 @@
       "cite_web",
       "list_sources",
       "get_citation",
+      "list_citations",
       "list_requirements",
       "get_requirement",
       "add_requirement"

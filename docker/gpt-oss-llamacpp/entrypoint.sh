@@ -129,11 +129,17 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 # Memory management - Q8_0 KV cache recommended for quality/memory balance
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
-CACHE_REUSE="${CACHE_REUSE:-256}"  # Reuse KV cache between requests (works with --swa-full)
+CACHE_REUSE="${CACHE_REUSE:-256}"  # Prefix caching threshold (requires SWA override to work)
 
-# Sliding Window Full - CRITICAL for long context stability with cache reuse
-# Without this flag, llama.cpp prints "cache_reuse is not supported" warning
+# Sliding Window Full - allocates full KV cache (prevents gibberish on long contexts)
 SWA_FULL="${SWA_FULL:-true}"
+
+# Override sliding window metadata to enable KV cache reuse
+# gpt-oss GGUF contains sliding_window=128 which forces iSWA (non-unified KV cache)
+# This triggers a hard-coded safeguard that disables cache reuse entirely
+# Setting to 0 forces unified KV cache, enabling prefix caching for multi-turn conversations
+# Safe because gpt-oss uses hybrid attention and --swa-full ensures correct computation
+SWA_OVERRIDE="${SWA_OVERRIDE:-true}"
 
 # Batch settings - tuned for datacenter GPUs (A100/H100/H200)
 # Larger batches improve MoE expert reuse and throughput
@@ -351,12 +357,17 @@ SHOW_LOADING_PROGRESS="${SHOW_LOADING_PROGRESS:-false}"
 if [[ "${MODEL}" == *"120b"* ]]; then
     WEIGHTS_GB="~70GB"
     EXPECTED_MEM_GB=70
+    EXPECTED_DOWNLOAD_GB=63  # 59.02 GiB GGUF split across 3 files
     LOAD_TIME="3-7 minutes"
 else
     WEIGHTS_GB="unknown"
     EXPECTED_MEM_GB=50
+    EXPECTED_DOWNLOAD_GB=30
     LOAD_TIME="varies"
 fi
+
+# Cache directory where llama.cpp downloads model files
+CACHE_DIR="/root/.cache/llama.cpp"
 
 echo ""
 echo "============================================================"
@@ -374,10 +385,12 @@ fi
 echo "============================================================"
 echo ""
 
-# GPU Memory Loading Progress Monitor
+# Loading Progress Monitor (two-phase: disk download + GPU loading)
 start_loading_monitor() {
     local expected_mem=$1
     local port=$2
+    local expected_download=$3
+    local cache_dir=$4
     local check_interval=2
     local last_mem=0
     local stable_count=0
@@ -400,26 +413,46 @@ start_loading_monitor() {
         fi
 
         # Get GPU memory usage
+        local mem_used=0
+        local mem_total=0
+        local mem_used_gb="0.0"
+        local mem_total_gb="0.0"
+        local mem_used_int=0
+
         if command -v nvidia-smi &> /dev/null; then
             local mem_info=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits | head -n1)
-            local mem_used=$(echo "$mem_info" | cut -d',' -f1 | tr -d ' ')
-            local mem_total=$(echo "$mem_info" | cut -d',' -f2 | tr -d ' ')
+            mem_used=$(echo "$mem_info" | cut -d',' -f1 | tr -d ' ')
+            mem_total=$(echo "$mem_info" | cut -d',' -f2 | tr -d ' ')
+            mem_used_gb=$(awk "BEGIN {printf \"%.1f\", ${mem_used}/1024}")
+            mem_total_gb=$(awk "BEGIN {printf \"%.1f\", ${mem_total}/1024}")
+            mem_used_int=${mem_used_gb%.*}
+        fi
 
-            # Convert to GB
-            local mem_used_gb=$(awk "BEGIN {printf \"%.1f\", ${mem_used}/1024}")
-            local mem_total_gb=$(awk "BEGIN {printf \"%.1f\", ${mem_total}/1024}")
+        local elapsed=$(($(date +%s) - start_time))
 
-            # Calculate memory delta to detect phase
+        if [ "${mem_used_int}" -lt 2 ]; then
+            # === DOWNLOAD PHASE: track disk usage in cache directory ===
+            local disk_bytes=0
+            if [ -d "${cache_dir}" ]; then
+                disk_bytes=$(du -sb "${cache_dir}" 2>/dev/null | cut -f1)
+                disk_bytes=${disk_bytes:-0}
+            fi
+            local disk_gb=$(awk "BEGIN {printf \"%.1f\", ${disk_bytes}/1073741824}")
+
+            # Build progress bar based on download progress
+            local progress=$(awk "BEGIN {p=(${disk_bytes}/1073741824/${expected_download})*95; if(p>95) p=95; if(p<0) p=0; printf \"%.0f\", p}")
+            local filled=$(awk "BEGIN {printf \"%.0f\", (${progress}/100)*20}")
+            local empty=$((20 - filled))
+            local bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
+
+            echo "[LOADING] ${bar} ${disk_gb}GB / ${expected_download}.0GB - downloading from HuggingFace... (${elapsed}s)"
+        else
+            # === GPU PHASE: track VRAM usage (existing logic) ===
             local mem_delta=$(awk "BEGIN {printf \"%.0f\", ${mem_used} - ${last_mem}}")
             last_mem=${mem_used}
 
-            # Determine loading phase based on memory change rate
             local phase=""
-            local mem_used_int=${mem_used_gb%.*}
-
-            if [ "${mem_used_int}" -lt 2 ]; then
-                phase="downloading from HuggingFace..."
-            elif [ "${mem_delta}" -gt 500 ]; then
+            if [ "${mem_delta}" -gt 500 ]; then
                 phase="loading weights to GPU..."
                 stable_count=0
             elif [ "${mem_delta}" -gt 50 ]; then
@@ -434,13 +467,12 @@ start_loading_monitor() {
                 fi
             fi
 
-            # Build progress bar
+            # Build progress bar based on GPU memory
             local progress=$(awk "BEGIN {p=(${mem_used_int}/${expected_mem})*95; if(p>95) p=95; printf \"%.0f\", p}")
             local filled=$(awk "BEGIN {printf \"%.0f\", (${progress}/100)*20}")
             local empty=$((20 - filled))
             local bar=$(printf "%${filled}s" | tr ' ' '#')$(printf "%${empty}s" | tr ' ' '-')
 
-            local elapsed=$(($(date +%s) - start_time))
             echo "[LOADING] ${bar} ${mem_used_gb}GB / ${mem_total_gb}GB - ${phase} (${elapsed}s)"
         fi
     done
@@ -450,7 +482,7 @@ start_loading_monitor() {
 if [ "${SHOW_LOADING_PROGRESS}" = "true" ]; then
     echo "[LOADING] Starting GPU memory monitor..."
     echo ""
-    start_loading_monitor "${EXPECTED_MEM_GB}" "${PORT}" &
+    start_loading_monitor "${EXPECTED_MEM_GB}" "${PORT}" "${EXPECTED_DOWNLOAD_GB}" "${CACHE_DIR}" &
     MONITOR_PID=$!
 
     # Ensure monitor is killed if script exits

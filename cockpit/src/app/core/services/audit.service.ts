@@ -27,12 +27,63 @@ export class AuditService {
   // Scroll target index (set by global time changes)
   readonly targetEntryIndex = signal<number | null>(null);
 
+  // Tracks the last seek version we handled to avoid duplicate API calls
+  private lastSeekVersion = 0;
+  // Tracks whether we're currently navigating to a page from a seek
+  private seekNavigating = false;
+
   constructor() {
-    // Watch global time and compute scroll target
+    // When global slider is dragged, navigate to the correct page
+    effect(() => {
+      const seekVersion = this.time.globalSeekVersion();
+      const timestamp = this.time.currentTimestamp();
+      const jobId = this.selectedJobId();
+
+      if (
+        seekVersion <= this.lastSeekVersion ||
+        !timestamp ||
+        !jobId
+      ) {
+        return;
+      }
+      this.lastSeekVersion = seekVersion;
+
+      // Ask the backend which page this timestamp falls on
+      this.seekNavigating = true;
+      this.api
+        .getPageForTimestamp(
+          jobId,
+          timestamp,
+          this.pageSize(),
+          this.activeFilter(),
+        )
+        .subscribe({
+          next: (result) => {
+            const targetPage = result.page;
+            if (targetPage !== this.currentPage()) {
+              // Navigate to the correct page — the entry-level scroll
+              // effect below will fire once entries load
+              this.currentPage.set(targetPage);
+              this.loadAuditEntries();
+            }
+            // Set the in-page scroll target index from the backend
+            this.targetEntryIndex.set(result.index);
+            this.seekNavigating = false;
+          },
+          error: () => {
+            this.seekNavigating = false;
+          },
+        });
+    });
+
+    // Watch global time and compute scroll target within current page
+    // (handles playback and minor adjustments that don't cross pages)
     effect(() => {
       const timestamp = this.time.currentTimestamp();
-      if (!timestamp) {
-        this.targetEntryIndex.set(null);
+      if (!timestamp || this.seekNavigating) {
+        if (!this.seekNavigating) {
+          this.targetEntryIndex.set(null);
+        }
         return;
       }
       const entries = this.entries();
