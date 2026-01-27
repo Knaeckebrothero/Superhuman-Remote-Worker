@@ -453,7 +453,7 @@ Created: {citation.created_at}
                 confidence = f" ({c.confidence.value})" if c.confidence else ""
                 status_str = c.verification_status.value.upper()
                 lines.append(
-                    f'  [{c.citation_id}] {status_str}{confidence} — Source [{c.source_id}] "{claim_preview}"'
+                    f'  [{c.id}] {status_str}{confidence} — Source [{c.source_id}] "{claim_preview}"'
                 )
 
             return "\n".join(lines)
