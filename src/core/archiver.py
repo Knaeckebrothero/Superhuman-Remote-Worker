@@ -208,6 +208,10 @@ class LLMArchiver:
     def _get_next_step_number(self, job_id: str) -> int:
         """Get the next step number for a job.
 
+        On first access for a given job_id, queries MongoDB for the current
+        max step_number so that resumed jobs continue numbering sequentially
+        instead of restarting from 1.
+
         Args:
             job_id: Job identifier
 
@@ -215,7 +219,19 @@ class LLMArchiver:
             Next sequential step number for this job.
         """
         if job_id not in self._step_counters:
-            self._step_counters[job_id] = 0
+            # Resume from existing max step_number in MongoDB
+            if self._audit_collection is not None:
+                try:
+                    max_doc = self._audit_collection.find_one(
+                        {"job_id": job_id},
+                        sort=[("step_number", -1)],
+                        projection={"step_number": 1},
+                    )
+                    self._step_counters[job_id] = max_doc["step_number"] if max_doc else 0
+                except Exception:
+                    self._step_counters[job_id] = 0
+            else:
+                self._step_counters[job_id] = 0
         self._step_counters[job_id] += 1
         return self._step_counters[job_id]
 
