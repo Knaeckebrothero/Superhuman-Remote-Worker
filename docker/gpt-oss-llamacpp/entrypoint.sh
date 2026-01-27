@@ -150,6 +150,11 @@ UBATCH_SIZE="${UBATCH_SIZE:-4096}"
 THREADS="${THREADS:-16}"
 THREADS_BATCH="${THREADS_BATCH:-32}"  # Prefill can use more threads
 
+# MoE expert offloading (for VRAM-constrained GPUs like L40S 48GB)
+# Offloads FFN/expert layers to CPU, keeping attention on GPU
+# Useful when model weights (~59GB) exceed VRAM capacity
+OFFLOAD_FFN="${OFFLOAD_FFN:-false}"
+
 # Multi-GPU support
 SPLIT_MODE="${SPLIT_MODE:-}"       # "row" for NVLink, "layer" for PCIe
 TENSOR_SPLIT="${TENSOR_SPLIT:-}"   # e.g., "1,1" for 2 GPUs equal split
@@ -249,6 +254,18 @@ if [ "${SWA_FULL}" = "true" ]; then
     CMD="${CMD} --swa-full"
 fi
 
+# Override sliding window metadata to enable cache reuse
+if [ "${SWA_OVERRIDE}" = "true" ]; then
+    CMD="${CMD} --override-kv gpt-oss.attention.sliding_window=int:0"
+    echo "SWA override: sliding_window=0 (enables unified KV cache + cache reuse)"
+fi
+
+# MoE FFN offloading (CPU offload for VRAM-constrained GPUs)
+if [ "${OFFLOAD_FFN}" = "true" ]; then
+    CMD="${CMD} -ot '.*ffn.*=CPU'"
+    echo "FFN offload: MoE expert layers offloaded to CPU (attention stays on GPU)"
+fi
+
 # Multi-GPU support
 if [ -n "${SPLIT_MODE}" ]; then
     CMD="${CMD} --split-mode ${SPLIT_MODE}"
@@ -325,6 +342,8 @@ echo "GPU layers:         ${N_GPU_LAYERS}"
 echo "KV cache type:      K=${CACHE_TYPE_K}, V=${CACHE_TYPE_V}"
 echo "Cache reuse:        ${CACHE_REUSE}"
 echo "SWA full:           ${SWA_FULL}"
+echo "SWA override:       ${SWA_OVERRIDE}"
+echo "FFN offload:        ${OFFLOAD_FFN}"
 echo "Batch size:         ${BATCH_SIZE}"
 echo "Micro-batch:        ${UBATCH_SIZE}"
 echo "Threads:            ${THREADS} (batch: ${THREADS_BATCH})"
