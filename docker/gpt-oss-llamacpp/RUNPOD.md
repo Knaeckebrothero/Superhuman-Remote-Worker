@@ -4,7 +4,7 @@ llama.cpp with GBNF grammar for reliable tool calling. **Drop-in replacement for
 
 ## Quick Start
 
-**Image:** `docker.io/yourusername/gpt-oss-llamacpp:latest`
+**Image:** `docker.io/knaeckebrothero/gpt-oss-llamacpp:latest`
 
 ### Environment Variables (Same as vLLM)
 
@@ -14,10 +14,19 @@ MODEL=openai/gpt-oss-120b
 MAX_MODEL_LEN=131072
 SHOW_LOADING_PROGRESS=true
 API_KEY=your-secret-key        # Optional: enables authentication
-CACHE_REUSE=1                  # Optional: reuse KV cache between requests
 ```
 
 Auto-translates `openai/gpt-oss-120b` to GGUF equivalent.
+
+### Defaults (no need to set)
+
+- `SWA_FULL=true` — full KV cache allocation (prevents gibberish on long contexts)
+- `SWA_OVERRIDE=true` — overrides sliding_window=128 metadata to enable unified KV cache + prefix caching
+- `CACHE_REUSE=256` — prefix caching threshold for multi-turn conversations
+- `BATCH_SIZE=4096`, `UBATCH_SIZE=4096` — optimized for datacenter GPUs
+- `MLOCK=true`, `NO_MMAP=true` — datacenter memory settings
+
+> **Cache reuse note:** gpt-oss GGUF contains `sliding_window=128` which disables KV cache reuse in llama.cpp. `SWA_OVERRIDE` sets it to 0 at runtime via `--override-kv`, enabling ~12x faster TTFT on multi-turn conversations. This is safe because gpt-oss uses hybrid attention. Set `SWA_OVERRIDE=false` to disable.
 
 ### API Key Authentication
 
@@ -33,7 +42,7 @@ curl http://<pod-ip>:8000/v1/chat/completions \
 
 ### Pod Configuration
 
-- **GPU:** H100/A100 80GB (128K) or L40S 48GB (32K)
+- **GPU:** H100/A100 80GB (128K) or L40S 48GB (32K, set `OFFLOAD_FFN=true`)
 - **Volume:** 100GB
 - **Ports:** `8000` TCP (API), `22` TCP (SSH)
 

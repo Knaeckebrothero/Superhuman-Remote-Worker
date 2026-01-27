@@ -340,12 +340,26 @@ def create_execute_node(
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
-        # Handle consecutive AI messages
+        # Handle consecutive AI messages — inject dynamic todo reminder
         if prepared_messages and isinstance(prepared_messages[-1], AIMessage):
             if not getattr(prepared_messages[-1], 'tool_calls', None):
-                prepared_messages.append(
-                    HumanMessage(content="Continue with the current task.")
-                )
+                remaining = todo_manager.list_pending()
+                if remaining:
+                    todo_lines = "\n".join(
+                        f"  - {t.id}: {t.content}"
+                        for t in remaining
+                    )
+                    reminder = (
+                        f"You have {len(remaining)} incomplete todo(s):\n"
+                        f"{todo_lines}\n\n"
+                        "Continue working on these items. "
+                        "Use `todo_complete(todo_id=\"<id>\")` to mark a todo as done, "
+                        "or call `todo_complete()` with no arguments to complete the next pending item. "
+                        "Use `todo_list()` to view the full list with completed and remaining todos."
+                    )
+                else:
+                    reminder = "All todos are complete. Continue with the current task."
+                prepared_messages.append(HumanMessage(content=reminder))
 
         # Audit LLM call (will be updated with response via update_llm_response)
         auditor = get_archiver()
