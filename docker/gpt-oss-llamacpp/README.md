@@ -1,4 +1,4 @@
-# gpt-oss-llamacpp: llama.cpp Container for OpenAI gpt-oss-120b
+# Optimized Llama.cpp Container for OpenAI gpt-oss-120b
 
 Custom llama.cpp Docker image optimized for running `gpt-oss-120b` with GBNF grammar constraints for reliable tool calling. **Drop-in replacement for vLLM** - uses the same environment variables and port.
 
@@ -48,7 +48,7 @@ docker run --gpus all -p 8000:8000 \
     -e MODEL=openai/gpt-oss-120b \
     -e MAX_MODEL_LEN=131072 \
     -e SHOW_LOADING_PROGRESS=true \
-    docker.io/yourusername/gpt-oss-llamacpp:latest
+    docker.io/knaeckebrothero/gpt-oss-llamacpp:latest
 ```
 
 ### Build locally
@@ -110,6 +110,7 @@ The container automatically translates vLLM model names to GGUF equivalents:
 | `CACHE_TYPE_V` | `q8_0` | KV cache value quantization |
 | `CACHE_REUSE` | `256` | Reuse KV cache between requests (tokens to preserve) |
 | `SWA_FULL` | `true` | **CRITICAL**: Enable full sliding window attention (required for cache reuse) |
+| `SWA_OVERRIDE` | `true` | Override sliding_window=128 metadata to enable KV cache reuse |
 | `BATCH_SIZE` | `4096` | Batch size for prompt processing (optimized for datacenter GPUs) |
 | `UBATCH_SIZE` | `4096` | Micro-batch size (optimized for MoE expert reuse) |
 
@@ -128,6 +129,7 @@ The container automatically translates vLLM model names to GGUF equivalents:
 | `N_PARALLEL` | `1` | Number of parallel sequences (for batched inference) |
 | `THREADS` | `16` | CPU threads for inference |
 | `THREADS_BATCH` | `32` | CPU threads for prompt processing (can be higher) |
+| `OFFLOAD_FFN` | `false` | Offload MoE FFN/expert layers to CPU (for VRAM-constrained GPUs) |
 
 ### Multi-GPU Support
 
@@ -149,6 +151,23 @@ Example for 2x A100 with NVLink:
 | `GRAMMAR_FILE` | `/app/harmony.gbnf` | Path to grammar file |
 
 **Why grammar constraints matter:** The grammar forces the model to output valid Harmony format tokens, preventing the parsing failures that plague vLLM's post-generation parsing approach. This is the main reason to use llama.cpp over vLLM.
+
+### Cache Reuse (SWA Override)
+
+The gpt-oss GGUF files contain `gpt-oss.attention.sliding_window = 128`, which triggers a hard-coded safeguard in llama.cpp that disables KV cache reuse (`kv_unified = false`). The `--swa-full` flag allocates a full KV cache but does not make it unified — the cache reuse check still fails.
+
+**Impact without fix:** Every request re-processes the full prompt from scratch. Multi-turn latency is ~12x worse than it should be.
+
+**Solution:** `SWA_OVERRIDE=true` (default) passes `--override-kv gpt-oss.attention.sliding_window=u32:0` to llama.cpp, which overrides the GGUF metadata at runtime without modifying the file. This forces a unified KV cache and enables prefix caching.
+
+**Why this is safe:** gpt-oss uses hybrid attention (alternating full/SWA layers). Allowing full attention is benign — RoPE/YaRN naturally decay attention for distant tokens. No quality degradation has been observed.
+
+**Verification:** After deploying, check logs for:
+- `kv_unified = true` (instead of `false`)
+- No `cache_reuse is not supported` warnings
+- `n_past` values persisting across requests
+
+To disable: `-e SWA_OVERRIDE=false`
 
 ### API Settings
 
@@ -235,6 +254,7 @@ docker run --gpus all -p 8000:8000 \
 
 The following are already set by default (no need to specify):
 - `SWA_FULL=true` (required for cache reuse)
+- `SWA_OVERRIDE=true` (overrides sliding_window metadata to enable unified KV cache)
 - `CACHE_REUSE=256` (KV cache reuse enabled)
 - `BATCH_SIZE=4096`, `UBATCH_SIZE=4096` (optimized for datacenter)
 - `MLOCK=true`, `NO_MMAP=true` (datacenter memory settings)
@@ -258,15 +278,19 @@ docker run --gpus all -p 8000:8000 \
 
 ```bash
 # L40S needs reduced context due to 48GB limit
+# OFFLOAD_FFN moves MoE expert layers to CPU, freeing VRAM for context
 docker run --gpus all -p 8000:8000 \
     -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
     -e MODEL=openai/gpt-oss-120b \
     -e MAX_MODEL_LEN=32768 \
+    -e OFFLOAD_FFN=true \
     -e CACHE_TYPE_K=q4_0 \
     -e CACHE_TYPE_V=q4_0 \
     -e SHOW_LOADING_PROGRESS=true \
     gpt-oss-llamacpp:latest
 ```
+
+> **FFN offloading note:** `OFFLOAD_FFN=true` uses `-ot '.*ffn.*=CPU'` to move the MoE Feed-Forward/expert layers to system RAM while keeping attention layers on GPU. This frees ~30-40% VRAM but reduces generation speed due to CPU memory bandwidth (~100-200 GB/s vs ~864 GB/s GPU). Expect ~5-10 tok/s generation on L40S vs ~20 tok/s without offloading on 80GB GPUs. Only use when VRAM is insufficient.
 
 ### Multi-GPU (2x A100 with NVLink)
 
