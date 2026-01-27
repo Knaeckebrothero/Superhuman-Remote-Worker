@@ -1,14 +1,12 @@
 {
   "$schema": "schema.json",
   "$comment": "Framework defaults - deployments extend this via $extends",
-
   "llm": {
     "model": "openai/gpt-oss-120b",
     "temperature": 0.0,
     "reasoning_level": "high",
     "base_url": null
   },
-
   "workspace": {
     "structure": [
       "archive/",
@@ -18,7 +16,7 @@
     "initial_files": {
       "workspace.md": "prompts/workspace_template.md"
     },
-    "max_read_size": 50000
+    "max_read_size": 25000
   },
   "tools": {
     "workspace": [
@@ -40,23 +38,27 @@
       "todo_complete",
       "todo_rewind"
     ],
-    "domain": [],
+    "domain": [
+      "web_search",
+      "cite_document",
+      "cite_web",
+      "list_sources",
+      "get_citation",
+      "list_citations"
+    ],
     "completion": [
       "mark_complete",
       "job_complete"
     ]
   },
-
   "todo": {
     "archive_on_reset": true,
     "archive_path": "archive/"
   },
-
   "connections": {
     "postgres": true,
     "neo4j": false
   },
-
   "polling": {
     "enabled": true,
     "status_value_pending": "pending",
@@ -65,20 +67,18 @@
     "status_value_failed": "failed",
     "interval_seconds": 30
   },
-
   "limits": {
-    "context_threshold_tokens": 80000,
-    "message_count_threshold": 200,
-    "message_count_min_tokens": 30000,
+    "context_threshold_tokens": 60000,
+    "message_count_threshold": 150,
+    "message_count_min_tokens": 25000,
     "tool_retry_count": 3
   },
-
   "context_management": {
     "compact_on_archive": true,
     "keep_recent_tool_results": 10,
-    "summarization_template": "summarization_prompt.md"
+    "keep_recent_messages": 10,
+    "summarization_template": "summarization_prompt.txt"
   },
-
   "document_processing": {
     "chunking_strategy": "general",
     "max_chunk_size": 1000,
@@ -86,18 +86,18 @@
     "extraction_mode": "balanced",
     "min_confidence_threshold": 0.5
   },
-
   "research": {
     "web_search_enabled": false,
     "graph_search_enabled": false,
     "research_depth": "standard"
   },
-
   "validation": {
     "duplicate_threshold": 0.9,
     "require_citations": false,
     "metamodel_validation_strict": false,
     "fulfillment_confidence_threshold": 0.5,
     "auto_integrate": false
-  }
+  },
+  "agent_id": "default",
+  "display_name": "A Generalist Agent"
 }

@@ -546,7 +546,7 @@ def create_archive_phase_node(
     Creates phase snapshots for recovery if snapshot_manager is provided.
     """
 
-    def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
+    async def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
         """Archive todos and mark phase complete in plan."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
@@ -615,23 +615,15 @@ def create_archive_phase_node(
 
         if config.context_management.compact_on_archive:
             if context_mgr.should_summarize(messages):
-                import asyncio
-                oss_reasoning_level = config.llm.reasoning_level or "high"
+                oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+                max_summary_length = config.context_management.max_summary_length
 
-                # Run async summarization
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-
-                compacted_messages = loop.run_until_complete(
-                    context_mgr.summarize_and_compact(
-                        messages,
-                        llm,
-                        summarization_prompt,
-                        oss_reasoning_level,
-                    )
+                compacted_messages = await context_mgr.summarize_and_compact(
+                    messages,
+                    llm,
+                    summarization_prompt,
+                    oss_reasoning_level,
+                    max_summary_length,
                 )
                 logger.info(
                     f"[{job_id}] Compacted context: {len(messages)} -> {len(compacted_messages)} messages"
@@ -1159,8 +1151,10 @@ def build_phase_alternation_graph(
     context_config = ContextConfig(
         compaction_threshold_tokens=config.limits.context_threshold_tokens,
         summarization_threshold_tokens=config.limits.context_threshold_tokens,
-        keep_recent_messages=10,
-        keep_recent_tool_results=10,
+        message_count_threshold=config.limits.message_count_threshold,
+        message_count_min_tokens=config.limits.message_count_min_tokens,
+        keep_recent_messages=config.context_management.keep_recent_messages,
+        keep_recent_tool_results=config.context_management.keep_recent_tool_results,
     )
     context_mgr = ContextManager(config=context_config, model=config.llm.model)
 

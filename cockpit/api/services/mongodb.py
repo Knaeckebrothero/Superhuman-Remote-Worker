@@ -219,6 +219,56 @@ class MongoDBService:
 
         return {"start": start_str, "end": end_str}
 
+    async def get_page_for_timestamp(
+        self,
+        job_id: str,
+        timestamp: str,
+        page_size: int = 50,
+        filter_category: FilterCategory = "all",
+    ) -> dict[str, Any]:
+        """Find which page contains the audit entry closest to a given timestamp.
+
+        Counts entries with timestamp <= target to determine the page number.
+
+        Args:
+            job_id: The job UUID to query
+            timestamp: ISO timestamp to locate
+            page_size: Page size for calculating page number
+            filter_category: Active filter category
+
+        Returns:
+            Dict with 'page' and 'index' (index within that page)
+        """
+        if not self._available or self._db is None:
+            return {"page": 1, "index": 0}
+
+        from datetime import datetime as dt
+
+        collection = self._db["agent_audit"]
+
+        # Build base query with filter
+        query: dict[str, Any] = {"job_id": job_id}
+        step_types = FILTER_MAPPINGS.get(filter_category, [])
+        if step_types:
+            query["step_type"] = {"$in": step_types}
+
+        # Parse the target timestamp
+        target_ts = dt.fromisoformat(timestamp)
+
+        # Count entries with timestamp <= target (these come before or at the target)
+        before_query = {**query, "timestamp": {"$lte": target_ts}}
+        count_before = await collection.count_documents(before_query)
+
+        if count_before == 0:
+            return {"page": 1, "index": 0}
+
+        # The entry is at position (count_before - 1) in 0-indexed list
+        position = count_before - 1
+        page = (position // page_size) + 1
+        index = position % page_size
+
+        return {"page": page, "index": index}
+
     async def get_chat_history(
         self,
         job_id: str,

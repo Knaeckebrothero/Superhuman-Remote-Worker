@@ -56,6 +56,15 @@ CITATION_TOOLS_METADATA = {
         "short_description": "Get details about a specific citation by ID.",
         "phases": ["tactical"],
     },
+    "list_citations": {
+        "module": "citation_tools",
+        "function": "list_citations",
+        "description": "List all citations created in this session",
+        "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "List all citations with status and source info.",
+        "phases": ["tactical"],
+    },
 }
 
 
@@ -403,9 +412,60 @@ Created: {citation.created_at}
             logger.error(f"Error getting citation: {e}")
             return f"Error getting citation: {str(e)}"
 
+    @tool
+    def list_citations(source_id: Optional[int] = None, status: Optional[str] = None) -> str:
+        """List all citations created in this session.
+
+        Shows citation IDs, claims (truncated), verification status, and source.
+        Optionally filter by source ID or verification status.
+
+        Args:
+            source_id: Filter by source ID (optional)
+            status: Filter by verification status: pending, verified, failed (optional)
+
+        Returns:
+            Formatted list of citations
+        """
+        try:
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+            except ImportError:
+                return "CitationEngine not installed. No citations available."
+
+            engine = context.get_citation_engine()
+            citations = engine.list_citations()
+
+            if not citations:
+                return "No citations created yet. Use cite_document or cite_web to create citations."
+
+            # Apply filters
+            if source_id is not None:
+                citations = [c for c in citations if c.source_id == source_id]
+            if status is not None:
+                citations = [c for c in citations if c.verification_status.value == status]
+
+            if not citations:
+                return "No citations match the given filters."
+
+            lines = [f"Citations ({len(citations)} total):", ""]
+            for c in citations:
+                claim_preview = c.claim[:50] + "..." if len(c.claim) > 50 else c.claim
+                confidence = f" ({c.confidence.value})" if c.confidence else ""
+                status_str = c.verification_status.value.upper()
+                lines.append(
+                    f'  [{c.citation_id}] {status_str}{confidence} — Source [{c.source_id}] "{claim_preview}"'
+                )
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Error listing citations: {e}")
+            return f"Error listing citations: {str(e)}"
+
     return [
         cite_document,
         cite_web,
         list_sources,
         get_citation,
+        list_citations,
     ]

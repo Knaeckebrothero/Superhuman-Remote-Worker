@@ -41,7 +41,7 @@
   },
 
   "context_management": {
-    "summarization_template": "summarization_prompt.md"
+    "summarization_template": "summarization_prompt.txt"
   },
 
   "validation": {

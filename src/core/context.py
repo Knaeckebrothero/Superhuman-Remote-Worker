@@ -27,8 +27,18 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+class ConversationSummary(BaseModel):
+    """Structured summary — forces the model to stop after valid JSON."""
+    summary: str = Field(description="General overview of the conversation and what happened")
+    tasks_completed: str = Field(description="Bullet-point list of completed tasks")
+    key_decisions: str = Field(description="Important decisions made")
+    current_state: str = Field(description="Current progress and immediate next steps")
+    blockers: str = Field(default="", description="Errors or blockers encountered, empty if none")
 
 
 def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int:
@@ -593,6 +603,7 @@ class ContextManager:
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
         oss_reasoning_level: str = "high",
+        max_summary_length: int = 10000,
     ) -> str:
         """Generate a summary of the conversation.
 
@@ -626,39 +637,50 @@ class ContextManager:
         # Include all formatted parts for complete context
         conversation_text = "\n".join(formatted_parts)
 
-        default_prompt = """Summarize this agent conversation concisely.
-Focus on:
-1. What tasks were completed
-2. Key decisions made
-3. Important information discovered
-4. Current progress and next steps
-5. Any errors or blockers encountered
-
-Keep the summary under 500 words. Use bullet points.
+        # Build prompt from template or fallback
+        if summarization_prompt:
+            prompt = summarization_prompt.format(
+                conversation=conversation_text,
+                oss_reasoning_level=oss_reasoning_level,
+                max_summary_length=max_summary_length,
+            )
+        else:
+            prompt = f"""Summarize this agent conversation into the required JSON fields.
 
 Conversation:
-{conversation}
-
-Summary:"""
-
-        prompt = summarization_prompt or default_prompt
-        prompt = prompt.format(
-            conversation=conversation_text,
-            oss_reasoning_level=oss_reasoning_level,
-        )
+{conversation_text}"""
 
         try:
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            summary = response.content if isinstance(response.content, str) else str(response.content)
+            structured_llm = llm.with_structured_output(ConversationSummary)
+
+            logger.info("Starting structured summarization")
+            result: ConversationSummary = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+
+            # Format into readable text
+            parts = []
+            if result.summary.strip():
+                parts.append(f"**Summary:**\n{result.summary.strip()}")
+            if result.tasks_completed.strip():
+                parts.append(f"**Tasks Completed:**\n{result.tasks_completed.strip()}")
+            if result.key_decisions.strip():
+                parts.append(f"**Key Decisions:**\n{result.key_decisions.strip()}")
+            if result.current_state.strip():
+                parts.append(f"**Current State:**\n{result.current_state.strip()}")
+            if result.blockers and result.blockers.strip():
+                parts.append(f"**Blockers:**\n{result.blockers.strip()}")
+            summary = "\n\n".join(parts)
+
+            logger.info(f"Generated structured summary ({len(summary)} chars)")
+            # Debug: log tail
+            tail = summary[-500:] if len(summary) > 500 else summary
+            logger.debug(f"Summary tail:\n{tail}")
 
             self._state.total_summarizations += 1
             self._state.summaries.append(summary)
-
-            logger.info(f"Generated summary ({len(summary)} chars)")
             return summary
 
         except Exception as e:
-            logger.error(f"Summarization failed: {e}")
+            logger.error(f"Structured summarization failed: {e}", exc_info=True)
             return f"[Summarization failed: {e}]"
 
     async def summarize_and_compact(
@@ -667,6 +689,7 @@ Summary:"""
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
         oss_reasoning_level: str = "high",
+        max_summary_length: int = 10000,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -703,7 +726,17 @@ Summary:"""
             llm,
             summarization_prompt,
             oss_reasoning_level,
+            max_summary_length,
         )
+
+        # Guard: if summary is larger than what we're replacing, skip compaction
+        summary_tokens = self.get_token_count([SystemMessage(content=summary)])
+        original_tokens = self.get_token_count(messages_to_summarize)
+        if summary_tokens > original_tokens:
+            logger.error(
+                f"Summary ({summary_tokens} tokens) larger than original ({original_tokens} tokens) — skipping compaction"
+            )
+            return messages
 
         # Create summary message
         summary_msg = SystemMessage(
