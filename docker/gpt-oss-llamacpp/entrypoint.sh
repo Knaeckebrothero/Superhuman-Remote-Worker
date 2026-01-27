@@ -129,7 +129,7 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 # Memory management - Q8_0 KV cache recommended for quality/memory balance
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
-CACHE_REUSE="${CACHE_REUSE:-256}"  # Prefix caching threshold (requires SWA override to work)
+CACHE_REUSE="${CACHE_REUSE:-0}"  # Prefix caching (0=disabled, requires SWA_OVERRIDE for iSWA models)
 
 # Sliding Window Full - allocates full KV cache (prevents gibberish on long contexts)
 SWA_FULL="${SWA_FULL:-true}"
@@ -139,7 +139,7 @@ SWA_FULL="${SWA_FULL:-true}"
 # This triggers a hard-coded safeguard that disables cache reuse entirely
 # Setting to 0 forces unified KV cache, enabling prefix caching for multi-turn conversations
 # Safe because gpt-oss uses hybrid attention and --swa-full ensures correct computation
-SWA_OVERRIDE="${SWA_OVERRIDE:-true}"
+SWA_OVERRIDE="${SWA_OVERRIDE:-false}"
 
 # Batch settings - tuned for datacenter GPUs (A100/H100/H200)
 # Larger batches improve MoE expert reuse and throughput
