@@ -341,6 +341,250 @@ class MongoDBService:
 
         return await self._db["chat_history"].count_documents({"job_id": job_id})
 
+    # =========================================================================
+    # Bulk Fetch Endpoints for Client-Side Caching
+    # =========================================================================
+
+    async def get_job_audit_bulk(
+        self,
+        job_id: str,
+        offset: int = 0,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        """Get bulk audit entries for caching in IndexedDB.
+
+        Uses offset/limit instead of page/pageSize for efficient bulk fetching.
+
+        Args:
+            job_id: The job UUID to query
+            offset: Number of entries to skip
+            limit: Maximum entries to return (up to 5000)
+
+        Returns:
+            Dict with entries, total count, offset, limit, hasMore
+        """
+        if not self._available or self._db is None:
+            return {
+                "entries": [],
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "hasMore": False,
+            }
+
+        collection = self._db["agent_audit"]
+        query = {"job_id": job_id}
+
+        # Get total count
+        total = await collection.count_documents(query)
+
+        # Clamp limit to prevent abuse
+        limit = min(limit, 5000)
+
+        # Check if there are more entries
+        has_more = (offset + limit) < total
+
+        # Fetch entries sorted by step_number
+        cursor = collection.find(query).sort("step_number", 1).skip(offset).limit(limit)
+
+        entries = []
+        async for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            # Convert timestamp to ISO string
+            if "timestamp" in doc and hasattr(doc["timestamp"], "isoformat"):
+                doc["timestamp"] = doc["timestamp"].isoformat()
+            entries.append(doc)
+
+        return {
+            "entries": entries,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": has_more,
+        }
+
+    async def get_chat_history_bulk(
+        self,
+        job_id: str,
+        offset: int = 0,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        """Get bulk chat history entries for caching in IndexedDB.
+
+        Args:
+            job_id: The job UUID to query
+            offset: Number of entries to skip
+            limit: Maximum entries to return (up to 5000)
+
+        Returns:
+            Dict with entries, total count, offset, limit, hasMore
+        """
+        if not self._available or self._db is None:
+            return {
+                "entries": [],
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "hasMore": False,
+            }
+
+        collection = self._db["chat_history"]
+        query = {"job_id": job_id}
+
+        # Get total count
+        total = await collection.count_documents(query)
+
+        # Clamp limit
+        limit = min(limit, 5000)
+
+        # Check if there are more entries
+        has_more = (offset + limit) < total
+
+        # Fetch entries sorted by sequence_number
+        cursor = collection.find(query).sort("sequence_number", 1).skip(offset).limit(limit)
+
+        entries = []
+        async for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            if "timestamp" in doc and hasattr(doc["timestamp"], "isoformat"):
+                doc["timestamp"] = doc["timestamp"].isoformat()
+            entries.append(doc)
+
+        return {
+            "entries": entries,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": has_more,
+        }
+
+    async def get_graph_deltas_bulk(
+        self,
+        job_id: str,
+        offset: int = 0,
+        limit: int = 5000,
+    ) -> dict[str, Any]:
+        """Get bulk graph deltas (execute_cypher_query tool calls) for caching.
+
+        Args:
+            job_id: The job UUID to query
+            offset: Number of deltas to skip
+            limit: Maximum deltas to return (up to 5000)
+
+        Returns:
+            Dict with deltas, total count, offset, limit, hasMore
+        """
+        if not self._available or self._db is None:
+            return {
+                "deltas": [],
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "hasMore": False,
+            }
+
+        collection = self._db["agent_audit"]
+
+        # Query for execute_cypher_query tool calls
+        query = {
+            "job_id": job_id,
+            "step_type": "tool",
+            "tool.name": "execute_cypher_query",
+        }
+
+        # Get total count
+        total = await collection.count_documents(query)
+
+        # Clamp limit
+        limit = min(limit, 5000)
+
+        # Check if there are more
+        has_more = (offset + limit) < total
+
+        # Fetch sorted by step_number
+        cursor = collection.find(query).sort("step_number", 1).skip(offset).limit(limit)
+
+        deltas = []
+        index = offset
+        async for doc in cursor:
+            # Extract relevant data for graph delta
+            query_text = doc.get("tool", {}).get("arguments", {}).get("query", "")
+            timestamp = doc.get("timestamp")
+            if hasattr(timestamp, "isoformat"):
+                timestamp = timestamp.isoformat()
+
+            deltas.append({
+                "toolCallIndex": index,
+                "timestamp": timestamp,
+                "cypherQuery": query_text,
+                "toolCallId": str(doc["_id"]),
+                "stepNumber": doc.get("step_number"),
+            })
+            index += 1
+
+        return {
+            "deltas": deltas,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": has_more,
+        }
+
+    async def get_job_version(self, job_id: str) -> dict[str, Any] | None:
+        """Get job data version info for cache invalidation.
+
+        Returns counts and timestamps that can be compared to detect changes.
+
+        Args:
+            job_id: The job UUID to query
+
+        Returns:
+            Dict with version info, or None if job has no audit data
+        """
+        if not self._available or self._db is None:
+            return None
+
+        audit_collection = self._db["agent_audit"]
+        chat_collection = self._db["chat_history"]
+
+        # Get counts
+        audit_count = await audit_collection.count_documents({"job_id": job_id})
+
+        if audit_count == 0:
+            return None
+
+        chat_count = await chat_collection.count_documents({"job_id": job_id})
+
+        # Count graph deltas (execute_cypher_query tool calls)
+        graph_count = await audit_collection.count_documents({
+            "job_id": job_id,
+            "step_type": "tool",
+            "tool.name": "execute_cypher_query",
+        })
+
+        # Get last audit entry timestamp
+        last_entry = await audit_collection.find_one(
+            {"job_id": job_id},
+            sort=[("step_number", -1)],
+            projection={"timestamp": 1},
+        )
+
+        last_update = None
+        if last_entry and "timestamp" in last_entry:
+            ts = last_entry["timestamp"]
+            last_update = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+
+        # Version is a hash of counts - if any count changes, version changes
+        version = hash((audit_count, chat_count, graph_count))
+
+        return {
+            "version": version,
+            "auditEntryCount": audit_count,
+            "chatEntryCount": chat_count,
+            "graphDeltaCount": graph_count,
+            "lastUpdate": last_update,
+        }
+
 
 # Singleton instance
 mongodb_service = MongoDBService()

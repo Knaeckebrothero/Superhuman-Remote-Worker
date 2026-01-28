@@ -1015,44 +1015,53 @@ class TestEditFileTool:
     """Tests for the edit_file workspace tool."""
 
     @pytest.fixture
-    def edit_tool(self, workspace_manager):
-        """Create workspace tools and return the edit_file tool."""
+    def workspace_tools_dict(self, workspace_manager):
+        """Create workspace tools and return as dict."""
         from src.tools.workspace_tools import create_workspace_tools
         from src.tools.context import ToolContext
 
         ctx = ToolContext(workspace_manager=workspace_manager)
         tools = create_workspace_tools(ctx)
-        # Find edit_file in the list
-        for t in tools:
-            if t.name == "edit_file":
-                return t
-        pytest.fail("edit_file tool not found in workspace tools")
+        return {t.name: t for t in tools}
 
-    def test_edit_file_single_replacement(self, workspace_manager, edit_tool):
+    @pytest.fixture
+    def edit_tool(self, workspace_tools_dict):
+        """Get the edit_file tool from workspace tools."""
+        return workspace_tools_dict["edit_file"]
+
+    @pytest.fixture
+    def read_tool(self, workspace_tools_dict):
+        """Get the read_file tool from workspace tools."""
+        return workspace_tools_dict["read_file"]
+
+    def test_edit_file_single_replacement(self, workspace_manager, edit_tool, read_tool):
         """Test successful single replacement."""
         workspace_manager.write_file("test.md", "Hello world\nGoodbye world\n")
+        read_tool.invoke({"path": "test.md"})  # Must read first
         result = edit_tool.invoke({"path": "test.md", "old_string": "Hello world", "new_string": "Hi world"})
         assert "Edited" in result
         content = workspace_manager.read_file("test.md")
         assert content == "Hi world\nGoodbye world\n"
 
     def test_edit_file_not_found(self, edit_tool):
-        """Test error when old_string is not found."""
-        # File doesn't exist
+        """Test error when file doesn't exist."""
+        # File doesn't exist - should fail before read check
         result = edit_tool.invoke({"path": "missing.md", "old_string": "x", "new_string": "y"})
         assert "Error" in result
         assert "not found" in result
 
-    def test_edit_file_old_string_missing(self, workspace_manager, edit_tool):
+    def test_edit_file_old_string_missing(self, workspace_manager, edit_tool, read_tool):
         """Test error when old_string not in file content."""
         workspace_manager.write_file("test.md", "Hello world\n")
+        read_tool.invoke({"path": "test.md"})  # Must read first
         result = edit_tool.invoke({"path": "test.md", "old_string": "does not exist", "new_string": "y"})
         assert "Error" in result
         assert "old_string not found" in result
 
-    def test_edit_file_multiple_matches(self, workspace_manager, edit_tool):
+    def test_edit_file_multiple_matches(self, workspace_manager, edit_tool, read_tool):
         """Test error when old_string appears multiple times."""
         workspace_manager.write_file("test.md", "foo bar\nfoo baz\n")
+        read_tool.invoke({"path": "test.md"})  # Must read first
         result = edit_tool.invoke({"path": "test.md", "old_string": "foo", "new_string": "qux"})
         assert "Error" in result
         assert "2 times" in result
@@ -1060,20 +1069,30 @@ class TestEditFileTool:
         # File should be unchanged
         assert workspace_manager.read_file("test.md") == "foo bar\nfoo baz\n"
 
-    def test_edit_file_deletion(self, workspace_manager, edit_tool):
+    def test_edit_file_deletion(self, workspace_manager, edit_tool, read_tool):
         """Test deletion by replacing with empty string."""
         workspace_manager.write_file("test.md", "keep this\ndelete this\nkeep too\n")
+        read_tool.invoke({"path": "test.md"})  # Must read first
         result = edit_tool.invoke({"path": "test.md", "old_string": "delete this\n", "new_string": ""})
         assert "Edited" in result
         content = workspace_manager.read_file("test.md")
         assert content == "keep this\nkeep too\n"
 
-    def test_edit_file_directory_error(self, workspace_manager, edit_tool):
+    def test_edit_file_directory_error(self, workspace_manager, edit_tool, read_tool):
         """Test error when path is a directory."""
         workspace_manager.get_path("subdir").mkdir(parents=True, exist_ok=True)
+        # Can't read a directory, so this should fail at the directory check
         result = edit_tool.invoke({"path": "subdir", "old_string": "x", "new_string": "y"})
         assert "Error" in result
         assert "directory" in result
+
+    def test_edit_file_requires_read(self, workspace_manager, edit_tool):
+        """Test that edit_file fails without recent read."""
+        workspace_manager.write_file("test.md", "Hello world\n")
+        # Don't read first - should fail
+        result = edit_tool.invoke({"path": "test.md", "old_string": "Hello", "new_string": "Hi"})
+        assert "Error" in result
+        assert "read_file" in result.lower()
 
 
 # =============================================================================

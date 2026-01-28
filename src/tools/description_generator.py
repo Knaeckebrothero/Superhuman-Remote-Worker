@@ -77,9 +77,12 @@ read_file("documents/GoBD.pdf", page_start=5, page_end=10)  # Read specific page
 Creates parent directories automatically if they don't exist.
 Overwrites the file if it already exists.
 
+**IMPORTANT:** If the file already exists, you must `read_file()` first to
+understand its current contents before overwriting.
+
 **Use this to:**
-- Create plans (plan.md)
-- Save research notes (research.md, document_analysis.md)
+- Create new files (plan.md, research.md)
+- Save research notes (document_analysis.md)
 - Write intermediate results (candidates/candidates.md)
 - Store processed data (chunks/chunk_001.md)
 
@@ -93,17 +96,6 @@ Overwrites the file if it already exists.
 ```
 write_file("notes/findings.md", "# Findings\\n\\n- Found 3 requirements...")
 ```""",
-
-        "append_file": """Append content to an existing file in the workspace.
-
-Creates the file if it doesn't exist.
-Use this for log-style files or incremental updates.
-
-**Arguments:**
-- `path` (str): Relative path to the file
-- `content` (str): Content to append
-
-**Returns:** Confirmation message""",
 
         "list_files": """List files and directories in a workspace path.
 
@@ -121,6 +113,42 @@ Use this to explore your workspace structure.
 list_files()  # List workspace root
 list_files("chunks")  # List all chunks
 list_files("notes", "*.md")  # List only markdown files in notes
+```""",
+
+        "edit_file": """Edit a file by replacing text or inserting at start/end.
+
+**IMPORTANT:** You must `read_file()` before editing to understand the file's
+current contents.
+
+**Modes:**
+
+1. **Replace mode** (default): Set `old_string` and `new_string` to find
+   and replace text. The `old_string` must appear exactly once.
+
+2. **Append mode**: Set `position="end"` to add `new_string` at the end
+   of the file. The `old_string` parameter is ignored.
+
+3. **Prepend mode**: Set `position="start"` to add `new_string` at the
+   beginning of the file. The `old_string` parameter is ignored.
+
+**Arguments:**
+- `path` (str): Relative path to the file (e.g., "plan.md")
+- `old_string` (str): Text to find and replace (required for replace mode)
+- `new_string` (str): Replacement text or content to insert
+- `position` (str, optional): Insert position - "start", "end", or omit for replace
+
+**Returns:** Confirmation message or error with guidance
+
+**Examples:**
+```
+# Replace mode (default)
+edit_file("plan.md", old_string="## Draft", new_string="## Final")
+
+# Append mode - add to end of file
+edit_file("notes.md", new_string="\\n## New Section", position="end")
+
+# Prepend mode - add to start of file
+edit_file("log.md", new_string="# Header\\n\\n", position="start")
 ```""",
 
         "delete_file": """Delete a file or empty directory from the workspace.

@@ -1,6 +1,9 @@
 // Setup fake-indexeddb for testing
 import 'fake-indexeddb/auto';
 
+// Import Angular compiler for JIT compilation in tests
+import '@angular/compiler';
+
 // Mock navigator.storage for getStorageEstimate
 Object.defineProperty(globalThis.navigator, 'storage', {
   value: {
