@@ -1,4 +1,4 @@
-import { Component, inject, computed, OnInit } from '@angular/core';
+import { Component, inject, computed, OnInit, OnDestroy } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MenuComponent } from '../menu/menu.component';
 import { DataService } from '../../core/services/data.service';
@@ -41,6 +41,17 @@ import { DataService } from '../../core/services/data.service';
         title="Refresh jobs"
       >
         &#x21bb;
+      </button>
+      <button
+        class="auto-refresh-btn"
+        [class.active]="data.autoRefreshEnabled()"
+        (click)="toggleAutoRefresh()"
+        [title]="data.autoRefreshEnabled() ? 'Disable auto-refresh (15s)' : 'Enable auto-refresh (15s)'"
+      >
+        @if (data.autoRefreshEnabled()) {
+          <span class="auto-indicator"></span>
+        }
+        AUTO
       </button>
 
       <div class="divider"></div>
@@ -271,6 +282,51 @@ import { DataService } from '../../core/services/data.service';
         cursor: not-allowed;
       }
 
+      .auto-refresh-btn {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 8px;
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 4px;
+        background: transparent;
+        color: var(--text-secondary, #a6adc8);
+        font-size: 10px;
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .auto-refresh-btn:hover {
+        background: var(--surface-0, #313244);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .auto-refresh-btn.active {
+        background: var(--accent-color, #cba6f7);
+        color: var(--timeline-bg, #11111b);
+        border-color: var(--accent-color, #cba6f7);
+      }
+
+      .auto-refresh-btn.active:hover {
+        background: var(--accent-hover, #b4befe);
+        border-color: var(--accent-hover, #b4befe);
+      }
+
+      .auto-indicator {
+        width: 6px;
+        height: 6px;
+        background: currentColor;
+        border-radius: 50%;
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.4; }
+      }
+
       .loading-indicator {
         display: flex;
         align-items: center;
@@ -306,7 +362,7 @@ import { DataService } from '../../core/services/data.service';
     `,
   ],
 })
-export class TimelineComponent implements OnInit {
+export class TimelineComponent implements OnInit, OnDestroy {
   readonly data = inject(DataService);
 
   // Playback state (placeholder - auto-advance not implemented yet)
@@ -335,6 +391,10 @@ export class TimelineComponent implements OnInit {
     this.data.loadJobs();
   }
 
+  ngOnDestroy(): void {
+    this.data.stopAutoRefresh();
+  }
+
   onJobSelect(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     if (value) {
@@ -358,6 +418,10 @@ export class TimelineComponent implements OnInit {
   togglePlay(): void {
     // Playback not implemented yet
     // Could auto-advance slider index at a rate
+  }
+
+  toggleAutoRefresh(): void {
+    this.data.toggleAutoRefresh();
   }
 
   private formatTimestamp(isoString: string): string {
