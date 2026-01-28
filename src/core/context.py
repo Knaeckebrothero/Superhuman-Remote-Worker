@@ -778,25 +778,56 @@ Conversation:
             )
             return messages
 
-        # Create summary as HumanMessage so it appears in conversation
-        summary_msg = HumanMessage(
+        # Create summary as SystemMessage (best practice per OpenAI/LangChain)
+        # SystemMessage signals "background context" rather than user dialogue
+        summary_msg = SystemMessage(
             content=f"[Summary of prior work]\n{summary}"
         )
 
-        # Generate removal markers for all messages being summarized
-        # The add_messages reducer will remove these from state
+        # Generate removal markers for ALL conversation messages (summarized + recent)
+        # We remove recent messages too and re-add them as fresh copies so they appear
+        # AFTER the summary in the correct order
         removal_markers = []
-        for msg in messages_to_summarize:
+        messages_without_ids = 0
+        for msg in conversation:  # All conversation messages, not just messages_to_summarize
             if hasattr(msg, 'id') and msg.id:
                 removal_markers.append(RemoveMessage(id=msg.id))
+            else:
+                messages_without_ids += 1
+
+        if messages_without_ids > 0:
+            logger.warning(f"{messages_without_ids} messages without IDs cannot be removed")
+
+        # Create fresh copies of recent messages without IDs so they get appended
+        # after the summary instead of staying in their original positions
+        fresh_recent = []
+        for msg in recent_messages:
+            if isinstance(msg, AIMessage):
+                fresh_recent.append(AIMessage(
+                    content=msg.content,
+                    tool_calls=getattr(msg, 'tool_calls', None) or [],
+                    additional_kwargs=msg.additional_kwargs,
+                ))
+            elif isinstance(msg, ToolMessage):
+                fresh_recent.append(ToolMessage(
+                    content=msg.content,
+                    tool_call_id=msg.tool_call_id,
+                ))
+            elif isinstance(msg, HumanMessage):
+                fresh_recent.append(HumanMessage(content=msg.content))
+            else:
+                # For any other message type, try to preserve it
+                fresh_recent.append(msg)
 
         logger.info(
-            f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(recent_messages)} "
-            f"(summarized {len(messages_to_summarize)} messages, removing {len(removal_markers)})"
+            f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(fresh_recent)} "
+            f"(summarized {len(messages_to_summarize)} messages, removing {len(removal_markers)}, "
+            f"{messages_without_ids} without IDs)"
         )
 
-        # Return: removal markers + system messages + summary + recent
-        return removal_markers + system_msgs + [summary_msg] + recent_messages
+        # Return: removal markers + system messages + summary + fresh recent
+        # Order matters: summary comes BEFORE recent messages
+        return removal_markers + system_msgs + [summary_msg] + fresh_recent
 
     def create_pre_model_hook(self) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
         """Create a pre-model hook for LangGraph integration.

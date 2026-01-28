@@ -52,6 +52,7 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -307,6 +308,13 @@ def create_execute_node(
 
         logger.debug(f"[{job_id}] Execute iteration {iteration}")
 
+        # Debug: log message types in state
+        msg_types = {}
+        for msg in messages:
+            msg_type = type(msg).__name__
+            msg_types[msg_type] = msg_types.get(msg_type, 0) + 1
+        logger.debug(f"[{job_id}] State messages: {len(messages)} total, types: {msg_types}")
+
         # Build messages for LLM
         prepared_messages = []
 
@@ -342,10 +350,15 @@ def create_execute_node(
             oss_reasoning_level=oss_reasoning_level,
             max_summary_length=config.context_management.max_summary_length,
         )
-        context_was_compacted = len(messages) < original_message_count
+        # Separate RemoveMessage markers from actual messages
+        # RemoveMessage markers must NOT be sent to LLM - they're only for state update
+        remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
+        messages = [m for m in messages if not isinstance(m, RemoveMessage)]
+        context_was_compacted = len(remove_markers) > 0
         if context_was_compacted:
             logger.info(
-                f"[{job_id}] Context compacted in execute: {original_message_count} -> {len(messages)} messages"
+                f"[{job_id}] Context compacted in execute: {original_message_count} -> {len(messages)} messages "
+                f"(removing {len(remove_markers)} old messages)"
             )
 
         # Always clear old tool results, keep last 10
@@ -355,9 +368,15 @@ def create_execute_node(
         # (can occur from improper context compaction or checkpoint corruption)
         messages = sanitize_message_history(messages)
 
-        # Add full conversation history (excluding system messages)
+        # Add full conversation history (excluding system messages, but keeping summaries)
+        # We exclude regular SystemMessages because we regenerate the system prompt fresh,
+        # but summary SystemMessages (from context compaction) should be included
         for msg in messages:
-            if not isinstance(msg, SystemMessage):
+            if isinstance(msg, SystemMessage):
+                # Include summary SystemMessages, exclude others
+                if "[Summary of prior work]" in msg.content:
+                    prepared_messages.append(msg)
+            else:
                 prepared_messages.append(msg)
 
         # Handle consecutive AI messages — inject dynamic todo reminder
@@ -450,8 +469,9 @@ def create_execute_node(
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
                 if context_was_compacted:
+                    # Include RemoveMessage markers so state reducer removes old messages
                     return {
-                        "messages": messages + [response],
+                        "messages": remove_markers + messages + [response],
                         "iteration": iteration + 1,
                         "error": None,
                     }
@@ -671,21 +691,34 @@ def create_archive_phase_node(
                 force=force_summarize,
             )
 
-            if len(compacted_messages) < len(messages):
+            # Check for RemoveMessage markers to detect if compaction occurred
+            # (RemoveMessage count makes len() unreliable)
+            remove_markers = [m for m in compacted_messages if isinstance(m, RemoveMessage)]
+            if remove_markers:
+                # Compaction occurred - separate markers from actual messages
+                actual_messages = [m for m in compacted_messages if not isinstance(m, RemoveMessage)]
                 reason = "strategic→tactical transition" if force_summarize else "threshold exceeded"
                 logger.info(
                     f"[{job_id}] Compacted context ({reason}): "
-                    f"{len(messages)} -> {len(compacted_messages)} messages"
+                    f"{len(messages)} -> {len(actual_messages)} messages "
+                    f"(removing {len(remove_markers)} old messages)"
                 )
+                # Reassemble: RemoveMessage markers first, then actual messages
+                compacted_messages = remove_markers + actual_messages
             else:
                 compacted_messages = None  # No compaction occurred
 
         # Return with compacted messages if compaction occurred
         if compacted_messages is not None:
+            logger.debug(
+                f"[{job_id}] archive_phase returning {len(compacted_messages)} compacted messages "
+                f"({len(remove_markers)} RemoveMessage + {len(actual_messages)} actual) + 1 new message"
+            )
             return {
                 "messages": compacted_messages + [message],
             }
 
+        logger.debug(f"[{job_id}] archive_phase returning 1 new message (no compaction)")
         return {
             "messages": [message],
         }

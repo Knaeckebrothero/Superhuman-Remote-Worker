@@ -189,6 +189,37 @@ class TodoManager:
         logger.warning(f"Todo not found: {todo_id}")
         return None
 
+    def complete_multiple(
+        self, todo_ids: List[str], notes: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Mark multiple todos as completed.
+
+        Args:
+            todo_ids: List of todo IDs to complete
+            notes: Optional notes to add to all completed todos
+
+        Returns:
+            Dictionary with:
+                - completed: List of completed TodoItems
+                - not_found: List of IDs that weren't found
+                - is_last: Whether all todos are now complete
+        """
+        completed = []
+        not_found = []
+
+        for todo_id in todo_ids:
+            todo = self.complete(todo_id.strip(), notes)
+            if todo:
+                completed.append(todo)
+            else:
+                not_found.append(todo_id)
+
+        return {
+            "completed": completed,
+            "not_found": not_found,
+            "is_last": self.all_complete(),
+        }
+
     def start(self, todo_id: str) -> Optional[TodoItem]:
         """Mark a todo as in progress.
 
