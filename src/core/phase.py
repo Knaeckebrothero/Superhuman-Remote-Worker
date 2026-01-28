@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import yaml
-from langchain_core.messages import RemoveMessage
+from langchain_core.messages import HumanMessage
 
 if TYPE_CHECKING:
     from ..core.loader import AgentConfig
@@ -376,21 +376,6 @@ def load_todos_from_yaml(
 # =============================================================================
 
 
-def _create_clear_messages_list(state: "UniversalAgentState") -> List[RemoveMessage]:
-    """Create RemoveMessage entries to clear all messages.
-
-    LangGraph's add_messages reducer requires explicit RemoveMessage
-    entries to remove messages from state.
-
-    Args:
-        state: Current agent state containing messages to clear
-
-    Returns:
-        List of RemoveMessage entries for all messages with IDs
-    """
-    messages = state.get("messages", [])
-    return [RemoveMessage(id=msg.id) for msg in messages if hasattr(msg, 'id') and msg.id]
-
 
 @dataclass
 class TransitionResult:
@@ -462,7 +447,7 @@ def on_strategic_phase_complete(
     3. This function checks for staged todos and applies them
 
     On success:
-    - Clears conversation history
+    - Injects phase boundary marker message
     - Applies staged todos to TodoManager
     - Flips to tactical phase
     - Increments phase_number
@@ -506,10 +491,18 @@ def on_strategic_phase_complete(
         f"({todo_count} todos)"
     )
 
+    phase_marker = HumanMessage(
+        content=(
+            f"[PHASE_TRANSITION] Strategic phase complete. "
+            f"Entering tactical phase {phase_number + 1}: {phase_name} "
+            f"({todo_count} todos). Work through the todos using your tools."
+        )
+    )
+
     return TransitionResult(
         success=True,
         state_updates={
-            "messages": _create_clear_messages_list(state),
+            "messages": [phase_marker],
             "is_strategic_phase": False,
             "phase_number": phase_number + 1,
             "phase_complete": False,
@@ -529,7 +522,7 @@ def on_tactical_phase_complete(
     It transitions to strategic phase with predefined todos.
 
     On success:
-    - Clears conversation history
+    - Injects phase boundary marker message
     - Loads predefined strategic todos
     - Flips to strategic phase
     - Increments phase_number
@@ -558,10 +551,19 @@ def on_tactical_phase_complete(
         f"({len(strategic_todos)} predefined todos)"
     )
 
+    phase_marker = HumanMessage(
+        content=(
+            f"[PHASE_TRANSITION] Tactical phase complete. "
+            f"Entering strategic phase {phase_number + 1}. "
+            f"Review what was accomplished, update workspace.md and plan.md, "
+            f"then create todos for the next tactical phase or call job_complete."
+        )
+    )
+
     return TransitionResult(
         success=True,
         state_updates={
-            "messages": _create_clear_messages_list(state),
+            "messages": [phase_marker],
             "is_strategic_phase": True,
             "phase_number": phase_number + 1,
             "phase_complete": False,

@@ -4,6 +4,7 @@ Provides document and web citation capabilities for requirement traceability.
 Integrates with CitationEngine for verified, persistent citations.
 """
 
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -63,6 +64,15 @@ CITATION_TOOLS_METADATA = {
         "category": "domain",
         "defer_to_workspace": True,
         "short_description": "List all citations with status and source info.",
+        "phases": ["tactical"],
+    },
+    "edit_citation": {
+        "module": "citation_tools",
+        "function": "edit_citation",
+        "description": "Edit fields of an existing citation",
+        "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "Edit citation fields (claim, quote, confidence, etc.).",
         "phases": ["tactical"],
     },
 }
@@ -462,10 +472,89 @@ Created: {citation.created_at}
             logger.error(f"Error listing citations: {e}")
             return f"Error listing citations: {str(e)}"
 
+    @tool
+    async def edit_citation(
+        citation_id: int,
+        claim: Optional[str] = None,
+        verbatim_quote: Optional[str] = None,
+        quote_context: Optional[str] = None,
+        relevance_reasoning: Optional[str] = None,
+        confidence: Optional[str] = None,
+        extraction_method: Optional[str] = None,
+        locator: Optional[str] = None,
+    ) -> str:
+        """Edit fields of an existing citation.
+
+        When content fields (claim, verbatim_quote, quote_context) are changed,
+        verification_status is automatically reset to 'pending' and previous
+        verification results are cleared, since the old verification is no
+        longer valid.
+
+        Args:
+            citation_id: The numeric citation ID (without brackets)
+            claim: The assertion being supported
+            verbatim_quote: Exact quote from source
+            quote_context: Context around the quote
+            relevance_reasoning: Why this citation is relevant
+            confidence: Confidence level (high, medium, low)
+            extraction_method: How extracted (direct_quote, paraphrase, inference, aggregation, negative)
+            locator: Location reference as JSON string (e.g., '{"page": 5, "section": "3.2"}')
+
+        Returns:
+            "ok: edited citation [N]" on success, "error: {reason}" on failure
+        """
+        try:
+            if not context.db:
+                return "error: no database connection"
+
+            # Build kwargs for edit, only including non-None values
+            kwargs = {}
+            if claim is not None:
+                kwargs["claim"] = claim
+            if verbatim_quote is not None:
+                kwargs["verbatim_quote"] = verbatim_quote
+            if quote_context is not None:
+                kwargs["quote_context"] = quote_context
+            if relevance_reasoning is not None:
+                kwargs["relevance_reasoning"] = relevance_reasoning
+            if confidence is not None:
+                kwargs["confidence"] = confidence
+            if extraction_method is not None:
+                kwargs["extraction_method"] = extraction_method
+            if locator is not None:
+                try:
+                    kwargs["locator"] = json.loads(locator)
+                except json.JSONDecodeError:
+                    return "error: locator must be valid JSON"
+
+            if not kwargs:
+                return "error: no fields provided to edit"
+
+            content_changed = any(
+                v is not None for v in [claim, verbatim_quote, quote_context]
+            )
+
+            await context.db.citations.edit(
+                citation_id=citation_id,
+                **kwargs
+            )
+
+            result = f"ok: edited citation [{citation_id}]"
+            if content_changed:
+                result += " (verification_status reset to 'pending')"
+            return result
+
+        except ValueError as e:
+            return f"error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error editing citation: {e}")
+            return f"error: {str(e)}"
+
     return [
         cite_document,
         cite_web,
         list_sources,
         get_citation,
         list_citations,
+        edit_citation,
     ]

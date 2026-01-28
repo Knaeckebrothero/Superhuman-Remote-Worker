@@ -994,8 +994,8 @@ def create_route_after_transition(
         IMPORTANT: If job is frozen (job_complete was called), always go to
         check_goal so the frozen state can be detected and the graph can stop.
 
-        If transition was rejected (messages contain error), go back to execute
-        so the agent can fix the issue. If transition succeeded (messages cleared),
+        If transition was rejected (last message contains rejection marker),
+        go back to execute so the agent can fix the issue. Otherwise,
         proceed to check_goal.
         """
         # Check if job is frozen - must go to check_goal to detect and stop
@@ -1003,20 +1003,15 @@ def create_route_after_transition(
         if job_frozen_path.exists():
             return "check_goal"
 
+        # Check if transition was rejected (last message contains rejection marker)
         messages = state.get("messages", [])
-
-        # If messages is empty, transition succeeded and cleared history
-        if not messages:
-            return "check_goal"
-
-        # If messages exist, check if it's a rejection error
         if messages:
             last_msg = messages[-1]
             content = getattr(last_msg, "content", "") or ""
             if "[TRANSITION_REJECTED]" in content:
                 return "execute"
 
-        # Default: proceed to goal check
+        # Default: transition succeeded, proceed to goal check
         return "check_goal"
 
     return route_after_transition

@@ -51,6 +51,15 @@ CACHE_TOOLS_METADATA = {
         "short_description": "Get complete details of a requirement by ID.",
         "phases": ["tactical"],
     },
+    "edit_requirement": {
+        "module": "cache_tools",
+        "function": "edit_requirement",
+        "description": "Edit content fields of an existing pending requirement",
+        "category": "domain",
+        "defer_to_workspace": True,
+        "short_description": "Edit fields of a pending requirement (text, name, type, etc.).",
+        "phases": ["tactical"],
+    },
 }
 
 
@@ -306,8 +315,108 @@ Validation:
             logger.error(f"Error getting requirement: {e}")
             return f"Error getting requirement: {str(e)}"
 
+    @tool
+    async def edit_requirement(
+        requirement_id: str,
+        text: Optional[str] = None,
+        name: Optional[str] = None,
+        req_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        gobd_relevant: Optional[bool] = None,
+        gdpr_relevant: Optional[bool] = None,
+        source_document: Optional[str] = None,
+        source_location: Optional[str] = None,
+        citations: Optional[str] = None,
+        mentioned_objects: Optional[str] = None,
+        mentioned_messages: Optional[str] = None,
+        reasoning: Optional[str] = None,
+        research_notes: Optional[str] = None,
+        confidence: Optional[float] = None,
+        tags: Optional[str] = None,
+    ) -> str:
+        """Edit content fields of an existing pending requirement.
+
+        Only requirements with status='pending' can be edited. Protected fields
+        (id, job_id, status, neo4j_id, validation_result, etc.) cannot be changed.
+        Provide only the fields you want to update.
+
+        Args:
+            requirement_id: UUID of the requirement to edit
+            text: Full requirement text
+            name: Short name/title (max 500 chars)
+            req_type: Type (functional, compliance, constraint, non_functional)
+            priority: Priority (high, medium, low)
+            gobd_relevant: GoBD relevance flag
+            gdpr_relevant: GDPR relevance flag
+            source_document: Source document path
+            source_location: Location in document (e.g., "Section 3.2")
+            citations: Comma-separated citation IDs (replaces existing)
+            mentioned_objects: Comma-separated BusinessObject names (replaces existing)
+            mentioned_messages: Comma-separated Message names (replaces existing)
+            reasoning: Extraction reasoning
+            research_notes: Research notes
+            confidence: Confidence score (0.0-1.0)
+            tags: Comma-separated tags (replaces existing)
+
+        Returns:
+            "ok: edited {uuid}" on success, "error: {reason}" on failure
+        """
+        try:
+            if not context.db:
+                return "error: no database connection"
+
+            # Build kwargs for edit_content, only including non-None values
+            kwargs = {}
+            if text is not None:
+                kwargs["text"] = text
+            if name is not None:
+                kwargs["name"] = name
+            if req_type is not None:
+                kwargs["req_type"] = req_type
+            if priority is not None:
+                kwargs["priority"] = priority
+            if gobd_relevant is not None:
+                kwargs["gobd_relevant"] = gobd_relevant
+            if gdpr_relevant is not None:
+                kwargs["gdpr_relevant"] = gdpr_relevant
+            if source_document is not None:
+                kwargs["source_document"] = source_document
+            if source_location is not None:
+                kwargs["source_location"] = {"section": source_location}
+            if citations is not None:
+                kwargs["citations"] = [c.strip() for c in citations.split(",") if c.strip()]
+            if mentioned_objects is not None:
+                kwargs["mentioned_objects"] = [o.strip() for o in mentioned_objects.split(",") if o.strip()]
+            if mentioned_messages is not None:
+                kwargs["mentioned_messages"] = [m.strip() for m in mentioned_messages.split(",") if m.strip()]
+            if reasoning is not None:
+                kwargs["reasoning"] = reasoning
+            if research_notes is not None:
+                kwargs["research_notes"] = research_notes
+            if confidence is not None:
+                kwargs["confidence"] = confidence
+            if tags is not None:
+                kwargs["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+
+            if not kwargs:
+                return "error: no fields provided to edit"
+
+            await context.db.requirements.edit_content(
+                requirement_uuid=uuid.UUID(requirement_id),
+                **kwargs
+            )
+
+            return f"ok: edited {requirement_id}"
+
+        except ValueError as e:
+            return f"error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error editing requirement: {e}")
+            return f"error: {str(e)}"
+
     return [
         add_requirement,
         list_requirements,
         get_requirement,
+        edit_requirement,
     ]

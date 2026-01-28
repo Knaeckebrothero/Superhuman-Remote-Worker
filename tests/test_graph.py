@@ -8,7 +8,7 @@ import pytest
 import tempfile
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, AsyncMock, patch
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
@@ -359,10 +359,12 @@ class TestCheckGoalNode:
 class TestRouteAfterTransition:
     """Tests for route_after_transition routing function."""
 
-    def test_route_after_transition_success_empty_messages(self, workspace_manager):
-        """Test routing when transition succeeded (messages cleared)."""
+    def test_route_after_transition_success_with_phase_marker(self, workspace_manager):
+        """Test routing when transition succeeded (phase boundary marker present)."""
         route_after_transition = create_route_after_transition(workspace_manager)
-        state = {"messages": []}
+        from langchain_core.messages import HumanMessage
+        marker = HumanMessage(content="[PHASE_TRANSITION] Tactical phase complete.")
+        state = {"messages": [marker]}
         result = route_after_transition(state)
         assert result == "check_goal"
 
@@ -602,8 +604,9 @@ todos:
         }
         result = node(state)
 
-        # Should clear messages (success)
-        assert result.get("messages") == []
+        # Should inject phase boundary marker
+        assert len(result.get("messages", [])) == 1
+        assert "[PHASE_TRANSITION]" in result["messages"][0].content
         # Should flip phase
         assert result.get("is_strategic_phase") is False
         # Should increment phase number
@@ -664,8 +667,9 @@ todos:
         }
         result = node(state)
 
-        # Should clear messages (success)
-        assert result.get("messages") == []
+        # Should inject phase boundary marker
+        assert len(result.get("messages", [])) == 1
+        assert "[PHASE_TRANSITION]" in result["messages"][0].content
         # Should flip to strategic
         assert result.get("is_strategic_phase") is True
         # Should increment phase number
@@ -740,7 +744,7 @@ todos:
         # Verify transition to tactical
         assert state.get("is_strategic_phase") is False
         assert state.get("phase_number") == 1
-        assert state.get("messages") == []  # Messages cleared
+        assert any("[PHASE_TRANSITION]" in getattr(m, "content", "") for m in state.get("messages", []))
         assert len(managers["todo"].list_all()) == 5  # Loaded from todos.yaml
 
         # Step 4: Complete tactical todos
@@ -755,7 +759,7 @@ todos:
         # Verify transition back to strategic
         assert state.get("is_strategic_phase") is True
         assert state.get("phase_number") == 2
-        assert state.get("messages") == []  # Messages cleared
+        assert any("[PHASE_TRANSITION]" in getattr(m, "content", "") for m in state.get("messages", []))
         # Should have transition strategic todos (4 items)
         assert len(managers["todo"].list_all()) == 4
 
@@ -835,12 +839,13 @@ todos:
         result = transition_node(state)
 
         # Should succeed now
-        assert result.get("messages") == []
+        assert len(result.get("messages", [])) == 1
+        assert "[PHASE_TRANSITION]" in result["messages"][0].content
         assert result.get("is_strategic_phase") is False
         assert result.get("phase_number") == 1
 
         # route_after_transition should proceed to check_goal
-        assert route_after_transition({"messages": []}) == "check_goal"
+        assert route_after_transition({"messages": result["messages"]}) == "check_goal"
 
     def test_workspace_memory_persists_across_phases(self, managers, mock_config):
         """Test that workspace.md content persists across phase transitions."""
@@ -911,3 +916,288 @@ todos:
         memory_content = managers["memory"].read()
         assert "Important fact 1" in memory_content
         assert "Important fact 2" in memory_content
+
+
+# =============================================================================
+# EDIT FILE TOOL TESTS
+# =============================================================================
+
+
+class TestEditFileTool:
+    """Tests for the edit_file workspace tool."""
+
+    @pytest.fixture
+    def edit_tool(self, workspace_manager):
+        """Create workspace tools and return the edit_file tool."""
+        from src.tools.workspace_tools import create_workspace_tools
+        from src.tools.context import ToolContext
+
+        ctx = ToolContext(workspace_manager=workspace_manager)
+        tools = create_workspace_tools(ctx)
+        # Find edit_file in the list
+        for t in tools:
+            if t.name == "edit_file":
+                return t
+        pytest.fail("edit_file tool not found in workspace tools")
+
+    def test_edit_file_single_replacement(self, workspace_manager, edit_tool):
+        """Test successful single replacement."""
+        workspace_manager.write_file("test.md", "Hello world\nGoodbye world\n")
+        result = edit_tool.invoke({"path": "test.md", "old_string": "Hello world", "new_string": "Hi world"})
+        assert "Edited" in result
+        content = workspace_manager.read_file("test.md")
+        assert content == "Hi world\nGoodbye world\n"
+
+    def test_edit_file_not_found(self, edit_tool):
+        """Test error when old_string is not found."""
+        # File doesn't exist
+        result = edit_tool.invoke({"path": "missing.md", "old_string": "x", "new_string": "y"})
+        assert "Error" in result
+        assert "not found" in result
+
+    def test_edit_file_old_string_missing(self, workspace_manager, edit_tool):
+        """Test error when old_string not in file content."""
+        workspace_manager.write_file("test.md", "Hello world\n")
+        result = edit_tool.invoke({"path": "test.md", "old_string": "does not exist", "new_string": "y"})
+        assert "Error" in result
+        assert "old_string not found" in result
+
+    def test_edit_file_multiple_matches(self, workspace_manager, edit_tool):
+        """Test error when old_string appears multiple times."""
+        workspace_manager.write_file("test.md", "foo bar\nfoo baz\n")
+        result = edit_tool.invoke({"path": "test.md", "old_string": "foo", "new_string": "qux"})
+        assert "Error" in result
+        assert "2 times" in result
+        assert "more surrounding context" in result
+        # File should be unchanged
+        assert workspace_manager.read_file("test.md") == "foo bar\nfoo baz\n"
+
+    def test_edit_file_deletion(self, workspace_manager, edit_tool):
+        """Test deletion by replacing with empty string."""
+        workspace_manager.write_file("test.md", "keep this\ndelete this\nkeep too\n")
+        result = edit_tool.invoke({"path": "test.md", "old_string": "delete this\n", "new_string": ""})
+        assert "Edited" in result
+        content = workspace_manager.read_file("test.md")
+        assert content == "keep this\nkeep too\n"
+
+    def test_edit_file_directory_error(self, workspace_manager, edit_tool):
+        """Test error when path is a directory."""
+        workspace_manager.get_path("subdir").mkdir(parents=True, exist_ok=True)
+        result = edit_tool.invoke({"path": "subdir", "old_string": "x", "new_string": "y"})
+        assert "Error" in result
+        assert "directory" in result
+
+
+# =============================================================================
+# EDIT REQUIREMENT TOOL TESTS
+# =============================================================================
+
+
+class TestEditRequirementTool:
+    """Tests for the edit_requirement tool."""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database with requirements namespace."""
+        db = MagicMock()
+        db.requirements = MagicMock()
+        return db
+
+    @pytest.fixture
+    def edit_tool(self, workspace_manager, mock_db):
+        """Create cache tools and return the edit_requirement tool."""
+        from src.tools.cache_tools import create_cache_tools
+        from src.tools.context import ToolContext
+
+        ctx = ToolContext(
+            workspace_manager=workspace_manager,
+            postgres_db=mock_db,
+            _job_id="test-job-123",
+        )
+        tools = create_cache_tools(ctx)
+        for t in tools:
+            if t.name == "edit_requirement":
+                return t
+        pytest.fail("edit_requirement tool not found in cache tools")
+
+    @pytest.mark.asyncio
+    async def test_edit_text_and_name(self, edit_tool, mock_db):
+        """Test successful edit of text and name."""
+        mock_db.requirements.edit_content = AsyncMock(return_value=None)
+
+        result = await edit_tool.ainvoke({
+            "requirement_id": "00000000-0000-0000-0000-000000000001",
+            "text": "Updated text",
+            "name": "Updated name",
+        })
+
+        assert "ok: edited" in result
+        mock_db.requirements.edit_content.assert_called_once()
+        call_kwargs = mock_db.requirements.edit_content.call_args
+        assert call_kwargs.kwargs["text"] == "Updated text"
+        assert call_kwargs.kwargs["name"] == "Updated name"
+
+    @pytest.mark.asyncio
+    async def test_edit_not_found(self, edit_tool, mock_db):
+        """Test error when requirement is not found."""
+        mock_db.requirements.edit_content = AsyncMock(
+            side_effect=ValueError("Requirement 00000000-0000-0000-0000-000000000099 not found")
+        )
+
+        result = await edit_tool.ainvoke({
+            "requirement_id": "00000000-0000-0000-0000-000000000099",
+            "text": "New text",
+        })
+
+        assert "error:" in result
+        assert "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_not_pending(self, edit_tool, mock_db):
+        """Test error when requirement is not in 'pending' status."""
+        mock_db.requirements.edit_content = AsyncMock(
+            side_effect=ValueError("has status 'integrated', only 'pending' requirements can be edited")
+        )
+
+        result = await edit_tool.ainvoke({
+            "requirement_id": "00000000-0000-0000-0000-000000000001",
+            "text": "New text",
+        })
+
+        assert "error:" in result
+        assert "pending" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_no_fields(self, edit_tool, mock_db):
+        """Test error when no fields are provided."""
+        result = await edit_tool.ainvoke({
+            "requirement_id": "00000000-0000-0000-0000-000000000001",
+        })
+
+        assert "error:" in result
+        assert "no fields" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_parses_comma_lists(self, edit_tool, mock_db):
+        """Test that comma-separated lists are parsed correctly."""
+        mock_db.requirements.edit_content = AsyncMock(return_value=None)
+
+        result = await edit_tool.ainvoke({
+            "requirement_id": "00000000-0000-0000-0000-000000000001",
+            "tags": "tag1, tag2, tag3",
+            "citations": "CIT-001, CIT-002",
+        })
+
+        assert "ok: edited" in result
+        call_kwargs = mock_db.requirements.edit_content.call_args.kwargs
+        assert call_kwargs["tags"] == ["tag1", "tag2", "tag3"]
+        assert call_kwargs["citations"] == ["CIT-001", "CIT-002"]
+
+
+# =============================================================================
+# EDIT CITATION TOOL TESTS
+# =============================================================================
+
+
+class TestEditCitationTool:
+    """Tests for the edit_citation tool."""
+
+    @pytest.fixture
+    def mock_db(self):
+        """Create a mock database with citations namespace."""
+        db = MagicMock()
+        db.citations = MagicMock()
+        return db
+
+    @pytest.fixture
+    def edit_tool(self, workspace_manager, mock_db):
+        """Create citation tools and return the edit_citation tool."""
+        from src.tools.citation_tools import create_citation_tools
+        from src.tools.context import ToolContext
+
+        ctx = ToolContext(
+            workspace_manager=workspace_manager,
+            postgres_db=mock_db,
+            _job_id="test-job-123",
+        )
+        tools = create_citation_tools(ctx)
+        for t in tools:
+            if t.name == "edit_citation":
+                return t
+        pytest.fail("edit_citation tool not found in citation tools")
+
+    @pytest.mark.asyncio
+    async def test_edit_claim(self, edit_tool, mock_db):
+        """Test successful edit of claim field."""
+        mock_db.citations.edit = AsyncMock(return_value=None)
+
+        result = await edit_tool.ainvoke({
+            "citation_id": 1,
+            "claim": "Updated claim text",
+        })
+
+        assert "ok: edited citation [1]" in result
+        assert "verification_status reset" in result
+        mock_db.citations.edit.assert_called_once()
+        assert mock_db.citations.edit.call_args.kwargs["claim"] == "Updated claim text"
+
+    @pytest.mark.asyncio
+    async def test_edit_not_found(self, edit_tool, mock_db):
+        """Test error when citation is not found."""
+        mock_db.citations.edit = AsyncMock(
+            side_effect=ValueError("Citation 999 not found")
+        )
+
+        result = await edit_tool.ainvoke({
+            "citation_id": 999,
+            "claim": "New claim",
+        })
+
+        assert "error:" in result
+        assert "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_content_edit_resets_verification(self, edit_tool, mock_db):
+        """Test that editing content fields triggers verification reset message."""
+        mock_db.citations.edit = AsyncMock(return_value=None)
+
+        result = await edit_tool.ainvoke({
+            "citation_id": 1,
+            "verbatim_quote": "New quote text",
+        })
+
+        assert "verification_status reset to 'pending'" in result
+
+    @pytest.mark.asyncio
+    async def test_non_content_edit_preserves_verification(self, edit_tool, mock_db):
+        """Test that editing non-content fields does not mention verification reset."""
+        mock_db.citations.edit = AsyncMock(return_value=None)
+
+        result = await edit_tool.ainvoke({
+            "citation_id": 1,
+            "confidence": "medium",
+        })
+
+        assert "ok: edited citation [1]" in result
+        assert "verification_status reset" not in result
+
+    @pytest.mark.asyncio
+    async def test_edit_no_fields(self, edit_tool, mock_db):
+        """Test error when no fields are provided."""
+        result = await edit_tool.ainvoke({
+            "citation_id": 1,
+        })
+
+        assert "error:" in result
+        assert "no fields" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_invalid_locator_json(self, edit_tool, mock_db):
+        """Test error when locator is not valid JSON."""
+        result = await edit_tool.ainvoke({
+            "citation_id": 1,
+            "locator": "not valid json{",
+        })
+
+        assert "error:" in result
+        assert "valid JSON" in result
