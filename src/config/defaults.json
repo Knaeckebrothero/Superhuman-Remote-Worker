@@ -22,7 +22,6 @@
     "workspace": [
       "read_file",
       "write_file",
-      "append_file",
       "edit_file",
       "list_files",
       "delete_file",

@@ -1,12 +1,14 @@
 import { Component, inject, computed, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MenuComponent } from '../menu/menu.component';
-import { TimeService } from '../../core/services/time.service';
-import { AuditService } from '../../core/services/audit.service';
+import { DataService } from '../../core/services/data.service';
 
 /**
  * Timeline scrubber component for playback control.
  * Fixed 60px height bar at the top of the app.
+ *
+ * Now uses index-based navigation via DataService instead of
+ * timestamp-based navigation via TimeService.
  */
 @Component({
   selector: 'app-timeline',
@@ -19,11 +21,11 @@ import { AuditService } from '../../core/services/audit.service';
 
       <select
         class="job-selector"
-        [value]="audit.selectedJobId() || ''"
+        [value]="data.currentJobId() || ''"
         (change)="onJobSelect($event)"
       >
         <option value="">Select a job...</option>
-        @for (job of audit.jobs(); track job.id) {
+        @for (job of data.jobs(); track job.id) {
           <option [value]="job.id">
             {{ job.id.slice(0, 8) }}... | {{ job.status }}
             @if (job.audit_count !== null) {
@@ -34,8 +36,8 @@ import { AuditService } from '../../core/services/audit.service';
       </select>
       <button
         class="refresh-btn"
-        (click)="audit.refresh()"
-        [disabled]="audit.isLoading()"
+        (click)="onRefresh()"
+        [disabled]="data.isLoading()"
         title="Refresh jobs"
       >
         &#x21bb;
@@ -47,7 +49,7 @@ import { AuditService } from '../../core/services/audit.service';
         class="play-button"
         (click)="togglePlay()"
         [attr.aria-label]="isPlaying() ? 'Pause' : 'Play'"
-        [disabled]="!hasTimeRange()"
+        [disabled]="!hasEntries()"
       >
         @if (isPlaying()) {
           <svg viewBox="0 0 24 24" fill="currentColor">
@@ -63,20 +65,35 @@ import { AuditService } from '../../core/services/audit.service';
 
       <span class="time-display">{{ formattedCurrentTime() }}</span>
 
-      <div class="scrubber-container" [class.disabled]="!hasTimeRange()">
+      <div class="scrubber-container" [class.disabled]="!hasEntries()">
         <input
           type="range"
           class="scrubber"
           [min]="0"
-          [max]="duration()"
-          [ngModel]="currentTime()"
-          (ngModelChange)="seek($event)"
+          [max]="data.maxIndex()"
+          [ngModel]="data.sliderIndex()"
+          (ngModelChange)="onSliderChange($event)"
           [attr.aria-label]="'Timeline position'"
-          [disabled]="!hasTimeRange()"
+          [disabled]="!hasEntries()"
         />
       </div>
 
       <span class="time-display">{{ formattedDuration() }}</span>
+
+      <!-- Loading indicator -->
+      @if (data.isLoading()) {
+        <div class="loading-indicator">
+          <span class="spinner-small"></span>
+          @if (data.loadingProgress() > 0) {
+            <span class="progress-text">{{ data.loadingProgress() }}%</span>
+          }
+        </div>
+      }
+
+      <!-- Cache indicator -->
+      @if (data.isCached() && !data.isLoading()) {
+        <span class="cache-indicator" title="Loaded from cache">&#x26A1;</span>
+      }
     </div>
   `,
   styles: [
@@ -253,43 +270,102 @@ import { AuditService } from '../../core/services/audit.service';
         opacity: 0.5;
         cursor: not-allowed;
       }
+
+      .loading-indicator {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+      }
+
+      .spinner-small {
+        width: 14px;
+        height: 14px;
+        border: 2px solid var(--surface-0, #313244);
+        border-top-color: var(--accent-color, #cba6f7);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      .progress-text {
+        font-family: 'JetBrains Mono', monospace;
+      }
+
+      .cache-indicator {
+        font-size: 14px;
+        color: #a6e3a1;
+        cursor: help;
+      }
     `,
   ],
 })
 export class TimelineComponent implements OnInit {
-  readonly time = inject(TimeService);
-  readonly audit = inject(AuditService);
+  readonly data = inject(DataService);
 
-  // Convert ms to seconds for display
-  readonly currentTime = computed(() => Math.floor(this.time.currentOffsetMs() / 1000));
-  readonly duration = computed(() => Math.floor(this.time.durationMs() / 1000));
-  readonly isPlaying = computed(() => this.time.isPlaying());
-  readonly progressPercent = computed(() => this.time.progressPercent());
-  readonly hasTimeRange = computed(() => this.time.hasTimeRange());
+  // Playback state (placeholder - auto-advance not implemented yet)
+  readonly isPlaying = computed(() => false);
 
-  readonly formattedCurrentTime = computed(() => this.formatTime(this.currentTime()));
-  readonly formattedDuration = computed(() => this.formatTime(this.duration()));
+  // Whether we have entries loaded
+  readonly hasEntries = computed(() => this.data.maxIndex() > 0);
+
+  // Format current position as time from entry timestamp
+  readonly formattedCurrentTime = computed(() => {
+    const timestamp = this.data.currentTimestamp();
+    if (!timestamp) {
+      const index = this.data.sliderIndex();
+      return `#${index}`;
+    }
+    return this.formatTimestamp(timestamp);
+  });
+
+  // Format total duration / max index
+  readonly formattedDuration = computed(() => {
+    const total = this.data.totalAuditEntries();
+    return `${total} entries`;
+  });
 
   ngOnInit(): void {
-    this.audit.loadJobs();
+    this.data.loadJobs();
   }
 
   onJobSelect(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
-    this.audit.selectJob(value || null);
+    if (value) {
+      this.data.loadJob(value);
+    } else {
+      this.data.clear();
+    }
+  }
+
+  onSliderChange(index: number): void {
+    this.data.setSliderIndex(index);
+  }
+
+  onRefresh(): void {
+    this.data.loadJobs();
+    if (this.data.currentJobId()) {
+      this.data.refresh();
+    }
   }
 
   togglePlay(): void {
-    this.time.togglePlay();
+    // Playback not implemented yet
+    // Could auto-advance slider index at a rate
   }
 
-  seek(seconds: number): void {
-    this.time.seek(seconds * 1000);
-  }
-
-  private formatTime(seconds: number): string {
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  private formatTimestamp(isoString: string): string {
+    const date = new Date(isoString);
+    return date.toLocaleTimeString('en-GB', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
   }
 }

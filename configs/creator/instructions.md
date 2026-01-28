@@ -9,7 +9,7 @@ Read the source document, identify requirement statements, create citations for 
 ## Tools
 
 <tool_categories>
-**Workspace**: `read_file`, `write_file`, `append_file`, `list_files`, `search_files`, `file_exists`, `get_workspace_summary`
+**Workspace**: `read_file`, `write_file`, `edit_file`, `list_files`, `search_files`, `file_exists`, `get_workspace_summary`
 
 **Todos**: `next_phase_todos`, `todo_complete`, `todo_rewind`
 

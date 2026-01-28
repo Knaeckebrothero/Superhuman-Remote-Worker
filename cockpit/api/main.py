@@ -417,3 +417,133 @@ async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
             detail=f"Archive '{filename}' not found for job '{job_id}'"
         )
     return result
+
+
+# =============================================================================
+# Bulk Fetch Endpoints for Client-Side Caching
+# =============================================================================
+
+
+@app.get("/api/jobs/{job_id}/audit/bulk")
+async def get_job_audit_bulk(
+    job_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=5000, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Get bulk audit entries for caching in IndexedDB.
+
+    Uses offset/limit instead of page/pageSize for efficient bulk fetching.
+    Returns up to 5000 entries per request.
+
+    Query params:
+        offset: Number of entries to skip (default 0)
+        limit: Maximum entries to return (max 5000)
+    """
+    if not mongodb_service.is_available:
+        return {
+            "entries": [],
+            "total": 0,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": False,
+            "error": "MongoDB not available",
+        }
+
+    try:
+        return await mongodb_service.get_job_audit_bulk(
+            job_id=job_id,
+            offset=offset,
+            limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/chat/bulk")
+async def get_job_chat_bulk(
+    job_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=5000, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Get bulk chat history entries for caching in IndexedDB.
+
+    Uses offset/limit for efficient bulk fetching.
+    Returns up to 5000 entries per request.
+
+    Query params:
+        offset: Number of entries to skip (default 0)
+        limit: Maximum entries to return (max 5000)
+    """
+    if not mongodb_service.is_available:
+        return {
+            "entries": [],
+            "total": 0,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": False,
+            "error": "MongoDB not available",
+        }
+
+    try:
+        return await mongodb_service.get_chat_history_bulk(
+            job_id=job_id,
+            offset=offset,
+            limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/graph/bulk")
+async def get_job_graph_bulk(
+    job_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=5000, ge=1, le=5000),
+) -> dict[str, Any]:
+    """Get bulk graph deltas (execute_cypher_query tool calls) for caching.
+
+    Returns raw graph operation data without computed snapshots.
+    Use /api/graph/changes/{job_id} for full graph timeline with snapshots.
+
+    Query params:
+        offset: Number of deltas to skip (default 0)
+        limit: Maximum deltas to return (max 5000)
+    """
+    if not mongodb_service.is_available:
+        return {
+            "deltas": [],
+            "total": 0,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": False,
+            "error": "MongoDB not available",
+        }
+
+    try:
+        return await mongodb_service.get_graph_deltas_bulk(
+            job_id=job_id,
+            offset=offset,
+            limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/version")
+async def get_job_version(job_id: str) -> dict[str, Any] | None:
+    """Get job data version info for cache invalidation.
+
+    Returns counts and timestamps that can be compared to cached values
+    to determine if the cache needs to be refreshed.
+
+    Returns:
+        Dict with version, auditEntryCount, chatEntryCount, graphDeltaCount, lastUpdate
+        Returns null if job has no audit data or MongoDB unavailable
+    """
+    if not mongodb_service.is_available:
+        return None
+
+    try:
+        return await mongodb_service.get_job_version(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e

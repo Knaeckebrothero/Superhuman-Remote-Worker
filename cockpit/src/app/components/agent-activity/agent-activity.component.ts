@@ -1,19 +1,21 @@
 import {
   Component,
   inject,
-  OnInit,
-  effect,
   ElementRef,
   viewChildren,
-  AfterViewInit,
+  signal,
+  computed,
 } from '@angular/core';
-import { AuditService } from '../../core/services/audit.service';
+import { DataService } from '../../core/services/data.service';
 import { RequestService } from '../../core/services/request.service';
 import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/models/audit.model';
 
 /**
  * Agent Activity component that displays MongoDB audit trail.
  * Shows chronological agent execution steps with filtering and expandable details.
+ *
+ * Now uses DataService for index-based filtering instead of pagination.
+ * Entries are filtered by slider position - only entries up to sliderIndex are shown.
  */
 @Component({
   selector: 'app-agent-activity',
@@ -25,40 +27,44 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         @for (filter of filters; track filter.value) {
           <button
             class="filter-btn"
-            [class.active]="audit.activeFilter() === filter.value"
-            (click)="audit.setFilter(filter.value)"
+            [class.active]="data.activeFilter() === filter.value"
+            (click)="data.setFilter(filter.value)"
           >
             {{ filter.label }}
           </button>
         }
+        <span class="entry-count">{{ entryCount() }}</span>
       </div>
 
       <!-- Loading State -->
-      @if (audit.isLoading()) {
+      @if (data.isLoading()) {
         <div class="loading-overlay">
           <div class="spinner"></div>
+          @if (data.loadingProgress() > 0) {
+            <span class="progress">{{ data.loadingProgress() }}%</span>
+          }
         </div>
       }
 
       <!-- Error State -->
-      @if (audit.error()) {
+      @if (data.error()) {
         <div class="error-state">
-          <span>{{ audit.error() }}</span>
-          <button (click)="audit.refresh()">Retry</button>
+          <span>{{ data.error() }}</span>
+          <button (click)="data.refresh()">Retry</button>
         </div>
       }
 
       <!-- Empty State -->
-      @if (!audit.isLoading() && !audit.error() && audit.entries().length === 0 && audit.selectedJobId()) {
+      @if (!data.isLoading() && !data.error() && entries().length === 0 && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C4;</span>
           <span>No audit entries for this job</span>
-          <span class="empty-hint">Try selecting a different filter or job</span>
+          <span class="empty-hint">Try selecting a different filter or moving the slider</span>
         </div>
       }
 
       <!-- No Job Selected -->
-      @if (!audit.selectedJobId() && !audit.isLoading()) {
+      @if (!data.currentJobId() && !data.isLoading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>Select a job from the timeline bar</span>
@@ -67,19 +73,18 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
       }
 
       <!-- Entry List -->
-      @if (audit.entries().length > 0) {
+      @if (entries().length > 0) {
         <div class="entry-list" #entryList>
-          @for (entry of audit.entries(); track entry._id; let i = $index) {
+          @for (entry of entries(); track entry._id; let i = $index) {
             <div
               #entryItem
               class="entry-item"
-              [class.expanded]="audit.isExpanded(entry._id)"
+              [class.expanded]="isExpanded(entry._id)"
               [class.phase-strategic]="entry.phase === 'strategic'"
               [class.phase-tactical]="entry.phase === 'tactical'"
-              [class.scroll-target]="audit.targetEntryIndex() === i"
               [style.border-left-color]="getStepColor(entry.step_type)"
             >
-              <div class="entry-header" (click)="audit.toggleExpanded(entry._id)">
+              <div class="entry-header" (click)="toggleExpanded(entry._id)">
                 <span class="step-number">#{{ entry.step_number }}</span>
                 <span class="step-badge" [style.background]="getStepColor(entry.step_type)">
                   {{ getStepBadge(entry.step_type) }}
@@ -92,10 +97,10 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                   <span class="latency">{{ formatLatency(entry.latency_ms) }}</span>
                 }
                 <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
-                <span class="expand-icon">{{ audit.isExpanded(entry._id) ? '&#x25BC;' : '&#x25B6;' }}</span>
+                <span class="expand-icon">{{ isExpanded(entry._id) ? '&#x25BC;' : '&#x25B6;' }}</span>
               </div>
 
-              @if (audit.isExpanded(entry._id)) {
+              @if (isExpanded(entry._id)) {
                 <div class="entry-details">
                   <!-- Initialize Step Details -->
                   @if (entry.step_type === 'initialize') {
@@ -273,45 +278,19 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         </div>
       }
 
-      <!-- Pagination -->
-      @if (audit.totalEntries() > 0) {
-        <div class="pagination">
-          <span class="page-info">{{ audit.paginationSummary() }}</span>
-          <div class="page-controls">
-            <button
-              class="page-btn"
-              (click)="audit.firstPage()"
-              [disabled]="!audit.canGoPrev()"
-              title="First page"
-            >
-              &lt;&lt;
+      <!-- Position indicator (replaces pagination) -->
+      @if (data.totalAuditEntries() > 0) {
+        <div class="position-bar">
+          <span class="position-info">
+            Showing {{ entries().length }} of {{ data.totalAuditEntries() }} entries
+            (up to step #{{ data.sliderIndex() }})
+          </span>
+          <div class="position-controls">
+            <button class="pos-btn" (click)="data.seekToStart()" title="Jump to start">
+              &#x23EE;
             </button>
-            <button
-              class="page-btn"
-              (click)="audit.previousPage()"
-              [disabled]="!audit.canGoPrev()"
-              title="Previous page"
-            >
-              &lt; Prev
-            </button>
-            <span class="page-number">
-              Page {{ audit.currentPage() }} of {{ audit.totalPages() }}
-            </span>
-            <button
-              class="page-btn"
-              (click)="audit.nextPage()"
-              [disabled]="!audit.canGoNext()"
-              title="Next page"
-            >
-              Next &gt;
-            </button>
-            <button
-              class="page-btn"
-              (click)="audit.lastPage()"
-              [disabled]="!audit.canGoNext()"
-              title="Last page"
-            >
-              &gt;&gt;
+            <button class="pos-btn" (click)="data.seekToEnd()" title="Jump to end">
+              &#x23ED;
             </button>
           </div>
         </div>
@@ -342,6 +321,7 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         background: var(--panel-header-bg, #1e1e2e);
         border-bottom: 1px solid var(--border-color, #313244);
         flex-shrink: 0;
+        align-items: center;
       }
 
       .filter-btn {
@@ -367,6 +347,13 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         border-color: var(--accent-color, #cba6f7);
       }
 
+      .entry-count {
+        margin-left: auto;
+        font-size: 11px;
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-muted, #6c7086);
+      }
+
       /* Loading Overlay */
       .loading-overlay {
         position: absolute;
@@ -376,8 +363,10 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         bottom: 0;
         background: rgba(17, 17, 27, 0.8);
         display: flex;
+        flex-direction: column;
         align-items: center;
         justify-content: center;
+        gap: 12px;
         z-index: 10;
       }
 
@@ -388,6 +377,12 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         border-top-color: var(--accent-color, #cba6f7);
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
+      }
+
+      .progress {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        color: var(--text-muted, #6c7086);
       }
 
       @keyframes spin {
@@ -479,10 +474,6 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
 
       .entry-item.phase-tactical:hover {
         background: rgba(166, 227, 161, 0.10);
-      }
-
-      .entry-item.scroll-target {
-        box-shadow: inset 0 0 0 2px var(--accent-color, #cba6f7);
       }
 
       .entry-header {
@@ -620,8 +611,8 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         font-family: 'JetBrains Mono', monospace;
       }
 
-      /* Pagination */
-      .pagination {
+      /* Position Bar (replaces Pagination) */
+      .position-bar {
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -631,42 +622,30 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
         flex-shrink: 0;
       }
 
-      .page-info {
+      .position-info {
         font-size: 12px;
         color: var(--text-muted, #6c7086);
       }
 
-      .page-controls {
+      .position-controls {
         display: flex;
-        align-items: center;
-        gap: 12px;
+        gap: 8px;
       }
 
-      .page-btn {
-        padding: 4px 12px;
+      .pos-btn {
+        padding: 4px 8px;
         border: 1px solid var(--border-color, #313244);
         border-radius: 4px;
         background: transparent;
         color: var(--text-secondary, #a6adc8);
-        font-size: 12px;
+        font-size: 14px;
         cursor: pointer;
         transition: all 0.15s ease;
       }
 
-      .page-btn:hover:not(:disabled) {
+      .pos-btn:hover {
         background: var(--panel-header-bg, #1e1e2e);
         color: var(--text-primary, #cdd6f4);
-        border-color: var(--text-muted, #6c7086);
-      }
-
-      .page-btn:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
-      }
-
-      .page-number {
-        font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
       }
 
       .request-link {
@@ -701,12 +680,15 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
     `,
   ],
 })
-export class AgentActivityComponent implements OnInit {
-  readonly audit = inject(AuditService);
+export class AgentActivityComponent {
+  readonly data = inject(DataService);
   private readonly requestService = inject(RequestService);
 
   // Query all entry items for scrolling
   readonly entryItems = viewChildren<ElementRef<HTMLElement>>('entryItem');
+
+  // Local expanded state (not part of DataService)
+  private readonly expandedIds = signal<Set<string>>(new Set());
 
   readonly filters: { label: string; value: AuditFilterCategory }[] = [
     { label: 'All', value: 'all' },
@@ -715,30 +697,15 @@ export class AgentActivityComponent implements OnInit {
     { label: 'Errors', value: 'errors' },
   ];
 
-  // Track last scrolled index to avoid redundant scrolls
-  private lastScrolledIndex: number | null = null;
+  // Use DataService's visible entries (filtered by slider position and active filter)
+  readonly entries = computed(() => this.data.visibleAuditEntries());
 
-  constructor() {
-    // Auto-scroll to target entry when global time changes
-    effect(() => {
-      const targetIndex = this.audit.targetEntryIndex();
-      if (targetIndex === null || targetIndex === this.lastScrolledIndex) {
-        return;
-      }
-
-      const items = this.entryItems();
-      if (targetIndex >= 0 && targetIndex < items.length) {
-        this.lastScrolledIndex = targetIndex;
-        // Use requestAnimationFrame to ensure DOM is ready
-        requestAnimationFrame(() => {
-          items[targetIndex].nativeElement.scrollIntoView({
-            behavior: 'smooth',
-            block: 'center',
-          });
-        });
-      }
-    });
-  }
+  // Entry count display
+  readonly entryCount = computed(() => {
+    const visible = this.entries().length;
+    const total = this.data.totalAuditEntries();
+    return `${visible}/${total}`;
+  });
 
   // Step type color mapping
   private readonly stepColors: Record<AuditStepType, string> = {
@@ -762,8 +729,21 @@ export class AgentActivityComponent implements OnInit {
     error: 'ERROR',
   };
 
-  ngOnInit(): void {
-    this.audit.loadJobs();
+  toggleExpanded(entryId: string): void {
+    const current = this.expandedIds();
+    const updated = new Set(current);
+
+    if (updated.has(entryId)) {
+      updated.delete(entryId);
+    } else {
+      updated.add(entryId);
+    }
+
+    this.expandedIds.set(updated);
+  }
+
+  isExpanded(entryId: string): boolean {
+    return this.expandedIds().has(entryId);
   }
 
   getStepColor(stepType: AuditStepType): string {

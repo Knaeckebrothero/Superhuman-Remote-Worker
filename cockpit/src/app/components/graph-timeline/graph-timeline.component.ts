@@ -9,9 +9,10 @@ import {
   ChangeDetectionStrategy,
   NgZone,
   DestroyRef,
+  computed,
 } from '@angular/core';
 import { GraphService } from '../../core/services/graph.service';
-import { AuditService } from '../../core/services/audit.service';
+import { DataService } from '../../core/services/data.service';
 import { cytoscapeStyles } from './graph-styles';
 import { TimelineRenderer } from './timeline-renderer';
 import type { Core } from 'cytoscape';
@@ -23,6 +24,9 @@ let cytoscape: any;
 /**
  * Graph Timeline component for visualizing Neo4j changes over time.
  * Uses Cytoscape.js for rendering with snapshot/delta optimization.
+ *
+ * Now uses DataService for job selection instead of AuditService.
+ * Maintains its own slider for graph-specific operations.
  */
 @Component({
   selector: 'app-graph-timeline',
@@ -36,7 +40,7 @@ let cytoscape: any;
           <button
             class="btn"
             (click)="loadGraphChanges()"
-            [disabled]="graph.loading() || !audit.selectedJobId()"
+            [disabled]="graph.loading() || !data.currentJobId()"
             title="Load graph changes for selected job"
           >
             Load Graph
@@ -151,7 +155,7 @@ let cytoscape: any;
       }
 
       <!-- Empty state -->
-      @if (!graph.loading() && !graph.error() && !graph.hasData() && audit.selectedJobId()) {
+      @if (!graph.loading() && !graph.error() && !graph.hasData() && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C8;</span>
           <span>No graph operations found</span>
@@ -160,7 +164,7 @@ let cytoscape: any;
       }
 
       <!-- No job selected -->
-      @if (!audit.selectedJobId() && !graph.loading()) {
+      @if (!data.currentJobId() && !graph.loading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>Select a job from the timeline bar</span>
@@ -497,7 +501,7 @@ export class GraphTimelineComponent implements OnDestroy {
   private readonly ngZone = inject(NgZone);
   private readonly destroyRef = inject(DestroyRef);
   readonly graph = inject(GraphService);
-  readonly audit = inject(AuditService);
+  readonly data = inject(DataService);
 
   private readonly graphContainer = viewChild<ElementRef<HTMLDivElement>>('graphContainer');
 
@@ -515,16 +519,16 @@ export class GraphTimelineComponent implements OnDestroy {
   constructor() {
     // Initialize Cytoscape and load data when available
     effect(() => {
-      const data = this.graph.changes();
-      if (data && data.deltas.length > 0) {
-        console.log('[GraphTimeline] Data available:', data.deltas.length, 'deltas');
+      const graphData = this.graph.changes();
+      if (graphData && graphData.deltas.length > 0) {
+        console.log('[GraphTimeline] Data available:', graphData.deltas.length, 'deltas');
 
         if (!this.cy) {
           // Initialize Cytoscape first, then load data
           this.initializeCytoscape().then(() => {
             console.log('[GraphTimeline] Cytoscape initialized, loading data');
-            if (this.renderer && data) {
-              this.renderer.load(data.snapshots, data.deltas);
+            if (this.renderer && graphData) {
+              this.renderer.load(graphData.snapshots, graphData.deltas);
               // Jump to end to show the final state
               this.graph.jumpToEnd();
             }
@@ -532,7 +536,7 @@ export class GraphTimelineComponent implements OnDestroy {
         } else if (this.renderer) {
           // Cytoscape already exists, just load new data
           console.log('[GraphTimeline] Reloading data into existing renderer');
-          this.renderer.load(data.snapshots, data.deltas);
+          this.renderer.load(graphData.snapshots, graphData.deltas);
           this.graph.jumpToEnd();
         }
       }
@@ -544,6 +548,15 @@ export class GraphTimelineComponent implements OnDestroy {
       if (this.renderer && this.cy) {
         console.log('[GraphTimeline] Seeking to index:', index);
         this.renderer.seekTo(index);
+      }
+    });
+
+    // Clear graph when job changes
+    effect(() => {
+      const jobId = this.data.currentJobId();
+      // When job changes, clear old graph data
+      if (!jobId) {
+        this.graph.clear();
       }
     });
   }
@@ -607,9 +620,9 @@ export class GraphTimelineComponent implements OnDestroy {
       }
 
       // Load initial data
-      const data = this.graph.changes();
-      if (data && this.renderer) {
-        this.renderer.load(data.snapshots, data.deltas);
+      const graphData = this.graph.changes();
+      if (graphData && this.renderer) {
+        this.renderer.load(graphData.snapshots, graphData.deltas);
       }
 
       // Set up event listeners
@@ -655,7 +668,10 @@ export class GraphTimelineComponent implements OnDestroy {
    * Load graph changes for selected job.
    */
   loadGraphChanges(): void {
-    this.graph.loadCurrentJobChanges();
+    const jobId = this.data.currentJobId();
+    if (jobId) {
+      this.graph.loadJobChanges(jobId);
+    }
   }
 
   /**

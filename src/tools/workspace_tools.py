@@ -122,7 +122,11 @@ def create_workspace_tools(context: ToolContext) -> List:
 
             # Handle PDF files with page-based reading
             if full_path.suffix.lower() == '.pdf':
-                return _read_pdf_file(full_path, path, page_start, page_end)
+                result = _read_pdf_file(full_path, path, page_start, page_end)
+                # Record successful PDF read for read-before-write tracking
+                if not result.startswith("Error:"):
+                    context.record_file_read(path)
+                return result
 
             # For non-PDF files, page parameters are ignored
             if page_start is not None or page_end is not None:
@@ -144,6 +148,8 @@ def create_workspace_tools(context: ToolContext) -> List:
                 )
 
             content = workspace.read_file(path)
+            # Record successful read for read-before-write tracking
+            context.record_file_read(path)
             return content
 
         except FileNotFoundError:
@@ -203,9 +209,13 @@ def create_workspace_tools(context: ToolContext) -> List:
         Creates parent directories automatically if they don't exist.
         Overwrites the file if it already exists.
 
+        IMPORTANT: If the file already exists, you must read_file() first to
+        understand its current contents before overwriting. This prevents
+        accidental data loss from blind overwrites.
+
         Use this to:
-        - Create plans (plan.md)
-        - Save research notes (research.md, document_analysis.md)
+        - Create new files (plan.md, research.md)
+        - Save research notes (document_analysis.md)
         - Write intermediate results (candidates/candidates.md)
         - Store processed data (chunks/chunk_001.md)
 
@@ -217,6 +227,14 @@ def create_workspace_tools(context: ToolContext) -> List:
             Confirmation message with file path and size
         """
         try:
+            # Enforce read-before-write for existing files
+            if workspace.exists(path) and not context.was_recently_read(path):
+                return (
+                    f"Error: You must read_file('{path}') before overwriting an existing file. "
+                    f"This ensures you understand the current contents before replacing them. "
+                    f"Read the file first, then call write_file again."
+                )
+
             result_path = workspace.write_file(path, content)
             size = len(content.encode('utf-8'))
 
@@ -229,49 +247,46 @@ def create_workspace_tools(context: ToolContext) -> List:
             return f"Error writing file: {str(e)}"
 
     @tool
-    def append_file(path: str, content: str) -> str:
-        """Append content to an existing file in the workspace.
+    def edit_file(
+        path: str,
+        old_string: str = "",
+        new_string: str = "",
+        position: Optional[str] = None
+    ) -> str:
+        """Edit a file by replacing text or inserting at start/end.
 
-        Creates the file if it doesn't exist.
-        Use this for log-style files or incremental updates.
+        IMPORTANT: You must read_file() before editing. This ensures you
+        understand the file's current contents before modifying it.
 
-        Args:
-            path: Relative path to the file
-            content: Content to append
+        **Modes:**
 
-        Returns:
-            Confirmation message
-        """
-        try:
-            workspace.append_file(path, content)
-            size = len(content.encode('utf-8'))
+        1. **Replace mode** (default): Set `old_string` and `new_string` to find
+           and replace text. The `old_string` must appear exactly once.
 
-            return f"Appended to: {path} ({size:,} bytes added)"
+        2. **Append mode**: Set `position="end"` to add `new_string` at the end
+           of the file. The `old_string` parameter is ignored.
 
-        except ValueError as e:
-            return f"Error: {str(e)}"
-        except Exception as e:
-            logger.error(f"append_file error for {path}: {e}")
-            return f"Error appending to file: {str(e)}"
-
-    @tool
-    def edit_file(path: str, old_string: str, new_string: str) -> str:
-        """Replace an exact string occurrence in a workspace file.
-
-        Performs a single str_replace: finds `old_string` in the file and
-        replaces it with `new_string`. The match must be unique — if
-        `old_string` appears zero times or more than once, the edit is
-        rejected with an actionable error message.
-
-        Use this instead of read→write_file round-trips for surgical edits.
+        3. **Prepend mode**: Set `position="start"` to add `new_string` at the
+           beginning of the file. The `old_string` parameter is ignored.
 
         Args:
             path: Relative path to the file (e.g., "plan.md")
-            old_string: Exact text to find (must appear exactly once)
-            new_string: Replacement text (may be empty to delete)
+            old_string: Text to find and replace (required for replace mode)
+            new_string: Replacement text or content to insert
+            position: Insert position - "start", "end", or None for replace mode
 
         Returns:
             Confirmation message or error with guidance
+
+        Examples:
+            # Replace mode (default)
+            edit_file("plan.md", old_string="## Draft", new_string="## Final")
+
+            # Append mode - add to end of file
+            edit_file("notes.md", new_string="\\n## New Section", position="end")
+
+            # Prepend mode - add to start of file
+            edit_file("log.md", new_string="# Header\\n\\n", position="start")
         """
         try:
             if not workspace.exists(path):
@@ -281,7 +296,43 @@ def create_workspace_tools(context: ToolContext) -> List:
             if full_path.is_dir():
                 return f"Error: '{path}' is a directory, not a file."
 
+            # Enforce read-before-write discipline
+            if not context.was_recently_read(path):
+                return (
+                    f"Error: You must read_file('{path}') before editing. "
+                    f"This ensures you understand the file's current contents. "
+                    f"Read the file first, then call edit_file again."
+                )
+
+            # Validate position parameter
+            if position is not None and position not in ("start", "end"):
+                return (
+                    f"Error: Invalid position '{position}'. "
+                    f"Use 'start' to prepend, 'end' to append, or omit for replace mode."
+                )
+
             content = workspace.read_file(path)
+
+            # Position-based insert modes
+            if position == "end":
+                new_content = content + new_string
+                workspace.write_file(path, new_content)
+                size = len(new_content.encode("utf-8"))
+                return f"Appended to: {path} ({size:,} bytes)"
+
+            if position == "start":
+                new_content = new_string + content
+                workspace.write_file(path, new_content)
+                size = len(new_content.encode("utf-8"))
+                return f"Prepended to: {path} ({size:,} bytes)"
+
+            # Replace mode (default) - requires old_string
+            if not old_string:
+                return (
+                    "Error: old_string is required for replace mode. "
+                    "To append, use position='end'. To prepend, use position='start'."
+                )
+
             count = content.count(old_string)
 
             if count == 0:
@@ -743,7 +794,6 @@ def create_workspace_tools(context: ToolContext) -> List:
     return [
         read_file,
         write_file,
-        append_file,
         edit_file,
         list_files,
         delete_file,
@@ -770,21 +820,14 @@ WORKSPACE_TOOLS_METADATA = {
     "write_file": {
         "module": "workspace_tools",
         "function": "write_file",
-        "description": "Write content to a file in the workspace",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "append_file": {
-        "module": "workspace_tools",
-        "function": "append_file",
-        "description": "Append content to a file in the workspace",
+        "description": "Write content to a file (requires read_file first for existing files)",
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },
     "edit_file": {
         "module": "workspace_tools",
         "function": "edit_file",
-        "description": "Replace an exact string occurrence in a workspace file",
+        "description": "Edit a file: replace text, or use position='end'/'start' to append/prepend (requires read_file first)",
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },
