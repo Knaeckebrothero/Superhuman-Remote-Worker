@@ -24,6 +24,7 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -777,21 +778,25 @@ Conversation:
             )
             return messages
 
-        # Create summary message
-        summary_msg = SystemMessage(
+        # Create summary as HumanMessage so it appears in conversation
+        summary_msg = HumanMessage(
             content=f"[Summary of prior work]\n{summary}"
         )
 
-        # Reconstruct: system + summary + recent
-        # Note: workspace.md is now injected via system prompt in nested loop graph
-        result = system_msgs + [summary_msg] + recent_messages
+        # Generate removal markers for all messages being summarized
+        # The add_messages reducer will remove these from state
+        removal_markers = []
+        for msg in messages_to_summarize:
+            if hasattr(msg, 'id') and msg.id:
+                removal_markers.append(RemoveMessage(id=msg.id))
 
         logger.info(
-            f"Compacted {len(messages)} messages to {len(result)} "
-            f"(summarized {len(messages_to_summarize)} messages)"
+            f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(recent_messages)} "
+            f"(summarized {len(messages_to_summarize)} messages, removing {len(removal_markers)})"
         )
 
-        return result
+        # Return: removal markers + system messages + summary + recent
+        return removal_markers + system_msgs + [summary_msg] + recent_messages
 
     def create_pre_model_hook(self) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
         """Create a pre-model hook for LangGraph integration.

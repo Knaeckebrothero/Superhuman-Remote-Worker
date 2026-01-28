@@ -7,7 +7,7 @@ import {
   ArchivedTodos,
   CurrentTodos,
 } from '../models/todo.model';
-import { AuditService } from './audit.service';
+import { DataService } from './data.service';
 
 /**
  * Service for fetching and managing todo data from workspace files.
@@ -15,7 +15,7 @@ import { AuditService } from './audit.service';
 @Injectable({ providedIn: 'root' })
 export class TodoService {
   private readonly http = inject(HttpClient);
-  private readonly audit = inject(AuditService);
+  private readonly data = inject(DataService);
   private readonly baseUrl = 'http://localhost:8085/api';
 
   // State signals
@@ -91,7 +91,7 @@ export class TodoService {
    * Load all todos for the currently selected job.
    */
   async loadTodos(): Promise<void> {
-    const jobId = this.audit.selectedJobId();
+    const jobId = this.data.currentJobId();
     if (!jobId) {
       this.clear();
       return;
@@ -125,7 +125,7 @@ export class TodoService {
    * Select an archive to view.
    */
   async selectArchive(filename: string | null): Promise<void> {
-    const jobId = this.audit.selectedJobId();
+    const jobId = this.data.currentJobId();
     if (!jobId) return;
 
     this.selectedArchive.set(filename);

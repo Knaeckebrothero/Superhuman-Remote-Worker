@@ -1,6 +1,6 @@
 import { Component, inject, effect, OnInit } from '@angular/core';
 import { TodoService } from '../../core/services/todo.service';
-import { AuditService } from '../../core/services/audit.service';
+import { DataService } from '../../core/services/data.service';
 import { TodoItem } from '../../core/models/todo.model';
 
 /**
@@ -88,7 +88,7 @@ import { TodoItem } from '../../core/models/todo.model';
       }
 
       <!-- No workspace -->
-      @if (!todo.hasWorkspace() && !todo.isLoading() && audit.selectedJobId()) {
+      @if (!todo.hasWorkspace() && !todo.isLoading() && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4C1;</span>
           <span>No workspace found</span>
@@ -97,7 +97,7 @@ import { TodoItem } from '../../core/models/todo.model';
       }
 
       <!-- No job selected -->
-      @if (!audit.selectedJobId() && !todo.isLoading()) {
+      @if (!data.currentJobId() && !todo.isLoading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>Select a job from the timeline bar</span>
@@ -111,7 +111,7 @@ import { TodoItem } from '../../core/models/todo.model';
         !todo.isLoading() &&
         !todo.error() &&
         todo.displayTodos().length === 0 &&
-        audit.selectedJobId()
+        data.currentJobId()
       ) {
         <div class="empty-state">
           <span class="empty-icon">&#x2705;</span>
@@ -493,12 +493,12 @@ import { TodoItem } from '../../core/models/todo.model';
 })
 export class TodoListComponent implements OnInit {
   readonly todo = inject(TodoService);
-  readonly audit = inject(AuditService);
+  readonly data = inject(DataService);
 
   constructor() {
     // Load todos when selected job changes
     effect(() => {
-      const jobId = this.audit.selectedJobId();
+      const jobId = this.data.currentJobId();
       if (jobId) {
         this.todo.loadTodos();
       } else {
@@ -509,7 +509,7 @@ export class TodoListComponent implements OnInit {
 
   ngOnInit(): void {
     // Initial load if job already selected
-    if (this.audit.selectedJobId()) {
+    if (this.data.currentJobId()) {
       this.todo.loadTodos();
     }
   }

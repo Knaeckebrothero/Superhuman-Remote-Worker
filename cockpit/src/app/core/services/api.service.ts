@@ -193,34 +193,8 @@ export class ApiService {
   }
 
   /**
-   * Find which page contains the audit entry at a given timestamp.
-   */
-  getPageForTimestamp(
-    jobId: string,
-    timestamp: string,
-    pageSize: number = 50,
-    filter: AuditFilterCategory = 'all',
-  ): Observable<{ page: number; index: number }> {
-    const params = new HttpParams()
-      .set('timestamp', timestamp)
-      .set('pageSize', pageSize.toString())
-      .set('filter', filter);
-
-    return this.http
-      .get<{ page: number; index: number }>(
-        `${this.baseUrl}/jobs/${jobId}/audit/page-for-timestamp`,
-        { params },
-      )
-      .pipe(
-        catchError((error) => {
-          console.error(`Failed to get page for timestamp:`, error);
-          return of({ page: 1, index: 0 });
-        }),
-      );
-  }
-
-  /**
    * Get the time range (first/last timestamps) for a job's audit entries.
+   * @deprecated Use DataService.timeRange() computed signal instead.
    */
   getAuditTimeRange(
     jobId: string,

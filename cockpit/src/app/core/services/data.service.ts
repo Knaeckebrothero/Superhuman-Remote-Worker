@@ -173,16 +173,20 @@ export class DataService {
 
   /**
    * Chat entries visible at current slider position.
+   * Filters by timestamp - shows entries that occurred at or before current audit entry.
    */
   readonly visibleChatEntries = computed(() => {
     const entries = this._liveChatEntries();
-    const sliderIndex = this._sliderIndex();
-    const windowStart = this._windowStart();
+    const currentTs = this.currentTimestamp();
 
-    // Chat entries are indexed by sequence_number
-    // Filter to those that occurred before current audit index
-    // For simplicity, show all loaded chat entries up to slider position
-    return entries.filter((e) => e.sequence_number <= sliderIndex - windowStart + 1);
+    if (!currentTs || entries.length === 0) {
+      return [];
+    }
+
+    const currentMs = new Date(currentTs).getTime();
+
+    // Show all chat entries that occurred at or before current timestamp
+    return entries.filter((e) => new Date(e.timestamp).getTime() <= currentMs);
   });
 
   /**
@@ -454,7 +458,7 @@ export class DataService {
 
     const maxIndex = this._maxIndex();
 
-    // Calculate window bounds
+    // Calculate window bounds for audit entries
     const halfWindow = Math.floor(this.WINDOW_SIZE / 2);
     let start = Math.max(0, centerIndex - halfWindow);
     let end = Math.min(maxIndex, start + this.WINDOW_SIZE - 1);
@@ -464,11 +468,18 @@ export class DataService {
       start = Math.max(0, end - this.WINDOW_SIZE + 1);
     }
 
-    // Load from IndexedDB
-    const [auditEntries, chatEntries, graphDeltas] = await Promise.all([
-      this.db.getAuditEntries(jobId, start, end),
-      this.db.getChatEntries(jobId, start, end),
-      this.db.getGraphDeltas(jobId, start, end),
+    // Load audit entries from IndexedDB (windowed by index)
+    const auditEntries = await this.db.getAuditEntries(jobId, start, end);
+
+    // Load ALL chat entries and graph deltas (they use different indexing)
+    // Chat entries are indexed by sequence_number (1-N), not audit index
+    // Graph deltas are indexed by toolCallIndex, not audit index
+    const chatCount = await this.db.getChatEntryCount(jobId);
+    const graphCount = await this.db.getGraphDeltaCount(jobId);
+
+    const [chatEntries, graphDeltas] = await Promise.all([
+      this.db.getChatEntries(jobId, 0, chatCount),
+      this.db.getGraphDeltas(jobId, 0, graphCount),
     ]);
 
     this._windowStart.set(start);
