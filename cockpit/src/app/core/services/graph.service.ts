@@ -1,7 +1,6 @@
 import { Injectable, inject, signal, computed, effect } from '@angular/core';
 import { ApiService } from './api.service';
-import { AuditService } from './audit.service';
-import { TimeService } from './time.service';
+import { DataService } from './data.service';
 import {
   GraphChangeResponse,
   GraphSnapshot,
@@ -20,8 +19,7 @@ import {
 @Injectable({ providedIn: 'root' })
 export class GraphService {
   private readonly api = inject(ApiService);
-  private readonly audit = inject(AuditService);
-  private readonly time = inject(TimeService);
+  private readonly data = inject(DataService);
 
   // Raw data from API
   readonly changes = signal<GraphChangeResponse | null>(null);
@@ -38,12 +36,15 @@ export class GraphService {
   private lastSeekTime = 0;
   private lastSeekIndex = 0;
 
+  // Track previous slider index to detect global slider changes
+  private lastGlobalSliderIndex = 0;
+
   constructor() {
     // Re-enable sync when global slider is used
     effect(() => {
-      // Just reading globalSeekVersion is enough to trigger this effect
-      const version = this.time.globalSeekVersion();
-      if (version > 0) {
+      const sliderIndex = this.data.sliderIndex();
+      if (sliderIndex !== this.lastGlobalSliderIndex) {
+        this.lastGlobalSliderIndex = sliderIndex;
         this.syncToGlobalTime.set(true);
       }
     });
@@ -51,7 +52,7 @@ export class GraphService {
     // Sync graph index when global time changes
     effect(() => {
       if (!this.syncToGlobalTime()) return;
-      const timestamp = this.time.currentTimestamp();
+      const timestamp = this.data.currentTimestamp();
       if (!timestamp || !this.hasData()) return;
       const index = this.findIndexAtTimestamp(timestamp);
       // Only update if the index actually changed to avoid triggering extra renders
@@ -151,7 +152,7 @@ export class GraphService {
    * Load graph changes for the currently selected job.
    */
   async loadCurrentJobChanges(): Promise<void> {
-    const jobId = this.audit.selectedJobId();
+    const jobId = this.data.currentJobId();
     if (!jobId) {
       this.error.set('No job selected');
       return;

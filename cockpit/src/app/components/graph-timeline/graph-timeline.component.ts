@@ -25,8 +25,8 @@ let cytoscape: any;
  * Graph Timeline component for visualizing Neo4j changes over time.
  * Uses Cytoscape.js for rendering with snapshot/delta optimization.
  *
- * Now uses DataService for job selection instead of AuditService.
- * Maintains its own slider for graph-specific operations.
+ * Uses DataService for job selection and maintains its own slider
+ * for graph-specific timeline operations.
  */
 @Component({
   selector: 'app-graph-timeline',

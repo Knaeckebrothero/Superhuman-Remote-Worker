@@ -276,32 +276,6 @@ async def get_request(doc_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@app.get("/api/jobs/{job_id}/audit/page-for-timestamp")
-async def get_page_for_timestamp(
-    job_id: str,
-    timestamp: str = Query(..., description="ISO timestamp to locate"),
-    page_size: int = Query(default=50, ge=1, le=200, alias="pageSize"),
-    filter: FilterCategory = Query(default="all"),
-) -> dict[str, int]:
-    """Find which page contains the audit entry at a given timestamp.
-
-    Returns:
-        Dict with 'page' (1-indexed) and 'index' (position within that page)
-    """
-    if not mongodb_service.is_available:
-        return {"page": 1, "index": 0}
-
-    try:
-        return await mongodb_service.get_page_for_timestamp(
-            job_id=job_id,
-            timestamp=timestamp,
-            page_size=page_size,
-            filter_category=filter,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 @app.get("/api/jobs/{job_id}/audit/timerange")
 async def get_audit_time_range(job_id: str) -> dict[str, str] | None:
     """Get first and last timestamps for job audit entries.
