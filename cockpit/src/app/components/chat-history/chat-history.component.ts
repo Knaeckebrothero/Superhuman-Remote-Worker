@@ -1,4 +1,4 @@
-import { Component, inject, computed } from '@angular/core';
+import { Component, inject, computed, effect, ElementRef, viewChild } from '@angular/core';
 import { DataService } from '../../core/services/data.service';
 import { RequestService } from '../../core/services/request.service';
 import { ChatEntry } from '../../core/models/chat.model';
@@ -61,7 +61,7 @@ import { ChatEntry } from '../../core/models/chat.model';
 
       <!-- Chat Messages -->
       @if (entries().length > 0) {
-        <div class="chat-list">
+        <div class="chat-list" #chatList>
           @for (entry of entries(); track entry._id; let idx = $index) {
             <div class="chat-turn">
               <!-- Turn Header -->
@@ -561,6 +561,12 @@ export class ChatHistoryComponent {
   readonly data = inject(DataService);
   private readonly requestService = inject(RequestService);
 
+  // Reference to the chat list container for auto-scrolling
+  private readonly chatListRef = viewChild<ElementRef<HTMLDivElement>>('chatList');
+
+  // Track the previous entry count to detect when new entries are added
+  private previousEntryCount = 0;
+
   // Use DataService's visible chat entries (filtered by slider position)
   readonly entries = computed(() => this.data.visibleChatEntries());
 
@@ -568,6 +574,26 @@ export class ChatHistoryComponent {
   readonly entryCount = computed(() => {
     return `${this.entries().length} turns`;
   });
+
+  constructor() {
+    // Effect to auto-scroll when entries change
+    effect(() => {
+      const entries = this.entries();
+      const currentCount = entries.length;
+      const chatList = this.chatListRef();
+
+      // Scroll to bottom when entries are added (count increased)
+      if (chatList && currentCount > this.previousEntryCount) {
+        // Use requestAnimationFrame to ensure DOM has updated
+        requestAnimationFrame(() => {
+          const el = chatList.nativeElement;
+          el.scrollTop = el.scrollHeight;
+        });
+      }
+
+      this.previousEntryCount = currentCount;
+    });
+  }
 
   formatLatency(ms: number): string {
     if (ms < 1000) {
