@@ -597,6 +597,45 @@ class ContextManager:
 
         return system_msgs + trimmed_conversation
 
+    async def ensure_within_limits(
+        self,
+        messages: List[BaseMessage],
+        llm: BaseChatModel,
+        summarization_prompt: Optional[str] = None,
+        oss_reasoning_level: str = "high",
+        max_summary_length: int = 10000,
+        force: bool = False,
+    ) -> List[BaseMessage]:
+        """Ensure messages are within configured limits, summarizing if needed.
+
+        This is the single entry point for context compaction. Call this before
+        LLM requests to guarantee context stays within bounds.
+
+        Args:
+            messages: Current message history
+            llm: LLM for summarization
+            summarization_prompt: Optional custom prompt
+            oss_reasoning_level: Reasoning level for OSS models
+            max_summary_length: Max length for summary
+            force: If True, summarize even if thresholds not exceeded
+
+        Returns:
+            Messages (possibly compacted) guaranteed to be within limits
+        """
+        if force or self.should_summarize(messages):
+            logger.info(
+                f"Context compaction triggered: {len(messages)} messages, "
+                f"{self.get_token_count(messages)} tokens"
+            )
+            return await self.summarize_and_compact(
+                messages,
+                llm,
+                summarization_prompt,
+                oss_reasoning_level,
+                max_summary_length,
+            )
+        return messages
+
     async def summarize_conversation(
         self,
         messages: List[BaseMessage],

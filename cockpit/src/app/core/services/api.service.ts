@@ -2,10 +2,59 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable, catchError, of } from 'rxjs';
 import { TableInfo, TableDataResponse, ColumnDef } from '../models/api.model';
-import { JobSummary, AuditResponse, AuditFilterCategory } from '../models/audit.model';
+import {
+  JobSummary,
+  AuditEntry,
+  AuditResponse,
+  AuditFilterCategory,
+} from '../models/audit.model';
 import { LLMRequest } from '../models/request.model';
-import { GraphChangeResponse } from '../models/graph.model';
-import { ChatHistoryResponse } from '../models/chat.model';
+import { GraphChangeResponse, GraphDelta } from '../models/graph.model';
+import { ChatEntry, ChatHistoryResponse } from '../models/chat.model';
+
+/**
+ * Response for bulk audit endpoint.
+ */
+export interface BulkAuditResponse {
+  entries: AuditEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+}
+
+/**
+ * Response for bulk chat endpoint.
+ */
+export interface BulkChatResponse {
+  entries: ChatEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+}
+
+/**
+ * Response for bulk graph changes endpoint.
+ */
+export interface BulkGraphResponse {
+  deltas: GraphDelta[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+}
+
+/**
+ * Job version info for cache invalidation.
+ */
+export interface JobVersionInfo {
+  version: number;
+  auditEntryCount: number;
+  chatEntryCount: number;
+  graphDeltaCount: number;
+  lastUpdate: string;
+}
 
 /**
  * HTTP client service for the cockpit API.
@@ -216,5 +265,104 @@ export class ApiService {
           });
         }),
       );
+  }
+
+  // ===== Bulk Fetch Endpoints for Caching =====
+
+  /**
+   * Get bulk audit entries for caching in IndexedDB.
+   * Returns large batches (up to 5000 entries) for efficient caching.
+   */
+  getJobAuditBulk(
+    jobId: string,
+    offset: number = 0,
+    limit: number = 5000,
+  ): Observable<BulkAuditResponse> {
+    const params = new HttpParams()
+      .set('offset', offset.toString())
+      .set('limit', limit.toString());
+
+    return this.http
+      .get<BulkAuditResponse>(`${this.baseUrl}/jobs/${jobId}/audit/bulk`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch bulk audit for job ${jobId}:`, error);
+          return of({
+            entries: [],
+            total: 0,
+            offset,
+            limit,
+            hasMore: false,
+          });
+        }),
+      );
+  }
+
+  /**
+   * Get bulk chat entries for caching in IndexedDB.
+   */
+  getChatHistoryBulk(
+    jobId: string,
+    offset: number = 0,
+    limit: number = 5000,
+  ): Observable<BulkChatResponse> {
+    const params = new HttpParams()
+      .set('offset', offset.toString())
+      .set('limit', limit.toString());
+
+    return this.http
+      .get<BulkChatResponse>(`${this.baseUrl}/jobs/${jobId}/chat/bulk`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch bulk chat for job ${jobId}:`, error);
+          return of({
+            entries: [],
+            total: 0,
+            offset,
+            limit,
+            hasMore: false,
+          });
+        }),
+      );
+  }
+
+  /**
+   * Get bulk graph deltas for caching in IndexedDB.
+   */
+  getGraphDeltasBulk(
+    jobId: string,
+    offset: number = 0,
+    limit: number = 5000,
+  ): Observable<BulkGraphResponse> {
+    const params = new HttpParams()
+      .set('offset', offset.toString())
+      .set('limit', limit.toString());
+
+    return this.http
+      .get<BulkGraphResponse>(`${this.baseUrl}/jobs/${jobId}/graph/bulk`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch bulk graph deltas for job ${jobId}:`, error);
+          return of({
+            deltas: [],
+            total: 0,
+            offset,
+            limit,
+            hasMore: false,
+          });
+        }),
+      );
+  }
+
+  /**
+   * Get job data version for cache invalidation.
+   */
+  getJobVersion(jobId: string): Observable<JobVersionInfo | null> {
+    return this.http.get<JobVersionInfo>(`${this.baseUrl}/jobs/${jobId}/version`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch job version for ${jobId}:`, error);
+        return of(null);
+      }),
+    );
   }
 }
