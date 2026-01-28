@@ -112,12 +112,14 @@ def create_todo_tools(context: ToolContext) -> List:
 
     @tool
     def todo_complete(todo_id: str = "") -> str:
-        """Mark a task as complete.
+        """Mark one or more tasks as complete.
 
         Call this tool AFTER you have finished working on a task.
 
         Args:
-            todo_id: Optional. The ID of the todo to complete (e.g., "todo_1", "todo_2").
+            todo_id: Optional. The ID(s) of the todo(s) to complete.
+                     - Single ID: "todo_1"
+                     - Multiple IDs: "todo_1, todo_2, todo_3"
                      If not provided, completes the first incomplete task
                      (in_progress first, then highest-priority pending).
 
@@ -129,7 +131,7 @@ def create_todo_tools(context: ToolContext) -> List:
 
         Returns:
             Status message including:
-            - Which task was completed
+            - Which task(s) were completed
             - How many tasks remain
             - What the next task is (if any)
             - Phase transition signal when all tasks complete
@@ -146,36 +148,65 @@ def create_todo_tools(context: ToolContext) -> List:
         Examples:
             todo_complete()  # Complete first pending task
             todo_complete(todo_id="todo_1")  # Complete specific task
-            todo_complete(todo_id="todo_3")  # Complete task 3 specifically
+            todo_complete(todo_id="todo_1, todo_2, todo_3")  # Complete multiple tasks
         """
         try:
             if todo_id and todo_id.strip():
-                # Complete specific todo by ID
-                todo = todo_mgr.complete(todo_id.strip())
-                if not todo:
-                    # List available todos to help the agent
-                    available = todo_mgr.list_all()
-                    if available:
-                        todo_list = ", ".join(t.id for t in available)
-                        return f"Error: Todo '{todo_id}' not found. Available todos: {todo_list}"
-                    return f"Error: Todo '{todo_id}' not found. No todos in the list."
+                # Parse comma-separated IDs
+                ids = [id.strip() for id in todo_id.split(",") if id.strip()]
 
-                # Build response message
-                remaining = todo_mgr.list_pending()
-                is_last = todo_mgr.all_complete()
+                if len(ids) == 1:
+                    # Single ID - use existing logic
+                    todo = todo_mgr.complete(ids[0])
+                    if not todo:
+                        # List available todos to help the agent
+                        available = todo_mgr.list_all()
+                        if available:
+                            todo_list = ", ".join(t.id for t in available)
+                            return f"Error: Todo '{ids[0]}' not found. Available todos: {todo_list}"
+                        return f"Error: Todo '{ids[0]}' not found. No todos in the list."
 
-                if is_last:
-                    message = (
-                        f"Completed: {todo.content}\n"
-                        f"All tasks complete! Ready for phase transition."
-                    )
+                    # Build response message
+                    remaining = todo_mgr.list_pending()
+                    is_last = todo_mgr.all_complete()
+
+                    if is_last:
+                        message = (
+                            f"Completed: {todo.content}\n"
+                            f"All tasks complete! Ready for phase transition."
+                        )
+                    else:
+                        next_task = remaining[0] if remaining else None
+                        next_str = f"\nNext: {next_task.content}" if next_task else ""
+                        message = (
+                            f"Completed: {todo.content}\n"
+                            f"Remaining: {len(remaining)} tasks{next_str}"
+                        )
                 else:
-                    next_task = remaining[0] if remaining else None
-                    next_str = f"\nNext: {next_task.content}" if next_task else ""
-                    message = (
-                        f"Completed: {todo.content}\n"
-                        f"Remaining: {len(remaining)} tasks{next_str}"
-                    )
+                    # Multiple IDs - use batch method
+                    result = todo_mgr.complete_multiple(ids)
+
+                    completed = result["completed"]
+                    not_found = result["not_found"]
+                    is_last = result["is_last"]
+
+                    lines = []
+                    if completed:
+                        lines.append(f"Completed {len(completed)} tasks:")
+                        for todo in completed:
+                            lines.append(f"  - {todo.content}")
+
+                    if not_found:
+                        lines.append(f"Not found: {', '.join(not_found)}")
+
+                    remaining = todo_mgr.list_pending()
+                    if is_last:
+                        lines.append("All tasks complete! Ready for phase transition.")
+                    elif remaining:
+                        lines.append(f"Remaining: {len(remaining)} tasks")
+                        lines.append(f"Next: {remaining[0].content}")
+
+                    message = "\n".join(lines)
             else:
                 # Original behavior: complete first pending task
                 result = todo_mgr.complete_first_pending_sync()
@@ -312,7 +343,7 @@ TODO_TOOLS_METADATA = {
     "todo_complete": {
         "module": "todo_tools",
         "function": "todo_complete",
-        "description": "Mark a task as complete (optionally by ID)",
+        "description": "Mark one or more tasks as complete (by ID or comma-separated IDs)",
         "category": "todo",
         "phases": ["strategic", "tactical"],  # Both: used in all phases
     },

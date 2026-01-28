@@ -25,12 +25,12 @@ def _import_module_directly(module_path: Path, module_name: str):
 
 
 # Import workspace manager first (dependency)
-workspace_path = project_root / "src" / "agent" / "core" / "workspace.py"
+workspace_path = project_root / "src" / "core" / "workspace.py"
 workspace_module = _import_module_directly(workspace_path, "test_memory_workspace_mgr")
 WorkspaceManager = workspace_module.WorkspaceManager
 
 # Import the memory module
-memory_path = project_root / "src" / "agent" / "managers" / "memory.py"
+memory_path = project_root / "src" / "managers" / "memory.py"
 memory_module = _import_module_directly(memory_path, "test_memory_manager")
 MemoryManager = memory_module.MemoryManager
 
