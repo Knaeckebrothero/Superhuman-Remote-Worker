@@ -4,8 +4,9 @@ Provides a container for dependencies that tools need access to,
 such as workspace managers, database connections, and configuration.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, Optional
 
 from ..core.workspace import WorkspaceManager
 
@@ -55,6 +56,7 @@ class ToolContext:
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
     _source_registry: Dict[str, int] = field(default_factory=dict)  # path/url -> source_id
+    _recent_reads: Deque[str] = field(default_factory=lambda: deque(maxlen=10))  # Recently read file paths
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -211,6 +213,43 @@ class ToolContext:
             self.citation_engine.close()
             self.citation_engine = None
             self._source_registry.clear()
+
+    def record_file_read(self, path: str) -> None:
+        """Record that a file was read. Uses normalized path.
+
+        This is called by read_file to track which files have been recently
+        accessed. The tracking window is limited to the last N reads (default 10).
+
+        Args:
+            path: Path to the file that was read
+        """
+        normalized = path.lstrip("/").strip()
+        # Remove if already present (we'll re-add at the end)
+        if normalized in self._recent_reads:
+            self._recent_reads.remove(normalized)
+        self._recent_reads.append(normalized)
+
+    def was_recently_read(self, path: str) -> bool:
+        """Check if file was read within the tracking window.
+
+        Used by edit_file and write_file to enforce read-before-write discipline.
+
+        Args:
+            path: Path to check
+
+        Returns:
+            True if the file was recently read, False otherwise
+        """
+        normalized = path.lstrip("/").strip()
+        return normalized in self._recent_reads
+
+    def get_read_tracking_limit(self) -> int:
+        """Get the tracking window size from config or default.
+
+        Returns:
+            Number of recent reads to track (default 10)
+        """
+        return self.get_config("read_tracking_limit", 10)
 
     async def update_job_status(
         self,

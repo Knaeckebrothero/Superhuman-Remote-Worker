@@ -1,12 +1,14 @@
-import { Component, inject, effect } from '@angular/core';
-import { ChatService } from '../../core/services/chat.service';
+import { Component, inject, computed } from '@angular/core';
+import { DataService } from '../../core/services/data.service';
 import { RequestService } from '../../core/services/request.service';
-import { AuditService } from '../../core/services/audit.service';
-import { ChatEntry, ChatInput } from '../../core/models/chat.model';
+import { ChatEntry } from '../../core/models/chat.model';
 
 /**
  * Chat History component that displays a clean sequential view of conversations.
  * Shows input -> response turns in a messenger-style layout.
+ *
+ * Now uses DataService for index-based filtering.
+ * Chat entries are filtered by slider position - shows entries up to sliderIndex.
  */
 @Component({
   selector: 'app-chat-history',
@@ -16,30 +18,31 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
       <!-- Header -->
       <div class="chat-header">
         <span class="header-title">Chat History</span>
-        @if (chat.selectedJobId()) {
-          <button class="refresh-btn" (click)="chat.refresh()" title="Refresh">
+        @if (data.currentJobId()) {
+          <span class="entry-count">{{ entryCount() }}</span>
+          <button class="refresh-btn" (click)="data.refresh()" title="Refresh">
             &#x21BB;
           </button>
         }
       </div>
 
       <!-- Loading State -->
-      @if (chat.isLoading()) {
+      @if (data.isLoading()) {
         <div class="loading-overlay">
           <div class="spinner"></div>
         </div>
       }
 
       <!-- Error State -->
-      @if (chat.error()) {
+      @if (data.error()) {
         <div class="error-state">
-          <span>{{ chat.error() }}</span>
-          <button (click)="chat.refresh()">Retry</button>
+          <span>{{ data.error() }}</span>
+          <button (click)="data.refresh()">Retry</button>
         </div>
       }
 
       <!-- Empty State -->
-      @if (!chat.isLoading() && !chat.error() && chat.entries().length === 0 && chat.selectedJobId()) {
+      @if (!data.isLoading() && !data.error() && entries().length === 0 && data.currentJobId()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4AC;</span>
           <span>No chat history for this job</span>
@@ -48,7 +51,7 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
       }
 
       <!-- No Job Selected -->
-      @if (!chat.selectedJobId() && !chat.isLoading()) {
+      @if (!data.currentJobId() && !data.isLoading()) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F50D;</span>
           <span>Select a job to view chat history</span>
@@ -57,9 +60,9 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
       }
 
       <!-- Chat Messages -->
-      @if (chat.entries().length > 0) {
+      @if (entries().length > 0) {
         <div class="chat-list">
-          @for (entry of chat.entries(); track entry._id; let idx = $index) {
+          @for (entry of entries(); track entry._id; let idx = $index) {
             <div class="chat-turn">
               <!-- Turn Header -->
               <div class="turn-header">
@@ -144,47 +147,12 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
         </div>
       }
 
-      <!-- Pagination -->
-      @if (chat.totalEntries() > 0) {
-        <div class="pagination">
-          <span class="page-info">{{ chat.paginationSummary() }}</span>
-          <div class="page-controls">
-            <button
-              class="page-btn"
-              (click)="chat.firstPage()"
-              [disabled]="!chat.canGoPrev()"
-              title="First page"
-            >
-              &lt;&lt;
-            </button>
-            <button
-              class="page-btn"
-              (click)="chat.previousPage()"
-              [disabled]="!chat.canGoPrev()"
-              title="Previous page"
-            >
-              &lt; Prev
-            </button>
-            <span class="page-number">
-              Page {{ chat.currentPage() }} of {{ chat.totalPages() }}
-            </span>
-            <button
-              class="page-btn"
-              (click)="chat.nextPage()"
-              [disabled]="!chat.canGoNext()"
-              title="Next page"
-            >
-              Next &gt;
-            </button>
-            <button
-              class="page-btn"
-              (click)="chat.lastPage()"
-              [disabled]="!chat.canGoNext()"
-              title="Last page"
-            >
-              &gt;&gt;
-            </button>
-          </div>
+      <!-- Position indicator -->
+      @if (entries().length > 0) {
+        <div class="position-bar">
+          <span class="position-info">
+            Showing {{ entries().length }} chat turns
+          </span>
         </div>
       }
     </div>
@@ -209,7 +177,7 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
       .chat-header {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        gap: 8px;
         padding: 8px 12px;
         background: var(--panel-header-bg, #1e1e2e);
         border-bottom: 1px solid var(--border-color, #313244);
@@ -220,6 +188,13 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
         font-size: 12px;
         font-weight: 600;
         color: var(--text-primary, #cdd6f4);
+      }
+
+      .entry-count {
+        margin-left: auto;
+        font-size: 11px;
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-muted, #6c7086);
       }
 
       .refresh-btn {
@@ -565,73 +540,34 @@ import { ChatEntry, ChatInput } from '../../core/models/chat.model';
         text-decoration-style: solid;
       }
 
-      /* Pagination */
-      .pagination {
+      /* Position Bar */
+      .position-bar {
         display: flex;
         align-items: center;
-        justify-content: space-between;
         padding: 8px 12px;
         background: var(--surface-0, #313244);
         border-top: 1px solid var(--border-color, #313244);
         flex-shrink: 0;
       }
 
-      .page-info {
+      .position-info {
         font-size: 12px;
         color: var(--text-muted, #6c7086);
-      }
-
-      .page-controls {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-      }
-
-      .page-btn {
-        padding: 4px 12px;
-        border: 1px solid var(--border-color, #313244);
-        border-radius: 4px;
-        background: transparent;
-        color: var(--text-secondary, #a6adc8);
-        font-size: 12px;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .page-btn:hover:not(:disabled) {
-        background: var(--panel-header-bg, #1e1e2e);
-        color: var(--text-primary, #cdd6f4);
-        border-color: var(--text-muted, #6c7086);
-      }
-
-      .page-btn:disabled {
-        opacity: 0.4;
-        cursor: not-allowed;
-      }
-
-      .page-number {
-        font-size: 12px;
-        color: var(--text-secondary, #a6adc8);
       }
     `,
   ],
 })
 export class ChatHistoryComponent {
-  readonly chat = inject(ChatService);
+  readonly data = inject(DataService);
   private readonly requestService = inject(RequestService);
-  private readonly auditService = inject(AuditService);
 
-  constructor() {
-    // Watch for job selection changes in AuditService and load chat history
-    effect(() => {
-      const jobId = this.auditService.selectedJobId();
-      if (jobId && jobId !== this.chat.selectedJobId()) {
-        this.chat.loadChatHistory(jobId);
-      } else if (!jobId) {
-        this.chat.clear();
-      }
-    });
-  }
+  // Use DataService's visible chat entries (filtered by slider position)
+  readonly entries = computed(() => this.data.visibleChatEntries());
+
+  // Entry count display
+  readonly entryCount = computed(() => {
+    return `${this.entries().length} turns`;
+  });
 
   formatLatency(ms: number): string {
     if (ms < 1000) {
@@ -658,7 +594,7 @@ export class ChatHistoryComponent {
    * Tool results appear as inputs in the following entry with matching tool_call_id.
    */
   getToolResult(currentIndex: number, toolCallId: string): string | null {
-    const entries = this.chat.entries();
+    const entries = this.entries();
     const nextEntry = entries[currentIndex + 1];
     if (!nextEntry) {
       return null;

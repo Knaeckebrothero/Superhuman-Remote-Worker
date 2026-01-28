@@ -1,4 +1,4 @@
-import { Injectable, inject, signal, computed, effect } from '@angular/core';
+import { Injectable, inject, signal, computed, effect, Injector, runInInjectionContext } from '@angular/core';
 import { firstValueFrom } from 'rxjs';
 import { ApiService, JobVersionInfo } from './api.service';
 import { IndexedDbService } from './indexed-db.service';
@@ -27,13 +27,33 @@ const FILTER_STEP_TYPES: Record<AuditFilterCategory, string[] | null> = {
  */
 @Injectable({ providedIn: 'root' })
 export class DataService {
-  private readonly api = inject(ApiService);
-  private readonly db = inject(IndexedDbService);
+  private readonly api: ApiService;
+  private readonly db: IndexedDbService;
+  private injector: Injector | null = null;
 
   // ===== Window Configuration =====
   private readonly WINDOW_SIZE = 1000;
   private readonly WINDOW_PADDING = 200; // Load more when within 200 of edge
   private readonly BULK_FETCH_SIZE = 5000;
+
+  /**
+   * Constructor supports optional dependency injection for testing.
+   * When called without arguments (production), uses Angular's inject().
+   * When called with arguments (testing), skips effect setup.
+   */
+  constructor(api?: ApiService, db?: IndexedDbService) {
+    if (api && db) {
+      // Testing mode - use provided dependencies, skip effects
+      this.api = api;
+      this.db = db;
+    } else {
+      // Production mode - use Angular DI
+      this.injector = inject(Injector);
+      this.api = inject(ApiService);
+      this.db = inject(IndexedDbService);
+      this.setupEffects();
+    }
+  }
 
   // ===== Core State Signals =====
 
@@ -77,25 +97,33 @@ export class DataService {
   readonly isCached = signal<boolean>(false);
   readonly cacheMetadata = signal<JobCacheMetadata | null>(null);
 
-  constructor() {
-    // Effect to reload window when slider moves outside current window
-    effect(() => {
-      const index = this._sliderIndex();
-      const windowStart = this._windowStart();
-      const windowEntries = this._liveAuditEntries();
-      const windowEnd = windowStart + windowEntries.length;
+  /**
+   * Setup reactive effects. Called from constructor in production mode.
+   * Wrapped in runInInjectionContext to ensure effects work properly.
+   */
+  private setupEffects(): void {
+    if (!this.injector) return;
 
-      // Check if slider is near window edges
-      if (
-        windowEntries.length > 0 &&
-        (index < windowStart + this.WINDOW_PADDING || index > windowEnd - this.WINDOW_PADDING)
-      ) {
-        // Need to recenter window - but only if we have a job loaded
-        const jobId = this._currentJobId();
-        if (jobId) {
-          this.loadWindow(index);
+    // Effect to reload window when slider moves outside current window
+    runInInjectionContext(this.injector, () => {
+      effect(() => {
+        const index = this._sliderIndex();
+        const windowStart = this._windowStart();
+        const windowEntries = this._liveAuditEntries();
+        const windowEnd = windowStart + windowEntries.length;
+
+        // Check if slider is near window edges
+        if (
+          windowEntries.length > 0 &&
+          (index < windowStart + this.WINDOW_PADDING || index > windowEnd - this.WINDOW_PADDING)
+        ) {
+          // Need to recenter window - but only if we have a job loaded
+          const jobId = this._currentJobId();
+          if (jobId) {
+            this.loadWindow(index);
+          }
         }
-      }
+      });
     });
   }
 
