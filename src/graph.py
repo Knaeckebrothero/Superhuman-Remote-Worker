@@ -280,6 +280,8 @@ def create_execute_node(
     config: AgentConfig,
     context_mgr: ContextManager,
     retry_manager: ToolRetryManager,
+    summarization_llm: BaseChatModel,
+    summarization_prompt: str,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node.
 
@@ -293,9 +295,11 @@ def create_execute_node(
         config: Agent configuration
         context_mgr: ContextManager for context window management
         retry_manager: ToolRetryManager for LLM call retry logic
+        summarization_llm: LLM for context summarization
+        summarization_prompt: Prompt template for summarization
     """
 
-    def execute(state: UniversalAgentState) -> Dict[str, Any]:
+    async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
@@ -327,6 +331,22 @@ def create_execute_node(
             f"prompt for phase {phase_number}"
         )
         prepared_messages.append(SystemMessage(content=full_system))
+
+        # Ensure context is within limits before LLM call
+        original_message_count = len(messages)
+        oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+        messages = await context_mgr.ensure_within_limits(
+            messages,
+            summarization_llm,
+            summarization_prompt,
+            oss_reasoning_level=oss_reasoning_level,
+            max_summary_length=config.context_management.max_summary_length,
+        )
+        context_was_compacted = len(messages) < original_message_count
+        if context_was_compacted:
+            logger.info(
+                f"[{job_id}] Context compacted in execute: {original_message_count} -> {len(messages)} messages"
+            )
 
         # Always clear old tool results, keep last 10
         messages = context_mgr.clear_old_tool_results(messages)
@@ -427,6 +447,14 @@ def create_execute_node(
                             latency_ms=latency_ms,
                         )
 
+                # Return compacted messages + response if compaction occurred,
+                # otherwise just append the response (add_messages reducer handles this)
+                if context_was_compacted:
+                    return {
+                        "messages": messages + [response],
+                        "iteration": iteration + 1,
+                        "error": None,
+                    }
                 return {
                     "messages": [response],
                     "iteration": iteration + 1,
@@ -623,25 +651,34 @@ def create_archive_phase_node(
             content=f"Phase complete. Archived todos to {archive_path}. Moving to next phase."
         )
 
-        # Context compaction at phase boundary
+        # Context compaction at phase boundary using unified method
         messages = state.get("messages", [])
         compacted_messages = None
 
         if config.context_management.compact_on_archive:
-            if context_mgr.should_summarize(messages):
-                oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
-                max_summary_length = config.context_management.max_summary_length
+            oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
 
-                compacted_messages = await context_mgr.summarize_and_compact(
-                    messages,
-                    llm,
-                    summarization_prompt,
-                    oss_reasoning_level,
-                    max_summary_length,
-                )
+            # Force summarization when transitioning from strategic to tactical
+            # This gives tactical phases a "fresh conversation" with just the plan summary
+            force_summarize = is_strategic  # True when completing strategic phase
+
+            compacted_messages = await context_mgr.ensure_within_limits(
+                messages,
+                llm,
+                summarization_prompt,
+                oss_reasoning_level=oss_reasoning_level,
+                max_summary_length=config.context_management.max_summary_length,
+                force=force_summarize,
+            )
+
+            if len(compacted_messages) < len(messages):
+                reason = "strategic→tactical transition" if force_summarize else "threshold exceeded"
                 logger.info(
-                    f"[{job_id}] Compacted context: {len(messages)} -> {len(compacted_messages)} messages"
+                    f"[{job_id}] Compacted context ({reason}): "
+                    f"{len(messages)} -> {len(compacted_messages)} messages"
                 )
+            else:
+                compacted_messages = None  # No compaction occurred
 
         # Return with compacted messages if compaction occurred
         if compacted_messages is not None:
@@ -1189,6 +1226,8 @@ def build_phase_alternation_graph(
     execute = create_execute_node(
         llm_with_tools, todo_manager, memory_manager, workspace,
         config, context_mgr, retry_manager,
+        summarization_llm=llm_for_summarization,
+        summarization_prompt=summarization_prompt,
     )
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(

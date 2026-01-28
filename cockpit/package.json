@@ -6,6 +6,8 @@
     "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "serve:ssr:cockpit": "node dist/cockpit/server/server.mjs"
   },
   "prettier": {
@@ -34,6 +36,7 @@
     "angular-split": "^20.0.0",
     "cytoscape": "^3.33.1",
     "cytoscape-fcose": "^2.2.0",
+    "dexie": "^4.2.1",
     "express": "^5.1.0",
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0"
@@ -45,6 +48,7 @@
     "@types/cytoscape": "^3.21.9",
     "@types/express": "^5.0.1",
     "@types/node": "^20.17.19",
+    "fake-indexeddb": "^6.2.5",
     "jsdom": "^27.1.0",
     "typescript": "~5.9.2",
     "vitest": "^4.0.8"
