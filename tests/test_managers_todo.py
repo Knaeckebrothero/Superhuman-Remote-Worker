@@ -26,12 +26,12 @@ def _import_module_directly(module_path: Path, module_name: str):
 
 
 # Import workspace manager first (dependency)
-workspace_path = project_root / "src" / "agent" / "core" / "workspace.py"
+workspace_path = project_root / "src" / "core" / "workspace.py"
 workspace_module = _import_module_directly(workspace_path, "test_workspace_mgr")
 WorkspaceManager = workspace_module.WorkspaceManager
 
 # Import the todo module
-todo_path = project_root / "src" / "agent" / "managers" / "todo.py"
+todo_path = project_root / "src" / "managers" / "todo.py"
 todo_module = _import_module_directly(todo_path, "test_todo_manager")
 TodoManager = todo_module.TodoManager
 TodoItem = todo_module.TodoItem
