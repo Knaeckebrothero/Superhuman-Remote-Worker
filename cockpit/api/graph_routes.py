@@ -117,9 +117,10 @@ async def _get_all_tool_calls(job_id: str) -> list[dict[str, Any]]:
     collection = mongodb_service._db["agent_audit"]
 
     # Query for tool-related entries
+    # Note: archiver stores tool calls with step_type="tool"
     query = {
         "job_id": job_id,
-        "step_type": {"$in": ["tool_call", "tool_result"]},
+        "step_type": "tool",
     }
 
     # Fetch all matching entries sorted by step_number
@@ -214,7 +215,7 @@ def parse_cypher_query(query: str) -> dict[str, list[Any]]:
 
     # CREATE relationship: CREATE (a)-[:TYPE {props}]->(b) or CREATE (a)-[var:TYPE]->(b)
     for match in re.finditer(
-        r'CREATE\s+\((\w+)\)-\[(?:\w+:)?(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)',
+        r'CREATE\s+\((\w+)\)-\[(?:\w+)?:(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)',
         query,
         re.IGNORECASE,
     ):
@@ -227,7 +228,7 @@ def parse_cypher_query(query: str) -> dict[str, list[Any]]:
 
     # MERGE relationship: MERGE (a)-[:TYPE]->(b) or MERGE (a)-[var:TYPE]->(b)
     for match in re.finditer(
-        r'MERGE\s+\((\w+)\)-\[(?:\w+:)?(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)',
+        r'MERGE\s+\((\w+)\)-\[(?:\w+)?:(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)',
         query,
         re.IGNORECASE,
     ):
