@@ -130,10 +130,11 @@ init_workspace → init_strategic_todos
 
 ### Configuration Inheritance
 
-Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`. Deep merge applies - set value to `null` to clear inherited defaults.
+Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`. Deep merge applies - set value to `null` to clear inherited defaults. The config schema (`src/config/schema.json`) provides IDE autocompletion via `"$schema"`.
 
 ```json
 {
+  "$schema": "../../src/config/schema.json",
   "$extends": "defaults",
   "agent_id": "creator",
   "tools": { "domain": ["extract_document_text", "web_search", ...] }
@@ -145,6 +146,8 @@ Tool categories in config:
 - `todo`: Task management (next_phase_todos, todo_complete, todo_rewind)
 - `domain`: Agent-specific tools (set per config)
 - `completion`: Phase/job signaling (mark_complete, job_complete)
+
+**Phase-specific tool filtering**: `job_complete` is only available during strategic phases. Tactical phases cannot signal job completion directly.
 
 ### Multi-Database Architecture
 
@@ -169,9 +172,15 @@ Per-job directory: `workspace/job_<uuid>/`
 ### Context Management
 
 Token limits trigger automatic summarization:
-- `context_threshold_tokens`: 80000 (default)
-- `message_count_threshold`: 200 messages
+- `context_threshold_tokens`: 60000 (default in defaults.json)
+- `message_count_threshold`: 150 messages
 - `keep_recent_tool_results`: 10 most recent preserved during compaction
+
+### Phase Settings
+
+Phase transition validation (in `phase_settings` config section):
+- `min_todos`: 5 (minimum todos required for strategic→tactical transition)
+- `max_todos`: 20 (maximum todos allowed)
 
 ## Key Source Directories
 

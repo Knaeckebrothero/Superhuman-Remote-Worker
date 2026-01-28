@@ -256,13 +256,19 @@ class TestArchivePhaseNode:
         managers["todo"].complete("todo_1")
         managers["plan"].write("## Phase 1: Test\n\n- [x] Task 1")
 
-        # Create mock context manager - skip compaction by returning False
+        # Create mock context manager - ensure_within_limits returns unchanged messages
         mock_context_mgr = MagicMock()
-        mock_context_mgr.should_summarize.return_value = False
+        # ensure_within_limits is async, so we need AsyncMock
+        from unittest.mock import AsyncMock
+        mock_context_mgr.ensure_within_limits = AsyncMock(return_value=[])
 
         # Mock config to enable compact_on_archive
         mock_config.context_management = MagicMock()
         mock_config.context_management.compact_on_archive = True
+        mock_config.context_management.reasoning_level = None
+        mock_config.context_management.max_summary_length = 10000
+        mock_config.llm = MagicMock()
+        mock_config.llm.reasoning_level = "high"
 
         mock_llm = MagicMock()
         mock_summarization_prompt = "Summarize this conversation."
@@ -279,6 +285,88 @@ class TestArchivePhaseNode:
         assert "Phase complete" in result["messages"][0].content
         # Todos should be cleared
         assert len(managers["todo"].list_all()) == 0
+
+    @pytest.mark.asyncio
+    async def test_force_summarize_on_strategic_to_tactical_transition(self, managers, mock_config):
+        """Test that summarization is forced when transitioning from strategic to tactical.
+
+        This ensures tactical phases get a 'fresh conversation' with just the plan summary,
+        reducing context size and removing irrelevant planning discussions.
+        """
+        managers["todo"].add("Task 1")
+        managers["todo"].complete("todo_1")
+        managers["plan"].write("## Phase 1: Test\n\n- [x] Task 1")
+
+        # Create mock context manager to capture the force parameter
+        mock_context_mgr = MagicMock()
+        mock_context_mgr.ensure_within_limits = AsyncMock(return_value=[])
+
+        # Mock config to enable compact_on_archive
+        mock_config.context_management = MagicMock()
+        mock_config.context_management.compact_on_archive = True
+        mock_config.context_management.reasoning_level = None
+        mock_config.context_management.max_summary_length = 10000
+        mock_config.llm = MagicMock()
+        mock_config.llm.reasoning_level = "high"
+
+        mock_llm = MagicMock()
+        mock_summarization_prompt = "Summarize this conversation."
+
+        node = create_archive_phase_node(
+            managers["todo"], managers["plan"], mock_config,
+            mock_context_mgr, mock_llm, mock_summarization_prompt
+        )
+
+        # Test strategic phase (is_strategic=True) - should force summarization
+        state = {"job_id": "test-123", "messages": [], "is_strategic_phase": True}
+        await node(state)
+
+        # Verify ensure_within_limits was called with force=True
+        call_kwargs = mock_context_mgr.ensure_within_limits.call_args
+        assert call_kwargs.kwargs.get("force") is True, (
+            "Expected force=True for strategic→tactical transition"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_force_summarize_on_tactical_to_strategic_transition(self, managers, mock_config):
+        """Test that summarization is NOT forced when transitioning from tactical to strategic.
+
+        Tactical→strategic transitions should preserve execution context for strategic reflection,
+        only summarizing if thresholds are exceeded.
+        """
+        managers["todo"].add("Task 1")
+        managers["todo"].complete("todo_1")
+        managers["plan"].write("## Phase 1: Test\n\n- [x] Task 1")
+
+        # Create mock context manager to capture the force parameter
+        mock_context_mgr = MagicMock()
+        mock_context_mgr.ensure_within_limits = AsyncMock(return_value=[])
+
+        # Mock config to enable compact_on_archive
+        mock_config.context_management = MagicMock()
+        mock_config.context_management.compact_on_archive = True
+        mock_config.context_management.reasoning_level = None
+        mock_config.context_management.max_summary_length = 10000
+        mock_config.llm = MagicMock()
+        mock_config.llm.reasoning_level = "high"
+
+        mock_llm = MagicMock()
+        mock_summarization_prompt = "Summarize this conversation."
+
+        node = create_archive_phase_node(
+            managers["todo"], managers["plan"], mock_config,
+            mock_context_mgr, mock_llm, mock_summarization_prompt
+        )
+
+        # Test tactical phase (is_strategic=False) - should NOT force summarization
+        state = {"job_id": "test-123", "messages": [], "is_strategic_phase": False}
+        await node(state)
+
+        # Verify ensure_within_limits was called with force=False
+        call_kwargs = mock_context_mgr.ensure_within_limits.call_args
+        assert call_kwargs.kwargs.get("force") is False, (
+            "Expected force=False for tactical→strategic transition"
+        )
 
 
 class TestCheckGoalNode:
@@ -1201,3 +1289,108 @@ class TestEditCitationTool:
 
         assert "error:" in result
         assert "valid JSON" in result
+
+
+# =============================================================================
+# CONTEXT MANAGER ENSURE_WITHIN_LIMITS TESTS
+# =============================================================================
+
+
+class TestEnsureWithinLimits:
+    """Tests for ContextManager.ensure_within_limits method."""
+
+    @pytest.fixture
+    def context_mgr(self):
+        """Create a ContextManager with low thresholds for testing."""
+        from src.core.context import ContextManager, ContextConfig
+        config = ContextConfig(
+            compaction_threshold_tokens=1000,
+            summarization_threshold_tokens=1000,
+            message_count_threshold=5,
+            message_count_min_tokens=100,
+            keep_recent_messages=2,
+        )
+        return ContextManager(config=config)
+
+    @pytest.fixture
+    def mock_llm(self):
+        """Create a mock LLM that returns a summary."""
+        from langchain_core.messages import AIMessage
+        llm = MagicMock()
+        # with_structured_output returns an LLM that can be awaited
+        structured_llm = MagicMock()
+        structured_llm.ainvoke = AsyncMock(return_value=MagicMock(
+            summary="Test summary",
+            tasks_completed="- Task 1",
+            key_decisions="- Decision 1",
+            current_state="In progress",
+            blockers="",
+        ))
+        llm.with_structured_output = MagicMock(return_value=structured_llm)
+        return llm
+
+    @pytest.mark.asyncio
+    async def test_no_compaction_when_under_threshold(self, context_mgr):
+        """Test that messages are returned unchanged when under threshold."""
+        from langchain_core.messages import HumanMessage
+        messages = [HumanMessage(content="Hello")]
+
+        mock_llm = MagicMock()
+        result = await context_mgr.ensure_within_limits(messages, mock_llm)
+
+        # Should return same messages unchanged
+        assert result == messages
+        # LLM should not be called
+        mock_llm.with_structured_output.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compaction_when_over_message_threshold(self, context_mgr, mock_llm):
+        """Test that compaction happens when message count exceeds threshold."""
+        from langchain_core.messages import HumanMessage, AIMessage
+
+        # Create enough messages to trigger threshold (>5 messages, >100 tokens)
+        messages = [
+            HumanMessage(content="Long message 1 " * 20),
+            AIMessage(content="Response 1 " * 20),
+            HumanMessage(content="Long message 2 " * 20),
+            AIMessage(content="Response 2 " * 20),
+            HumanMessage(content="Long message 3 " * 20),
+            AIMessage(content="Response 3 " * 20),
+        ]
+
+        result = await context_mgr.ensure_within_limits(messages, mock_llm)
+
+        # Should have fewer messages (compacted)
+        assert len(result) < len(messages)
+
+    @pytest.mark.asyncio
+    async def test_force_compaction(self, context_mgr, mock_llm):
+        """Test that force=True triggers compaction even under threshold."""
+        from langchain_core.messages import HumanMessage, AIMessage
+
+        # Large messages so the summary is smaller than original
+        # (compaction is skipped if summary is larger than original)
+        messages = [
+            HumanMessage(content="Hello world " * 50),
+            AIMessage(content="Hi there " * 50),
+            HumanMessage(content="How are you doing today? " * 50),
+            AIMessage(content="I am doing great, thanks! " * 50),
+        ]
+
+        result = await context_mgr.ensure_within_limits(messages, mock_llm, force=True)
+
+        # With force=True, compaction should happen (summary is smaller than original)
+        assert len(result) < len(messages)
+
+    @pytest.mark.asyncio
+    async def test_returns_original_when_not_enough_messages(self, context_mgr, mock_llm):
+        """Test that messages are returned unchanged when too few to compact."""
+        from langchain_core.messages import HumanMessage
+
+        # Only 1 message - can't really compact
+        messages = [HumanMessage(content="Hello")]
+
+        result = await context_mgr.ensure_within_limits(messages, mock_llm, force=True)
+
+        # Should return same messages since there's nothing to summarize
+        assert result == messages
