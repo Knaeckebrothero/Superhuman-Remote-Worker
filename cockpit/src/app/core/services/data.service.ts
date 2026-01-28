@@ -290,10 +290,27 @@ export class DataService {
 
   /**
    * Set the slider to a specific index.
+   * If the index is outside the current window, loads the window first.
    */
-  setSliderIndex(index: number): void {
+  async setSliderIndex(index: number): Promise<void> {
     const max = this._maxIndex();
     const clamped = Math.max(0, Math.min(index, max));
+
+    // Check if we need to load a new window
+    const windowStart = this._windowStart();
+    const windowEntries = this._liveAuditEntries();
+    const windowEnd = windowStart + windowEntries.length;
+
+    const jobId = this._currentJobId();
+    if (
+      jobId &&
+      windowEntries.length > 0 &&
+      (clamped < windowStart || clamped >= windowEnd)
+    ) {
+      // Index is outside current window - load new window first
+      await this.loadWindow(clamped);
+    }
+
     this._sliderIndex.set(clamped);
   }
 

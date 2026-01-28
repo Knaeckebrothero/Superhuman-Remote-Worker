@@ -3,8 +3,10 @@ import {
   inject,
   ElementRef,
   viewChildren,
+  viewChild,
   signal,
   computed,
+  effect,
 } from '@angular/core';
 import { DataService } from '../../core/services/data.service';
 import { RequestService } from '../../core/services/request.service';
@@ -689,6 +691,32 @@ export class AgentActivityComponent {
 
   // Local expanded state (not part of DataService)
   private readonly expandedIds = signal<Set<string>>(new Set());
+
+  // Reference to the entry list container for auto-scrolling
+  private readonly entryListRef = viewChild<ElementRef<HTMLDivElement>>('entryList');
+
+  // Track the previous entry count to detect when new entries are added
+  private previousEntryCount = 0;
+
+  constructor() {
+    // Effect to auto-scroll when entries change
+    effect(() => {
+      const entries = this.entries();
+      const currentCount = entries.length;
+      const entryList = this.entryListRef();
+
+      // Scroll to bottom when entries are added (count increased)
+      if (entryList && currentCount > this.previousEntryCount) {
+        // Use requestAnimationFrame to ensure DOM has updated
+        requestAnimationFrame(() => {
+          const el = entryList.nativeElement;
+          el.scrollTop = el.scrollHeight;
+        });
+      }
+
+      this.previousEntryCount = currentCount;
+    });
+  }
 
   readonly filters: { label: string; value: AuditFilterCategory }[] = [
     { label: 'All', value: 'all' },
