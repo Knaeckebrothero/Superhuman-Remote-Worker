@@ -255,6 +255,63 @@ def create_workspace_tools(context: ToolContext) -> List:
             return f"Error appending to file: {str(e)}"
 
     @tool
+    def edit_file(path: str, old_string: str, new_string: str) -> str:
+        """Replace an exact string occurrence in a workspace file.
+
+        Performs a single str_replace: finds `old_string` in the file and
+        replaces it with `new_string`. The match must be unique — if
+        `old_string` appears zero times or more than once, the edit is
+        rejected with an actionable error message.
+
+        Use this instead of read→write_file round-trips for surgical edits.
+
+        Args:
+            path: Relative path to the file (e.g., "plan.md")
+            old_string: Exact text to find (must appear exactly once)
+            new_string: Replacement text (may be empty to delete)
+
+        Returns:
+            Confirmation message or error with guidance
+        """
+        try:
+            if not workspace.exists(path):
+                return f"Error: File not found: {path}"
+
+            full_path = workspace.get_path(path)
+            if full_path.is_dir():
+                return f"Error: '{path}' is a directory, not a file."
+
+            content = workspace.read_file(path)
+            count = content.count(old_string)
+
+            if count == 0:
+                # Show a short snippet of the file to help the caller orient
+                preview = content[:200].replace("\n", "\\n")
+                return (
+                    f"Error: old_string not found in {path}. "
+                    f"Make sure the string matches exactly (including whitespace and newlines). "
+                    f"File starts with: {preview!r}"
+                )
+
+            if count > 1:
+                return (
+                    f"Error: old_string appears {count} times in {path}. "
+                    f"Include more surrounding context to make the match unique."
+                )
+
+            new_content = content.replace(old_string, new_string, 1)
+            workspace.write_file(path, new_content)
+
+            size = len(new_content.encode("utf-8"))
+            return f"Edited: {path} ({size:,} bytes)"
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"edit_file error for {path}: {e}")
+            return f"Error editing file: {str(e)}"
+
+    @tool
     def list_files(path: str = "", pattern: str = "*", depth: int = 1) -> str:
         """List files and directories in a workspace path with optional depth.
 
@@ -687,6 +744,7 @@ def create_workspace_tools(context: ToolContext) -> List:
         read_file,
         write_file,
         append_file,
+        edit_file,
         list_files,
         delete_file,
         search_files,
@@ -720,6 +778,13 @@ WORKSPACE_TOOLS_METADATA = {
         "module": "workspace_tools",
         "function": "append_file",
         "description": "Append content to a file in the workspace",
+        "category": "workspace",
+        "phases": ["strategic", "tactical"],
+    },
+    "edit_file": {
+        "module": "workspace_tools",
+        "function": "edit_file",
+        "description": "Replace an exact string occurrence in a workspace file",
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },

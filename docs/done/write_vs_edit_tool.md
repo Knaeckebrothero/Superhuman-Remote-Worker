@@ -342,8 +342,155 @@ Most features are already implemented in `src/agent/context.py`. Remaining work:
 2. **Warning before clearing** - Inject system message when approaching threshold
 3. **Protected tools** - Add config to exclude specific tools (like `read_file`) from clearing
 
+## Industry Research: How Major AI Tools Implement File Editing (January 2026)
+
+Research into Claude Code, Google Gemini CLI, AWS Q CLI, and emerging tools like Morph reveals
+a strong consensus around the `str_replace` pattern, with divergence only in how aggressively
+implementations handle imprecise matches.
+
+### Anthropic — Text Editor Tool (`str_replace_based_edit_tool`)
+
+**Source**: [Text editor tool - Claude API Docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool)
+
+Anthropic's tool is a schema-less, model-integrated tool (the schema is baked into the model weights).
+It exposes multiple commands through a single tool:
+
+| Command | Parameters | Purpose |
+|---------|-----------|---------|
+| `view` | `path`, `view_range` (optional line range) | Read file or directory listing |
+| `str_replace` | `path`, `old_str`, `new_str` | Exact search-and-replace |
+| `create` | `path`, `file_text` | Create new file |
+| `insert` | `path`, `insert_line`, `new_str` | Insert text after a line number |
+| `undo_edit` | `path` | Revert last edit (Claude 3.7 only, removed in Claude 4) |
+
+Key design decisions:
+- **Exact match only** — no fuzzy matching, no regex. `old_str` must match the file content exactly
+  including whitespace and indentation.
+- **Single replacement** — if `old_str` matches 0 times → error ("no match found"); if >1 times →
+  error ("found N matches, provide more context"). No `replace_all` option.
+- **Implementation is on the caller** — the API defines the tool schema but the application must
+  implement the actual file I/O, matching, and error handling.
+- **Recommended error responses**: Return `is_error: true` with descriptive messages
+  ("Found 3 matches for replacement text. Please provide more context to make a unique match.").
+- **`undo_edit` was removed** in Claude 4 (`text_editor_20250728`) — Anthropic decided backups are
+  the caller's responsibility.
+
+Reference implementation from the docs:
+
+```python
+def safe_replace(file_path, old_text, new_text):
+    """Replace text only if there's exactly one match."""
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    count = content.count(old_text)
+    if count == 0:
+        return "Error: No match found"
+    elif count > 1:
+        return f"Error: Found {count} matches"
+    else:
+        new_content = content.replace(old_text, new_text)
+        with open(file_path, 'w') as f:
+            f.write(new_content)
+        return "Successfully replaced text"
+```
+
+### Google — Gemini CLI (`replace` tool)
+
+**Sources**:
+- [Gemini CLI file system tools](https://google-gemini.github.io/gemini-cli/docs/tools/file-system.html)
+- [Seeking Testers: New edit/replace tool](https://github.com/google-gemini/gemini-cli/discussions/7758)
+
+Gemini CLI takes a more sophisticated approach with self-correction:
+
+| Parameter | Type | Purpose |
+|-----------|------|---------|
+| `file_path` | string | Absolute path to file |
+| `old_string` | string | Exact text to find |
+| `new_string` | string | Replacement text |
+| `expected_replacements` | number (optional, default 1) | How many occurrences to replace |
+
+Key design decisions:
+- **Multi-stage matching strategy**:
+  1. Exact literal string matching
+  2. Flexible match (ignoring leading/trailing whitespace per line)
+  3. Regex-based matching (tolerant of variable whitespace between tokens)
+  4. **LLM self-correction** — if all strategies fail, invokes the model again to refine `old_string`/`new_string`
+- **`expected_replacements`** instead of boolean `replace_all` — more explicit about intent.
+- **File creation via overloading** — empty `old_string` + nonexistent file = create; empty `old_string` +
+  existing file = error.
+- **User confirmation** — shows a diff and requires approval before writing.
+
+The fuzzy matching adds robustness (~85-90% accuracy vs ~70% for exact-only) but also
+adds significant complexity. The self-correction layer requires an additional LLM call on failure.
+
+### AWS — Q CLI (`fs_write` with `str_replace` mode)
+
+**Source**: [The hidden sophistication behind how AI agents edit files](https://sumitgouthaman.com/posts/file-editing-for-llms/)
+
+The simplest implementation:
+- Parameters: `old_str`, `new_str`, optional summary
+- Error if 0 matches or >1 matches — no fuzzy logic, no self-correction
+- Straightforward `content.count()` + `content.replace()` pattern
+
+### Morph / Fast-Apply (Emerging Pattern)
+
+**Source**: [Diff Format Explained - Morph](https://www.morphllm.com/edit-formats/diff-format-explained)
+
+An alternative paradigm that avoids search/replace entirely:
+- The reasoning LLM outputs only the new code + change instructions (not `old_str`/`new_str`)
+- A specialized fine-tuned model (Llama 70B) applies the edits semantically
+- Claims ~98% first-pass accuracy vs ~84% for search/replace
+- Two-model architecture: planner decides, applier edits
+
+This is relevant for IDE-level source code editing but overkill for workspace file management.
+
+### Cross-Tool Comparison
+
+| Feature | Anthropic | Gemini CLI | Q CLI | Our System |
+|---------|-----------|------------|-------|------------|
+| Core mechanism | `old_str`/`new_str` | `old_string`/`new_string` | `old_str`/`new_str` | `append_file` only |
+| Default behavior | Single replacement | Single (configurable) | Single replacement | Append only |
+| Multi-match handling | Error + count | Error + self-correct | Error + count | N/A |
+| No-match handling | Error message | Fuzzy fallback + LLM retry | Error message | N/A |
+| Replace-all | Not supported | `expected_replacements` param | Not supported | N/A |
+| Fuzzy matching | No | Yes (3 tiers) | No | N/A |
+| LLM self-correction | No | Yes | No | N/A |
+| File creation | Separate `create` command | Empty `old_string` overload | Separate mode | `write_file` |
+| Undo support | Removed in v4 | No | No | No |
+| Accuracy (estimated) | ~70-80% | ~85-90% | ~60-70% | N/A |
+
+### Design Recommendations for Our Implementation
+
+Based on this research:
+
+1. **Follow the Anthropic/Q pattern** (simple exact match). Our agent uses an OpenAI-compatible LLM
+   without model-specific `str_replace` training, so keeping the tool simple and the error messages
+   clear is more important than fuzzy matching.
+
+2. **Parameters**: `path`, `old_string`, `new_string`. No `replace_all` — if the agent needs to
+   replace multiple occurrences, it should call the tool multiple times or use `write_file`. This
+   matches the industry consensus that single-replacement-by-default prevents accidental bulk changes.
+
+3. **Error messages should be actionable**:
+   - 0 matches: "old_string not found in {path}. Make sure it matches exactly (including whitespace)."
+   - N>1 matches: "old_string appears {N} times in {path}. Include more surrounding context to make it unique."
+
+4. **Skip fuzzy matching and self-correction** — these add complexity and latency (extra LLM call).
+   Our workspace files are markdown/yaml where whitespace is predictable. If the agent gets it wrong,
+   the clear error message lets it retry with better context.
+
+5. **Keep `write_file` for file creation** — don't overload `edit_file` with creation semantics.
+   Explicit is better than implicit.
+
 ## References
 
+- [Text editor tool - Claude API Docs](https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool)
+- [Gemini CLI file system tools](https://google-gemini.github.io/gemini-cli/docs/tools/file-system.html)
+- [Seeking Testers: New edit/replace tool for Gemini CLI](https://github.com/google-gemini/gemini-cli/discussions/7758)
+- [The hidden sophistication behind how AI agents edit files](https://sumitgouthaman.com/posts/file-editing-for-llms/)
+- [Diff Format Explained - Morph](https://www.morphllm.com/edit-formats/diff-format-explained)
+- [Anthropic API: Text editor tool (Simon Willison)](https://simonwillison.net/2025/Mar/13/anthropic-api-text-editor-tool/)
 - [Context editing - Claude Docs](https://platform.claude.com/docs/en/build-with-claude/context-editing)
 - [Managing context on the Claude Developer Platform](https://claude.com/blog/context-management)
 - [How Claude Code Got Better by Protecting More Context](https://hyperdev.matsuoka.com/p/how-claude-code-got-better-by-protecting)

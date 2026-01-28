@@ -876,6 +876,116 @@ class RequirementsNamespace:
         )
         logger.debug(f"Updated requirement {requirement_uuid} with neo4j_id={neo4j_id}")
 
+    async def edit_content(
+        self,
+        requirement_uuid: uuid.UUID,
+        text: Optional[str] = None,
+        name: Optional[str] = None,
+        req_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        source_document: Optional[str] = None,
+        source_location: Optional[Dict[str, Any]] = None,
+        gobd_relevant: Optional[bool] = None,
+        gdpr_relevant: Optional[bool] = None,
+        citations: Optional[List[str]] = None,
+        mentioned_objects: Optional[List[str]] = None,
+        mentioned_messages: Optional[List[str]] = None,
+        reasoning: Optional[str] = None,
+        research_notes: Optional[str] = None,
+        confidence: Optional[float] = None,
+        tags: Optional[List[str]] = None,
+    ) -> None:
+        """Edit content fields of a pending requirement.
+
+        Only editable when status='pending' (not yet picked up by validator).
+        Protected fields (id, job_id, status, neo4j_id, etc.) cannot be set.
+
+        Args:
+            requirement_uuid: Requirement UUID
+            text: Full requirement text
+            name: Short name/title
+            req_type: Type (functional, compliance, constraint, non_functional)
+            priority: Priority (high, medium, low)
+            source_document: Source document path
+            source_location: Location in document
+            gobd_relevant: GoBD relevance flag
+            gdpr_relevant: GDPR relevance flag
+            citations: Citation IDs list
+            mentioned_objects: BusinessObject names list
+            mentioned_messages: Message names list
+            reasoning: Extraction reasoning
+            research_notes: Research notes
+            confidence: Confidence score (0.0-1.0)
+            tags: Tags list
+
+        Raises:
+            ValueError: If requirement not found, not pending, or no fields provided
+        """
+        # Guard: check current status
+        row = await self.db.fetchrow(
+            "SELECT status FROM requirements WHERE id = $1",
+            requirement_uuid
+        )
+        if not row:
+            raise ValueError(f"Requirement {requirement_uuid} not found")
+        if row["status"] != "pending":
+            raise ValueError(
+                f"Requirement {requirement_uuid} has status '{row['status']}', "
+                f"only 'pending' requirements can be edited"
+            )
+
+        # Build dynamic UPDATE clause
+        updates = []
+        values = []
+        idx = 1
+
+        field_map = [
+            ("text", text, lambda v: v),
+            ("name", name, lambda v: v[:500] if v else v),
+            ("type", req_type, lambda v: v),
+            ("priority", priority, lambda v: v),
+            ("source_document", source_document, lambda v: v),
+            ("source_location", source_location, lambda v: json.dumps(v)),
+            ("gobd_relevant", gobd_relevant, lambda v: v),
+            ("gdpr_relevant", gdpr_relevant, lambda v: v),
+            ("citations", citations, lambda v: json.dumps(v)),
+            ("mentioned_objects", mentioned_objects, lambda v: json.dumps(v)),
+            ("mentioned_messages", mentioned_messages, lambda v: json.dumps(v)),
+            ("reasoning", reasoning, lambda v: v),
+            ("research_notes", research_notes, lambda v: v),
+            ("confidence", confidence, lambda v: v),
+            ("tags", tags, lambda v: json.dumps(v)),
+        ]
+
+        for col, val, transform in field_map:
+            if val is not None:
+                updates.append(f"{col} = ${idx}")
+                values.append(transform(val))
+                idx += 1
+
+        if not updates:
+            raise ValueError("No fields provided to edit")
+
+        updates.append("updated_at = NOW()")
+        values.append(requirement_uuid)
+
+        query = f"""
+            UPDATE requirements
+            SET {', '.join(updates)}
+            WHERE id = ${idx}
+        """
+
+        await self.db.execute(query, *values)
+        logger.debug(f"Edited content of requirement {requirement_uuid}")
+
+    def edit_content_sync(
+        self,
+        requirement_uuid: uuid.UUID,
+        **kwargs
+    ) -> None:
+        """Synchronous wrapper for edit_content()."""
+        return PostgresDB._run_async(self.edit_content(requirement_uuid, **kwargs))
+
     # Sync wrappers for dashboard/scripts
     def create_sync(
         self,
@@ -956,8 +1066,92 @@ class CitationsNamespace:
     def __init__(self, db: PostgresDB):
         self.db = db
 
-    # TODO: Implement citation operations when schema is defined
-    # For now, this is a placeholder for future citation functionality
+    async def edit(
+        self,
+        citation_id: int,
+        claim: Optional[str] = None,
+        verbatim_quote: Optional[str] = None,
+        quote_context: Optional[str] = None,
+        relevance_reasoning: Optional[str] = None,
+        confidence: Optional[str] = None,
+        extraction_method: Optional[str] = None,
+        locator: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Edit fields of a citation.
+
+        When content fields (claim, verbatim_quote, quote_context) change,
+        verification_status is reset to 'pending' and verification_notes,
+        similarity_score, matched_location are cleared.
+
+        Args:
+            citation_id: Citation integer ID
+            claim: The assertion being supported
+            verbatim_quote: Exact quote from source
+            quote_context: Context around the quote
+            relevance_reasoning: Why this citation is relevant
+            confidence: Confidence level (high, medium, low)
+            extraction_method: How the citation was extracted
+            locator: Location reference (JSON)
+
+        Raises:
+            ValueError: If citation not found or no fields provided
+        """
+        # Guard: check citation exists
+        row = await self.db.fetchrow(
+            "SELECT id FROM citations WHERE id = $1",
+            citation_id
+        )
+        if not row:
+            raise ValueError(f"Citation {citation_id} not found")
+
+        # Determine if content fields are changing
+        content_fields_changed = any(v is not None for v in [claim, verbatim_quote, quote_context])
+
+        # Build dynamic UPDATE clause
+        updates = []
+        values = []
+        idx = 1
+
+        field_map = [
+            ("claim", claim, lambda v: v),
+            ("verbatim_quote", verbatim_quote, lambda v: v),
+            ("quote_context", quote_context, lambda v: v),
+            ("relevance_reasoning", relevance_reasoning, lambda v: v),
+            ("confidence", confidence, lambda v: v),
+            ("extraction_method", extraction_method, lambda v: v),
+            ("locator", locator, lambda v: json.dumps(v)),
+        ]
+
+        for col, val, transform in field_map:
+            if val is not None:
+                updates.append(f"{col} = ${idx}")
+                values.append(transform(val))
+                idx += 1
+
+        if not updates:
+            raise ValueError("No fields provided to edit")
+
+        # Reset verification fields when content changes
+        if content_fields_changed:
+            updates.append("verification_status = 'pending'")
+            updates.append("verification_notes = NULL")
+            updates.append("similarity_score = NULL")
+            updates.append("matched_location = NULL")
+
+        values.append(citation_id)
+
+        query = f"""
+            UPDATE citations
+            SET {', '.join(updates)}
+            WHERE id = ${idx}
+        """
+
+        await self.db.execute(query, *values)
+        logger.debug(f"Edited citation {citation_id}")
+
+    def edit_sync(self, citation_id: int, **kwargs) -> None:
+        """Synchronous wrapper for edit()."""
+        return PostgresDB._run_async(self.edit(citation_id, **kwargs))
 
 
 __all__ = ['PostgresDB']
