@@ -1,4 +1,5 @@
-import { Injectable, signal } from '@angular/core';
+import { Injectable, signal, PLATFORM_ID, inject } from '@angular/core';
+import { isPlatformBrowser } from '@angular/common';
 import Dexie, { Table } from 'dexie';
 import { AuditEntry } from '../models/audit.model';
 import { ChatEntry } from '../models/chat.model';
@@ -49,7 +50,9 @@ class CockpitDatabase extends Dexie {
  */
 @Injectable({ providedIn: 'root' })
 export class IndexedDbService {
-  private db: CockpitDatabase;
+  private db: CockpitDatabase | null = null;
+  private readonly platformId = inject(PLATFORM_ID);
+  private readonly isBrowser: boolean;
 
   /** Whether the database is ready for operations */
   readonly isReady = signal(false);
@@ -58,11 +61,16 @@ export class IndexedDbService {
   readonly error = signal<string | null>(null);
 
   constructor() {
-    this.db = new CockpitDatabase();
-    this.init();
+    this.isBrowser = isPlatformBrowser(this.platformId);
+    if (this.isBrowser) {
+      this.db = new CockpitDatabase();
+      this.init();
+    }
+    // On server, db stays null and isReady stays false - that's fine for SSR
   }
 
   private async init(): Promise<void> {
+    if (!this.db) return;
     try {
       await this.db.open();
       this.isReady.set(true);
@@ -79,6 +87,7 @@ export class IndexedDbService {
    * Get cache metadata for a job.
    */
   async getJobMetadata(jobId: string): Promise<JobCacheMetadata | undefined> {
+    if (!this.db) return undefined;
     return this.db.jobMetadata.get(jobId);
   }
 
@@ -86,6 +95,7 @@ export class IndexedDbService {
    * Set or update cache metadata for a job.
    */
   async setJobMetadata(metadata: JobCacheMetadata): Promise<void> {
+    if (!this.db) return;
     await this.db.jobMetadata.put(metadata);
   }
 
@@ -93,6 +103,7 @@ export class IndexedDbService {
    * Check if a job has cached data.
    */
   async hasJob(jobId: string): Promise<boolean> {
+    if (!this.db) return false;
     const metadata = await this.db.jobMetadata.get(jobId);
     return metadata !== undefined;
   }
@@ -112,6 +123,7 @@ export class IndexedDbService {
     entries: AuditEntry[],
     startIndex: number = 0,
   ): Promise<void> {
+    if (!this.db) return;
     const cached: CachedAuditEntry[] = entries.map((entry, i) => ({
       id: `${jobId}_${startIndex + i}`,
       jobId,
@@ -135,6 +147,7 @@ export class IndexedDbService {
     startIndex: number,
     endIndex: number,
   ): Promise<AuditEntry[]> {
+    if (!this.db) return [];
     const entries = await this.db.auditEntries
       .where('[jobId+index]')
       .between([jobId, startIndex], [jobId, endIndex], true, true)
@@ -152,6 +165,7 @@ export class IndexedDbService {
     startIndex: number,
     endIndex: number,
   ): Promise<AuditEntry[]> {
+    if (!this.db) return [];
     // Use compound index for efficient filtering
     const entries = await this.db.auditEntries
       .where('[jobId+stepType+index]')
@@ -165,6 +179,7 @@ export class IndexedDbService {
    * Get the count of cached audit entries for a job.
    */
   async getAuditEntryCount(jobId: string): Promise<number> {
+    if (!this.db) return 0;
     return this.db.auditEntries.where('jobId').equals(jobId).count();
   }
 
@@ -172,7 +187,7 @@ export class IndexedDbService {
     jobId: string,
     newEntries: CachedAuditEntry[],
   ): Promise<void> {
-    if (newEntries.length === 0) return;
+    if (!this.db || newEntries.length === 0) return;
 
     const existing = await this.db.jobMetadata.get(jobId);
     const count = await this.getAuditEntryCount(jobId);
@@ -201,6 +216,7 @@ export class IndexedDbService {
    * Cache chat entries for a job.
    */
   async cacheChatEntries(jobId: string, entries: ChatEntry[]): Promise<void> {
+    if (!this.db) return;
     const cached: CachedChatEntry[] = entries.map((entry) => ({
       id: `${jobId}_${entry.sequence_number}`,
       jobId,
@@ -223,6 +239,7 @@ export class IndexedDbService {
     startSeq: number,
     endSeq: number,
   ): Promise<ChatEntry[]> {
+    if (!this.db) return [];
     const entries = await this.db.chatEntries
       .where('[jobId+sequenceNumber]')
       .between([jobId, startSeq], [jobId, endSeq], true, true)
@@ -235,6 +252,7 @@ export class IndexedDbService {
    * Get the count of cached chat entries for a job.
    */
   async getChatEntryCount(jobId: string): Promise<number> {
+    if (!this.db) return 0;
     return this.db.chatEntries.where('jobId').equals(jobId).count();
   }
 
@@ -242,7 +260,7 @@ export class IndexedDbService {
     jobId: string,
     newEntries: CachedChatEntry[],
   ): Promise<void> {
-    if (newEntries.length === 0) return;
+    if (!this.db || newEntries.length === 0) return;
 
     const existing = await this.db.jobMetadata.get(jobId);
     const count = await this.getChatEntryCount(jobId);
@@ -271,6 +289,7 @@ export class IndexedDbService {
    * Cache graph deltas for a job.
    */
   async cacheGraphDeltas(jobId: string, deltas: GraphDelta[]): Promise<void> {
+    if (!this.db) return;
     const cached: CachedGraphDelta[] = deltas.map((delta) => ({
       id: `${jobId}_${delta.toolCallIndex}`,
       jobId,
@@ -293,6 +312,7 @@ export class IndexedDbService {
     startIndex: number,
     endIndex: number,
   ): Promise<GraphDelta[]> {
+    if (!this.db) return [];
     const entries = await this.db.graphDeltas
       .where('[jobId+index]')
       .between([jobId, startIndex], [jobId, endIndex], true, true)
@@ -305,6 +325,7 @@ export class IndexedDbService {
    * Get the count of cached graph deltas for a job.
    */
   async getGraphDeltaCount(jobId: string): Promise<number> {
+    if (!this.db) return 0;
     return this.db.graphDeltas.where('jobId').equals(jobId).count();
   }
 
@@ -312,7 +333,7 @@ export class IndexedDbService {
     jobId: string,
     newEntries: CachedGraphDelta[],
   ): Promise<void> {
-    if (newEntries.length === 0) return;
+    if (!this.db || newEntries.length === 0) return;
 
     const existing = await this.db.jobMetadata.get(jobId);
     const count = await this.getGraphDeltaCount(jobId);
@@ -341,6 +362,7 @@ export class IndexedDbService {
    * Clear all cached data for a specific job.
    */
   async clearJob(jobId: string): Promise<void> {
+    if (!this.db) return;
     await Promise.all([
       this.db.auditEntries.where('jobId').equals(jobId).delete(),
       this.db.chatEntries.where('jobId').equals(jobId).delete(),
@@ -353,6 +375,7 @@ export class IndexedDbService {
    * Clear all cached data.
    */
   async clearAll(): Promise<void> {
+    if (!this.db) return;
     await Promise.all([
       this.db.auditEntries.clear(),
       this.db.chatEntries.clear(),
@@ -366,6 +389,7 @@ export class IndexedDbService {
    * Returns usage and quota in bytes.
    */
   async getStorageEstimate(): Promise<{ usage: number; quota: number }> {
+    if (!this.isBrowser) return { usage: 0, quota: 0 };
     if (navigator.storage && navigator.storage.estimate) {
       const estimate = await navigator.storage.estimate();
       return {

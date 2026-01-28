@@ -7,8 +7,8 @@ import { DataService } from '../../core/services/data.service';
  * Timeline scrubber component for playback control.
  * Fixed 60px height bar at the top of the app.
  *
- * Now uses index-based navigation via DataService instead of
- * timestamp-based navigation via TimeService.
+ * Uses index-based navigation via DataService for instant seeking
+ * without backend round-trips.
  */
 @Component({
   selector: 'app-timeline',
