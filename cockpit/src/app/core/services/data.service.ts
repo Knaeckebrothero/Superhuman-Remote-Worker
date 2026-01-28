@@ -97,6 +97,11 @@ export class DataService {
   readonly isCached = signal<boolean>(false);
   readonly cacheMetadata = signal<JobCacheMetadata | null>(null);
 
+  // ===== Auto-Refresh State =====
+  private readonly AUTO_REFRESH_INTERVAL = 15000; // 15 seconds
+  private autoRefreshTimer: ReturnType<typeof setInterval> | null = null;
+  readonly autoRefreshEnabled = signal<boolean>(false);
+
   /**
    * Setup reactive effects. Called from constructor in production mode.
    * Wrapped in runInInjectionContext to ensure effects work properly.
@@ -392,6 +397,81 @@ export class DataService {
     this.isCached.set(false);
     this.cacheMetadata.set(null);
     this.error.set(null);
+    this.stopAutoRefresh();
+  }
+
+  // ===== Auto-Refresh Methods =====
+
+  /**
+   * Start auto-refresh polling.
+   * Refreshes job list and current job data every 15 seconds.
+   */
+  startAutoRefresh(): void {
+    if (this.autoRefreshTimer) {
+      return; // Already running
+    }
+
+    this.autoRefreshEnabled.set(true);
+    this.autoRefreshTimer = setInterval(async () => {
+      await this.autoRefreshTick();
+    }, this.AUTO_REFRESH_INTERVAL);
+  }
+
+  /**
+   * Stop auto-refresh polling.
+   */
+  stopAutoRefresh(): void {
+    if (this.autoRefreshTimer) {
+      clearInterval(this.autoRefreshTimer);
+      this.autoRefreshTimer = null;
+    }
+    this.autoRefreshEnabled.set(false);
+  }
+
+  /**
+   * Toggle auto-refresh on/off.
+   */
+  toggleAutoRefresh(): void {
+    if (this.autoRefreshEnabled()) {
+      this.stopAutoRefresh();
+    } else {
+      this.startAutoRefresh();
+    }
+  }
+
+  /**
+   * Single auto-refresh tick - refreshes jobs and current job if loaded.
+   */
+  private async autoRefreshTick(): Promise<void> {
+    // Skip if already loading
+    if (this.isLoading()) {
+      return;
+    }
+
+    try {
+      // Refresh job list
+      const jobs = await firstValueFrom(this.api.getJobs());
+      this.jobs.set(jobs);
+
+      // If a job is selected, check for new data
+      const jobId = this._currentJobId();
+      if (jobId) {
+        const versionInfo = await firstValueFrom(this.api.getJobVersion(jobId));
+        const currentMax = this._maxIndex() + 1;
+
+        // Only refresh if there's new data
+        if (versionInfo && versionInfo.auditEntryCount > currentMax) {
+          // Clear cache and reload to get new entries
+          await this.db.clearJob(jobId);
+          this.isCached.set(false);
+          this._currentJobId.set(null);
+          await this.loadJob(jobId);
+        }
+      }
+    } catch (err) {
+      // Silently ignore errors during auto-refresh to avoid disrupting the UI
+      console.warn('Auto-refresh error:', err);
+    }
   }
 
   // ===== Private Methods =====
