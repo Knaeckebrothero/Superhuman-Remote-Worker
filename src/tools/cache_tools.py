@@ -54,10 +54,10 @@ CACHE_TOOLS_METADATA = {
     "edit_requirement": {
         "module": "cache_tools",
         "function": "edit_requirement",
-        "description": "Edit content fields of an existing pending requirement",
+        "description": "Edit requirement fields. Content fields (text, name, etc.) only editable when pending. Status fields (status, neo4j_id) for validator integration.",
         "category": "domain",
         "defer_to_workspace": True,
-        "short_description": "Edit fields of a pending requirement (text, name, type, etc.).",
+        "short_description": "Edit requirement content or update validation status.",
         "phases": ["tactical"],
     },
 }
@@ -305,6 +305,7 @@ Validation:
     @tool
     async def edit_requirement(
         requirement_id: str,
+        # Content fields (pending-only)
         text: Optional[str] = None,
         name: Optional[str] = None,
         req_type: Optional[str] = None,
@@ -317,15 +318,25 @@ Validation:
         reasoning: Optional[str] = None,
         research_notes: Optional[str] = None,
         tags: Optional[str] = None,
+        # Status fields (validator integration)
+        status: Optional[str] = None,
+        neo4j_id: Optional[str] = None,
+        rejection_reason: Optional[str] = None,
+        validation_result: Optional[str] = None,
     ) -> str:
-        """Edit content fields of an existing pending requirement.
+        """Edit requirement fields. Supports two modes:
 
-        Only requirements with status='pending' can be edited. Protected fields
-        (id, job_id, status, neo4j_id, validation_result, etc.) cannot be changed.
-        Provide only the fields you want to update.
+        1. Content editing (pending requirements only):
+           Edit text, name, type, priority, etc. Only works when status='pending'.
+
+        2. Status updates (validator integration):
+           Update status, neo4j_id, rejection_reason, validation_result.
+           Works regardless of current status.
 
         Args:
             requirement_id: UUID of the requirement to edit
+
+            Content fields (pending-only):
             text: Full requirement text
             name: Short name/title (max 500 chars)
             req_type: Type (functional, compliance, constraint, non_functional)
@@ -339,6 +350,12 @@ Validation:
             research_notes: Research notes
             tags: Comma-separated tags (replaces existing)
 
+            Status fields (validator integration):
+            status: New status (validating, integrated, rejected, failed)
+            neo4j_id: Neo4j ID after integration (e.g., "R-0042")
+            rejection_reason: Reason if status=rejected
+            validation_result: JSON string with validation details
+
         Returns:
             "ok: edited {uuid}" on success, "error: {reason}" on failure
         """
@@ -346,42 +363,82 @@ Validation:
             if not context.db:
                 return "error: no database connection"
 
-            # Build kwargs for edit_content, only including non-None values
-            kwargs = {}
-            if text is not None:
-                kwargs["text"] = text
-            if name is not None:
-                kwargs["name"] = name
-            if req_type is not None:
-                kwargs["req_type"] = req_type
-            if priority is not None:
-                kwargs["priority"] = priority
-            if gobd_relevant is not None:
-                kwargs["gobd_relevant"] = gobd_relevant
-            if gdpr_relevant is not None:
-                kwargs["gdpr_relevant"] = gdpr_relevant
-            if source_document is not None:
-                kwargs["source_document"] = source_document
-            if source_location is not None:
-                kwargs["source_location"] = {"section": source_location}
-            if citations is not None:
-                kwargs["citations"] = [c.strip() for c in citations.split(",") if c.strip()]
-            if reasoning is not None:
-                kwargs["reasoning"] = reasoning
-            if research_notes is not None:
-                kwargs["research_notes"] = research_notes
-            if tags is not None:
-                kwargs["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+            # Determine if this is a status update or content edit
+            status_fields = {status, neo4j_id, rejection_reason, validation_result}
+            is_status_update = any(f is not None for f in status_fields)
 
-            if not kwargs:
-                return "error: no fields provided to edit"
+            if is_status_update:
+                # Validate status value
+                valid_statuses = {"pending", "validating", "integrated", "rejected", "failed"}
+                if status and status not in valid_statuses:
+                    return f"error: invalid status '{status}'. Valid: {valid_statuses}"
 
-            await context.db.requirements.edit_content(
-                requirement_uuid=uuid.UUID(requirement_id),
-                **kwargs
-            )
+                # If setting status to "integrated", neo4j_id is required
+                if status == "integrated" and not neo4j_id:
+                    return "error: neo4j_id required when status is 'integrated'"
 
-            return f"ok: edited {requirement_id}"
+                # If setting status to "rejected", rejection_reason should be provided
+                if status == "rejected" and not rejection_reason:
+                    return "error: rejection_reason required when status is 'rejected'"
+
+                # Parse validation_result JSON if provided
+                parsed_validation_result = None
+                if validation_result:
+                    try:
+                        parsed_validation_result = json.loads(validation_result)
+                    except json.JSONDecodeError:
+                        return "error: validation_result must be valid JSON"
+
+                # Use db.requirements.update() for status changes
+                await context.db.requirements.update(
+                    requirement_uuid=uuid.UUID(requirement_id),
+                    status=status,
+                    neo4j_id=neo4j_id,
+                    rejection_reason=rejection_reason,
+                    validation_result=parsed_validation_result,
+                    validated_at=(status in {"integrated", "rejected", "failed"}),
+                )
+
+                return f"ok: updated status for {requirement_id}"
+
+            else:
+                # Content edit - build kwargs for edit_content
+                kwargs = {}
+                if text is not None:
+                    kwargs["text"] = text
+                if name is not None:
+                    kwargs["name"] = name
+                if req_type is not None:
+                    kwargs["req_type"] = req_type
+                if priority is not None:
+                    kwargs["priority"] = priority
+                if gobd_relevant is not None:
+                    kwargs["gobd_relevant"] = gobd_relevant
+                if gdpr_relevant is not None:
+                    kwargs["gdpr_relevant"] = gdpr_relevant
+                if source_document is not None:
+                    kwargs["source_document"] = source_document
+                if source_location is not None:
+                    kwargs["source_location"] = {"section": source_location}
+                if citations is not None:
+                    kwargs["citations"] = [c.strip() for c in citations.split(",") if c.strip()]
+                if reasoning is not None:
+                    kwargs["reasoning"] = reasoning
+                if research_notes is not None:
+                    kwargs["research_notes"] = research_notes
+                if tags is not None:
+                    kwargs["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+
+                if not kwargs:
+                    return "error: no fields provided to edit"
+
+                # Use db.requirements.edit_content() for content (pending-only)
+                await context.db.requirements.edit_content(
+                    requirement_uuid=uuid.UUID(requirement_id),
+                    **kwargs
+                )
+
+                return f"ok: edited {requirement_id}"
 
         except ValueError as e:
             return f"error: {str(e)}"

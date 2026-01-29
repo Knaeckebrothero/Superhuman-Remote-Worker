@@ -19,7 +19,18 @@
     "domain": [
       "execute_cypher_query",
       "get_database_schema",
-      "validate_schema_compliance"
+      "validate_schema_compliance",
+      "web_search",
+      "cite_document",
+      "cite_web",
+      "list_sources",
+      "get_citation",
+      "list_citations",
+      "list_requirements",
+      "get_requirement",
+      "add_requirement",
+      "edit_requirement",
+      "edit_citation"
     ]
   },
 
