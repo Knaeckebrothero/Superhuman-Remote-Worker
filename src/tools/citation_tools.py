@@ -346,10 +346,11 @@ Similarity Score: {similarity}
 
     @tool
     def list_sources() -> str:
-        """List all registered citation sources.
+        """List citation sources registered by this job.
 
-        Shows all document, web, database, and custom sources that have been
-        registered for citations in this session.
+        Shows document, web, database, and custom sources that have been
+        registered for citations in the current job. Sources from other jobs
+        are not visible.
 
         Returns:
             Formatted list of sources with IDs and types
@@ -361,6 +362,7 @@ Similarity Score: {similarity}
                 return "CitationEngine not installed. No sources available."
 
             engine = context.get_citation_engine()
+            # list_sources() now filters by job_id from context automatically
             sources = engine.list_sources()
 
             if not sources:
@@ -378,16 +380,18 @@ Similarity Score: {similarity}
 
     @tool
     def get_citation(citation_id: int) -> str:
-        """Get details about a specific citation.
+        """Get details about a specific citation from this job.
 
         Retrieves the full citation record including claim, source, verification
-        status, and similarity score.
+        status, and similarity score. Only citations belonging to the current job
+        are accessible.
 
         Args:
             citation_id: The numeric citation ID (without brackets)
 
         Returns:
-            Detailed citation information
+            Detailed citation information, or not found if citation doesn't exist
+            or belongs to another job
         """
         try:
             try:
@@ -396,6 +400,7 @@ Similarity Score: {similarity}
                 return "CitationEngine not installed."
 
             engine = context.get_citation_engine()
+            # get_citation() now filters by job_id from context automatically
             citation = engine.get_citation(citation_id)
 
             if not citation:
@@ -424,17 +429,18 @@ Created: {citation.created_at}
 
     @tool
     def list_citations(source_id: Optional[int] = None, status: Optional[str] = None) -> str:
-        """List all citations created in this session.
+        """List citations created by this job.
 
         Shows citation IDs, claims (truncated), verification status, and source.
-        Optionally filter by source ID or verification status.
+        Optionally filter by source ID or verification status. Citations from
+        other jobs are not visible.
 
         Args:
             source_id: Filter by source ID (optional)
             status: Filter by verification status: pending, verified, failed (optional)
 
         Returns:
-            Formatted list of citations
+            Formatted list of citations for the current job
         """
         try:
             try:
@@ -443,19 +449,17 @@ Created: {citation.created_at}
                 return "CitationEngine not installed. No citations available."
 
             engine = context.get_citation_engine()
-            citations = engine.list_citations()
+            # list_citations() now filters by job_id from context automatically
+            # Pass filters directly to engine for efficiency
+            citations = engine.list_citations(
+                source_id=source_id,
+                verification_status=status,
+            )
 
             if not citations:
+                if source_id is not None or status is not None:
+                    return "No citations match the given filters."
                 return "No citations created yet. Use cite_document or cite_web to create citations."
-
-            # Apply filters
-            if source_id is not None:
-                citations = [c for c in citations if c.source_id == source_id]
-            if status is not None:
-                citations = [c for c in citations if c.verification_status.value == status]
-
-            if not citations:
-                return "No citations match the given filters."
 
             lines = [f"Citations ({len(citations)} total):", ""]
             for c in citations:
@@ -483,12 +487,14 @@ Created: {citation.created_at}
         extraction_method: Optional[str] = None,
         locator: Optional[str] = None,
     ) -> str:
-        """Edit fields of an existing citation.
+        """Edit fields of an existing citation belonging to this job.
 
         When content fields (claim, verbatim_quote, quote_context) are changed,
         verification_status is automatically reset to 'pending' and previous
         verification results are cleared, since the old verification is no
         longer valid.
+
+        Only citations belonging to the current job can be edited.
 
         Args:
             citation_id: The numeric citation ID (without brackets)
@@ -506,6 +512,17 @@ Created: {citation.created_at}
         try:
             if not context.db:
                 return "error: no database connection"
+
+            # Verify citation belongs to current job before editing
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+                engine = context.get_citation_engine()
+                # get_citation filters by job_id from context
+                citation = engine.get_citation(citation_id)
+                if not citation:
+                    return f"error: citation [{citation_id}] not found"
+            except ImportError:
+                pass  # If CitationEngine not available, skip ownership check
 
             # Build kwargs for edit, only including non-None values
             kwargs = {}

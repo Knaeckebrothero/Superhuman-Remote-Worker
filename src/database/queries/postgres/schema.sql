@@ -164,8 +164,10 @@ EXCEPTION
 END $$;
 
 -- Sources table: canonical documents, websites, databases, or custom artifacts
+-- Each source belongs to a specific job for isolation between agents
 CREATE TABLE IF NOT EXISTS sources (
     id SERIAL PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     type source_type NOT NULL,
     identifier TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -176,13 +178,16 @@ CREATE TABLE IF NOT EXISTS sources (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_sources_job_id ON sources(job_id);
 CREATE INDEX IF NOT EXISTS idx_sources_identifier ON sources(identifier);
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
 CREATE INDEX IF NOT EXISTS idx_sources_name ON sources(name);
 
 -- Citations table: links claims to their supporting evidence
+-- Each citation belongs to a specific job for isolation between agents
 CREATE TABLE IF NOT EXISTS citations (
     id SERIAL PRIMARY KEY,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     claim TEXT NOT NULL,
     verbatim_quote TEXT,
     quote_context TEXT NOT NULL,
@@ -200,6 +205,7 @@ CREATE TABLE IF NOT EXISTS citations (
     created_by TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_citations_job_id ON citations(job_id);
 CREATE INDEX IF NOT EXISTS idx_citations_source_id ON citations(source_id);
 CREATE INDEX IF NOT EXISTS idx_citations_created_by ON citations(created_by);
 CREATE INDEX IF NOT EXISTS idx_citations_verification_status ON citations(verification_status);
