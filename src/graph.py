@@ -78,6 +78,7 @@ from .core.phase import (
     get_transition_strategic_todos,
 )
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
+from .llm.exceptions import ContextOverflowError
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +538,95 @@ def create_execute_node(
                     "messages": [response],
                     "iteration": iteration + 1,
                     "error": None,
+                }
+
+            except ContextOverflowError as e:
+                # Layer 0 (HTTP layer) caught context overflow
+                logger.warning(
+                    f"[{job_id}] HTTP layer context overflow: "
+                    f"{e.token_count:,} tokens exceeds limit of {e.limit:,}"
+                )
+
+                # Try emergency compaction once (on first attempt only)
+                if attempt == 0:
+                    logger.info(f"[{job_id}] Attempting emergency compaction after HTTP overflow")
+
+                    # Force aggressive compaction
+                    messages = await context_mgr.ensure_within_limits(
+                        messages,
+                        summarization_llm,
+                        summarization_prompt,
+                        oss_reasoning_level=oss_reasoning_level,
+                        max_summary_length=config.context_management.max_summary_length,
+                        force=True,
+                    )
+
+                    # Separate RemoveMessage markers
+                    emergency_remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
+                    messages = [m for m in messages if not isinstance(m, RemoveMessage)]
+
+                    # Rebuild prepared_messages with compacted history
+                    system_msg = prepared_messages[0] if prepared_messages and isinstance(prepared_messages[0], SystemMessage) else None
+                    prepared_messages = []
+                    if system_msg:
+                        prepared_messages.append(system_msg)
+
+                    for msg in messages:
+                        if isinstance(msg, SystemMessage):
+                            if "[Summary of prior work]" in msg.content:
+                                prepared_messages.append(msg)
+                        else:
+                            prepared_messages.append(msg)
+
+                    # Merge remove markers
+                    if emergency_remove_markers:
+                        remove_markers = emergency_remove_markers + remove_markers
+                        context_was_compacted = True
+
+                    logger.info(
+                        f"[{job_id}] Emergency compaction complete, "
+                        f"retrying with {len(prepared_messages)} messages"
+                    )
+                    attempt += 1
+                    continue
+
+                # Compaction didn't help - this is unrecoverable
+                logger.error(
+                    f"[{job_id}] Context overflow persists after compaction: "
+                    f"{e.token_count:,} tokens (limit: {e.limit:,})"
+                )
+
+                # Audit error
+                if auditor:
+                    auditor.audit_step(
+                        job_id=job_id,
+                        agent_type=config.agent_id,
+                        step_type="error",
+                        node_name="execute",
+                        iteration=iteration,
+                        data={
+                            "error": {
+                                "type": "context_overflow",
+                                "message": str(e),
+                                "token_count": e.token_count,
+                                "limit": e.limit,
+                                "recoverable": False,
+                            }
+                        },
+                        metadata=state.get("metadata"),
+                        phase=phase_str,
+                        phase_number=phase_number,
+                    )
+
+                return {
+                    "error": {
+                        "message": str(e),
+                        "type": "context_overflow",
+                        "recoverable": False,
+                        "token_count": e.token_count,
+                        "limit": e.limit,
+                    },
+                    "iteration": iteration + 1,
                 }
 
             except Exception as e:

@@ -501,11 +501,16 @@ def load_agent_config(
     )
 
 
-def create_llm(config: LLMConfig) -> BaseChatModel:
+def create_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
     """Create an LLM instance from configuration.
 
     Args:
         config: LLM configuration
+        limits: Optional limits configuration for context token limit.
+                When provided, enables HTTP-layer context overflow protection.
 
     Returns:
         Configured ChatOpenAI instance
@@ -548,11 +553,17 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
 
+    # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
+    max_context_tokens = limits.model_max_context_tokens if limits else None
+    if max_context_tokens:
+        llm_kwargs["max_context_tokens"] = max_context_tokens
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
         f"Created LLM: model={config.model}, temp={config.temperature}, "
-        f"base_url={base_url or 'default'}, timeout={config.timeout}s, max_retries={config.max_retries}"
+        f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
+        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}"
     )
 
     return llm
