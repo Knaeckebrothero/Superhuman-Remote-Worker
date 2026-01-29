@@ -653,8 +653,14 @@ class ContextManager:
         Returns:
             List of formatted text parts
         """
+        from src.core.workspace_injection import is_workspace_injection_message
+
         formatted_parts = []
         for msg in messages:
+            # Skip workspace injection messages - they're re-injected fresh after summarization
+            if is_workspace_injection_message(msg):
+                continue
+
             if isinstance(msg, SystemMessage):
                 # Include prior summaries in the new summarization so context is preserved
                 # Skip other system messages (like the main system prompt)
@@ -952,6 +958,12 @@ Conversation:
         Returns:
             Compacted message list with summary prepended
         """
+        from src.core.workspace_injection import is_workspace_injection_message
+
+        # Filter out workspace injection messages BEFORE processing
+        # They are transient and will be re-injected fresh after summarization
+        messages = [m for m in messages if not is_workspace_injection_message(m)]
+
         # Separate system messages into:
         # 1. Regular system messages (keep in output)
         # 2. Old summary messages (incorporate into new summary, then discard)

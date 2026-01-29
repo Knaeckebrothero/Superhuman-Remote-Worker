@@ -644,7 +644,6 @@ def get_phase_system_prompt(
     is_strategic: bool,
     phase_number: int = 0,
     todos_content: str = "",
-    workspace_content: str = "",
     config_dir: Optional[str] = None,
 ) -> str:
     """Get the complete system prompt for the current phase.
@@ -655,14 +654,16 @@ def get_phase_system_prompt(
     2. Load phase component (strategic.txt or tactical.txt)
     3. Render phase component's {phase_number} placeholder
     4. Inject rendered component into base template's {prompt_content}
-    5. Render remaining placeholders ({todos_content}, {workspace_content}, etc.)
+    5. Render remaining placeholders ({todos_content}, etc.)
+
+    Note: workspace.md content is now injected as a synthetic tool call result
+    in graph.py, not included in the system prompt.
 
     Args:
         config: Agent configuration
         is_strategic: True for strategic phase, False for tactical
         phase_number: Current phase number
         todos_content: Formatted todo list string
-        workspace_content: Contents of workspace.md
         config_dir: Base directory for config files (deprecated, uses deployment_dir)
 
     Returns:
@@ -675,7 +676,6 @@ def get_phase_system_prompt(
             is_strategic=True,
             phase_number=1,
             todos_content="- Explore workspace\\n- Create plan",
-            workspace_content="## Overview\\n...",
         )
         ```
     """
@@ -698,7 +698,6 @@ def get_phase_system_prompt(
         agent_display_name=config.display_name,
         prompt_content=rendered_component,
         todos_content=todos_content,
-        workspace_content=workspace_content,
     )
 
 

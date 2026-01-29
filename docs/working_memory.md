@@ -463,3 +463,49 @@ Given the comparison with CLAUDE.md and GEMINI.md, the recommended approach is a
 4. **Consider `save_memory` tool** (Option 6) to let agent store learnings separately from status
 
 This respects the core insight: **static project knowledge should be separate from dynamic working state**
+
+---
+
+## Implemented: Workspace Injection via Fake Tool Calls
+
+**Status:** Implemented (2026-01-29)
+
+To avoid the issue where agents redundantly call `read_file("workspace.md")` when it's already in the system prompt, we implemented a "fake tool call" approach.
+
+### How It Works
+
+Instead of including workspace.md content directly in the system prompt, we inject it as a synthetic AIMessage + ToolMessage pair at the start of each conversation turn:
+
+```
+1. SystemMessage (system prompt without workspace)
+2. [Summary of prior work] SystemMessage (if exists)
+3. AIMessage with tool_calls=[{name: "read_file", args: {path: "workspace.md"}, id: "workspace_init_xxx"}]
+4. ToolMessage with workspace.md content (tool_call_id: "workspace_init_xxx")
+5. HumanMessage (user's initial task)
+6. ... rest of conversation ...
+```
+
+### Benefits
+
+1. **No duplication** - Agent sees workspace.md content once as a tool result
+2. **No redundant read_file calls** - Agent thinks it already read the file
+3. **Cleaner system prompt** - Removes ~10KB+ from system prompt
+4. **Not included in summarization** - Workspace is re-injected fresh after each summarization
+
+### Implementation Details
+
+| File | Purpose |
+|------|---------|
+| `src/core/workspace_injection.py` | Helper functions for creating/identifying synthetic messages |
+| `src/config/prompts/systemprompt.txt` | Removed `{workspace_content}` placeholder |
+| `src/core/loader.py` | Removed `workspace_content` parameter from `get_phase_system_prompt()` |
+| `src/graph.py` | Injects workspace as fake tool call in `execute()` node |
+| `src/core/context.py` | Excludes workspace messages from summarization |
+
+### Key Design Decisions
+
+1. **Transient injection** - Workspace messages are added to `prepared_messages` only, not stored in state's `messages`. This means they're re-injected fresh each turn and not persisted in checkpoints.
+
+2. **Identifiable via prefix** - Tool call IDs use `workspace_init_` prefix for easy identification during summarization exclusion.
+
+3. **No special resume handling** - Since injection happens in `execute()` each time, resume naturally gets fresh workspace content
