@@ -51,6 +51,19 @@
         "base_url": {
           "type": ["string", "null"],
           "description": "Custom API base URL (null for default)"
+        },
+        "timeout": {
+          "type": ["number", "null"],
+          "minimum": 1,
+          "default": 600,
+          "description": "Request timeout in seconds (null for no timeout, default 600s = 10 minutes)"
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 3,
+          "description": "Number of retries for failed LLM requests with exponential backoff"
         }
       }
     },
