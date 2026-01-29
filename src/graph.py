@@ -400,6 +400,64 @@ def create_execute_node(
                     reminder = "All todos are complete. Continue with the current task."
                 prepared_messages.append(HumanMessage(content=reminder))
 
+        # LAYER 1 SAFETY CHECK: Ensure we don't exceed model context limit
+        # This catches bad configs and edge cases that slip through normal compaction
+        total_tokens = context_mgr.get_token_count(prepared_messages)
+        model_max = config.limits.model_max_context_tokens
+
+        if total_tokens > model_max:
+            logger.warning(
+                f"[{job_id}] Pre-request safety triggered: {total_tokens} tokens exceeds "
+                f"{model_max} limit. Forcing summarization."
+            )
+
+            # Force summarization on conversation messages (not system prompt)
+            messages = await context_mgr.ensure_within_limits(
+                messages,
+                summarization_llm,
+                summarization_prompt,
+                oss_reasoning_level=oss_reasoning_level,
+                max_summary_length=config.context_management.max_summary_length,
+                force=True,
+            )
+
+            # Separate RemoveMessage markers from actual messages
+            safety_remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
+            messages = [m for m in messages if not isinstance(m, RemoveMessage)]
+
+            # Rebuild prepared_messages with compacted history
+            # Keep system prompt, replace conversation history
+            system_msg = prepared_messages[0] if prepared_messages else None
+            prepared_messages = []
+            if system_msg and isinstance(system_msg, SystemMessage):
+                prepared_messages.append(system_msg)
+
+            # Add compacted conversation (including summary SystemMessages)
+            for msg in messages:
+                if isinstance(msg, SystemMessage):
+                    if "[Summary of prior work]" in msg.content:
+                        prepared_messages.append(msg)
+                else:
+                    prepared_messages.append(msg)
+
+            # Merge remove markers if compaction occurred
+            if safety_remove_markers:
+                remove_markers = safety_remove_markers + remove_markers
+                context_was_compacted = True
+
+            # Re-check - if still over limit, something is very wrong
+            total_tokens = context_mgr.get_token_count(prepared_messages)
+            if total_tokens > model_max:
+                raise RuntimeError(
+                    f"[{job_id}] Context still at {total_tokens} tokens after forced summarization. "
+                    f"Model limit is {model_max}. System prompt may be too large "
+                    f"({context_mgr.get_token_count([prepared_messages[0]]) if prepared_messages else 0} tokens)."
+                )
+
+            logger.info(
+                f"[{job_id}] Safety compaction complete: now at {total_tokens} tokens"
+            )
+
         # Audit LLM call (will be updated with response via update_llm_response)
         auditor = get_archiver()
         llm_audit_id = None
@@ -1234,6 +1292,10 @@ def build_phase_alternation_graph(
         message_count_min_tokens=config.limits.message_count_min_tokens,
         keep_recent_messages=config.context_management.keep_recent_messages,
         keep_recent_tool_results=config.context_management.keep_recent_tool_results,
+        # Safety layer constants
+        model_max_context_tokens=config.limits.model_max_context_tokens,
+        summarization_safe_limit=config.limits.summarization_safe_limit,
+        summarization_chunk_size=config.limits.summarization_chunk_size,
     )
     context_mgr = ContextManager(config=context_config, model=config.llm.model)
 

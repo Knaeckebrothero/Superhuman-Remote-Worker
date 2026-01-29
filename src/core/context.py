@@ -201,6 +201,9 @@ class ContextConfig:
         placeholder_text: Text to use when replacing cleared tool results
         tool_retry_count: Number of retries for failed tool calls
         tool_retry_delay_seconds: Delay between retries
+        model_max_context_tokens: Hard limit for model context window
+        summarization_safe_limit: Max input tokens for summarization LLM
+        summarization_chunk_size: Chunk size for recursive summarization
     """
     compaction_threshold_tokens: int = 100_000
     summarization_threshold_tokens: int = 100_000
@@ -212,6 +215,10 @@ class ContextConfig:
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
+    # Safety layer constants
+    model_max_context_tokens: int = 128_000
+    summarization_safe_limit: int = 100_000
+    summarization_chunk_size: int = 80_000
 
 
 def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> int:
@@ -637,26 +644,15 @@ class ContextManager:
             )
         return messages
 
-    async def summarize_conversation(
-        self,
-        messages: List[BaseMessage],
-        llm: BaseChatModel,
-        summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
-        max_summary_length: int = 10000,
-    ) -> str:
-        """Generate a summary of the conversation.
+    def _format_messages_for_summary(self, messages: List[BaseMessage]) -> List[str]:
+        """Format messages into text parts for summarization.
 
         Args:
-            messages: Messages to summarize
-            llm: LLM to use for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
+            messages: Messages to format
 
         Returns:
-            Summary string
+            List of formatted text parts
         """
-        # Format messages for summarization
         formatted_parts = []
         for msg in messages:
             if isinstance(msg, SystemMessage):
@@ -678,9 +674,61 @@ class ContextManager:
                 # Just note that a tool was called, don't include full result
                 formatted_parts.append(f"[Tool result: {len(msg.content)} chars]")
 
-        # Include all formatted parts for complete context
-        conversation_text = "\n".join(formatted_parts)
+        return formatted_parts
 
+    def _split_into_chunks(
+        self,
+        parts: List[str],
+        target_tokens: int,
+    ) -> List[List[str]]:
+        """Split formatted parts into chunks of approximately target_tokens.
+
+        Args:
+            parts: List of formatted message strings
+            target_tokens: Target token count per chunk
+
+        Returns:
+            List of chunks, each chunk being a list of parts
+        """
+        chunks: List[List[str]] = []
+        current_chunk: List[str] = []
+        current_tokens = 0
+
+        for part in parts:
+            # Approximate token count: ~4 chars per token
+            part_tokens = len(part) // 4
+            if current_tokens + part_tokens > target_tokens and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_tokens = 0
+            current_chunk.append(part)
+            current_tokens += part_tokens
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        return chunks
+
+    async def _single_pass_summarize(
+        self,
+        conversation_text: str,
+        llm: BaseChatModel,
+        summarization_prompt: Optional[str],
+        oss_reasoning_level: str,
+        max_summary_length: int,
+    ) -> str:
+        """Single-pass summarization of conversation text.
+
+        Args:
+            conversation_text: Formatted conversation as string
+            llm: LLM to use for summarization
+            summarization_prompt: Optional custom prompt template
+            oss_reasoning_level: Reasoning level for OSS models
+            max_summary_length: Maximum summary length
+
+        Returns:
+            Summary string
+        """
         # Build prompt from template or fallback
         if summarization_prompt:
             prompt = summarization_prompt.format(
@@ -697,7 +745,6 @@ Conversation:
         try:
             structured_llm = llm.with_structured_output(ConversationSummary)
 
-            logger.info("Starting structured summarization")
             result: ConversationSummary = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
             # Format into readable text
@@ -714,18 +761,174 @@ Conversation:
                 parts.append(f"**Blockers:**\n{result.blockers.strip()}")
             summary = "\n\n".join(parts)
 
-            logger.info(f"Generated structured summary ({len(summary)} chars)")
-            # Debug: log tail
-            tail = summary[-500:] if len(summary) > 500 else summary
-            logger.debug(f"Summary tail:\n{tail}")
-
-            self._state.total_summarizations += 1
-            self._state.summaries.append(summary)
             return summary
 
         except Exception as e:
-            logger.error(f"Structured summarization failed: {e}", exc_info=True)
+            logger.error(f"Single-pass summarization failed: {e}", exc_info=True)
             return f"[Summarization failed: {e}]"
+
+    async def _recursive_summarize(
+        self,
+        formatted_parts: List[str],
+        llm: BaseChatModel,
+        summarization_prompt: Optional[str],
+        oss_reasoning_level: str,
+        max_summary_length: int,
+        depth: int = 0,
+    ) -> str:
+        """Recursively summarize large inputs by chunking.
+
+        This method handles arbitrarily large inputs by:
+        1. Splitting formatted_parts into chunks of ~chunk_size tokens
+        2. Summarizing each chunk
+        3. If combined summaries > safe_limit, recursing
+        4. Returning the final combined summary
+
+        Args:
+            formatted_parts: List of formatted message strings
+            llm: LLM for summarization
+            summarization_prompt: Optional custom prompt template
+            oss_reasoning_level: Reasoning level for OSS models
+            max_summary_length: Maximum final summary length
+            depth: Current recursion depth (for logging)
+
+        Returns:
+            Final summarized text
+        """
+        max_depth = 5  # Safety limit to prevent infinite recursion
+        if depth >= max_depth:
+            logger.warning(
+                f"Recursive summarization hit max depth ({max_depth}). "
+                "Returning truncated content."
+            )
+            # Truncate and return what we have
+            combined = "\n".join(formatted_parts)
+            return combined[:max_summary_length * 4]  # Approximate chars for token limit
+
+        chunk_size = self.config.summarization_chunk_size
+
+        # Split into chunks
+        chunks = self._split_into_chunks(formatted_parts, chunk_size)
+        logger.info(
+            f"Recursive summarization depth {depth}: "
+            f"split into {len(chunks)} chunks (target {chunk_size} tokens each)"
+        )
+
+        # Summarize each chunk
+        chunk_summaries = []
+        for i, chunk in enumerate(chunks):
+            chunk_text = "\n".join(chunk)
+            logger.debug(f"Summarizing chunk {i+1}/{len(chunks)} ({len(chunk_text)} chars)")
+
+            # Allocate proportional max length to each chunk
+            chunk_max_length = max(1000, max_summary_length // max(len(chunks), 1))
+            summary = await self._single_pass_summarize(
+                chunk_text,
+                llm,
+                summarization_prompt,
+                oss_reasoning_level,
+                chunk_max_length,
+            )
+            chunk_summaries.append(summary)
+
+        # Combine summaries
+        combined = "\n\n---\n\n".join(chunk_summaries)
+        combined_tokens = len(combined) // 4  # Approximate
+
+        logger.debug(
+            f"Combined summaries: {combined_tokens} tokens (safe limit: {self.config.summarization_safe_limit})"
+        )
+
+        # If still too large, recurse
+        if combined_tokens > self.config.summarization_safe_limit:
+            logger.info(
+                f"Combined summaries still too large ({combined_tokens} tokens). "
+                f"Recursing to depth {depth + 1}."
+            )
+            return await self._recursive_summarize(
+                [f"Previous summary section:\n{s}" for s in chunk_summaries],
+                llm,
+                summarization_prompt,
+                oss_reasoning_level,
+                max_summary_length,
+                depth + 1,
+            )
+
+        # Final pass to unify the chunk summaries into a coherent summary
+        if len(chunks) > 1:
+            logger.info(f"Unifying {len(chunks)} chunk summaries into final summary")
+            return await self._single_pass_summarize(
+                f"Combine these section summaries into a unified summary:\n\n{combined}",
+                llm,
+                summarization_prompt,
+                oss_reasoning_level,
+                max_summary_length,
+            )
+
+        return combined
+
+    async def summarize_conversation(
+        self,
+        messages: List[BaseMessage],
+        llm: BaseChatModel,
+        summarization_prompt: Optional[str] = None,
+        oss_reasoning_level: str = "high",
+        max_summary_length: int = 10000,
+    ) -> str:
+        """Generate a summary of the conversation.
+
+        Handles arbitrarily large inputs via recursive chunked summarization.
+        If the input exceeds summarization_safe_limit, it will be split into
+        chunks, each chunk summarized, and the results combined.
+
+        Args:
+            messages: Messages to summarize
+            llm: LLM to use for summarization
+            summarization_prompt: Optional custom prompt
+            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
+            max_summary_length: Maximum length for the final summary
+
+        Returns:
+            Summary string
+        """
+        # Format messages for summarization
+        formatted_parts = self._format_messages_for_summary(messages)
+        conversation_text = "\n".join(formatted_parts)
+
+        # Check if input exceeds safe limit for summarization LLM
+        # Approximate token count: ~4 chars per token
+        input_tokens = len(conversation_text) // 4
+
+        if input_tokens > self.config.summarization_safe_limit:
+            logger.info(
+                f"Input too large for single summarization ({input_tokens} tokens > "
+                f"{self.config.summarization_safe_limit} limit). Using recursive chunked summarization."
+            )
+            summary = await self._recursive_summarize(
+                formatted_parts,
+                llm,
+                summarization_prompt,
+                oss_reasoning_level,
+                max_summary_length,
+            )
+        else:
+            logger.info(f"Starting single-pass summarization ({input_tokens} tokens)")
+            summary = await self._single_pass_summarize(
+                conversation_text,
+                llm,
+                summarization_prompt,
+                oss_reasoning_level,
+                max_summary_length,
+            )
+
+        logger.info(f"Generated summary ({len(summary)} chars)")
+        # Debug: log tail
+        tail = summary[-500:] if len(summary) > 500 else summary
+        logger.debug(f"Summary tail:\n{tail}")
+
+        self._state.total_summarizations += 1
+        self._state.summaries.append(summary)
+        return summary
 
     async def summarize_and_compact(
         self,

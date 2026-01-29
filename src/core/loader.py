@@ -285,6 +285,10 @@ class LimitsConfig:
     message_count_threshold: int = 200
     message_count_min_tokens: int = 30000
     tool_retry_count: int = 3
+    # Safety layer constants for preventing context overflow
+    model_max_context_tokens: int = 128000  # Hard limit for model context window
+    summarization_safe_limit: int = 100000  # Max input tokens for summarization LLM
+    summarization_chunk_size: int = 80000   # Chunk size for recursive summarization
 
 
 @dataclass
@@ -446,6 +450,9 @@ def load_agent_config(
         message_count_threshold=limits_data.get("message_count_threshold", 200),
         message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
+        model_max_context_tokens=limits_data.get("model_max_context_tokens", 128000),
+        summarization_safe_limit=limits_data.get("summarization_safe_limit", 100000),
+        summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
     )
 
     context_data = data.get("context_management", {})

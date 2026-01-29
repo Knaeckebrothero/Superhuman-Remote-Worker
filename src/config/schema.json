@@ -253,6 +253,24 @@
           "minimum": 0,
           "default": 3,
           "description": "Number of retries for failed tool calls"
+        },
+        "model_max_context_tokens": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 128000,
+          "description": "Hard limit for model context window. Pre-request safety check will force summarization if exceeded."
+        },
+        "summarization_safe_limit": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 100000,
+          "description": "Maximum input tokens for summarization LLM. Larger inputs trigger recursive chunked summarization."
+        },
+        "summarization_chunk_size": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 80000,
+          "description": "Target chunk size in tokens when splitting for recursive summarization."
         }
       }
     },
