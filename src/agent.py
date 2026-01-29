@@ -179,8 +179,8 @@ class UniversalAgent:
         # Set up database connections if needed
         await self._setup_connections()
 
-        # Create LLM
-        self._llm = create_llm(self.config.llm)
+        # Create LLM with context limit validation (Layer 0 safety)
+        self._llm = create_llm(self.config.llm, limits=self.config.limits)
 
         self._initialized = True
         logger.info(f"{self.config.display_name} initialized successfully")
