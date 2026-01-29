@@ -2,24 +2,30 @@
 
 This module provides two completion tools:
 - mark_complete: Signals that a task/phase is complete (used by phase transitions)
-- job_complete: Freezes the job for human review (requires approval to complete)
+- job_complete: Marks the phase as final, job completes after remaining todos are done
 
-The job_complete tool implements a human-in-the-loop checkpoint:
-1. Rejects the call if there are pending todos (agent must complete all work first)
-2. Freezes the job with status 'pending_review' instead of completing it
-3. Human operator can then approve (mark completed) or resume with feedback
+The job_complete tool implements a final phase pattern:
+1. Rejects if called from tactical phase (must be in strategic phase)
+2. Sets is_final_phase=True in state
+3. Agent completes remaining strategic todos (summarize, update workspace/plan)
+4. When all todos complete, on_strategic_phase_complete detects final phase and freezes job
 """
 
 import json
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
 from .context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+
+# Global storage for final phase data (set by job_complete, used by finalize_job)
+# This is necessary because tools can't directly modify state, but phase.py can read this
+_final_phase_data: Dict[str, Dict[str, Any]] = {}
 
 
 def create_completion_tools(context: ToolContext) -> List:
@@ -99,11 +105,12 @@ def create_completion_tools(context: ToolContext) -> List:
     ) -> str:
         """Signal that the job is complete and ready for human review.
 
-        This tool freezes the job for human review rather than completing it directly.
-        A human operator must approve the job before it is marked as truly complete.
+        This tool marks the current strategic phase as "final". The job will
+        complete after all remaining strategic todos are done (summarize,
+        update workspace.md, update plan.md).
 
-        IMPORTANT: All todos must be completed before calling this tool.
-        If there are pending todos, this tool will return an error.
+        IMPORTANT: This tool can only be called during a strategic phase.
+        If called from tactical phase, it will be rejected.
 
         Args:
             summary: Brief description of what was accomplished across all phases (2-5 sentences)
@@ -112,109 +119,112 @@ def create_completion_tools(context: ToolContext) -> List:
             notes: Optional notes about limitations, edge cases, or recommendations
 
         Returns:
-            Confirmation that job is frozen for review, or error if todos remain
+            Confirmation that phase is marked as final, or error if in tactical phase
         """
         try:
-            # Check for pending todos with special handling for strategic phase
+            # Check if we're in a strategic phase
+            is_strategic = True
             if context.has_todo():
-                pending = context.todo_manager.list_pending()
-                if pending:
-                    pending_count = len(pending)
-                    is_strategic = context.todo_manager.is_strategic_phase
+                is_strategic = context.todo_manager.is_strategic_phase
 
-                    # Special case: In strategic phase with only todo_4 pending
-                    # This is the "call job_complete OR next_phase_todos" todo
-                    # Auto-complete it since we're completing the job
-                    if is_strategic and pending_count == 1 and pending[0].id == "todo_4":
-                        context.todo_manager.complete(
-                            "todo_4",
-                            notes=["Auto-completed by job_complete: plan fully executed"]
-                        )
-                        logger.info("Auto-completed todo_4 (last strategic todo) for job completion")
-                    else:
-                        # Standard rejection
-                        pending_list = "\n".join(
-                            f"  - [{t.id}] {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
-                            for t in pending[:5]
-                        )
-                        more_msg = f"\n  ... and {pending_count - 5} more" if pending_count > 5 else ""
+            if not is_strategic:
+                logger.warning("job_complete rejected: called from tactical phase")
+                return (
+                    "ERROR: job_complete can only be called during a strategic phase.\n\n"
+                    "Complete all tactical todos first. When all tactical todos are done,\n"
+                    "you will automatically transition to a strategic phase where you can\n"
+                    "call job_complete."
+                )
 
-                        if not is_strategic:
-                            error_detail = (
-                                "job_complete can only be called during a strategic phase.\n"
-                                "Complete all tactical todos first, then wait for the strategic phase."
-                            )
-                        else:
-                            error_detail = (
-                                "Please complete all todos using `todo_complete` before calling `job_complete`.\n"
-                                "If a todo is no longer needed, you can use `todo_rewind` to reconsider it."
-                            )
+            # Check if already in final phase
+            if context.job_id in _final_phase_data:
+                logger.info(f"job_complete called again for job {context.job_id} - already marked as final")
+                return (
+                    "Phase is already marked as final. Complete your remaining todos\n"
+                    "to finish the job."
+                )
 
-                        logger.warning(f"job_complete rejected: {pending_count} pending todos remain")
-                        return (
-                            f"ERROR: Cannot complete job - {pending_count} todo(s) still pending.\n\n"
-                            f"Pending todos:\n{pending_list}{more_msg}\n\n"
-                            f"{error_detail}"
-                        )
+            # Check if there are staged todos (shouldn't call job_complete if planning more work)
+            if context.has_todo() and context.todo_manager.has_staged_todos():
+                logger.warning("job_complete rejected: staged todos exist")
+                return (
+                    "ERROR: Cannot mark job as complete - you have staged todos for the next phase.\n\n"
+                    "Either:\n"
+                    "1. Clear the staged todos and call job_complete again, or\n"
+                    "2. Continue with next_phase_todos to execute the staged work"
+                )
 
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
 
-            # Build freeze report (job awaiting human review)
-            freeze_data = {
-                "status": "pending_review",
-                "timestamp": datetime.now().isoformat(),
+            # Store final phase data for later use by finalize_job
+            final_data = {
                 "summary": summary,
                 "deliverables": deliverables,
                 "confidence": confidence,
                 "job_id": context.job_id,
             }
-
             if notes:
-                freeze_data["notes"] = notes
+                final_data["notes"] = notes
 
-            # Write to output/job_frozen.json (NOT job_completion.json)
-            output_path = "output/job_frozen.json"
-            workspace.write_file(
-                output_path,
-                json.dumps(freeze_data, indent=2, ensure_ascii=False)
-            )
+            _final_phase_data[context.job_id] = final_data
 
-            logger.info(f"JOB FROZEN for review: {summary}")
+            logger.info(f"Job {context.job_id} marked as final phase")
+            logger.info(f"Summary: {summary}")
             logger.info(f"Deliverables: {deliverables}")
-            logger.info(f"Confidence: {confidence}")
 
-            # Update job status to pending_review (not completed)
-            db_updated = False
-            if context.has_postgres():
-                try:
-                    db_updated = await context.update_job_status(
-                        status="pending_review",
-                        completed_at=False,
-                    )
-                    if db_updated:
-                        logger.info(f"Updated job {context.job_id} status to 'pending_review' in database")
-                    else:
-                        logger.warning("Failed to update job status in database")
-                except Exception as e:
-                    logger.error(f"Error updating job status in database: {e}")
+            # Check if there are no pending todos - if so, job will complete immediately
+            # after this tool returns (on_strategic_phase_complete will be called)
+            pending_count = 0
+            if context.has_todo():
+                pending = context.todo_manager.list_pending()
+                pending_count = len(pending)
+
+            if pending_count == 0:
+                return (
+                    "Phase marked as final. No remaining todos - job will complete now.\n\n"
+                    f"Summary: {summary}\n"
+                    f"Deliverables: {len(deliverables)} files\n"
+                    f"Confidence: {confidence:.0%}"
+                )
             else:
-                logger.debug("No PostgreSQL connection available, skipping database status update")
-
-            db_status = " Database updated to 'pending_review'." if db_updated else ""
-            return (
-                f"JOB FROZEN - Awaiting human review.{db_status}\n"
-                f"Wrote: output/job_frozen.json\n"
-                f"Summary: {summary}\n"
-                f"Deliverables: {len(deliverables)} files\n"
-                f"Confidence: {confidence:.0%}\n\n"
-                f"The job has been paused for human review. A human operator can:\n"
-                f"  - Approve: python agent.py --config <config> --job-id {context.job_id} --approve\n"
-                f"  - Resume:  python agent.py --config <config> --job-id {context.job_id} --resume --feedback '...'\n"
-            )
+                return (
+                    f"Phase marked as final. Complete your {pending_count} remaining todo(s) to finish the job.\n\n"
+                    f"Summary: {summary}\n"
+                    f"Deliverables: {len(deliverables)} files\n"
+                    f"Confidence: {confidence:.0%}\n\n"
+                    "Once all todos are complete, the job will be frozen for human review."
+                )
 
         except Exception as e:
-            logger.error(f"Failed to freeze job: {e}")
-            return f"Error freezing job: {str(e)}"
+            logger.error(f"Failed to mark job as final: {e}")
+            return f"Error marking job as final: {str(e)}"
 
     return [mark_complete, job_complete]
+
+
+def get_final_phase_data(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get the final phase data for a job, if it exists.
+
+    Called by phase.py to check if a job has been marked as final.
+
+    Args:
+        job_id: The job ID to check
+
+    Returns:
+        Final phase data dict if job is marked as final, None otherwise
+    """
+    return _final_phase_data.get(job_id)
+
+
+def clear_final_phase_data(job_id: str) -> None:
+    """Clear the final phase data for a job.
+
+    Called by phase.py after job finalization is complete.
+
+    Args:
+        job_id: The job ID to clear
+    """
+    if job_id in _final_phase_data:
+        del _final_phase_data[job_id]
+        logger.debug(f"Cleared final phase data for job {job_id}")

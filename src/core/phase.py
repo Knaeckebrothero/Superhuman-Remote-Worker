@@ -14,7 +14,9 @@ todos from todos.yaml.
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 import yaml
 from langchain_core.messages import HumanMessage
@@ -429,17 +431,148 @@ def reject_transition(
     )
 
 
+def finalize_job(
+    state: "UniversalAgentState",
+    workspace: "WorkspaceManager",
+    todo_manager: "TodoManager",
+    postgres_db: Optional[Any] = None,
+) -> TransitionResult:
+    """Finalize the job for human review.
+
+    This function is called when all strategic todos are complete and the
+    phase has been marked as final via job_complete. It freezes the job
+    for human review.
+
+    Actions:
+    - Write output/job_frozen.json with summary/deliverables
+    - Update PostgreSQL job status to 'pending_review'
+    - Return TransitionResult with should_stop=True
+
+    Args:
+        state: Current agent state
+        workspace: WorkspaceManager for file access
+        todo_manager: TodoManager (for archiving)
+        postgres_db: Optional PostgreSQL database for status update
+
+    Returns:
+        TransitionResult with should_stop=True to end the agent loop
+    """
+    from ..tools.completion_tools import get_final_phase_data, clear_final_phase_data
+
+    job_id = state.get("job_id", "unknown")
+
+    # Get the final phase data (set by job_complete tool)
+    final_data = get_final_phase_data(job_id)
+
+    if not final_data:
+        # Fallback data if not found (shouldn't happen)
+        logger.warning(f"[{job_id}] No final phase data found, using defaults")
+        final_data = {
+            "summary": "Job completed",
+            "deliverables": [],
+            "confidence": 1.0,
+            "job_id": job_id,
+        }
+
+    # Build freeze report
+    freeze_data = {
+        "status": "pending_review",
+        "timestamp": datetime.now().isoformat(),
+        "summary": final_data.get("summary", "Job completed"),
+        "deliverables": final_data.get("deliverables", []),
+        "confidence": final_data.get("confidence", 1.0),
+        "job_id": job_id,
+    }
+
+    if "notes" in final_data:
+        freeze_data["notes"] = final_data["notes"]
+
+    # Write to output/job_frozen.json
+    output_path = "output/job_frozen.json"
+    workspace.write_file(
+        output_path,
+        json.dumps(freeze_data, indent=2, ensure_ascii=False)
+    )
+
+    logger.info(f"[{job_id}] JOB FROZEN for review: {freeze_data['summary']}")
+    logger.info(f"[{job_id}] Deliverables: {freeze_data['deliverables']}")
+
+    # Update job status in PostgreSQL (async operation handled synchronously here)
+    db_updated = False
+    if postgres_db:
+        try:
+            import asyncio
+
+            async def update_status():
+                return await postgres_db.jobs.update(
+                    job_id,
+                    status="pending_review",
+                )
+
+            # Run the async operation
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # We're already in an async context, create a task
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(asyncio.run, update_status())
+                    db_updated = future.result(timeout=10)
+            else:
+                db_updated = loop.run_until_complete(update_status())
+
+            if db_updated:
+                logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
+        except Exception as e:
+            logger.error(f"[{job_id}] Error updating job status in database: {e}")
+
+    # Clear the final phase data
+    clear_final_phase_data(job_id)
+
+    # Archive todos if any remain
+    if todo_manager:
+        todo_manager.archive("final")
+
+    # Create completion message
+    db_status = " Database updated to 'pending_review'." if db_updated else ""
+    completion_msg = HumanMessage(
+        content=(
+            f"[JOB_FROZEN] Job frozen for human review.{db_status}\n"
+            f"Wrote: {output_path}\n"
+            f"Summary: {freeze_data['summary']}\n"
+            f"Deliverables: {len(freeze_data['deliverables'])} files\n"
+            f"Confidence: {freeze_data['confidence']:.0%}\n\n"
+            f"The job has been paused for human review. A human operator can:\n"
+            f"  - Approve: python agent.py --config <config> --job-id {job_id} --approve\n"
+            f"  - Resume:  python agent.py --config <config> --job-id {job_id} --resume --feedback '...'"
+        )
+    )
+
+    return TransitionResult(
+        success=True,
+        state_updates={
+            "messages": [completion_msg],
+            "goal_achieved": True,
+            "should_stop": True,
+            "is_final_phase": False,  # Reset for cleanliness
+        },
+    )
+
+
 def on_strategic_phase_complete(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
     todo_manager: "TodoManager",
     min_todos: int = 5,
     max_todos: int = 20,
+    postgres_db: Optional[Any] = None,
 ) -> TransitionResult:
     """Handle transition from strategic phase to tactical phase.
 
     This function is called when the last strategic todo is completed.
     It checks for staged todos and, if present, transitions to tactical phase.
+
+    If the phase is marked as final (via job_complete), it finalizes the job
+    instead of transitioning to another phase.
 
     The new flow uses staged todos instead of todos.yaml:
     1. Agent calls next_phase_todos() to stage todos
@@ -462,12 +595,23 @@ def on_strategic_phase_complete(
         todo_manager: TodoManager for loading todos
         min_todos: Minimum todos required (default: 5, used by staging)
         max_todos: Maximum todos allowed (default: 20, used by staging)
+        postgres_db: Optional PostgreSQL database for job status update
 
     Returns:
         TransitionResult indicating success/failure with state updates
     """
+    from ..tools.completion_tools import get_final_phase_data
+
     job_id = state.get("job_id", "unknown")
     phase_number = state.get("phase_number", 0)
+
+    # Check if this is the final phase (job_complete was called)
+    is_final = state.get("is_final_phase", False)
+    final_data = get_final_phase_data(job_id)
+
+    if is_final or final_data:
+        logger.info(f"[{job_id}] Final phase detected, completing job")
+        return finalize_job(state, workspace, todo_manager, postgres_db)
 
     logger.info(f"[{job_id}] Strategic phase complete, checking for staged todos")
 
@@ -476,7 +620,8 @@ def on_strategic_phase_complete(
         return reject_transition(
             state,
             "No todos staged for the next phase. "
-            "Use next_phase_todos tool to create 5-20 tasks first.",
+            "Use next_phase_todos tool to create 5-20 tasks first, "
+            "or call job_complete if the plan is fully executed.",
         )
 
     # Get phase name from staged todos
@@ -578,6 +723,7 @@ def handle_phase_transition(
     min_todos: int = 5,
     max_todos: int = 20,
     config: Optional["AgentConfig"] = None,
+    postgres_db: Optional[Any] = None,
 ) -> TransitionResult:
     """Route to the appropriate phase transition handler.
 
@@ -591,6 +737,7 @@ def handle_phase_transition(
         min_todos: Minimum todos for strategic->tactical transition
         max_todos: Maximum todos for strategic->tactical transition
         config: Agent configuration for loading strategic todos from template
+        postgres_db: Optional PostgreSQL database for job status update
 
     Returns:
         TransitionResult from the appropriate handler
@@ -599,7 +746,7 @@ def handle_phase_transition(
 
     if is_strategic:
         return on_strategic_phase_complete(
-            state, workspace, todo_manager, min_todos, max_todos
+            state, workspace, todo_manager, min_todos, max_todos, postgres_db
         )
     else:
         return on_tactical_phase_complete(state, workspace, todo_manager, config)
