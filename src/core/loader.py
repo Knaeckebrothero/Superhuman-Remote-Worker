@@ -233,6 +233,7 @@ class WorkspaceConfig:
     structure: List[str] = field(default_factory=list)
     instructions_template: str = ""
     initial_files: Dict[str, str] = field(default_factory=dict)
+    max_read_words: int = 25000  # Maximum word count for file reads
 
 
 @dataclass
@@ -404,10 +405,27 @@ def load_agent_config(
     )
 
     workspace_data = data.get("workspace", {})
+
+    # Handle backward compatibility: if max_read_words not set but max_read_size is,
+    # convert bytes to words using average of 5.5 bytes per word
+    max_read_words = workspace_data.get("max_read_words")
+    max_read_size_legacy = workspace_data.get("max_read_size")
+
+    if max_read_words is None and max_read_size_legacy is not None:
+        # Convert legacy bytes to words
+        max_read_words = int(max_read_size_legacy / 5.5)
+        logger.debug(
+            f"Converting legacy max_read_size ({max_read_size_legacy} bytes) "
+            f"to max_read_words ({max_read_words} words)"
+        )
+    elif max_read_words is None:
+        max_read_words = 25000  # Default
+
     workspace_config = WorkspaceConfig(
         structure=workspace_data.get("structure", []),
         instructions_template=workspace_data.get("instructions_template", ""),
         initial_files=workspace_data.get("initial_files", {}),
+        max_read_words=max_read_words,
     )
 
     tools_data = data.get("tools", {})
