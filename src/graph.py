@@ -321,11 +321,8 @@ def create_execute_node(
 
         # Get current dynamic content for system prompt
         todos_content = todo_manager.format_for_display()
-        workspace_content = ""
-        if workspace_manager.exists("workspace.md"):
-            workspace_content = workspace_manager.read_file("workspace.md")
 
-        # Get phase-aware system prompt
+        # Get phase-aware system prompt (workspace.md is now injected as fake tool call below)
         is_strategic = state.get("is_strategic_phase", True)
         phase_number = state.get("phase_number", 0)
         full_system = get_phase_system_prompt(
@@ -333,7 +330,6 @@ def create_execute_node(
             is_strategic=is_strategic,
             phase_number=phase_number,
             todos_content=todos_content,
-            workspace_content=workspace_content,
         )
         logger.debug(
             f"[{job_id}] Using {'strategic' if is_strategic else 'tactical'} "
@@ -369,15 +365,32 @@ def create_execute_node(
         # (can occur from improper context compaction or checkpoint corruption)
         messages = sanitize_message_history(messages)
 
-        # Add full conversation history (excluding system messages, but keeping summaries)
-        # We exclude regular SystemMessages because we regenerate the system prompt fresh,
-        # but summary SystemMessages (from context compaction) should be included
+        # Add full conversation history in specific order:
+        # 1. Summary SystemMessages first (context from before compaction)
+        # 2. Workspace injection (fake tool call - current workspace state)
+        # 3. Rest of conversation (excluding regular SystemMessages)
+
+        # Step 1: Add summaries first
         for msg in messages:
             if isinstance(msg, SystemMessage):
-                # Include summary SystemMessages, exclude others
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
-            else:
+
+        # Step 2: Inject workspace.md as fake tool call result
+        # This makes it appear as if the agent already read workspace.md
+        # Note: workspace injection is transient (not stored in state), so it's
+        # re-injected fresh each turn and won't be included in summarization
+        if workspace_manager.exists("workspace.md"):
+            from src.core.workspace_injection import create_workspace_tool_messages
+
+            workspace_content = workspace_manager.read_file("workspace.md")
+            ws_ai_msg, ws_tool_msg = create_workspace_tool_messages(workspace_content)
+            prepared_messages.append(ws_ai_msg)
+            prepared_messages.append(ws_tool_msg)
+
+        # Step 3: Add rest of conversation (excluding all SystemMessages)
+        for msg in messages:
+            if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
         # Handle consecutive AI messages — inject dynamic todo reminder

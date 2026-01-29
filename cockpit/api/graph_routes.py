@@ -373,7 +373,20 @@ def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[s
         for matched in changes.get("matchedVariables", []):
             # Get ID from matched node properties
             matched_id = _get_node_id(matched)
-            var_to_id[matched["variable"]] = matched_id
+
+            # If node with this ID exists, use it directly
+            if matched_id in nodes:
+                var_to_id[matched["variable"]] = matched_id
+            else:
+                # Try to find existing node by checking if it was created with this variable
+                # in an earlier delta (the node exists but with a different ID derivation)
+                existing_id = var_to_id.get(matched["variable"])
+                if existing_id and existing_id in nodes:
+                    # Keep the existing mapping - don't overwrite with unresolvable ID
+                    pass
+                else:
+                    # No existing mapping, use the derived ID
+                    var_to_id[matched["variable"]] = matched_id
 
         # Apply changes to build current state
         for node in changes.get("nodesCreated", []):
@@ -396,6 +409,12 @@ def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[s
                 nodes[node_id]["visible"] = False
                 nodes[node_id]["deletedAt"] = delta["toolCallIndex"]
 
+                # Cascade: mark relationships referencing this node as invisible
+                for rel_id, rel_data in relationships.items():
+                    if rel_data["sourceId"] == node_id or rel_data["targetId"] == node_id:
+                        rel_data["visible"] = False
+                        rel_data["deletedAt"] = delta["toolCallIndex"]
+
         for mod in changes.get("nodesModified", []):
             node_id = var_to_id.get(mod["variable"], mod["variable"])
             if node_id in nodes:
@@ -408,6 +427,15 @@ def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[s
         for rel in changes.get("relationshipsCreated", []):
             source_id = var_to_id.get(rel["sourceVar"], rel["sourceVar"])
             target_id = var_to_id.get(rel["targetVar"], rel["targetVar"])
+
+            # Try to resolve node IDs - find matching nodes if exact ID doesn't exist
+            source_id = _resolve_node_id(source_id, rel["sourceVar"], nodes)
+            target_id = _resolve_node_id(target_id, rel["targetVar"], nodes)
+
+            # Skip only if we truly can't find the nodes
+            if source_id is None or target_id is None:
+                continue
+
             rel_id = f"{source_id}-{rel['type']}-{target_id}"
             relationships[rel_id] = {
                 "id": rel_id,
@@ -446,6 +474,46 @@ def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[s
             })
 
     return snapshots
+
+
+def _resolve_node_id(
+    derived_id: str,
+    variable: str,
+    nodes: dict[str, dict[str, Any]],
+) -> str | None:
+    """Resolve a node ID, trying to find a matching node if exact ID doesn't exist.
+
+    Args:
+        derived_id: The ID derived from var_to_id mapping
+        variable: The original variable name from the Cypher query
+        nodes: Current nodes dict
+
+    Returns:
+        Resolved node ID, or None if no match found
+    """
+    # Exact match
+    if derived_id in nodes:
+        return derived_id
+
+    # Try to find node by variable name pattern (e.g., "Label_variable")
+    for node_id in nodes:
+        if node_id.endswith(f"_{variable}"):
+            return node_id
+
+    # Try to find node whose ID contains the derived_id or vice versa
+    for node_id in nodes:
+        if derived_id in node_id or node_id in derived_id:
+            return node_id
+
+    # Try to find node with matching property value
+    for node_id, node_data in nodes.items():
+        props = node_data.get("properties", {})
+        for prop_value in props.values():
+            if str(prop_value) == derived_id:
+                return node_id
+
+    # No match found
+    return None
 
 
 def _get_node_id(node: dict[str, Any]) -> str:

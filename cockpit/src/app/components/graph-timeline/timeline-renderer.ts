@@ -252,24 +252,27 @@ export class TimelineRenderer {
 
     // Add created relationships
     for (const rel of changes.relationshipsCreated) {
-      const sourceId = this.varToIdPersistent.get(rel.sourceVar) ?? rel.sourceVar;
-      const targetId = this.varToIdPersistent.get(rel.targetVar) ?? rel.targetVar;
-      const relId = `${sourceId}-${rel.type}-${targetId}`;
+      let sourceId = this.varToIdPersistent.get(rel.sourceVar) ?? rel.sourceVar;
+      let targetId = this.varToIdPersistent.get(rel.targetVar) ?? rel.targetVar;
 
-      // Verify source and target nodes exist before adding edge
-      const sourceNode = this.cy.getElementById(sourceId);
-      const targetNode = this.cy.getElementById(targetId);
+      // Try to find nodes with fuzzy matching
+      const resolvedSource = this.findNodeInGraph(sourceId);
+      const resolvedTarget = this.findNodeInGraph(targetId);
 
-      if (sourceNode.length === 0 || targetNode.length === 0) {
+      if (!resolvedSource || !resolvedTarget) {
         console.log('[TimelineRenderer] Skipping edge - missing node:', {
-          relId,
           sourceId,
-          sourceExists: sourceNode.length > 0,
+          resolvedSource: resolvedSource?.id(),
           targetId,
-          targetExists: targetNode.length > 0,
+          resolvedTarget: resolvedTarget?.id(),
         });
         continue;
       }
+
+      // Use resolved IDs
+      sourceId = resolvedSource.id();
+      targetId = resolvedTarget.id();
+      const relId = `${sourceId}-${rel.type}-${targetId}`;
 
       const existingEdge = this.cy.getElementById(relId);
       if (existingEdge.length === 0 || !rel.merge) {
@@ -402,16 +405,35 @@ export class TimelineRenderer {
         });
       }
 
-      // Add all relationships
+      // Build set of node IDs being added for edge validation
+      const nodeIds = new Set(elements.filter(e => e.group === 'nodes').map(e => e.data?.id));
+
+      // Add all relationships (with fuzzy matching for source/target)
       for (const [id, rel] of Object.entries(snapshot.relationships)) {
         if (!rel.visible) continue;
+
+        // Try to resolve source and target IDs with fuzzy matching
+        const sourceId = this.resolveNodeIdInSet(rel.sourceId, nodeIds);
+        const targetId = this.resolveNodeIdInSet(rel.targetId, nodeIds);
+
+        // Skip edges where source or target node doesn't exist
+        if (!sourceId || !targetId) {
+          console.log('[TimelineRenderer] Skipping edge in snapshot - missing node:', {
+            relId: rel.id,
+            sourceId: rel.sourceId,
+            resolvedSource: sourceId,
+            targetId: rel.targetId,
+            resolvedTarget: targetId,
+          });
+          continue;
+        }
 
         elements.push({
           group: 'edges',
           data: {
-            id: rel.id,
-            source: rel.sourceId,
-            target: rel.targetId,
+            id: `${sourceId}-${rel.type}-${targetId}`,
+            source: sourceId,
+            target: targetId,
             type: rel.type,
             ...rel.properties,
             createdAt: rel.createdAt,
@@ -535,6 +557,48 @@ export class TimelineRenderer {
 
     console.log('[TimelineRenderer] Rebuilt varToId mapping up to index', upToIndex,
       'with', this.varToIdPersistent.size, 'entries');
+  }
+
+  /**
+   * Find a node in the Cytoscape graph by ID with fuzzy matching.
+   */
+  private findNodeInGraph(id: string): NodeSingular | null {
+    // Exact match
+    const exactMatch = this.cy.getElementById(id);
+    if (exactMatch.length > 0 && exactMatch.isNode()) {
+      return exactMatch as NodeSingular;
+    }
+
+    // Fuzzy match: find node whose ID contains this ID or vice versa
+    const nodes = this.cy.nodes();
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      const nodeId = node.id();
+      if (id.includes(nodeId) || nodeId.includes(id)) {
+        return node;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Try to resolve a node ID by fuzzy matching against a set of known node IDs.
+   */
+  private resolveNodeIdInSet(id: string, nodeIds: Set<string>): string | null {
+    // Exact match
+    if (nodeIds.has(id)) {
+      return id;
+    }
+
+    // Try to find a node whose ID contains this ID or vice versa
+    for (const nodeId of nodeIds) {
+      if (id.includes(nodeId) || nodeId.includes(id)) {
+        return nodeId;
+      }
+    }
+
+    return null;
   }
 
   /**

@@ -359,6 +359,14 @@ export class GraphService {
         if (id === nodeId || id.includes(deletion.variable)) {
           node.visible = false;
           node.deletedAt = currentToolIndex;
+
+          // Cascade: mark relationships referencing this node as invisible
+          for (const [relId, rel] of relationships) {
+            if (rel.sourceId === id || rel.targetId === id) {
+              rel.visible = false;
+              rel.deletedAt = currentToolIndex;
+            }
+          }
         }
       }
     }
@@ -381,8 +389,18 @@ export class GraphService {
 
     // Create relationships
     for (const creation of changes.relationshipsCreated) {
-      const sourceId = varToId.get(creation.sourceVar) ?? creation.sourceVar;
-      const targetId = varToId.get(creation.targetVar) ?? creation.targetVar;
+      let sourceId = varToId.get(creation.sourceVar) ?? creation.sourceVar;
+      let targetId = varToId.get(creation.targetVar) ?? creation.targetVar;
+
+      // Try to resolve node IDs with fuzzy matching
+      sourceId = this.resolveNodeId(sourceId, creation.sourceVar, nodes) ?? sourceId;
+      targetId = this.resolveNodeId(targetId, creation.targetVar, nodes) ?? targetId;
+
+      // Skip only if we truly can't find the nodes
+      if (!nodes.has(sourceId) || !nodes.has(targetId)) {
+        continue;
+      }
+
       const relId = `${sourceId}-${creation.type}-${targetId}`;
 
       if (!relationships.has(relId) || !creation.merge) {
@@ -407,6 +425,45 @@ export class GraphService {
         }
       }
     }
+  }
+
+  /**
+   * Try to resolve a node ID by fuzzy matching if exact ID doesn't exist.
+   */
+  private resolveNodeId(
+    derivedId: string,
+    variable: string,
+    nodes: Map<string, NodeState>,
+  ): string | null {
+    // Exact match
+    if (nodes.has(derivedId)) {
+      return derivedId;
+    }
+
+    // Try to find node by variable name pattern
+    for (const nodeId of nodes.keys()) {
+      if (nodeId.endsWith(`_${variable}`)) {
+        return nodeId;
+      }
+    }
+
+    // Try to find node whose ID contains the derived ID or vice versa
+    for (const nodeId of nodes.keys()) {
+      if (derivedId.includes(nodeId) || nodeId.includes(derivedId)) {
+        return nodeId;
+      }
+    }
+
+    // Try to find node with matching property value
+    for (const [nodeId, node] of nodes) {
+      for (const propValue of Object.values(node.properties)) {
+        if (String(propValue) === derivedId) {
+          return nodeId;
+        }
+      }
+    }
+
+    return null;
   }
 
   /**
