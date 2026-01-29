@@ -222,6 +222,8 @@ class LLMConfig:
     reasoning_level: str = "high"
     base_url: Optional[str] = None
     api_key: Optional[str] = None
+    timeout: Optional[float] = 600.0  # 10 minutes default
+    max_retries: int = 3
 
 
 @dataclass
@@ -393,6 +395,8 @@ def load_agent_config(
         reasoning_level=llm_data.get("reasoning_level", "high"),
         base_url=llm_data.get("base_url"),
         api_key=llm_data.get("api_key"),
+        timeout=llm_data.get("timeout", 600.0),
+        max_retries=llm_data.get("max_retries", 3),
     )
 
     workspace_data = data.get("workspace", {})
@@ -522,7 +526,12 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
         "model": config.model,
         "temperature": config.temperature,
         "api_key": api_key,
+        "max_retries": config.max_retries,
     }
+
+    # Add timeout if specified
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
 
     # Only add base_url if specified
     if base_url:
@@ -536,7 +545,7 @@ def create_llm(config: LLMConfig) -> BaseChatModel:
 
     logger.info(
         f"Created LLM: model={config.model}, temp={config.temperature}, "
-        f"base_url={base_url or 'default'}"
+        f"base_url={base_url or 'default'}, timeout={config.timeout}s, max_retries={config.max_retries}"
     )
 
     return llm

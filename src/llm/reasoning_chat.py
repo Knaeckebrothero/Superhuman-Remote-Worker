@@ -33,7 +33,10 @@ def _get_debug_tail_chars() -> int:
 class ReasoningCapturingClient(httpx.Client):
     """HTTP client that captures reasoning_content from API responses."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, timeout: Optional[float] = None, **kwargs):
+        # Apply timeout if specified
+        if timeout is not None:
+            kwargs["timeout"] = httpx.Timeout(timeout)
         super().__init__(*args, **kwargs)
         self._last_reasoning_content: Optional[str] = None
 
@@ -73,8 +76,11 @@ class ReasoningChatOpenAI(ChatOpenAI):
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
 
     def __init__(self, **kwargs):
+        # Extract timeout to apply to our custom client
+        timeout = kwargs.get("timeout")
+
         # Create the client before calling super().__init__
-        reasoning_client = ReasoningCapturingClient()
+        reasoning_client = ReasoningCapturingClient(timeout=timeout)
         kwargs["http_client"] = reasoning_client
         super().__init__(**kwargs)
         # Store after init

@@ -5,7 +5,9 @@
     "model": "openai/gpt-oss-120b",
     "temperature": 0.0,
     "reasoning_level": "high",
-    "base_url": null
+    "base_url": null,
+    "timeout": 600,
+    "max_retries": 3
   },
   "workspace": {
     "structure": [
