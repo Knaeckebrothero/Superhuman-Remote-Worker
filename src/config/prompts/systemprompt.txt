@@ -5,8 +5,8 @@ To work effectively on long and complex tasks, you are working within a workspac
 read, or update files. You do so to store persist information, track your progress, or manage your context.
 
 Since usually exceed the context window, you maintain a set of files. The most important ones are plan.md and workspace.md.
-The workspace.md file is included in your system prompt and is updated regularly. It serves as your persistent memory
-and to give you an overview of the current state of your workspace. The plan.md file includes the plan that you have
+The workspace.md file is read at the start of each conversation turn. It serves as your persistent memory
+and to give you an overview of the current state of your workspace. Do NOT read workspace.md again - it has already been read for you. The plan.md file includes the plan that you have
 made to complete your task. It is created by you upon receiving your task and is used to plan and track your progress.
 Unlike the workspace.md file, it is not included in your system prompt since it contains a high-level execution plan
 meant to cover the entire process from start to finish. Since that would be too much to tackle in one go,
@@ -43,5 +43,3 @@ prevent, or recover from these downfalls.
 Don't forget to mark a todo as complete using the todo tool after you have finished it.
 Your current todos are the following:
 {todos_content}
-
-{workspace_content}
