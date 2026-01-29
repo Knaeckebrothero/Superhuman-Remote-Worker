@@ -84,10 +84,7 @@ def create_cache_tools(context: ToolContext) -> List:
         source_document: Optional[str] = None,
         source_location: Optional[str] = None,
         citations: Optional[str] = None,
-        mentioned_objects: Optional[str] = None,
-        mentioned_messages: Optional[str] = None,
         reasoning: Optional[str] = None,
-        confidence: float = 0.8
     ) -> str:
         """Create and submit a finalized requirement for validation.
 
@@ -104,10 +101,7 @@ def create_cache_tools(context: ToolContext) -> List:
             source_document: Source document path
             source_location: Location in document (e.g., "Section 3.2")
             citations: Comma-separated citation IDs
-            mentioned_objects: Comma-separated BusinessObject names
-            mentioned_messages: Comma-separated Message names
             reasoning: Extraction reasoning
-            confidence: Confidence score (0.0-1.0)
 
         Returns:
             "ok: {uuid}" on success, "error: {reason}" on failure
@@ -122,8 +116,6 @@ def create_cache_tools(context: ToolContext) -> List:
 
             # Parse comma-separated lists
             citation_list = [c.strip() for c in (citations or "").split(",") if c.strip()]
-            object_list = [o.strip() for o in (mentioned_objects or "").split(",") if o.strip()]
-            message_list = [m.strip() for m in (mentioned_messages or "").split(",") if m.strip()]
 
             # Parse source_location into structured format
             source_location_dict = {"section": source_location} if source_location else None
@@ -140,10 +132,7 @@ def create_cache_tools(context: ToolContext) -> List:
                 gobd_relevant=gobd_relevant,
                 gdpr_relevant=gdpr_relevant,
                 citations=citation_list,
-                mentioned_objects=object_list,
-                mentioned_messages=message_list,
                 reasoning=reasoning,
-                confidence=confidence,
             )
 
             return f"ok: {req_uuid}"
@@ -297,8 +286,6 @@ Compliance:
 Extraction:
   Reasoning: {requirement.get('reasoning', 'N/A')}
   Citations: {requirement.get('citations', '[]')}
-  Mentioned Objects: {requirement.get('mentioned_objects', '[]')}
-  Mentioned Messages: {requirement.get('mentioned_messages', '[]')}
 
 Validation:
   Status: {requirement['status']}
@@ -327,11 +314,8 @@ Validation:
         source_document: Optional[str] = None,
         source_location: Optional[str] = None,
         citations: Optional[str] = None,
-        mentioned_objects: Optional[str] = None,
-        mentioned_messages: Optional[str] = None,
         reasoning: Optional[str] = None,
         research_notes: Optional[str] = None,
-        confidence: Optional[float] = None,
         tags: Optional[str] = None,
     ) -> str:
         """Edit content fields of an existing pending requirement.
@@ -351,11 +335,8 @@ Validation:
             source_document: Source document path
             source_location: Location in document (e.g., "Section 3.2")
             citations: Comma-separated citation IDs (replaces existing)
-            mentioned_objects: Comma-separated BusinessObject names (replaces existing)
-            mentioned_messages: Comma-separated Message names (replaces existing)
             reasoning: Extraction reasoning
             research_notes: Research notes
-            confidence: Confidence score (0.0-1.0)
             tags: Comma-separated tags (replaces existing)
 
         Returns:
@@ -385,16 +366,10 @@ Validation:
                 kwargs["source_location"] = {"section": source_location}
             if citations is not None:
                 kwargs["citations"] = [c.strip() for c in citations.split(",") if c.strip()]
-            if mentioned_objects is not None:
-                kwargs["mentioned_objects"] = [o.strip() for o in mentioned_objects.split(",") if o.strip()]
-            if mentioned_messages is not None:
-                kwargs["mentioned_messages"] = [m.strip() for m in mentioned_messages.split(",") if m.strip()]
             if reasoning is not None:
                 kwargs["reasoning"] = reasoning
             if research_notes is not None:
                 kwargs["research_notes"] = research_notes
-            if confidence is not None:
-                kwargs["confidence"] = confidence
             if tags is not None:
                 kwargs["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
 

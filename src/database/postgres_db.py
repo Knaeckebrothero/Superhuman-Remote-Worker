@@ -607,11 +607,8 @@ class RequirementsNamespace:
         gobd_relevant: bool = False,
         gdpr_relevant: bool = False,
         citations: Optional[List[str]] = None,
-        mentioned_objects: Optional[List[str]] = None,
-        mentioned_messages: Optional[List[str]] = None,
         reasoning: Optional[str] = None,
         research_notes: Optional[str] = None,
-        confidence: float = 0.0,
         tags: Optional[List[str]] = None,
     ) -> uuid.UUID:
         """Create a new requirement.
@@ -628,11 +625,8 @@ class RequirementsNamespace:
             gobd_relevant: GoBD compliance relevance flag
             gdpr_relevant: GDPR compliance relevance flag
             citations: List of citation IDs
-            mentioned_objects: List of mentioned BusinessObject names
-            mentioned_messages: List of mentioned Message names
             reasoning: Extraction reasoning/justification
             research_notes: Additional research notes
-            confidence: Confidence score (0.0-1.0)
             tags: Optional tags for categorization
 
         Returns:
@@ -644,15 +638,13 @@ class RequirementsNamespace:
                 job_id, text, name, requirement_id, type, priority,
                 source_document, source_location,
                 gobd_relevant, gdpr_relevant,
-                citations, mentioned_objects, mentioned_messages,
-                reasoning, research_notes, confidence, tags,
+                citations, reasoning, research_notes, tags,
                 status, created_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8,
                 $9, $10,
-                $11, $12, $13,
-                $14, $15, $16, $17,
+                $11, $12, $13, $14,
                 'pending', NOW()
             )
             RETURNING id
@@ -668,11 +660,8 @@ class RequirementsNamespace:
             gobd_relevant,
             gdpr_relevant,
             json.dumps(citations or []),
-            json.dumps(mentioned_objects or []),
-            json.dumps(mentioned_messages or []),
             reasoning,
             research_notes,
-            confidence,
             json.dumps(tags or []),
         )
         logger.debug(f"Created requirement {requirement_id or req_uuid} (uuid={req_uuid})")
@@ -888,11 +877,8 @@ class RequirementsNamespace:
         gobd_relevant: Optional[bool] = None,
         gdpr_relevant: Optional[bool] = None,
         citations: Optional[List[str]] = None,
-        mentioned_objects: Optional[List[str]] = None,
-        mentioned_messages: Optional[List[str]] = None,
         reasoning: Optional[str] = None,
         research_notes: Optional[str] = None,
-        confidence: Optional[float] = None,
         tags: Optional[List[str]] = None,
     ) -> None:
         """Edit content fields of a pending requirement.
@@ -911,11 +897,8 @@ class RequirementsNamespace:
             gobd_relevant: GoBD relevance flag
             gdpr_relevant: GDPR relevance flag
             citations: Citation IDs list
-            mentioned_objects: BusinessObject names list
-            mentioned_messages: Message names list
             reasoning: Extraction reasoning
             research_notes: Research notes
-            confidence: Confidence score (0.0-1.0)
             tags: Tags list
 
         Raises:
@@ -949,11 +932,8 @@ class RequirementsNamespace:
             ("gobd_relevant", gobd_relevant, lambda v: v),
             ("gdpr_relevant", gdpr_relevant, lambda v: v),
             ("citations", citations, lambda v: json.dumps(v)),
-            ("mentioned_objects", mentioned_objects, lambda v: json.dumps(v)),
-            ("mentioned_messages", mentioned_messages, lambda v: json.dumps(v)),
             ("reasoning", reasoning, lambda v: v),
             ("research_notes", research_notes, lambda v: v),
-            ("confidence", confidence, lambda v: v),
             ("tags", tags, lambda v: json.dumps(v)),
         ]
 
@@ -1000,11 +980,8 @@ class RequirementsNamespace:
         gobd_relevant: bool = False,
         gdpr_relevant: bool = False,
         citations: Optional[List[str]] = None,
-        mentioned_objects: Optional[List[str]] = None,
-        mentioned_messages: Optional[List[str]] = None,
         reasoning: Optional[str] = None,
         research_notes: Optional[str] = None,
-        confidence: float = 0.0,
         tags: Optional[List[str]] = None,
     ) -> uuid.UUID:
         """Synchronous wrapper for create()."""
@@ -1012,8 +989,7 @@ class RequirementsNamespace:
             self.create(
                 job_id, text, name, requirement_id, req_type, priority,
                 source_document, source_location, gobd_relevant, gdpr_relevant,
-                citations, mentioned_objects, mentioned_messages, reasoning,
-                research_notes, confidence, tags
+                citations, reasoning, research_notes, tags
             )
         )
 

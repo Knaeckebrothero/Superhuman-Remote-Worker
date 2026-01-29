@@ -291,3 +291,175 @@ If you want immediate improvement without architectural changes:
 4. Agent still explores later, but workspace.md has basic facts from start
 
 This can be done in ~30 lines of code changes and gives immediate value.
+
+---
+
+## Comparison with CLAUDE.md and GEMINI.md
+
+This section compares how Claude Code and Gemini CLI handle their workspace/memory files versus our current workspace.md implementation.
+
+### Claude Code's CLAUDE.md
+
+**Sources**: [Using CLAUDE.MD files](https://claude.com/blog/using-claude-md-files), [Writing a good CLAUDE.md](https://www.humanlayer.dev/blog/writing-a-good-claude-md), [Best Practices](https://www.anthropic.com/engineering/claude-code-best-practices)
+
+| Aspect | CLAUDE.md |
+|--------|-----------|
+| **Purpose** | Static project configuration - tells Claude about the codebase |
+| **Content** | WHAT (tech stack, structure), WHY (project purpose), HOW (commands, gotchas) |
+| **Persistence** | Checked into git, shared with team |
+| **Size** | Short - <300 lines recommended, <60 lines ideal |
+| **Loading** | Hierarchical: `~/.claude/CLAUDE.md` → repo root → child directories |
+| **Mutability** | Human-edited, stable over time |
+| **Imports** | `@path/to/file` syntax to import other files |
+| **Rules** | `.claude/rules/` directory auto-loaded |
+
+**Key design principles**:
+- Keep it concise - for each line, ask "Would removing this cause Claude to make mistakes?"
+- Include: commands (test, build, lint), gotchas, project structure map
+- Treat it like code: review when things go wrong, prune regularly
+- Use emphasis ("IMPORTANT", "YOU MUST") for critical instructions
+
+### Gemini CLI's GEMINI.md
+
+**Sources**: [Gemini CLI GEMINI.md docs](https://geminicli.com/docs/cli/gemini-md/), [Memory tool](https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/memory.md)
+
+| Aspect | GEMINI.md |
+|--------|-----------|
+| **Purpose** | Context files + memory storage |
+| **Content** | Project instructions + agent-saved memories |
+| **Persistence** | Hierarchical loading like CLAUDE.md |
+| **Loading** | `~/.gemini/GEMINI.md` → project root → parent dirs → subdirs |
+| **Agent writes** | `save_memory` tool appends to `## Gemini Added Memories` section |
+| **Commands** | `/memory show`, `/memory refresh`, `/memory add` |
+| **Separation** | Human-written instructions vs agent-appended memories in same file |
+
+**Key features**:
+- `save_memory(fact)` tool lets agent persist learnings across sessions
+- Memories stored under a dedicated `## Gemini Added Memories` section
+- Human instructions and agent memories coexist in same file
+- Memory file is plain text, manually editable
+
+### Our workspace.md
+
+| Aspect | workspace.md |
+|--------|-----------|
+| **Purpose** | Agent's working memory during task execution |
+| **Content** | Status, progress, decisions, entities, learnings |
+| **Persistence** | Per-job, survives context compaction |
+| **Loading** | Single file per job workspace, always in system prompt |
+| **Initialization** | Static template, agent updates during execution |
+| **Mutability** | Agent-written, changes frequently |
+| **Structure** | Semi-structured sections (Status, Key Decisions, Entities) |
+
+### Key Differences
+
+#### 1. Static vs Dynamic
+
+| Tool | Nature |
+|------|--------|
+| **CLAUDE.md** | Static project docs, human-maintained |
+| **GEMINI.md** | Hybrid - human instructions + agent memories |
+| **workspace.md** | Dynamic working memory, agent-maintained |
+
+Our workspace.md is fundamentally different - it's meant for task-specific working memory, not project documentation.
+
+#### 2. Scope
+
+| Tool | Scope |
+|------|-------|
+| **CLAUDE.md** | Project-wide, shared across sessions |
+| **GEMINI.md** | Project-wide + user-global |
+| **workspace.md** | Per-job, isolated to one task |
+
+#### 3. Initialization Problem
+
+Both CLAUDE.md and GEMINI.md expect **humans** to write the initial content. Our workspace.md starts from a generic template because it's agent-driven working memory - the agent is expected to populate it.
+
+#### 4. Core Insight
+
+**The key insight from both CLAUDE.md and GEMINI.md is: separate static project knowledge from dynamic working state.** Our workspace.md currently conflates both purposes.
+
+### Additional Solution Options
+
+Based on this comparison, here are additional approaches beyond the original options:
+
+#### Option 5: Separate Concerns (Add context.md)
+
+Keep workspace.md for working memory but add a **separate CLAUDE.md-style file** for project configuration:
+
+```
+workspace/job_{id}/
+├── instructions.md    # Already exists - task instructions
+├── workspace.md       # Working memory (current use)
+└── context.md         # NEW: Project context (CLAUDE.md-style)
+```
+
+The `context.md` could be:
+- Copied from a per-agent template in `configs/{agent}/context.md`
+- Contains: tool descriptions, common patterns, gotchas
+- Static, not updated by agent
+
+**Pros**:
+- Clear separation of static context vs dynamic memory
+- Follows proven patterns from CLAUDE.md/GEMINI.md
+- context.md can be agent-specific
+
+**Cons**:
+- Another file to maintain
+- More content in system prompt
+
+#### Option 6: Adopt Gemini's Hybrid Pattern (save_memory tool)
+
+Add a `save_memory` tool that appends to a special section:
+
+```python
+def save_memory(fact: str) -> str:
+    """Save a fact to persistent memory."""
+    memory_manager.append_to_section("Agent Memories", fact)
+    return f"Saved: {fact}"
+```
+
+This separates human-written template from agent-learned facts.
+
+**Pros**:
+- Clean separation within same file
+- Agent can explicitly persist learnings
+- Easy to implement with existing MemoryManager
+
+**Cons**:
+- Adds another tool
+- Agent must decide what to save
+
+#### Option 7: Hierarchical Loading (like CLAUDE.md)
+
+Support multiple context files that get concatenated:
+
+```
+configs/creator/
+├── context.md           # Agent-specific context
+├── rules/
+│   ├── citations.md     # Citation rules
+│   └── extraction.md    # Extraction patterns
+```
+
+Loaded automatically and concatenated, similar to `.claude/rules/`.
+
+**Pros**:
+- Modular, maintainable
+- Different team members can own different rule sets
+- Follows proven CLAUDE.md pattern
+
+**Cons**:
+- More complex loading logic
+- More files to manage
+
+### Updated Recommendation
+
+Given the comparison with CLAUDE.md and GEMINI.md, the recommended approach is a combination:
+
+1. **Keep workspace.md** as working memory (it's working well for its purpose)
+2. **Add `context.md`** (Option 5) as a CLAUDE.md-style static file per agent type
+3. **Implement template rendering** (Option 3) for basic job metadata in workspace.md
+4. **Consider `save_memory` tool** (Option 6) to let agent store learnings separately from status
+
+This respects the core insight: **static project knowledge should be separate from dynamic working state**

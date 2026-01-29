@@ -34,7 +34,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-graphrag}
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
-      - ./src/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
+      - ./src/database/queries/postgres/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:

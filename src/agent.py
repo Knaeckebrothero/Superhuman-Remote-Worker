@@ -874,38 +874,6 @@ class UniversalAgent:
 
         lines.append("")
 
-        # Handle mentioned_objects (may be JSON string or list)
-        mentioned_objects = req.get('mentioned_objects')
-        if mentioned_objects:
-            if isinstance(mentioned_objects, str):
-                try:
-                    mentioned_objects = json.loads(mentioned_objects)
-                except (json.JSONDecodeError, TypeError):
-                    mentioned_objects = []
-            if mentioned_objects:
-                lines.extend([
-                    "## Mentioned Business Objects",
-                    "",
-                    *[f"- {obj}" for obj in mentioned_objects],
-                    "",
-                ])
-
-        # Handle mentioned_messages (may be JSON string or list)
-        mentioned_messages = req.get('mentioned_messages')
-        if mentioned_messages:
-            if isinstance(mentioned_messages, str):
-                try:
-                    mentioned_messages = json.loads(mentioned_messages)
-                except (json.JSONDecodeError, TypeError):
-                    mentioned_messages = []
-            if mentioned_messages:
-                lines.extend([
-                    "## Mentioned Messages",
-                    "",
-                    *[f"- {msg}" for msg in mentioned_messages],
-                    "",
-                ])
-
         if req.get('reasoning'):
             lines.extend([
                 "## Extraction Reasoning",

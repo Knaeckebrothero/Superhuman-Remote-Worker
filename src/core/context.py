@@ -660,7 +660,11 @@ class ContextManager:
         formatted_parts = []
         for msg in messages:
             if isinstance(msg, SystemMessage):
-                continue  # Skip system messages
+                # Include prior summaries in the new summarization so context is preserved
+                # Skip other system messages (like the main system prompt)
+                if "[Summary of prior work]" in msg.content:
+                    formatted_parts.append(f"Prior Summary: {msg.content}")
+                continue
             elif isinstance(msg, HumanMessage):
                 formatted_parts.append(f"User: {msg.content[:500]}")
             elif isinstance(msg, AIMessage):
@@ -745,8 +749,18 @@ Conversation:
         Returns:
             Compacted message list with summary prepended
         """
-        # Separate system messages
-        system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+        # Separate system messages into:
+        # 1. Regular system messages (keep in output)
+        # 2. Old summary messages (incorporate into new summary, then discard)
+        # Old summaries are identified by the "[Summary of prior work]" prefix
+        system_msgs = [
+            m for m in messages
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" not in m.content
+        ]
+        old_summaries = [
+            m for m in messages
+            if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
+        ]
         conversation = [m for m in messages if not isinstance(m, SystemMessage)]
 
         if len(conversation) <= self.config.keep_recent_messages:
@@ -760,9 +774,13 @@ Conversation:
         messages_to_summarize = conversation[:safe_start]
         recent_messages = conversation[safe_start:]
 
+        # Include old summaries at the start so their context is incorporated
+        # into the new summary (rolling summary pattern)
+        messages_for_summarization = old_summaries + messages_to_summarize
+
         # Generate summary
         summary = await self.summarize_conversation(
-            messages_to_summarize,
+            messages_for_summarization,
             llm,
             summarization_prompt,
             oss_reasoning_level,
@@ -771,7 +789,7 @@ Conversation:
 
         # Guard: if summary is larger than what we're replacing, skip compaction
         summary_tokens = self.get_token_count([SystemMessage(content=summary)])
-        original_tokens = self.get_token_count(messages_to_summarize)
+        original_tokens = self.get_token_count(messages_for_summarization)
         if summary_tokens > original_tokens:
             logger.error(
                 f"Summary ({summary_tokens} tokens) larger than original ({original_tokens} tokens) — skipping compaction"
@@ -784,12 +802,21 @@ Conversation:
             content=f"[Summary of prior work]\n{summary}"
         )
 
-        # Generate removal markers for ALL conversation messages (summarized + recent)
-        # We remove recent messages too and re-add them as fresh copies so they appear
-        # AFTER the summary in the correct order
+        # Generate removal markers for:
+        # 1. ALL conversation messages (summarized + recent) - recent are re-added as fresh copies
+        # 2. Old summary messages - they've been incorporated into the new summary
         removal_markers = []
         messages_without_ids = 0
-        for msg in conversation:  # All conversation messages, not just messages_to_summarize
+
+        # Remove old summaries (they've been merged into the new summary)
+        for msg in old_summaries:
+            if hasattr(msg, 'id') and msg.id:
+                removal_markers.append(RemoveMessage(id=msg.id))
+            else:
+                messages_without_ids += 1
+
+        # Remove conversation messages (recent ones will be re-added as fresh copies)
+        for msg in conversation:
             if hasattr(msg, 'id') and msg.id:
                 removal_markers.append(RemoveMessage(id=msg.id))
             else:
@@ -819,10 +846,11 @@ Conversation:
                 # For any other message type, try to preserve it
                 fresh_recent.append(msg)
 
+        merged_summaries_info = f", merged {len(old_summaries)} prior summaries" if old_summaries else ""
         logger.info(
             f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(fresh_recent)} "
-            f"(summarized {len(messages_to_summarize)} messages, removing {len(removal_markers)}, "
-            f"{messages_without_ids} without IDs)"
+            f"(summarized {len(messages_to_summarize)} messages{merged_summaries_info}, "
+            f"removing {len(removal_markers)}, {messages_without_ids} without IDs)"
         )
 
         # Return: removal markers + system messages + summary + fresh recent
