@@ -18,7 +18,7 @@
     "initial_files": {
       "workspace.md": "prompts/workspace_template.md"
     },
-    "max_read_size": 25000
+    "max_read_words": 25000
   },
   "tools": {
     "workspace": [

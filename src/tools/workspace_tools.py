@@ -85,31 +85,53 @@ def create_workspace_tools(context: ToolContext) -> List:
         raise ValueError("ToolContext must have a workspace_manager for workspace tools")
 
     workspace = context.workspace_manager
-    max_read_size = context.get_config("max_read_size", 25_000)  # 25KB default (~7,500 tokens)
+    # Get word limit (with backward compatibility fallback)
+    max_read_words = context.get_config("max_read_words")
+    if max_read_words is None:
+        # Fall back to legacy bytes limit, convert to words
+        max_read_size_legacy = context.get_config("max_read_size", 137_500)  # ~25k words
+        max_read_words = int(max_read_size_legacy / 5.5)
+
     max_search_results = context.get_config("max_search_results", 50)
 
-    # Initialize PDF reader with same size limit
-    pdf_reader = PDFReader(max_chars_per_read=max_read_size)
+    # Average bytes per word (for estimation before reading file)
+    BYTES_PER_WORD = 5.5
+
+    # Initialize PDF reader with word limit
+    pdf_reader = PDFReader(max_words_per_read=max_read_words)
+
+    # Line-based reading constants (matching Claude Code behavior)
+    DEFAULT_LINE_LIMIT = 2000
+    MAX_LINE_LIMIT = 2000
+    MAX_LINE_LENGTH = 2000  # Truncate lines longer than this
 
     @tool
     def read_file(
         path: str,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
         page_start: Optional[int] = None,
         page_end: Optional[int] = None
     ) -> str:
         """Read content from a file in the workspace.
 
+        For text files, supports line-based access:
+        - read_file("doc.txt") - reads first 2000 lines
+        - read_file("doc.txt", offset=500, limit=100) - lines 500-599
+
         For PDF files, supports page-based access:
-        - read_file("doc.pdf") - reads first pages within size limit
-        - read_file("doc.pdf", page_start=5, page_end=10) - specific page range
+        - read_file("doc.pdf") - reads first pages within word limit
+        - read_file("doc.pdf", page_start=5, page_end=10) - specific pages
 
         Args:
-            path: Relative path to the file (e.g., "documents/GoBD.pdf")
-            page_start: For PDFs: first page to read (1-indexed, default: 1)
-            page_end: For PDFs: last page to read (default: auto-limit by size)
+            path: Relative path to the file (e.g., "workspace.md")
+            offset: For text files: starting line number (1-indexed, default: 1)
+            limit: For text files: number of lines to read (default/max: 2000)
+            page_start: For PDFs: first page to read (1-indexed)
+            page_end: For PDFs: last page to read
 
         Returns:
-            File content or error message. For PDFs, includes page info.
+            File content with line numbers, or error message.
         """
         try:
             # Check file exists
@@ -132,25 +154,44 @@ def create_workspace_tools(context: ToolContext) -> List:
             if page_start is not None or page_end is not None:
                 logger.warning(f"page_start/page_end ignored for non-PDF file: {path}")
 
-            file_size = full_path.stat().st_size
+            # Apply line-based reading defaults
+            start_line = offset if offset is not None else 1
+            line_count = limit if limit is not None else DEFAULT_LINE_LIMIT
+            line_count = min(line_count, MAX_LINE_LIMIT)  # Cap at max
 
-            # Reject files that are too large
-            if file_size > max_read_size:
-                estimated_tokens = file_size // 4
-                max_tokens = max_read_size // 4
-                return (
-                    f"Error: File '{path}' ({file_size:,} bytes, ~{estimated_tokens:,} tokens) "
-                    f"exceeds maximum allowed size ({max_read_size:,} bytes, ~{max_tokens:,} tokens).\n\n"
-                    f"Alternatives:\n"
-                    f"- Use search_files('{path.split('/')[-1].split('.')[0]}') to find specific content\n"
-                    f"- Read individual chunks from the chunks/ directory instead\n"
-                    f"- For document content, always prefer reading from chunks/chunk_XXX.txt files"
-                )
+            if start_line < 1:
+                return "Error: offset must be >= 1 (line numbers are 1-indexed)"
 
+            # Read file content
             content = workspace.read_file(path)
+            lines = content.splitlines()
+            total_lines = len(lines)
+
+            # Validate offset
+            if start_line > total_lines:
+                return f"Error: offset ({start_line}) exceeds total lines ({total_lines})"
+
+            # Extract requested range (convert to 0-indexed internally)
+            end_line = min(start_line + line_count - 1, total_lines)
+            selected_lines = lines[start_line - 1:end_line]
+
+            # Format with line numbers (cat -n style) and truncate long lines
+            output_lines = []
+            for i, line in enumerate(selected_lines, start=start_line):
+                if len(line) > MAX_LINE_LENGTH:
+                    line = line[:MAX_LINE_LENGTH] + "..."
+                output_lines.append(f"{i:6}\t{line}")
+
+            result = "\n".join(output_lines)
+
+            # Add continuation hint if there are more lines
+            if end_line < total_lines:
+                result += f"\n\n[Lines {start_line}-{end_line} of {total_lines}. "
+                result += f"Use offset={end_line + 1} to continue.]"
+
             # Record successful read for read-before-write tracking
             context.record_file_read(path)
-            return content
+            return result
 
         except FileNotFoundError:
             return f"Error: File not found: {path}"
@@ -745,15 +786,19 @@ def create_workspace_tools(context: ToolContext) -> List:
                     total_chars = info.get("estimated_total_chars", 0)
                     page_count = info.get("page_count", 0)
 
-                    if total_chars <= max_read_size:
+                    # Convert chars to estimated words (conservative estimate for PDF text)
+                    estimated_words = total_chars // 5
+
+                    if estimated_words <= max_read_words:
                         lines.append("This document fits in a single read.")
                         lines.append(f'Use: read_file("{path}")')
                     else:
                         # Estimate how many pages fit in one read
                         chars_per_page = info.get("estimated_chars_per_page", 3000)
-                        pages_per_read = max(1, max_read_size // chars_per_page)
+                        words_per_page = chars_per_page // 5  # Approximate words per page
+                        pages_per_read = max(1, max_read_words // words_per_page) if words_per_page > 0 else 1
 
-                        lines.append(f"Suggested approach (document exceeds single-read limit):")
+                        lines.append(f"Suggested approach (document exceeds single-read limit of ~{max_read_words:,} words):")
                         lines.append(f"- Read ~{pages_per_read} pages at a time")
                         lines.append(f'- Start with: read_file("{path}", page_start=1, page_end={min(pages_per_read, page_count)})')
                         if page_count > pages_per_read:
@@ -767,19 +812,20 @@ def create_workspace_tools(context: ToolContext) -> List:
 
             # For non-PDF files, return basic info
             file_size = full_path.stat().st_size
-            estimated_tokens = file_size // 4
+            estimated_words = int(file_size / BYTES_PER_WORD)
+            estimated_tokens = estimated_words  # Roughly 1 word ≈ 1 token
 
             lines = [
                 f"Document: {full_path.name}",
                 f"Type: {full_path.suffix or 'unknown'}",
-                f"File size: {file_size:,} bytes (~{estimated_tokens:,} tokens)",
+                f"File size: {file_size:,} bytes (~{estimated_words:,} words, ~{estimated_tokens:,} tokens)",
             ]
 
-            if file_size <= max_read_size:
+            if estimated_words <= max_read_words:
                 lines.append(f"\nThis file fits in a single read.")
                 lines.append(f'Use: read_file("{path}")')
             else:
-                lines.append(f"\nFile exceeds single-read limit ({max_read_size:,} bytes).")
+                lines.append(f"\nFile exceeds single-read limit (~{max_read_words:,} words).")
                 lines.append("Consider using search_files() or chunking.")
 
             return "\n".join(lines)

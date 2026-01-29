@@ -21,14 +21,14 @@ except ImportError:
 class PDFReader:
     """Utility class for page-based PDF reading with auto-pagination."""
 
-    def __init__(self, max_chars_per_read: int = 25_000):
-        """Initialize PDF reader with size limits.
+    def __init__(self, max_words_per_read: int = 25_000):
+        """Initialize PDF reader with word limits.
 
         Args:
-            max_chars_per_read: Maximum characters to return in a single read.
-                               Default 25,000 (~6,250 tokens).
+            max_words_per_read: Maximum words to return in a single read.
+                               Default 25,000 (~25,000 tokens).
         """
-        self.max_chars = max_chars_per_read
+        self.max_words = max_words_per_read
 
     def is_available(self) -> bool:
         """Check if PDF reading is available."""
@@ -150,13 +150,13 @@ class PDFReader:
             "total_pages": 0,
             "was_truncated": False,
             "next_page": None,
-            "chars_read": 0,
+            "words_read": 0,
             "page_start": page_start,
             "page_end": page_end,
         }
 
         text_parts: List[str] = []
-        total_chars = 0
+        total_words = 0
 
         with pdfplumber.open(path) as pdf:
             total_pages = len(pdf.pages)
@@ -182,14 +182,17 @@ class PDFReader:
                 page = pdf.pages[page_num - 1]
                 page_text = page.extract_text() or ""
 
-                # Check if adding this page would exceed limit
+                # Count words in this page
+                page_words = len(page_text.split())
+
+                # Check if adding this page would exceed word limit
                 # (Only check when page_end is not explicitly set)
-                if page_end is None and total_chars + len(page_text) > self.max_chars:
+                if page_end is None and total_words + page_words > self.max_words:
                     # If we haven't read anything yet, read at least one page
                     if not text_parts:
                         text_parts.append(f"[PAGE {page_num}]\n{page_text}")
                         read_info["pages_read"].append(page_num)
-                        total_chars += len(page_text)
+                        total_words += page_words
 
                     read_info["was_truncated"] = True
                     read_info["next_page"] = page_num if not text_parts else page_num
@@ -197,7 +200,7 @@ class PDFReader:
 
                 text_parts.append(f"[PAGE {page_num}]\n{page_text}")
                 read_info["pages_read"].append(page_num)
-                total_chars += len(page_text)
+                total_words += page_words
 
             # Set next_page if there are more pages
             if read_info["pages_read"]:
@@ -205,7 +208,7 @@ class PDFReader:
                 if last_read < total_pages:
                     read_info["next_page"] = last_read + 1
 
-        read_info["chars_read"] = total_chars
+        read_info["words_read"] = total_words
         return "\n\n".join(text_parts), read_info
 
 
@@ -265,8 +268,8 @@ def format_read_info(info: Dict[str, Any], file_path: str) -> str:
 
     lines = [
         "---",
-        f"Reached size limit after {len(info['pages_read'])} pages "
-        f"(~{info['chars_read']:,} chars).",
+        f"Reached word limit after {len(info['pages_read'])} pages "
+        f"(~{info['words_read']:,} words).",
     ]
 
     if info["next_page"]:

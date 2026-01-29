@@ -91,11 +91,16 @@
           },
           "description": "Files to copy into workspace on initialization. Keys are destination paths, values are source paths relative to src/agent/config/"
         },
+        "max_read_words": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 25000,
+          "description": "Maximum word count for workspace read operations. For non-PDF files, estimated from file size (bytes / 5.5). For PDFs, counted during page iteration."
+        },
         "max_read_size": {
           "type": "integer",
           "minimum": 1000,
-          "default": 50000,
-          "description": "Maximum file size in characters for workspace read operations"
+          "description": "DEPRECATED: Use max_read_words instead. If max_read_words is not set, falls back to max_read_size / 5.5."
         }
       }
     },
