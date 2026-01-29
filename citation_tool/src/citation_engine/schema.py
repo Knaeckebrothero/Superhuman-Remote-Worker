@@ -29,8 +29,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 -- Sources table: canonical documents, websites, databases, or custom artifacts
+-- job_id is TEXT in SQLite (no FK since jobs table doesn't exist in standalone mode)
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT,
     type TEXT NOT NULL CHECK(type IN ('document', 'website', 'database', 'custom')),
     identifier TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -42,13 +44,16 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 
 -- Index on identifier for quick lookups
+CREATE INDEX IF NOT EXISTS idx_sources_job_id ON sources(job_id);
 CREATE INDEX IF NOT EXISTS idx_sources_identifier ON sources(identifier);
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
 CREATE INDEX IF NOT EXISTS idx_sources_name ON sources(name);
 
 -- Citations table: links claims to their supporting evidence
+-- job_id is TEXT in SQLite (no FK since jobs table doesn't exist in standalone mode)
 CREATE TABLE IF NOT EXISTS citations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT,
     claim TEXT NOT NULL,
     verbatim_quote TEXT,
     quote_context TEXT NOT NULL,
@@ -68,6 +73,7 @@ CREATE TABLE IF NOT EXISTS citations (
 );
 
 -- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_citations_job_id ON citations(job_id);
 CREATE INDEX IF NOT EXISTS idx_citations_source_id ON citations(source_id);
 CREATE INDEX IF NOT EXISTS idx_citations_created_by ON citations(created_by);
 CREATE INDEX IF NOT EXISTS idx_citations_verification_status ON citations(verification_status);
@@ -119,8 +125,10 @@ EXCEPTION
 END $$;
 
 -- Sources table
+-- job_id is UUID but no FK here (FK is in main project's schema.sql)
 CREATE TABLE IF NOT EXISTS sources (
     id SERIAL PRIMARY KEY,
+    job_id UUID,
     type source_type NOT NULL,
     identifier TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -132,13 +140,16 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 
 -- Index on identifier for quick lookups
+CREATE INDEX IF NOT EXISTS idx_sources_job_id ON sources(job_id);
 CREATE INDEX IF NOT EXISTS idx_sources_identifier ON sources(identifier);
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
 CREATE INDEX IF NOT EXISTS idx_sources_name ON sources(name);
 
 -- Citations table
+-- job_id is UUID but no FK here (FK is in main project's schema.sql)
 CREATE TABLE IF NOT EXISTS citations (
     id SERIAL PRIMARY KEY,
+    job_id UUID,
     claim TEXT NOT NULL,
     verbatim_quote TEXT,
     quote_context TEXT NOT NULL,
@@ -157,6 +168,7 @@ CREATE TABLE IF NOT EXISTS citations (
 );
 
 -- Indexes for common queries
+CREATE INDEX IF NOT EXISTS idx_citations_job_id ON citations(job_id);
 CREATE INDEX IF NOT EXISTS idx_citations_source_id ON citations(source_id);
 CREATE INDEX IF NOT EXISTS idx_citations_created_by ON citations(created_by);
 CREATE INDEX IF NOT EXISTS idx_citations_verification_status ON citations(verification_status);

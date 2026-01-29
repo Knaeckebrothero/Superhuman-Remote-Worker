@@ -684,13 +684,17 @@ class CitationEngine:
         # Serialize metadata to JSON
         metadata_json = json.dumps(metadata) if metadata else None
 
+        # Get job_id from context (session_id is the job_id)
+        job_id = self.context.session_id if self.context else None
+
         # Prepare insert query based on database type
         if self._db_type == "sqlite":
             query = """
-                INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO sources (job_id, type, identifier, name, version, content, content_hash, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """
             params = (
+                job_id,
                 source_type.value,
                 identifier,
                 name,
@@ -701,11 +705,12 @@ class CitationEngine:
             )
         else:
             query = """
-                INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO sources (job_id, type, identifier, name, version, content, content_hash, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """
             params = (
+                job_id,
                 source_type.value,
                 identifier,
                 name,
@@ -1080,9 +1085,11 @@ class CitationEngine:
         # Check if relevance_reasoning is required based on configuration
         self._validate_reasoning_requirement(conf, relevance_reasoning)
 
-        # Get created_by from context for audit trail
+        # Get job_id and created_by from context for audit trail
+        job_id = None
         created_by = None
         if self.context:
+            job_id = self.context.session_id
             created_by = (
                 f"{self.context.session_id}:{self.context.agent_id}"
                 if self.context.agent_id
@@ -1096,12 +1103,13 @@ class CitationEngine:
         if self._db_type == "sqlite":
             query = """
                 INSERT INTO citations (
-                    claim, verbatim_quote, quote_context, quote_language,
+                    job_id, claim, verbatim_quote, quote_context, quote_language,
                     relevance_reasoning, confidence, extraction_method,
                     source_id, locator, verification_status, created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """
             params = (
+                job_id,
                 claim,
                 verbatim_quote,
                 quote_context,
@@ -1116,13 +1124,14 @@ class CitationEngine:
         else:
             query = """
                 INSERT INTO citations (
-                    claim, verbatim_quote, quote_context, quote_language,
+                    job_id, claim, verbatim_quote, quote_context, quote_language,
                     relevance_reasoning, confidence, extraction_method,
                     source_id, locator, verification_status, created_by
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s)
                 RETURNING id
             """
             params = (
+                job_id,
                 claim,
                 verbatim_quote,
                 quote_context,
@@ -1598,74 +1607,110 @@ Respond in JSON format."""
     # RETRIEVAL METHODS
     # =========================================================================
 
-    def get_source(self, source_id: int) -> Source | None:
+    def get_source(self, source_id: int, job_id: str | None = None) -> Source | None:
         """
-        Get a source by ID.
+        Get a source by ID, optionally verifying job_id ownership.
 
         Args:
             source_id: The ID of the source to retrieve
+            job_id: Optional job_id to verify ownership (defaults to context.session_id)
 
         Returns:
-            Source object or None if not found
+            Source object or None if not found or job_id doesn't match
         """
-        log.debug(f"Retrieving source [{source_id}]")
+        # Default to context's job_id if not provided
+        if job_id is None and self.context:
+            job_id = self.context.session_id
 
-        if self._db_type == "sqlite":
-            query = "SELECT * FROM sources WHERE id = ?"
+        log.debug(f"Retrieving source [{source_id}], job_id={job_id}")
+
+        if job_id is not None:
+            if self._db_type == "sqlite":
+                query = "SELECT * FROM sources WHERE id = ? AND job_id = ?"
+            else:
+                query = "SELECT * FROM sources WHERE id = %s AND job_id = %s"
+            results = self._query(query, (source_id, job_id))
         else:
-            query = "SELECT * FROM sources WHERE id = %s"
+            if self._db_type == "sqlite":
+                query = "SELECT * FROM sources WHERE id = ?"
+            else:
+                query = "SELECT * FROM sources WHERE id = %s"
+            results = self._query(query, (source_id,))
 
-        results = self._query(query, (source_id,))
         if not results:
-            log.debug(f"Source [{source_id}] not found")
+            log.debug(f"Source [{source_id}] not found (job_id={job_id})")
             return None
 
         return self._row_to_source(results[0])
 
-    def get_citation(self, citation_id: int) -> Citation | None:
+    def get_citation(self, citation_id: int, job_id: str | None = None) -> Citation | None:
         """
-        Get a citation by ID.
+        Get a citation by ID, optionally verifying job_id ownership.
 
         Args:
             citation_id: The ID of the citation to retrieve
+            job_id: Optional job_id to verify ownership (defaults to context.session_id)
 
         Returns:
-            Citation object or None if not found
+            Citation object or None if not found or job_id doesn't match
         """
-        log.debug(f"Retrieving citation [{citation_id}]")
+        # Default to context's job_id if not provided
+        if job_id is None and self.context:
+            job_id = self.context.session_id
 
-        if self._db_type == "sqlite":
-            query = "SELECT * FROM citations WHERE id = ?"
+        log.debug(f"Retrieving citation [{citation_id}], job_id={job_id}")
+
+        if job_id is not None:
+            if self._db_type == "sqlite":
+                query = "SELECT * FROM citations WHERE id = ? AND job_id = ?"
+            else:
+                query = "SELECT * FROM citations WHERE id = %s AND job_id = %s"
+            results = self._query(query, (citation_id, job_id))
         else:
-            query = "SELECT * FROM citations WHERE id = %s"
+            if self._db_type == "sqlite":
+                query = "SELECT * FROM citations WHERE id = ?"
+            else:
+                query = "SELECT * FROM citations WHERE id = %s"
+            results = self._query(query, (citation_id,))
 
-        results = self._query(query, (citation_id,))
         if not results:
-            log.debug(f"Citation [{citation_id}] not found")
+            log.debug(f"Citation [{citation_id}] not found (job_id={job_id})")
             return None
 
         return self._row_to_citation(results[0])
 
-    def get_citations_for_source(self, source_id: int) -> list[Citation]:
+    def get_citations_for_source(self, source_id: int, job_id: str | None = None) -> list[Citation]:
         """
-        Get all citations referencing a source.
+        Get all citations referencing a source within a job.
 
         Args:
             source_id: The ID of the source
+            job_id: Optional job_id filter (defaults to context.session_id)
 
         Returns:
-            List of Citation objects
+            List of Citation objects for the specified job
         """
-        log.debug(f"Retrieving citations for source [{source_id}]")
+        # Default to context's job_id if not provided
+        if job_id is None and self.context:
+            job_id = self.context.session_id
 
-        if self._db_type == "sqlite":
-            query = "SELECT * FROM citations WHERE source_id = ? ORDER BY created_at DESC"
+        log.debug(f"Retrieving citations for source [{source_id}], job_id={job_id}")
+
+        if job_id is not None:
+            if self._db_type == "sqlite":
+                query = "SELECT * FROM citations WHERE source_id = ? AND job_id = ? ORDER BY created_at DESC"
+            else:
+                query = "SELECT * FROM citations WHERE source_id = %s AND job_id = %s ORDER BY created_at DESC"
+            results = self._query(query, (source_id, job_id))
         else:
-            query = "SELECT * FROM citations WHERE source_id = %s ORDER BY created_at DESC"
+            if self._db_type == "sqlite":
+                query = "SELECT * FROM citations WHERE source_id = ? ORDER BY created_at DESC"
+            else:
+                query = "SELECT * FROM citations WHERE source_id = %s ORDER BY created_at DESC"
+            results = self._query(query, (source_id,))
 
-        results = self._query(query, (source_id,))
         citations = [self._row_to_citation(row) for row in results]
-        log.debug(f"Found {len(citations)} citations for source [{source_id}]")
+        log.debug(f"Found {len(citations)} citations for source [{source_id}], job_id={job_id}")
         return citations
 
     def get_citations_by_session(self, session_id: str) -> list[Citation]:
@@ -1692,30 +1737,50 @@ Respond in JSON format."""
         log.debug(f"Found {len(citations)} citations for session: {session_id}")
         return citations
 
-    def list_sources(self, source_type: str | None = None) -> list[Source]:
+    def list_sources(
+        self,
+        source_type: str | None = None,
+        job_id: str | None = None,
+    ) -> list[Source]:
         """
-        List all registered sources, optionally filtered by type.
+        List registered sources, filtered by job_id and optionally by type.
 
         Args:
             source_type: Optional type filter (document, website, database, custom)
+            job_id: Optional job_id filter (defaults to context.session_id if available)
 
         Returns:
-            List of Source objects
+            List of Source objects for the specified job
         """
-        log.debug(f"Listing sources, type filter: {source_type or 'all'}")
+        # Default to context's job_id if not provided
+        if job_id is None and self.context:
+            job_id = self.context.session_id
 
-        if source_type:
-            if self._db_type == "sqlite":
-                query = "SELECT * FROM sources WHERE type = ? ORDER BY created_at DESC"
-            else:
-                query = "SELECT * FROM sources WHERE type = %s ORDER BY created_at DESC"
-            results = self._query(query, (source_type,))
-        else:
-            query = "SELECT * FROM sources ORDER BY created_at DESC"
-            results = self._query(query)
+        log.debug(f"Listing sources, job_id={job_id}, type filter: {source_type or 'all'}")
 
+        conditions = []
+        params = []
+
+        if job_id is not None:
+            conditions.append("job_id = ?")
+            params.append(job_id)
+
+        if source_type is not None:
+            conditions.append("type = ?")
+            params.append(source_type)
+
+        query = "SELECT * FROM sources"
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+
+        # Adjust placeholders for PostgreSQL
+        if self._db_type == "postgresql":
+            query = query.replace("?", "%s")
+
+        results = self._query(query, tuple(params) if params else None)
         sources = [self._row_to_source(row) for row in results]
-        log.debug(f"Found {len(sources)} sources")
+        log.debug(f"Found {len(sources)} sources for job_id={job_id}")
         return sources
 
     def list_citations(
@@ -1723,25 +1788,35 @@ Respond in JSON format."""
         source_id: int | None = None,
         session_id: str | None = None,
         verification_status: str | None = None,
+        job_id: str | None = None,
     ) -> list[Citation]:
         """
         List citations with optional filters.
 
         Args:
             source_id: Filter by source ID
-            session_id: Filter by session ID
+            session_id: Filter by session ID (legacy, uses created_by LIKE)
             verification_status: Filter by verification status
+            job_id: Filter by job_id (defaults to context.session_id if available)
 
         Returns:
-            List of Citation objects
+            List of Citation objects for the specified job
         """
+        # Default to context's job_id if not provided
+        if job_id is None and self.context:
+            job_id = self.context.session_id
+
         log.debug(
-            f"Listing citations: source_id={source_id}, session_id={session_id}, "
-            f"status={verification_status}"
+            f"Listing citations: job_id={job_id}, source_id={source_id}, "
+            f"session_id={session_id}, status={verification_status}"
         )
 
         conditions = []
         params = []
+
+        if job_id is not None:
+            conditions.append("job_id = ?")
+            params.append(job_id)
 
         if source_id is not None:
             conditions.append("source_id = ?")
@@ -1766,7 +1841,7 @@ Respond in JSON format."""
 
         results = self._query(query, tuple(params) if params else None)
         citations = [self._row_to_citation(row) for row in results]
-        log.debug(f"Found {len(citations)} citations matching filters")
+        log.debug(f"Found {len(citations)} citations for job_id={job_id}")
         return citations
 
     def _row_to_source(self, row: dict[str, Any]) -> Source:
