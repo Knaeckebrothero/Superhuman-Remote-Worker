@@ -485,10 +485,7 @@ The requirement will be validated and integrated into the knowledge graph.
 - `source_document` (str, optional): Source document path
 - `source_location` (str, optional): Location in document (e.g., "Section 3.2")
 - `citations` (str, optional): Comma-separated citation IDs
-- `mentioned_objects` (str, optional): Comma-separated BusinessObject names
-- `mentioned_messages` (str, optional): Comma-separated Message names
 - `reasoning` (str, optional): Extraction reasoning
-- `confidence` (float, optional): Confidence score 0.0-1.0 (default: 0.8)
 
 **Returns:** Requirement ID and confirmation
 
@@ -502,8 +499,7 @@ write_requirement_to_cache(
     gobd_relevant=True,
     source_document="documents/GoBD.pdf",
     source_location="Section 3.2",
-    mentioned_objects="Invoice,Record",
-    confidence=0.92
+    citations="CIT-001,CIT-002"
 )
 ```""",
 

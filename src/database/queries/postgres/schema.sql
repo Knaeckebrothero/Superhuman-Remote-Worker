@@ -79,39 +79,68 @@ CREATE TABLE IF NOT EXISTS requirements (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
 
+    -- ========================================================================
+    -- CREATOR FIELDS (filled by Creator Agent)
+    -- ========================================================================
+
     -- Requirement identification
-    requirement_id VARCHAR(100),  -- Optional external/canonical ID
+    requirement_id VARCHAR(100),  -- Globally unique ID assigned by Creator
 
     -- Requirement content
-    text TEXT NOT NULL,
-    name VARCHAR(500),
+    name VARCHAR(500),            -- Short, content-appropriate designation
+    text TEXT NOT NULL,           -- Full requirement description (atomic, verifiable)
     type VARCHAR(100),            -- functional, compliance, constraint, etc.
     priority VARCHAR(50),         -- high, medium, low
 
     -- Source tracking
-    source_document TEXT,
-    source_location JSONB,        -- {article, paragraph, page, etc.}
+    source_document TEXT,         -- Document path/name
+    source_location JSONB,        -- {page, section, paragraph, line, marginal_number}
 
     -- Compliance relevance
     gobd_relevant BOOLEAN DEFAULT FALSE,
     gdpr_relevant BOOLEAN DEFAULT FALSE,
 
-    -- Research data (from Creator)
-    citations JSONB DEFAULT '[]',
-    mentioned_objects JSONB DEFAULT '[]',
-    mentioned_messages JSONB DEFAULT '[]',
-    reasoning TEXT,
-    research_notes TEXT,
-    confidence FLOAT DEFAULT 0.0,
+    -- Creator research data
+    citations JSONB DEFAULT '[]',      -- Citation IDs linking to citations table
+    reasoning TEXT,                    -- Creator's extraction reasoning
+    research_notes TEXT,               -- Additional notes from Creator
 
-    -- Validation (from Validator)
-    -- neo4j_id: The Neo4j node rid after the requirement is integrated into the graph.
-    -- Validator queries WHERE neo4j_id IS NULL to find unprocessed requirements.
-    neo4j_id VARCHAR(100),
-    validation_result JSONB,
-    rejection_reason TEXT,
+    -- ========================================================================
+    -- VALIDATOR FIELDS (filled by Validator Agent)
+    -- ========================================================================
 
-    -- Processing metadata
+    -- Quality assessment
+    quality_score FLOAT,                        -- Numeric quality score (0.0-1.0)
+    quality_class VARCHAR(50),                  -- Quality classification (A/B/C or similar)
+
+    -- ISO/IEC/IEEE 29148:2018 evaluation (9 criteria)
+    -- Each criterion: necessary, appropriate, unambiguous, complete, singular,
+    --                 feasible, verifiable, correct, conforming
+    iso_29148_evaluation JSONB,                 -- {criterion: {score, notes}, ...}
+
+    -- Fulfillment assessment against domain model
+    fulfillment_status VARCHAR(50),             -- FULFILLED, PARTIALLY_FULFILLED, NOT_FULFILLED, UNCLEAR
+    fulfillment_justification TEXT,             -- Explanation for the status
+
+    -- Domain model mapping
+    found_model_elements JSONB,                 -- BusinessObjects, attributes, services found
+    attribute_quality_assessment JSONB,         -- Attribute quality checks per found element
+
+    -- Graph integration
+    neo4j_id VARCHAR(100),                      -- Neo4j node ID after integration
+    graph_query TEXT,                           -- Cypher query used for validation/integration
+
+    -- Recommendations
+    recommendations TEXT,                       -- Improvement suggestions from Validator
+
+    -- Legacy/compatibility (may be removed in future)
+    validation_result JSONB,                    -- Deprecated: use structured fields above
+    rejection_reason TEXT,                      -- Deprecated: use fulfillment_justification
+
+    -- ========================================================================
+    -- PROCESSING METADATA
+    -- ========================================================================
+
     status VARCHAR(50) NOT NULL DEFAULT 'pending',
     retry_count INTEGER DEFAULT 0,
     last_error TEXT,
@@ -123,7 +152,8 @@ CREATE TABLE IF NOT EXISTS requirements (
 
     tags JSONB DEFAULT '[]',
 
-    CONSTRAINT valid_req_status CHECK (status IN ('pending', 'validating', 'integrated', 'rejected', 'failed'))
+    CONSTRAINT valid_req_status CHECK (status IN ('pending', 'validating', 'integrated', 'rejected', 'failed')),
+    CONSTRAINT valid_fulfillment_status CHECK (fulfillment_status IS NULL OR fulfillment_status IN ('FULFILLED', 'PARTIALLY_FULFILLED', 'NOT_FULFILLED', 'UNCLEAR'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_requirements_job_id ON requirements(job_id);
