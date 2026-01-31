@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Universal Agent Entry Point.
 
 Run the Universal Agent in various modes:
@@ -53,7 +52,6 @@ Examples:
     # Recover to a specific phase and resume
     python agent.py --config validator --job-id abc123 --recover-phase 2 --resume
 """
-
 import argparse
 import asyncio
 import json
@@ -257,10 +255,10 @@ def parse_args():
     # Configuration
     parser.add_argument(
         "--config", "-c",
-        default="creator",
+        default="defaults",
         help=(
-            "Agent config name or path. Looks in configs/{name}/ first, "
-            "then src/agent/config/. (default: creator)"
+            "Agent config name or path. Looks in config/{name}/config.yaml first, "
+            "then config/{name}.yaml. (default: defaults)"
         ),
     )
 

@@ -27,6 +27,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkpoints_path
 from .core.phase_snapshot import PhaseSnapshotManager
+from .core.loader import get_project_root
 
 
 class _AiosqliteConnectionWrapper:
@@ -443,9 +444,9 @@ class UniversalAgent:
         Returns:
             Template content for workspace.md
         """
-        # Template is at src/config/workspace_template.md
-        config_dir = Path(__file__).parent / "config"
-        template_path = config_dir / "workspace_template.md"
+        # Template is at config/templates/workspace_template.md
+        templates_dir = get_project_root() / "config" / "templates"
+        template_path = templates_dir / "workspace_template.md"
 
         if not template_path.exists():
             raise FileNotFoundError(f"Workspace template not found: {template_path}")

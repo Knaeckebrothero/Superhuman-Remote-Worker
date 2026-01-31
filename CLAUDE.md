@@ -39,18 +39,20 @@ python scripts/app_init.py --restore-backup backups/20260117_001_my_backup
 
 ### Running Agents
 ```bash
-# Process document
-python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+# Run with defaults
+python agent.py --prompt "Your task here" --stream --verbose
 
-# Process directory
-python agent.py --config creator --document-dir ./data/example_data/ --prompt "Extract requirements" --stream --verbose
+# Run with custom config
+python agent.py --config my_agent --prompt "Your task" --stream --verbose
+
+# Process document
+python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
 
 # Start as API server
-python agent.py --config creator --port 8001
-python agent.py --config validator --port 8002
+python agent.py --port 8001
 
 # Resume from checkpoint
-python agent.py --config creator --job-id <id> --resume
+python agent.py --job-id <id> --resume
 ```
 
 ### Testing
@@ -70,6 +72,16 @@ ruff format src/ tests/         # Format
 mypy src/                       # Type check
 ```
 
+### Cockpit (Angular Frontend)
+```bash
+cd cockpit
+npm install                     # Install dependencies
+npm start                       # Dev server at http://localhost:4000
+npm run build                   # Production build
+npm test                        # Run vitest tests
+npm run test:watch              # Watch mode
+```
+
 ### Validation
 ```bash
 python validate_metamodel.py --check all --json
@@ -79,14 +91,13 @@ python validate_metamodel.py --check all --json
 
 ### Universal Agent Pattern
 
-Single codebase configured for different roles via JSON configs in `configs/`:
+Single codebase configured for different roles via JSON configs in `config/`. See `config/README.md` for full documentation on creating custom agent configs.
 
-| Config | Purpose | Polls | Key Tools |
-|--------|---------|-------|-----------|
-| `creator` | Extract requirements from documents | `jobs` table | document, search, citation, cache |
-| `validator` | Validate and integrate into Neo4j | `requirements` table | execute_cypher_query, get_database_schema, validate_schema_compliance |
-
-Data flow: Creator → `requirements` table → Validator → Neo4j
+Config structure:
+- `config/defaults.json` - Framework defaults (all configs extend this)
+- `config/schema.json` - JSON Schema for config validation
+- `config/my_agent.json` - Custom single-file config
+- `config/my_agent/config.json` - Custom directory config (with prompt overrides)
 
 ### Phase Alternation Model
 
@@ -130,15 +141,19 @@ init_workspace → init_strategic_todos
 
 ### Configuration Inheritance
 
-Configs use `"$extends": "defaults"` to inherit from `src/config/defaults.json`. Deep merge applies - set value to `null` to clear inherited defaults. The config schema (`src/config/schema.json`) provides IDE autocompletion via `"$schema"`.
+Configs use `$extends: defaults` to inherit from `config/defaults.yaml`. Deep merge applies - set value to `null` to clear inherited defaults. The config schema (`config/schema.json`) provides IDE autocompletion via the YAML language server comment.
 
-```json
-{
-  "$schema": "../../src/config/schema.json",
-  "$extends": "defaults",
-  "agent_id": "creator",
-  "tools": { "domain": ["extract_document_text", "web_search", ...] }
-}
+```yaml
+# yaml-language-server: $schema=schema.json
+$extends: defaults
+
+agent_id: my_agent
+display_name: My Custom Agent
+
+tools:
+  domain:
+    - web_search
+    - cite_web
 ```
 
 Tool categories in config:
@@ -176,11 +191,10 @@ Token limits trigger automatic summarization:
 - `message_count_threshold`: 150 messages
 - `keep_recent_tool_results`: 10 most recent preserved during compaction
 
-### Phase Settings
+### Todo Limits
 
-Phase transition validation (in `phase_settings` config section):
-- `min_todos`: 5 (minimum todos required for strategic→tactical transition)
-- `max_todos`: 20 (maximum todos allowed)
+Todo constraints (in `todo` config section):
+- `max_items`: 20 (maximum todos allowed per phase)
 
 ## Key Source Directories
 
@@ -202,8 +216,9 @@ Phase transition validation (in `phase_settings` config section):
   - `neo4j_db.py` - Neo4j session-based with namespaces
   - `schema.sql` - PostgreSQL schema
 - `src/api/` - FastAPI application
-- `configs/` - Agent-specific configurations (`creator/`, `validator/`)
+- `config/` - Configuration files, defaults, schema, and prompt templates
 - `dashboard/` - Streamlit UI
+- `cockpit/` - Angular frontend for graph visualization and management
 - `citation_tool/` - Separate installable package for citation management
 
 ## Environment Variables
@@ -219,8 +234,7 @@ Required in `.env`:
 | Service | Port |
 |---------|------|
 | Dashboard | 8501 |
-| Creator API | 8001 |
-| Validator API | 8002 |
+| Agent API (default) | 8001 |
 | Cockpit Frontend | 4000 |
 | Cockpit API | 8085 |
 | Neo4j Bolt | 7687 |

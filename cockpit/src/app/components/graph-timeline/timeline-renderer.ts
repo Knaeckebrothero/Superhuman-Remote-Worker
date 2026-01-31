@@ -406,7 +406,12 @@ export class TimelineRenderer {
       }
 
       // Build set of node IDs being added for edge validation
-      const nodeIds = new Set(elements.filter(e => e.group === 'nodes').map(e => e.data?.id));
+      const nodeIds = new Set(
+        elements
+          .filter(e => e.group === 'nodes')
+          .map(e => e.data?.id)
+          .filter((id): id is string => id !== undefined)
+      );
 
       // Add all relationships (with fuzzy matching for source/target)
       for (const [id, rel] of Object.entries(snapshot.relationships)) {
