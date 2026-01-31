@@ -38,10 +38,10 @@ Edit `.env` with your configuration:
 - `LLM_BASE_URL` - Custom endpoint URL (if using self-hosted models)
 
 **Optional:**
-- `TAVILY_API_KEY` - For web search functionality in Creator agent
+- `TAVILY_API_KEY` - For web search functionality
 - `NEO4J_PASSWORD`, `POSTGRES_PASSWORD` - Custom database passwords
 - `LOG_LEVEL` - DEBUG, INFO, WARNING, ERROR (default: INFO)
-- Port overrides: `CREATOR_PORT`, `VALIDATOR_PORT`, `DASHBOARD_PORT`, etc.
+- Port overrides: `AGENT_PORT`, `DASHBOARD_PORT`, etc.
 
 ### 3. Start All Services
 
@@ -50,10 +50,9 @@ podman-compose up -d
 ```
 
 This starts:
-- **PostgreSQL** - Job tracking and requirement cache
-- **Neo4j** - Knowledge graph storage
-- **Creator Agent** - Document processing and requirement extraction
-- **Validator Agent** - Requirement validation and graph integration
+- **PostgreSQL** - Job tracking and data cache
+- **Neo4j** - Knowledge graph storage (optional)
+- **Agent** - Universal agent for document processing
 - **Dashboard** - Streamlit UI for job management
 
 ### 4. Access Services
@@ -62,15 +61,14 @@ This starts:
 |---------|-----|
 | Dashboard | http://localhost:8501 |
 | Neo4j Browser | http://localhost:7474 |
-| Creator API | http://localhost:8001 |
-| Validator API | http://localhost:8002 |
+| Agent API | http://localhost:8001 |
 
 ### 5. Common Operations
 
 ```bash
 # View logs
 podman-compose logs -f
-podman-compose logs -f creator validator
+podman-compose logs -f agent
 
 # Check service status
 podman-compose ps
@@ -130,20 +128,20 @@ python scripts/app_init.py --force-reset --seed
 ### 5. Run Agents Locally
 
 ```bash
-# Process a document
-python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements"
+# Process a document (uses defaults config)
+python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements"
 
-# Run Creator as API server
-python agent.py --config creator --port 8001
+# Run as API server
+python agent.py --port 8001
 
-# Run Validator as API server
-python agent.py --config validator --port 8002
+# Run with custom config
+python agent.py --config my_agent --port 8001
 
 # Run with streaming output
-python agent.py --config creator --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
 
-# Perform a full scale test
-python agent.py --config creator --document-dir ./data/example_data/ --prompt "Identify possible requirements for a medium sized car rental company based on the provided GoBD document." --stream --verbose
+# Process a directory of documents
+python agent.py --document-dir ./data/example_data/ --prompt "Identify possible requirements" --stream --verbose
 ```
 
 ### 6. Crash Recovery & Checkpointing
@@ -152,13 +150,13 @@ The agent automatically creates checkpoints during execution, enabling resume af
 
 ```bash
 # Start a job with explicit job ID (for later resume)
-python agent.py --config creator --job-id my-job-123 --document-path ./data/doc.pdf --prompt "Extract requirements"
+python agent.py --job-id my-job-123 --document-path ./data/doc.pdf --prompt "Extract requirements"
 
 # If the agent crashes, resume from the last checkpoint
-python agent.py --config creator --job-id my-job-123 --resume
+python agent.py --job-id my-job-123 --resume
 
 # Resume with streaming output
-python agent.py --config creator --job-id my-job-123 --resume --stream --verbose
+python agent.py --job-id my-job-123 --resume --stream --verbose
 ```
 
 **How it works:**
@@ -208,7 +206,7 @@ podman-compose -f docker-compose.dev.yaml down -v   # Remove data
 
 ## Architecture
 
-The system uses a **Universal Agent** pattern - a single config-driven agent that can be deployed as either Creator or Validator by changing its configuration:
+The system uses a **Universal Agent** pattern - a single config-driven agent that can be customized for different tasks by changing its YAML configuration:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -216,42 +214,34 @@ The system uses a **Universal Agent** pattern - a single config-driven agent tha
 │                  (Streamlit UI - Job Management)                    │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
-         ┌──────────────────────────┴──────────────────────────┐
-         │                                                      │
-         ▼                                                      ▼
-┌───────────────────────────┐                    ┌───────────────────────────┐
-│     UNIVERSAL AGENT       │                    │     UNIVERSAL AGENT       │
-│   (config: creator)       │                    │   (config: validator)     │
-│                           │                    │                           │
-│ - Document processing     │  PostgreSQL Cache  │ - Graph exploration       │
-│ - Requirement extraction  │ ◄────────────────► │ - Relevance checking      │
-│ - Research & citations    │   (requirements)   │ - Fulfillment validation  │
-│                           │                    │ - Neo4j integration       │
-└───────────────────────────┘                    └───────────────────────────┘
-                                                              │
-                                                              ▼
-                                                  ┌─────────────────────┐
-                                                  │       Neo4j         │
-                                                  │  (Knowledge Graph)  │
-                                                  └─────────────────────┘
+                                    ▼
+                    ┌───────────────────────────┐
+                    │     UNIVERSAL AGENT       │
+                    │                           │
+                    │ - Document processing     │
+                    │ - Research & citations    │
+                    │ - Tool execution          │
+                    │ - Phase-based planning    │
+                    └─────────────┬─────────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+                    ▼                           ▼
+        ┌─────────────────────┐     ┌─────────────────────┐
+        │     PostgreSQL      │     │       Neo4j         │
+        │   (Jobs & Cache)    │     │  (Knowledge Graph)  │
+        └─────────────────────┘     └─────────────────────┘
 ```
 
 **Universal Agent:**
 
-The same agent codebase (`src/agent/`) serves both roles. Behavior is determined by configuration:
+Agent behavior is determined by YAML configuration in `config/`:
 
-| Config | Purpose | Tools | Polls |
-|--------|---------|-------|-------|
-| `creator` | Extract requirements from documents | document, search, citation, cache | `jobs` table |
-| `validator` | Validate and integrate into graph | graph, cypher, validation | `requirements` table |
+- `config/defaults.yaml` - Framework defaults (all configs extend this)
+- `config/my_agent.yaml` - Custom single-file config
+- `config/my_agent/config.yaml` - Directory config with prompt overrides
 
-Configs live in `configs/{name}/` and extend framework defaults via `$extends`. See [CLAUDE.md](CLAUDE.md) for the full configuration system.
-
-**Data flow:**
-1. Creator polls `jobs` table → processes document → writes to `requirements` table
-2. Validator queries pending requirements → validates → integrates into Neo4j
-
-For detailed configuration, API reference, and development guidelines, see [CLAUDE.md](CLAUDE.md).
+Configs use `$extends: defaults` to inherit and override specific settings. See [config/README.md](config/README.md) for creating custom configs and [CLAUDE.md](CLAUDE.md) for development guidelines.
 
 ## Debugging
 

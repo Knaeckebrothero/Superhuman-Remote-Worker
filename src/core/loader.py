@@ -1,10 +1,9 @@
 """Configuration and tool loader for Universal Agent.
 
-Handles loading agent configuration from JSON files and dynamically
+Handles loading agent configuration from YAML files and dynamically
 loading the appropriate tools based on configuration.
 """
 
-import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -87,22 +86,23 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
 
     Handles $extends field to load and merge parent configs.
     Supports chained inheritance (A extends B extends C).
+    Supports both YAML and JSON config files.
 
     Args:
-        config_path: Path to the configuration JSON file
+        config_path: Path to the configuration file (YAML or JSON)
 
     Returns:
         Merged configuration dictionary
 
     Example:
         ```python
-        # configs/creator/config.json: {"$extends": "defaults", "agent_id": "creator"}
-        data = load_and_merge_config("configs/creator/config.json")
-        # Returns merged defaults + creator overrides
+        # config/my_agent.yaml with $extends: defaults
+        data = load_and_merge_config("config/my_agent.yaml")
+        # Returns merged defaults + agent overrides
         ```
     """
     with open(config_path, "r", encoding="utf-8") as f:
-        config_data = json.load(f)
+        config_data = yaml.safe_load(f)
 
     # Handle $extends inheritance
     if "$extends" in config_data:
@@ -136,10 +136,10 @@ class PromptResolver:
 
     Example:
         ```python
-        resolver = PromptResolver(deployment_dir="/project/configs/creator")
+        resolver = PromptResolver(deployment_dir="/project/config/my_agent")
 
-        # Will check: /project/configs/creator/instructions.md
-        # Falls back to: src/agent/config/prompts/instructions.md
+        # Will check: /project/config/my_agent/instructions.md
+        # Falls back to: config/prompts/instructions.md
         content = resolver.load("instructions.md")
         ```
     """
@@ -148,11 +148,11 @@ class PromptResolver:
         """Initialize prompt resolver.
 
         Args:
-            deployment_dir: Path to deployment directory (e.g., configs/creator)
+            deployment_dir: Path to deployment directory (e.g., config/my_agent)
                           If None, only framework prompts are used.
         """
         self.deployment_dir = Path(deployment_dir) if deployment_dir else None
-        self.framework_dir = Path(__file__).parent.parent / "config" / "prompts"
+        self.framework_dir = get_project_root() / "config" / "prompts"
 
     def resolve(self, template_name: str) -> Path:
         """Find prompt template, checking deployment dir first.
@@ -320,7 +320,7 @@ class PhaseSettings:
 class AgentConfig:
     """Complete agent configuration.
 
-    Loaded from JSON configuration file (e.g., creator.json, validator.json).
+    Loaded from YAML configuration file (e.g., defaults.yaml, my_agent.yaml).
     """
 
     agent_id: str
@@ -342,7 +342,7 @@ class AgentConfig:
     extra: Dict[str, Any] = field(default_factory=dict)
 
     # Internal: deployment directory for prompt resolution
-    # Set automatically by load_agent_config when loading from configs/
+    # Set automatically by load_agent_config when loading from config/
     _deployment_dir: Optional[str] = None
 
 
@@ -358,7 +358,7 @@ def load_agent_config(
     Args:
         config_path: Path to the configuration JSON file
         deployment_dir: Optional deployment directory for prompt resolution.
-                       Set automatically when loading from configs/{name}/.
+                       Set automatically when loading from config/{name}/.
 
     Returns:
         AgentConfig dataclass with loaded configuration
@@ -370,12 +370,12 @@ def load_agent_config(
 
     Example:
         ```python
-        # Direct load (backward compat)
-        config = load_agent_config("src/agent/config/creator.json")
+        # Single file config
+        config = load_agent_config("config/my_agent.yaml")
 
-        # With inheritance (new style)
-        # configs/creator/config.json: {"$extends": "defaults", "agent_id": "creator"}
-        config = load_agent_config("configs/creator/config.json", "configs/creator")
+        # Directory config with prompt overrides
+        # config/my_agent/config.yaml with $extends: defaults
+        config = load_agent_config("config/my_agent/config.yaml", "config/my_agent")
         ```
     """
     config_path_obj = Path(config_path)
@@ -601,7 +601,7 @@ def load_base_system_prompt(
     allowing deployments to override the base template.
 
     Args:
-        deployment_dir: Path to deployment directory (e.g., configs/creator).
+        deployment_dir: Path to deployment directory (e.g., config/my_agent).
                        If None, only framework templates are used.
 
     Returns:
@@ -625,7 +625,7 @@ def load_phase_component(
 
     Args:
         is_strategic: True for strategic phase, False for tactical
-        deployment_dir: Path to deployment directory (e.g., configs/creator).
+        deployment_dir: Path to deployment directory (e.g., config/my_agent).
                        If None, only framework templates are used.
 
     Returns:
@@ -733,7 +733,7 @@ def load_instructions(
 
     # Legacy path resolution (backward compatibility)
     if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
+        config_dir = get_project_root() / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -800,7 +800,7 @@ def load_summarization_prompt(
 
     # Legacy path resolution (backward compatibility)
     if config_dir is None:
-        config_dir = Path(__file__).parent.parent / "config"
+        config_dir = get_project_root() / "config"
     else:
         config_dir = Path(config_dir)
 
@@ -851,42 +851,43 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     Resolve a config name to a full path and deployment directory.
 
     Resolution order:
-    1. Absolute path or .json suffix -> use as-is
-    2. configs/{name}/config.json (deployment configs at project root)
-    3. src/agent/config/{name}.json (framework configs, backward compat)
+    1. Absolute path or explicit extension (.yaml/.json) -> use as-is
+    2. config/{name}/config.yaml (directory with possible prompt overrides)
+    3. config/{name}.yaml (single file config)
 
     Args:
-        config_name: Config name (e.g., "creator", "validator")
+        config_name: Config name (e.g., "defaults", "my_agent")
                     or full path to config file
 
     Returns:
         Tuple of (config_path, deployment_dir_or_none)
         - config_path: Full path to the config file
         - deployment_dir: Directory containing deployment files (for prompt resolution)
-                         None if using framework config or direct path
+                         None if using single file config or direct path
     """
-    # If it's already a full path or explicit .json file
-    if os.path.isabs(config_name) or config_name.endswith(".json"):
+    # If it's already a full path or has explicit extension
+    if os.path.isabs(config_name) or config_name.endswith((".yaml", ".yml", ".json")):
         return (config_name, None)
 
-    # Try deployment config first (configs/{name}/config.json)
     project_root = get_project_root()
-    deployment_dir = project_root / "configs" / config_name
-    deployment_config = deployment_dir / "config.json"
+    config_dir = project_root / "config"
+
+    # Try directory config first (config/{name}/config.yaml)
+    # This allows prompt overrides in the same directory
+    deployment_dir = config_dir / config_name
+    deployment_config = deployment_dir / "config.yaml"
 
     if deployment_config.exists():
         return (str(deployment_config), str(deployment_dir))
 
-    # Fall back to framework config (src/agent/config/{name}.json)
-    # This maintains backward compatibility
-    framework_dir = Path(__file__).parent.parent / "config"
-    framework_config = framework_dir / f"{config_name}.json"
+    # Fall back to single file config (config/{name}.yaml)
+    single_file_config = config_dir / f"{config_name}.yaml"
 
-    if framework_config.exists():
-        return (str(framework_config), None)
+    if single_file_config.exists():
+        return (str(single_file_config), None)
 
-    # Return framework path even if it doesn't exist (let caller handle error)
-    return (str(framework_config), None)
+    # Return single file path even if it doesn't exist (let caller handle error)
+    return (str(single_file_config), None)
 
 
 # =============================================================================
@@ -1034,7 +1035,7 @@ def load_strategic_todos_template(
 
     Args:
         template_name: Name of the template file (e.g., "strategic_todos_initial.yaml")
-        deployment_dir: Path to deployment directory (e.g., configs/creator).
+        deployment_dir: Path to deployment directory (e.g., config/my_agent).
                        If None, only framework templates are used.
 
     Returns:
@@ -1048,7 +1049,7 @@ def load_strategic_todos_template(
         ```python
         todos = load_strategic_todos_template(
             "strategic_todos_initial.yaml",
-            deployment_dir="configs/creator"
+            deployment_dir="config/my_agent"
         )
         # Returns: [{"id": 1, "content": "..."}, {"id": 2, "content": "..."}, ...]
         ```
@@ -1060,9 +1061,9 @@ def load_strategic_todos_template(
             logger.debug(f"Loading strategic todos from deployment: {deployment_path}")
             return _parse_strategic_todos_yaml(deployment_path)
 
-    # Fall back to framework directory
-    framework_dir = Path(__file__).parent.parent / "config"
-    framework_path = framework_dir / template_name
+    # Fall back to framework templates directory
+    templates_dir = get_project_root() / "config" / "templates"
+    framework_path = templates_dir / template_name
 
     if framework_path.exists():
         logger.debug(f"Loading strategic todos from framework: {framework_path}")
@@ -1070,7 +1071,7 @@ def load_strategic_todos_template(
 
     raise FileNotFoundError(
         f"Strategic todos template not found: {template_name} "
-        f"(checked: {deployment_dir}, {framework_dir})"
+        f"(checked: {deployment_dir}, {templates_dir})"
     )
 
 
@@ -1105,7 +1106,7 @@ def get_initial_strategic_todos_from_config(
     except FileNotFoundError:
         logger.warning(
             "strategic_todos_initial.yaml not found, using empty list. "
-            "Create src/config/strategic_todos_initial.yaml or deployment override."
+            "Create config/templates/strategic_todos_initial.yaml or deployment override."
         )
         return []
 
@@ -1152,7 +1153,7 @@ def get_transition_strategic_todos_from_config(
     except FileNotFoundError:
         logger.warning(
             "strategic_todos_transition.yaml not found, using empty list. "
-            "Create src/config/strategic_todos_transition.yaml or deployment override."
+            "Create config/templates/strategic_todos_transition.yaml or deployment override."
         )
         return []
 
