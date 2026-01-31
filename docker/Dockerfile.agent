@@ -2,25 +2,22 @@
 # Universal Agent Dockerfile
 # =============================================================================
 #
-# A unified Docker image for all agent types (Creator, Validator, etc.).
+# A unified Docker image for any agent configuration.
 # The agent behavior is determined by the AGENT_CONFIG environment variable.
 #
 # Build:
 #   docker build -t graphrag-agent -f docker/Dockerfile.agent .
 #
-# Run as Creator:
+# Run with defaults:
 #   docker run -p 8001:8001 \
-#     -e AGENT_CONFIG=creator \
 #     -e DATABASE_URL=postgresql://... \
 #     -e OPENAI_API_KEY=... \
 #     graphrag-agent
 #
-# Run as Validator:
-#   docker run -p 8002:8002 \
-#     -e AGENT_CONFIG=validator \
-#     -e AGENT_PORT=8002 \
+# Run with custom config:
+#   docker run -p 8001:8001 \
+#     -e AGENT_CONFIG=my_agent \
 #     -e DATABASE_URL=postgresql://... \
-#     -e NEO4J_URI=bolt://... \
 #     -e OPENAI_API_KEY=... \
 #     graphrag-agent
 #
@@ -51,7 +48,7 @@ LABEL description="Universal Agent for document processing and requirement valid
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
-    AGENT_CONFIG=creator \
+    AGENT_CONFIG=defaults \
     AGENT_PORT=8001
 
 WORKDIR /app
@@ -68,7 +65,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy source code
 COPY src/ ./src/
-COPY configs/ ./configs/
+COPY config/ ./config/
 COPY citation_tool/ ./citation_tool/
 COPY agent.py ./
 

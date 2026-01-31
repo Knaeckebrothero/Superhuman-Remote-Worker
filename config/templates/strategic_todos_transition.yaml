@@ -1,0 +1,20 @@
+# Strategic todos for phase transitions (between tactical phases)
+# These todos guide the agent through summarizing the previous
+# phase, updating memory, and planning the next phase.
+todos:
+  - id: 1
+    content: >-
+      Summarize what was accomplished in the previous tactical phase.
+      Note any issues encountered, decisions made, or discoveries.
+  - id: 2
+    content: >-
+      Update workspace.md with new learnings, patterns discovered,
+      or important context for future phases.
+  - id: 3
+    content: >-
+      Update plan.md to mark completed phases and adjust
+      upcoming phases if needed based on learnings.
+  - id: 4
+    content: >-
+      Create todos for the next tactical phase using next_phase_todos,
+      or call job_complete if the plan is fully executed.
