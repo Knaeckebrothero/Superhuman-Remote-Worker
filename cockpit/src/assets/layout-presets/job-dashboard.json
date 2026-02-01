@@ -1,0 +1,16 @@
+{
+  "id": "job-dashboard",
+  "name": "Job Dashboard",
+  "description": "Overview with statistics, job list, and agents",
+  "featured": true,
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [30, 40, 30],
+    "children": [
+      { "type": "component", "component": "statistics" },
+      { "type": "component", "component": "job-list" },
+      { "type": "component", "component": "agent-list" }
+    ]
+  }
+}

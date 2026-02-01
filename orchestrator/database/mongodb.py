@@ -1,15 +1,38 @@
-"""MongoDB service for the cockpit API."""
+"""MongoDB Database Manager with async motor for audit queries.
+
+This module provides the canonical async MongoDB interface using motor with:
+- Async connection with lazy initialization
+- Paginated audit trail queries
+- Chat history retrieval
+- Bulk fetch endpoints for client-side caching
+- Graph delta tracking
+
+MongoDB is optional - the system gracefully degrades if unavailable.
+This is the canonical database layer for the orchestrator.
+"""
 
 import math
 import os
-from typing import Any, Literal
+import logging
+from datetime import datetime as dt
+from typing import Optional, List, Dict, Any, Literal
 
-from bson import ObjectId
-from bson.errors import InvalidId
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+try:
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+    MOTOR_AVAILABLE = True
+except ImportError:
+    ObjectId = None
+    InvalidId = None
+    AsyncIOMotorClient = None
+    AsyncIOMotorDatabase = None
+    MOTOR_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 # Filter category to step_type mapping
-FILTER_MAPPINGS: dict[str, list[str]] = {
+FILTER_MAPPINGS: Dict[str, List[str]] = {
     "all": [],  # Empty means no filtering
     "messages": ["llm"],
     "tools": ["tool"],
@@ -19,13 +42,55 @@ FILTER_MAPPINGS: dict[str, list[str]] = {
 FilterCategory = Literal["all", "messages", "tools", "errors"]
 
 
-class MongoDBService:
-    """Async MongoDB service for querying agent audit logs."""
+class MongoDB:
+    """Async MongoDB manager for audit queries using motor.
 
-    def __init__(self) -> None:
-        self._client: AsyncIOMotorClient | None = None
-        self._db: AsyncIOMotorDatabase | None = None
+    This database is optional - if not configured or unavailable, operations
+    silently return None/empty lists and log warnings.
+
+    Example:
+        ```python
+        db = MongoDB()
+        await db.connect()
+
+        # Get paginated audit trail
+        result = await db.get_job_audit("abc-123", page=1, page_size=50)
+
+        # Get chat history
+        chat = await db.get_chat_history("abc-123")
+
+        # Bulk fetch for client-side caching
+        bulk = await db.get_job_audit_bulk("abc-123", offset=0, limit=5000)
+
+        # Get cache invalidation version
+        version = await db.get_job_version("abc-123")
+
+        await db.disconnect()
+        ```
+    """
+
+    def __init__(self, url: Optional[str] = None):
+        """Initialize MongoDB manager.
+
+        Args:
+            url: MongoDB connection URL. Falls back to MONGODB_URL env var.
+                Format: mongodb://host:port/database
+        """
+        if not MOTOR_AVAILABLE:
+            logger.warning(
+                "motor not installed. MongoDB features disabled. "
+                "Install with: pip install motor"
+            )
+
+        self._url = url or os.getenv('MONGODB_URL')
+        self._client: Optional[AsyncIOMotorClient] = None
+        self._db: Optional[AsyncIOMotorDatabase] = None
         self._available: bool = False
+
+        if not self._url:
+            logger.info("MongoDB URL not configured. Logging features disabled.")
+
+        logger.info("MongoDB initialized (not connected yet)")
 
     @property
     def is_available(self) -> bool:
@@ -33,23 +98,31 @@ class MongoDBService:
         return self._available
 
     async def connect(self) -> None:
-        """Create MongoDB connection."""
+        """Create MongoDB connection.
+
+        Tests the connection with a ping command. If connection fails,
+        MongoDB features are disabled but no exception is raised.
+        """
         if self._client is not None:
             return
 
-        mongodb_url = os.getenv("MONGODB_URL")
-        if not mongodb_url:
-            # MongoDB is optional - graceful degradation
+        if not MOTOR_AVAILABLE:
+            self._available = False
+            return
+
+        if not self._url:
             self._available = False
             return
 
         try:
-            self._client = AsyncIOMotorClient(mongodb_url, serverSelectionTimeoutMS=5000)
+            self._client = AsyncIOMotorClient(self._url, serverSelectionTimeoutMS=5000)
             # Test the connection
             await self._client.admin.command("ping")
             self._db = self._client.get_database("graphrag_logs")
             self._available = True
-        except Exception:
+            logger.info("MongoDB connected: graphrag_logs")
+        except Exception as e:
+            logger.warning(f"MongoDB connection failed: {e}")
             self._available = False
             self._client = None
             self._db = None
@@ -61,6 +134,16 @@ class MongoDBService:
             self._client = None
             self._db = None
             self._available = False
+            logger.info("MongoDB connection closed")
+
+    # Alias for compatibility
+    async def close(self) -> None:
+        """Close MongoDB connection (alias for disconnect())."""
+        await self.disconnect()
+
+    # =========================================================================
+    # AUDIT TRAIL OPERATIONS
+    # =========================================================================
 
     async def get_job_audit(
         self,
@@ -68,7 +151,7 @@ class MongoDBService:
         page: int = 1,
         page_size: int = 50,
         filter_category: FilterCategory = "all",
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Get paginated audit entries for a job.
 
         Args:
@@ -92,7 +175,7 @@ class MongoDBService:
         collection = self._db["agent_audit"]
 
         # Build query filter
-        query: dict[str, Any] = {"job_id": job_id}
+        query: Dict[str, Any] = {"job_id": job_id}
         step_types = FILTER_MAPPINGS.get(filter_category, [])
         if step_types:
             query["step_type"] = {"$in": step_types}
@@ -140,7 +223,7 @@ class MongoDBService:
         collection = self._db["agent_audit"]
         return await collection.count_documents({"job_id": job_id})
 
-    async def get_job_ids_with_audit(self) -> list[str]:
+    async def get_job_ids_with_audit(self) -> List[str]:
         """Get list of job IDs that have audit entries.
 
         Returns:
@@ -153,7 +236,7 @@ class MongoDBService:
         job_ids = await collection.distinct("job_id")
         return job_ids
 
-    async def get_request(self, doc_id: str) -> dict[str, Any] | None:
+    async def get_request(self, doc_id: str) -> Dict[str, Any] | None:
         """Get a single LLM request by document ID.
 
         Args:
@@ -180,7 +263,7 @@ class MongoDBService:
         doc["_id"] = str(doc["_id"])
         return doc
 
-    async def get_audit_time_range(self, job_id: str) -> dict[str, str] | None:
+    async def get_audit_time_range(self, job_id: str) -> Dict[str, str] | None:
         """Get first and last timestamps for a job's audit entries.
 
         Args:
@@ -225,7 +308,7 @@ class MongoDBService:
         timestamp: str,
         page_size: int = 50,
         filter_category: FilterCategory = "all",
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Find which page contains the audit entry closest to a given timestamp.
 
         Counts entries with timestamp <= target to determine the page number.
@@ -242,12 +325,10 @@ class MongoDBService:
         if not self._available or self._db is None:
             return {"page": 1, "index": 0}
 
-        from datetime import datetime as dt
-
         collection = self._db["agent_audit"]
 
         # Build base query with filter
-        query: dict[str, Any] = {"job_id": job_id}
+        query: Dict[str, Any] = {"job_id": job_id}
         step_types = FILTER_MAPPINGS.get(filter_category, [])
         if step_types:
             query["step_type"] = {"$in": step_types}
@@ -269,12 +350,16 @@ class MongoDBService:
 
         return {"page": page, "index": index}
 
+    # =========================================================================
+    # CHAT HISTORY OPERATIONS
+    # =========================================================================
+
     async def get_chat_history(
         self,
         job_id: str,
         page: int = 1,
         page_size: int = 50,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Get paginated chat history for a job.
 
         Returns a clean sequential view of conversation turns (input -> response).
@@ -342,7 +427,7 @@ class MongoDBService:
         return await self._db["chat_history"].count_documents({"job_id": job_id})
 
     # =========================================================================
-    # Bulk Fetch Endpoints for Client-Side Caching
+    # BULK FETCH ENDPOINTS FOR CLIENT-SIDE CACHING
     # =========================================================================
 
     async def get_job_audit_bulk(
@@ -350,7 +435,7 @@ class MongoDBService:
         job_id: str,
         offset: int = 0,
         limit: int = 5000,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Get bulk audit entries for caching in IndexedDB.
 
         Uses offset/limit instead of page/pageSize for efficient bulk fetching.
@@ -408,7 +493,7 @@ class MongoDBService:
         job_id: str,
         offset: int = 0,
         limit: int = 5000,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Get bulk chat history entries for caching in IndexedDB.
 
         Args:
@@ -463,7 +548,7 @@ class MongoDBService:
         job_id: str,
         offset: int = 0,
         limit: int = 5000,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Get bulk graph deltas (execute_cypher_query tool calls) for caching.
 
         Args:
@@ -530,7 +615,7 @@ class MongoDBService:
             "hasMore": has_more,
         }
 
-    async def get_job_version(self, job_id: str) -> dict[str, Any] | None:
+    async def get_job_version(self, job_id: str) -> Dict[str, Any] | None:
         """Get job data version info for cache invalidation.
 
         Returns counts and timestamps that can be compared to detect changes.
@@ -585,6 +670,100 @@ class MongoDBService:
             "lastUpdate": last_update,
         }
 
+    # =========================================================================
+    # LEGACY COMPATIBILITY (from original MongoDB class)
+    # =========================================================================
 
-# Singleton instance
-mongodb_service = MongoDBService()
+    async def get_job_audit_trail(
+        self,
+        job_id: str,
+        event_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get complete audit trail for a job (legacy method).
+
+        Args:
+            job_id: Job ID
+            event_type: Filter by event type (optional, e.g., "tool_call", "phase_transition")
+
+        Returns:
+            List of audit records, or empty list if MongoDB unavailable
+        """
+        if not self._available or self._db is None:
+            return []
+
+        try:
+            query: Dict[str, Any] = {"job_id": job_id}
+            if event_type:
+                query["event_type"] = event_type
+
+            cursor = self._db.agent_audit.find(query).sort("timestamp", 1)
+            results = []
+            async for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                results.append(doc)
+            return results
+        except Exception as e:
+            logger.error(f"Failed to get audit trail: {e}")
+            return []
+
+    async def get_llm_conversation(
+        self,
+        job_id: str,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get LLM conversation history for a job (legacy method).
+
+        Args:
+            job_id: Job ID
+            limit: Maximum number of records to return
+
+        Returns:
+            List of LLM request/response records, or empty list if MongoDB unavailable
+        """
+        if not self._available or self._db is None:
+            return []
+
+        try:
+            cursor = self._db.llm_requests.find(
+                {"job_id": job_id}
+            ).sort("timestamp", 1).limit(limit)
+            results = []
+            async for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                results.append(doc)
+            return results
+        except Exception as e:
+            logger.error(f"Failed to get LLM conversation: {e}")
+            return []
+
+    async def get_statistics(self) -> Dict[str, Any]:
+        """Get MongoDB collection statistics (legacy method).
+
+        Returns:
+            Dictionary with collection counts, or empty dict if MongoDB unavailable
+        """
+        if not self._available or self._db is None:
+            return {}
+
+        try:
+            stats = {
+                'llm_requests_count': await self._db.llm_requests.count_documents({}),
+                'agent_audit_count': await self._db.agent_audit.count_documents({}),
+                'connected': True
+            }
+            return stats
+        except Exception as e:
+            logger.error(f"Failed to get statistics: {e}")
+            return {'connected': False}
+
+    @property
+    def db(self):
+        """Get database instance (for backward compatibility).
+
+        Returns:
+            Database instance or None if unavailable
+        """
+        return self._db
+
+
+__all__ = ['MongoDB', 'FILTER_MAPPINGS', 'FilterCategory']

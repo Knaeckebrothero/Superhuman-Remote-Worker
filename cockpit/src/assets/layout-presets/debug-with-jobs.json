@@ -1,0 +1,23 @@
+{
+  "id": "debug-with-jobs",
+  "name": "Debug + Jobs",
+  "description": "Job list with debug panels for selected job",
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [25, 50, 25],
+    "children": [
+      { "type": "component", "component": "job-list" },
+      { "type": "component", "component": "agent-activity" },
+      {
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [50, 50],
+        "children": [
+          { "type": "component", "component": "todo-list" },
+          { "type": "component", "component": "request-viewer" }
+        ]
+      }
+    ]
+  }
+}

@@ -115,14 +115,14 @@ podman-compose -f docker-compose.dev.yaml up -d
 
 This starts PostgreSQL, Neo4j, and MongoDB (for optional LLM request logging).
 
-### 4. Initialize Databases
+### 4. Initialize Databases and Workspace
 
 ```bash
-# First time setup with sample data
-python scripts/app_init.py --seed
+# Initialize everything (databases + workspace)
+python init.py
 
-# Reset everything (deletes all data)
-python scripts/app_init.py --force-reset --seed
+# Reset everything (WARNING: deletes all data)
+python init.py --force-reset
 ```
 
 ### 5. Run Agents Locally
@@ -179,22 +179,64 @@ rm workspace/checkpoints/job_my-job-123.db
 rm workspace/logs/job_my-job-123.log
 ```
 
-### 7. Database Management
+### 7. Initialization Scripts
 
+The system provides modular initialization scripts for different deployment scenarios:
+
+**Root Initialization (Recommended for Development):**
 ```bash
-# Reset PostgreSQL only
-python scripts/app_init.py --only-postgres --force-reset
+# Initialize everything (databases + workspace)
+python init.py
 
-# Reset Neo4j with seed data
-python scripts/app_init.py --only-neo4j --force-reset --seed
+# Reset everything (WARNING: deletes all data)
+python init.py --force-reset
 
-# View init script options
-python scripts/app_init.py --help
+# Initialize only databases (orchestrator components)
+python init.py --only-orchestrator
 
-# Nuclear option: remove all Docker volumes and reinitialize
+# Initialize only workspace (agent components)
+python init.py --only-agent
+
+# Skip optional MongoDB
+python init.py --skip-mongodb
+```
+
+**Component-Specific Initialization:**
+```bash
+# Database initialization only (PostgreSQL + MongoDB)
+python -m orchestrator.init
+
+# Database initialization with options
+python -m orchestrator.init --force-reset       # Reset databases
+python -m orchestrator.init --skip-mongodb      # Skip MongoDB
+python -m orchestrator.init --verify            # Verify connectivity only
+
+# Workspace initialization only
+python -m src.init
+
+# Workspace initialization with options
+python -m src.init --force-reset                # Clean all workspaces
+python -m src.init --verify                     # Verify workspace structure
+```
+
+**Backup and Restore:**
+```bash
+# Create backup (auto-named: backups/YYYYMMDD_NNN/)
+python init.py --create-backup
+
+# Create backup with custom name
+python init.py --create-backup my_backup
+
+# Restore from backup
+python init.py --restore-backup backups/20260201_001_my_backup
+```
+
+**Nuclear Option:**
+```bash
+# Remove all Docker volumes and reinitialize
 podman-compose -f docker-compose.dev.yaml down -v
 podman-compose -f docker-compose.dev.yaml up -d
-python scripts/app_init.py --seed
+python init.py
 ```
 
 ### 8. Stop Databases

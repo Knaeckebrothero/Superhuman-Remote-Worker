@@ -1,0 +1,23 @@
+{
+  "id": "job-management",
+  "name": "Job Management",
+  "description": "Create jobs and manage the queue",
+  "featured": true,
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [35, 65],
+    "children": [
+      { "type": "component", "component": "job-create" },
+      {
+        "type": "split",
+        "direction": "horizontal",
+        "sizes": [60, 40],
+        "children": [
+          { "type": "component", "component": "job-list" },
+          { "type": "component", "component": "agent-list" }
+        ]
+      }
+    ]
+  }
+}

@@ -9,7 +9,23 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from services.mongodb import mongodb_service
+from database import MongoDB
+
+# Shared MongoDB instance - will be connected via lifespan in main.py
+# We need to import the instance from main to share the connection
+# For now, create a module-level reference that will be set from main
+_mongodb: MongoDB | None = None
+
+
+def set_mongodb(mongodb: MongoDB) -> None:
+    """Set the MongoDB instance from main.py."""
+    global _mongodb
+    _mongodb = mongodb
+
+
+def get_mongodb() -> MongoDB | None:
+    """Get the MongoDB instance."""
+    return _mongodb
 
 router = APIRouter(prefix="/api/graph", tags=["graph"])
 
@@ -32,7 +48,8 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
     Returns:
         Dict with jobId, timeRange, summary, snapshots, and deltas
     """
-    if not mongodb_service.is_available:
+    mongodb = get_mongodb()
+    if mongodb is None or not mongodb.is_available:
         raise HTTPException(
             status_code=503,
             detail="MongoDB not available",
@@ -111,10 +128,11 @@ async def _get_all_tool_calls(job_id: str) -> list[dict[str, Any]]:
 
     Fetches all pages from MongoDB to get complete audit trail.
     """
-    if not mongodb_service._available or mongodb_service._db is None:
+    mongodb = get_mongodb()
+    if mongodb is None or not mongodb.is_available or mongodb._db is None:
         return []
 
-    collection = mongodb_service._db["agent_audit"]
+    collection = mongodb._db["agent_audit"]
 
     # Query for tool-related entries
     # Note: archiver stores tool calls with step_type="tool"

@@ -1,44 +1,46 @@
 """FastAPI application for Universal Agent.
 
-Provides HTTP endpoints for job submission, status queries,
-health checks, and agent management.
+Provides HTTP endpoints for health checks, agent status, and orchestrator
+integration. Jobs are received from the orchestrator via /job/start endpoint.
 """
 
 import asyncio
 import logging
 import os
-import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
 from .models import (
-    JobSubmitRequest,
-    JobSubmitResponse,
-    JobStatusResponse,
-    JobCancelRequest,
-    JobListResponse,
     HealthResponse,
     HealthStatus,
     ReadyResponse,
     AgentStatusResponse,
     ErrorResponse,
     MetricsResponse,
-    JobStatus,
+    JobStartRequest,
+    JobStartResponse,
+    JobCancelByOrchestratorRequest,
+    JobResumeRequest,
 )
+from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
 
 logger = logging.getLogger(__name__)
 
 # Global state
 _agent: Optional[UniversalAgent] = None
-_agent_task: Optional[asyncio.Task] = None
 _shutdown_requested = False
 _config_path: Optional[str] = None
+
+# Orchestrator integration state
+_orchestrator_client: Optional[OrchestratorClient] = None
+_heartbeat_task: Optional[asyncio.Task] = None
+_current_job_id: Optional[str] = None
+_current_job_task: Optional[asyncio.Task] = None
 
 
 def set_config_path(path: str) -> None:
@@ -55,8 +57,10 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager.
 
     Handles startup and shutdown of the agent and its components.
+    Agents receive jobs from orchestrator (ORCHESTRATOR_URL defaults to localhost:8085).
     """
-    global _agent, _agent_task, _shutdown_requested
+    global _agent, _shutdown_requested
+    global _orchestrator_client, _heartbeat_task
 
     # Startup
     logger.info("Starting Universal Agent application...")
@@ -71,10 +75,25 @@ async def lifespan(app: FastAPI):
     _agent = UniversalAgent.from_config(resolved_path)
     await _agent.initialize()
 
-    # Start polling loop if enabled
-    if _agent.config.polling.enabled:
-        _agent_task = asyncio.create_task(_run_agent_loop())
-        logger.info("Agent polling loop started")
+    # Register with orchestrator and start heartbeat
+    _orchestrator_client = create_orchestrator_client_from_env(_agent.config.agent_id)
+    logger.info("Registering with orchestrator...")
+    await _orchestrator_client.connect()
+
+    if await _orchestrator_client.register():
+        # Start heartbeat loop
+        _heartbeat_task = asyncio.create_task(
+            _orchestrator_client.run_heartbeat_loop(
+                get_status=_get_agent_status_for_heartbeat,
+                get_job_id=_get_current_job_id,
+                get_metrics=_get_agent_metrics,
+            )
+        )
+        logger.info("Orchestrator heartbeat loop started")
+    else:
+        logger.error("Failed to register with orchestrator - agent will not receive jobs")
+        await _orchestrator_client.close()
+        _orchestrator_client = None
 
     yield
 
@@ -82,10 +101,26 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down Universal Agent application...")
     _shutdown_requested = True
 
-    if _agent_task:
-        _agent_task.cancel()
+    # Stop orchestrator heartbeat and deregister
+    if _orchestrator_client:
+        logger.info("Stopping orchestrator heartbeat and deregistering...")
+        _orchestrator_client.stop_heartbeat()
+
+        if _heartbeat_task:
+            _heartbeat_task.cancel()
+            try:
+                await _heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        await _orchestrator_client.deregister()
+        await _orchestrator_client.close()
+
+    # Cancel any running job task
+    if _current_job_task and not _current_job_task.done():
+        _current_job_task.cancel()
         try:
-            await _agent_task
+            await _current_job_task
         except asyncio.CancelledError:
             pass
 
@@ -95,18 +130,88 @@ async def lifespan(app: FastAPI):
     logger.info("Universal Agent application shutdown complete")
 
 
-async def _run_agent_loop():
-    """Run the agent's polling loop."""
-    global _shutdown_requested
+def _get_agent_status_for_heartbeat() -> str:
+    """Get current agent status for heartbeat reporting."""
+    if _agent is None:
+        return "booting"
 
-    while not _shutdown_requested:
-        try:
-            await _agent.start_polling()
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Agent loop error: {e}", exc_info=True)
-            await asyncio.sleep(5)
+    if _current_job_id is not None:
+        return "working"
+
+    status = _agent.get_status()
+    if not status.get("initialized"):
+        return "booting"
+
+    return "ready"
+
+
+def _get_current_job_id() -> Optional[str]:
+    """Get current job ID for heartbeat reporting."""
+    return _current_job_id
+
+
+def _get_agent_metrics() -> Optional[Dict[str, Any]]:
+    """Get agent metrics for heartbeat reporting."""
+    try:
+        import psutil
+
+        process = psutil.Process()
+        return {
+            "memory_mb": process.memory_info().rss / (1024 * 1024),
+            "cpu_percent": process.cpu_percent(),
+        }
+    except ImportError:
+        # psutil not installed
+        return None
+    except Exception as e:
+        logger.debug(f"Failed to collect metrics: {e}")
+        return None
+
+
+async def _process_orchestrator_job(
+    job_id: str,
+    prompt: str,
+    document_path: Optional[str] = None,
+    document_dir: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+    instructions: Optional[str] = None,
+) -> None:
+    """Process a job assigned by the orchestrator.
+
+    This runs in the background after accepting a job from the orchestrator.
+    """
+    global _current_job_id
+
+    if _agent is None:
+        logger.error("Cannot process job - agent not initialized")
+        return
+
+    try:
+        logger.info(f"Starting orchestrator job {job_id}")
+
+        # Build metadata
+        metadata: Dict[str, Any] = {"prompt": prompt}
+        if document_path:
+            metadata["document_path"] = document_path
+        if document_dir:
+            metadata["document_dir"] = document_dir
+        if context:
+            metadata["context"] = context
+        if instructions:
+            metadata["instructions"] = instructions
+
+        # Process the job
+        result = await _agent.process_job(job_id, metadata)
+
+        logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
+
+    except asyncio.CancelledError:
+        logger.info(f"Orchestrator job {job_id} was cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
+    finally:
+        _current_job_id = None
 
 
 def create_app(config_path: Optional[str] = None) -> FastAPI:
@@ -196,203 +301,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         status = _agent.get_status()
         return AgentStatusResponse(**status)
 
-    # Job management endpoints
-
-    @app.post(
-        "/jobs",
-        response_model=JobSubmitResponse,
-        tags=["Jobs"],
-        responses={400: {"model": ErrorResponse}},
-    )
-    async def submit_job(
-        request: JobSubmitRequest,
-        background_tasks: BackgroundTasks,
-    ) -> JobSubmitResponse:
-        """Submit a new job for processing."""
-        if _agent is None:
-            raise HTTPException(status_code=503, detail="Agent not initialized")
-
-        # Generate job ID
-        job_id = str(uuid.uuid4())
-        created_at = datetime.utcnow()
-
-        # Build metadata from request
-        metadata: Dict[str, Any] = {}
-        if request.document_path:
-            metadata["document_path"] = request.document_path
-        if request.prompt:
-            metadata["prompt"] = request.prompt
-        if request.requirement_id:
-            metadata["requirement_id"] = request.requirement_id
-        if request.metadata:
-            metadata.update(request.metadata)
-
-        # Add job to processing queue
-        background_tasks.add_task(
-            _process_job_background,
-            job_id,
-            metadata,
-        )
-
-        return JobSubmitResponse(
-            job_id=job_id,
-            status=JobStatus.PENDING,
-            created_at=created_at,
-            message="Job submitted successfully",
-        )
-
-    @app.get(
-        "/jobs/{job_id}",
-        response_model=JobStatusResponse,
-        tags=["Jobs"],
-        responses={404: {"model": ErrorResponse}},
-    )
-    async def get_job_status(job_id: str) -> JobStatusResponse:
-        """Get status of a specific job."""
-        if _agent is None:
-            raise HTTPException(status_code=503, detail="Agent not initialized")
-
-        # Query job from database
-        if _agent.postgres_conn:
-            table = _agent.config.polling.table
-            query = f"SELECT * FROM {table} WHERE id = $1::uuid"
-            try:
-                row = await _agent.postgres_conn.fetchrow(query, job_id)
-                if row:
-                    job = dict(row)
-                    status_field = _agent.config.polling.status_field
-                    return JobStatusResponse(
-                        job_id=str(job["id"]),
-                        status=JobStatus(job.get(status_field, "pending")),
-                        created_at=job.get("created_at", datetime.utcnow()),
-                        updated_at=job.get("updated_at"),
-                        iteration=job.get("iteration", 0),
-                        error=job.get("error"),
-                        result=job.get("result"),
-                    )
-            except Exception as e:
-                logger.error(f"Error querying job: {e}")
-
-        raise HTTPException(
-            status_code=404,
-            detail=f"Job {job_id} not found",
-        )
-
-    @app.get("/jobs", response_model=JobListResponse, tags=["Jobs"])
-    async def list_jobs(
-        status: Optional[str] = Query(None, description="Filter by status"),
-        page: int = Query(1, ge=1, description="Page number"),
-        page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    ) -> JobListResponse:
-        """List jobs with optional filtering."""
-        if _agent is None:
-            raise HTTPException(status_code=503, detail="Agent not initialized")
-
-        jobs = []
-        total = 0
-
-        if _agent.postgres_conn:
-            table = _agent.config.polling.table
-            status_field = _agent.config.polling.status_field
-            offset = (page - 1) * page_size
-
-            # Build query
-            if status:
-                query = f"""
-                    SELECT * FROM {table}
-                    WHERE {status_field} = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2 OFFSET $3
-                """
-                count_query = f"""
-                    SELECT COUNT(*) FROM {table}
-                    WHERE {status_field} = $1
-                """
-                rows = await _agent.postgres_conn.fetch(
-                    query, status, page_size, offset
-                )
-                total = await _agent.postgres_conn.fetchval(count_query, status)
-            else:
-                query = f"""
-                    SELECT * FROM {table}
-                    ORDER BY created_at DESC
-                    LIMIT $1 OFFSET $2
-                """
-                count_query = f"SELECT COUNT(*) FROM {table}"
-                rows = await _agent.postgres_conn.fetch(query, page_size, offset)
-                total = await _agent.postgres_conn.fetchval(count_query)
-
-            for row in rows:
-                job = dict(row)
-                jobs.append(
-                    JobStatusResponse(
-                        job_id=str(job["id"]),
-                        status=JobStatus(job.get(status_field, "pending")),
-                        created_at=job.get("created_at", datetime.utcnow()),
-                        updated_at=job.get("updated_at"),
-                        iteration=job.get("iteration", 0),
-                    )
-                )
-
-        return JobListResponse(
-            jobs=jobs,
-            total=total or 0,
-            page=page,
-            page_size=page_size,
-        )
-
-    @app.post(
-        "/jobs/{job_id}/cancel",
-        response_model=JobStatusResponse,
-        tags=["Jobs"],
-        responses={404: {"model": ErrorResponse}},
-    )
-    async def cancel_job(
-        job_id: str,
-        request: JobCancelRequest,
-    ) -> JobStatusResponse:
-        """Cancel a running job."""
-        if _agent is None:
-            raise HTTPException(status_code=503, detail="Agent not initialized")
-
-        # Update job status to cancelled
-        if _agent.postgres_conn:
-            table = _agent.config.polling.table
-            status_field = _agent.config.polling.status_field
-
-            query = f"""
-                UPDATE {table}
-                SET {status_field} = 'cancelled',
-                    error = $1,
-                    updated_at = NOW()
-                WHERE id = $2::uuid
-                RETURNING *
-            """
-
-            try:
-                row = await _agent.postgres_conn.fetchrow(
-                    query,
-                    {"reason": request.reason or "User cancelled"},
-                    job_id,
-                )
-
-                if row:
-                    job = dict(row)
-                    return JobStatusResponse(
-                        job_id=str(job["id"]),
-                        status=JobStatus.CANCELLED,
-                        created_at=job.get("created_at", datetime.utcnow()),
-                        updated_at=job.get("updated_at"),
-                        error={"reason": request.reason or "User cancelled"},
-                    )
-            except Exception as e:
-                logger.error(f"Error cancelling job: {e}")
-
-        raise HTTPException(
-            status_code=404,
-            detail=f"Job {job_id} not found",
-        )
-
     # Metrics endpoint
 
     @app.get("/metrics", response_model=MetricsResponse, tags=["Monitoring"])
@@ -408,15 +316,12 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         jobs_failed = 0
 
         if _agent.postgres_conn:
-            table = _agent.config.polling.table
-            status_field = _agent.config.polling.status_field
-
             try:
                 success_count = await _agent.postgres_conn.fetchval(
-                    f"SELECT COUNT(*) FROM {table} WHERE {status_field} = 'complete'"
+                    "SELECT COUNT(*) FROM jobs WHERE status = 'complete'"
                 )
                 failed_count = await _agent.postgres_conn.fetchval(
-                    f"SELECT COUNT(*) FROM {table} WHERE {status_field} = 'failed'"
+                    "SELECT COUNT(*) FROM jobs WHERE status = 'failed'"
                 )
                 jobs_success = success_count or 0
                 jobs_failed = failed_count or 0
@@ -434,20 +339,182 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             uptime_seconds=status["uptime_seconds"],
         )
 
+    # =========================================================================
+    # Orchestrator Integration Endpoints
+    # =========================================================================
+
+    @app.post(
+        "/job/start",
+        response_model=JobStartResponse,
+        status_code=202,
+        tags=["Orchestrator"],
+        responses={
+            409: {"model": ErrorResponse, "description": "Agent is busy"},
+            503: {"model": ErrorResponse, "description": "Agent not initialized"},
+        },
+    )
+    async def start_job_from_orchestrator(
+        request: JobStartRequest,
+        background_tasks: BackgroundTasks,
+    ) -> JobStartResponse:
+        """Receive and start a job from the orchestrator.
+
+        This endpoint is called by the orchestrator to assign a job to this agent.
+        The job is processed in the background and the endpoint returns immediately
+        with a 202 Accepted status.
+        """
+        global _current_job_id, _current_job_task
+
+        if _agent is None:
+            raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        # Check if already processing a job
+        if _current_job_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Agent is busy processing job {_current_job_id}",
+            )
+
+        # Accept the job
+        _current_job_id = request.job_id
+
+        # Start processing in background
+        _current_job_task = asyncio.create_task(
+            _process_orchestrator_job(
+                job_id=request.job_id,
+                prompt=request.prompt,
+                document_path=request.document_path,
+                document_dir=request.document_dir,
+                context=request.context,
+                instructions=request.instructions,
+            )
+        )
+
+        logger.info(f"Accepted job {request.job_id} from orchestrator")
+
+        return JobStartResponse(
+            job_id=request.job_id,
+            status="accepted",
+            message="Job processing started",
+        )
+
+    @app.post(
+        "/job/cancel",
+        tags=["Orchestrator"],
+        responses={
+            404: {"model": ErrorResponse, "description": "No job running"},
+        },
+    )
+    async def cancel_current_job(
+        request: JobCancelByOrchestratorRequest,
+    ) -> Dict[str, Any]:
+        """Cancel the currently running job.
+
+        This endpoint is called by the orchestrator to gracefully cancel
+        the current job processing.
+        """
+        global _current_job_id, _current_job_task
+
+        if _current_job_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No job currently running",
+            )
+
+        job_id = _current_job_id
+        reason = request.reason or "Cancelled by orchestrator"
+
+        # Cancel the job task
+        if _current_job_task and not _current_job_task.done():
+            _current_job_task.cancel()
+            try:
+                await _current_job_task
+            except asyncio.CancelledError:
+                pass
+
+        _current_job_id = None
+        _current_job_task = None
+
+        logger.info(f"Cancelled job {job_id}: {reason}")
+
+        return {
+            "job_id": job_id,
+            "status": "cancelled",
+            "reason": reason,
+        }
+
+    @app.post(
+        "/job/resume",
+        response_model=JobStartResponse,
+        status_code=202,
+        tags=["Orchestrator"],
+        responses={
+            409: {"model": ErrorResponse, "description": "Agent is busy"},
+            503: {"model": ErrorResponse, "description": "Agent not initialized"},
+        },
+    )
+    async def resume_job(
+        request: JobResumeRequest,
+        background_tasks: BackgroundTasks,
+    ) -> JobStartResponse:
+        """Resume a job from checkpoint.
+
+        This endpoint resumes a previously started job from its last checkpoint.
+        Optional feedback can be injected before resuming.
+        """
+        global _current_job_id, _current_job_task
+
+        if _agent is None:
+            raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        # Check if already processing a job
+        if _current_job_id is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Agent is busy processing job {_current_job_id}",
+            )
+
+        # Accept the resume request
+        _current_job_id = request.job_id
+
+        # Build metadata for resume
+        metadata: Dict[str, Any] = {"resume": True}
+        if request.feedback:
+            metadata["feedback"] = request.feedback
+
+        # Start processing in background
+        async def _resume_job():
+            global _current_job_id
+            try:
+                result = await _agent.process_job(request.job_id, metadata)
+                logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
+            except asyncio.CancelledError:
+                logger.info(f"Resumed job {request.job_id} was cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Resumed job {request.job_id} failed: {e}", exc_info=True)
+            finally:
+                _current_job_id = None
+
+        _current_job_task = asyncio.create_task(_resume_job())
+
+        logger.info(f"Accepted resume request for job {request.job_id}")
+
+        return JobStartResponse(
+            job_id=request.job_id,
+            status="accepted",
+            message="Job resume started",
+        )
+
+    @app.get("/job/current", tags=["Orchestrator"])
+    async def get_current_job() -> Dict[str, Any]:
+        """Get information about the currently running job."""
+        return {
+            "job_id": _current_job_id,
+            "is_busy": _current_job_id is not None,
+        }
+
     return app
-
-
-async def _process_job_background(job_id: str, metadata: Dict[str, Any]) -> None:
-    """Process a job in the background."""
-    if _agent is None:
-        logger.error("Cannot process job - agent not initialized")
-        return
-
-    try:
-        result = await _agent.process_job(job_id, metadata)
-        logger.info(f"Job {job_id} completed: {result.get('should_stop')}")
-    except Exception as e:
-        logger.error(f"Background job {job_id} failed: {e}", exc_info=True)
 
 
 # Default app instance (uses environment config)

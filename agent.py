@@ -2,49 +2,45 @@
 
 Run the Universal Agent in various modes:
 - CLI mode: Process documents (creates job automatically)
-- API server mode: Start FastAPI server for HTTP interface
-- Polling mode: Continuously poll for jobs
+- API server mode: Start FastAPI server for HTTP interface (receives jobs from orchestrator)
 
 Examples:
     # Process a single document
-    python run_universal_agent.py --config creator \
+    python agent.py --config creator \
         --document-path ./data/doc.pdf \
         --prompt "Extract GoBD requirements" \
         --verbose
 
     # Process all documents in a directory
-    python run_universal_agent.py --config creator \
+    python agent.py --config creator \
         --document-dir ./data/example_data/ \
         --prompt "Extract requirements based on the provided documents" \
         --stream --verbose
 
     # Combine single document with directory
-    python run_universal_agent.py --config creator \
+    python agent.py --config creator \
         --document-path ./data/main.pdf \
         --document-dir ./data/context/ \
         --prompt "Extract requirements" \
         --verbose
 
     # Run as API server (Creator agent on port 8001)
-    python run_universal_agent.py --config creator --port 8001
+    python agent.py --config creator --port 8001
 
     # Run as Validator on port 8002
-    python run_universal_agent.py --config validator --port 8002
+    python agent.py --config validator --port 8002
 
     # Process an existing job by ID
-    python run_universal_agent.py --config creator --job-id <uuid>
-
-    # Run polling loop (no API server)
-    python run_universal_agent.py --config creator --polling-only
+    python agent.py --config creator --job-id <uuid>
 
     # Resume an existing job
-    python run_universal_agent.py --config creator --job-id abc123 --resume
+    python agent.py --config creator --job-id abc123 --resume
 
     # Resume a frozen job with feedback
-    python run_universal_agent.py --config validator --job-id abc123 --resume --feedback "Please also check X"
+    python agent.py --config validator --job-id abc123 --resume --feedback "Please also check X"
 
     # Approve a frozen job (marks as completed)
-    python run_universal_agent.py --config validator --job-id abc123 --approve
+    python agent.py --config validator --job-id abc123 --approve
 
     # List available phase snapshots for recovery
     python agent.py --config validator --job-id abc123 --list-phases
@@ -277,7 +273,7 @@ def parse_args():
     parser.add_argument(
         "--no-server",
         action="store_true",
-        help="Don't start API server, only run polling or job",
+        help="Don't start API server, only run job",
     )
 
     # Job options
@@ -331,13 +327,6 @@ def parse_args():
         type=int,
         metavar="N",
         help="Recover to phase N before resuming (requires --job-id and --resume)",
-    )
-
-    # Polling options
-    parser.add_argument(
-        "--polling-only",
-        action="store_true",
-        help="Run polling loop without API server",
     )
 
     # Output options
@@ -617,20 +606,6 @@ async def recover_and_resume(
     )
 
 
-async def run_polling_loop(config_path: str):
-    """Run the agent's polling loop."""
-    logger = logging.getLogger(__name__)
-
-    agent = UniversalAgent.from_config(config_path)
-    await agent.initialize()
-
-    try:
-        logger.info(f"Starting {agent.display_name} polling loop...")
-        await agent.start_polling()
-    finally:
-        await agent.shutdown()
-
-
 def run_server(config_path: str, host: str, port: int):
     """Run the FastAPI server."""
     logger = logging.getLogger(__name__)
@@ -771,14 +746,9 @@ def main():
         ))
         return
 
-    # Polling-only mode
-    if args.polling_only:
-        asyncio.run(run_polling_loop(config_path))
-        return
-
     # API server mode (default)
     if args.no_server:
-        logger.error("Specify --job-id, --prompt, or --polling-only with --no-server")
+        logger.error("Specify --job-id or --prompt with --no-server")
         sys.exit(1)
 
     run_server(config_path, args.host, args.port)

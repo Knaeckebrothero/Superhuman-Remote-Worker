@@ -12,6 +12,10 @@ import { RequestViewerComponent } from './components/request-viewer/request-view
 import { GraphTimelineComponent } from './components/graph-timeline/graph-timeline.component';
 import { TodoListComponent } from './components/todo-list/todo-list.component';
 import { ChatHistoryComponent } from './components/chat-history/chat-history.component';
+import { AgentListComponent } from './components/agent-list/agent-list.component';
+import { JobListComponent } from './components/job-list/job-list.component';
+import { JobCreateComponent } from './components/job-create/job-create.component';
+import { StatisticsComponent } from './components/statistics/statistics.component';
 
 @Component({
   selector: 'app-root',
@@ -108,6 +112,31 @@ export class App implements OnInit {
       type: 'agent-chat',
       displayName: 'Chat History',
       component: ChatHistoryComponent,
+    });
+
+    // Job Management Components
+    this.registry.register({
+      type: 'agent-list',
+      displayName: 'Agents',
+      component: AgentListComponent,
+    });
+
+    this.registry.register({
+      type: 'job-list',
+      displayName: 'Jobs',
+      component: JobListComponent,
+    });
+
+    this.registry.register({
+      type: 'job-create',
+      displayName: 'New Job',
+      component: JobCreateComponent,
+    });
+
+    this.registry.register({
+      type: 'statistics',
+      displayName: 'Statistics',
+      component: StatisticsComponent,
     });
   }
 }

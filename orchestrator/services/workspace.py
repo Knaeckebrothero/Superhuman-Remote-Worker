@@ -293,6 +293,114 @@ class WorkspaceService:
             "has_workspace": self._get_job_path(job_id) is not None,
         }
 
+    def get_workspace_file(self, job_id: str, filename: str) -> str | None:
+        """Get content of a workspace file.
+
+        Args:
+            job_id: Job UUID
+            filename: File name (e.g., "workspace.md", "plan.md")
+
+        Returns:
+            File content as string, or None if not found
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return None
+
+        # Security: only allow specific files
+        allowed_files = {"workspace.md", "plan.md", "todos.yaml"}
+        if filename not in allowed_files:
+            return None
+
+        file_path = job_path / filename
+        if not file_path.exists():
+            return None
+
+        try:
+            return file_path.read_text()
+        except Exception:
+            return None
+
+    def list_workspace_files(self, job_id: str) -> list[dict[str, Any]]:
+        """List available files in a job workspace.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            List of file metadata (name, size, modified)
+        """
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return []
+
+        # Only list main workspace files
+        files_to_check = ["workspace.md", "plan.md", "todos.yaml"]
+        files = []
+
+        for filename in files_to_check:
+            file_path = job_path / filename
+            if file_path.exists():
+                stat = file_path.stat()
+                files.append({
+                    "name": filename,
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                })
+
+        return files
+
+    def get_workspace_overview(self, job_id: str) -> dict[str, Any]:
+        """Get an overview of the job workspace.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with workspace files, todos summary, and metadata
+        """
+        job_path = self._get_job_path(job_id)
+        has_workspace = job_path is not None
+
+        result = {
+            "job_id": job_id,
+            "has_workspace": has_workspace,
+            "files": [],
+            "workspace_md": None,
+            "plan_md": None,
+            "todos": None,
+            "archive_count": 0,
+        }
+
+        if not has_workspace:
+            return result
+
+        # List files
+        result["files"] = self.list_workspace_files(job_id)
+
+        # Get workspace.md content (truncated for overview)
+        workspace_content = self.get_workspace_file(job_id, "workspace.md")
+        if workspace_content:
+            # Truncate to first 2000 chars for overview
+            result["workspace_md"] = workspace_content[:2000]
+            if len(workspace_content) > 2000:
+                result["workspace_md"] += "\n\n... (truncated)"
+
+        # Get plan.md content (truncated)
+        plan_content = self.get_workspace_file(job_id, "plan.md")
+        if plan_content:
+            result["plan_md"] = plan_content[:2000]
+            if len(plan_content) > 2000:
+                result["plan_md"] += "\n\n... (truncated)"
+
+        # Get current todos
+        result["todos"] = self.get_current_todos(job_id)
+
+        # Count archives
+        result["archive_count"] = len(self.list_archived_todos(job_id))
+
+        return result
+
 
 # Global service instance
 workspace_service = WorkspaceService()

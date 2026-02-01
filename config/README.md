@@ -127,23 +127,6 @@ connections:
   neo4j: false
 ```
 
-### Polling Configuration
-
-For agents that poll a database for work:
-
-```yaml
-polling:
-  enabled: true
-  table: jobs
-  status_field: status
-  status_value_pending: pending
-  status_value_processing: processing
-  status_value_complete: complete
-  status_value_failed: failed
-  interval_seconds: 30
-  use_skip_locked: false
-```
-
 ### Context Management
 
 ```yaml

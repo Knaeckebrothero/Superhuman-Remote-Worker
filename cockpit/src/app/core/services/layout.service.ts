@@ -45,15 +45,30 @@ export class LayoutService {
   private readonly presetsSignal = signal<LayoutPreset[]>([]);
   readonly availablePresets = this.presetsSignal.asReadonly();
 
-  /** List of preset file names to load */
+  /** Featured presets (shown prominently in picker) */
+  readonly featuredPresets = computed(() =>
+    this.presetsSignal().filter((p) => p.featured)
+  );
+
+  /** Non-featured presets */
+  readonly otherPresets = computed(() =>
+    this.presetsSignal().filter((p) => !p.featured)
+  );
+
+  /** List of preset file names to load (featured first) */
   private readonly presetFiles = [
+    // Featured presets first
+    'debug',
+    'job-dashboard',
+    'job-management',
+    // Standard layouts
     'single',
     'two-column',
     'two-row',
     'three-column',
     'left-right-stack',
     'grid-2x2',
-    'chat-focused',
+    'debug-with-jobs',
   ];
 
   constructor() {

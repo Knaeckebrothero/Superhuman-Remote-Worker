@@ -585,9 +585,10 @@ cursor = collection.find({"job_id": job_id}).sort("timestamp", 1)
 ### Pattern 4: Initialization Check
 
 **Current**:
+
 ```python
 # scripts/app_init.py
-from scripts.init_mongodb import initialize_mongodb
+from DEPRECATED_scripts.init_mongodb import initialize_mongodb
 
 success = initialize_mongodb(logger, force_reset=args.force_reset)
 if not success:
@@ -1732,7 +1733,7 @@ class QueryOperations:
 2. **Update `scripts/app_init.py`**:
    ```python
    # Old
-   from scripts.init_mongodb import initialize_mongodb
+   from DEPRECATED_scripts.init_mongodb import initialize_mongodb
    initialize_mongodb(logger, force_reset)
 
    # New (minimal changes)

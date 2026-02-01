@@ -35,5 +35,7 @@ httpx>=0.26.0
 python-multipart>=0.0.6
 # Optional: MongoDB for LLM request archiving
 pymongo>=4.6.0
+# System metrics for agent heartbeats
+psutil>=5.9.0
 # Install the citation engine from local directory:
 # -e ./citation_tool[full]
