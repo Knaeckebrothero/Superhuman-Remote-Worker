@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Initialize or reset the MongoDB database for LLM request archiving.
 
+DEPRECATED: This script is deprecated. Use 'python -m orchestrator.init' instead.
+
 This script:
 1. Creates the database and collections if they don't exist
 2. Sets up indexes for efficient querying
@@ -26,9 +28,17 @@ import logging
 import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
+
+# Emit deprecation warning
+warnings.warn(
+    "scripts/init_mongodb.py is deprecated. Use 'python -m orchestrator.init' instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 # Add project root to path
 project_root = Path(__file__).parent.parent

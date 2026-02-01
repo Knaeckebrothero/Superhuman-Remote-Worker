@@ -235,6 +235,14 @@ export class DataService {
   // ===== Public Methods =====
 
   /**
+   * Set the current job and load its data.
+   * Convenience wrapper around loadJob().
+   */
+  setCurrentJob(jobId: string): void {
+    this.loadJob(jobId);
+  }
+
+  /**
    * Load list of jobs from the API.
    */
   async loadJobs(): Promise<void> {

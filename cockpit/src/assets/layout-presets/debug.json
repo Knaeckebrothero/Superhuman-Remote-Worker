@@ -1,0 +1,16 @@
+{
+  "id": "debug",
+  "name": "Debug",
+  "description": "Chat, activity, and request viewer for debugging",
+  "featured": true,
+  "config": {
+    "type": "split",
+    "direction": "vertical",
+    "sizes": [33, 34, 33],
+    "children": [
+      { "type": "component", "component": "agent-chat" },
+      { "type": "component", "component": "agent-activity" },
+      { "type": "component", "component": "request-viewer" }
+    ]
+  }
+}

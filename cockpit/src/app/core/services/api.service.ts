@@ -1,7 +1,21 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
 import { Observable, catchError, of } from 'rxjs';
-import { TableInfo, TableDataResponse, ColumnDef } from '../models/api.model';
+import {
+  TableInfo,
+  TableDataResponse,
+  ColumnDef,
+  Agent,
+  Job,
+  JobCreateRequest,
+  JobProgress,
+  RequirementsResponse,
+  JobStatistics,
+  DailyStatistics,
+  AgentStatistics,
+  StuckJob,
+  WorkspaceOverview,
+} from '../models/api.model';
 import {
   JobSummary,
   AuditEntry,
@@ -336,6 +350,232 @@ export class ApiService {
       catchError((error) => {
         console.error(`Failed to fetch job version for ${jobId}:`, error);
         return of(null);
+      }),
+    );
+  }
+
+  // ===== Agent Management Endpoints =====
+
+  /**
+   * Get list of registered agents.
+   */
+  getAgents(status?: string, limit: number = 100): Observable<Agent[]> {
+    let params = new HttpParams().set('limit', limit.toString());
+    if (status) {
+      params = params.set('status', status);
+    }
+
+    return this.http.get<Agent[]>(`${this.baseUrl}/agents`, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch agents:', error);
+        return of([]);
+      }),
+    );
+  }
+
+  /**
+   * Get a single agent by ID.
+   */
+  getAgent(agentId: string): Observable<Agent | null> {
+    return this.http.get<Agent>(`${this.baseUrl}/agents/${agentId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch agent ${agentId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Delete (deregister) an agent.
+   */
+  deleteAgent(agentId: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/agents/${agentId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to delete agent ${agentId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  // ===== Job Management Endpoints =====
+
+  /**
+   * Create a new job.
+   */
+  createJob(job: JobCreateRequest): Observable<Job | null> {
+    return this.http.post<Job>(`${this.baseUrl}/jobs`, job).pipe(
+      catchError((error) => {
+        console.error('Failed to create job:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get a single job by ID.
+   */
+  getJob(jobId: string): Observable<Job | null> {
+    return this.http.get<Job>(`${this.baseUrl}/jobs/${jobId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Delete a job.
+   */
+  deleteJob(jobId: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to delete job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Cancel a running job.
+   */
+  cancelJob(jobId: string): Observable<{ status: string } | null> {
+    return this.http.put<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/cancel`, {}).pipe(
+      catchError((error) => {
+        console.error(`Failed to cancel job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Assign a job to an agent.
+   */
+  assignJob(jobId: string, agentId: string): Observable<{ status: string; agent_id: string; job_id: string } | null> {
+    return this.http
+      .post<{ status: string; agent_id: string; job_id: string }>(
+        `${this.baseUrl}/jobs/${jobId}/assign/${agentId}`,
+        {},
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to assign job ${jobId} to agent ${agentId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Get requirements for a job.
+   */
+  getJobRequirements(
+    jobId: string,
+    status?: string,
+    limit: number = 100,
+    offset: number = 0,
+  ): Observable<RequirementsResponse> {
+    let params = new HttpParams().set('limit', limit.toString()).set('offset', offset.toString());
+    if (status) {
+      params = params.set('status', status);
+    }
+
+    return this.http
+      .get<RequirementsResponse>(`${this.baseUrl}/jobs/${jobId}/requirements`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch requirements for job ${jobId}:`, error);
+          return of({ requirements: [], total: 0, limit, offset });
+        }),
+      );
+  }
+
+  /**
+   * Get job progress with ETA.
+   */
+  getJobProgress(jobId: string): Observable<JobProgress | null> {
+    return this.http.get<JobProgress>(`${this.baseUrl}/jobs/${jobId}/progress`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch progress for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get workspace overview for a job.
+   */
+  getJobWorkspace(jobId: string): Observable<WorkspaceOverview | null> {
+    return this.http.get<WorkspaceOverview>(`${this.baseUrl}/jobs/${jobId}/workspace`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch workspace for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get content of a specific workspace file.
+   */
+  getWorkspaceFile(jobId: string, filename: string): Observable<{ filename: string; content: string } | null> {
+    return this.http
+      .get<{ filename: string; content: string }>(`${this.baseUrl}/jobs/${jobId}/workspace/${filename}`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch workspace file ${filename} for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  // ===== Statistics Endpoints =====
+
+  /**
+   * Get overall job statistics.
+   */
+  getJobStatistics(): Observable<JobStatistics | null> {
+    return this.http.get<JobStatistics>(`${this.baseUrl}/stats/jobs`).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch job statistics:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get daily job statistics.
+   */
+  getDailyStatistics(days: number = 7): Observable<DailyStatistics[]> {
+    const params = new HttpParams().set('days', days.toString());
+
+    return this.http.get<DailyStatistics[]>(`${this.baseUrl}/stats/daily`, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch daily statistics:', error);
+        return of([]);
+      }),
+    );
+  }
+
+  /**
+   * Get agent workforce summary.
+   */
+  getAgentStatistics(): Observable<AgentStatistics | null> {
+    return this.http.get<AgentStatistics>(`${this.baseUrl}/stats/agents`).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch agent statistics:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get stuck jobs.
+   */
+  getStuckJobs(thresholdMinutes: number = 60): Observable<StuckJob[]> {
+    const params = new HttpParams().set('threshold_minutes', thresholdMinutes.toString());
+
+    return this.http.get<StuckJob[]>(`${this.baseUrl}/stats/stuck`, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch stuck jobs:', error);
+        return of([]);
       }),
     );
   }

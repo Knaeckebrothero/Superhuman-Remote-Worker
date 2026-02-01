@@ -20,7 +20,12 @@ export type ComponentType =
   | 'metrics'
   | 'logs'
   | 'json-viewer'
-  | 'todo-list';
+  | 'todo-list'
+  // Job Management Components
+  | 'agent-list'
+  | 'job-list'
+  | 'job-create'
+  | 'statistics';
 
 /**
  * Layout configuration for the tiling system.

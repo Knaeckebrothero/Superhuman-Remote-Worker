@@ -58,14 +58,6 @@ connections:
   postgres: true
   neo4j: false
 
-polling:
-  enabled: true
-  status_value_pending: pending
-  status_value_processing: processing
-  status_value_complete: complete
-  status_value_failed: failed
-  interval_seconds: 30
-
 limits:
   context_threshold_tokens: 60000
   message_count_threshold: 200

@@ -1,5 +1,6 @@
 import { Component, signal, HostListener, ElementRef, inject } from '@angular/core';
 import { LayoutService } from '../../core/services/layout.service';
+import { LayoutPickerComponent } from '../layout-picker/layout-picker.component';
 
 interface MenuLink {
   label: string;
@@ -15,6 +16,7 @@ interface MenuSection {
 
 @Component({
   selector: 'app-menu',
+  imports: [LayoutPickerComponent],
   template: `
     <div class="menu-container">
       <button
@@ -60,27 +62,30 @@ interface MenuSection {
             </div>
           }
 
-          <!-- Layout Presets Section -->
-          <div class="menu-section">
+          <!-- Layout Picker Trigger -->
+          <div class="menu-section layout-section">
             <h3 class="section-title">Layouts</h3>
-            @for (preset of layoutService.availablePresets(); track preset.id) {
-              <button class="menu-item" (click)="applyPreset(preset.id)">
-                <span class="item-icon">📐</span>
-                <div class="item-content">
-                  <span class="item-label">{{ preset.name }}</span>
-                  @if (preset.description) {
-                    <span class="item-description">{{ preset.description }}</span>
-                  }
-                </div>
-              </button>
-            }
-            @if (layoutService.availablePresets().length === 0) {
-              <div class="menu-item settings-item">
-                <span class="item-icon">⏳</span>
-                <div class="item-content">
-                  <span class="item-description">Loading presets...</span>
-                </div>
+            <button
+              #layoutBtn
+              class="menu-item"
+              (click)="toggleLayoutPicker($event, layoutBtn)"
+              [class.active]="isLayoutPickerOpen()"
+            >
+              <span class="item-icon">📐</span>
+              <div class="item-content">
+                <span class="item-label">Choose Layout</span>
+                <span class="item-description">Select panel arrangement</span>
               </div>
+              <svg class="chevron-icon" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M9 6l6 6-6 6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            @if (isLayoutPickerOpen()) {
+              <app-layout-picker
+                [top]="pickerTop()"
+                [left]="pickerLeft()"
+                (closed)="closeLayoutPicker()"
+              />
             }
           </div>
 
@@ -233,6 +238,21 @@ interface MenuSection {
         flex-shrink: 0;
       }
 
+      .chevron-icon {
+        width: 14px;
+        height: 14px;
+        color: var(--text-muted, #6c7086);
+        flex-shrink: 0;
+      }
+
+      .menu-item.active .chevron-icon {
+        color: var(--accent, #89b4fa);
+      }
+
+      .layout-section {
+        position: relative;
+      }
+
       .menu-footer {
         padding: 8px 12px;
         background: var(--timeline-bg, #11111b);
@@ -248,6 +268,9 @@ export class MenuComponent {
   readonly layoutService = inject(LayoutService);
 
   readonly isOpen = signal(false);
+  readonly isLayoutPickerOpen = signal(false);
+  readonly pickerTop = signal(0);
+  readonly pickerLeft = signal(0);
 
   readonly menuSections: MenuSection[] = [
     {
@@ -310,10 +333,22 @@ export class MenuComponent {
 
   closeMenu(): void {
     this.isOpen.set(false);
+    this.isLayoutPickerOpen.set(false);
   }
 
-  applyPreset(presetId: string): void {
-    this.layoutService.applyPreset(presetId);
+  toggleLayoutPicker(event: MouseEvent, buttonEl: HTMLButtonElement): void {
+    event.stopPropagation();
+    if (!this.isLayoutPickerOpen()) {
+      // Calculate position based on button location
+      const rect = buttonEl.getBoundingClientRect();
+      this.pickerTop.set(rect.top);
+      this.pickerLeft.set(rect.right + 8); // 8px gap
+    }
+    this.isLayoutPickerOpen.update((v) => !v);
+  }
+
+  closeLayoutPicker(): void {
+    this.isLayoutPickerOpen.set(false);
     this.closeMenu();
   }
 
