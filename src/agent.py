@@ -12,11 +12,9 @@ Key Features:
 - Simplified 4-node LangGraph workflow
 """
 
-import asyncio
 import logging
 import os
 import shutil
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -658,139 +656,6 @@ class UniversalAgent:
         """
         return get_checkpoints_path() / f"job_{job_id}.db"
 
-    async def start_polling(self) -> None:
-        """Start the polling loop for jobs.
-
-        Continuously polls the configured table for pending jobs
-        and processes them. Runs until shutdown is requested.
-
-        Example:
-            ```python
-            agent = UniversalAgent.from_config("creator")
-            await agent.initialize()
-
-            # Start polling (blocks until shutdown)
-            await agent.start_polling()
-            ```
-        """
-        if not self._initialized:
-            await self.initialize()
-
-        if not self.config.polling.enabled:
-            logger.warning("Polling is disabled in config")
-            return
-
-        logger.info(
-            f"Starting polling loop: table={self.config.polling.table}, "
-            f"field={self.config.polling.status_field}, "
-            f"interval={self.config.polling.interval_seconds}s"
-        )
-
-        while not self._shutdown_requested:
-            try:
-                # Poll for pending job
-                job = await self._poll_for_job()
-
-                if job:
-                    job_id = str(job.get("id", job.get("job_id", uuid.uuid4())))
-                    metadata = self._extract_job_metadata(job)
-
-                    # Update status to processing
-                    await self._update_job_status(
-                        job_id,
-                        self.config.polling.status_value_processing,
-                    )
-
-                    # Process the job
-                    result = await self.process_job(job_id, metadata)
-
-                    # Update status based on result
-                    if result.get("error"):
-                        await self._update_job_status(
-                            job_id,
-                            self.config.polling.status_value_failed,
-                            error=result["error"],
-                        )
-                    else:
-                        await self._update_job_status(
-                            job_id,
-                            self.config.polling.status_value_complete,
-                        )
-
-                else:
-                    # No job found, wait before polling again
-                    await asyncio.sleep(self.config.polling.interval_seconds)
-
-            except asyncio.CancelledError:
-                logger.info("Polling cancelled")
-                break
-
-            except Exception as e:
-                logger.error(f"Polling error: {e}", exc_info=True)
-                await asyncio.sleep(self.config.polling.interval_seconds)
-
-        logger.info("Polling loop ended")
-
-    async def _poll_for_job(self) -> Optional[Dict[str, Any]]:
-        """Poll the database for a pending job.
-
-        Uses configuration to determine which table and field to check.
-        Supports SKIP LOCKED for concurrent processing.
-        """
-        if not self.postgres_conn:
-            logger.warning("No database connection for polling")
-            return None
-
-        table = self.config.polling.table
-        status_field = self.config.polling.status_field
-        pending_value = self.config.polling.status_value_pending
-        use_skip_locked = self.config.polling.use_skip_locked
-
-        skip_locked_clause = "FOR UPDATE SKIP LOCKED" if use_skip_locked else ""
-
-        query = f"""
-            SELECT * FROM {table}
-            WHERE {status_field} = $1
-            ORDER BY created_at ASC
-            LIMIT 1
-            {skip_locked_clause}
-        """
-
-        try:
-            row = await self.postgres_conn.fetchrow(query, pending_value)
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Polling query failed: {e}")
-            return None
-
-    async def _update_job_status(
-        self,
-        job_id: str,
-        status: str,
-        error: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Update job status in the database."""
-        if not self.postgres_conn:
-            return
-
-        table = self.config.polling.table
-        status_field = self.config.polling.status_field
-
-        if error:
-            query = f"""
-                UPDATE {table}
-                SET {status_field} = $1, error = $2, updated_at = NOW()
-                WHERE id = $3::uuid
-            """
-            await self.postgres_conn.execute(query, status, str(error), job_id)
-        else:
-            query = f"""
-                UPDATE {table}
-                SET {status_field} = $1, updated_at = NOW()
-                WHERE id = $2::uuid
-            """
-            await self.postgres_conn.execute(query, status, job_id)
-
     def _extract_job_metadata(self, job: Dict[str, Any]) -> Dict[str, Any]:
         """Extract metadata from a job record for processing.
 
@@ -1013,7 +878,6 @@ class UniversalAgent:
                 "neo4j": self.neo4j_conn is not None,
             },
             "config": {
-                "polling_enabled": self.config.polling.enabled,
                 "model": self.config.llm.model,
             },
         }

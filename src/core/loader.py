@@ -264,21 +264,6 @@ class ConnectionsConfig:
 
 
 @dataclass
-class PollingConfig:
-    """Job polling configuration."""
-
-    enabled: bool = True
-    table: str = "jobs"
-    status_field: str = "status"
-    status_value_pending: str = "pending"
-    status_value_processing: str = "processing"
-    status_value_complete: str = "complete"
-    status_value_failed: str = "failed"
-    interval_seconds: int = 30
-    use_skip_locked: bool = False
-
-
-@dataclass
 class LimitsConfig:
     """Execution limits configuration."""
 
@@ -331,7 +316,6 @@ class AgentConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     todo: TodoConfig = field(default_factory=TodoConfig)
     connections: ConnectionsConfig = field(default_factory=ConnectionsConfig)
-    polling: PollingConfig = field(default_factory=PollingConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     context_management: ContextManagementConfig = field(
         default_factory=ContextManagementConfig
@@ -449,19 +433,6 @@ def load_agent_config(
         neo4j=connections_data.get("neo4j", False),
     )
 
-    polling_data = data.get("polling", {})
-    polling_config = PollingConfig(
-        enabled=polling_data.get("enabled", True),
-        table=polling_data.get("table", "jobs"),
-        status_field=polling_data.get("status_field", "status"),
-        status_value_pending=polling_data.get("status_value_pending", "pending"),
-        status_value_processing=polling_data.get("status_value_processing", "processing"),
-        status_value_complete=polling_data.get("status_value_complete", "complete"),
-        status_value_failed=polling_data.get("status_value_failed", "failed"),
-        interval_seconds=polling_data.get("interval_seconds", 30),
-        use_skip_locked=polling_data.get("use_skip_locked", False),
-    )
-
     limits_data = data.get("limits", {})
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
@@ -510,7 +481,6 @@ def load_agent_config(
         tools=tools_config,
         todo=todo_config,
         connections=connections_config,
-        polling=polling_config,
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,

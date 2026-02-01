@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Graph-RAG system for requirement traceability and compliance checking. Uses LangGraph and LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
+Graph-RAG system for requirement traceability and compliance checking. Uses LangGraph and LLMs to extract requirements from documents, validate them, and track GoBD/GDPR compliance.
 
 ## Commands
 
@@ -21,21 +21,30 @@ cp .env.example .env  # Then configure API keys
 # Start databases (development)
 podman-compose -f docker-compose.dev.yaml up -d
 
-# Initialize with sample data
-python scripts/app_init.py --seed
+# Initialize everything (databases + workspace) - RECOMMENDED
+python init.py
 
-# Reset databases
-python scripts/app_init.py --force-reset --seed
-python scripts/app_init.py --only-postgres --force-reset
-python scripts/app_init.py --only-neo4j --force-reset
+# Reset everything (WARNING: deletes all data)
+python init.py --force-reset
+
+# Initialize specific components only
+python init.py --only-orchestrator     # Only databases (PostgreSQL, MongoDB)
+python init.py --only-agent            # Only workspace
+python init.py --skip-mongodb          # Skip MongoDB (optional component)
+
+# Component-specific initialization (alternative)
+python -m orchestrator.init            # Initialize databases only
+python -m src.init                     # Initialize workspace only
 
 # Create backup of current state
-python scripts/app_init.py --create-backup                  # Auto-named: backups/YYYYMMDD_NNN/
-python scripts/app_init.py --create-backup my_backup        # Named: backups/YYYYMMDD_NNN_my_backup/
+python init.py --create-backup                  # Auto-named: backups/YYYYMMDD_NNN/
+python init.py --create-backup my_backup        # Named: backups/YYYYMMDD_NNN_my_backup/
 
 # Restore from backup
-python scripts/app_init.py --restore-backup backups/20260117_001_my_backup
+python init.py --restore-backup backups/20260117_001_my_backup
 ```
+
+Note: Legacy scripts are in `DEPRECATED_scripts/` and show deprecation warnings.
 
 ### Running Agents
 ```bash
@@ -47,6 +56,9 @@ python agent.py --config my_agent --prompt "Your task" --stream --verbose
 
 # Process document
 python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+
+# Process directory of documents
+python agent.py --document-dir ./data/example_data/ --prompt "Identify requirements" --stream --verbose
 
 # Start as API server
 python agent.py --port 8001
@@ -76,10 +88,17 @@ mypy src/                       # Type check
 ```bash
 cd cockpit
 npm install                     # Install dependencies
-npm start                       # Dev server at http://localhost:4000
+npm start                       # Dev server at http://localhost:4200
 npm run build                   # Production build
 npm test                        # Run vitest tests
 npm run test:watch              # Watch mode
+```
+
+### Orchestrator (Backend API)
+```bash
+cd orchestrator
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8085
 ```
 
 ### Validation
@@ -94,10 +113,12 @@ python validate_metamodel.py --check all --json
 Single codebase configured for different roles via JSON configs in `config/`. See `config/README.md` for full documentation on creating custom agent configs.
 
 Config structure:
-- `config/defaults.json` - Framework defaults (all configs extend this)
+- `config/defaults.yaml` - Framework defaults (all configs extend this)
 - `config/schema.json` - JSON Schema for config validation
-- `config/my_agent.json` - Custom single-file config
-- `config/my_agent/config.json` - Custom directory config (with prompt overrides)
+- `config/prompts/` - System prompts (strategic.txt, tactical.txt, systemprompt.txt)
+- `config/templates/` - File templates (workspace_template.md, strategic_todos_*.yaml)
+- `config/my_agent.yaml` - Custom single-file config
+- `config/my_agent/config.yaml` - Custom directory config (with prompt overrides)
 
 ### Phase Alternation Model
 
@@ -141,7 +162,7 @@ init_workspace → init_strategic_todos
 
 ### Configuration Inheritance
 
-Configs use `$extends: defaults` to inherit from `config/defaults.yaml`. Deep merge applies - set value to `null` to clear inherited defaults. The config schema (`config/schema.json`) provides IDE autocompletion via the YAML language server comment.
+Configs use `$extends: defaults` to inherit from `config/defaults.yaml`. Deep merge applies: objects merge recursively, arrays replace entirely, `null` clears a key. The config schema (`config/schema.json`) provides IDE autocompletion via the YAML language server comment.
 
 ```yaml
 # yaml-language-server: $schema=schema.json
@@ -168,9 +189,9 @@ Tool categories in config:
 
 | Database | Purpose | Connection |
 |----------|---------|------------|
-| PostgreSQL | Jobs, requirements, citations | Async with asyncpg, namespace pattern: `db.jobs.create()` |
-| Neo4j | Knowledge graph | Session-based, namespace pattern: `db.requirements.create()` |
+| PostgreSQL | Jobs, agents, requirements, citations | Async with asyncpg, namespace pattern: `db.jobs.create()` |
 | MongoDB | LLM request logging (optional) | Audit trail and token tracking |
+| Neo4j | Knowledge graph (optional) | Graph visualization and querying |
 
 ### Workspace Structure
 
@@ -187,8 +208,8 @@ Per-job directory: `workspace/job_<uuid>/`
 ### Context Management
 
 Token limits trigger automatic summarization:
-- `context_threshold_tokens`: 60000 (default in defaults.json)
-- `message_count_threshold`: 150 messages
+- `context_threshold_tokens`: 60000 (default in defaults.yaml)
+- `message_count_threshold`: 200 messages
 - `keep_recent_tool_results`: 10 most recent preserved during compaction
 
 ### Todo Limits
@@ -198,8 +219,10 @@ Todo constraints (in `todo` config section):
 
 ## Key Source Directories
 
+- `init.py` - Root initialization script (orchestrates all components)
 - `src/graph.py` - LangGraph state machine (phase alternation graph)
 - `src/agent.py` - UniversalAgent main class
+- `src/init.py` - Agent workspace initialization
 - `src/core/` - State management, workspace, context, phase transitions
   - `state.py` - UniversalAgentState TypedDict
   - `workspace.py` - WorkspaceManager for job directories
@@ -209,16 +232,19 @@ Todo constraints (in `todo` config section):
 - `src/tools/` - Tool implementations and registry
   - `registry.py` - Tool metadata registry with phase filtering
   - `context.py` - ToolContext dependency injection
-  - `graph_tools.py` - Neo4j tools (execute_cypher_query, get_database_schema, validate_schema_compliance)
   - `description_generator.py` - Generates tool documentation for workspace
-- `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
+- `src/database/` - PostgreSQL (asyncpg), MongoDB managers
   - `postgres_db.py` - Async PostgreSQL with namespaces
-  - `neo4j_db.py` - Neo4j session-based with namespaces
   - `schema.sql` - PostgreSQL schema
-- `src/api/` - FastAPI application
+- `src/api/` - FastAPI application (agent API)
 - `config/` - Configuration files, defaults, schema, and prompt templates
-- `dashboard/` - Streamlit UI
-- `cockpit/` - Angular frontend for graph visualization and management
+- `orchestrator/` - Backend API for monitoring and agent orchestration
+  - `orchestrator/init.py` - Database initialization (PostgreSQL, MongoDB)
+  - `orchestrator/main.py` - FastAPI endpoints
+  - `orchestrator/database/` - Database layer (postgres.py, mongodb.py, schema.sql)
+  - `orchestrator/services/` - Services (workspace)
+  - `orchestrator/mcp/` - MCP server for Claude Code integration
+- `cockpit/` - Angular frontend for debugging and job management
 - `citation_tool/` - Separate installable package for citation management
 
 ## Environment Variables
@@ -233,12 +259,10 @@ Required in `.env`:
 
 | Service | Port |
 |---------|------|
-| Dashboard | 8501 |
-| Agent API (default) | 8001 |
-| Cockpit Frontend | 4000 |
-| Cockpit API | 8085 |
-| Neo4j Bolt | 7687 |
-| Neo4j HTTP | 7474 |
+| Agent API | 8001 |
+| Orchestrator API | 8085 |
+| Cockpit Frontend (docker) | 4000 |
+| Cockpit Frontend (npm start) | 4200 |
 | PostgreSQL | 5432 |
 | MongoDB | 27017 |
 
@@ -257,8 +281,24 @@ rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 
 **MongoDB LLM Viewer** (requires `MONGODB_URL` in .env):
 ```bash
-python scripts/view_llm_conversation.py --list                    # List jobs
-python scripts/view_llm_conversation.py --job-id <uuid>           # View conversation
-python scripts/view_llm_conversation.py --job-id <uuid> --stats   # Token usage stats
-python scripts/view_llm_conversation.py --job-id <uuid> --audit   # Full audit trail
+python DEPRECATED_scripts/view_llm_conversation.py --list                    # List jobs
+python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid>           # View conversation
+python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid> --stats   # Token usage stats
+python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid> --audit   # Full audit trail
 ```
+
+**Orchestrator MCP Server** (for Claude Code integration):
+The project includes `.mcp.json` for MCP server configuration. Claude Code can use these tools for AI-assisted debugging:
+
+| Tool | Description |
+|------|-------------|
+| `list_jobs` | List jobs with status filter |
+| `get_job` | Get job details by ID |
+| `get_audit_trail` | Get paginated audit entries |
+| `get_chat_history` | Get conversation turns |
+| `get_todos` | Get current and archived todos |
+| `get_graph_changes` | Get Neo4j graph mutations timeline |
+| `get_llm_request` | Get full LLM request/response |
+| `search_audit` | Search audit entries by pattern |
+
+The MCP server is located at `orchestrator/mcp/`.

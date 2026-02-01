@@ -232,3 +232,75 @@ class MetricsResponse(BaseModel):
     )
     current_iterations: int = Field(default=0, description="Iterations in current job")
     uptime_seconds: float = Field(..., description="Agent uptime")
+
+
+# =============================================================================
+# Orchestrator Integration Models
+# =============================================================================
+
+
+class JobStartRequest(BaseModel):
+    """Request from orchestrator to start a job."""
+
+    job_id: str = Field(..., description="Job UUID assigned by orchestrator")
+    prompt: str = Field(..., description="Task prompt for the agent")
+    document_path: Optional[str] = Field(
+        default=None,
+        description="Path to document to process",
+    )
+    document_dir: Optional[str] = Field(
+        default=None,
+        description="Directory containing documents",
+    )
+    config_name: Optional[str] = Field(
+        default=None,
+        description="Agent configuration name override",
+    )
+    context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional context dictionary",
+    )
+    instructions: Optional[str] = Field(
+        default=None,
+        description="Additional instructions for the agent",
+    )
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "job_id": "abc123-def456-789",
+                "prompt": "Extract requirements from document",
+                "document_path": "/data/documents/spec.pdf",
+            }
+        }
+    )
+
+
+class JobStartResponse(BaseModel):
+    """Response after accepting a job from orchestrator."""
+
+    job_id: str = Field(..., description="Accepted job ID")
+    status: str = Field(default="accepted", description="Acceptance status")
+    message: str = Field(
+        default="Job processing started",
+        description="Status message",
+    )
+
+
+class JobCancelByOrchestratorRequest(BaseModel):
+    """Request from orchestrator to cancel current job."""
+
+    reason: Optional[str] = Field(
+        default=None,
+        description="Reason for cancellation",
+    )
+
+
+class JobResumeRequest(BaseModel):
+    """Request to resume a job from checkpoint."""
+
+    job_id: str = Field(..., description="Job ID to resume")
+    feedback: Optional[str] = Field(
+        default=None,
+        description="Optional feedback to inject before resuming",
+    )

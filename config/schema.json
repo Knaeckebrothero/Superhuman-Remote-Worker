@@ -181,56 +181,6 @@
         }
       }
     },
-    "polling": {
-      "type": "object",
-      "description": "Database polling configuration",
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable polling mode"
-        },
-        "table": {
-          "type": "string",
-          "description": "Table to poll for work"
-        },
-        "status_field": {
-          "type": "string",
-          "description": "Field containing status"
-        },
-        "status_value_pending": {
-          "type": "string",
-          "default": "pending",
-          "description": "Status value for pending items"
-        },
-        "status_value_processing": {
-          "type": "string",
-          "default": "processing",
-          "description": "Status value for items being processed"
-        },
-        "status_value_complete": {
-          "type": "string",
-          "default": "complete",
-          "description": "Status value for completed items"
-        },
-        "status_value_failed": {
-          "type": "string",
-          "default": "failed",
-          "description": "Status value for failed items"
-        },
-        "interval_seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "default": 10,
-          "description": "Polling interval in seconds"
-        },
-        "use_skip_locked": {
-          "type": "boolean",
-          "default": false,
-          "description": "Use SKIP LOCKED for concurrent processing"
-        }
-      }
-    },
     "limits": {
       "type": "object",
       "description": "Execution limits",

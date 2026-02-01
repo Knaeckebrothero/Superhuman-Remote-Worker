@@ -10,6 +10,8 @@ export interface LayoutPreset {
   name: string;
   /** Optional description of the layout */
   description?: string;
+  /** Whether this preset should appear in the featured section */
+  featured?: boolean;
   /** The layout configuration */
   config: LayoutConfig;
 }

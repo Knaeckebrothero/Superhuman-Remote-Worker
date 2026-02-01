@@ -5,8 +5,8 @@ Angular dashboard for debugging and visualizing Graph-RAG agent execution. Featu
 ## Quick Start
 
 ```bash
-# Terminal 1: Start FastAPI backend
-cd cockpit/api
+# Terminal 1: Start Orchestrator backend
+cd orchestrator
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8085
 
@@ -24,7 +24,7 @@ npm start
 │                     Angular Frontend                         │
 │                    http://localhost:4200                     │
 ├─────────────────────────────────────────────────────────────┤
-│                     FastAPI Backend                          │
+│                   Orchestrator Backend                       │
 │                    http://localhost:8085                     │
 ├──────────────────┬──────────────────┬───────────────────────┤
 │    PostgreSQL    │     MongoDB      │        Neo4j          │
@@ -66,7 +66,7 @@ npm test
 
 ## API Endpoints
 
-The backend runs on port **8085** and provides:
+The orchestrator backend runs on port **8085** and provides:
 
 - `GET /api/tables` - List available PostgreSQL tables
 - `GET /api/tables/{name}` - Get paginated table data
@@ -78,7 +78,7 @@ The backend runs on port **8085** and provides:
 
 ## Environment
 
-The backend requires these environment variables (see `.env.example`):
+The orchestrator backend requires these environment variables (see `.env.example`):
 
 - `DATABASE_URL` - PostgreSQL connection string
 - `MONGODB_URL` - MongoDB connection string (optional)
@@ -93,15 +93,15 @@ The MCP (Model Context Protocol) server exposes cockpit metrics to LLMs like Cla
 
 **Local development:**
 ```bash
-cd cockpit/mcp
+cd orchestrator/mcp
 pip install -r requirements.txt
 python run.py
 ```
 
 **Docker:**
 ```bash
-podman-compose -f docker-compose.dev.yaml up -d cockpit-mcp
-docker exec -i graphrag-cockpit-mcp-dev python run.py
+podman-compose -f docker-compose.dev.yaml up -d orchestrator-mcp
+docker exec -i graphrag-orchestrator-mcp-dev python run.py
 ```
 
 ### Claude Code Configuration
@@ -112,9 +112,9 @@ For containerized setup, create or update `.mcp.json`:
 ```json
 {
   "mcpServers": {
-    "cockpit-debug": {
+    "orchestrator": {
       "command": "docker",
-      "args": ["exec", "-i", "graphrag-cockpit-mcp-dev", "python", "run.py"]
+      "args": ["exec", "-i", "graphrag-orchestrator-mcp-dev", "python", "run.py"]
     }
   }
 }
