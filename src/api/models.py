@@ -244,6 +244,18 @@ class JobStartRequest(BaseModel):
 
     job_id: str = Field(..., description="Job UUID assigned by orchestrator")
     prompt: str = Field(..., description="Task prompt for the agent")
+    upload_id: Optional[str] = Field(
+        default=None,
+        description="Upload ID for document files (from /api/uploads)",
+    )
+    config_upload_id: Optional[str] = Field(
+        default=None,
+        description="Upload ID for config YAML override",
+    )
+    instructions_upload_id: Optional[str] = Field(
+        default=None,
+        description="Upload ID for instructions markdown file",
+    )
     document_path: Optional[str] = Field(
         default=None,
         description="Path to document to process",
@@ -262,7 +274,7 @@ class JobStartRequest(BaseModel):
     )
     instructions: Optional[str] = Field(
         default=None,
-        description="Additional instructions for the agent",
+        description="Additional inline instructions for the agent",
     )
 
     model_config = ConfigDict(

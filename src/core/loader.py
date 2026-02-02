@@ -489,6 +489,185 @@ def load_agent_config(
     )
 
 
+def load_agent_config_from_dict(
+    data: Dict[str, Any],
+    deployment_dir: Optional[str] = None
+) -> AgentConfig:
+    """Create an AgentConfig from a pre-merged configuration dictionary.
+
+    This is useful when you've already merged config data (e.g., from an uploaded
+    config merged with defaults) and want to create an AgentConfig.
+
+    Args:
+        data: Merged configuration dictionary
+        deployment_dir: Optional deployment directory for prompt resolution
+
+    Returns:
+        AgentConfig dataclass
+
+    Raises:
+        ValueError: If required fields are missing
+    """
+    # Validate required fields
+    required = ["agent_id", "display_name"]
+    missing = [field for field in required if field not in data]
+    if missing:
+        raise ValueError(f"Missing required config fields: {missing}")
+
+    # Parse nested configs (same as load_agent_config)
+    llm_data = data.get("llm", {})
+    llm_config = LLMConfig(
+        model=llm_data.get("model", "gpt-4o"),
+        temperature=llm_data.get("temperature", 0.0),
+        reasoning_level=llm_data.get("reasoning_level", "high"),
+        base_url=llm_data.get("base_url"),
+        api_key=llm_data.get("api_key"),
+        timeout=llm_data.get("timeout", 600.0),
+        max_retries=llm_data.get("max_retries", 3),
+    )
+
+    workspace_data = data.get("workspace", {})
+    max_read_words = workspace_data.get("max_read_words")
+    max_read_size_legacy = workspace_data.get("max_read_size")
+    if max_read_words is None and max_read_size_legacy is not None:
+        max_read_words = int(max_read_size_legacy / 5.5)
+    elif max_read_words is None:
+        max_read_words = 25000
+
+    workspace_config = WorkspaceConfig(
+        structure=workspace_data.get("structure", []),
+        instructions_template=workspace_data.get("instructions_template", ""),
+        initial_files=workspace_data.get("initial_files", {}),
+        max_read_words=max_read_words,
+    )
+
+    tools_data = data.get("tools", {})
+    tools_config = ToolsConfig(
+        workspace=tools_data.get("workspace", []),
+        todo=tools_data.get("todo", []),
+        domain=tools_data.get("domain", []),
+        completion=tools_data.get("completion", []),
+    )
+
+    todo_data = data.get("todo", {})
+    todo_config = TodoConfig(
+        max_items=todo_data.get("max_items", 25),
+        archive_on_reset=todo_data.get("archive_on_reset", True),
+        archive_path=todo_data.get("archive_path", "archive/"),
+    )
+
+    connections_data = data.get("connections", {})
+    connections_config = ConnectionsConfig(
+        postgres=connections_data.get("postgres", True),
+        neo4j=connections_data.get("neo4j", False),
+    )
+
+    limits_data = data.get("limits", {})
+    limits_config = LimitsConfig(
+        context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
+        message_count_threshold=limits_data.get("message_count_threshold", 200),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
+        tool_retry_count=limits_data.get("tool_retry_count", 3),
+        model_max_context_tokens=limits_data.get("model_max_context_tokens", 128000),
+        summarization_safe_limit=limits_data.get("summarization_safe_limit", 100000),
+        summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+    )
+
+    context_data = data.get("context_management", {})
+    context_config = ContextManagementConfig(
+        compact_on_archive=context_data.get("compact_on_archive", True),
+        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 10),
+        keep_recent_messages=context_data.get("keep_recent_messages", 10),
+        summarization_template=context_data.get(
+            "summarization_template",
+            "summarization_prompt.txt"
+        ),
+        reasoning_level=context_data.get("reasoning_level", "high"),
+        max_summary_length=context_data.get("max_summary_length", 10000),
+    )
+
+    phase_data = data.get("phase_settings", {})
+    phase_config = PhaseSettings(
+        min_todos=phase_data.get("min_todos", 5),
+        max_todos=phase_data.get("max_todos", 20),
+        archive_on_transition=phase_data.get("archive_on_transition", True),
+    )
+
+    # Collect extra fields
+    known_fields = {
+        "$schema", "agent_id", "display_name", "description", "llm", "workspace",
+        "tools", "todo", "connections", "polling", "limits", "context_management",
+        "phase_settings"
+    }
+    extra = {k: v for k, v in data.items() if k not in known_fields}
+
+    return AgentConfig(
+        agent_id=data["agent_id"],
+        display_name=data["display_name"],
+        description=data.get("description", ""),
+        llm=llm_config,
+        workspace=workspace_config,
+        tools=tools_config,
+        todo=todo_config,
+        connections=connections_config,
+        limits=limits_config,
+        context_management=context_config,
+        phase_settings=phase_config,
+        extra=extra,
+        _deployment_dir=deployment_dir,
+    )
+
+
+def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
+    """Load an uploaded config file and merge with defaults.
+
+    The uploaded config is treated as an override on top of defaults.yaml.
+    Uses the same deep_merge semantics as $extends inheritance.
+
+    This enables per-job config customization without modifying the defaults.
+
+    Args:
+        uploaded_config_path: Path to the uploaded YAML config file
+
+    Returns:
+        Merged configuration dictionary (defaults + uploaded overrides)
+
+    Example:
+        ```python
+        # User uploads a YAML file with:
+        # llm:
+        #   temperature: 0.7
+        #
+        # Result is defaults.yaml with temperature overridden to 0.7
+
+        merged = load_uploaded_config(Path("/workspace/uploads/config_123/agent.yaml"))
+        config = load_agent_config_from_dict(merged)
+        ```
+    """
+    # Load defaults first
+    defaults_path, _ = resolve_config_path("defaults")
+    defaults_data = load_and_merge_config(defaults_path)
+
+    # Load uploaded config
+    with open(uploaded_config_path, "r", encoding="utf-8") as f:
+        uploaded_data = yaml.safe_load(f) or {}
+
+    # Remove $extends if present - we always extend defaults for uploaded configs
+    uploaded_data.pop("$extends", None)
+    uploaded_data.pop("$comment", None)
+
+    # Merge: defaults as base, uploaded as override
+    merged = deep_merge(defaults_data, uploaded_data)
+
+    logger.info(
+        f"Merged uploaded config with defaults: "
+        f"agent_id={merged.get('agent_id')}, "
+        f"overrides={list(uploaded_data.keys())}"
+    )
+
+    return merged
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
