@@ -9,20 +9,20 @@ import logging
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from .context import ToolContext
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-CITATION_TOOLS_METADATA = {
+CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "cite_document": {
-        "module": "citation_tools",
+        "module": "citation.sources",
         "function": "cite_document",
         "description": "Create a verified citation for document content",
         "category": "domain",
@@ -31,7 +31,7 @@ CITATION_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "cite_web": {
-        "module": "citation_tools",
+        "module": "citation.sources",
         "function": "cite_web",
         "description": "Create a verified citation for web content",
         "category": "domain",
@@ -40,7 +40,7 @@ CITATION_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "list_sources": {
-        "module": "citation_tools",
+        "module": "citation.sources",
         "function": "list_sources",
         "description": "List all registered citation sources",
         "category": "domain",
@@ -49,7 +49,7 @@ CITATION_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "get_citation": {
-        "module": "citation_tools",
+        "module": "citation.sources",
         "function": "get_citation",
         "description": "Get details about a specific citation",
         "category": "domain",
@@ -58,7 +58,7 @@ CITATION_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "list_citations": {
-        "module": "citation_tools",
+        "module": "citation.sources",
         "function": "list_citations",
         "description": "List all citations created in this session",
         "category": "domain",
@@ -67,7 +67,7 @@ CITATION_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "edit_citation": {
-        "module": "citation_tools",
+        "module": "citation.sources",
         "function": "edit_citation",
         "description": "Edit fields of an existing citation",
         "category": "domain",
@@ -124,7 +124,7 @@ Note: CitationEngine not available. Citation stored in stub mode only.
 Use this citation_id when writing requirements."""
 
 
-def create_citation_tools(context: ToolContext) -> List:
+def create_source_tools(context: ToolContext) -> List[Any]:
     """Create citation tools with injected context.
 
     Args:

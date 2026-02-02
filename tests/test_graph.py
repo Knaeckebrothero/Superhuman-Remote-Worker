@@ -1017,7 +1017,7 @@ class TestEditFileTool:
     @pytest.fixture
     def workspace_tools_dict(self, workspace_manager):
         """Create workspace tools and return as dict."""
-        from src.tools.workspace_tools import create_workspace_tools
+        from src.tools.workspace import create_workspace_tools
         from src.tools.context import ToolContext
 
         ctx = ToolContext(workspace_manager=workspace_manager)
@@ -1096,112 +1096,6 @@ class TestEditFileTool:
 
 
 # =============================================================================
-# EDIT REQUIREMENT TOOL TESTS
-# =============================================================================
-
-
-class TestEditRequirementTool:
-    """Tests for the edit_requirement tool."""
-
-    @pytest.fixture
-    def mock_db(self):
-        """Create a mock database with requirements namespace."""
-        db = MagicMock()
-        db.requirements = MagicMock()
-        return db
-
-    @pytest.fixture
-    def edit_tool(self, workspace_manager, mock_db):
-        """Create cache tools and return the edit_requirement tool."""
-        from src.tools.cache_tools import create_cache_tools
-        from src.tools.context import ToolContext
-
-        ctx = ToolContext(
-            workspace_manager=workspace_manager,
-            postgres_db=mock_db,
-            _job_id="test-job-123",
-        )
-        tools = create_cache_tools(ctx)
-        for t in tools:
-            if t.name == "edit_requirement":
-                return t
-        pytest.fail("edit_requirement tool not found in cache tools")
-
-    @pytest.mark.asyncio
-    async def test_edit_text_and_name(self, edit_tool, mock_db):
-        """Test successful edit of text and name."""
-        mock_db.requirements.edit_content = AsyncMock(return_value=None)
-
-        result = await edit_tool.ainvoke({
-            "requirement_id": "00000000-0000-0000-0000-000000000001",
-            "text": "Updated text",
-            "name": "Updated name",
-        })
-
-        assert "ok: edited" in result
-        mock_db.requirements.edit_content.assert_called_once()
-        call_kwargs = mock_db.requirements.edit_content.call_args
-        assert call_kwargs.kwargs["text"] == "Updated text"
-        assert call_kwargs.kwargs["name"] == "Updated name"
-
-    @pytest.mark.asyncio
-    async def test_edit_not_found(self, edit_tool, mock_db):
-        """Test error when requirement is not found."""
-        mock_db.requirements.edit_content = AsyncMock(
-            side_effect=ValueError("Requirement 00000000-0000-0000-0000-000000000099 not found")
-        )
-
-        result = await edit_tool.ainvoke({
-            "requirement_id": "00000000-0000-0000-0000-000000000099",
-            "text": "New text",
-        })
-
-        assert "error:" in result
-        assert "not found" in result
-
-    @pytest.mark.asyncio
-    async def test_edit_not_pending(self, edit_tool, mock_db):
-        """Test error when requirement is not in 'pending' status."""
-        mock_db.requirements.edit_content = AsyncMock(
-            side_effect=ValueError("has status 'integrated', only 'pending' requirements can be edited")
-        )
-
-        result = await edit_tool.ainvoke({
-            "requirement_id": "00000000-0000-0000-0000-000000000001",
-            "text": "New text",
-        })
-
-        assert "error:" in result
-        assert "pending" in result
-
-    @pytest.mark.asyncio
-    async def test_edit_no_fields(self, edit_tool, mock_db):
-        """Test error when no fields are provided."""
-        result = await edit_tool.ainvoke({
-            "requirement_id": "00000000-0000-0000-0000-000000000001",
-        })
-
-        assert "error:" in result
-        assert "no fields" in result
-
-    @pytest.mark.asyncio
-    async def test_edit_parses_comma_lists(self, edit_tool, mock_db):
-        """Test that comma-separated lists are parsed correctly."""
-        mock_db.requirements.edit_content = AsyncMock(return_value=None)
-
-        result = await edit_tool.ainvoke({
-            "requirement_id": "00000000-0000-0000-0000-000000000001",
-            "tags": "tag1, tag2, tag3",
-            "citations": "CIT-001, CIT-002",
-        })
-
-        assert "ok: edited" in result
-        call_kwargs = mock_db.requirements.edit_content.call_args.kwargs
-        assert call_kwargs["tags"] == ["tag1", "tag2", "tag3"]
-        assert call_kwargs["citations"] == ["CIT-001", "CIT-002"]
-
-
-# =============================================================================
 # EDIT CITATION TOOL TESTS
 # =============================================================================
 
@@ -1219,7 +1113,7 @@ class TestEditCitationTool:
     @pytest.fixture
     def edit_tool(self, workspace_manager, mock_db):
         """Create citation tools and return the edit_citation tool."""
-        from src.tools.citation_tools import create_citation_tools
+        from src.tools.citation import create_citation_tools
         from src.tools.context import ToolContext
 
         ctx = ToolContext(

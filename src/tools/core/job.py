@@ -1,6 +1,6 @@
-"""Completion signaling tools for the Universal Agent.
+"""Job lifecycle tools for the Universal Agent.
 
-This module provides two completion tools:
+This module provides completion signaling tools:
 - mark_complete: Signals that a task/phase is complete (used by phase transitions)
 - job_complete: Marks the phase as final, job completes after remaining todos are done
 
@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from .context import ToolContext
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -28,17 +28,43 @@ logger = logging.getLogger(__name__)
 _final_phase_data: Dict[str, Dict[str, Any]] = {}
 
 
-def create_completion_tools(context: ToolContext) -> List:
-    """Create completion signaling tools.
+# Tool metadata for registry
+# Phase availability:
+#   - "strategic": Only in strategic mode (planning)
+#   - "tactical": Only in tactical mode (execution)
+#   - Both: Available in both modes (default if not specified)
+JOB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    "mark_complete": {
+        "module": "core.job",
+        "function": "mark_complete",
+        "description": "Signal task/phase completion with structured report",
+        "category": "completion",
+        "phases": ["strategic", "tactical"],  # Both modes
+    },
+    "job_complete": {
+        "module": "core.job",
+        "function": "job_complete",
+        "description": "Signal FINAL job completion - call when all phases are done",
+        "category": "completion",
+        "phases": ["strategic"],  # Strategic-only: prevents premature termination
+    },
+}
+
+
+def create_job_tools(context: ToolContext) -> List[Any]:
+    """Create job lifecycle tools.
 
     Args:
         context: Tool context with workspace manager
 
     Returns:
-        List of completion tools
+        List of job tools
+
+    Raises:
+        ValueError: If context doesn't have a workspace_manager
     """
     if not context.has_workspace():
-        raise ValueError("ToolContext must have a workspace_manager for completion tools")
+        raise ValueError("ToolContext must have a workspace_manager for job tools")
 
     workspace = context.workspace_manager
 
