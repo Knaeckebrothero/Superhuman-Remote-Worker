@@ -16,6 +16,7 @@ import {
   StuckJob,
   WorkspaceOverview,
 } from '../models/api.model';
+import { UploadResponse, UploadInfo } from '../models/file.model';
 import {
   JobSummary,
   AuditEntry,
@@ -394,6 +395,89 @@ export class ApiService {
       catchError((error) => {
         console.error(`Failed to delete agent ${agentId}:`, error);
         return of(null);
+      }),
+    );
+  }
+
+  // ===== File Upload Endpoints =====
+
+  /**
+   * Upload files for job creation.
+   * @param files Files to upload
+   * @returns Observable with upload response containing upload_id
+   */
+  uploadFiles(files: File[]): Observable<UploadResponse | null> {
+    const formData = new FormData();
+    files.forEach((file) => formData.append('files', file, file.name));
+
+    return this.http.post<UploadResponse>(`${this.baseUrl}/uploads`, formData).pipe(
+      catchError((error) => {
+        console.error('Failed to upload files:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Upload a config file (YAML) for job creation.
+   * Config files override default agent settings.
+   * @param file Single YAML config file
+   * @returns Observable with upload response containing upload_id
+   */
+  uploadConfig(file: File): Observable<UploadResponse | null> {
+    const formData = new FormData();
+    formData.append('files', file, file.name);
+
+    const params = new HttpParams().set('upload_type', 'config');
+
+    return this.http.post<UploadResponse>(`${this.baseUrl}/uploads`, formData, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to upload config file:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Upload an instructions file (Markdown/Text) for job creation.
+   * Instructions files replace the default agent instructions.
+   * @param file Single .md or .txt instructions file
+   * @returns Observable with upload response containing upload_id
+   */
+  uploadInstructions(file: File): Observable<UploadResponse | null> {
+    const formData = new FormData();
+    formData.append('files', file, file.name);
+
+    const params = new HttpParams().set('upload_type', 'instructions');
+
+    return this.http.post<UploadResponse>(`${this.baseUrl}/uploads`, formData, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to upload instructions file:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get information about an upload.
+   */
+  getUploadInfo(uploadId: string): Observable<UploadInfo | null> {
+    return this.http.get<UploadInfo>(`${this.baseUrl}/uploads/${uploadId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch upload info for ${uploadId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Delete an upload and all its files.
+   */
+  deleteUpload(uploadId: string): Observable<void> {
+    return this.http.delete<void>(`${this.baseUrl}/uploads/${uploadId}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to delete upload ${uploadId}:`, error);
+        throw error;
       }),
     );
   }

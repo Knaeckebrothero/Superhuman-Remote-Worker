@@ -4,25 +4,27 @@ Run the Universal Agent in various modes:
 - CLI mode: Process documents (creates job automatically)
 - API server mode: Start FastAPI server for HTTP interface (receives jobs from orchestrator)
 
+Logging is controlled via environment variables:
+- LOG_LEVEL: DEBUG, INFO (default), WARNING, ERROR
+- DEBUG_LLM_STREAM: Set to "1" for LLM token output to stderr
+- DEBUG_LLM_TAIL: Characters to show in LLM debug output (default: 500)
+
 Examples:
     # Process a single document
     python agent.py --config creator \
         --document-path ./data/doc.pdf \
-        --prompt "Extract GoBD requirements" \
-        --verbose
+        --prompt "Extract GoBD requirements"
 
-    # Process all documents in a directory
-    python agent.py --config creator \
+    # Process all documents in a directory (with debug logging)
+    LOG_LEVEL=DEBUG python agent.py --config creator \
         --document-dir ./data/example_data/ \
-        --prompt "Extract requirements based on the provided documents" \
-        --stream --verbose
+        --prompt "Extract requirements based on the provided documents"
 
     # Combine single document with directory
     python agent.py --config creator \
         --document-path ./data/main.pdf \
         --document-dir ./data/context/ \
-        --prompt "Extract requirements" \
-        --verbose
+        --prompt "Extract requirements"
 
     # Run as API server (Creator agent on port 8001)
     python agent.py --config creator --port 8001
@@ -73,9 +75,13 @@ from src.core.phase_snapshot import PhaseSnapshotManager, format_snapshots_table
 from src.database.postgres_db import PostgresDB
 
 
-def setup_logging(verbose: bool = False):
-    """Configure logging based on verbosity level."""
-    level = logging.DEBUG if verbose else logging.INFO
+def setup_logging():
+    """Configure logging from LOG_LEVEL environment variable.
+
+    Reads LOG_LEVEL env var (default: INFO). Valid values: DEBUG, INFO, WARNING, ERROR.
+    """
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
 
     logging.basicConfig(
         level=level,
@@ -106,15 +112,25 @@ def setup_logging(verbose: bool = False):
     logging.getLogger("uvicorn").setLevel(logging.INFO)
 
 
-def setup_job_file_logging(job_id: str, verbose: bool = False) -> Path:
+class FlushingFileHandler(logging.FileHandler):
+    """File handler that flushes after every emit for crash safety."""
+
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+def setup_job_file_logging(job_id: str) -> Path:
     """Set up file logging for a specific job.
 
     Creates a log file in the logs directory (not inside the job workspace,
-    so the agent cannot read its own logs).
+    so the agent cannot read its own logs). Uses FlushingFileHandler to ensure
+    logs are written immediately for crash safety.
+
+    Log level is read from LOG_LEVEL environment variable (default: INFO).
 
     Args:
         job_id: The job identifier
-        verbose: Whether to use DEBUG level
 
     Returns:
         Path to the log file
@@ -124,9 +140,12 @@ def setup_job_file_logging(job_id: str, verbose: bool = False) -> Path:
     # Log file goes in the logs directory
     log_file = logs_dir / f"job_{job_id}.log"
 
-    # Create file handler
-    level = logging.DEBUG if verbose else logging.INFO
-    file_handler = logging.FileHandler(log_file, mode='a')
+    # Get level from env var (same as setup_logging)
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    # Create flushing file handler for crash safety
+    file_handler = FlushingFileHandler(log_file, mode='a')
     file_handler.setLevel(level)
     file_handler.setFormatter(logging.Formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -329,23 +348,6 @@ def parse_args():
         help="Recover to phase N before resuming (requires --job-id and --resume)",
     )
 
-    # Output options
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable verbose logging",
-    )
-    parser.add_argument(
-        "--stream",
-        action="store_true",
-        help="Stream state updates (for --job-id)",
-    )
-    parser.add_argument(
-        "--debug-llm-stream",
-        action="store_true",
-        help="Print live tail of LLM token stream to stderr (debug)",
-    )
-
     return parser.parse_args()
 
 
@@ -356,15 +358,14 @@ async def run_single_job(
     prompt: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     requirement_data: Optional[Dict[str, Any]] = None,
-    stream: bool = False,
     resume: bool = False,
     feedback: Optional[str] = None,
-    verbose: bool = False,
 ):
     """Run a single job and exit.
 
     If job_id is not provided, creates a new job from document_paths and prompt.
     Logs are written to the workspace directory as job_{job_id}.log.
+    Always uses streaming mode with iteration logging.
 
     Args:
         config_path: Path to agent configuration
@@ -373,10 +374,8 @@ async def run_single_job(
         prompt: Processing prompt
         context: Additional context dictionary
         requirement_data: Requirement data fetched from PostgreSQL (for validator)
-        stream: Enable streaming output
         resume: Resume existing job
         feedback: Feedback message to inject when resuming a frozen job
-        verbose: Enable verbose logging
     """
     logger = logging.getLogger(__name__)
     start_time = datetime.now()
@@ -410,7 +409,7 @@ async def run_single_job(
             logger.info("Disconnected from PostgreSQL (job created)")
 
     # Set up file logging for this job
-    log_file = setup_job_file_logging(job_id, verbose)
+    log_file = setup_job_file_logging(job_id)
 
     # Build metadata for the job
     metadata = {}
@@ -428,23 +427,19 @@ async def run_single_job(
     await agent.initialize()
 
     try:
-        if stream:
-            logger.info(f"Processing job {job_id} with streaming...")
-            final_state = None
-            # process_job returns an async generator when stream=True
-            # We need to await the coroutine first to get the generator
-            streaming_gen = await agent.process_job(job_id, metadata, stream=True, resume=resume, feedback=feedback)
-            async for state in streaming_gen:
-                final_state = state
-                # Print streaming updates
-                if isinstance(state, dict):
-                    iteration = state.get("iteration", "?")
-                    has_error = state.get("error") is not None
-                    logger.info(f"[Iteration {iteration}] error={has_error}")
-            result = final_state or {}
-        else:
-            logger.info(f"Processing job {job_id}...")
-            result = await agent.process_job(job_id, metadata, resume=resume, feedback=feedback)
+        logger.info(f"Processing job {job_id} with streaming...")
+        final_state = None
+        # process_job returns an async generator when stream=True
+        # We need to await the coroutine first to get the generator
+        streaming_gen = await agent.process_job(job_id, metadata, stream=True, resume=resume, feedback=feedback)
+        async for state in streaming_gen:
+            final_state = state
+            # Print streaming updates
+            if isinstance(state, dict):
+                iteration = state.get("iteration", "?")
+                has_error = state.get("error") is not None
+                logger.info(f"[Iteration {iteration}] error={has_error}")
+        result = final_state or {}
 
         elapsed = (datetime.now() - start_time).total_seconds()
 
@@ -542,8 +537,6 @@ async def recover_and_resume(
     prompt: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     requirement_data: Optional[Dict[str, Any]] = None,
-    stream: bool = False,
-    verbose: bool = False,
 ):
     """Recover to a specific phase and resume execution.
 
@@ -555,8 +548,6 @@ async def recover_and_resume(
         prompt: Processing prompt (for metadata)
         context: Additional context dictionary
         requirement_data: Requirement data (for validator)
-        stream: Enable streaming output
-        verbose: Enable verbose logging
     """
     logger = logging.getLogger(__name__)
 
@@ -599,10 +590,8 @@ async def recover_and_resume(
         prompt=prompt,
         context=context,
         requirement_data=requirement_data,
-        stream=stream,
         resume=True,  # Always resume after recovery
         feedback=None,
-        verbose=verbose,
     )
 
 
@@ -626,11 +615,7 @@ def run_server(config_path: str, host: str, port: int):
 def main():
     """Main entry point."""
     args = parse_args()
-    setup_logging(args.verbose)
-
-    # Propagate --debug-llm-stream to the env var before any LLM is created
-    if args.debug_llm_stream:
-        os.environ["DEBUG_LLM_STREAM"] = "1"
+    setup_logging()
 
     logger = logging.getLogger(__name__)
 
@@ -725,8 +710,6 @@ def main():
             prompt=args.prompt,
             context=context,
             requirement_data=requirement_data,
-            stream=args.stream,
-            verbose=args.verbose,
         ))
         return
 
@@ -739,10 +722,8 @@ def main():
             prompt=args.prompt,
             context=context,
             requirement_data=requirement_data,
-            stream=args.stream,
             resume=args.resume,
             feedback=args.feedback,
-            verbose=args.verbose,
         ))
         return
 

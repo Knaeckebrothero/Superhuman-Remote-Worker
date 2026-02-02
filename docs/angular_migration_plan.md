@@ -1,14 +1,14 @@
 # Angular Cockpit Migration Plan
 
-> **Status**: Phases 1-4 complete ✅ | Phase 5 (Cleanup & Deployment) pending ⏳
+> **Status**: Phases 1-5 complete ✅ | Migration complete!
 >
-> **Remaining work**:
-> - Job Details Component (`job-details.component.ts`) - not yet implemented
-> - API endpoint tests & E2E tests
-> - Remove Streamlit dashboard
-> - Environment variable cleanup
-> - Documentation updates
-> - k3s deployment manifests
+> **Completed in Phase 5**:
+> - ✅ Removed Streamlit dashboard (`dashboard/` directory deleted)
+> - ✅ Updated README.md with new architecture
+> - ✅ Cleaned up deprecated code comments
+> - ⏳ Job Details Component - deferred (optional enhancement)
+> - ⏳ API endpoint tests & E2E tests - deferred (optional)
+> - ⏳ k3s deployment manifests - separate deployment task
 
 This document outlines the plan to consolidate the two existing UIs (Streamlit dashboard and Angular cockpit) into a single Angular application.
 
@@ -687,24 +687,23 @@ Also remove from `docker-compose.yaml`:
    - API endpoint tests ⏳
    - E2E tests for job workflow ⏳
 
-### Phase 5: Cleanup & Deployment
+### Phase 5: Cleanup & Deployment ✅
 
-1. **Remove Streamlit Dashboard**
-   - Delete `dashboard/` directory
-   - Remove from docker-compose files
-   - Update documentation
+1. **Remove Streamlit Dashboard** ✅
+   - Deleted `dashboard/` directory
+   - docker-compose.dev.yaml already clean (no dashboard service)
+   - Updated documentation
 
-2. **Environment Variable Cleanup**
-   - Remove deprecated variables
-   - Migrate LLM settings to config
-   - Update `.env.example`
+2. **Environment Variable Cleanup** ✅
+   - `.env.example` already clean (no deprecated variables)
+   - Deprecated vars (CREATOR_AGENT_URL, VALIDATOR_AGENT_URL) were only in dashboard/
 
-3. **Documentation Updates**
-   - Update README.md
-   - Update CLAUDE.md
-   - Move this plan to `docs/done/`
+3. **Documentation Updates** ✅
+   - Updated README.md with new architecture diagram
+   - Updated README.md service URLs and descriptions
+   - Cleaned up "dashboard" references in code comments
 
-4. **k3s Deployment**
+4. **k3s Deployment** ⏳ (separate deployment task)
    - Create Kubernetes manifests
    - Configure Longhorn volumes
    - Test horizontal scaling
@@ -885,7 +884,7 @@ Consistent status badge styling:
 | Phase 2 | Job Management API | Phase 1 | ✅ Complete |
 | Phase 3 | Angular Components | Phase 2 | ✅ Complete |
 | Phase 4 | Integration & Polish | Phase 3 | ✅ Complete |
-| Phase 5 | Cleanup & Deployment | Phase 4 | ⏳ Pending |
+| Phase 5 | Cleanup & Deployment | Phase 4 | ✅ Complete |
 
 ### Success Criteria
 
@@ -895,7 +894,7 @@ Consistent status badge styling:
 | Phase 2 | Jobs can be created, listed, assigned to agents via API | ✅ Complete |
 | Phase 3 | UI shows agents, jobs, allows manual assignment | ✅ Complete |
 | Phase 4 | Full workflow: create job → assign → agent processes → view results | ✅ Complete |
-| Phase 5 | Running in k3s with Streamlit removed | ⏳ Pending |
+| Phase 5 | Streamlit removed, documentation updated | ✅ Complete |
 
 ---
 

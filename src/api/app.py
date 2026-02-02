@@ -9,12 +9,14 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 
 from ..agent import UniversalAgent
 from ..core.loader import resolve_config_path
+from ..core.workspace import get_logs_path
 from .models import (
     HealthResponse,
     HealthStatus,
@@ -168,9 +170,70 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         return None
 
 
+class _FlushingFileHandler(logging.FileHandler):
+    """File handler that flushes after every emit for crash safety."""
+
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+def _setup_job_file_logging(job_id: str) -> Path:
+    """Set up file logging for a specific job in server mode.
+
+    Creates a log file in the logs directory. Uses FlushingFileHandler
+    to ensure logs are written immediately for crash safety.
+
+    Args:
+        job_id: The job identifier
+
+    Returns:
+        Path to the log file
+    """
+    logs_dir = get_logs_path()  # Creates workspace/logs/ if needed
+    log_file = logs_dir / f"job_{job_id}.log"
+
+    # Get level from env var
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    # Create flushing file handler for crash safety
+    file_handler = _FlushingFileHandler(log_file, mode='a')
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
+    # Add to root logger
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+
+    logger.info(f"Job log file: {log_file}")
+
+    return log_file
+
+
+def _cleanup_job_file_handler(job_id: str) -> None:
+    """Remove job-specific file handler from root logger.
+
+    Args:
+        job_id: The job identifier
+    """
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        if isinstance(handler, logging.FileHandler):
+            if f"job_{job_id}.log" in str(handler.baseFilename):
+                handler.close()
+                root.removeHandler(handler)
+
+
 async def _process_orchestrator_job(
     job_id: str,
     prompt: str,
+    upload_id: Optional[str] = None,
+    config_upload_id: Optional[str] = None,
+    instructions_upload_id: Optional[str] = None,
     document_path: Optional[str] = None,
     document_dir: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
@@ -179,6 +242,7 @@ async def _process_orchestrator_job(
     """Process a job assigned by the orchestrator.
 
     This runs in the background after accepting a job from the orchestrator.
+    Uses streaming mode with iteration logging and per-job file logging.
     """
     global _current_job_id
 
@@ -186,11 +250,20 @@ async def _process_orchestrator_job(
         logger.error("Cannot process job - agent not initialized")
         return
 
+    # Set up per-job file logging for crash safety
+    log_file = _setup_job_file_logging(job_id)
+
     try:
         logger.info(f"Starting orchestrator job {job_id}")
 
         # Build metadata
         metadata: Dict[str, Any] = {"prompt": prompt}
+        if upload_id:
+            metadata["upload_id"] = upload_id
+        if config_upload_id:
+            metadata["config_upload_id"] = config_upload_id
+        if instructions_upload_id:
+            metadata["instructions_upload_id"] = instructions_upload_id
         if document_path:
             metadata["document_path"] = document_path
         if document_dir:
@@ -200,9 +273,17 @@ async def _process_orchestrator_job(
         if instructions:
             metadata["instructions"] = instructions
 
-        # Process the job
-        result = await _agent.process_job(job_id, metadata)
+        # Process the job with streaming for iteration logging
+        final_state = None
+        streaming_gen = await _agent.process_job(job_id, metadata, stream=True)
+        async for state in streaming_gen:
+            final_state = state
+            if isinstance(state, dict):
+                iteration = state.get("iteration", "?")
+                has_error = state.get("error") is not None
+                logger.info(f"[Iteration {iteration}] job={job_id} error={has_error}")
 
+        result = final_state or {}
         logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
 
     except asyncio.CancelledError:
@@ -212,6 +293,7 @@ async def _process_orchestrator_job(
         logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
     finally:
         _current_job_id = None
+        _cleanup_job_file_handler(job_id)
 
 
 def create_app(config_path: Optional[str] = None) -> FastAPI:
@@ -383,6 +465,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             _process_orchestrator_job(
                 job_id=request.job_id,
                 prompt=request.prompt,
+                upload_id=request.upload_id,
+                config_upload_id=request.config_upload_id,
+                instructions_upload_id=request.instructions_upload_id,
                 document_path=request.document_path,
                 document_dir=request.document_dir,
                 context=request.context,

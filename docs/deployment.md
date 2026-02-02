@@ -39,9 +39,9 @@ Transform this project from a domain-specific requirement extraction system (cre
 
 ### Phase 2: Cockpit Expansion
 - [ ] Add login/authentication (salvage from advanced-llm-chat)
-- [ ] Add job submission page
-- [ ] Drop Streamlit dashboard entirely
-- [ ] Cockpit becomes the single UI for everything
+- [x] Add job submission page
+- [x] Drop Streamlit dashboard entirely
+- [x] Cockpit becomes the single UI for everything
 
 ### Phase 3: Containerized Full Stack
 - [ ] Docker Compose that runs the entire stack (databases + agents + cockpit)
@@ -174,12 +174,12 @@ class Neo4jToolkit(Toolkit):
 
 ### Cockpit Expansion
 
-**Current State:** Cockpit has job list, conversation viewer, graph visualization, but:
-- No authentication
-- No job submission UI
-- Streamlit dashboard exists separately but is half-built
+**Current State:** Cockpit has job list, job creation, agent management, conversation viewer, graph visualization.
+- No authentication (deferred)
+- Job submission UI ✅
+- Streamlit dashboard removed ✅
 
-**Target:** Cockpit becomes the single UI for the entire system.
+**Target:** Cockpit is now the single UI for the entire system.
 
 #### Features to Add
 
@@ -436,11 +436,11 @@ volumes:
 5. **Environment-based toolkit validation** - Skip toolkits if required env vars missing
 
 ### Phase 2: Cockpit Expansion
-6. **Add authentication to cockpit-api** - JWT-based, salvage from advanced-llm-chat
-7. **Create login page in cockpit-frontend** - Route guards, token storage
-8. **Build job submission page** - Form with prompt, toolkit selection, file upload
-9. **Add job management actions** - Cancel, retry, clone
-10. **Delete Streamlit dashboard** - `dashboard/` directory
+6. **Add authentication to cockpit-api** - JWT-based, salvage from advanced-llm-chat (deferred)
+7. **Create login page in cockpit-frontend** - Route guards, token storage (deferred)
+8. ~~**Build job submission page** - Form with prompt, toolkit selection, file upload~~ ✅
+9. ~~**Add job management actions** - Cancel, retry, clone~~ ✅
+10. ~~**Delete Streamlit dashboard** - `dashboard/` directory~~ ✅
 
 ### Phase 3: Database & Job Queue
 11. **Simplify jobs table schema** - Remove creator_status/validator_status, add toolkits JSONB
@@ -474,9 +474,9 @@ volumes:
 3. Test locally: agent can pick up and complete simple jobs
 
 ### Week 2: UI & Auth
-4. Add authentication to Cockpit (tasks 6-7)
-5. Build job submission page (tasks 8-9)
-6. Delete Streamlit dashboard (task 10)
+4. Add authentication to Cockpit (tasks 6-7) - deferred
+5. ~~Build job submission page (tasks 8-9)~~ ✅
+6. ~~Delete Streamlit dashboard (task 10)~~ ✅
 
 ### Week 3: Production Ready
 7. Simplify job queue schema (tasks 11-14)

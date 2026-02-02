@@ -41,7 +41,7 @@ Edit `.env` with your configuration:
 - `TAVILY_API_KEY` - For web search functionality
 - `NEO4J_PASSWORD`, `POSTGRES_PASSWORD` - Custom database passwords
 - `LOG_LEVEL` - DEBUG, INFO, WARNING, ERROR (default: INFO)
-- Port overrides: `AGENT_PORT`, `DASHBOARD_PORT`, etc.
+- Port overrides: `AGENT_PORT`, `ORCHESTRATOR_PORT`, `COCKPIT_PORT`, etc.
 
 ### 3. Start All Services
 
@@ -52,16 +52,16 @@ podman-compose up -d
 This starts:
 - **PostgreSQL** - Job tracking and data cache
 - **Neo4j** - Knowledge graph storage (optional)
-- **Agent** - Universal agent for document processing
-- **Dashboard** - Streamlit UI for job management
+- **Orchestrator** - Backend API for job management and agent coordination
+- **Cockpit** - Angular UI for job management and debugging
 
 ### 4. Access Services
 
 | Service | URL |
 |---------|-----|
-| Dashboard | http://localhost:8501 |
+| Cockpit | http://localhost:4000 |
+| Orchestrator API | http://localhost:8085 |
 | Neo4j Browser | http://localhost:7474 |
-| Agent API | http://localhost:8001 |
 
 ### 5. Common Operations
 
@@ -252,27 +252,29 @@ The system uses a **Universal Agent** pattern - a single config-driven agent tha
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                           DASHBOARD                                 │
-│                  (Streamlit UI - Job Management)                    │
+│                            COCKPIT                                  │
+│              (Angular UI - Job Management & Debugging)              │
 └───────────────────────────────────┬─────────────────────────────────┘
                                     │
                                     ▼
                     ┌───────────────────────────┐
-                    │     UNIVERSAL AGENT       │
+                    │       ORCHESTRATOR        │
                     │                           │
-                    │ - Document processing     │
-                    │ - Research & citations    │
-                    │ - Tool execution          │
-                    │ - Phase-based planning    │
+                    │ - Job management API      │
+                    │ - Agent coordination      │
+                    │ - Statistics & monitoring │
                     └─────────────┬─────────────┘
                                   │
-                    ┌─────────────┴─────────────┐
-                    │                           │
-                    ▼                           ▼
-        ┌─────────────────────┐     ┌─────────────────────┐
-        │     PostgreSQL      │     │       Neo4j         │
-        │   (Jobs & Cache)    │     │  (Knowledge Graph)  │
-        └─────────────────────┘     └─────────────────────┘
+              ┌───────────────────┼───────────────────┐
+              │                   │                   │
+              ▼                   ▼                   ▼
+┌─────────────────────┐ ┌─────────────────┐ ┌─────────────────────┐
+│   UNIVERSAL AGENT   │ │   PostgreSQL    │ │       Neo4j         │
+│                     │ │  (Jobs & Data)  │ │  (Knowledge Graph)  │
+│ - Doc processing    │ └─────────────────┘ └─────────────────────┘
+│ - Tool execution    │
+│ - Phase planning    │
+└─────────────────────┘
 ```
 
 **Universal Agent:**

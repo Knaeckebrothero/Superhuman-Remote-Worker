@@ -265,7 +265,7 @@ class PostgresDB:
         return self._pool is not None
 
     # =========================================================================
-    # SYNC WRAPPERS (for dashboard, scripts, and other sync contexts)
+    # SYNC WRAPPERS (for scripts and other sync contexts)
     # =========================================================================
 
     # Class-level event loop for sync wrappers (shared across all instances)
@@ -542,7 +542,7 @@ class JobsNamespace:
             )
         return [self.db._row_to_dict(row) for row in rows]
 
-    # Sync wrappers for dashboard/scripts
+    # Sync wrappers for scripts
     def create_sync(
         self,
         prompt: str,
@@ -966,7 +966,7 @@ class RequirementsNamespace:
         """Synchronous wrapper for edit_content()."""
         return PostgresDB._run_async(self.edit_content(requirement_uuid, **kwargs))
 
-    # Sync wrappers for dashboard/scripts
+    # Sync wrappers for scripts
     def create_sync(
         self,
         job_id: uuid.UUID,
