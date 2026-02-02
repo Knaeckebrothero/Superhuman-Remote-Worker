@@ -8,6 +8,7 @@ import {
   CurrentTodos,
 } from '../models/todo.model';
 import { DataService } from './data.service';
+import { environment } from '../environment';
 
 /**
  * Service for fetching and managing todo data from workspace files.
@@ -16,7 +17,7 @@ import { DataService } from './data.service';
 export class TodoService {
   private readonly http = inject(HttpClient);
   private readonly data = inject(DataService);
-  private readonly baseUrl = 'http://localhost:8085/api';
+  private readonly baseUrl = environment.apiUrl;
 
   // State signals
   readonly isLoading = signal(false);

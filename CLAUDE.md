@@ -94,6 +94,11 @@ npm test                        # Run vitest tests
 npm run test:watch              # Watch mode
 ```
 
+**Runtime API Configuration**: Edit `cockpit/src/assets/env.js` to configure the API URL at runtime (no rebuild required):
+```javascript
+window['env']['apiUrl'] = 'http://your-server:8085/api';
+```
+
 ### Orchestrator (Backend API)
 ```bash
 cd orchestrator
