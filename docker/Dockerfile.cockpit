@@ -1,16 +1,16 @@
 # =============================================================================
-# Debug Cockpit Frontend Dockerfile
+# Cockpit Frontend Dockerfile
 # =============================================================================
 #
-# Angular SSR application for the Debug Cockpit UI.
+# Angular SSR application for the Cockpit UI.
 #
 # Build:
-#   docker build -t graphrag-cockpit-frontend -f docker/Dockerfile.cockpit-frontend .
+#   docker build -t graphrag-cockpit -f docker/Dockerfile.cockpit .
 #
 # Run:
 #   docker run -p 4000:4000 \
 #     -e PORT=4000 \
-#     graphrag-cockpit-frontend
+#     graphrag-cockpit
 # =============================================================================
 
 FROM node:22-alpine AS builder
@@ -35,7 +35,7 @@ RUN npm run build
 FROM node:22-alpine
 
 LABEL maintainer="Graph-RAG Team"
-LABEL description="Debug Cockpit Angular SSR Frontend"
+LABEL description="Cockpit Angular SSR Frontend"
 
 ENV NODE_ENV=production \
     PORT=4000

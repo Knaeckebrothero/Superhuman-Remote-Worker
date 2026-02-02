@@ -50,7 +50,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  build-dashboard:
+  build-orchestrator:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -70,27 +70,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for Dashboard
+      - name: Extract metadata for Orchestrator
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-dashboard
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-orchestrator
           tags: |
             type=raw,value=latest
             type=sha,format=short,prefix=sha-
 
-      - name: Build and push Dashboard image
+      - name: Build and push Orchestrator image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/Dockerfile.dashboard
+          file: ./docker/Dockerfile.orchestrator
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  build-cockpit-api:
+  build-cockpit:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -110,27 +110,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for Cockpit API
+      - name: Extract metadata for Cockpit
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit-api
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit
           tags: |
             type=raw,value=latest
             type=sha,format=short,prefix=sha-
 
-      - name: Build and push Cockpit API image
+      - name: Build and push Cockpit image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/Dockerfile.cockpit-api
+          file: ./docker/Dockerfile.cockpit
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  build-cockpit-frontend:
+  build-mcp:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -150,60 +150,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata for Cockpit Frontend
+      - name: Extract metadata for MCP Server
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit-frontend
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-mcp
           tags: |
             type=raw,value=latest
             type=sha,format=short,prefix=sha-
 
-      - name: Build and push Cockpit Frontend image
+      - name: Build and push MCP Server image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/Dockerfile.cockpit-frontend
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  build-cockpit-mcp:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata for Cockpit MCP
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-cockpit-mcp
-          tags: |
-            type=raw,value=latest
-            type=sha,format=short,prefix=sha-
-
-      - name: Build and push Cockpit MCP image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./docker/Dockerfile.cockpit-mcp
+          file: ./docker/Dockerfile.mcp
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

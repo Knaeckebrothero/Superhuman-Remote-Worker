@@ -2,7 +2,7 @@
 # Graph-RAG - Development Environment
 # =============================================================================
 #
-# Use this for local development: run databases and debug cockpit in containers,
+# Use this for local development: run databases and cockpit in containers,
 # agents directly with Python for easy debugging and iteration.
 #
 # Usage:
@@ -14,13 +14,14 @@
 # Start only databases (without cockpit):
 #   podman-compose -f docker-compose.dev.yaml up -d postgres neo4j mongodb
 #
-# Then run agents locally:
-#   python agent.py --config creator --document-path ./data/doc.pdf --prompt "..."
-#   python agent.py --config validator --port 8002
+# Then run components locally:
+#   cd orchestrator && uvicorn main:app --reload --port 8085
+#   python agent.py --config defaults --port 8001
+#   cd cockpit && npm start
 #
-# Debug Cockpit (uses pre-built images from GHCR):
-#   Frontend: http://localhost:4000
-#   API:      http://localhost:8085
+# Pre-built images from GHCR:
+#   Cockpit Frontend: http://localhost:4000
+#   Orchestrator API: http://localhost:8085
 #
 # =============================================================================
 
@@ -78,9 +79,9 @@ services:
       timeout: 5s
       retries: 5
 
-  cockpit-api:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit-api:${COCKPIT_IMAGE_TAG:-latest}
-    container_name: graphrag-cockpit-api-dev
+  orchestrator:
+    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-orchestrator:${IMAGE_TAG:-latest}
+    container_name: graphrag-orchestrator-dev
     environment:
       PORT: 8085
       DATABASE_URL: postgresql://${POSTGRES_USER:-graphrag}:${POSTGRES_PASSWORD:-graphrag_password}@postgres:5432/${POSTGRES_DB:-graphrag}
@@ -94,7 +95,7 @@ services:
       # Mount local workspace directory for todo/workspace access
       - ./workspace:/workspace:Z
     ports:
-      - "${COCKPIT_API_PORT:-8085}:8085"
+      - "${ORCHESTRATOR_PORT:-8085}:8085"
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,15 +107,15 @@ services:
       timeout: 5s
       retries: 5
 
-  cockpit-frontend:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit-frontend:${COCKPIT_IMAGE_TAG:-latest}
-    container_name: graphrag-cockpit-frontend-dev
+  cockpit:
+    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit:${IMAGE_TAG:-latest}
+    container_name: graphrag-cockpit-dev
     environment:
       PORT: 4000
     ports:
-      - "${COCKPIT_FRONTEND_PORT:-4000}:4000"
+      - "${COCKPIT_PORT:-4000}:4000"
     depends_on:
-      cockpit-api:
+      orchestrator:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/"]
@@ -122,13 +123,13 @@ services:
       timeout: 5s
       retries: 5
 
-  cockpit-mcp:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit-mcp:${COCKPIT_IMAGE_TAG:-latest}
-    container_name: graphrag-cockpit-mcp-dev
+  mcp:
+    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-mcp:${IMAGE_TAG:-latest}
+    container_name: graphrag-mcp-dev
     environment:
-      COCKPIT_API_URL: http://cockpit-api:8085
+      COCKPIT_API_URL: http://orchestrator:8085
     depends_on:
-      cockpit-api:
+      orchestrator:
         condition: service_healthy
     # For stdio transport: keep container alive with stdin open
     stdin_open: true
