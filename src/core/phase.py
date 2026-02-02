@@ -457,7 +457,7 @@ def finalize_job(
     Returns:
         TransitionResult with should_stop=True to end the agent loop
     """
-    from ..tools.completion_tools import get_final_phase_data, clear_final_phase_data
+    from ..tools.core.job import get_final_phase_data, clear_final_phase_data
 
     job_id = state.get("job_id", "unknown")
 
@@ -600,7 +600,7 @@ def on_strategic_phase_complete(
     Returns:
         TransitionResult indicating success/failure with state updates
     """
-    from ..tools.completion_tools import get_final_phase_data
+    from ..tools.core.job import get_final_phase_data
 
     job_id = state.get("job_id", "unknown")
     phase_number = state.get("phase_number", 0)
