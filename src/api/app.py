@@ -67,12 +67,12 @@ async def lifespan(app: FastAPI):
 
     # Get config path from environment or global setting
     config_path = _config_path or os.getenv("AGENT_CONFIG", "creator")
-    resolved_path = resolve_config_path(config_path)
+    resolved_path, deployment_dir = resolve_config_path(config_path)
 
     logger.info(f"Loading agent configuration from: {resolved_path}")
 
-    # Create and initialize agent
-    _agent = UniversalAgent.from_config(resolved_path)
+    # Create and initialize agent - pass original config_path, not resolved tuple
+    _agent = UniversalAgent.from_config(config_path)
     await _agent.initialize()
 
     # Register with orchestrator and start heartbeat
