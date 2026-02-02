@@ -1,4 +1,4 @@
-"""Graph tools for the Universal Agent.
+"""Neo4j graph tools for the Universal Agent.
 
 Provides Neo4j graph operations for the Validator Agent:
 - Cypher query execution
@@ -7,20 +7,20 @@ Provides Neo4j graph operations for the Validator Agent:
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from .context import ToolContext
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-GRAPH_TOOLS_METADATA = {
+GRAPH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "execute_cypher_query": {
-        "module": "graph_tools",
+        "module": "graph.neo4j",
         "function": "execute_cypher_query",
         "description": "Execute a Cypher query against Neo4j",
         "category": "domain",
@@ -29,7 +29,7 @@ GRAPH_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "get_database_schema": {
-        "module": "graph_tools",
+        "module": "graph.neo4j",
         "function": "get_database_schema",
         "description": "Get Neo4j database schema (labels, relationships, properties)",
         "category": "domain",
@@ -38,7 +38,7 @@ GRAPH_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "validate_schema_compliance": {
-        "module": "graph_tools",
+        "module": "graph.neo4j",
         "function": "validate_schema_compliance",
         "description": "Run metamodel compliance checks",
         "category": "domain",
@@ -49,8 +49,8 @@ GRAPH_TOOLS_METADATA = {
 }
 
 
-def create_graph_tools(context: ToolContext) -> List:
-    """Create graph tools with injected context.
+def create_neo4j_tools(context: ToolContext) -> List[Any]:
+    """Create Neo4j graph tools with injected context.
 
     Args:
         context: ToolContext with dependencies (must include neo4j connection)

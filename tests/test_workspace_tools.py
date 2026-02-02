@@ -16,7 +16,7 @@ if str(project_root) not in sys.path:
 # Import from src package
 from src.core.workspace import WorkspaceManager
 from src.tools.context import ToolContext
-from src.tools.workspace_tools import create_workspace_tools
+from src.tools.workspace import create_workspace_tools
 
 
 @pytest.fixture

@@ -34,13 +34,24 @@ Usage:
 """
 
 from .context import ToolContext
-from .workspace_tools import create_workspace_tools
-from .todo_tools import create_todo_tools
-from .document_tools import create_document_tools
-from .search_tools import create_search_tools
-from .citation_tools import create_citation_tools
-from .cache_tools import create_cache_tools
-from .graph_tools import create_graph_tools
+
+# Workspace toolkit (new package structure)
+from .workspace import create_workspace_tools, get_workspace_metadata
+
+# Domain tools
+from .document import create_document_tools, get_document_metadata
+from .research import create_research_tools, get_research_metadata
+
+# Backward compatibility alias
+create_search_tools = create_research_tools
+from .citation import create_citation_tools, get_citation_metadata
+# Note: cache_tools removed (deprecated, not used in configs)
+from .graph import create_graph_tools, get_graph_metadata
+
+# Core toolkit exports (todo + job tools)
+from .core import create_core_tools, get_core_metadata
+from .core.todo import create_todo_tools
+from .core.job import create_job_tools, get_final_phase_data, clear_final_phase_data
 from .registry import (
     TOOL_REGISTRY,
     load_tools,
@@ -66,16 +77,26 @@ from .description_override import (
 __all__ = [
     # Context
     "ToolContext",
-    # Workspace tools
+    # Workspace toolkit
     "create_workspace_tools",
-    # Todo tools
+    "get_workspace_metadata",
+    # Core toolkit (todo + job)
+    "create_core_tools",
+    "get_core_metadata",
     "create_todo_tools",
+    "create_job_tools",
+    "get_final_phase_data",
+    "clear_final_phase_data",
     # Domain tools
     "create_document_tools",
+    "get_document_metadata",
     "create_search_tools",
+    "create_research_tools",
+    "get_research_metadata",
     "create_citation_tools",
-    "create_cache_tools",
+    "get_citation_metadata",
     "create_graph_tools",
+    "get_graph_metadata",
     # Registry
     "TOOL_REGISTRY",
     "load_tools",

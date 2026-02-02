@@ -1,23 +1,23 @@
-"""Search tools for the Universal Agent.
+"""Web search tools for the Universal Agent.
 
 Provides web search capabilities using Tavily API.
 """
 
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from .context import ToolContext
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-SEARCH_TOOLS_METADATA = {
+RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "web_search": {
-        "module": "search_tools",
+        "module": "research.web",
         "function": "web_search",
         "description": "Search the web using Tavily API",
         "category": "domain",
@@ -28,8 +28,8 @@ SEARCH_TOOLS_METADATA = {
 }
 
 
-def create_search_tools(context: ToolContext) -> List:
-    """Create search tools with injected context.
+def create_web_tools(context: ToolContext) -> List[Any]:
+    """Create web search tools with injected context.
 
     Args:
         context: ToolContext with dependencies

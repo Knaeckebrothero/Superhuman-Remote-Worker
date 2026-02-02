@@ -18,36 +18,31 @@ import logging
 from typing import Any, Dict, List, Optional, Set
 
 from .context import ToolContext
-from .workspace_tools import create_workspace_tools, WORKSPACE_TOOLS_METADATA
-from .todo_tools import create_todo_tools, TODO_TOOLS_METADATA
-from .document_tools import create_document_tools, DOCUMENT_TOOLS_METADATA
-from .search_tools import create_search_tools, SEARCH_TOOLS_METADATA
-from .citation_tools import create_citation_tools, CITATION_TOOLS_METADATA
-from .cache_tools import create_cache_tools, CACHE_TOOLS_METADATA
-from .graph_tools import create_graph_tools, GRAPH_TOOLS_METADATA
-from .completion_tools import create_completion_tools
 
-# Completion tools metadata
-# Phase availability:
-#   - "strategic": Only in strategic mode (planning)
-#   - "tactical": Only in tactical mode (execution)
-#   - Both: Available in both modes (default if not specified)
-COMPLETION_TOOLS_METADATA = {
-    "mark_complete": {
-        "module": "completion_tools",
-        "function": "mark_complete",
-        "description": "Signal task/phase completion with structured report",
-        "category": "completion",
-        "phases": ["strategic", "tactical"],  # Both modes
-    },
-    "job_complete": {
-        "module": "completion_tools",
-        "function": "job_complete",
-        "description": "Signal FINAL job completion - call when all phases are done",
-        "category": "completion",
-        "phases": ["strategic"],  # Strategic-only: prevents premature termination
-    },
-}
+# Import workspace tools from new package
+from .workspace import create_workspace_tools, get_workspace_metadata
+
+# Import domain tools
+from .document import create_document_tools, get_document_metadata
+from .research import create_research_tools, get_research_metadata
+from .research.web import RESEARCH_TOOLS_METADATA  # For _load_domain_tools
+
+# Backward compatibility alias
+SEARCH_TOOLS_METADATA = RESEARCH_TOOLS_METADATA
+create_search_tools = create_research_tools
+from .citation import create_citation_tools, get_citation_metadata
+from .citation.sources import CITATION_TOOLS_METADATA  # For _load_domain_tools
+# Note: cache_tools removed (deprecated, not used in configs)
+from .graph import create_graph_tools, get_graph_metadata
+from .graph.neo4j import GRAPH_TOOLS_METADATA  # For _load_domain_tools
+
+# Import from new core toolkit package
+from .core import create_core_tools, get_core_metadata
+from .core.todo import create_todo_tools, TODO_TOOLS_METADATA
+from .core.job import create_job_tools, JOB_TOOLS_METADATA
+
+# Re-export completion tools metadata for backwards compatibility
+COMPLETION_TOOLS_METADATA = JOB_TOOLS_METADATA
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +51,17 @@ logger = logging.getLogger(__name__)
 # This is populated from individual tool modules
 TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
-# Register workspace tools (Phase 2)
-TOOL_REGISTRY.update(WORKSPACE_TOOLS_METADATA)
+# Register workspace tools
+TOOL_REGISTRY.update(get_workspace_metadata())
 
-# Register todo tools (Phase 3)
-TOOL_REGISTRY.update(TODO_TOOLS_METADATA)
+# Register core toolkit (todo + job/completion tools)
+TOOL_REGISTRY.update(get_core_metadata())
 
-# Register domain tools (Phase 5)
-TOOL_REGISTRY.update(DOCUMENT_TOOLS_METADATA)
-TOOL_REGISTRY.update(SEARCH_TOOLS_METADATA)
-TOOL_REGISTRY.update(CITATION_TOOLS_METADATA)
-TOOL_REGISTRY.update(CACHE_TOOLS_METADATA)
-TOOL_REGISTRY.update(GRAPH_TOOLS_METADATA)
-
-# Register completion tools
-TOOL_REGISTRY.update(COMPLETION_TOOLS_METADATA)
+# Register domain tools
+TOOL_REGISTRY.update(get_document_metadata())
+TOOL_REGISTRY.update(get_research_metadata())
+TOOL_REGISTRY.update(get_citation_metadata())
+TOOL_REGISTRY.update(get_graph_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -298,15 +289,15 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
         loaded_domain_tools = _load_domain_tools(domain_tool_names, context)
         all_tools.extend(loaded_domain_tools)
 
-    # Completion tools
+    # Completion/job tools (from core toolkit)
     if "completion" in tools_by_category:
         if not context.has_workspace():
             raise ValueError(
                 "Completion tools require a workspace_manager in ToolContext"
             )
-        completion_tools = create_completion_tools(context)
+        job_tools = create_job_tools(context)
         completion_tool_names = set(tools_by_category["completion"])
-        for tool in completion_tools:
+        for tool in job_tools:
             if tool.name in completion_tool_names:
                 all_tools.append(tool)
                 logger.debug(f"Loaded completion tool: {tool.name}")
@@ -331,7 +322,6 @@ def _load_domain_tools(tool_names: Set[str], context: ToolContext) -> List[Any]:
     document_tools_needed = tool_names & set(DOCUMENT_TOOLS_METADATA.keys())
     search_tools_needed = tool_names & set(SEARCH_TOOLS_METADATA.keys())
     citation_tools_needed = tool_names & set(CITATION_TOOLS_METADATA.keys())
-    cache_tools_needed = tool_names & set(CACHE_TOOLS_METADATA.keys())
     graph_tools_needed = tool_names & set(GRAPH_TOOLS_METADATA.keys())
 
     # Load document tools if needed
@@ -366,17 +356,6 @@ def _load_domain_tools(tool_names: Set[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded citation tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load citation tools: {e}")
-
-    # Load cache tools if needed
-    if cache_tools_needed:
-        try:
-            cche_tools = create_cache_tools(context)
-            for tool in cche_tools:
-                if tool.name in cache_tools_needed:
-                    loaded_tools.append(tool)
-                    logger.debug(f"Loaded cache tool: {tool.name}")
-        except Exception as e:
-            logger.warning(f"Could not load cache tools: {e}")
 
     # Load graph tools if needed
     if graph_tools_needed:

@@ -7,20 +7,20 @@ using langchain document loaders and text splitters.
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from langchain_core.tools import tool
 
-from .context import ToolContext
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
 
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
-DOCUMENT_TOOLS_METADATA = {
+DOCUMENT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "extract_document_text": {
-        "module": "document_tools",
+        "module": "document.processing",
         "function": "extract_document_text",
         "description": "Extract text content from PDF, DOCX, TXT, or HTML documents",
         "category": "domain",
@@ -29,7 +29,7 @@ DOCUMENT_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "chunk_document": {
-        "module": "document_tools",
+        "module": "document.processing",
         "function": "chunk_document",
         "description": "Split document into processable chunks with different strategies",
         "category": "domain",
@@ -38,7 +38,7 @@ DOCUMENT_TOOLS_METADATA = {
         "phases": ["tactical"],
     },
     "identify_requirement_candidates": {
-        "module": "document_tools",
+        "module": "document.processing",
         "function": "identify_requirement_candidates",
         "description": "Identify requirement-like statements in text",
         "category": "domain",
@@ -264,7 +264,7 @@ def _identify_candidates(text: str, mode: str) -> List[Dict[str, Any]]:
     return candidates
 
 
-def create_document_tools(context: ToolContext) -> List:
+def create_processing_tools(context: ToolContext) -> List[Any]:
     """Create document processing tools with injected context.
 
     Args:

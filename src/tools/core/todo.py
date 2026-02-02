@@ -1,30 +1,63 @@
-"""Todo tools - Claude Code TodoWrite pattern.
+"""Todo management tools for the Universal Agent.
 
-Provides LangGraph-compatible tools for managing short-term todos
-within the two-tier planning model:
-
-- Strategic planning: Long-term plans in workspace filesystem
-- Tactical execution: Short-term todos managed by these tools
+Provides task tracking and phase control tools that enable
+the strategic/tactical phase alternation pattern.
 
 In the phase alternation architecture:
 - `next_phase_todos` is strategic-only (stages todos for tactical phases)
 - `todo_complete` is shared (marks tasks done, triggers phase transitions)
+- `todo_list` is shared (helps see current state)
+- `todo_rewind` is tactical-only (escape hatch when stuck)
 """
 
-import json
 import logging
 from typing import Any, Dict, List
 
-import yaml
 from langchain_core.tools import tool
 
-from .context import ToolContext
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
+# Tool metadata for registry
+# Phase availability:
+#   - "strategic": Available only in strategic mode (planning)
+#   - "tactical": Available only in tactical mode (execution)
+#   - Both: Available in both modes
+TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    "next_phase_todos": {
+        "module": "core.todo",
+        "function": "next_phase_todos",
+        "description": "Stage todos for the next tactical phase",
+        "category": "todo",
+        "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
+    },
+    "todo_complete": {
+        "module": "core.todo",
+        "function": "todo_complete",
+        "description": "Mark one or more tasks as complete (by ID or comma-separated IDs)",
+        "category": "todo",
+        "phases": ["strategic", "tactical"],  # Both: used in all phases
+    },
+    "todo_list": {
+        "module": "core.todo",
+        "function": "todo_list",
+        "description": "List all todos with IDs and status",
+        "category": "todo",
+        "phases": ["strategic", "tactical"],  # Both: helps see current state
+    },
+    "todo_rewind": {
+        "module": "core.todo",
+        "function": "todo_rewind",
+        "description": "Panic button - abandon current approach and re-plan",
+        "category": "todo",
+        "phases": ["tactical"],  # Tactical-only: escape hatch when stuck
+    },
+}
 
-def create_todo_tools(context: ToolContext) -> List:
-    """Create todo tools bound to a specific context.
+
+def create_todo_tools(context: ToolContext) -> List[Any]:
+    """Create todo management tools with injected context.
 
     Args:
         context: ToolContext with todo_manager
@@ -162,8 +195,8 @@ def create_todo_tools(context: ToolContext) -> List:
                         # List available todos to help the agent
                         available = todo_mgr.list_all()
                         if available:
-                            todo_list = ", ".join(t.id for t in available)
-                            return f"Error: Todo '{ids[0]}' not found. Available todos: {todo_list}"
+                            todo_list_str = ", ".join(t.id for t in available)
+                            return f"Error: Todo '{ids[0]}' not found. Available todos: {todo_list_str}"
                         return f"Error: Todo '{ids[0]}' not found. No todos in the list."
 
                     # Build response message
@@ -325,40 +358,3 @@ def create_todo_tools(context: ToolContext) -> List:
         todo_list,
         todo_rewind,
     ]
-
-
-# Tool metadata for registry
-# Phase availability:
-#   - "strategic": Available only in strategic mode (planning)
-#   - "tactical": Available only in tactical mode (execution)
-#   - "both": Available in both modes
-TODO_TOOLS_METADATA = {
-    "next_phase_todos": {
-        "module": "todo_tools",
-        "function": "next_phase_todos",
-        "description": "Stage todos for the next tactical phase",
-        "category": "todo",
-        "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
-    },
-    "todo_complete": {
-        "module": "todo_tools",
-        "function": "todo_complete",
-        "description": "Mark one or more tasks as complete (by ID or comma-separated IDs)",
-        "category": "todo",
-        "phases": ["strategic", "tactical"],  # Both: used in all phases
-    },
-    "todo_list": {
-        "module": "todo_tools",
-        "function": "todo_list",
-        "description": "List all todos with IDs and status",
-        "category": "todo",
-        "phases": ["strategic", "tactical"],  # Both: helps see current state
-    },
-    "todo_rewind": {
-        "module": "todo_tools",
-        "function": "todo_rewind",
-        "description": "Panic button - abandon current approach and re-plan",
-        "category": "todo",
-        "phases": ["tactical"],  # Tactical-only: escape hatch when stuck
-    },
-}
