@@ -1,31 +1,31 @@
 # =============================================================================
-# Debug Cockpit MCP Server Dockerfile
+# MCP Server Dockerfile
 # =============================================================================
 #
-# MCP server exposing cockpit API to LLMs like Claude Code.
+# MCP server exposing orchestrator API to LLMs like Claude Code.
 # Uses FastMCP 2.0 with dual transport support (stdio/HTTP).
 #
 # Build:
-#   docker build -t graphrag-cockpit-mcp -f docker/Dockerfile.cockpit-mcp .
+#   docker build -t graphrag-mcp -f docker/Dockerfile.mcp .
 #
 # Run (HTTP transport - default for container):
-#   docker run -d --name cockpit-mcp \
+#   docker run -d --name mcp \
 #     -p 8000:8000 \
-#     -e COCKPIT_API_URL=http://cockpit-api:8085 \
-#     graphrag-cockpit-mcp
+#     -e COCKPIT_API_URL=http://orchestrator:8085 \
+#     graphrag-mcp
 #
 # Run (stdio transport - for docker exec):
-#   docker run -d --name cockpit-mcp \
+#   docker run -d --name mcp \
 #     -e MCP_TRANSPORT=stdio \
-#     -e COCKPIT_API_URL=http://cockpit-api:8085 \
-#     graphrag-cockpit-mcp sleep infinity
-#   docker exec -i cockpit-mcp python run.py
+#     -e COCKPIT_API_URL=http://orchestrator:8085 \
+#     graphrag-mcp sleep infinity
+#   docker exec -i mcp python run.py
 # =============================================================================
 
 FROM python:3.12-slim
 
 LABEL maintainer="Graph-RAG Team"
-LABEL description="Debug Cockpit MCP Server (FastMCP 2.0)"
+LABEL description="MCP Server for Claude Code integration (FastMCP 2.0)"
 LABEL org.opencontainers.image.source="https://github.com/knaeckebrothero/Uni-Projekt-Graph-RAG"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -38,11 +38,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && \
     rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
-COPY cockpit/mcp/requirements.txt .
+COPY orchestrator/mcp/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy MCP server source code
-COPY cockpit/mcp/ ./
+COPY orchestrator/mcp/ ./
 
 # Create non-root user
 RUN groupadd -r graphrag && useradd -r -g graphrag graphrag && \
@@ -54,7 +54,7 @@ USER graphrag
 ENV MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000 \
-    COCKPIT_API_URL=http://cockpit-api:8085
+    COCKPIT_API_URL=http://orchestrator:8085
 
 EXPOSE 8000
 
