@@ -25,6 +25,7 @@ import {
 import { LLMRequest } from '../models/request.model';
 import { GraphChangeResponse, GraphDelta } from '../models/graph.model';
 import { ChatEntry, ChatHistoryResponse } from '../models/chat.model';
+import { environment } from '../environment';
 
 /**
  * Response for bulk audit endpoint.
@@ -76,7 +77,7 @@ export interface JobVersionInfo {
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
-  private readonly baseUrl = 'http://localhost:8085/api';
+  private readonly baseUrl = environment.apiUrl;
 
   /**
    * Get list of available tables with row counts.
