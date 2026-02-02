@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory
 from services.workspace import workspace_service
 from graph_routes import router as graph_router, set_mongodb
+from uploads import router as uploads_router
 
 logger = logging.getLogger(__name__)
 
@@ -119,11 +120,14 @@ class JobCreate(BaseModel):
     """Request body for creating a new job."""
 
     prompt: str = Field(..., description="Task prompt for the agent")
-    document_path: str | None = Field(None, description="Path to a document")
-    document_dir: str | None = Field(None, description="Directory containing documents")
+    upload_id: str | None = Field(None, description="Upload ID for document files (from /api/uploads)")
+    config_upload_id: str | None = Field(None, description="Upload ID for config YAML override")
+    instructions_upload_id: str | None = Field(None, description="Upload ID for instructions markdown")
+    document_path: str | None = Field(None, description="Path to a document (deprecated, use upload_id)")
+    document_dir: str | None = Field(None, description="Directory containing documents (deprecated)")
     config_name: str | None = Field(None, description="Agent configuration name")
     context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
-    instructions: str | None = Field(None, description="Additional instructions for the agent")
+    instructions: str | None = Field(None, description="Additional inline instructions for the agent")
 
 
 class JobStartRequest(BaseModel):
@@ -131,6 +135,9 @@ class JobStartRequest(BaseModel):
 
     job_id: str
     prompt: str
+    upload_id: str | None = None
+    config_upload_id: str | None = None
+    instructions_upload_id: str | None = None
     document_path: str | None = None
     document_dir: str | None = None
     config_name: str | None = None
@@ -216,6 +223,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(graph_router)
+app.include_router(uploads_router)
 
 
 @app.get("/api/tables")
@@ -346,12 +354,21 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
     to start processing.
     """
     try:
+        # Merge upload IDs into context
+        context = dict(job.context) if job.context else {}
+        if job.upload_id:
+            context["upload_id"] = job.upload_id
+        if job.config_upload_id:
+            context["config_upload_id"] = job.config_upload_id
+        if job.instructions_upload_id:
+            context["instructions_upload_id"] = job.instructions_upload_id
+
         return await postgres_db.create_job(
             prompt=job.prompt,
             document_path=job.document_path,
             document_dir=job.document_dir,
             config_name=job.config_name,
-            context=job.context,
+            context=context if context else None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -825,10 +842,22 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
                 detail="Agent has no pod IP configured",
             )
 
+        # Extract upload IDs from context if present
+        job_context = job.get("context") or {}
+        if isinstance(job_context, str):
+            import json as json_module
+            job_context = json_module.loads(job_context)
+        upload_id = job_context.get("upload_id")
+        config_upload_id = job_context.get("config_upload_id")
+        instructions_upload_id = job_context.get("instructions_upload_id")
+
         # Build job start request
         job_start = JobStartRequest(
             job_id=job_id,
             prompt=job["prompt"],
+            upload_id=upload_id,
+            config_upload_id=config_upload_id,
+            instructions_upload_id=instructions_upload_id,
             document_path=job.get("document_path"),
             config_name=agent["config_name"],
         )

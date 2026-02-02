@@ -48,17 +48,23 @@ Note: Legacy scripts are in `DEPRECATED_scripts/` and show deprecation warnings.
 
 ### Running Agents
 ```bash
-# Run with defaults
-python agent.py --prompt "Your task here" --stream --verbose
+# Run with defaults (LOG_LEVEL=INFO, streaming enabled)
+python agent.py --prompt "Your task here"
 
 # Run with custom config
-python agent.py --config my_agent --prompt "Your task" --stream --verbose
+python agent.py --config my_agent --prompt "Your task"
+
+# Run with debug logging
+LOG_LEVEL=DEBUG python agent.py --prompt "Your task"
+
+# Run with LLM token streaming to stderr
+DEBUG_LLM_STREAM=1 python agent.py --prompt "Your task"
 
 # Process document
-python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements"
 
 # Process directory of documents
-python agent.py --document-dir ./data/example_data/ --prompt "Identify requirements" --stream --verbose
+python agent.py --document-dir ./data/example_data/ --prompt "Identify requirements"
 
 # Start as API server
 python agent.py --port 8001
@@ -66,6 +72,13 @@ python agent.py --port 8001
 # Resume from checkpoint
 python agent.py --job-id <id> --resume
 ```
+
+**Environment Variables:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
+| `DEBUG_LLM_STREAM` | unset | Set to `1` for LLM token output to stderr |
+| `DEBUG_LLM_TAIL` | `500` | Characters to show in LLM debug output |
 
 ### Testing
 ```bash

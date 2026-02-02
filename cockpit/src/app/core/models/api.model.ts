@@ -96,6 +96,9 @@ export interface Job {
  */
 export interface JobCreateRequest {
   prompt: string;
+  upload_id?: string;
+  config_upload_id?: string;
+  instructions_upload_id?: string;
   document_path?: string;
   document_dir?: string;
   config_name?: string;

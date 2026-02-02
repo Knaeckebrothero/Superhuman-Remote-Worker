@@ -476,6 +476,37 @@ class UniversalAgent:
         """
         metadata = metadata or {}
 
+        # Handle config upload - load and merge with defaults BEFORE workspace setup
+        # This must happen first since config affects workspace settings
+        if metadata.get("config_upload_id"):
+            config_upload_id = metadata["config_upload_id"]
+            from .core.workspace import get_workspace_base_path
+            from .core.loader import load_uploaded_config, load_agent_config_from_dict
+
+            config_uploads_dir = get_workspace_base_path() / "uploads" / config_upload_id
+
+            if config_uploads_dir.exists():
+                # Find the YAML file
+                yaml_files = list(config_uploads_dir.glob("*.yaml")) + list(
+                    config_uploads_dir.glob("*.yml")
+                )
+                if yaml_files:
+                    uploaded_config_path = yaml_files[0]
+                    logger.info(f"Loading uploaded config: {uploaded_config_path.name}")
+
+                    # Load and merge with defaults
+                    merged_config_data = load_uploaded_config(uploaded_config_path)
+
+                    # Create new config object (replaces self.config for this job)
+                    self.config = load_agent_config_from_dict(merged_config_data)
+                    logger.info("Applied uploaded config overrides")
+                else:
+                    logger.warning(
+                        f"No YAML files found in config upload: {config_upload_id}"
+                    )
+            else:
+                logger.warning(f"Config upload directory not found: {config_uploads_dir}")
+
         # Create workspace manager
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
         self._workspace_manager = WorkspaceManager(
@@ -505,12 +536,43 @@ class UniversalAgent:
         # Initialize workspace (creates directories)
         self._workspace_manager.initialize()
 
-        # Copy instructions to workspace
-        instructions = load_instructions(self.config)
-        self._workspace_manager.write_file(
-            "instructions.md",
-            instructions,
-        )
+        # Copy instructions to workspace (from upload or template)
+        if metadata.get("instructions_upload_id"):
+            # Use uploaded instructions
+            instr_upload_id = metadata["instructions_upload_id"]
+            from .core.workspace import get_workspace_base_path
+
+            instr_uploads_dir = get_workspace_base_path() / "uploads" / instr_upload_id
+
+            instructions_written = False
+            if instr_uploads_dir.exists():
+                # Find the instructions file (.md or .txt)
+                instr_files = list(instr_uploads_dir.glob("*.md")) + list(
+                    instr_uploads_dir.glob("*.txt")
+                )
+                if instr_files:
+                    uploaded_instr_path = instr_files[0]
+                    content = uploaded_instr_path.read_text(encoding="utf-8")
+                    self._workspace_manager.write_file("instructions.md", content)
+                    logger.info(f"Copied uploaded instructions: {uploaded_instr_path.name}")
+                    instructions_written = True
+                else:
+                    logger.warning(
+                        f"No .md/.txt files found in instructions upload: {instr_upload_id}"
+                    )
+            else:
+                logger.warning(
+                    f"Instructions upload directory not found: {instr_uploads_dir}"
+                )
+
+            # Fall back to template if upload failed
+            if not instructions_written:
+                instructions = load_instructions(self.config)
+                self._workspace_manager.write_file("instructions.md", instructions)
+        else:
+            # Use template-based instructions
+            instructions = load_instructions(self.config)
+            self._workspace_manager.write_file("instructions.md", instructions)
 
         # Process initial_files from config (e.g., workspace.md template)
         if self.config.workspace.initial_files:
@@ -533,8 +595,42 @@ class UniversalAgent:
         # Copy documents to workspace if provided
         updated_metadata = dict(metadata)
 
+        # Handle upload_id (files uploaded via orchestrator UI)
+        if metadata.get("upload_id"):
+            upload_id = metadata["upload_id"]
+            # Use get_workspace_base_path() to find uploads in the shared workspace
+            from .core.workspace import get_workspace_base_path
+            uploads_dir = get_workspace_base_path() / "uploads" / upload_id
+
+            if uploads_dir.exists():
+                copied_paths = []
+                original_paths = []
+                for file_path in sorted(uploads_dir.iterdir()):
+                    # Skip metadata.json
+                    if file_path.name == "metadata.json":
+                        continue
+                    if file_path.is_file():
+                        dest_relative = f"documents/{file_path.name}"
+                        dest_path = self._workspace_manager.get_path(dest_relative)
+                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                        shutil.copy2(file_path, dest_path)
+                        logger.info(f"Copied uploaded file to workspace: {dest_relative}")
+
+                        copied_paths.append(dest_relative)
+                        original_paths.append(str(file_path))
+
+                if copied_paths:
+                    updated_metadata["document_paths"] = copied_paths
+                    updated_metadata["original_document_paths"] = original_paths
+                    # For backwards compatibility, set document_path to first document
+                    updated_metadata["document_path"] = copied_paths[0]
+                    updated_metadata["original_document_path"] = original_paths[0]
+            else:
+                logger.warning(f"Upload directory not found: {uploads_dir}")
+
         # Handle multiple documents (document_paths list)
-        if metadata.get("document_paths"):
+        elif metadata.get("document_paths"):
             copied_paths = []
             original_paths = []
             for doc_path in metadata["document_paths"]:

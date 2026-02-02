@@ -73,7 +73,7 @@ class PostgresDB:
     - Job management (CRUD, status updates, progress tracking)
     - Agent management (registration, heartbeat, status)
     - Requirement queries and statistics
-    - Sync wrappers for scripts and dashboard use
+    - Sync wrappers for scripts and other sync contexts
 
     Example:
         ```python
@@ -1294,7 +1294,7 @@ class PostgresDB:
         return result
 
     # =========================================================================
-    # SYNC WRAPPERS (for dashboard, scripts, and other sync contexts)
+    # SYNC WRAPPERS (for scripts and other sync contexts)
     # =========================================================================
 
     # Class-level event loop for sync wrappers (shared across all instances)
