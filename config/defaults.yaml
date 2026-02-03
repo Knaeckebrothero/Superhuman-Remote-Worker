@@ -6,6 +6,7 @@ display_name: A Generalist Agent
 
 llm:
   model: openai/gpt-oss-120b
+  provider: null  # Auto-detect from model name (claude-* → anthropic, gemini-* → google)
   temperature: 0.0
   reasoning_level: high
   base_url: null

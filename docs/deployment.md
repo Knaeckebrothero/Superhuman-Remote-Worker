@@ -214,54 +214,58 @@ class Neo4jToolkit(Toolkit):
 
 ### LLM Backend Support
 
-**Current:** Single OpenAI-compatible endpoint configured via `LLM_BASE_URL`.
-
-**Target:** Multiple backends, selectable per job.
+**Implemented:** Multiple providers supported via `provider` field in LLM config.
 
 #### Supported Backends
 
 | Backend | Status | Notes |
 |---------|--------|-------|
-| Self-hosted OSS (vLLM) | Current | A100 @ ~100 tok/s, Blackwell 96GB incoming |
-| Anthropic | Planned | Claude models, expensive - need efficiency work first |
-| Google Gemini | Planned | Alternative to Anthropic |
-| OpenAI | Supported | Via existing OpenAI-compatible code |
+| Self-hosted OSS (vLLM) | ✅ Supported | A100 @ ~100 tok/s, via OpenAI-compatible API |
+| Anthropic | ✅ Supported | Claude models via langchain-anthropic |
+| Google Gemini | ✅ Supported | Via langchain-google-genai |
+| OpenAI | ✅ Supported | Default, OpenAI-compatible APIs |
 
-#### Config Structure
+#### Provider Auto-Detection
 
-```json
-{
-  "llm_backends": {
-    "default": "local",
-    "backends": {
-      "local": {
-        "type": "openai",
-        "base_url": "http://vllm:8000/v1",
-        "model": "gpt-oss-120b",
-        "api_key_env": "LOCAL_LLM_KEY"
-      },
-      "anthropic": {
-        "type": "anthropic",
-        "model": "claude-sonnet-4-20250514",
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "cost_per_1k_input": 0.003,
-        "cost_per_1k_output": 0.015
-      },
-      "gemini": {
-        "type": "google",
-        "model": "gemini-2.0-flash",
-        "api_key_env": "GOOGLE_API_KEY"
-      }
-    }
-  }
-}
+Provider is auto-detected from model name prefix:
+- `claude-*` → anthropic
+- `gemini-*` → google
+- `gpt-*`, `openai/*`, others → openai (default)
+
+Or explicitly set via `provider` field.
+
+#### Config Structure (Implemented)
+
+```yaml
+# config/my_agent.yaml
+llm:
+  model: claude-sonnet-4-20250514
+  provider: anthropic  # Optional, auto-detected from model name
+  temperature: 0.0
+  timeout: 600
+  max_retries: 3
 ```
 
-Jobs can specify backend:
+#### Environment Variables
+
+| Provider | API Key Variable |
+|----------|------------------|
+| OpenAI | `OPENAI_API_KEY` |
+| Anthropic | `ANTHROPIC_API_KEY` |
+| Google | `GOOGLE_API_KEY` |
+
+#### Job-Level LLM Selection
+
+Jobs can override LLM via `config_override`:
 ```json
 {
   "description": "Complex reasoning task...",
-  "llm_backend": "anthropic"
+  "config_override": {
+    "llm": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-20250514"
+    }
+  }
 }
 ```
 
@@ -449,10 +453,10 @@ volumes:
 14. **Graceful shutdown handling** - Release claimed jobs on SIGTERM (deferred)
 
 ### Phase 4: Multi-LLM Backend
-15. **Create LLM backend abstraction** - Support OpenAI, Anthropic, Google APIs
-16. **Add backend configuration** - Multiple backends in config, job-level selection
-17. **Cost tracking** - Log token usage and estimated cost per job
-18. **Budget controls** - Per-job limits, daily caps for expensive backends
+15. ~~**Create LLM backend abstraction** - Support OpenAI, Anthropic, Google APIs~~ ✅
+16. ~~**Add backend configuration** - Multiple backends in config, job-level selection~~ ✅
+17. **Cost tracking** - Log token usage and estimated cost per job (deferred)
+18. **Budget controls** - Per-job limits, daily caps for expensive backends (deferred)
 
 ### Phase 5: Containerization
 19. **Fix Dockerfile workspace paths** - Ensure `/app/workspace` works with volumes
