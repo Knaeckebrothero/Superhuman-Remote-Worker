@@ -42,7 +42,8 @@ function getStatusCount(jobs: Job[], status: JobStatus): number {
 function createMockJob(overrides: Partial<Job> = {}): Job {
   return {
     id: `job_${Math.random().toString(36).slice(2)}`,
-    prompt: 'Test job prompt',
+    description: 'Test job description',
+    config_name: 'default',
     status: 'created' as JobStatus,
     creator_status: 'pending',
     validator_status: 'pending',
