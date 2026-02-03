@@ -98,7 +98,7 @@ export interface AuditResponse {
  */
 export interface JobSummary {
   id: string;
-  prompt: string;
+  description: string;
   status: string;
   creator_status?: string;
   validator_status?: string;
