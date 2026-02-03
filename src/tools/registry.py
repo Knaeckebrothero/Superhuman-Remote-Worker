@@ -15,7 +15,7 @@ Usage:
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from .context import ToolContext
 
@@ -25,24 +25,13 @@ from .workspace import create_workspace_tools, get_workspace_metadata
 # Import domain tools
 from .document import create_document_tools, get_document_metadata
 from .research import create_research_tools, get_research_metadata
-from .research.web import RESEARCH_TOOLS_METADATA  # For _load_domain_tools
-
-# Backward compatibility alias
-SEARCH_TOOLS_METADATA = RESEARCH_TOOLS_METADATA
-create_search_tools = create_research_tools
 from .citation import create_citation_tools, get_citation_metadata
-from .citation.sources import CITATION_TOOLS_METADATA  # For _load_domain_tools
-# Note: cache_tools removed (deprecated, not used in configs)
 from .graph import create_graph_tools, get_graph_metadata
-from .graph.neo4j import GRAPH_TOOLS_METADATA  # For _load_domain_tools
 
-# Import from new core toolkit package
+# Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
-from .core.todo import create_todo_tools, TODO_TOOLS_METADATA
-from .core.job import create_job_tools, JOB_TOOLS_METADATA
-
-# Re-export completion tools metadata for backwards compatibility
-COMPLETION_TOOLS_METADATA = JOB_TOOLS_METADATA
+from .core.todo import create_todo_tools
+from .core.job import create_job_tools
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +66,7 @@ def get_tools_by_category(category: str) -> List[str]:
     """Get tool names in a specific category.
 
     Args:
-        category: Category name ("workspace", "todo", "domain")
+        category: Category name (workspace, core, document, research, citation, graph)
 
     Returns:
         List of tool names in the category
@@ -88,7 +77,7 @@ def get_tools_by_category(category: str) -> List[str]:
     ]
 
 
-def get_categories() -> Set[str]:
+def get_categories() -> set[str]:
     """Get all available tool categories.
 
     Returns:
@@ -142,8 +131,8 @@ def get_phase_tool_summary() -> Dict[str, Dict[str, List[str]]]:
     Returns:
         Dictionary with structure:
         {
-            "strategic": {"workspace": [...], "todo": [...], ...},
-            "tactical": {"workspace": [...], "domain": [...], ...}
+            "strategic": {"workspace": [...], "core": [...], ...},
+            "tactical": {"workspace": [...], "document": [...], ...}
         }
     """
     summary = {
@@ -259,126 +248,88 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Workspace tools
     if "workspace" in tools_by_category:
-        workspace_tool_names = set(tools_by_category["workspace"])
         if not context.has_workspace():
-            raise ValueError(
-                "Workspace tools require a workspace_manager in ToolContext"
-            )
+            raise ValueError("Workspace tools require workspace_manager in ToolContext")
         workspace_tools = create_workspace_tools(context)
+        requested = set(tools_by_category["workspace"])
         for tool in workspace_tools:
-            if tool.name in workspace_tool_names:
+            if tool.name in requested:
                 all_tools.append(tool)
                 logger.debug(f"Loaded workspace tool: {tool.name}")
 
-    # Todo tools
-    if "todo" in tools_by_category:
-        if not context.has_todo():
-            raise ValueError(
-                "Todo tools require a todo_manager in ToolContext"
-            )
-        todo_tools = create_todo_tools(context)
-        todo_tool_names = set(tools_by_category["todo"])
-        for tool in todo_tools:
-            if tool.name in todo_tool_names:
-                all_tools.append(tool)
-                logger.debug(f"Loaded todo tool: {tool.name}")
-
-    # Domain tools (Phase 5)
-    if "domain" in tools_by_category:
-        domain_tool_names = set(tools_by_category["domain"])
-        loaded_domain_tools = _load_domain_tools(domain_tool_names, context)
-        all_tools.extend(loaded_domain_tools)
-
-    # Completion/job tools (from core toolkit)
-    if "completion" in tools_by_category:
+    # Core tools (todo + job)
+    if "core" in tools_by_category:
         if not context.has_workspace():
-            raise ValueError(
-                "Completion tools require a workspace_manager in ToolContext"
-            )
-        job_tools = create_job_tools(context)
-        completion_tool_names = set(tools_by_category["completion"])
-        for tool in job_tools:
-            if tool.name in completion_tool_names:
+            raise ValueError("Core tools require workspace_manager in ToolContext")
+        if not context.has_todo():
+            raise ValueError("Core tools require todo_manager in ToolContext")
+        core_tools = create_core_tools(context)
+        requested = set(tools_by_category["core"])
+        for tool in core_tools:
+            if tool.name in requested:
                 all_tools.append(tool)
-                logger.debug(f"Loaded completion tool: {tool.name}")
+                logger.debug(f"Loaded core tool: {tool.name}")
 
-    logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
-    return all_tools
-
-
-def _load_domain_tools(tool_names: Set[str], context: ToolContext) -> List[Any]:
-    """Load domain-specific tools based on requested names.
-
-    Args:
-        tool_names: Set of domain tool names to load
-        context: ToolContext with dependencies
-
-    Returns:
-        List of domain tool objects
-    """
-    loaded_tools = []
-
-    # Group by module for efficient loading
-    document_tools_needed = tool_names & set(DOCUMENT_TOOLS_METADATA.keys())
-    search_tools_needed = tool_names & set(SEARCH_TOOLS_METADATA.keys())
-    citation_tools_needed = tool_names & set(CITATION_TOOLS_METADATA.keys())
-    graph_tools_needed = tool_names & set(GRAPH_TOOLS_METADATA.keys())
-
-    # Load document tools if needed
-    if document_tools_needed:
+    # Document tools
+    if "document" in tools_by_category:
         try:
             doc_tools = create_document_tools(context)
+            requested = set(tools_by_category["document"])
             for tool in doc_tools:
-                if tool.name in document_tools_needed:
-                    loaded_tools.append(tool)
+                if tool.name in requested:
+                    all_tools.append(tool)
                     logger.debug(f"Loaded document tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load document tools: {e}")
 
-    # Load search tools if needed
-    if search_tools_needed:
+    # Research tools
+    if "research" in tools_by_category:
         try:
-            srch_tools = create_search_tools(context)
-            for tool in srch_tools:
-                if tool.name in search_tools_needed:
-                    loaded_tools.append(tool)
-                    logger.debug(f"Loaded search tool: {tool.name}")
+            research_tools = create_research_tools(context)
+            requested = set(tools_by_category["research"])
+            for tool in research_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded research tool: {tool.name}")
         except Exception as e:
-            logger.warning(f"Could not load search tools: {e}")
+            logger.warning(f"Could not load research tools: {e}")
 
-    # Load citation tools if needed
-    if citation_tools_needed:
+    # Citation tools
+    if "citation" in tools_by_category:
         try:
             cite_tools = create_citation_tools(context)
+            requested = set(tools_by_category["citation"])
             for tool in cite_tools:
-                if tool.name in citation_tools_needed:
-                    loaded_tools.append(tool)
+                if tool.name in requested:
+                    all_tools.append(tool)
                     logger.debug(f"Loaded citation tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load citation tools: {e}")
 
-    # Load graph tools if needed
-    if graph_tools_needed:
+    # Graph tools
+    if "graph" in tools_by_category:
         if not context.has_neo4j():
             logger.warning("Graph tools require neo4j_db in ToolContext")
         else:
             try:
-                grph_tools = create_graph_tools(context)
-                for tool in grph_tools:
-                    if tool.name in graph_tools_needed:
-                        loaded_tools.append(tool)
+                graph_tools = create_graph_tools(context)
+                requested = set(tools_by_category["graph"])
+                for tool in graph_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
                         logger.debug(f"Loaded graph tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load graph tools: {e}")
 
-    return loaded_tools
+    logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
+    return all_tools
 
 
 def load_tools_by_category(category: str, context: ToolContext) -> List[Any]:
     """Load all tools in a specific category.
 
     Args:
-        category: Category name ("workspace", "todo", "domain")
+        category: Category name (workspace, core, document, research, citation, graph)
         context: ToolContext with dependencies
 
     Returns:
