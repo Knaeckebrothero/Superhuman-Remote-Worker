@@ -84,7 +84,7 @@ class PostgresDB:
         rows = await db.fetch("SELECT * FROM jobs WHERE status = $1", "pending")
 
         # Job operations
-        job = await db.create_job(prompt="Extract requirements")
+        job = await db.create_job(description="Extract requirements")
         jobs = await db.get_jobs(status="processing")
 
         # Agent operations
@@ -435,7 +435,8 @@ class PostgresDB:
             if status:
                 rows = await conn.fetch(
                     """
-                    SELECT id, status, creator_status, validator_status, created_at
+                    SELECT id, status, creator_status, validator_status,
+                           config_name, assigned_agent_id, created_at
                     FROM jobs
                     WHERE status = $1
                     ORDER BY created_at DESC
@@ -447,7 +448,8 @@ class PostgresDB:
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT id, status, creator_status, validator_status, created_at
+                    SELECT id, status, creator_status, validator_status,
+                           config_name, assigned_agent_id, created_at
                     FROM jobs
                     ORDER BY created_at DESC
                     LIMIT $1
@@ -475,6 +477,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, status, creator_status, validator_status,
+                       config_name, config_override, assigned_agent_id,
                        created_at, updated_at, description
                 FROM jobs
                 WHERE id = $1
@@ -489,7 +492,8 @@ class PostgresDB:
         description: str,
         document_path: str | None = None,
         document_dir: str | None = None,
-        config_name: str | None = None,
+        config_name: str = "default",
+        config_override: Dict[str, Any] | None = None,
         context: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
@@ -498,7 +502,8 @@ class PostgresDB:
             description: Job description - what the agent should accomplish
             document_path: Optional path to a document
             document_dir: Optional directory containing documents
-            config_name: Optional agent configuration name
+            config_name: Agent configuration name (default: "default")
+            config_override: Optional per-job configuration overrides
             context: Optional context dictionary
 
         Returns:
@@ -507,12 +512,14 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, context, status, creator_status, validator_status)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, status, creator_status, validator_status, created_at, updated_at, description
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, created_at, updated_at, description
                 """,
                 description,
                 document_path or document_dir,
+                config_name,
+                json.dumps(config_override) if config_override else None,
                 json.dumps(context) if context else None,
                 "created",
                 "pending",
@@ -621,6 +628,11 @@ class PostgresDB:
             param_count += 1
             updates.append(f"error_message = ${param_count}")
             values.append(error_message)
+
+        if assigned_agent_id is not None:
+            param_count += 1
+            updates.append(f"assigned_agent_id = ${param_count}")
+            values.append(UUID(assigned_agent_id) if assigned_agent_id else None)
 
         if not updates:
             return False
@@ -763,8 +775,8 @@ class PostgresDB:
             # Get job info
             job = await conn.fetchrow(
                 """
-                SELECT id, prompt, status, creator_status, validator_status,
-                       created_at, updated_at, completed_at
+                SELECT id, description, status, creator_status, validator_status,
+                       config_name, assigned_agent_id, created_at, updated_at, completed_at
                 FROM jobs WHERE id = $1
                 """,
                 uuid_val,
@@ -887,8 +899,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT j.id, j.prompt, j.status, j.creator_status, j.validator_status,
-                       j.created_at, j.updated_at,
+                SELECT j.id, j.description, j.status, j.creator_status, j.validator_status,
+                       j.config_name, j.assigned_agent_id, j.created_at, j.updated_at,
                        COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,
                        COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements
                 FROM jobs j

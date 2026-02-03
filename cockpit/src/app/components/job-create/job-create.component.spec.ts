@@ -23,8 +23,8 @@ function parseContextJson(contextJson: string): { context: Record<string, unknow
 }
 
 function buildJobRequest(formData: JobCreateRequest, contextJson: string): { request: JobCreateRequest | null; error: string | null } {
-  if (!formData.prompt) {
-    return { request: null, error: 'Prompt is required' };
+  if (!formData.description) {
+    return { request: null, error: 'Description is required' };
   }
 
   // Parse context JSON if provided
@@ -35,7 +35,7 @@ function buildJobRequest(formData: JobCreateRequest, contextJson: string): { req
 
   // Build request with only non-empty fields
   const request: JobCreateRequest = {
-    prompt: formData.prompt,
+    description: formData.description,
   };
 
   if (formData.document_path?.trim()) {
@@ -103,27 +103,27 @@ describe('JobCreateComponent utilities', () => {
   });
 
   describe('buildJobRequest', () => {
-    it('should return error when prompt is empty', () => {
-      const formData: JobCreateRequest = { prompt: '' };
+    it('should return error when description is empty', () => {
+      const formData: JobCreateRequest = { description: '' };
 
       const { request, error } = buildJobRequest(formData, '');
 
       expect(request).toBeNull();
-      expect(error).toBe('Prompt is required');
+      expect(error).toBe('Description is required');
     });
 
-    it('should build request with prompt only', () => {
-      const formData: JobCreateRequest = { prompt: 'Extract requirements' };
+    it('should build request with description only', () => {
+      const formData: JobCreateRequest = { description: 'Extract requirements' };
 
       const { request, error } = buildJobRequest(formData, '');
 
       expect(error).toBeNull();
-      expect(request).toEqual({ prompt: 'Extract requirements' });
+      expect(request).toEqual({ description: 'Extract requirements' });
     });
 
     it('should build request with all optional fields', () => {
       const formData: JobCreateRequest = {
-        prompt: 'Test prompt',
+        description: 'Test prompt',
         document_path: '/path/to/doc.pdf',
         document_dir: '/path/to/docs/',
         config_name: 'creator',
@@ -134,7 +134,7 @@ describe('JobCreateComponent utilities', () => {
 
       expect(error).toBeNull();
       expect(request).toEqual({
-        prompt: 'Test prompt',
+        description: 'Test prompt',
         document_path: '/path/to/doc.pdf',
         document_dir: '/path/to/docs/',
         config_name: 'creator',
@@ -144,7 +144,7 @@ describe('JobCreateComponent utilities', () => {
     });
 
     it('should return error for invalid JSON context', () => {
-      const formData: JobCreateRequest = { prompt: 'Test' };
+      const formData: JobCreateRequest = { description: 'Test' };
 
       const { request, error } = buildJobRequest(formData, 'invalid');
 
@@ -154,7 +154,7 @@ describe('JobCreateComponent utilities', () => {
 
     it('should trim whitespace from optional fields', () => {
       const formData: JobCreateRequest = {
-        prompt: 'Test prompt',
+        description: 'Test prompt',
         document_path: '  /path/to/doc.pdf  ',
         config_name: '  creator  ',
         instructions: '  Some instructions  ',
@@ -170,7 +170,7 @@ describe('JobCreateComponent utilities', () => {
 
     it('should not include empty optional fields', () => {
       const formData: JobCreateRequest = {
-        prompt: 'Test prompt',
+        description: 'Test prompt',
         document_path: '   ', // Only whitespace
         config_name: '',
       };
@@ -178,34 +178,34 @@ describe('JobCreateComponent utilities', () => {
       const { request, error } = buildJobRequest(formData, '');
 
       expect(error).toBeNull();
-      expect(request).toEqual({ prompt: 'Test prompt' });
+      expect(request).toEqual({ description: 'Test prompt' });
       expect(request?.document_path).toBeUndefined();
       expect(request?.config_name).toBeUndefined();
     });
   });
 
   describe('form validation', () => {
-    it('should require prompt field', () => {
-      const formData: JobCreateRequest = { prompt: '' };
+    it('should require description field', () => {
+      const formData: JobCreateRequest = { description: '' };
       const { error } = buildJobRequest(formData, '');
 
-      expect(error).toBe('Prompt is required');
+      expect(error).toBe('Description is required');
     });
 
-    it('should accept prompt with only whitespace as valid (validation not trimming prompt)', () => {
-      const formData: JobCreateRequest = { prompt: '   ' };
+    it('should accept description with only whitespace as valid (validation not trimming description)', () => {
+      const formData: JobCreateRequest = { description: '   ' };
       const { request, error } = buildJobRequest(formData, '');
 
       // Note: The actual component might want to trim this, but we're testing current behavior
       expect(error).toBeNull();
-      expect(request?.prompt).toBe('   ');
+      expect(request?.description).toBe('   ');
     });
   });
 
   describe('form reset', () => {
     it('should produce empty form data structure', () => {
       const emptyFormData: JobCreateRequest = {
-        prompt: '',
+        description: '',
         document_path: undefined,
         document_dir: undefined,
         config_name: undefined,
@@ -213,7 +213,7 @@ describe('JobCreateComponent utilities', () => {
         instructions: undefined,
       };
 
-      expect(emptyFormData.prompt).toBe('');
+      expect(emptyFormData.description).toBe('');
       expect(emptyFormData.document_path).toBeUndefined();
       expect(emptyFormData.document_dir).toBeUndefined();
       expect(emptyFormData.config_name).toBeUndefined();

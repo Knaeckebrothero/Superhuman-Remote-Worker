@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     total_tokens_used INTEGER DEFAULT 0,
     total_requests INTEGER DEFAULT 0,
 
+    -- Job configuration (which agent config to use)
+    config_name VARCHAR(100) DEFAULT 'default',
+    config_override JSONB DEFAULT NULL,
+    assigned_agent_id UUID,  -- FK added after agents table creation
+
     CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
@@ -62,6 +67,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_creator_status ON jobs(creator_status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_config_name ON jobs(config_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_assigned_agent ON jobs(assigned_agent_id);
 
 -- ============================================================================
 -- 2. AGENTS TABLE
@@ -97,6 +104,14 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_agents_last_heartbeat ON agents(last_heartbeat);
 CREATE INDEX IF NOT EXISTS idx_agents_current_job ON agents(current_job_id);
+
+-- Add FK constraint for jobs.assigned_agent_id now that agents table exists
+DO $$ BEGIN
+    ALTER TABLE jobs ADD CONSTRAINT fk_jobs_assigned_agent
+        FOREIGN KEY (assigned_agent_id) REFERENCES agents(id) ON DELETE SET NULL;
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;
 
 -- ============================================================================
 -- 3. REQUIREMENTS TABLE
@@ -326,6 +341,8 @@ SELECT
     j.status,
     j.creator_status,
     j.validator_status,
+    j.config_name,
+    j.assigned_agent_id,
     j.created_at,
     j.completed_at,
     COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,

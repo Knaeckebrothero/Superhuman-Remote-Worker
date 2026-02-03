@@ -125,7 +125,8 @@ class JobCreate(BaseModel):
     instructions_upload_id: str | None = Field(None, description="Upload ID for instructions markdown")
     document_path: str | None = Field(None, description="Path to a document (deprecated, use upload_id)")
     document_dir: str | None = Field(None, description="Directory containing documents (deprecated)")
-    config_name: str | None = Field(None, description="Agent configuration name")
+    config_name: str = Field("default", description="Agent configuration name")
+    config_override: dict[str, Any] | None = Field(None, description="Per-job configuration overrides")
     context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
     instructions: str | None = Field(None, description="Additional inline instructions for the agent")
 
@@ -140,7 +141,8 @@ class JobStartRequest(BaseModel):
     instructions_upload_id: str | None = None
     document_path: str | None = None
     document_dir: str | None = None
-    config_name: str | None = None
+    config_name: str = "default"
+    config_override: dict[str, Any] | None = None
     context: dict[str, Any] | None = None
     instructions: str | None = None
 
@@ -368,6 +370,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             document_path=job.document_path,
             document_dir=job.document_dir,
             config_name=job.config_name,
+            config_override=job.config_override,
             context=context if context else None,
         )
     except Exception as e:
@@ -851,7 +854,13 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
         config_upload_id = job_context.get("config_upload_id")
         instructions_upload_id = job_context.get("instructions_upload_id")
 
-        # Build job start request
+        # Parse config_override if stored as string
+        config_override = job.get("config_override")
+        if isinstance(config_override, str):
+            import json as json_module
+            config_override = json_module.loads(config_override)
+
+        # Build job start request - use job's config, not agent's
         job_start = JobStartRequest(
             job_id=job_id,
             description=job["description"],
@@ -859,7 +868,8 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             config_upload_id=config_upload_id,
             instructions_upload_id=instructions_upload_id,
             document_path=job.get("document_path"),
-            config_name=agent["config_name"],
+            config_name=job.get("config_name", "default"),
+            config_override=config_override,
         )
 
         # Send request to agent pod
@@ -877,11 +887,12 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
                 detail=f"Agent rejected job: {response.text}",
             )
 
-        # Update job status
+        # Update job status and assign to agent
         await postgres_db.update_job_status(
             job_id=job_id,
             status="processing",
             creator_status="pending",
+            assigned_agent_id=agent_id,
         )
 
         # Update agent status via heartbeat simulation

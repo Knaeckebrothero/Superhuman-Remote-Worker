@@ -44,7 +44,7 @@ import { JobSummary } from '../../core/models/audit.model';
                       [class.selected]="selectedJobId() === job.id"
                       (click)="selectJob(job.id)"
                     >
-                      <span class="job-prompt">{{ truncatePrompt(job.prompt) }}</span>
+                      <span class="job-prompt">{{ truncatePrompt(job.description) }}</span>
                       <span class="job-meta">{{ job.id.slice(0, 8) }}... | {{ formatDate(job.created_at) }}</span>
                     </div>
                   }

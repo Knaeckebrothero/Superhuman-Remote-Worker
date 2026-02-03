@@ -88,7 +88,7 @@ async def list_jobs(
 async def get_job(job_id: str) -> str:
     """Get detailed information about a specific job by ID.
 
-    Returns full job details including prompt, config, status,
+    Returns full job details including description, config, status,
     timestamps, and audit count.
 
     Args:
@@ -293,11 +293,11 @@ def _format_job_detail(job: dict[str, Any]) -> str:
         f"Audit entries: {job.get('audit_count', 'N/A')}",
     ]
 
-    if job.get("prompt"):
-        prompt = job["prompt"]
-        if len(prompt) > 500:
-            prompt = prompt[:500] + "..."
-        lines.append(f"\nPrompt:\n{prompt}")
+    if job.get("description"):
+        description = job["description"]
+        if len(description) > 500:
+            description = description[:500] + "..."
+        lines.append(f"\nDescription:\n{description}")
 
     if job.get("error"):
         lines.append(f"\nError: {job['error']}")

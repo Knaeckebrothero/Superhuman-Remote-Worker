@@ -21,7 +21,7 @@ Example:
     tables = await db.verify_schema()  # Check all tables exist
 
     # Job and agent operations
-    job = await db.create_job(prompt="Extract requirements")
+    job = await db.create_job(description="Extract requirements")
     await db.register_agent(config_name="creator", pod_ip="10.0.0.1")
 
     # MongoDB (optional, async)
