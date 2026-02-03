@@ -40,9 +40,9 @@ class JobSubmitRequest(BaseModel):
         default=None,
         description="Path to document to process (for Creator agent)",
     )
-    prompt: Optional[str] = Field(
+    description: Optional[str] = Field(
         default=None,
-        description="Processing prompt/instructions",
+        description="Job description - what the agent should accomplish",
     )
     requirement_id: Optional[str] = Field(
         default=None,
@@ -61,7 +61,7 @@ class JobSubmitRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "document_path": "/data/documents/gobd_spec.pdf",
-                "prompt": "Extract GoBD compliance requirements",
+                "description": "Extract GoBD compliance requirements",
                 "priority": "high",
             }
         }
@@ -243,7 +243,7 @@ class JobStartRequest(BaseModel):
     """Request from orchestrator to start a job."""
 
     job_id: str = Field(..., description="Job UUID assigned by orchestrator")
-    prompt: str = Field(..., description="Task prompt for the agent")
+    description: str = Field(..., description="Job description - what the agent should accomplish")
     upload_id: Optional[str] = Field(
         default=None,
         description="Upload ID for document files (from /api/uploads)",
@@ -281,7 +281,7 @@ class JobStartRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "job_id": "abc123-def456-789",
-                "prompt": "Extract requirements from document",
+                "description": "Extract requirements from document",
                 "document_path": "/data/documents/spec.pdf",
             }
         }

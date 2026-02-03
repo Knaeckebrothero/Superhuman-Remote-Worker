@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
 
     -- Input data
-    prompt TEXT NOT NULL,
+    description TEXT NOT NULL,
     document_path TEXT,
     document_content BYTEA,
     context JSONB DEFAULT '{}',

@@ -19,7 +19,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 CREATE TABLE IF NOT EXISTS jobs (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    prompt TEXT NOT NULL,
+    description TEXT NOT NULL,
     document_path TEXT,
     document_content BYTEA,
     context JSONB DEFAULT '{}',
@@ -187,7 +187,7 @@ SELECT
     j.status,
     j.creator_status,
     j.validator_status,
-    j.prompt,
+    j.description,
     j.created_at,
     j.updated_at,
     j.completed_at,

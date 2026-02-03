@@ -10,7 +10,7 @@ Example:
     # PostgreSQL (async) - create instance with dependency injection
     postgres_db = PostgresDB()
     await postgres_db.connect()
-    job_id = await postgres_db.jobs.create(prompt="Extract requirements")
+    job_id = await postgres_db.jobs.create(description="Extract requirements")
 
     # Neo4j (sync)
     neo4j_db = Neo4jDB()

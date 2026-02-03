@@ -119,7 +119,7 @@ class AgentHeartbeat(BaseModel):
 class JobCreate(BaseModel):
     """Request body for creating a new job."""
 
-    prompt: str = Field(..., description="Task prompt for the agent")
+    description: str = Field(..., description="Job description - what the agent should accomplish")
     upload_id: str | None = Field(None, description="Upload ID for document files (from /api/uploads)")
     config_upload_id: str | None = Field(None, description="Upload ID for config YAML override")
     instructions_upload_id: str | None = Field(None, description="Upload ID for instructions markdown")
@@ -134,7 +134,7 @@ class JobStartRequest(BaseModel):
     """Request sent to agent to start a job."""
 
     job_id: str
-    prompt: str
+    description: str
     upload_id: str | None = None
     config_upload_id: str | None = None
     instructions_upload_id: str | None = None
@@ -364,7 +364,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             context["instructions_upload_id"] = job.instructions_upload_id
 
         return await postgres_db.create_job(
-            prompt=job.prompt,
+            description=job.description,
             document_path=job.document_path,
             document_dir=job.document_dir,
             config_name=job.config_name,
@@ -854,7 +854,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
         # Build job start request
         job_start = JobStartRequest(
             job_id=job_id,
-            prompt=job["prompt"],
+            description=job["description"],
             upload_id=upload_id,
             config_upload_id=config_upload_id,
             instructions_upload_id=instructions_upload_id,
