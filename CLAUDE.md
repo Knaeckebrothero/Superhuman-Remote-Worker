@@ -49,22 +49,22 @@ Note: Legacy scripts are in `DEPRECATED_scripts/` and show deprecation warnings.
 ### Running Agents
 ```bash
 # Run with defaults (LOG_LEVEL=INFO, streaming enabled)
-python agent.py --prompt "Your task here"
+python agent.py --description "Your task here"
 
 # Run with custom config
-python agent.py --config my_agent --prompt "Your task"
+python agent.py --config my_agent --description "Your task"
 
 # Run with debug logging
-LOG_LEVEL=DEBUG python agent.py --prompt "Your task"
+LOG_LEVEL=DEBUG python agent.py --description "Your task"
 
 # Run with LLM token streaming to stderr
-DEBUG_LLM_STREAM=1 python agent.py --prompt "Your task"
+DEBUG_LLM_STREAM=1 python agent.py --description "Your task"
 
 # Process document
-python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements"
+python agent.py --document-path ./data/doc.pdf --description "Extract requirements"
 
 # Process directory of documents
-python agent.py --document-dir ./data/example_data/ --prompt "Identify requirements"
+python agent.py --document-dir ./data/example_data/ --description "Identify requirements"
 
 # Start as API server
 python agent.py --port 8001

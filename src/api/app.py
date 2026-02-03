@@ -230,7 +230,7 @@ def _cleanup_job_file_handler(job_id: str) -> None:
 
 async def _process_orchestrator_job(
     job_id: str,
-    prompt: str,
+    description: str,
     upload_id: Optional[str] = None,
     config_upload_id: Optional[str] = None,
     instructions_upload_id: Optional[str] = None,
@@ -257,7 +257,7 @@ async def _process_orchestrator_job(
         logger.info(f"Starting orchestrator job {job_id}")
 
         # Build metadata
-        metadata: Dict[str, Any] = {"prompt": prompt}
+        metadata: Dict[str, Any] = {"description": description}
         if upload_id:
             metadata["upload_id"] = upload_id
         if config_upload_id:
@@ -464,7 +464,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         _current_job_task = asyncio.create_task(
             _process_orchestrator_job(
                 job_id=request.job_id,
-                prompt=request.prompt,
+                description=request.description,
                 upload_id=request.upload_id,
                 config_upload_id=request.config_upload_id,
                 instructions_upload_id=request.instructions_upload_id,
