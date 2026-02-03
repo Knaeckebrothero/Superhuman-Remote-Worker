@@ -14,10 +14,16 @@
 #   - mcp: MCP server for Claude Code integration
 #
 # Usage:
-#   docker-compose up -d          # Start all services
-#   docker-compose logs -f        # View logs
-#   docker-compose down           # Stop all services
-#   docker-compose down -v        # Stop and remove volumes
+#   docker-compose up -d                    # Start all services
+#   docker-compose up -d --scale agent=3    # Start with 3 agent instances
+#   docker-compose logs -f                  # View logs
+#   docker-compose down                     # Stop all services
+#   docker-compose down -v                  # Stop and remove volumes
+#
+# Multi-agent scaling:
+#   Agents register with orchestrator on startup (pod_ip, port).
+#   Orchestrator dispatches jobs to available agents via internal network.
+#   Use --scale agent=N to run multiple agent instances.
 #
 # =============================================================================
 
@@ -90,7 +96,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.agent
-    container_name: graphrag-agent
+    # No container_name - allows scaling with: docker-compose up --scale agent=N
     restart: unless-stopped
     depends_on:
       postgres:
@@ -109,13 +115,14 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       WORKSPACE_PATH: /app/workspace
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - workspace_data:/app/workspace
       - ./config:/app/config:Z
-    ports:
-      - "${AGENT_PORT:-8001}:8001"
+    # No ports - orchestrator dispatches jobs via internal network (pod_ip:8001)
 
   orchestrator:
     build:
