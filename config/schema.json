@@ -106,39 +106,56 @@
     },
     "tools": {
       "type": "object",
-      "description": "Tool configuration by category",
-      "required": ["workspace", "todo"],
+      "description": "Tool configuration by category (matches src/tools/ packages)",
+      "required": ["workspace", "core"],
       "properties": {
         "workspace": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Workspace tools to enable",
-          "examples": [["read_file", "write_file", "list_files"]]
+          "description": "Workspace file operation tools (src/tools/workspace/)",
+          "examples": [["read_file", "write_file", "list_files", "edit_file"]]
         },
-        "todo": {
+        "core": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Todo tools to enable",
-          "examples": [["add_todo", "complete_todo", "list_todos"]]
+          "description": "Core tools: todo management + job completion (src/tools/core/)",
+          "examples": [["next_phase_todos", "todo_complete", "mark_complete", "job_complete"]]
         },
-        "domain": {
+        "document": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Domain-specific tools to enable"
+          "description": "Document processing tools (src/tools/document/)",
+          "examples": [["extract_document_text", "chunk_document"]]
         },
-        "completion": {
+        "research": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Phase/job completion signaling tools to enable",
-          "examples": [["mark_complete", "job_complete"]]
+          "description": "Research/web search tools (src/tools/research/)",
+          "examples": [["web_search"]]
+        },
+        "citation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Citation management tools (src/tools/citation/)",
+          "examples": [["cite_document", "cite_web", "list_sources"]]
+        },
+        "graph": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Neo4j graph operation tools (src/tools/graph/)",
+          "examples": [["execute_cypher_query", "get_database_schema"]]
         }
       }
     },

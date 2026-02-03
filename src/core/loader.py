@@ -238,12 +238,14 @@ class WorkspaceConfig:
 
 @dataclass
 class ToolsConfig:
-    """Tools configuration by category."""
+    """Tools configuration by category (matches src/tools/ packages)."""
 
     workspace: List[str] = field(default_factory=list)
-    todo: List[str] = field(default_factory=list)
-    domain: List[str] = field(default_factory=list)
-    completion: List[str] = field(default_factory=list)
+    core: List[str] = field(default_factory=list)
+    document: List[str] = field(default_factory=list)
+    research: List[str] = field(default_factory=list)
+    citation: List[str] = field(default_factory=list)
+    graph: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -415,9 +417,11 @@ def load_agent_config(
     tools_data = data.get("tools", {})
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
-        todo=tools_data.get("todo", []),
-        domain=tools_data.get("domain", []),
-        completion=tools_data.get("completion", []),
+        core=tools_data.get("core", []),
+        document=tools_data.get("document", []),
+        research=tools_data.get("research", []),
+        citation=tools_data.get("citation", []),
+        graph=tools_data.get("graph", []),
     )
 
     todo_data = data.get("todo", {})
@@ -544,9 +548,11 @@ def load_agent_config_from_dict(
     tools_data = data.get("tools", {})
     tools_config = ToolsConfig(
         workspace=tools_data.get("workspace", []),
-        todo=tools_data.get("todo", []),
-        domain=tools_data.get("domain", []),
-        completion=tools_data.get("completion", []),
+        core=tools_data.get("core", []),
+        document=tools_data.get("document", []),
+        research=tools_data.get("research", []),
+        citation=tools_data.get("citation", []),
+        graph=tools_data.get("graph", []),
     )
 
     todo_data = data.get("todo", {})
@@ -989,9 +995,11 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
     """
     return (
         config.tools.workspace +
-        config.tools.todo +
-        config.tools.domain +
-        config.tools.completion
+        config.tools.core +
+        config.tools.document +
+        config.tools.research +
+        config.tools.citation +
+        config.tools.graph
     )
 
 

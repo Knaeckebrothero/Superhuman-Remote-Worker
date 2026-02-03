@@ -29,28 +29,28 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.todo",
         "function": "next_phase_todos",
         "description": "Stage todos for the next tactical phase",
-        "category": "todo",
+        "category": "core",
         "phases": ["strategic"],  # Strategic-only: creates work for tactical phase
     },
     "todo_complete": {
         "module": "core.todo",
         "function": "todo_complete",
         "description": "Mark one or more tasks as complete (by ID or comma-separated IDs)",
-        "category": "todo",
+        "category": "core",
         "phases": ["strategic", "tactical"],  # Both: used in all phases
     },
     "todo_list": {
         "module": "core.todo",
         "function": "todo_list",
         "description": "List all todos with IDs and status",
-        "category": "todo",
+        "category": "core",
         "phases": ["strategic", "tactical"],  # Both: helps see current state
     },
     "todo_rewind": {
         "module": "core.todo",
         "function": "todo_rewind",
         "description": "Panic button - abandon current approach and re-plan",
-        "category": "todo",
+        "category": "core",
         "phases": ["tactical"],  # Tactical-only: escape hatch when stuck
     },
 }

@@ -22,6 +22,7 @@ workspace:
   max_read_words: 25000
 
 tools:
+  # Workspace tools - file operations (src/tools/workspace/)
   workspace:
     - read_file
     - write_file
@@ -35,20 +36,35 @@ tools:
     - copy_file
     - get_workspace_summary
     - get_document_info
-  todo:
+  # Core tools - todo + job management (src/tools/core/)
+  core:
     - next_phase_todos
     - todo_complete
+    - todo_list
     - todo_rewind
-  domain:
+    - mark_complete
+    - job_complete
+  # Document tools - document processing (src/tools/document/)
+  document:
+    - extract_document_text
+    - chunk_document
+    - identify_requirement_candidates
+  # Research tools - web search (src/tools/research/)
+  research:
     - web_search
+  # Citation tools - citation management (src/tools/citation/)
+  citation:
     - cite_document
     - cite_web
     - list_sources
     - get_citation
     - list_citations
-  completion:
-    - mark_complete
-    - job_complete
+    - edit_citation
+  # Graph tools - Neo4j operations (src/tools/graph/)
+  graph:
+    - execute_cypher_query
+    - get_database_schema
+    - validate_schema_compliance
 
 todo:
   archive_on_reset: true

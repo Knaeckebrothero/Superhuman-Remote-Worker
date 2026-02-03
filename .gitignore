@@ -2,6 +2,7 @@
 backups/*
 workspace/*
 output/*
+orchestrator/workspace/*
 
 # MCP configuration files
 .mcp.json

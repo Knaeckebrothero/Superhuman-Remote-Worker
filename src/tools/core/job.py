@@ -38,14 +38,14 @@ JOB_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "core.job",
         "function": "mark_complete",
         "description": "Signal task/phase completion with structured report",
-        "category": "completion",
+        "category": "core",
         "phases": ["strategic", "tactical"],  # Both modes
     },
     "job_complete": {
         "module": "core.job",
         "function": "job_complete",
         "description": "Signal FINAL job completion - call when all phases are done",
-        "category": "completion",
+        "category": "core",
         "phases": ["strategic"],  # Strategic-only: prevents premature termination
     },
 }
