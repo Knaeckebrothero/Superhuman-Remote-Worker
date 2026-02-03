@@ -74,13 +74,13 @@ jobs table (creator polls) → requirements table (validator polls) → Neo4j
 jobs table (any agent polls) → job.type determines behavior → output varies
 ```
 
-Job schema changes:
+Job schema changes (implemented):
 ```sql
--- Simplified job queue
-ALTER TABLE jobs ADD COLUMN job_type VARCHAR(50) DEFAULT 'generic';
+-- Job configuration columns (added)
+ALTER TABLE jobs ADD COLUMN config_name VARCHAR(100) DEFAULT 'default';
 ALTER TABLE jobs ADD COLUMN config_override JSONB;  -- Runtime config tweaks
--- Remove: creator_status, validator_status
--- Add: status (pending/processing/complete/failed), claimed_by (agent_id)
+ALTER TABLE jobs ADD COLUMN assigned_agent_id UUID REFERENCES agents(id);
+-- Kept: creator_status, validator_status (useful for pipeline tracking)
 ```
 
 ### Toolkit Architecture
@@ -133,7 +133,7 @@ ALTER TABLE jobs ADD COLUMN config_override JSONB;  -- Runtime config tweaks
 Jobs can request additional toolkits or disable defaults:
 ```json
 {
-  "prompt": "Analyze this codebase and write tests",
+  "description": "Analyze this codebase and write tests",
   "toolkits": {
     "add": ["dev"],
     "remove": ["web"]
@@ -260,7 +260,7 @@ class Neo4jToolkit(Toolkit):
 Jobs can specify backend:
 ```json
 {
-  "prompt": "Complex reasoning task...",
+  "description": "Complex reasoning task...",
   "llm_backend": "anthropic"
 }
 ```
@@ -443,10 +443,10 @@ volumes:
 10. ~~**Delete Streamlit dashboard** - `dashboard/` directory~~ ✅
 
 ### Phase 3: Database & Job Queue
-11. **Simplify jobs table schema** - Remove creator_status/validator_status, add toolkits JSONB
-12. **Implement SELECT FOR UPDATE SKIP LOCKED** - Proper job claiming
-13. **Add claimed_by column** - Track which agent instance has the job
-14. **Graceful shutdown handling** - Release claimed jobs on SIGTERM
+11. ~~**Add job configuration columns** - config_name, config_override, assigned_agent_id~~ ✅
+12. **Implement SELECT FOR UPDATE SKIP LOCKED** - Proper job claiming (deferred - manual assignment for now)
+13. ~~**Add assigned_agent_id column** - Track which agent instance has the job~~ ✅
+14. **Graceful shutdown handling** - Release claimed jobs on SIGTERM (deferred)
 
 ### Phase 4: Multi-LLM Backend
 15. **Create LLM backend abstraction** - Support OpenAI, Anthropic, Google APIs
@@ -479,7 +479,7 @@ volumes:
 6. ~~Delete Streamlit dashboard (task 10)~~ ✅
 
 ### Week 3: Production Ready
-7. Simplify job queue schema (tasks 11-14)
+7. ~~Add job configuration schema (tasks 11, 13)~~ ✅
 8. Write docker-compose.yaml (tasks 19-21)
 9. Test full stack in containers locally
 

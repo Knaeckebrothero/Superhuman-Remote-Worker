@@ -79,8 +79,11 @@ export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'fa
  */
 export interface Job {
   id: string;
-  prompt: string;
+  description: string;
   document_path?: string;
+  config_name: string;
+  config_override?: Record<string, unknown>;
+  assigned_agent_id?: string;
   status: JobStatus;
   creator_status: string;
   validator_status: string;
@@ -95,13 +98,14 @@ export interface Job {
  * Request body for creating a new job.
  */
 export interface JobCreateRequest {
-  prompt: string;
+  description: string;
   upload_id?: string;
   config_upload_id?: string;
   instructions_upload_id?: string;
   document_path?: string;
   document_dir?: string;
   config_name?: string;
+  config_override?: Record<string, unknown>;
   context?: Record<string, unknown>;
   instructions?: string;
 }
@@ -211,7 +215,7 @@ export interface AgentStatistics {
  */
 export interface StuckJob {
   id: string;
-  prompt: string;
+  description: string;
   status: string;
   creator_status: string;
   validator_status: string;

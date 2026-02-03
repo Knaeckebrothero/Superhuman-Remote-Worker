@@ -264,9 +264,13 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Directory containing documents",
     )
-    config_name: Optional[str] = Field(
+    config_name: str = Field(
+        default="default",
+        description="Agent configuration name",
+    )
+    config_override: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Agent configuration name override",
+        description="Per-job configuration overrides",
     )
     context: Optional[Dict[str, Any]] = Field(
         default=None,
