@@ -902,22 +902,32 @@ def load_instructions(
             f"Instructions template not found: {template_name}. "
             "Using minimal instructions."
         )
+        # Build tool list from all categories
+        all_tools = []
+        all_tools.extend(config.tools.workspace)
+        all_tools.extend(config.tools.core)
+        all_tools.extend(config.tools.document)
+        all_tools.extend(config.tools.research)
+        all_tools.extend(config.tools.citation)
+        all_tools.extend(config.tools.graph)
+        tools_str = ", ".join(all_tools) if all_tools else "(none configured)"
+
         return f"""# {config.display_name} Instructions
 
 You are running as {config.display_name}.
 
 ## Available Tools
 
-Workspace tools: {', '.join(config.tools.workspace)}
-Todo tools: {', '.join(config.tools.todo)}
-Domain tools: {', '.join(config.tools.domain)}
+{tools_str}
+
+See `tools/README.md` for detailed documentation of each tool.
 
 ## How to Work
 
 1. Create a plan in `plan.md`
 2. Use todos to track immediate steps
 3. Write results to files as you go
-4. When complete, write status to `output/completion.json`
+4. When complete, call `job_complete`
 """
 
 
