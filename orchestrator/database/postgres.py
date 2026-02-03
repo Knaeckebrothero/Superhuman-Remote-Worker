@@ -475,7 +475,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, status, creator_status, validator_status,
-                       created_at, updated_at, prompt
+                       created_at, updated_at, description
                 FROM jobs
                 WHERE id = $1
                 """,
@@ -486,7 +486,7 @@ class PostgresDB:
 
     async def create_job(
         self,
-        prompt: str,
+        description: str,
         document_path: str | None = None,
         document_dir: str | None = None,
         config_name: str | None = None,
@@ -495,7 +495,7 @@ class PostgresDB:
         """Create a new job.
 
         Args:
-            prompt: Task prompt for the agent
+            description: Job description - what the agent should accomplish
             document_path: Optional path to a document
             document_dir: Optional directory containing documents
             config_name: Optional agent configuration name
@@ -507,11 +507,11 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (prompt, document_path, context, status, creator_status, validator_status)
+                INSERT INTO jobs (description, document_path, context, status, creator_status, validator_status)
                 VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, status, creator_status, validator_status, created_at, updated_at, prompt
+                RETURNING id, status, creator_status, validator_status, created_at, updated_at, description
                 """,
-                prompt,
+                description,
                 document_path or document_dir,
                 json.dumps(context) if context else None,
                 "created",

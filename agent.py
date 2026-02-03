@@ -13,18 +13,18 @@ Examples:
     # Process a single document
     python agent.py --config creator \
         --document-path ./data/doc.pdf \
-        --prompt "Extract GoBD requirements"
+        --description "Extract GoBD requirements"
 
     # Process all documents in a directory (with debug logging)
     LOG_LEVEL=DEBUG python agent.py --config creator \
         --document-dir ./data/example_data/ \
-        --prompt "Extract requirements based on the provided documents"
+        --description "Extract requirements based on the provided documents"
 
     # Combine single document with directory
     python agent.py --config creator \
         --document-path ./data/main.pdf \
         --document-dir ./data/context/ \
-        --prompt "Extract requirements"
+        --description "Extract requirements"
 
     # Run as API server (Creator agent on port 8001)
     python agent.py --config creator --port 8001
@@ -309,8 +309,8 @@ def parse_args():
         help="Directory containing documents (all files will be included)",
     )
     parser.add_argument(
-        "--prompt",
-        help="Processing prompt for Creator agent",
+        "--description",
+        help="Job description - what the agent should accomplish",
     )
     parser.add_argument(
         "--requirement-id", "-r",
@@ -355,7 +355,7 @@ async def run_single_job(
     config_path: str,
     job_id: str = None,
     document_paths: Optional[List[str]] = None,
-    prompt: Optional[str] = None,
+    description: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     requirement_data: Optional[Dict[str, Any]] = None,
     resume: bool = False,
@@ -363,7 +363,7 @@ async def run_single_job(
 ):
     """Run a single job and exit.
 
-    If job_id is not provided, creates a new job from document_paths and prompt.
+    If job_id is not provided, creates a new job from document_paths and description.
     Logs are written to the workspace directory as job_{job_id}.log.
     Always uses streaming mode with iteration logging.
 
@@ -371,7 +371,7 @@ async def run_single_job(
         config_path: Path to agent configuration
         job_id: Existing job ID to process
         document_paths: List of document paths to include
-        prompt: Processing prompt
+        description: Job description - what the agent should accomplish
         context: Additional context dictionary
         requirement_data: Requirement data fetched from PostgreSQL (for validator)
         resume: Resume existing job
@@ -385,8 +385,8 @@ async def run_single_job(
 
     # Create job if needed
     if not job_id:
-        if not prompt:
-            logger.error("Either --job-id or --prompt is required")
+        if not description:
+            logger.error("Either --job-id or --description is required")
             sys.exit(1)
 
         # Connect to database to create job using new PostgresDB class
@@ -397,7 +397,7 @@ async def run_single_job(
         try:
             # Use PostgresDB.jobs.create() namespace method
             job_uuid = await db.jobs.create(
-                prompt=prompt,
+                description=description,
                 document_path=primary_document,
                 context=context,
             )
@@ -415,8 +415,8 @@ async def run_single_job(
     metadata = {}
     if document_paths:
         metadata["document_paths"] = document_paths
-    if prompt:
-        metadata["prompt"] = prompt
+    if description:
+        metadata["description"] = description
     if context:
         metadata.update(context)
     if requirement_data:
@@ -534,7 +534,7 @@ async def recover_and_resume(
     job_id: str,
     phase_number: int,
     document_paths: Optional[List[str]] = None,
-    prompt: Optional[str] = None,
+    description: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     requirement_data: Optional[Dict[str, Any]] = None,
 ):
@@ -545,7 +545,7 @@ async def recover_and_resume(
         job_id: Job identifier
         phase_number: Phase number to recover to
         document_paths: List of document paths (for metadata)
-        prompt: Processing prompt (for metadata)
+        description: Job description (for metadata)
         context: Additional context dictionary
         requirement_data: Requirement data (for validator)
     """
@@ -587,7 +587,7 @@ async def recover_and_resume(
         config_path=config_path,
         job_id=job_id,
         document_paths=document_paths,
-        prompt=prompt,
+        description=description,
         context=context,
         requirement_data=requirement_data,
         resume=True,  # Always resume after recovery
@@ -707,19 +707,19 @@ def main():
             job_id=args.job_id,
             phase_number=args.recover_phase,
             document_paths=document_paths if document_paths else None,
-            prompt=args.prompt,
+            description=args.description,
             context=context,
             requirement_data=requirement_data,
         ))
         return
 
-    # Single job mode (either by job_id or by document+prompt or by requirement_id)
-    if args.job_id or args.prompt or args.requirement_id:
+    # Single job mode (either by job_id or by description or by requirement_id)
+    if args.job_id or args.description or args.requirement_id:
         asyncio.run(run_single_job(
             config_path=config_path,
             job_id=args.job_id,
             document_paths=document_paths if document_paths else None,
-            prompt=args.prompt,
+            description=args.description,
             context=context,
             requirement_data=requirement_data,
             resume=args.resume,
@@ -729,7 +729,7 @@ def main():
 
     # API server mode (default)
     if args.no_server:
-        logger.error("Specify --job-id or --prompt with --no-server")
+        logger.error("Specify --job-id or --description with --no-server")
         sys.exit(1)
 
     run_server(config_path, args.host, args.port)

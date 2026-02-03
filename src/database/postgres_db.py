@@ -44,7 +44,7 @@ class PostgresDB:
 
         # Create a job
         job_id = await db.jobs.create(
-            prompt="Extract requirements",
+            description="Extract requirements",
             document_path="doc.pdf"
         )
 
@@ -387,14 +387,14 @@ class JobsNamespace:
 
     async def create(
         self,
-        prompt: str,
+        description: str,
         document_path: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None
     ) -> uuid.UUID:
         """Create a new job.
 
         Args:
-            prompt: User prompt for the job
+            description: Job description - what the agent should accomplish
             document_path: Path to document file (optional)
             context: Additional context dictionary (optional)
 
@@ -403,11 +403,11 @@ class JobsNamespace:
         """
         job_id = await self.db.fetchval(
             """
-            INSERT INTO jobs (prompt, document_path, context)
+            INSERT INTO jobs (description, document_path, context)
             VALUES ($1, $2, $3)
             RETURNING id
             """,
-            prompt,
+            description,
             document_path,
             json.dumps(context or {})
         )
@@ -545,13 +545,13 @@ class JobsNamespace:
     # Sync wrappers for scripts
     def create_sync(
         self,
-        prompt: str,
+        description: str,
         document_path: Optional[str] = None,
         context: Optional[Dict[str, Any]] = None
     ) -> uuid.UUID:
         """Synchronous wrapper for create()."""
         return PostgresDB._run_async(
-            self.create(prompt, document_path, context)
+            self.create(description, document_path, context)
         )
 
     def get_sync(self, job_id: uuid.UUID) -> Optional[Dict[str, Any]]:
