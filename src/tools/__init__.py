@@ -63,12 +63,11 @@ from .registry import (
     get_tools_for_phase,
     get_phase_tool_summary,
 )
-from .description_generator import (
+from .description_manager import (
+    DescriptionManager,
     generate_workspace_tool_docs,
     generate_tool_description,
     generate_tool_index,
-)
-from .description_override import (
     apply_description_overrides,
     get_deferred_tools,
     get_core_tools,
@@ -108,11 +107,11 @@ __all__ = [
     "filter_tools_by_phase",
     "get_tools_for_phase",
     "get_phase_tool_summary",
-    # Description generator
+    # Description manager
+    "DescriptionManager",
     "generate_workspace_tool_docs",
     "generate_tool_description",
     "generate_tool_index",
-    # Description override
     "apply_description_overrides",
     "get_deferred_tools",
     "get_core_tools",

@@ -59,8 +59,7 @@ from .core.loader import (
     get_all_tool_names,
     resolve_config_path,
 )
-from .tools.description_generator import generate_workspace_tool_docs
-from .tools.description_override import apply_description_overrides
+from .tools.description_manager import generate_workspace_tool_docs, apply_description_overrides
 from .graph import build_phase_alternation_graph, run_graph_with_streaming
 
 

@@ -20,7 +20,7 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "module": "research.web",
         "function": "web_search",
         "description": "Search the web using Tavily API",
-        "category": "domain",
+        "category": "research",
         "defer_to_workspace": True,
         "short_description": "Search the web via Tavily for context and research.",
         "phases": ["tactical"],
