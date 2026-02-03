@@ -218,6 +218,7 @@ class LLMConfig:
     """LLM configuration."""
 
     model: str = "gpt-4o"
+    provider: Optional[str] = None  # "openai", "anthropic", "google" (auto-detect if None)
     temperature: float = 0.0
     reasoning_level: str = "high"
     base_url: Optional[str] = None
@@ -674,23 +675,69 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     return merged
 
 
+def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str:
+    """Detect LLM provider from model name or explicit setting.
+
+    Args:
+        model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o")
+        explicit_provider: Explicit provider override ("openai", "anthropic", "google")
+
+    Returns:
+        Provider name: "openai", "anthropic", or "google"
+    """
+    if explicit_provider:
+        return explicit_provider.lower()
+
+    model_lower = model.lower()
+    if model_lower.startswith("claude"):
+        return "anthropic"
+    if model_lower.startswith("gemini"):
+        return "google"
+    # Default to openai (covers gpt-*, openai/*, local models)
+    return "openai"
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
 ) -> BaseChatModel:
     """Create an LLM instance from configuration.
 
+    Supports multiple providers:
+    - OpenAI (and OpenAI-compatible APIs like vLLM, Ollama)
+    - Anthropic (Claude models)
+    - Google (Gemini models)
+
+    Provider is auto-detected from model name or can be explicitly set via config.provider.
+
     Args:
         config: LLM configuration
         limits: Optional limits configuration for context token limit.
-                When provided, enables HTTP-layer context overflow protection.
 
     Returns:
-        Configured ChatOpenAI instance
+        Configured LLM instance (ChatOpenAI, ChatAnthropic, or ChatGoogleGenerativeAI)
+    """
+    provider = _detect_provider(config.model, config.provider)
 
-    Note:
-        Uses OpenAI-compatible API. The base_url can point to
-        any OpenAI-compatible endpoint (local LLM server, etc.)
+    if provider == "anthropic":
+        return _create_anthropic_llm(config, limits)
+    elif provider == "google":
+        return _create_google_llm(config, limits)
+    else:
+        return _create_openai_llm(config, limits)
+
+
+def _create_openai_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create OpenAI-compatible LLM.
+
+    Uses ReasoningChatOpenAI which provides:
+    - reasoning_content capture for DeepSeek-style models
+    - HTTP-layer context overflow protection
+
+    The base_url can point to any OpenAI-compatible endpoint (vLLM, Ollama, etc.)
     """
     # Get API key from config or environment
     api_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
@@ -734,9 +781,94 @@ def create_llm(
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     logger.info(
-        f"Created LLM: model={config.model}, temp={config.temperature}, "
+        f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
         f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}"
+    )
+
+    return llm
+
+
+def _create_anthropic_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create Anthropic Claude LLM.
+
+    Requires ANTHROPIC_API_KEY environment variable or config.api_key.
+    """
+    # Lazy import to avoid requiring the package when not used
+    from langchain_anthropic import ChatAnthropic
+
+    api_key = config.api_key or os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "ANTHROPIC_API_KEY environment variable required for Anthropic provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+
+    llm_kwargs = {
+        "model": config.model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "max_retries": config.max_retries,
+    }
+
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+
+    # Anthropic requires max_tokens - set a reasonable default
+    # Use limits if available, otherwise default to 4096
+    if limits and limits.model_max_context_tokens:
+        # Reserve reasonable space for output (up to 8192 tokens)
+        llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
+    else:
+        llm_kwargs["max_tokens"] = 4096
+
+    llm = ChatAnthropic(**llm_kwargs)
+
+    logger.info(
+        f"Created Anthropic LLM: model={config.model}, temp={config.temperature}, "
+        f"timeout={config.timeout}s, max_retries={config.max_retries}, "
+        f"max_tokens={llm_kwargs['max_tokens']}"
+    )
+
+    return llm
+
+
+def _create_google_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create Google Gemini LLM.
+
+    Requires GOOGLE_API_KEY environment variable or config.api_key.
+    """
+    # Lazy import to avoid requiring the package when not used
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    api_key = config.api_key or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "GOOGLE_API_KEY environment variable required for Google provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+
+    llm_kwargs = {
+        "model": config.model,
+        "temperature": config.temperature,
+        "google_api_key": api_key,
+    }
+
+    # Google's timeout parameter name differs
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+
+    llm = ChatGoogleGenerativeAI(**llm_kwargs)
+
+    logger.info(
+        f"Created Google LLM: model={config.model}, temp={config.temperature}, "
+        f"timeout={config.timeout}s"
     )
 
     return llm

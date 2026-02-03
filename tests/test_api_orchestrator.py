@@ -78,7 +78,7 @@ class TestJobStartEndpoint:
             "/job/start",
             json={
                 "job_id": "test-job-123",
-                "prompt": "Test task",
+                "description": "Test task",
             },
         )
 
@@ -99,7 +99,7 @@ class TestJobStartEndpoint:
             "/job/start",
             json={
                 "job_id": "new-job-789",
-                "prompt": "Another task",
+                "description": "Another task",
             },
         )
 

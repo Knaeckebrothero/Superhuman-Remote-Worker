@@ -33,7 +33,13 @@
         "model": {
           "type": "string",
           "description": "Model identifier",
-          "examples": ["gpt-oss-120b", "gpt-4o", "claude-3-opus"]
+          "examples": ["gpt-oss-120b", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"]
+        },
+        "provider": {
+          "type": ["string", "null"],
+          "enum": ["openai", "anthropic", "google", null],
+          "default": null,
+          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai)"
         },
         "temperature": {
           "type": "number",
