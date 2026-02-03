@@ -36,19 +36,19 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         }
 
         <form (ngSubmit)="onSubmit()" #jobForm="ngForm">
-          <!-- Prompt Field (Required) -->
+          <!-- Description Field (Required) -->
           <div class="form-group">
-            <label for="prompt" class="form-label">
-              Prompt <span class="required">*</span>
+            <label for="description" class="form-label">
+              Description <span class="required">*</span>
             </label>
             <textarea
-              id="prompt"
-              name="prompt"
+              id="description"
+              name="description"
               class="form-textarea"
-              [(ngModel)]="formData.prompt"
+              [(ngModel)]="formData.description"
               required
               rows="6"
-              placeholder="Enter the task prompt for the agent..."
+              placeholder="Describe what the agent should accomplish..."
               [disabled]="isSubmitting()"
             ></textarea>
             <span class="field-hint">Describe what you want the agent to do</span>
@@ -213,7 +213,7 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
             <button
               type="submit"
               class="btn btn-primary"
-              [disabled]="!formData.prompt || isSubmitting() || isUploading()"
+              [disabled]="!formData.description || isSubmitting() || isUploading()"
             >
               @if (isSubmitting()) {
                 <span class="spinner-small"></span>
@@ -771,7 +771,7 @@ export class JobCreateComponent {
   private instructionsUploadId: string | null = null;
 
   formData: JobCreateRequest = {
-    prompt: '',
+    description: '',
   };
 
   // ===== File Upload Methods =====
@@ -906,7 +906,7 @@ export class JobCreateComponent {
   // ===== Form Submission =====
 
   async onSubmit(): Promise<void> {
-    if (!this.formData.prompt || this.isSubmitting() || this.isUploading()) {
+    if (!this.formData.description || this.isSubmitting() || this.isUploading()) {
       return;
     }
 
@@ -941,7 +941,7 @@ export class JobCreateComponent {
     this.isSubmitting.set(true);
 
     const request: JobCreateRequest = {
-      prompt: this.formData.prompt,
+      description: this.formData.description,
     };
 
     if (this.uploadId) {
@@ -1090,7 +1090,7 @@ export class JobCreateComponent {
 
   resetForm(): void {
     this.formData = {
-      prompt: '',
+      description: '',
     };
     this.filePreviews.set([]);
     this.uploadId = null;

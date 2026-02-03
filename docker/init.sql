@@ -33,7 +33,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_details JSONB,
     total_tokens_used INTEGER DEFAULT 0,
     total_requests INTEGER DEFAULT 0,
-    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled')),
+    config_name VARCHAR(100) DEFAULT 'default',
+    config_override JSONB DEFAULT NULL,
+    assigned_agent_id UUID,
+    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
 );
@@ -41,6 +44,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_creator_status ON jobs(creator_status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_config_name ON jobs(config_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_assigned_agent ON jobs(assigned_agent_id);
 
 -- ============================================================================
 -- 2. REQUIREMENT_CACHE TABLE
@@ -187,6 +192,8 @@ SELECT
     j.status,
     j.creator_status,
     j.validator_status,
+    j.config_name,
+    j.assigned_agent_id,
     j.description,
     j.created_at,
     j.updated_at,

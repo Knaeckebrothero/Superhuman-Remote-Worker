@@ -82,8 +82,8 @@ type StatusFilter = 'all' | JobStatus;
                     </span>
                   </td>
                   <td class="prompt-cell">
-                    <span class="prompt-text" [title]="job.prompt">
-                      {{ truncatePrompt(job.prompt) }}
+                    <span class="prompt-text" [title]="job.description">
+                      {{ truncatePrompt(job.description) }}
                     </span>
                     <span class="job-id">{{ job.id.slice(0, 8) }}...</span>
                   </td>

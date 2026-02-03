@@ -81,7 +81,7 @@ function createMockDailyStats(days: number = 7): DailyStatistics[] {
 function createMockStuckJob(overrides: Partial<StuckJob> = {}): StuckJob {
   return {
     id: `job_${Math.random().toString(36).slice(2)}`,
-    prompt: 'Test stuck job',
+    description: 'Test stuck job',
     status: 'processing',
     stuck_component: 'creator',
     stuck_reason: 'No heartbeat for 60 minutes',
@@ -244,11 +244,11 @@ describe('StatisticsComponent utilities', () => {
       expect(validatorStuck.stuck_component).toBe('validator');
     });
 
-    it('should have ID and prompt', () => {
-      const stuckJob = createMockStuckJob({ id: 'test-123', prompt: 'Test prompt' });
+    it('should have ID and description', () => {
+      const stuckJob = createMockStuckJob({ id: 'test-123', description: 'Test description' });
 
       expect(stuckJob.id).toBe('test-123');
-      expect(stuckJob.prompt).toBe('Test prompt');
+      expect(stuckJob.description).toBe('Test description');
     });
   });
 
