@@ -138,6 +138,7 @@ async def init_all(
             total_steps += 1
         if not skip_mongodb:
             total_steps += 1
+        total_steps += 1  # Uploads step
     if not only_orchestrator:
         total_steps += 1
     total_steps += 1  # Verification step
@@ -177,6 +178,22 @@ async def init_all(
         logger.info(f"[{step}/{total_steps}] Initializing workspace...")
         if not init_workspace():
             logger.warning("  Workspace initialization had issues")
+        logger.info("")
+
+    # Initialize uploads directory
+    if not only_agent:
+        from orchestrator.init import init_uploads, cleanup_uploads
+
+        step += 1
+        if force_reset:
+            logger.info(f"[{step}/{total_steps}] Cleaning uploads...")
+            cleanup_uploads()
+            logger.info("")
+            step += 1
+            total_steps += 1
+
+        logger.info(f"[{step}/{total_steps}] Initializing uploads...")
+        init_uploads()
         logger.info("")
 
     # Verification
@@ -227,6 +244,15 @@ async def verify_all(
         else:
             logger.warning("  Workspace: not initialized")
 
+    if not skip_orchestrator:
+        from orchestrator.init import verify_uploads
+
+        uploads_result = verify_uploads()
+        if uploads_result.get("exists"):
+            logger.info(f"  Uploads: {uploads_result['upload_count']} uploads, {uploads_result['total_files']} files")
+        else:
+            logger.info("  Uploads: not initialized")
+
 
 # =============================================================================
 # Backup/Restore Functions
@@ -258,7 +284,7 @@ def create_backup(name: str | None = None) -> bool:
     }
 
     # 1. Backup PostgreSQL
-    logger.info("[1/3] Backing up PostgreSQL...")
+    logger.info("[1/4] Backing up PostgreSQL...")
     postgres_file = backup_dir / "postgres.dump"
     if backup_postgres(postgres_file):
         backup_info["components"]["postgres"] = {"file": "postgres.dump", "success": True}
@@ -268,7 +294,7 @@ def create_backup(name: str | None = None) -> bool:
     logger.info("")
 
     # 2. Backup MongoDB
-    logger.info("[2/3] Backing up MongoDB...")
+    logger.info("[2/4] Backing up MongoDB...")
     mongodb_dir = backup_dir / "mongodb"
     mongodb_dir.mkdir(exist_ok=True)
     if backup_mongodb(mongodb_dir):
@@ -278,7 +304,7 @@ def create_backup(name: str | None = None) -> bool:
     logger.info("")
 
     # 3. Backup workspace
-    logger.info("[3/3] Backing up workspace...")
+    logger.info("[3/4] Backing up workspace...")
     if backup_workspace(backup_dir):
         from src.init import verify_workspace
         ws = verify_workspace()
@@ -290,6 +316,20 @@ def create_backup(name: str | None = None) -> bool:
         }
     else:
         backup_info["components"]["workspace"] = {"success": False}
+    logger.info("")
+
+    # 4. Backup uploads
+    logger.info("[4/4] Backing up uploads...")
+    from orchestrator.init import backup_uploads, verify_uploads
+    if backup_uploads(backup_dir):
+        uploads_info = verify_uploads()
+        backup_info["components"]["uploads"] = {
+            "directory": "uploads",
+            "success": True,
+            "count": uploads_info.get("upload_count", 0),
+        }
+    else:
+        backup_info["components"]["uploads"] = {"success": False}
     logger.info("")
 
     # Write backup info
@@ -335,7 +375,7 @@ def restore_backup(backup_path: str) -> bool:
     success = True
 
     # 1. Restore PostgreSQL
-    logger.info("[1/3] Restoring PostgreSQL...")
+    logger.info("[1/4] Restoring PostgreSQL...")
     postgres_file = backup_dir / "postgres.dump"
     if postgres_file.exists():
         if not restore_postgres(postgres_file):
@@ -345,7 +385,7 @@ def restore_backup(backup_path: str) -> bool:
     logger.info("")
 
     # 2. Restore MongoDB
-    logger.info("[2/3] Restoring MongoDB...")
+    logger.info("[2/4] Restoring MongoDB...")
     mongodb_dir = backup_dir / "mongodb"
     if mongodb_dir.exists() and any(mongodb_dir.iterdir()):
         if not restore_mongodb(mongodb_dir):
@@ -355,9 +395,16 @@ def restore_backup(backup_path: str) -> bool:
     logger.info("")
 
     # 3. Restore workspace
-    logger.info("[3/3] Restoring workspace...")
+    logger.info("[3/4] Restoring workspace...")
     if not restore_workspace(backup_dir):
         logger.warning("  Workspace restore had issues")
+    logger.info("")
+
+    # 4. Restore uploads
+    logger.info("[4/4] Restoring uploads...")
+    from orchestrator.init import restore_uploads
+    if not restore_uploads(backup_dir):
+        logger.warning("  Uploads restore had issues")
     logger.info("")
 
     return success

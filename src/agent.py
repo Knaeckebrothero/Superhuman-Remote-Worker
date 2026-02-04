@@ -15,6 +15,7 @@ Key Features:
 import logging
 import os
 import shutil
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -481,30 +482,59 @@ class UniversalAgent:
             config_upload_id = metadata["config_upload_id"]
             from .core.workspace import get_workspace_base_path
             from .core.loader import load_uploaded_config, load_agent_config_from_dict
+            import tempfile
 
-            config_uploads_dir = get_workspace_base_path() / "uploads" / config_upload_id
+            config_loaded = False
 
-            if config_uploads_dir.exists():
-                # Find the YAML file
-                yaml_files = list(config_uploads_dir.glob("*.yaml")) + list(
-                    config_uploads_dir.glob("*.yml")
+            # Try HTTP download first
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                downloaded_files = await self._download_upload_files(
+                    config_upload_id, temp_path, logger
                 )
-                if yaml_files:
-                    uploaded_config_path = yaml_files[0]
-                    logger.info(f"Loading uploaded config: {uploaded_config_path.name}")
 
-                    # Load and merge with defaults
-                    merged_config_data = load_uploaded_config(uploaded_config_path)
-
-                    # Create new config object (replaces self.config for this job)
-                    self.config = load_agent_config_from_dict(merged_config_data)
-                    logger.info("Applied uploaded config overrides")
-                else:
-                    logger.warning(
-                        f"No YAML files found in config upload: {config_upload_id}"
+                if downloaded_files:
+                    # Find the YAML file from downloaded files
+                    yaml_files = list(temp_path.glob("*.yaml")) + list(
+                        temp_path.glob("*.yml")
                     )
-            else:
-                logger.warning(f"Config upload directory not found: {config_uploads_dir}")
+                    if yaml_files:
+                        uploaded_config_path = yaml_files[0]
+                        logger.info(f"Loading uploaded config (HTTP): {uploaded_config_path.name}")
+
+                        # Load and merge with defaults
+                        merged_config_data = load_uploaded_config(uploaded_config_path)
+
+                        # Create new config object (replaces self.config for this job)
+                        self.config = load_agent_config_from_dict(merged_config_data)
+                        logger.info("Applied uploaded config overrides")
+                        config_loaded = True
+
+            # Fall back to local filesystem
+            if not config_loaded:
+                config_uploads_dir = get_workspace_base_path() / "uploads" / config_upload_id
+
+                if config_uploads_dir.exists():
+                    # Find the YAML file
+                    yaml_files = list(config_uploads_dir.glob("*.yaml")) + list(
+                        config_uploads_dir.glob("*.yml")
+                    )
+                    if yaml_files:
+                        uploaded_config_path = yaml_files[0]
+                        logger.info(f"Loading uploaded config (local): {uploaded_config_path.name}")
+
+                        # Load and merge with defaults
+                        merged_config_data = load_uploaded_config(uploaded_config_path)
+
+                        # Create new config object (replaces self.config for this job)
+                        self.config = load_agent_config_from_dict(merged_config_data)
+                        logger.info("Applied uploaded config overrides")
+                    else:
+                        logger.warning(
+                            f"No YAML files found in config upload: {config_upload_id}"
+                        )
+                else:
+                    logger.warning(f"Config upload directory not found: {config_uploads_dir}")
 
         # Create workspace manager
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
@@ -540,29 +570,52 @@ class UniversalAgent:
             # Use uploaded instructions
             instr_upload_id = metadata["instructions_upload_id"]
             from .core.workspace import get_workspace_base_path
-
-            instr_uploads_dir = get_workspace_base_path() / "uploads" / instr_upload_id
+            import tempfile
 
             instructions_written = False
-            if instr_uploads_dir.exists():
-                # Find the instructions file (.md or .txt)
-                instr_files = list(instr_uploads_dir.glob("*.md")) + list(
-                    instr_uploads_dir.glob("*.txt")
+
+            # Try HTTP download first
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                downloaded_files = await self._download_upload_files(
+                    instr_upload_id, temp_path, logger
                 )
-                if instr_files:
-                    uploaded_instr_path = instr_files[0]
-                    content = uploaded_instr_path.read_text(encoding="utf-8")
-                    self._workspace_manager.write_file("instructions.md", content)
-                    logger.info(f"Copied uploaded instructions: {uploaded_instr_path.name}")
-                    instructions_written = True
+
+                if downloaded_files:
+                    # Find the instructions file from downloaded files
+                    instr_files = list(temp_path.glob("*.md")) + list(
+                        temp_path.glob("*.txt")
+                    )
+                    if instr_files:
+                        uploaded_instr_path = instr_files[0]
+                        content = uploaded_instr_path.read_text(encoding="utf-8")
+                        self._workspace_manager.write_file("instructions.md", content)
+                        logger.info(f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}")
+                        instructions_written = True
+
+            # Fall back to local filesystem
+            if not instructions_written:
+                instr_uploads_dir = get_workspace_base_path() / "uploads" / instr_upload_id
+
+                if instr_uploads_dir.exists():
+                    # Find the instructions file (.md or .txt)
+                    instr_files = list(instr_uploads_dir.glob("*.md")) + list(
+                        instr_uploads_dir.glob("*.txt")
+                    )
+                    if instr_files:
+                        uploaded_instr_path = instr_files[0]
+                        content = uploaded_instr_path.read_text(encoding="utf-8")
+                        self._workspace_manager.write_file("instructions.md", content)
+                        logger.info(f"Copied uploaded instructions (local): {uploaded_instr_path.name}")
+                        instructions_written = True
+                    else:
+                        logger.warning(
+                            f"No .md/.txt files found in instructions upload: {instr_upload_id}"
+                        )
                 else:
                     logger.warning(
-                        f"No .md/.txt files found in instructions upload: {instr_upload_id}"
+                        f"Instructions upload directory not found: {instr_uploads_dir}"
                     )
-            else:
-                logger.warning(
-                    f"Instructions upload directory not found: {instr_uploads_dir}"
-                )
 
             # Fall back to template if upload failed
             if not instructions_written:
@@ -597,54 +650,114 @@ class UniversalAgent:
         # Handle upload_id (files uploaded via orchestrator UI)
         if metadata.get("upload_id"):
             upload_id = metadata["upload_id"]
-            # Use get_workspace_base_path() to find uploads in the shared workspace
             from .core.workspace import get_workspace_base_path
-            uploads_dir = get_workspace_base_path() / "uploads" / upload_id
+            import tempfile
 
-            if uploads_dir.exists():
-                copied_paths = []
-                original_paths = []
-                for file_path in sorted(uploads_dir.iterdir()):
+            copied_paths = []
+            original_paths = []
+
+            # Ensure documents directory exists
+            documents_dir = self._workspace_manager.get_path("documents")
+            documents_dir.mkdir(parents=True, exist_ok=True)
+
+            upload_source_dir = None
+
+            # Try HTTP download first
+            temp_dir_obj = tempfile.TemporaryDirectory()
+            temp_path = Path(temp_dir_obj.name)
+            downloaded_files = await self._download_upload_files(
+                upload_id, temp_path, logger
+            )
+
+            if downloaded_files:
+                upload_source_dir = temp_path
+                logger.info(f"Processing documents from HTTP download: {upload_id}")
+            else:
+                # Fall back to local filesystem
+                local_uploads_dir = get_workspace_base_path() / "uploads" / upload_id
+                if local_uploads_dir.exists():
+                    upload_source_dir = local_uploads_dir
+                    logger.info(f"Processing documents from local path: {local_uploads_dir}")
+                else:
+                    logger.warning(f"Upload directory not found locally or via HTTP: {upload_id}")
+
+            if upload_source_dir:
+                for file_path in sorted(upload_source_dir.iterdir()):
                     # Skip metadata.json
                     if file_path.name == "metadata.json":
                         continue
                     if file_path.is_file():
-                        dest_relative = f"documents/{file_path.name}"
-                        dest_path = self._workspace_manager.get_path(dest_relative)
-                        dest_path.parent.mkdir(parents=True, exist_ok=True)
+                        # Check if zip - extract instead of copy
+                        if file_path.suffix.lower() == '.zip':
+                            extracted = self._extract_zip(
+                                file_path, documents_dir, logger
+                            )
+                            copied_paths.extend(extracted)
+                            original_paths.extend([str(file_path)] * len(extracted))
+                            logger.info(f"Processed zip file: {file_path.name} ({len(extracted)} files extracted)")
+                        else:
+                            # Regular file - copy with conflict handling
+                            dest_path = documents_dir / file_path.name
+                            counter = 1
+                            stem = Path(file_path.name).stem
+                            suffix = Path(file_path.name).suffix
+                            while dest_path.exists():
+                                dest_path = documents_dir / f"{stem}_{counter}{suffix}"
+                                counter += 1
 
-                        shutil.copy2(file_path, dest_path)
-                        logger.info(f"Copied uploaded file to workspace: {dest_relative}")
+                            shutil.copy2(file_path, dest_path)
+                            dest_relative = f"documents/{dest_path.name}"
+                            logger.info(f"Copied uploaded file to workspace: {dest_relative}")
 
-                        copied_paths.append(dest_relative)
-                        original_paths.append(str(file_path))
+                            copied_paths.append(dest_relative)
+                            original_paths.append(str(file_path))
 
-                if copied_paths:
-                    updated_metadata["document_paths"] = copied_paths
-                    updated_metadata["original_document_paths"] = original_paths
-                    # For backwards compatibility, set document_path to first document
-                    updated_metadata["document_path"] = copied_paths[0]
-                    updated_metadata["original_document_path"] = original_paths[0]
-            else:
-                logger.warning(f"Upload directory not found: {uploads_dir}")
+            # Clean up temp directory
+            temp_dir_obj.cleanup()
+
+            if copied_paths:
+                updated_metadata["document_paths"] = copied_paths
+                updated_metadata["original_document_paths"] = original_paths
+                # For backwards compatibility, set document_path to first document
+                updated_metadata["document_path"] = copied_paths[0]
+                updated_metadata["original_document_path"] = original_paths[0]
 
         # Handle multiple documents (document_paths list)
         elif metadata.get("document_paths"):
             copied_paths = []
             original_paths = []
+
+            # Ensure documents directory exists
+            documents_dir = self._workspace_manager.get_path("documents")
+            documents_dir.mkdir(parents=True, exist_ok=True)
+
             for doc_path in metadata["document_paths"]:
                 source_path = Path(doc_path)
                 if source_path.exists():
-                    dest_filename = source_path.name
-                    dest_relative = f"documents/{dest_filename}"
-                    dest_path = self._workspace_manager.get_path(dest_relative)
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Check if zip - extract instead of copy
+                    if source_path.suffix.lower() == '.zip':
+                        extracted = self._extract_zip(
+                            source_path, documents_dir, logger
+                        )
+                        copied_paths.extend(extracted)
+                        original_paths.extend([str(source_path)] * len(extracted))
+                        logger.info(f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)")
+                    else:
+                        # Regular file - copy with conflict handling
+                        dest_path = documents_dir / source_path.name
+                        counter = 1
+                        stem = Path(source_path.name).stem
+                        suffix = Path(source_path.name).suffix
+                        while dest_path.exists():
+                            dest_path = documents_dir / f"{stem}_{counter}{suffix}"
+                            counter += 1
 
-                    shutil.copy2(source_path, dest_path)
-                    logger.info(f"Copied document to workspace: {dest_relative}")
+                        shutil.copy2(source_path, dest_path)
+                        dest_relative = f"documents/{dest_path.name}"
+                        logger.info(f"Copied document to workspace: {dest_relative}")
 
-                    copied_paths.append(dest_relative)
-                    original_paths.append(str(source_path))
+                        copied_paths.append(dest_relative)
+                        original_paths.append(str(source_path))
                 else:
                     logger.warning(f"Document not found: {source_path}")
 
@@ -659,18 +772,33 @@ class UniversalAgent:
         elif metadata.get("document_path"):
             source_path = Path(metadata["document_path"])
             if source_path.exists():
-                # Copy to documents/ folder in workspace
-                dest_filename = source_path.name
-                dest_relative = f"documents/{dest_filename}"
-                dest_path = self._workspace_manager.get_path(dest_relative)
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                # Ensure documents directory exists
+                documents_dir = self._workspace_manager.get_path("documents")
+                documents_dir.mkdir(parents=True, exist_ok=True)
 
-                shutil.copy2(source_path, dest_path)
-                logger.info(f"Copied document to workspace: {dest_relative}")
+                # Check if zip - extract instead of copy
+                if source_path.suffix.lower() == '.zip':
+                    extracted = self._extract_zip(
+                        source_path, documents_dir, logger
+                    )
+                    if extracted:
+                        updated_metadata["document_paths"] = extracted
+                        updated_metadata["original_document_paths"] = [str(source_path)] * len(extracted)
+                        updated_metadata["document_path"] = extracted[0]
+                        updated_metadata["original_document_path"] = str(source_path)
+                    logger.info(f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)")
+                else:
+                    # Regular file - copy to documents/ folder
+                    dest_filename = source_path.name
+                    dest_relative = f"documents/{dest_filename}"
+                    dest_path = self._workspace_manager.get_path(dest_relative)
 
-                # Update metadata to use workspace-relative path
-                updated_metadata["document_path"] = dest_relative
-                updated_metadata["original_document_path"] = str(source_path)
+                    shutil.copy2(source_path, dest_path)
+                    logger.info(f"Copied document to workspace: {dest_relative}")
+
+                    # Update metadata to use workspace-relative path
+                    updated_metadata["document_path"] = dest_relative
+                    updated_metadata["original_document_path"] = str(source_path)
             else:
                 logger.warning(f"Document not found: {source_path}")
 
@@ -852,6 +980,149 @@ class UniversalAgent:
             ])
 
         return "\n".join(lines)
+
+    def _extract_zip(
+        self,
+        zip_path: Path,
+        dest_dir: Path,
+        job_logger: logging.Logger,
+    ) -> List[str]:
+        """Extract zip file contents preserving directory structure.
+
+        Skips hidden files and macOS __MACOSX folders.
+
+        Args:
+            zip_path: Path to the zip file
+            dest_dir: Destination directory for extracted files
+            job_logger: Logger instance
+
+        Returns:
+            List of relative paths to extracted files (e.g., ["documents/subdir/file.pdf"])
+        """
+        extracted_paths = []
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                for zip_info in zf.infolist():
+                    # Skip directories (created implicitly)
+                    if zip_info.is_dir():
+                        continue
+
+                    # Get relative path within zip
+                    relative_path = Path(zip_info.filename)
+
+                    # Skip hidden files and macOS metadata
+                    if any(part.startswith('.') for part in relative_path.parts):
+                        continue
+                    if '__MACOSX' in zip_info.filename:
+                        continue
+
+                    # Skip empty filenames
+                    if not relative_path.name:
+                        continue
+
+                    # Preserve directory structure
+                    dest_path = dest_dir / relative_path
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # Extract file
+                    with zf.open(zip_info) as source:
+                        dest_path.write_bytes(source.read())
+
+                    # Return path relative to workspace
+                    rel_to_workspace = dest_path.relative_to(dest_dir.parent)
+                    extracted_paths.append(str(rel_to_workspace))
+                    job_logger.debug(f"Extracted: {zip_info.filename} -> {rel_to_workspace}")
+
+            job_logger.info(f"Extracted {len(extracted_paths)} files from {zip_path.name}")
+
+        except zipfile.BadZipFile as e:
+            job_logger.error(f"Invalid zip file {zip_path.name}: {e}")
+        except Exception as e:
+            job_logger.error(f"Failed to extract zip {zip_path.name}: {e}")
+
+        return extracted_paths
+
+    async def _download_upload_files(
+        self,
+        upload_id: str,
+        dest_dir: Path,
+        job_logger: logging.Logger,
+    ) -> Optional[List[str]]:
+        """Download files from orchestrator upload via HTTP.
+
+        Attempts to download files from the orchestrator API. If the orchestrator
+        is not configured or the download fails, returns None to signal that the
+        caller should fall back to local filesystem access.
+
+        Args:
+            upload_id: Upload identifier
+            dest_dir: Destination directory for downloaded files
+            job_logger: Logger instance
+
+        Returns:
+            List of downloaded filenames, or None if HTTP download failed/unavailable
+        """
+        # Use same default as orchestrator_client.py
+        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
+
+        # Import here to avoid circular imports
+        from .api.orchestrator_client import OrchestratorClient
+
+        # Create a temporary client for downloads (no registration needed)
+        client = OrchestratorClient(
+            orchestrator_url=orchestrator_url,
+            pod_ip="",  # Not needed for downloads
+            pod_port=0,
+            hostname="",
+            config_name="",
+        )
+
+        try:
+            await client.connect()
+
+            # Get upload info
+            upload_info = await client.get_upload_info(upload_id)
+            if not upload_info:
+                job_logger.info(
+                    f"Upload {upload_id} not found on orchestrator, will try local"
+                )
+                return None
+
+            # Ensure destination directory exists
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            downloaded_files = []
+            for file_info in upload_info.files:
+                # Skip metadata.json
+                if file_info.name == "metadata.json":
+                    continue
+
+                content = await client.download_file(upload_id, file_info.name)
+                if content is None:
+                    job_logger.warning(
+                        f"Failed to download {file_info.name} from {upload_id}, will try local"
+                    )
+                    return None
+
+                # Save file
+                dest_path = dest_dir / file_info.name
+                dest_path.write_bytes(content)
+                downloaded_files.append(file_info.name)
+                job_logger.debug(
+                    f"Downloaded via HTTP: {upload_id}/{file_info.name} ({len(content)} bytes)"
+                )
+
+            job_logger.info(
+                f"Downloaded {len(downloaded_files)} files from orchestrator for upload {upload_id}"
+            )
+            return downloaded_files
+
+        except Exception as e:
+            job_logger.warning(f"HTTP download failed for {upload_id}: {e}, will try local")
+            return None
+        finally:
+            await client.close()
 
     async def approve_frozen_job(self, job_id: str) -> Dict[str, Any]:
         """Approve a frozen job, marking it as truly completed.
