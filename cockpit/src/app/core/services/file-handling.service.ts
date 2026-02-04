@@ -13,7 +13,7 @@ export class FileHandlingService {
   private readonly MAX_FILE_SIZE_MB = 50;
 
   /** Maximum number of files per upload */
-  private readonly MAX_FILES = 10;
+  private readonly MAX_FILES = 100;
 
   /**
    * Validates file size against maximum limit.
@@ -134,6 +134,10 @@ export class FileHandlingService {
     ];
 
     if (documentTypes.includes(mimeType)) return FileType.DOCUMENT;
+
+    // Treat zip files as documents (they contain documents)
+    const archiveTypes = ['application/zip', 'application/x-zip-compressed'];
+    if (archiveTypes.includes(mimeType)) return FileType.DOCUMENT;
 
     return FileType.OTHER;
   }

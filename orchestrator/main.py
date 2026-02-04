@@ -881,7 +881,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
                 json=job_start.model_dump(exclude_none=True),
             )
 
-        if response.status_code != 200:
+        if response.status_code not in (200, 202):
             raise HTTPException(
                 status_code=502,
                 detail=f"Agent rejected job: {response.text}",

@@ -10,7 +10,10 @@ import { Job, JobStatus } from '../../core/models/api.model';
  */
 
 // Extract utility functions from component for testing
-function truncatePrompt(prompt: string, maxLength: number = 80): string {
+function truncatePrompt(prompt: string | undefined, maxLength: number = 80): string {
+  if (!prompt) {
+    return '';
+  }
   if (prompt.length <= maxLength) {
     return prompt;
   }

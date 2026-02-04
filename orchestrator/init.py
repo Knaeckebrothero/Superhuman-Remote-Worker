@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
@@ -566,6 +567,117 @@ def restore_mongodb(backup_dir: Path) -> bool:
         return True
     except FileNotFoundError:
         logger.error("  mongorestore not found. Is MongoDB tools installed?")
+        return False
+
+
+# =============================================================================
+# Uploads Directory Management
+# =============================================================================
+
+UPLOADS_DIR = Path("workspace/uploads")
+
+
+def get_uploads_path() -> Path:
+    """Get the uploads directory path."""
+    return UPLOADS_DIR
+
+
+def init_uploads() -> bool:
+    """Initialize uploads directory."""
+    uploads_path = get_uploads_path()
+    try:
+        uploads_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"  Uploads path: {uploads_path}")
+        return True
+    except Exception as e:
+        logger.error(f"  Failed to initialize uploads: {e}")
+        return False
+
+
+def cleanup_uploads() -> bool:
+    """Clean up all uploads."""
+    uploads_path = get_uploads_path()
+    if not uploads_path.exists():
+        return True
+
+    removed = 0
+    for item in uploads_path.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            removed += 1
+        except Exception as e:
+            logger.warning(f"  Failed to remove {item}: {e}")
+
+    logger.info(f"  Removed {removed} upload(s)")
+    return True
+
+
+def verify_uploads() -> dict:
+    """Verify uploads directory and return stats."""
+    uploads_path = get_uploads_path()
+    result = {
+        "path": str(uploads_path),
+        "exists": uploads_path.exists(),
+        "upload_count": 0,
+        "total_files": 0,
+        "total_size_bytes": 0,
+    }
+
+    if not uploads_path.exists():
+        return result
+
+    # Count uploads (directories with metadata.json)
+    for upload_dir in uploads_path.iterdir():
+        if upload_dir.is_dir() and (upload_dir / "metadata.json").exists():
+            result["upload_count"] += 1
+            for f in upload_dir.iterdir():
+                if f.is_file() and f.name != "metadata.json":
+                    result["total_files"] += 1
+                    result["total_size_bytes"] += f.stat().st_size
+
+    return result
+
+
+def backup_uploads(backup_dir: Path) -> bool:
+    """Backup uploads directory."""
+    uploads_path = get_uploads_path()
+    if not uploads_path.exists() or not any(uploads_path.iterdir()):
+        logger.info("  No uploads to backup")
+        return True
+
+    dest = backup_dir / "uploads"
+    try:
+        shutil.copytree(uploads_path, dest)
+        upload_count = len([d for d in dest.iterdir() if d.is_dir()])
+        logger.info(f"  Backed up {upload_count} upload(s)")
+        return True
+    except Exception as e:
+        logger.error(f"  Uploads backup failed: {e}")
+        return False
+
+
+def restore_uploads(backup_dir: Path) -> bool:
+    """Restore uploads from backup."""
+    src = backup_dir / "uploads"
+    if not src.exists():
+        logger.info("  No uploads backup found")
+        return True
+
+    uploads_path = get_uploads_path()
+    try:
+        # Clear existing
+        if uploads_path.exists():
+            shutil.rmtree(uploads_path)
+
+        shutil.copytree(src, uploads_path)
+        upload_count = len([d for d in uploads_path.iterdir() if d.is_dir()])
+        logger.info(f"  Restored {upload_count} upload(s)")
+        return True
+    except Exception as e:
+        logger.error(f"  Uploads restore failed: {e}")
         return False
 
 
