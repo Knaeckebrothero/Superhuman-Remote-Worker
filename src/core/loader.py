@@ -218,7 +218,7 @@ class LLMConfig:
     """LLM configuration."""
 
     model: str = "gpt-4o"
-    provider: Optional[str] = None  # "openai", "anthropic", "google" (auto-detect if None)
+    provider: Optional[str] = None  # "openai", "anthropic", "google", "groq" (auto-detect if None)
     temperature: float = 0.0
     reasoning_level: str = "high"
     base_url: Optional[str] = None
@@ -680,10 +680,14 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
 
     Args:
         model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o")
-        explicit_provider: Explicit provider override ("openai", "anthropic", "google")
+        explicit_provider: Explicit provider override ("openai", "anthropic", "google", "groq")
 
     Returns:
-        Provider name: "openai", "anthropic", or "google"
+        Provider name: "openai", "anthropic", "google", or "groq"
+
+    Note:
+        Groq requires explicit provider setting since it hosts open models
+        (Llama, Mixtral, etc.) that could also be served via other providers.
     """
     if explicit_provider:
         return explicit_provider.lower()
@@ -707,6 +711,7 @@ def create_llm(
     - OpenAI (and OpenAI-compatible APIs like vLLM, Ollama)
     - Anthropic (Claude models)
     - Google (Gemini models)
+    - Groq (fast inference for open models)
 
     Provider is auto-detected from model name or can be explicitly set via config.provider.
 
@@ -715,7 +720,7 @@ def create_llm(
         limits: Optional limits configuration for context token limit.
 
     Returns:
-        Configured LLM instance (ChatOpenAI, ChatAnthropic, or ChatGoogleGenerativeAI)
+        Configured LLM instance (ChatOpenAI, ChatAnthropic, ChatGoogleGenerativeAI, or ChatGroq)
     """
     provider = _detect_provider(config.model, config.provider)
 
@@ -723,6 +728,8 @@ def create_llm(
         return _create_anthropic_llm(config, limits)
     elif provider == "google":
         return _create_google_llm(config, limits)
+    elif provider == "groq":
+        return _create_groq_llm(config, limits)
     else:
         return _create_openai_llm(config, limits)
 
@@ -869,6 +876,49 @@ def _create_google_llm(
     logger.info(
         f"Created Google LLM: model={config.model}, temp={config.temperature}, "
         f"timeout={config.timeout}s"
+    )
+
+    return llm
+
+
+def _create_groq_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create Groq LLM for fast inference.
+
+    Requires GROQ_API_KEY environment variable or config.api_key.
+    Groq hosts open models (Llama, Mixtral, Gemma) with fast inference.
+    """
+    # Lazy import to avoid requiring the package when not used
+    from langchain_groq import ChatGroq
+
+    api_key = config.api_key or os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "GROQ_API_KEY environment variable required for Groq provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+
+    llm_kwargs = {
+        "model": config.model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "max_retries": config.max_retries,
+    }
+
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+
+    # Optional: custom base URL for Groq enterprise/proxy
+    if config.base_url:
+        llm_kwargs["groq_api_base"] = config.base_url
+
+    llm = ChatGroq(**llm_kwargs)
+
+    logger.info(
+        f"Created Groq LLM: model={config.model}, temp={config.temperature}, "
+        f"timeout={config.timeout}s, max_retries={config.max_retries}"
     )
 
     return llm
