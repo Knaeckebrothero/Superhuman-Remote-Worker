@@ -37,9 +37,9 @@
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", null],
+          "enum": ["openai", "anthropic", "google", "groq", null],
           "default": null,
-          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai)"
+          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai). Groq requires explicit setting."
         },
         "temperature": {
           "type": "number",
