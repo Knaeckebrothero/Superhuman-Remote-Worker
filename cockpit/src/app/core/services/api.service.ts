@@ -533,6 +533,34 @@ export class ApiService {
   }
 
   /**
+   * Resume a failed job from its checkpoint.
+   * @param jobId The job ID to resume
+   * @param feedback Optional feedback to inject before resuming
+   * @param agentId Optional agent ID override if original agent is offline
+   */
+  resumeJob(
+    jobId: string,
+    feedback?: string,
+    agentId?: string,
+  ): Observable<{ status: string; job_id: string; agent_id: string } | null> {
+    const body: { feedback?: string; agent_id?: string } = {};
+    if (feedback) body.feedback = feedback;
+    if (agentId) body.agent_id = agentId;
+
+    return this.http
+      .post<{ status: string; job_id: string; agent_id: string }>(
+        `${this.baseUrl}/jobs/${jobId}/resume`,
+        body,
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to resume job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
    * Assign a job to an agent.
    */
   assignJob(jobId: string, agentId: string): Observable<{ status: string; agent_id: string; job_id: string } | null> {

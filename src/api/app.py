@@ -562,16 +562,18 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         # Accept the resume request
         _current_job_id = request.job_id
 
-        # Build metadata for resume
-        metadata: Dict[str, Any] = {"resume": True}
-        if request.feedback:
-            metadata["feedback"] = request.feedback
+        # Capture feedback for closure
+        feedback = request.feedback
 
         # Start processing in background
         async def _resume_job():
             global _current_job_id
             try:
-                result = await _agent.process_job(request.job_id, metadata)
+                result = await _agent.process_job(
+                    request.job_id,
+                    resume=True,
+                    feedback=feedback,
+                )
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")

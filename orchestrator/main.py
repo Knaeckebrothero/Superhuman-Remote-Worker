@@ -420,6 +420,125 @@ async def cancel_job(job_id: str) -> dict[str, str]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+class JobResumeRequest(BaseModel):
+    """Request body for resuming a failed job."""
+
+    feedback: str | None = Field(None, description="Optional feedback to inject before resuming")
+    agent_id: str | None = Field(None, description="Override agent ID if original is offline")
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> dict[str, str]:
+    """Resume a failed job from its checkpoint.
+
+    This endpoint:
+    1. Validates the job exists and is in 'failed' status
+    2. Gets the assigned agent (or uses override agent_id from request)
+    3. Validates the agent is ready or completed (not offline/working)
+    4. Sends a resume request to the agent's pod
+    5. Updates job and agent status on success
+
+    Returns:
+        Status message indicating resume result
+    """
+    import httpx
+
+    if request is None:
+        request = JobResumeRequest()
+
+    try:
+        # Get job details
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        # Allow resuming jobs in any status except completed/cancelled
+        # This handles cases where agents disappear without marking jobs as failed
+        if job["status"] in ("completed", "cancelled"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job cannot be resumed (status: {job['status']}).",
+            )
+
+        # Determine which agent to use
+        agent_id = request.agent_id or job.get("assigned_agent_id")
+        agent = None
+
+        # Try to get the specified/assigned agent
+        if agent_id:
+            agent = await postgres_db.get_agent(agent_id)
+
+        # If no agent or agent is offline/unavailable, find a ready one
+        if not agent or agent["status"] in ("offline", "failed"):
+            ready_agents = await postgres_db.list_agents(status="ready", limit=1)
+            if not ready_agents:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No ready agents available to resume job.",
+                )
+            agent = ready_agents[0]
+            agent_id = agent["id"]
+            logger.info(f"Auto-selected agent {agent_id} for job resume")
+
+        if agent["status"] not in ("ready", "completed"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Agent is not ready (status: {agent['status']})",
+            )
+
+        if not agent.get("pod_ip"):
+            raise HTTPException(
+                status_code=400,
+                detail="Agent has no pod IP configured",
+            )
+
+        # Build resume request payload
+        resume_payload = {"job_id": job_id}
+        if request.feedback:
+            resume_payload["feedback"] = request.feedback
+
+        # Send request to agent pod
+        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                agent_url,
+                json=resume_payload,
+            )
+
+        if response.status_code not in (200, 202):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Agent rejected resume request: {response.text}",
+            )
+
+        # Update job status and assign to agent (if using override)
+        await postgres_db.update_job_status(
+            job_id=job_id,
+            status="processing",
+            assigned_agent_id=agent_id,
+        )
+
+        # Update agent status via heartbeat simulation
+        await postgres_db.heartbeat(
+            agent_id=agent_id,
+            status="working",
+            current_job_id=job_id,
+        )
+
+        return {"status": "resumed", "job_id": job_id, "agent_id": agent_id}
+
+    except HTTPException:
+        raise
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to connect to agent: {str(e)}. Agent may be offline.",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/jobs/{job_id}/requirements")
 async def get_job_requirements(
     job_id: str,
