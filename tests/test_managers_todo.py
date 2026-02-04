@@ -486,3 +486,140 @@ class TestTodoManagerLogging:
         assert "completed=1" in caplog.text
         assert "in_progress=1" in caplog.text
         assert "pending=0" in caplog.text
+
+
+class TestTodoManagerStatePersistence:
+    """Tests for export_state and restore_state methods."""
+
+    def test_export_state_empty(self, todo_manager):
+        """Test export_state with empty TodoManager."""
+        state = todo_manager.export_state()
+
+        assert state["todos"] == []
+        assert state["staged_todos"] == []
+        assert state["next_id"] == 1
+        assert state["staged_phase_name"] == ""
+
+    def test_export_state_with_todos(self, todo_manager):
+        """Test export_state captures all todo state."""
+        todo_manager.add("Task 1", priority="high")
+        todo_manager.add("Task 2")
+        todo_manager.complete("todo_1", notes=["Done"])
+
+        state = todo_manager.export_state()
+
+        assert len(state["todos"]) == 2
+        assert state["todos"][0]["id"] == "todo_1"
+        assert state["todos"][0]["status"] == "completed"
+        assert state["todos"][0]["priority"] == "high"
+        assert state["todos"][0]["notes"] == ["Done"]
+        assert state["todos"][1]["id"] == "todo_2"
+        assert state["todos"][1]["status"] == "pending"
+        assert state["next_id"] == 3
+
+    def test_export_state_with_staged_todos(self, todo_manager):
+        """Test export_state captures staged todos."""
+        # Stage some todos
+        todos = [
+            f"Task {i}: do something meaningful here" for i in range(1, 6)
+        ]
+        todo_manager.stage_tactical_todos(todos, "Test Phase")
+
+        state = todo_manager.export_state()
+
+        assert len(state["staged_todos"]) == 5
+        assert state["staged_phase_name"] == "Test Phase"
+
+    def test_restore_state_basic(self, todo_manager):
+        """Test restore_state restores todos correctly."""
+        state = {
+            "todos": [
+                {"id": "todo_1", "content": "Task 1", "status": "pending", "priority": "high", "notes": []},
+                {"id": "todo_2", "content": "Task 2", "status": "completed", "priority": "medium", "notes": ["Done"]},
+            ],
+            "staged_todos": [],
+            "next_id": 3,
+            "staged_phase_name": "",
+        }
+
+        todo_manager.restore_state(state)
+
+        todos = todo_manager.list_all()
+        assert len(todos) == 2
+        assert todos[0].id == "todo_1"
+        assert todos[0].content == "Task 1"
+        assert todos[0].priority == "high"
+        assert todos[1].id == "todo_2"
+        assert todos[1].status.value == "completed"
+        assert todos[1].notes == ["Done"]
+
+    def test_restore_state_with_staged_todos(self, todo_manager):
+        """Test restore_state restores staged todos."""
+        state = {
+            "todos": [],
+            "staged_todos": [
+                {"id": "todo_1", "content": "Staged Task 1", "status": "pending", "priority": "medium", "notes": []},
+            ],
+            "next_id": 5,
+            "staged_phase_name": "Restored Phase",
+        }
+
+        todo_manager.restore_state(state)
+
+        assert todo_manager.has_staged_todos()
+        assert todo_manager.get_staged_phase_name() == "Restored Phase"
+        assert todo_manager._next_id == 5
+
+    def test_restore_state_with_todo_next_id_key(self, todo_manager):
+        """Test restore_state handles todo_next_id key from checkpoint state."""
+        # Checkpoint state uses todo_next_id instead of next_id
+        state = {
+            "todos": [],
+            "staged_todos": [],
+            "todo_next_id": 10,  # Key used in UniversalAgentState
+        }
+
+        todo_manager.restore_state(state)
+
+        assert todo_manager._next_id == 10
+
+    def test_restore_state_handles_none_values(self, todo_manager):
+        """Test restore_state handles None/missing values gracefully."""
+        state = {
+            "todos": None,
+            "staged_todos": None,
+            "next_id": None,
+        }
+
+        todo_manager.restore_state(state)
+
+        assert todo_manager.list_all() == []
+        assert not todo_manager.has_staged_todos()
+        assert todo_manager._next_id == 1
+
+    def test_export_restore_roundtrip(self, todo_manager):
+        """Test that export/restore is a perfect roundtrip."""
+        # Set up state
+        todo_manager.add("Task 1", priority="high")
+        todo_manager.add("Task 2")
+        todo_manager.complete("todo_1", notes=["Completed"])
+        todo_manager.start("todo_2")
+
+        # Stage some todos
+        todos = [f"Staged task {i}: meaningful description" for i in range(1, 6)]
+        todo_manager.stage_tactical_todos(todos, "Next Phase")
+
+        # Export
+        state = todo_manager.export_state()
+
+        # Create a new manager and restore
+        from src.managers.todo import TodoManager
+        new_manager = TodoManager(todo_manager._workspace)
+        new_manager.restore_state(state)
+
+        # Verify
+        new_state = new_manager.export_state()
+        assert state["todos"] == new_state["todos"]
+        assert state["staged_todos"] == new_state["staged_todos"]
+        assert state["next_id"] == new_state["next_id"]
+        assert state["staged_phase_name"] == new_state["staged_phase_name"]

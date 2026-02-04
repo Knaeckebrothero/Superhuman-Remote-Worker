@@ -631,6 +631,9 @@ def on_strategic_phase_complete(
     todo_manager.apply_staged_todos()
     todo_count = len(todo_manager.list_all())
 
+    # Export todo state for checkpointing
+    todo_state = todo_manager.export_state()
+
     logger.info(
         f"[{job_id}] Transitioning to tactical phase: {phase_name} "
         f"({todo_count} todos)"
@@ -651,6 +654,9 @@ def on_strategic_phase_complete(
             "is_strategic_phase": False,
             "phase_number": phase_number + 1,
             "phase_complete": False,
+            "todos": todo_state["todos"],
+            "staged_todos": todo_state["staged_todos"],
+            "todo_next_id": todo_state["next_id"],
         },
     )
 
@@ -691,6 +697,9 @@ def on_tactical_phase_complete(
     todo_list = [todo.to_dict() for todo in strategic_todos]
     todo_manager.set_todos_from_list(todo_list)
 
+    # Export todo state for checkpointing
+    todo_state = todo_manager.export_state()
+
     logger.info(
         f"[{job_id}] Transitioning to strategic phase "
         f"({len(strategic_todos)} predefined todos)"
@@ -712,6 +721,9 @@ def on_tactical_phase_complete(
             "is_strategic_phase": True,
             "phase_number": phase_number + 1,
             "phase_complete": False,
+            "todos": todo_state["todos"],
+            "staged_todos": todo_state["staged_todos"],
+            "todo_next_id": todo_state["next_id"],
         },
     )
 

@@ -88,10 +88,10 @@ class TestRouteEntry:
         assert result == "init_workspace"
 
     def test_route_entry_initialized(self):
-        """Test that initialized state routes to execute (resume)."""
+        """Test that initialized state routes to restore_todo_state (resume)."""
         state = {"initialized": True}
         result = route_entry(state)
-        assert result == "execute"
+        assert result == "restore_todo_state"
 
     def test_route_entry_missing_key(self):
         """Test default behavior when key is missing."""
@@ -232,6 +232,11 @@ class TestCheckTodosNode:
         result = node(state)
 
         assert result.get("phase_complete") is False
+        # Should also export todo state for checkpointing
+        assert "todos" in result
+        assert "staged_todos" in result
+        assert "todo_next_id" in result
+        assert len(result["todos"]) == 2
 
     def test_todos_all_complete(self, managers, mock_config):
         """Test check when all todos are complete."""
@@ -244,6 +249,89 @@ class TestCheckTodosNode:
         result = node(state)
 
         assert result.get("phase_complete") is True
+        # Should also export todo state for checkpointing
+        assert "todos" in result
+        assert result["todos"][0]["status"] == "completed"
+
+
+class TestRestoreTodoStateNode:
+    """Tests for restore_todo_state node."""
+
+    def test_restores_from_checkpoint(self, managers):
+        """Test that restore_todo_state restores TodoManager from checkpoint."""
+        from src.graph import create_restore_todo_state_node
+
+        node = create_restore_todo_state_node(managers["todo"])
+
+        # State with todo data from checkpoint
+        state = {
+            "job_id": "test-123",
+            "is_strategic_phase": False,
+            "todos": [
+                {"id": "todo_1", "content": "Task 1", "status": "completed", "priority": "high", "notes": ["Done"]},
+                {"id": "todo_2", "content": "Task 2", "status": "pending", "priority": "medium", "notes": []},
+            ],
+            "staged_todos": [],
+            "todo_next_id": 3,
+        }
+
+        result = node(state)
+
+        # Node returns empty dict (no state changes needed)
+        assert result == {}
+
+        # But TodoManager should be restored
+        todos = managers["todo"].list_all()
+        assert len(todos) == 2
+        assert todos[0].id == "todo_1"
+        assert todos[0].status.value == "completed"
+        assert todos[1].id == "todo_2"
+        assert managers["todo"]._next_id == 3
+        # Phase state should also be restored
+        assert managers["todo"].is_strategic_phase is False
+
+    def test_handles_empty_checkpoint(self, managers):
+        """Test that restore_todo_state handles checkpoints without todo data."""
+        from src.graph import create_restore_todo_state_node
+
+        node = create_restore_todo_state_node(managers["todo"])
+
+        # Old checkpoint without todo fields
+        state = {
+            "job_id": "test-123",
+            "is_strategic_phase": True,
+            "todos": None,
+            "staged_todos": None,
+            "todo_next_id": None,
+        }
+
+        result = node(state)
+
+        # Node returns empty dict
+        assert result == {}
+        # TodoManager should remain in initial state
+        assert managers["todo"].list_all() == []
+
+    def test_restores_staged_todos(self, managers):
+        """Test that restore_todo_state restores staged todos."""
+        from src.graph import create_restore_todo_state_node
+
+        node = create_restore_todo_state_node(managers["todo"])
+
+        state = {
+            "job_id": "test-123",
+            "is_strategic_phase": True,
+            "todos": [],
+            "staged_todos": [
+                {"id": "todo_1", "content": "Staged Task 1", "status": "pending", "priority": "medium", "notes": []},
+            ],
+            "todo_next_id": 5,
+        }
+
+        node(state)
+
+        assert managers["todo"].has_staged_todos()
+        assert managers["todo"]._next_id == 5
 
 
 class TestArchivePhaseNode:

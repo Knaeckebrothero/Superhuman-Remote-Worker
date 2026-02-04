@@ -785,3 +785,50 @@ class TodoManager:
             f"Todo list cleared for re-planning."
         )
 
+    # =========================================================================
+    # State persistence methods (for checkpoint/resume)
+    # =========================================================================
+
+    def export_state(self) -> Dict[str, Any]:
+        """Export full TodoManager state for persistence in LangGraph checkpoints.
+
+        Returns:
+            Dictionary containing all state needed to restore the TodoManager:
+            - todos: List of todo dicts
+            - staged_todos: List of staged todo dicts
+            - next_id: Next todo ID counter
+            - staged_phase_name: Name of the staged phase
+        """
+        return {
+            "todos": [t.to_dict() for t in self._todos],
+            "staged_todos": [t.to_dict() for t in self._staged_todos],
+            "next_id": self._next_id,
+            "staged_phase_name": self._staged_phase_name,
+        }
+
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        """Restore TodoManager state from persisted checkpoint data.
+
+        Args:
+            state: Dictionary containing:
+                - todos: List of todo dicts (optional)
+                - staged_todos: List of staged todo dicts (optional)
+                - next_id or todo_next_id: Next todo ID counter (optional)
+                - staged_phase_name: Name of the staged phase (optional)
+        """
+        todos_data = state.get("todos") or []
+        self._todos = [TodoItem.from_dict(t) for t in todos_data]
+
+        staged_data = state.get("staged_todos") or []
+        self._staged_todos = [TodoItem.from_dict(t) for t in staged_data]
+
+        # Support both "next_id" (from export_state) and "todo_next_id" (from state)
+        self._next_id = state.get("next_id") or state.get("todo_next_id") or 1
+
+        self._staged_phase_name = state.get("staged_phase_name") or ""
+
+        logger.info(
+            f"Restored TodoManager: {len(self._todos)} todos, "
+            f"{len(self._staged_todos)} staged, next_id={self._next_id}"
+        )
+

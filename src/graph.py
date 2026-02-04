@@ -744,11 +744,24 @@ def create_check_todos_node(
         all_complete = todo_manager.all_complete()
         todo_manager.log_state()
 
+        # Export TodoManager state for checkpointing
+        todo_state = todo_manager.export_state()
+
         if all_complete:
             logger.info(f"[{job_id}] All todos complete")
-            return {"phase_complete": True}
+            return {
+                "phase_complete": True,
+                "todos": todo_state["todos"],
+                "staged_todos": todo_state["staged_todos"],
+                "todo_next_id": todo_state["next_id"],
+            }
 
-        return {"phase_complete": False}
+        return {
+            "phase_complete": False,
+            "todos": todo_state["todos"],
+            "staged_todos": todo_state["staged_todos"],
+            "todo_next_id": todo_state["next_id"],
+        }
 
     return check_todos
 
@@ -1194,15 +1207,61 @@ def route_after_check_todos(state: UniversalAgentState) -> Literal["execute", "a
     return "execute"
 
 
-def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "execute"]:
+def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "restore_todo_state"]:
     """Route at entry based on initialization state.
 
-    If already initialized (resume), go directly to execute.
+    If already initialized (resume), restore todo state then go to execute.
     Otherwise, start initialization flow.
     """
     if state.get("initialized", False):
-        return "execute"
+        return "restore_todo_state"
     return "init_workspace"
+
+
+def create_restore_todo_state_node(
+    todo_manager: TodoManager,
+) -> Callable[[UniversalAgentState], Dict[str, Any]]:
+    """Create node that restores TodoManager from checkpointed state.
+
+    This node is only executed on resume (when initialized=True).
+    It restores the TodoManager's internal state from the checkpoint
+    before continuing execution.
+
+    Args:
+        todo_manager: TodoManager instance to restore state into
+
+    Returns:
+        Node function that restores todo state
+    """
+
+    def restore_todo_state(state: UniversalAgentState) -> Dict[str, Any]:
+        """Restore TodoManager from checkpointed state."""
+        job_id = state.get("job_id", "unknown")
+
+        todos = state.get("todos")
+        staged_todos = state.get("staged_todos")
+        todo_next_id = state.get("todo_next_id")
+
+        # Check if we have todo state in the checkpoint
+        if todos is not None or staged_todos is not None:
+            todo_manager.restore_state({
+                "todos": todos,
+                "staged_todos": staged_todos,
+                "next_id": todo_next_id,
+            })
+            logger.info(f"[{job_id}] Restored TodoManager from checkpoint state")
+        else:
+            # No todo state in checkpoint - this is expected for old checkpoints
+            # The existing recovery logic in check_todos will handle this
+            logger.warning(f"[{job_id}] No todo state in checkpoint, using legacy recovery")
+
+        # Also restore phase state on TodoManager for tool access
+        is_strategic = state.get("is_strategic_phase", True)
+        todo_manager.is_strategic_phase = is_strategic
+
+        return {}
+
+    return restore_todo_state
 
 
 def create_route_after_transition(
@@ -1420,6 +1479,7 @@ def build_phase_alternation_graph(
     # Create nodes
     init_workspace = create_init_workspace_node(memory_manager, workspace_template, config)
     init_strategic_todos = create_init_strategic_todos_node(workspace, todo_manager, config)
+    restore_todo_state = create_restore_todo_state_node(todo_manager)
 
     execute = create_execute_node(
         llm_with_tools, todo_manager, memory_manager, workspace,
@@ -1446,6 +1506,7 @@ def build_phase_alternation_graph(
     # Add nodes to graph
     workflow.add_node("init_workspace", init_workspace)
     workflow.add_node("init_strategic_todos", init_strategic_todos)
+    workflow.add_node("restore_todo_state", restore_todo_state)
     workflow.add_node("execute", execute)
     workflow.add_node("tools", tool_node)
     workflow.add_node("check_todos", check_todos)
@@ -1460,13 +1521,16 @@ def build_phase_alternation_graph(
         route_entry,
         {
             "init_workspace": "init_workspace",
-            "execute": "execute",
+            "restore_todo_state": "restore_todo_state",
         },
     )
 
     # Wire initialization: init_workspace -> init_strategic_todos -> execute
     workflow.add_edge("init_workspace", "init_strategic_todos")
     workflow.add_edge("init_strategic_todos", "execute")
+
+    # Wire resume path: restore_todo_state -> execute
+    workflow.add_edge("restore_todo_state", "execute")
 
     # Wire ReAct loop
     workflow.add_conditional_edges(

@@ -110,6 +110,12 @@ class UniversalAgentState(TypedDict):
     # Contains: transition_type, trigger_summarization, metadata
     phase_transition: Optional[Dict[str, Any]]
 
+    # Todo persistence (for checkpoint/resume)
+    # These fields sync TodoManager state to LangGraph checkpoints
+    todos: Optional[List[Dict[str, Any]]]
+    staged_todos: Optional[List[Dict[str, Any]]]
+    todo_next_id: Optional[int]
+
 
 def create_initial_state(
     job_id: str,
@@ -176,4 +182,9 @@ def create_initial_state(
 
         # Legacy
         phase_transition=None,
+
+        # Todo persistence
+        todos=None,
+        staged_todos=None,
+        todo_next_id=1,
     )
