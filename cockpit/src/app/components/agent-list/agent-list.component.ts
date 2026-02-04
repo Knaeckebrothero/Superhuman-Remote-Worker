@@ -765,7 +765,10 @@ export class AgentListComponent implements OnInit, OnDestroy {
     return date.toLocaleDateString();
   }
 
-  truncatePrompt(prompt: string, maxLength: number = 60): string {
+  truncatePrompt(prompt: string | undefined, maxLength: number = 60): string {
+    if (!prompt) {
+      return '';
+    }
     if (prompt.length <= maxLength) {
       return prompt;
     }

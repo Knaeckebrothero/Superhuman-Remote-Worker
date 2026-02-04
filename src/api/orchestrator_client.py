@@ -10,8 +10,26 @@ import socket
 from typing import Any, Callable, Optional
 
 import httpx
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+
+class UploadedFileInfo(BaseModel):
+    """Metadata for a single uploaded file."""
+
+    name: str
+    size: int
+    mime_type: str
+
+
+class UploadInfo(BaseModel):
+    """Information about an upload."""
+
+    upload_id: str
+    upload_type: str
+    files: list[UploadedFileInfo]
+    created_at: str
 
 
 def get_agent_ip() -> str:
@@ -280,6 +298,87 @@ class OrchestratorClient:
     def stop_heartbeat(self) -> None:
         """Signal the heartbeat loop to stop."""
         self._stop_heartbeat.set()
+
+    async def get_upload_info(self, upload_id: str) -> Optional[UploadInfo]:
+        """Get information about an upload from the orchestrator.
+
+        Args:
+            upload_id: Upload identifier
+
+        Returns:
+            UploadInfo with file list and metadata, or None if not found/error
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/uploads/{upload_id}"
+
+        try:
+            response = await self._client.get(url)
+
+            if response.status_code == 200:
+                data = response.json()
+                return UploadInfo(**data)
+            elif response.status_code == 404:
+                logger.debug(f"Upload not found on orchestrator: {upload_id}")
+                return None
+            else:
+                logger.warning(
+                    f"Failed to get upload info: {response.status_code} - {response.text}"
+                )
+                return None
+
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to connect to orchestrator for upload info: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error getting upload info: {e}")
+            return None
+
+    async def download_file(self, upload_id: str, filename: str) -> Optional[bytes]:
+        """Download a file from an upload on the orchestrator.
+
+        Uses streaming to handle large files efficiently.
+
+        Args:
+            upload_id: Upload identifier
+            filename: Name of the file to download
+
+        Returns:
+            File contents as bytes, or None if not found/error
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/uploads/{upload_id}/files/{filename}"
+
+        try:
+            # Use streaming for large file support
+            async with self._client.stream("GET", url) as response:
+                if response.status_code == 200:
+                    chunks = []
+                    async for chunk in response.aiter_bytes():
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
+                    logger.debug(
+                        f"Downloaded {filename} from {upload_id} ({len(content)} bytes)"
+                    )
+                    return content
+                elif response.status_code == 404:
+                    logger.debug(f"File not found on orchestrator: {upload_id}/{filename}")
+                    return None
+                else:
+                    logger.warning(
+                        f"Failed to download file: {response.status_code}"
+                    )
+                    return None
+
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to connect to orchestrator for file download: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error downloading file: {e}")
+            return None
 
 
 def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:

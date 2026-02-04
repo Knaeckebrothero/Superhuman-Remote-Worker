@@ -40,7 +40,10 @@ function formatTimestamp(timestamp: string): string {
   return date.toLocaleDateString();
 }
 
-function truncatePrompt(prompt: string, maxLength: number = 60): string {
+function truncatePrompt(prompt: string | undefined, maxLength: number = 60): string {
+  if (!prompt) {
+    return '';
+  }
   if (prompt.length <= maxLength) {
     return prompt;
   }

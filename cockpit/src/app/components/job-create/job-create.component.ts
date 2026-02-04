@@ -120,7 +120,7 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
               #fileInput
               type="file"
               multiple
-              accept=".pdf,.doc,.docx,.txt,.md,.png,.jpg,.jpeg,.gif,.webp"
+              accept=".pdf,.doc,.docx,.txt,.md,.png,.jpg,.jpeg,.gif,.webp,.zip"
               (change)="onFilesSelected($event)"
               style="display: none"
             >
@@ -147,7 +147,11 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
                   class="single-file-upload"
                   [class.has-file]="configFile()"
                   [class.disabled]="isSubmitting()"
+                  [class.dragover]="isConfigDragOver()"
                   (click)="triggerConfigInput()"
+                  (dragover)="onConfigDragOver($event)"
+                  (dragleave)="onConfigDragLeave($event)"
+                  (drop)="onConfigDrop($event)"
                 >
                   @if (configFile()) {
                     <div class="file-chip">
@@ -176,7 +180,11 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
                   class="single-file-upload"
                   [class.has-file]="instructionsFile()"
                   [class.disabled]="isSubmitting()"
+                  [class.dragover]="isInstructionsDragOver()"
                   (click)="triggerInstructionsInput()"
+                  (dragover)="onInstructionsDragOver($event)"
+                  (dragleave)="onInstructionsDragLeave($event)"
+                  (drop)="onInstructionsDrop($event)"
                 >
                   @if (instructionsFile()) {
                     <div class="file-chip">
@@ -627,6 +635,11 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         background: rgba(203, 166, 247, 0.05);
       }
 
+      .single-file-upload.dragover {
+        border-color: var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.1);
+      }
+
       .single-file-upload.has-file {
         border-style: solid;
         justify-content: flex-start;
@@ -756,6 +769,8 @@ export class JobCreateComponent {
   readonly isSubmitting = signal(false);
   readonly isUploading = signal(false);
   readonly isDragOver = signal(false);
+  readonly isConfigDragOver = signal(false);
+  readonly isInstructionsDragOver = signal(false);
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
   readonly filePreviews = signal<FilePreview[]>([]);
@@ -901,6 +916,76 @@ export class JobCreateComponent {
     event.stopPropagation();
     this.instructionsFile.set(null);
     this.instructionsUploadId = null;
+  }
+
+  // ===== Config/Instructions Drag & Drop =====
+
+  onConfigDragOver(event: DragEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.isSubmitting()) {
+      this.isConfigDragOver.set(true);
+    }
+  }
+
+  onConfigDragLeave(event: DragEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isConfigDragOver.set(false);
+  }
+
+  async onConfigDrop(event: DragEvent): Promise<void> {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isConfigDragOver.set(false);
+
+    if (this.isSubmitting()) return;
+
+    const files = event.dataTransfer?.files;
+    if (files && files.length > 0) {
+      const file = files[0];
+      if (!file.name.toLowerCase().endsWith('.yaml') && !file.name.toLowerCase().endsWith('.yml')) {
+        this.errorMessage.set('Config must be a YAML file (.yaml or .yml)');
+        return;
+      }
+      const previews = await this.fileService.createFilePreviews([file]);
+      this.configFile.set(previews[0] || null);
+      this.configUploadId = null;
+    }
+  }
+
+  onInstructionsDragOver(event: DragEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!this.isSubmitting()) {
+      this.isInstructionsDragOver.set(true);
+    }
+  }
+
+  onInstructionsDragLeave(event: DragEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isInstructionsDragOver.set(false);
+  }
+
+  async onInstructionsDrop(event: DragEvent): Promise<void> {
+    event.preventDefault();
+    event.stopPropagation();
+    this.isInstructionsDragOver.set(false);
+
+    if (this.isSubmitting()) return;
+
+    const files = event.dataTransfer?.files;
+    if (files && files.length > 0) {
+      const file = files[0];
+      if (!file.name.toLowerCase().endsWith('.md') && !file.name.toLowerCase().endsWith('.txt')) {
+        this.errorMessage.set('Instructions must be a markdown or text file (.md or .txt)');
+        return;
+      }
+      const previews = await this.fileService.createFilePreviews([file]);
+      this.instructionsFile.set(previews[0] || null);
+      this.instructionsUploadId = null;
+    }
   }
 
   // ===== Form Submission =====

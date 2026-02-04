@@ -429,13 +429,13 @@ class PostgresDB:
             limit: Maximum number of jobs to return
 
         Returns:
-            List of job dicts with id, status, creator_status, validator_status, created_at
+            List of job dicts with id, description, status, creator_status, validator_status, created_at
         """
         async with self.acquire() as conn:
             if status:
                 rows = await conn.fetch(
                     """
-                    SELECT id, status, creator_status, validator_status,
+                    SELECT id, description, status, creator_status, validator_status,
                            config_name, assigned_agent_id, created_at
                     FROM jobs
                     WHERE status = $1
@@ -448,7 +448,7 @@ class PostgresDB:
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT id, status, creator_status, validator_status,
+                    SELECT id, description, status, creator_status, validator_status,
                            config_name, assigned_agent_id, created_at
                     FROM jobs
                     ORDER BY created_at DESC
@@ -478,7 +478,7 @@ class PostgresDB:
                 """
                 SELECT id, status, creator_status, validator_status,
                        config_name, config_override, assigned_agent_id,
-                       created_at, updated_at, description
+                       created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1
                 """,

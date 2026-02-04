@@ -40,7 +40,7 @@ UPLOADS_DIR = Path("workspace/uploads")
 
 # Limits
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB per file
-MAX_FILES_PER_UPLOAD = 10
+MAX_FILES_PER_UPLOAD = 100
 
 
 # =============================================================================
@@ -130,6 +130,8 @@ def _get_media_type(file_path: Path) -> str:
         ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         ".xls": "application/vnd.ms-excel",
         ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        # Archives
+        ".zip": "application/zip",
     }
     return extension_to_media_type.get(
         file_path.suffix.lower(), "application/octet-stream"
@@ -166,7 +168,7 @@ async def upload_files(
 
     Limits:
     - Maximum 50MB per file
-    - Maximum 10 files per upload (documents only)
+    - Maximum 100 files per upload (documents only)
     - Config and instructions must be exactly 1 file
 
     Args:

@@ -542,7 +542,10 @@ export class JobListComponent implements OnInit, OnDestroy {
     });
   }
 
-  truncatePrompt(prompt: string, maxLength: number = 80): string {
+  truncatePrompt(prompt: string | undefined, maxLength: number = 80): string {
+    if (!prompt) {
+      return '';
+    }
     if (prompt.length <= maxLength) {
       return prompt;
     }
