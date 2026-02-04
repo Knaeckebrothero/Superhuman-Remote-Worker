@@ -113,6 +113,15 @@ type StatusFilter = 'all' | JobStatus;
                         Cancel
                       </button>
                     }
+                    @if (job.status !== 'completed' && job.status !== 'cancelled') {
+                      <button
+                        class="action-btn resume"
+                        (click)="resumeJob(job.id); $event.stopPropagation()"
+                        title="Resume from checkpoint"
+                      >
+                        Resume
+                      </button>
+                    }
                     @if (job.status !== 'processing') {
                       <button
                         class="action-btn delete"
@@ -429,6 +438,11 @@ type StatusFilter = 'all' | JobStatus;
         border-color: #f38ba8;
       }
 
+      .action-btn.resume {
+        color: #a6e3a1;
+        border-color: #a6e3a1;
+      }
+
       .action-btn:hover {
         background: rgba(255, 255, 255, 0.1);
       }
@@ -524,6 +538,14 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   cancelJob(jobId: string): void {
     this.api.cancelJob(jobId).subscribe((result) => {
+      if (result) {
+        this.refresh();
+      }
+    });
+  }
+
+  resumeJob(jobId: string): void {
+    this.api.resumeJob(jobId).subscribe((result) => {
       if (result) {
         this.refresh();
       }
