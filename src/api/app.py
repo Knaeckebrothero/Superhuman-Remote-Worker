@@ -562,8 +562,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         # Accept the resume request
         _current_job_id = request.job_id
 
-        # Capture feedback for closure
+        # Capture for closure
         feedback = request.feedback
+        resume_config_name = request.config_name
 
         # Start processing in background
         async def _resume_job():
@@ -573,6 +574,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     request.job_id,
                     resume=True,
                     feedback=feedback,
+                    resume_config_name=resume_config_name,
                 )
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
             except asyncio.CancelledError:

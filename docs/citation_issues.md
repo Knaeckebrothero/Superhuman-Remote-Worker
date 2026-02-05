@@ -225,6 +225,40 @@ The key insight from the NeurIPS paper is that P-Cite methods achieve **twice th
 
 ---
 
+## Database Configuration
+
+The citation tool supports two database modes:
+
+| Mode | Database | Use Case |
+|------|----------|----------|
+| `basic` | SQLite | Single-agent, local development |
+| `multi-agent` | PostgreSQL | Production, shared database |
+
+**Shared Database with Orchestrator**: The citation tool can use the same PostgreSQL database as the orchestrator by setting `CITATION_DB_URL` to the same connection string:
+
+```bash
+# .env
+DATABASE_URL=postgresql://graphrag:graphrag_password@localhost:5432/graphrag
+CITATION_DB_URL=postgresql://graphrag:graphrag_password@localhost:5432/graphrag
+```
+
+**How it works**:
+- The orchestrator schema (`orchestrator/database/schema.sql`) already creates the `sources`, `citations`, and `schema_migrations` tables
+- The citation tool's `CREATE TABLE IF NOT EXISTS` statements become no-ops
+- Job isolation is automatic: `job_id` flows through `ToolContext` → `CitationContext` → INSERT
+- Cascading deletes: when a job is deleted, all its citations/sources are cleaned up
+
+**Schema differences** (orchestrator is stricter):
+- Orchestrator: `job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE`
+- Citation tool standalone: `job_id UUID` (nullable, no FK)
+
+This means citations are properly isolated per job and can be queried:
+```sql
+SELECT * FROM citations WHERE job_id = 'your-job-uuid';
+```
+
+---
+
 ## References
 
 1. [Generation-Time vs. Post-hoc Citation: A Holistic Evaluation of LLM Attribution](https://arxiv.org/html/2509.21557) - NeurIPS 2025
