@@ -10,7 +10,7 @@ import { FilePreview, FileType, UploadStatus } from '../models/file.model';
 })
 export class FileHandlingService {
   /** Maximum file size in MB */
-  private readonly MAX_FILE_SIZE_MB = 50;
+  private readonly MAX_FILE_SIZE_MB = 5120; // 5GB
 
   /** Maximum number of files per upload */
   private readonly MAX_FILES = 100;

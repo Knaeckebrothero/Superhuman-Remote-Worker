@@ -4,18 +4,24 @@
 todos:
   - id: 1
     content: >-
-      Explore the workspace and populate workspace.md with an overview
-      of the environment, available tools, and any existing context.
+      EXPLORE: Read instructions.md to understand the task. List available
+      tools in the tools/ directory. Check documents/ for input files.
+      Understand the scope before planning.
   - id: 2
     content: >-
-      Read the instructions.md file and create an execution plan in
-      plan.md. The plan should outline the phases needed to
-      complete the task.
+      PLAN: Create plan.md with phases to complete the task. For each phase,
+      estimate complexity: exploratory/complex (5-10 todos), moderate (10-15),
+      or simple/repetitive (15-20). Plans are living documents - they WILL
+      be adapted as you learn. Don't over-plan; focus on the first 2-3 phases.
   - id: 3
     content: >-
-      Divide the plan into phases, where each phase contains 5-20
-      concrete, actionable todos.
+      INITIALIZE workspace.md: Set up the Status section with current phase
+      and "Starting" progress. Add any Key Decisions made during planning
+      (with reasoning). Add Entities section only if you already identified
+      key entities. Keep it minimal - you'll update it after each phase.
   - id: 4
     content: >-
-      Create todos for the first tactical phase using the
-      next_phase_todos tool.
+      CREATE first phase todos using next_phase_todos. Start conservative:
+      prefer 5-10 todos for the first phase to calibrate effort. Include
+      a final todo to verify the phase goals were met. You can adjust
+      phase sizing in future strategic phases based on how this goes.

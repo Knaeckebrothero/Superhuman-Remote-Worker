@@ -134,7 +134,7 @@ Config structure:
 - `config/defaults.yaml` - Framework defaults (all configs extend this)
 - `config/schema.json` - JSON Schema for config validation
 - `config/prompts/` - System prompts (strategic.txt, tactical.txt, systemprompt.txt)
-- `config/templates/` - File templates (workspace_template.md, strategic_todos_*.yaml)
+- `config/templates/` - File templates (workspace_template.md, strategic_todos_*.yaml, phase_retrospective_template.md)
 - `config/my_agent.yaml` - Custom single-file config
 - `config/my_agent/config.yaml` - Custom directory config (with prompt overrides)
 
@@ -157,10 +157,11 @@ init_workspace → init_strategic_todos
                             back to execute                END
 ```
 
-**Strategic Phase** (planning mode):
-- Reviews instructions and creates plan
-- Updates workspace.md (long-term memory)
-- Creates todos for tactical execution via `next_phase_todos`
+**Strategic Phase** (review-reflect-adapt cycle):
+- **Review**: Uses git tools to see what actually changed, writes retrospective to `archive/`
+- **Reflect**: Rewrites workspace.md (compact, don't append) - removes redundancy with plan.md
+- **Adapt**: Updates plan.md with outcomes, adjusts phase sizing, adds intermediate phases if needed
+- **Plan**: Creates right-sized todos (5-10 complex, 10-15 moderate, 15-20 simple) via `next_phase_todos`
 - Has access to `job_complete` tool (tactical does not)
 
 **Tactical Phase** (execution mode):
@@ -221,7 +222,7 @@ Per-job directory: `workspace/job_<uuid>/`
 - `workspace.md` - Long-term memory (always in system prompt, persists across context compaction)
 - `plan.md` - Strategic plan
 - `todos.yaml` - Current task list (managed by TodoManager)
-- `archive/` - Phase artifacts and archived todos (`todos_phase_{n}.yaml`)
+- `archive/` - Phase artifacts: archived todos (`todos_phase_{n}.yaml`) and retrospectives (`phase_{n}_retrospective.md`)
 - `documents/` - Input documents
 - `tools/` - Auto-generated tool documentation (one `.md` file per tool)
 - `analysis/` - Validator working files (e.g., `requirement_input.md`)

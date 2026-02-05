@@ -19,15 +19,6 @@ logger = logging.getLogger(__name__)
 # Tool metadata for registry
 # Phase availability: domain tools are tactical-only
 DOCUMENT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "extract_document_text": {
-        "module": "document.processing",
-        "function": "extract_document_text",
-        "description": "Extract text content from PDF, DOCX, TXT, or HTML documents",
-        "category": "document",
-        "defer_to_workspace": True,
-        "short_description": "Extract text from PDF/DOCX/TXT/HTML documents.",
-        "phases": ["tactical"],
-    },
     "chunk_document": {
         "module": "document.processing",
         "function": "chunk_document",
@@ -284,60 +275,6 @@ def create_processing_tools(context: ToolContext) -> List[Any]:
         return path
 
     @tool
-    def extract_document_text(file_path: str) -> str:
-        """Extract text content from a document file.
-
-        Args:
-            file_path: Path to the document (PDF, DOCX, TXT, or HTML).
-                       Can be relative to workspace (e.g., "documents/file.pdf")
-                       or absolute.
-
-        Returns:
-            Extraction result with metadata and text preview
-        """
-        try:
-            resolved_path = resolve_path(file_path)
-            result = _load_document(resolved_path)
-
-            # Persist full text to workspace
-            full_text = result.get('text', '')
-            output_filename = f"extracted/{Path(file_path).stem}_full_text.txt"
-            if workspace is not None:
-                workspace.write_file(output_filename, full_text)
-                persist_msg = f"\nFull text written to: {output_filename}\nUse read_file(\"{output_filename}\") to access the content."
-            else:
-                persist_msg = "\nNote: No workspace available, full text not persisted."
-
-            # Auto-register document as citation source
-            source_msg = ""
-            try:
-                source_id = context.get_or_register_doc_source(
-                    resolved_path,
-                    name=Path(file_path).name
-                )
-                source_msg = f"\nCitation Source ID: {source_id}\nThis document is now registered as a citation source. Use cite_document() to create citations."
-            except ImportError:
-                source_msg = "\nNote: CitationEngine not available, document not registered as source."
-            except Exception as e:
-                logger.warning(f"Could not register document as citation source: {e}")
-                source_msg = f"\nNote: Could not register as citation source: {e}"
-
-            return f"""Document Extraction Complete
-
-File: {file_path}
-Page Count: {result.get('page_count', 'unknown')}
-Document Type: {result.get('document_type', 'unknown')}
-Total Characters: {result.get('char_count', 0)}
-{persist_msg}
-{source_msg}
-
-Use 'chunk_document' to split this into processable chunks."""
-
-        except Exception as e:
-            logger.error(f"Document extraction error: {e}")
-            return f"Error extracting document: {str(e)}"
-
-    @tool
     def chunk_document(
         file_path: str,
         strategy: str = "legal",
@@ -439,7 +376,6 @@ Chunk Statistics:
             return f"Error identifying candidates: {str(e)}"
 
     return [
-        extract_document_text,
         chunk_document,
         identify_requirement_candidates,
     ]

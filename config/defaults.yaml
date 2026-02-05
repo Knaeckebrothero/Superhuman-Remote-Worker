@@ -56,7 +56,6 @@ tools:
     - job_complete
   # Document tools - document processing (src/tools/document/)
   document:
-    - extract_document_text
     - chunk_document
     - identify_requirement_candidates
   # Research tools - web search (src/tools/research/)
