@@ -779,7 +779,6 @@ export class AgentActivityComponent {
     mark_complete: 'core',
     job_complete: 'core',
     // Document tools
-    extract_document_text: 'document',
     chunk_document: 'document',
     identify_requirement_candidates: 'document',
     // Research tools
