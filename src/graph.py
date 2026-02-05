@@ -275,7 +275,8 @@ def create_init_strategic_todos_node(
 
 
 def create_execute_node(
-    llm_with_tools: BaseChatModel,
+    strategic_llm_with_tools: BaseChatModel,
+    tactical_llm_with_tools: BaseChatModel,
     todo_manager: TodoManager,
     memory_manager: MemoryManager,
     workspace_manager: WorkspaceManager,
@@ -285,12 +286,14 @@ def create_execute_node(
     summarization_llm: BaseChatModel,
     summarization_prompt: str,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create the execute node.
+    """Create the execute node with phase-specific LLM selection.
 
     This is the main ReAct execution node that processes todos.
+    Selects strategic or tactical LLM based on current phase.
 
     Args:
-        llm_with_tools: LLM with tools bound for execution
+        strategic_llm_with_tools: LLM for strategic (planning) phases
+        tactical_llm_with_tools: LLM for tactical (execution) phases
         todo_manager: TodoManager for task tracking
         memory_manager: MemoryManager for workspace.md access
         workspace_manager: WorkspaceManager for file operations
@@ -306,6 +309,10 @@ def create_execute_node(
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
         messages = state.get("messages", [])
+        is_strategic = state.get("is_strategic_phase", True)
+
+        # Select LLM based on current phase
+        llm_with_tools = strategic_llm_with_tools if is_strategic else tactical_llm_with_tools
 
         logger.debug(f"[{job_id}] Execute iteration {iteration}")
 
@@ -323,7 +330,6 @@ def create_execute_node(
         todos_content = todo_manager.format_for_display()
 
         # Get phase-aware system prompt (workspace.md is now injected as fake tool call below)
-        is_strategic = state.get("is_strategic_phase", True)
         phase_number = state.get("phase_number", 0)
         full_system = get_phase_system_prompt(
             config=config,
@@ -331,9 +337,9 @@ def create_execute_node(
             phase_number=phase_number,
             todos_content=todos_content,
         )
+        phase_name = "strategic" if is_strategic else "tactical"
         logger.debug(
-            f"[{job_id}] Using {'strategic' if is_strategic else 'tactical'} "
-            f"prompt for phase {phase_number}"
+            f"[{job_id}] Using {phase_name} LLM and prompt for phase {phase_number}"
         )
         prepared_messages.append(SystemMessage(content=full_system))
 
@@ -1404,7 +1410,8 @@ def create_audited_tool_node(
 
 
 def build_phase_alternation_graph(
-    llm_with_tools: BaseChatModel,
+    strategic_llm_with_tools: BaseChatModel,
+    tactical_llm_with_tools: BaseChatModel,
     tools: List[Any],
     config: AgentConfig,
     workspace: WorkspaceManager,
@@ -1413,6 +1420,8 @@ def build_phase_alternation_graph(
     checkpointer: Optional[BaseCheckpointSaver] = None,
     summarization_llm: Optional[BaseChatModel] = None,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
+    # Backwards compatibility
+    llm_with_tools: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
     """Build the phase alternation graph for the Universal Agent.
 
@@ -1426,7 +1435,8 @@ def build_phase_alternation_graph(
     - Goal check: check_goal -> END or back to execute
 
     Args:
-        llm_with_tools: LLM with tools bound for execution
+        strategic_llm_with_tools: LLM with tools for strategic (planning) phases
+        tactical_llm_with_tools: LLM with tools for tactical (execution) phases
         tools: List of tool objects
         config: Agent configuration
         workspace: WorkspaceManager instance
@@ -1435,13 +1445,25 @@ def build_phase_alternation_graph(
         checkpointer: Optional LangGraph checkpointer for state persistence.
             When provided, enables resume after crash using the same thread_id.
         summarization_llm: Optional LLM for context summarization at phase boundaries.
-            If not provided, uses llm_with_tools for summarization.
+            If not provided, uses strategic_llm_with_tools for summarization.
         snapshot_manager: Optional PhaseSnapshotManager for creating phase snapshots.
             When provided, enables recovery to previous phases after corruption.
+        llm_with_tools: Deprecated - use strategic_llm_with_tools instead.
 
     Returns:
         Compiled StateGraph with checkpointing if checkpointer provided
     """
+    # Backwards compatibility: if old param used, map to new params
+    if llm_with_tools is not None and strategic_llm_with_tools is None:
+        import warnings
+        warnings.warn(
+            "llm_with_tools is deprecated, use strategic_llm_with_tools and "
+            "tactical_llm_with_tools instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        strategic_llm_with_tools = llm_with_tools
+        tactical_llm_with_tools = llm_with_tools
     # Create managers (todo_manager is passed in to ensure it's the same instance used by tools)
     plan_manager = PlanManager(workspace)
     memory_manager = MemoryManager(workspace)
@@ -1470,8 +1492,8 @@ def build_phase_alternation_graph(
     if not workspace_template:
         raise ValueError("workspace_template is required")
 
-    # Use provided summarization LLM or fall back to main LLM
-    llm_for_summarization = summarization_llm or llm_with_tools
+    # Use provided summarization LLM or fall back to strategic LLM
+    llm_for_summarization = summarization_llm or strategic_llm_with_tools
 
     # Create graph
     workflow = StateGraph(UniversalAgentState)
@@ -1482,8 +1504,14 @@ def build_phase_alternation_graph(
     restore_todo_state = create_restore_todo_state_node(todo_manager)
 
     execute = create_execute_node(
-        llm_with_tools, todo_manager, memory_manager, workspace,
-        config, context_mgr, retry_manager,
+        strategic_llm_with_tools=strategic_llm_with_tools,
+        tactical_llm_with_tools=tactical_llm_with_tools,
+        todo_manager=todo_manager,
+        memory_manager=memory_manager,
+        workspace_manager=workspace,
+        config=config,
+        context_mgr=context_mgr,
+        retry_manager=retry_manager,
         summarization_llm=llm_for_summarization,
         summarization_prompt=summarization_prompt,
     )
@@ -1619,7 +1647,8 @@ def build_nested_loop_graph(
         stacklevel=2,
     )
     return build_phase_alternation_graph(
-        llm_with_tools=llm_with_tools,
+        strategic_llm_with_tools=llm_with_tools,
+        tactical_llm_with_tools=llm_with_tools,
         tools=tools,
         config=config,
         workspace=workspace,

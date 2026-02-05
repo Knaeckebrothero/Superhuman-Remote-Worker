@@ -25,6 +25,8 @@ tiktoken>=0.5.0
 streamlit>=1.30.0
 pdfplumber>=0.10.0
 python-docx>=1.1.0
+python-pptx>=0.6.21
+openpyxl>=3.1.0
 beautifulsoup4>=4.12.0
 # Optional: Semantic similarity for advanced duplicate detection
 # sentence-transformers>=2.2.0

@@ -27,12 +27,12 @@
     },
     "llm": {
       "type": "object",
-      "description": "LLM configuration",
+      "description": "LLM configuration with optional phase-specific overrides",
       "required": ["model"],
       "properties": {
         "model": {
           "type": "string",
-          "description": "Model identifier",
+          "description": "Default model identifier (used when no phase override)",
           "examples": ["gpt-oss-120b", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"]
         },
         "provider": {
@@ -70,6 +70,18 @@
           "maximum": 10,
           "default": 3,
           "description": "Number of retries for failed LLM requests with exponential backoff"
+        },
+        "strategic": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."
+        },
+        "tactical": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for tactical (execution) phases. Can use faster/cheaper models for task execution."
+        },
+        "summarization": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for context summarization. Can use different model for compacting conversation history."
         }
       }
     },
@@ -387,5 +399,53 @@
       }
     }
   },
-  "additionalProperties": true
+  "additionalProperties": true,
+  "$defs": {
+    "llmPhaseOverride": {
+      "type": "object",
+      "description": "Phase-specific LLM overrides. Only specified fields override the base config.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model identifier for this phase"
+        },
+        "provider": {
+          "type": ["string", "null"],
+          "enum": ["openai", "anthropic", "google", "groq", null],
+          "description": "LLM provider override"
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature override"
+        },
+        "reasoning_level": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Reasoning depth override"
+        },
+        "base_url": {
+          "type": ["string", "null"],
+          "description": "Custom API base URL override"
+        },
+        "api_key": {
+          "type": ["string", "null"],
+          "description": "API key override (for different provider)"
+        },
+        "timeout": {
+          "type": ["number", "null"],
+          "minimum": 1,
+          "description": "Request timeout override"
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Retry count override"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 }

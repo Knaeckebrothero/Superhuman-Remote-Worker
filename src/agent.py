@@ -107,6 +107,13 @@ class UniversalAgent:
         self._checkpointer: Optional[AsyncSqliteSaver] = None
         self._checkpoint_conn: Optional[aiosqlite.Connection] = None
 
+        # Phase-specific LLMs (created if phase overrides configured)
+        self._strategic_llm: Optional[BaseChatModel] = None
+        self._tactical_llm: Optional[BaseChatModel] = None
+        self._summarization_llm: Optional[BaseChatModel] = None
+        self._strategic_llm_with_tools: Optional[BaseChatModel] = None
+        self._tactical_llm_with_tools: Optional[BaseChatModel] = None
+
         # Current job state
         self._workspace_manager: Optional[WorkspaceManager] = None
         self._todo_manager: Optional[TodoManager] = None
@@ -178,11 +185,61 @@ class UniversalAgent:
         # Set up database connections if needed
         await self._setup_connections()
 
-        # Create LLM with context limit validation (Layer 0 safety)
-        self._llm = create_llm(self.config.llm, limits=self.config.limits)
+        # Create LLM(s) with context limit validation (Layer 0 safety)
+        self._create_phase_llms()
 
         self._initialized = True
         logger.info(f"{self.config.display_name} initialized successfully")
+
+    def _create_phase_llms(self) -> None:
+        """Create phase-specific LLMs based on configuration.
+
+        If phase overrides are configured, creates separate LLMs for:
+        - Strategic phase (planning, high-level decisions)
+        - Tactical phase (execution)
+        - Summarization (context compaction)
+
+        If no overrides configured, reuses the same LLM for all phases.
+        """
+        llm_config = self.config.llm
+        limits = self.config.limits
+
+        if llm_config.has_phase_overrides():
+            # Create phase-specific LLMs
+            strategic_config = llm_config.get_phase_config("strategic")
+            tactical_config = llm_config.get_phase_config("tactical")
+            summarization_config = llm_config.get_phase_config("summarization")
+
+            self._strategic_llm = create_llm(strategic_config, limits=limits)
+            logger.info(f"Created strategic LLM: {strategic_config.model}")
+
+            # Optimization: reuse LLM if same config
+            if tactical_config.model == strategic_config.model:
+                self._tactical_llm = self._strategic_llm
+                logger.info(f"Tactical LLM: reusing strategic ({tactical_config.model})")
+            else:
+                self._tactical_llm = create_llm(tactical_config, limits=limits)
+                logger.info(f"Created tactical LLM: {tactical_config.model}")
+
+            if summarization_config.model == strategic_config.model:
+                self._summarization_llm = self._strategic_llm
+                logger.info(f"Summarization LLM: reusing strategic ({summarization_config.model})")
+            elif summarization_config.model == tactical_config.model:
+                self._summarization_llm = self._tactical_llm
+                logger.info(f"Summarization LLM: reusing tactical ({summarization_config.model})")
+            else:
+                self._summarization_llm = create_llm(summarization_config, limits=limits)
+                logger.info(f"Created summarization LLM: {summarization_config.model}")
+
+            # Base LLM defaults to strategic for backwards compatibility
+            self._llm = self._strategic_llm
+        else:
+            # No phase overrides - single LLM for all phases
+            self._llm = create_llm(llm_config, limits=limits)
+            self._strategic_llm = self._llm
+            self._tactical_llm = self._llm
+            self._summarization_llm = self._llm
+            logger.info(f"Created single LLM for all phases: {llm_config.model}")
 
     async def _setup_connections(self) -> None:
         """Set up required database connections using new DB classes.
@@ -321,15 +378,16 @@ class UniversalAgent:
             workspace_template = self._load_workspace_template()
 
             self._graph = build_phase_alternation_graph(
-                llm_with_tools=self._llm_with_tools,
+                strategic_llm_with_tools=self._strategic_llm_with_tools,
+                tactical_llm_with_tools=self._tactical_llm_with_tools,
                 tools=self._tools,
                 config=self.config,
                 workspace=self._workspace_manager,
                 todo_manager=self._todo_manager,
                 workspace_template=workspace_template,
                 checkpointer=self._checkpointer,
-                summarization_llm=self._llm,  # Use base LLM for context summarization
-                snapshot_manager=snapshot_manager,  # Enable phase snapshots for recovery
+                summarization_llm=self._summarization_llm,
+                snapshot_manager=snapshot_manager,
             )
 
             # Execute graph
@@ -956,8 +1014,12 @@ class UniversalAgent:
         # Domain tools get short descriptions; agent reads full docs from workspace
         self._tools = apply_description_overrides(self._tools)
 
-        # Bind tools to LLM
-        self._llm_with_tools = self._llm.bind_tools(self._tools)
+        # Bind tools to phase-specific LLMs
+        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(self._tools)
+        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(self._tools)
+
+        # Keep _llm_with_tools for backwards compatibility
+        self._llm_with_tools = self._strategic_llm_with_tools
 
         logger.debug(f"Loaded {len(self._tools)} tools")
 

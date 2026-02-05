@@ -1,7 +1,7 @@
 """
 Document Processor Core
 
-Handles text extraction from various document formats (PDF, DOCX, TXT, HTML)
+Handles text extraction from various document formats (PDF, DOCX, PPTX, XLSX, TXT, HTML)
 and applies intelligent chunking strategies for legal and technical documents.
 """
 
@@ -39,6 +39,20 @@ try:
 except ImportError:
     HTML_AVAILABLE = False
     BeautifulSoup = None
+
+try:
+    from pptx import Presentation
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+    Presentation = None
+
+try:
+    from openpyxl import load_workbook
+    XLSX_AVAILABLE = True
+except ImportError:
+    XLSX_AVAILABLE = False
+    load_workbook = None
 
 
 # =============================================================================
@@ -170,13 +184,47 @@ class DocumentExtractor:
         """Initialize the document extractor."""
         self._check_dependencies()
 
+    # Text-based formats that can be read directly as plain text
+    TEXT_FORMATS = {
+        # Plain text
+        ".txt", ".text",
+        # Data formats
+        ".csv", ".tsv",
+        ".json", ".jsonl", ".ndjson",
+        ".xml",
+        ".yaml", ".yml",
+        ".toml",
+        ".ini", ".cfg", ".conf",
+        # Markup/documentation
+        ".md", ".markdown", ".rst", ".asciidoc", ".adoc",
+        # Code files (common ones)
+        ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".java", ".kt", ".scala",
+        ".c", ".cpp", ".h", ".hpp",
+        ".cs", ".go", ".rs", ".rb",
+        ".php", ".swift", ".r",
+        ".sql", ".sh", ".bash", ".zsh", ".ps1",
+        ".css", ".scss", ".sass", ".less",
+        # Config files
+        ".env", ".properties", ".gradle",
+        ".dockerfile",
+        # Log files
+        ".log",
+        # Web
+        ".svg",  # XML-based, readable as text
+    }
+
     def _check_dependencies(self):
         """Log available document processing capabilities."""
         self.capabilities = {
             "pdf": PDF_AVAILABLE,
             "docx": DOCX_AVAILABLE,
+            "pptx": PPTX_AVAILABLE,
+            "xlsx": XLSX_AVAILABLE,
             "html": HTML_AVAILABLE,
             "txt": True,  # Always available
+            "text_formats": True,  # CSV, JSON, YAML, MD, code files, etc.
+            "fallback": True,  # Attempt to read unknown formats as text
         }
 
     def extract(self, file_path: str) -> Tuple[str, Dict[str, Any]]:
@@ -203,12 +251,20 @@ class DocumentExtractor:
             return self._extract_pdf(path)
         elif suffix == ".docx":
             return self._extract_docx(path)
+        elif suffix == ".pptx":
+            return self._extract_pptx(path)
+        elif suffix == ".xlsx":
+            return self._extract_xlsx(path)
         elif suffix == ".txt":
             return self._extract_txt(path)
         elif suffix in (".html", ".htm"):
             return self._extract_html(path)
+        elif suffix in self.TEXT_FORMATS:
+            # Known text-based formats - read as plain text
+            return self._extract_txt(path)
         else:
-            raise ValueError(f"Unsupported file type: {suffix}")
+            # Fallback: attempt to read as text
+            return self._extract_fallback(path)
 
     def _extract_pdf(self, path: Path) -> Tuple[str, Dict[str, Any]]:
         """Extract text from PDF using pdfplumber."""
@@ -280,6 +336,60 @@ class DocumentExtractor:
 
         return text, {"page_count": page_count}
 
+    def _extract_fallback(self, path: Path) -> Tuple[str, Dict[str, Any]]:
+        """
+        Attempt to read unknown file formats as text.
+
+        This is a fallback for files with unrecognized extensions.
+        It tries UTF-8 first, then falls back to latin-1 if that fails.
+        Binary files (those with too many non-printable characters) will raise an error.
+        """
+        # First, check if file appears to be binary
+        try:
+            with open(path, "rb") as f:
+                sample = f.read(8192)  # Read first 8KB to check
+
+            # Check for null bytes (strong indicator of binary)
+            if b"\x00" in sample:
+                raise ValueError(
+                    f"File appears to be binary: {path.suffix}. "
+                    "Binary files cannot be processed as text."
+                )
+
+            # Check ratio of non-printable characters
+            non_printable = sum(
+                1 for b in sample
+                if b < 32 and b not in (9, 10, 13)  # Allow tab, newline, carriage return
+            )
+            if len(sample) > 0 and non_printable / len(sample) > 0.1:
+                raise ValueError(
+                    f"File appears to be binary or encoded: {path.suffix}. "
+                    f"Non-printable character ratio: {non_printable / len(sample):.1%}"
+                )
+
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Could not read file {path}: {e}")
+
+        # Try reading as text
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            # Fallback to latin-1 which can read any byte sequence
+            with open(path, "r", encoding="latin-1") as f:
+                text = f.read()
+
+        # Estimate page count
+        page_count = max(1, len(text) // 3000)
+
+        return text, {
+            "page_count": page_count,
+            "fallback_extraction": True,
+            "original_extension": path.suffix,
+        }
+
     def _extract_html(self, path: Path) -> Tuple[str, Dict[str, Any]]:
         """Extract text from HTML using BeautifulSoup."""
         if not HTML_AVAILABLE:
@@ -308,6 +418,88 @@ class DocumentExtractor:
         page_count = max(1, len(text) // 3000)
 
         return text, {"page_count": page_count, "title": title}
+
+    def _extract_pptx(self, path: Path) -> Tuple[str, Dict[str, Any]]:
+        """Extract text from PowerPoint using python-pptx."""
+        if not PPTX_AVAILABLE:
+            raise ValueError(
+                "PPTX extraction requires python-pptx. Install with: pip install python-pptx"
+            )
+
+        prs = Presentation(path)
+        text_parts = []
+        info = {}
+        slide_count = len(prs.slides)
+        info["page_count"] = slide_count
+
+        for slide_num, slide in enumerate(prs.slides, 1):
+            slide_texts = []
+
+            # Extract text from all shapes
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_texts.append(shape.text)
+                # Handle tables
+                if shape.has_table:
+                    table = shape.table
+                    for row in table.rows:
+                        row_text = " | ".join(
+                            cell.text.strip() for cell in row.cells if cell.text.strip()
+                        )
+                        if row_text:
+                            slide_texts.append(row_text)
+
+            if slide_texts:
+                slide_content = "\n".join(slide_texts)
+                text_parts.append(f"[SLIDE {slide_num}]\n{slide_content}")
+
+        # Try to get title from first slide
+        if prs.slides and prs.slides[0].shapes.title:
+            info["title"] = prs.slides[0].shapes.title.text
+
+        return "\n\n".join(text_parts), info
+
+    def _extract_xlsx(self, path: Path) -> Tuple[str, Dict[str, Any]]:
+        """Extract text from Excel using openpyxl."""
+        if not XLSX_AVAILABLE:
+            raise ValueError(
+                "XLSX extraction requires openpyxl. Install with: pip install openpyxl"
+            )
+
+        wb = load_workbook(path, data_only=True)
+        text_parts = []
+        info = {}
+        info["page_count"] = len(wb.sheetnames)
+
+        for sheet_name in wb.sheetnames:
+            sheet = wb[sheet_name]
+            sheet_texts = [f"[SHEET: {sheet_name}]"]
+
+            # Get header row (first row)
+            headers = []
+            for row_num, row in enumerate(sheet.iter_rows(values_only=True), 1):
+                # Skip completely empty rows
+                if not any(cell is not None for cell in row):
+                    continue
+
+                # Format row as table-like structure
+                row_values = [str(cell) if cell is not None else "" for cell in row]
+                if row_num == 1:
+                    headers = row_values
+                    sheet_texts.append("| " + " | ".join(row_values) + " |")
+                    sheet_texts.append("|" + "|".join(["---"] * len(row_values)) + "|")
+                else:
+                    sheet_texts.append("| " + " | ".join(row_values) + " |")
+
+            if len(sheet_texts) > 1:  # More than just the header
+                text_parts.append("\n".join(sheet_texts))
+
+        wb.close()
+
+        # Use first sheet name or filename as title
+        info["title"] = wb.sheetnames[0] if wb.sheetnames else path.stem
+
+        return "\n\n".join(text_parts), info
 
 
 # =============================================================================
@@ -776,5 +968,9 @@ def estimate_processing_time(file_path: str) -> float:
         return size_mb * 1.0
     elif suffix == ".docx":
         return size_mb * 0.8
+    elif suffix == ".pptx":
+        return size_mb * 1.2
+    elif suffix == ".xlsx":
+        return size_mb * 0.6
     else:
         return size_mb * 0.5
