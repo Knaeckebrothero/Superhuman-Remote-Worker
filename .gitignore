@@ -3,6 +3,7 @@ backups/*
 workspace/*
 output/*
 orchestrator/workspace/*
+project_documentation/*
 
 # MCP configuration files
 .mcp.json

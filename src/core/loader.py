@@ -214,8 +214,42 @@ class PromptResolver:
 
 
 @dataclass
+class PhaseLLMOverride:
+    """Phase-specific LLM overrides.
+
+    Only specified (non-None) fields override the base LLM config.
+    Used for strategic, tactical, and summarization phase customization.
+    """
+
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    temperature: Optional[float] = None
+    reasoning_level: Optional[str] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    timeout: Optional[float] = None
+    max_retries: Optional[int] = None
+
+
+@dataclass
 class LLMConfig:
-    """LLM configuration."""
+    """LLM configuration with optional phase-specific overrides.
+
+    Base fields define the default model. Phase-specific overrides (strategic,
+    tactical, summarization) can specify different models/providers for each phase.
+
+    Example:
+        llm:
+          model: claude-sonnet-4-20250514
+          temperature: 0.3
+          strategic:
+            model: claude-opus-4-5-20250514
+          tactical:
+            temperature: 0.2
+          summarization:
+            model: gpt-4o
+            provider: openai
+    """
 
     model: str = "gpt-4o"
     provider: Optional[str] = None  # "openai", "anthropic", "google", "groq" (auto-detect if None)
@@ -225,6 +259,48 @@ class LLMConfig:
     api_key: Optional[str] = None
     timeout: Optional[float] = 600.0  # 10 minutes default
     max_retries: int = 3
+
+    # Phase-specific overrides (optional)
+    strategic: Optional[PhaseLLMOverride] = None
+    tactical: Optional[PhaseLLMOverride] = None
+    summarization: Optional[PhaseLLMOverride] = None
+
+    def get_phase_config(self, phase: str) -> "LLMConfig":
+        """Get effective LLM config for a specific phase.
+
+        Merges phase-specific overrides with base config. Only non-None
+        fields from the phase override replace base values.
+
+        Args:
+            phase: One of "strategic", "tactical", "summarization"
+
+        Returns:
+            New LLMConfig with phase-specific overrides applied.
+            Returns self if no override exists for the phase.
+        """
+        override = getattr(self, phase, None)
+        if not override:
+            return self
+
+        # Create new config with overrides applied (don't copy phase fields)
+        return LLMConfig(
+            model=override.model if override.model is not None else self.model,
+            provider=override.provider if override.provider is not None else self.provider,
+            temperature=override.temperature if override.temperature is not None else self.temperature,
+            reasoning_level=override.reasoning_level if override.reasoning_level is not None else self.reasoning_level,
+            base_url=override.base_url if override.base_url is not None else self.base_url,
+            api_key=override.api_key if override.api_key is not None else self.api_key,
+            timeout=override.timeout if override.timeout is not None else self.timeout,
+            max_retries=override.max_retries if override.max_retries is not None else self.max_retries,
+            # Phase overrides not inherited to resolved config
+            strategic=None,
+            tactical=None,
+            summarization=None,
+        )
+
+    def has_phase_overrides(self) -> bool:
+        """Check if any phase-specific overrides are configured."""
+        return any([self.strategic, self.tactical, self.summarization])
 
 
 @dataclass
@@ -333,6 +409,55 @@ class AgentConfig:
     _deployment_dir: Optional[str] = None
 
 
+def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOverride]:
+    """Parse a phase-specific LLM override from config dict.
+
+    Args:
+        data: Dict with override fields, or None
+
+    Returns:
+        PhaseLLMOverride if data provided, None otherwise
+    """
+    if not data:
+        return None
+
+    return PhaseLLMOverride(
+        model=data.get("model"),
+        provider=data.get("provider"),
+        temperature=data.get("temperature"),
+        reasoning_level=data.get("reasoning_level"),
+        base_url=data.get("base_url"),
+        api_key=data.get("api_key"),
+        timeout=data.get("timeout"),
+        max_retries=data.get("max_retries"),
+    )
+
+
+def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
+    """Parse LLM configuration including phase-specific overrides.
+
+    Args:
+        llm_data: Dict with LLM config fields
+
+    Returns:
+        LLMConfig with base settings and optional phase overrides
+    """
+    return LLMConfig(
+        model=llm_data.get("model", "gpt-4o"),
+        provider=llm_data.get("provider"),
+        temperature=llm_data.get("temperature", 0.0),
+        reasoning_level=llm_data.get("reasoning_level", "high"),
+        base_url=llm_data.get("base_url"),
+        api_key=llm_data.get("api_key"),
+        timeout=llm_data.get("timeout", 600.0),
+        max_retries=llm_data.get("max_retries", 3),
+        # Phase-specific overrides
+        strategic=_parse_phase_override(llm_data.get("strategic")),
+        tactical=_parse_phase_override(llm_data.get("tactical")),
+        summarization=_parse_phase_override(llm_data.get("summarization")),
+    )
+
+
 def load_agent_config(
     config_path: str,
     deployment_dir: Optional[str] = None
@@ -381,15 +506,7 @@ def load_agent_config(
 
     # Parse nested configs
     llm_data = data.get("llm", {})
-    llm_config = LLMConfig(
-        model=llm_data.get("model", "gpt-4o"),
-        temperature=llm_data.get("temperature", 0.0),
-        reasoning_level=llm_data.get("reasoning_level", "high"),
-        base_url=llm_data.get("base_url"),
-        api_key=llm_data.get("api_key"),
-        timeout=llm_data.get("timeout", 600.0),
-        max_retries=llm_data.get("max_retries", 3),
-    )
+    llm_config = _parse_llm_config(llm_data)
 
     workspace_data = data.get("workspace", {})
 
@@ -521,15 +638,7 @@ def load_agent_config_from_dict(
 
     # Parse nested configs (same as load_agent_config)
     llm_data = data.get("llm", {})
-    llm_config = LLMConfig(
-        model=llm_data.get("model", "gpt-4o"),
-        temperature=llm_data.get("temperature", 0.0),
-        reasoning_level=llm_data.get("reasoning_level", "high"),
-        base_url=llm_data.get("base_url"),
-        api_key=llm_data.get("api_key"),
-        timeout=llm_data.get("timeout", 600.0),
-        max_retries=llm_data.get("max_retries", 3),
-    )
+    llm_config = _parse_llm_config(llm_data)
 
     workspace_data = data.get("workspace", {})
     max_read_words = workspace_data.get("max_read_words")
