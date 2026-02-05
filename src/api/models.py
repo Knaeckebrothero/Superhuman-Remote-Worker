@@ -316,6 +316,10 @@ class JobResumeRequest(BaseModel):
     """Request to resume a job from checkpoint."""
 
     job_id: str = Field(..., description="Job ID to resume")
+    config_name: Optional[str] = Field(
+        default=None,
+        description="Original config name for checkpoint lookup (thread_id = config_name_job_id)",
+    )
     feedback: Optional[str] = Field(
         default=None,
         description="Optional feedback to inject before resuming",

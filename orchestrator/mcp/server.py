@@ -623,7 +623,7 @@ def _entry_matches(entry: dict[str, Any], query: str) -> bool:
         return True
 
     # Check error
-    if query in entry.get("error", "").lower():
+    if query in str(entry.get("error", "")).lower():
         return True
 
     return False

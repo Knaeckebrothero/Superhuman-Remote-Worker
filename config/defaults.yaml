@@ -37,7 +37,7 @@ tools:
     - copy_file
     - get_workspace_summary
     - get_document_info
-  # Core tools - todo + job management (src/tools/core/)
+  # Core tools - to-do + job management (src/tools/core/)
   core:
     - next_phase_todos
     - todo_complete
@@ -76,7 +76,7 @@ connections:
   neo4j: false
 
 limits:
-  context_threshold_tokens: 60000
+  context_threshold_tokens: 80000
   message_count_threshold: 200
   message_count_min_tokens: 40000
   tool_retry_count: 3

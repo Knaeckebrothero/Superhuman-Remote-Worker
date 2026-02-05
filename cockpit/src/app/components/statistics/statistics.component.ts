@@ -436,7 +436,7 @@ export class StatisticsComponent implements OnInit, OnDestroy {
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);
-    return date.toLocaleDateString('en-GB', {
+    return date.toLocaleDateString(undefined, {
       weekday: 'short',
       month: 'short',
       day: 'numeric',

@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -153,7 +153,16 @@ class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj: Any) -> Any:
         if isinstance(obj, UUID):
             return str(obj)
-        if isinstance(obj, (datetime, date)):
+        if isinstance(obj, datetime):
+            # Ensure timestamps include UTC indicator for proper browser parsing
+            if obj.tzinfo is None:
+                # Naive datetime - assume UTC and add Z suffix
+                return obj.isoformat() + "Z"
+            else:
+                # Timezone-aware - convert to UTC and use Z suffix
+                utc_dt = obj.astimezone(timezone.utc)
+                return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        if isinstance(obj, date):
             return obj.isoformat()
         if isinstance(obj, Decimal):
             return float(obj)
@@ -493,7 +502,13 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             )
 
         # Build resume request payload
-        resume_payload = {"job_id": job_id}
+        # Include config_name so agent can find the correct checkpoint
+        # (thread_id is constructed as {config_name}_{job_id})
+        job_config_name = job.get("config_name", "default")
+        resume_payload = {
+            "job_id": job_id,
+            "config_name": job_config_name,
+        }
         if request.feedback:
             resume_payload["feedback"] = request.feedback
 

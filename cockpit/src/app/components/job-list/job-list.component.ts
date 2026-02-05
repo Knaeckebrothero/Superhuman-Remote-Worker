@@ -576,11 +576,12 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   formatDate(dateString: string): string {
     const date = new Date(dateString);
-    return date.toLocaleDateString('en-GB', {
+    return date.toLocaleDateString(undefined, {
       day: '2-digit',
       month: 'short',
       hour: '2-digit',
       minute: '2-digit',
+      hour12: false,
     });
   }
 }

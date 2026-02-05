@@ -526,11 +526,12 @@ export class TodoListComponent implements OnInit {
   formatArchiveDate(timestamp: string): string {
     try {
       const date = new Date(timestamp);
-      return date.toLocaleDateString('en-GB', {
+      return date.toLocaleDateString(undefined, {
         month: 'short',
         day: 'numeric',
         hour: '2-digit',
         minute: '2-digit',
+        hour12: false,
       });
     } catch {
       return timestamp;
