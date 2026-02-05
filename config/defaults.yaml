@@ -12,6 +12,7 @@ llm:
   base_url: null
   timeout: 600
   max_retries: 3
+  multimodal: false  # Set to true if model can process images directly
 
 workspace:
   structure:
