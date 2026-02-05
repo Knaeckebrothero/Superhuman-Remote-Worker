@@ -558,6 +558,60 @@ def finalize_job(
     )
 
 
+def _complete_phase_with_git(
+    workspace: "WorkspaceManager",
+    phase_number: int,
+    phase_type: str,
+    next_phase_type: str,
+    next_phase_name: str = "",
+    todos_archived: int = 0,
+) -> None:
+    """Complete a phase with git operations.
+
+    Creates a git tag for the completed phase, updates phase_state.yaml
+    for the next phase, and commits the changes.
+
+    Args:
+        workspace: WorkspaceManager with git_manager
+        phase_number: Current phase number
+        phase_type: Completed phase type ("strategic" or "tactical")
+        next_phase_type: Next phase type ("strategic" or "tactical")
+        next_phase_name: Name for the next phase (optional)
+        todos_archived: Number of todos archived in this phase
+    """
+    git_mgr = workspace.git_manager
+    if not git_mgr or not git_mgr.is_active:
+        return
+
+    try:
+        # Create tag for completed phase
+        tag_name = f"phase-{phase_number}-{phase_type}-complete"
+        git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
+        logger.debug(f"Created git tag: {tag_name}")
+
+        # Update phase_state.yaml for next phase
+        # Note: for tactical->strategic, phase_number increments (done by caller)
+        # For strategic->tactical, phase_number stays same
+        next_phase_number = phase_number + 1 if phase_type == "tactical" else phase_number
+        workspace.update_phase_state(
+            phase_number=next_phase_number,
+            phase_type=next_phase_type,
+            phase_name=next_phase_name,
+        )
+
+        # Commit the phase state change
+        commit_msg = (
+            f"[Phase {phase_number} {phase_type.title()}] Complete - "
+            f"archived {todos_archived} todos"
+        )
+        git_mgr.commit(commit_msg, allow_empty=False)
+        logger.debug(f"Committed phase completion: {commit_msg}")
+
+    except Exception as e:
+        logger.warning(f"Git operations failed during phase transition: {e}")
+        # Don't fail the transition - git is optional
+
+
 def on_strategic_phase_complete(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
@@ -627,12 +681,25 @@ def on_strategic_phase_complete(
     # Get phase name from staged todos
     phase_name = todo_manager.get_staged_phase_name() or f"Phase {phase_number + 1}"
 
+    # Get count of completed todos before applying new ones
+    completed_todos = len([t for t in todo_manager.list_all() if t.status.value == "completed"])
+
     # Apply staged todos to the active todo list
     todo_manager.apply_staged_todos()
     todo_count = len(todo_manager.list_all())
 
     # Export todo state for checkpointing
     todo_state = todo_manager.export_state()
+
+    # Git operations: tag completed phase, update phase_state.yaml, commit
+    _complete_phase_with_git(
+        workspace=workspace,
+        phase_number=phase_number,
+        phase_type="strategic",
+        next_phase_type="tactical",
+        next_phase_name=phase_name,
+        todos_archived=completed_todos,
+    )
 
     logger.info(
         f"[{job_id}] Transitioning to tactical phase: {phase_name} "
@@ -692,6 +759,9 @@ def on_tactical_phase_complete(
 
     logger.info(f"[{job_id}] Tactical phase complete, transitioning to strategic")
 
+    # Get count of completed todos before loading new ones
+    completed_todos = len([t for t in todo_manager.list_all() if t.status.value == "completed"])
+
     # Load predefined strategic todos (from config template or defaults)
     strategic_todos = get_transition_strategic_todos(config)
     todo_list = [todo.to_dict() for todo in strategic_todos]
@@ -699,6 +769,17 @@ def on_tactical_phase_complete(
 
     # Export todo state for checkpointing
     todo_state = todo_manager.export_state()
+
+    # Git operations: tag completed phase, update phase_state.yaml, commit
+    # Note: tactical->strategic increments phase_number (handled by _complete_phase_with_git)
+    _complete_phase_with_git(
+        workspace=workspace,
+        phase_number=phase_number,
+        phase_type="tactical",
+        next_phase_type="strategic",
+        next_phase_name="",  # Strategic phases use predefined todos, no custom name
+        todos_archived=completed_todos,
+    )
 
     logger.info(
         f"[{job_id}] Transitioning to strategic phase "

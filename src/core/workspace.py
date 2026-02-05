@@ -7,14 +7,22 @@ documents, notes, and intermediate work products.
 Environment-aware path resolution:
 - Container mode: /workspace/job_{uuid}/
 - Dev mode: ./workspace/job_{uuid}/
+
+Git versioning:
+- Optional git repository per workspace for automatic change tracking
+- Commits on todo completion for audit trail
+- Phase tags for milestone tracking
 """
 
 import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Optional, List
+from typing import TYPE_CHECKING, Optional, List
 from dataclasses import dataclass, field
+
+if TYPE_CHECKING:
+    from ..managers.git_manager import GitManager
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +52,12 @@ class WorkspaceManagerConfig:
     # Template file to copy as instructions.md (optional)
     instructions_template: Optional[str] = None
 
+    # Git versioning settings
+    git_versioning: bool = True  # Enable git versioning for workspace history
+    git_ignore_patterns: List[str] = field(
+        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+    )
+
     @classmethod
     def from_dict(cls, data: dict) -> "WorkspaceManagerConfig":
         """Create config from dictionary."""
@@ -51,6 +65,11 @@ class WorkspaceManagerConfig:
             base_path=data.get("base_path"),
             structure=data.get("structure", cls.__dataclass_fields__["structure"].default_factory()),
             instructions_template=data.get("instructions_template"),
+            git_versioning=data.get("git_versioning", True),
+            git_ignore_patterns=data.get(
+                "git_ignore_patterns",
+                cls.__dataclass_fields__["git_ignore_patterns"].default_factory()
+            ),
         )
 
 
@@ -167,6 +186,9 @@ class WorkspaceManager:
         self._workspace_path = self._base_path / f"job_{job_id}"
         self._initialized = False
 
+        # Git manager (created during initialize if git_versioning enabled)
+        self._git_manager: Optional["GitManager"] = None
+
     @property
     def path(self) -> Path:
         """Get the root path of this workspace."""
@@ -177,11 +199,25 @@ class WorkspaceManager:
         """Check if workspace has been initialized."""
         return self._initialized or self._workspace_path.exists()
 
+    @property
+    def git_manager(self) -> Optional["GitManager"]:
+        """Get the GitManager for this workspace.
+
+        Returns None if git versioning is not enabled or initialization failed.
+        """
+        return self._git_manager
+
     def initialize(self) -> None:
         """Initialize the workspace directory structure.
 
         Creates the workspace root and all configured subdirectories.
         Safe to call multiple times - will not overwrite existing files.
+
+        If git_versioning is enabled, also:
+        - Creates a GitManager instance
+        - Initializes a git repository with .gitignore
+        - Creates initial phase_state.yaml
+        - Makes an initial commit
         """
         # Create workspace root
         self._workspace_path.mkdir(parents=True, exist_ok=True)
@@ -197,7 +233,88 @@ class WorkspaceManager:
         if self.config.instructions_template:
             self._copy_instructions_template()
 
+        # Initialize git versioning if enabled
+        if self.config.git_versioning:
+            self._initialize_git()
+
         self._initialized = True
+
+    def _initialize_git(self) -> None:
+        """Initialize git versioning for the workspace.
+
+        Creates GitManager, initializes repository with .gitignore,
+        and creates initial phase_state.yaml.
+        """
+        try:
+            from ..managers.git_manager import GitManager
+        except ImportError:
+            # Handle case where module is imported directly (e.g., in tests)
+            from src.managers.git_manager import GitManager
+
+        # Create GitManager instance
+        self._git_manager = GitManager(self._workspace_path)
+
+        # Initialize repository (no-op if already exists)
+        success = self._git_manager.init_repository(
+            ignore_patterns=self.config.git_ignore_patterns
+        )
+
+        if success:
+            logger.info("Git versioning enabled for workspace")
+
+            # Create initial phase_state.yaml if it doesn't exist
+            phase_state_path = self._workspace_path / "phase_state.yaml"
+            if not phase_state_path.exists():
+                self._create_initial_phase_state()
+        else:
+            logger.warning("Failed to initialize git repository")
+            self._git_manager = None
+
+    def _create_initial_phase_state(self) -> None:
+        """Create initial phase_state.yaml file."""
+        from datetime import datetime, timezone
+
+        initial_state = (
+            "# Phase state - tracks current phase for recovery after context compaction\n"
+            "phase_number: 1\n"
+            "phase_type: strategic\n"
+            "phase_name: \"\"\n"
+            f"started_at: {datetime.now(timezone.utc).isoformat()}\n"
+        )
+
+        phase_state_path = self._workspace_path / "phase_state.yaml"
+        phase_state_path.write_text(initial_state)
+        logger.debug("Created initial phase_state.yaml")
+
+    def update_phase_state(
+        self,
+        phase_number: int,
+        phase_type: str,
+        phase_name: str = "",
+    ) -> None:
+        """Update phase_state.yaml with new phase information.
+
+        Called during phase transitions to track the current phase.
+        This file survives context compaction and enables recovery.
+
+        Args:
+            phase_number: Current phase number (paired numbering)
+            phase_type: "strategic" or "tactical"
+            phase_name: Optional human-readable phase name
+        """
+        from datetime import datetime, timezone
+
+        state_content = (
+            "# Phase state - tracks current phase for recovery after context compaction\n"
+            f"phase_number: {phase_number}\n"
+            f"phase_type: {phase_type}\n"
+            f"phase_name: \"{phase_name}\"\n"
+            f"started_at: {datetime.now(timezone.utc).isoformat()}\n"
+        )
+
+        phase_state_path = self._workspace_path / "phase_state.yaml"
+        phase_state_path.write_text(state_content)
+        logger.debug(f"Updated phase_state.yaml: phase {phase_number} {phase_type}")
 
     def _copy_instructions_template(self) -> None:
         """Copy instructions template to workspace."""

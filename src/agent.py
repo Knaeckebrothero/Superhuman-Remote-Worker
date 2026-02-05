@@ -693,6 +693,8 @@ class UniversalAgent:
             job_id=job_id,
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
+                git_versioning=self.config.workspace.git_versioning,
+                git_ignore_patterns=self.config.workspace.git_ignore_patterns,
             )
         )
 
@@ -1312,6 +1314,8 @@ class UniversalAgent:
             job_id=job_id,
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
+                git_versioning=self.config.workspace.git_versioning,
+                git_ignore_patterns=self.config.workspace.git_ignore_patterns,
             )
         )
 

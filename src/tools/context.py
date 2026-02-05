@@ -100,6 +100,17 @@ class ToolContext:
         """Check if Neo4j connection is available."""
         return self.neo4j_db is not None
 
+    def has_git(self) -> bool:
+        """Check if git manager is available and active.
+
+        Returns True only if workspace_manager exists, has a git_manager,
+        and the git_manager is active (git available and repo initialized).
+        """
+        if not self.has_workspace():
+            return False
+        gm = self.workspace_manager.git_manager
+        return gm is not None and gm.is_active
+
     @property
     def db(self) -> Optional["PostgresDB"]:
         """Get PostgresDB instance.

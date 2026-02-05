@@ -27,6 +27,7 @@ from .document import create_document_tools, get_document_metadata
 from .research import create_research_tools, get_research_metadata
 from .citation import create_citation_tools, get_citation_metadata
 from .graph import create_graph_tools, get_graph_metadata
+from .git import create_git_tools, get_git_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
@@ -51,6 +52,7 @@ TOOL_REGISTRY.update(get_document_metadata())
 TOOL_REGISTRY.update(get_research_metadata())
 TOOL_REGISTRY.update(get_citation_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
+TOOL_REGISTRY.update(get_git_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -320,6 +322,23 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded graph tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load graph tools: {e}")
+
+    # Git tools
+    if "git" in tools_by_category:
+        if not context.has_workspace():
+            logger.warning("Git tools require workspace_manager in ToolContext")
+        elif context.workspace_manager.git_manager is None:
+            logger.warning("Git tools require git_manager on workspace_manager")
+        else:
+            try:
+                git_tools = create_git_tools(context)
+                requested = set(tools_by_category["git"])
+                for tool in git_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded git tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load git tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools
