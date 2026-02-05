@@ -106,7 +106,742 @@ The Fessi backend provides the vision helper pattern we'll adapt:
 | `backend/services/file_retrieval_service.py` | Orchestrates content retrieval by file type |
 | `backend/services/cache/description_cache.py` | Database-backed cache for vision descriptions |
 | `backend/services/audio_handler.py` | Whisper transcription (API + local fallback) |
+| `backend/services/document_handler.py` | PDF text extraction and page rendering |
+| `backend/services/image_handler.py` | Image/document preparation for LLM |
 | `backend/services/tools/file_tools.py` | `get_file_content` tool exposed to agent |
+
+---
+
+## Fessi Implementation Analysis
+
+This section provides detailed analysis of the Fessi codebase to guide porting.
+
+### Architecture Overview
+
+```
+Fessi Backend Architecture
+==========================
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        API Layer (files.py)                         │
+│  POST /upload  │  GET /{file_id}  │  GET /{file_id}/text  │  DELETE │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    FileRetrievalService                              │
+│  get_content(file_id, query, pages, model_receives_images)          │
+│  Returns: FileContentResult(text, images, description, error)       │
+└─────────────────────────────────────────────────────────────────────┘
+                    │                           │
+          ┌─────────┴─────────┐       ┌─────────┴─────────┐
+          ▼                   ▼       ▼                   ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ DocumentHandler  │ │  ImageHandler    │ │  AudioHandler    │
+│ - extract_pdf    │ │ - read_base64    │ │ - transcribe     │
+│ - render_pages   │ │ - prepare_llm    │ │ - local/API      │
+└──────────────────┘ └──────────────────┘ └──────────────────┘
+          │                   │
+          └─────────┬─────────┘
+                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       VisionHelper                                   │
+│  describe_image(image_data, mime_type, prompt)                      │
+│  analyze_document_page(page_image, mime_type, query)                │
+└─────────────────────────────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     DescriptionCache                                 │
+│  SHA256(file_id + query) → PostgreSQL table                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### VisionHelper (`backend/services/vision_helper.py`)
+
+The core vision service using AsyncOpenAI:
+
+```python
+# Fessi Pattern
+class VisionHelper:
+    def __init__(self):
+        self.api_key = os.getenv("VISION_API_KEY", os.getenv("OPENAI_API_KEY"))
+        self.api_base = os.getenv("VISION_BASE_URL", os.getenv("OPENAI_BASE_URL"))
+        self.model = os.getenv("VISION_MODEL", "gpt-4o-mini")
+        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.api_base)
+
+    async def describe_image(
+        self,
+        image_data: Union[bytes, str],
+        mime_type: str,
+        prompt: Optional[str] = None
+    ) -> str:
+        """Generate description of an image."""
+        # Convert bytes to base64 if needed
+        if isinstance(image_data, bytes):
+            base64_data = base64.b64encode(image_data).decode('utf-8')
+        else:
+            base64_data = image_data
+
+        default_prompt = (
+            "Describe this image in detail, including all visible text, "
+            "objects, colors, layout..."
+        )
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or default_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime_type};base64,{base64_data}"}
+                    }
+                ]
+            }],
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
+
+    async def analyze_document_page(
+        self,
+        page_image: Union[bytes, str],
+        mime_type: str,
+        query: Optional[str] = None
+    ) -> str:
+        """Analyze a document page with structured extraction."""
+        # Similar to describe_image but with document-specific prompt
+        # Extracts: text, tables, charts, layout
+        # max_tokens=2000 for detailed analysis
+        ...
+
+# Singleton access
+_vision_helper: Optional[VisionHelper] = None
+
+def get_vision_helper() -> VisionHelper:
+    global _vision_helper
+    if _vision_helper is None:
+        _vision_helper = VisionHelper()
+    return _vision_helper
+```
+
+### DocumentHandler (`backend/services/document_handler.py`)
+
+PDF processing with pdfplumber and pdf2image:
+
+```python
+# Fessi Constants
+MAX_PDF_PAGES = 20
+SUPPORTED_DOCUMENT_TYPES = {
+    'application/pdf': 'pdf',
+    'text/plain': 'txt',
+    'text/markdown': 'md',
+}
+
+def extract_pdf_text(file_path: Path) -> Optional[str]:
+    """Extract text from PDF using pdfplumber."""
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            text_parts = []
+            for i, page in enumerate(pdf.pages[:MAX_PDF_PAGES]):
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(f"--- Page {i + 1} ---\n{page_text}")
+            return "\n\n".join(text_parts) if text_parts else None
+    except Exception as e:
+        logger.error(f"PDF extraction failed: {e}")
+        return None
+
+def render_pdf_pages(
+    file_path: Path,
+    output_dir: Path,
+    file_id: str
+) -> list[Path]:
+    """Render PDF pages as PNG images."""
+    from pdf2image import convert_from_path
+
+    images = convert_from_path(
+        file_path,
+        first_page=1,
+        last_page=MAX_PDF_PAGES,
+        dpi=150,              # Balance quality/size
+        fmt='png'
+    )
+
+    output_paths = []
+    for i, image in enumerate(images, 1):
+        output_path = output_dir / f"{file_id}_page_{i}.png"
+        image.save(output_path, 'PNG')
+        output_paths.append(output_path)
+
+    return output_paths
+
+def process_pdf(file_path: Path, file_id: str) -> dict:
+    """Orchestrate PDF processing: extract text + render pages."""
+    output_dir = file_path.parent
+
+    # Extract text → {file_id}_text.txt
+    text = extract_pdf_text(file_path)
+    if text:
+        text_file = output_dir / f"{file_id}_text.txt"
+        text_file.write_text(text)
+
+    # Render pages → {file_id}_page_1.png, {file_id}_page_2.png, ...
+    page_paths = render_pdf_pages(file_path, output_dir, file_id)
+
+    return {
+        "text": text,
+        "page_count": len(page_paths),
+        "page_paths": page_paths
+    }
+```
+
+### ImageHandler (`backend/services/image_handler.py`)
+
+Base64 encoding and LLM-ready formatting:
+
+```python
+SUPPORTED_IMAGE_TYPES = {
+    'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'
+}
+
+def read_image_as_base64(file_id: str) -> Optional[tuple[str, str]]:
+    """Read image file and return (base64_data, mime_type)."""
+    file_path = find_file_by_id(file_id)
+    if not file_path:
+        return None
+
+    mime_type = mimetypes.guess_type(file_path)[0] or 'image/png'
+
+    with open(file_path, 'rb') as f:
+        image_data = f.read()
+
+    base64_data = base64.b64encode(image_data).decode('utf-8')
+    return (base64_data, mime_type)
+
+def prepare_image_for_llm(
+    file_id: str,
+    mime_type: Optional[str] = None
+) -> Optional[dict]:
+    """Prepare image in LLM-ready format."""
+    result = read_image_as_base64(file_id)
+    if not result:
+        return None
+
+    base64_data, detected_mime = result
+    mime = mime_type or detected_mime
+
+    return {
+        'type': 'image_url',
+        'image_url': {
+            'url': f"data:{mime};base64,{base64_data}"
+        }
+    }
+
+def prepare_document_for_llm(
+    file_id: str,
+    mime_type: str,
+    name: str
+) -> Optional[dict]:
+    """Prepare document with text + optional page images."""
+    result = {"text": None, "images": []}
+
+    # Get extracted text
+    text = get_extracted_text(file_id)
+    if text:
+        result["text"] = text
+
+    # Get rendered page images (for PDFs)
+    if mime_type == 'application/pdf':
+        page_paths = get_pdf_page_paths(file_id)
+        for page_path in page_paths:
+            img_content = prepare_image_for_llm(page_path.stem)
+            if img_content:
+                result["images"].append(img_content)
+
+    return result
+```
+
+### DescriptionCache (`backend/services/cache/description_cache.py`)
+
+Database-backed caching:
+
+```python
+class DescriptionCache:
+    """Cache for vision-generated descriptions."""
+
+    def _make_key(self, file_id: str, query: Optional[str] = None) -> str:
+        """Generate SHA256 cache key."""
+        key_data = {"file_id": file_id, "query": query or ""}
+        return hashlib.sha256(
+            json.dumps(key_data, sort_keys=True).encode()
+        ).hexdigest()
+
+    async def get(
+        self,
+        file_id: str,
+        query: Optional[str] = None
+    ) -> Optional[str]:
+        """Retrieve cached description."""
+        key = self._make_key(file_id, query)
+        return self.db.get_cache_entry(key)
+
+    async def set(
+        self,
+        file_id: str,
+        description: str,
+        query: Optional[str] = None
+    ):
+        """Store description in cache."""
+        key = self._make_key(file_id, query)
+        self.db.set_cache_entry(key, file_id, description, query)
+
+    async def delete_by_file(self, file_id: str) -> int:
+        """Delete all cache entries for a file."""
+        return self.db.delete_cache_by_file(file_id)
+
+# Database table (PostgreSQL)
+# file_description_cache:
+#   - cache_key (TEXT, PK) - SHA256 hash
+#   - file_id (TEXT, indexed)
+#   - query (TEXT, nullable)
+#   - description (TEXT)
+#   - created_at (TIMESTAMP)
+```
+
+### FileRetrievalService (`backend/services/file_retrieval_service.py`)
+
+Unified orchestrator with dual output paths:
+
+```python
+@dataclass
+class FileContentResult:
+    text: Optional[str] = None
+    images: Optional[List[bytes]] = None
+    description: Optional[str] = None
+    error: Optional[str] = None
+
+class FileRetrievalService:
+    """Orchestrates file content retrieval by type."""
+
+    async def get_content(
+        self,
+        file_id: str,
+        query: Optional[str] = None,
+        pages: Optional[List[int]] = None,
+        model_receives_images: Optional[bool] = None
+    ) -> FileContentResult:
+        """Get file content with appropriate handling."""
+
+        file_path = find_file_by_id(file_id)
+        mime_type = get_mime_type(file_path)
+
+        # IMAGE FILES
+        if mime_type in SUPPORTED_IMAGE_TYPES:
+            if model_receives_images and not query:
+                # Return raw image for multimodal model
+                return FileContentResult(images=[file_path.read_bytes()])
+            else:
+                # Get/generate description for text-only model
+                cached = await self.cache.get(file_id, query)
+                if cached:
+                    return FileContentResult(description=cached)
+
+                image_data = file_path.read_bytes()
+                description = await self.vision.describe_image(
+                    image_data, mime_type, query
+                )
+                await self.cache.set(file_id, description, query)
+                return FileContentResult(description=description)
+
+        # PDF FILES
+        if mime_type == 'application/pdf':
+            text = get_extracted_text(file_id)
+
+            if model_receives_images:
+                # Return text + page images
+                page_paths = get_pdf_page_paths(file_id)
+                images = [p.read_bytes() for p in page_paths]
+                return FileContentResult(text=text, images=images)
+            else:
+                # Return text + visual descriptions
+                page_paths = get_pdf_page_paths(file_id)
+                descriptions = []
+                for i, page_path in enumerate(page_paths, 1):
+                    page_data = page_path.read_bytes()
+                    desc = await self.vision.analyze_document_page(
+                        page_data, 'image/png', query
+                    )
+                    descriptions.append(f"[Page {i}]\n{desc}")
+                return FileContentResult(
+                    text=text,
+                    description="\n\n".join(descriptions)
+                )
+
+        # AUDIO FILES
+        if mime_type.startswith('audio/'):
+            transcript = get_transcript(file_id)
+            return FileContentResult(text=transcript)
+
+        # TEXT FILES
+        return FileContentResult(text=file_path.read_text())
+```
+
+### AudioHandler (`backend/services/audio_handler.py`)
+
+Transcription with API + local fallback:
+
+```python
+USE_LOCAL_WHISPER = os.getenv("USE_LOCAL_WHISPER", "false").lower() == "true"
+LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", None)
+
+async def _transcribe_with_openai(file_path: Path) -> Optional[str]:
+    """Transcribe using OpenAI Whisper API."""
+    client = AsyncOpenAI(
+        api_key=os.getenv("WHISPER_API_KEY", os.getenv("OPENAI_API_KEY")),
+        base_url=os.getenv("WHISPER_BASE_URL", os.getenv("OPENAI_BASE_URL"))
+    )
+
+    with open(file_path, "rb") as f:
+        response = await client.audio.transcriptions.create(
+            model=os.getenv("WHISPER_MODEL", "whisper-1"),
+            file=f,
+            language=WHISPER_LANGUAGE
+        )
+    return response.text
+
+def _transcribe_local(
+    file_path: Path,
+    language: Optional[str] = None
+) -> Optional[str]:
+    """Fallback to local whisper model."""
+    import whisper
+    model = whisper.load_model(LOCAL_WHISPER_MODEL)
+    result = model.transcribe(str(file_path), language=language)
+    return result["text"]
+
+async def process_audio(file_path: Path, file_id: str) -> dict:
+    """Process audio file: transcribe and save."""
+    try:
+        # Try API first
+        transcript = await _transcribe_with_openai(file_path)
+    except Exception as e:
+        if USE_LOCAL_WHISPER:
+            transcript = _transcribe_local(file_path, WHISPER_LANGUAGE)
+        else:
+            raise
+
+    # Save transcript
+    transcript_path = file_path.parent / f"{file_id}_transcript.txt"
+    transcript_path.write_text(transcript)
+
+    return {"transcript": transcript, "path": transcript_path}
+```
+
+### Configuration (`backend/config.py`)
+
+```python
+# Document Processing
+MAX_PDF_PAGES = 20
+SUPPORTED_DOCUMENT_TYPES = {
+    'application/pdf': 'pdf',
+    'text/plain': 'txt',
+    'text/markdown': 'md',
+}
+
+# Image Processing
+MODEL_RECEIVE_IMAGES = os.getenv("MODEL_RECEIVE_IMAGES", "false") == "true"
+MODEL_RECEIVE_IMAGES_PDF = os.getenv("MODEL_RECEIVE_IMAGES_PDF", "false") == "true"
+SUPPORTED_IMAGE_TYPES = {'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'}
+
+# Vision Model (separate from primary LLM)
+VISION_API_KEY = os.getenv("VISION_API_KEY")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL")
+VISION_MODEL = os.getenv("VISION_MODEL", "gpt-4o-mini")
+
+# Audio/Whisper
+WHISPER_BASE_URL = os.getenv("WHISPER_BASE_URL")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+USE_LOCAL_WHISPER = os.getenv("USE_LOCAL_WHISPER", "false") == "true"
+LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
+
+# File Storage
+FILES_DIR = os.getenv("FILES_DIR", "./files")
+```
+
+---
+
+## Implementation Roadmap
+
+This roadmap maps Fessi components to Graph-RAG implementation tasks.
+
+### Overview
+
+```
+Porting Strategy
+================
+
+Phase 1: Configuration ──────────────────────────────────────────────────
+         No Fessi code needed - new Graph-RAG config
+
+Phase 2: VisionHelper ───────────────────────────────────────────────────
+         Port: vision_helper.py → src/services/vision_helper.py
+         Changes: Singleton → ToolContext service, add sync wrapper
+
+Phase 3: DocumentRenderer ───────────────────────────────────────────────
+         Port: document_handler.py (partial) → src/services/document_renderer.py
+         Extend: Add PPTX/DOCX rendering (not in Fessi)
+
+Phase 4: DescriptionCache ───────────────────────────────────────────────
+         Port: description_cache.py → src/services/description_cache.py
+         Changes: PostgreSQL → file-based, file_id → content hash
+
+Phase 5: Enhanced read_file ─────────────────────────────────────────────
+         Port: file_retrieval_service.py logic → workspace_tools.py
+         Integrate: DocumentRenderer, VisionHelper, DescriptionCache
+
+Phase 6: Environment ────────────────────────────────────────────────────
+         Port: config.py patterns → .env.example
+```
+
+### Phase 1: Agent Configuration (No Fessi Port)
+
+**New Files:**
+- `config/defaults.yaml` (modify)
+- `config/schema.json` (modify)
+
+**Tasks:**
+| # | Task | Details |
+|---|------|---------|
+| 1.1 | Add `model.multimodal` to defaults.yaml | Default: `false` |
+| 1.2 | Add schema definition | Type: boolean, description |
+| 1.3 | Update config loader | Ensure property is accessible via `config.model.multimodal` |
+
+**Estimated Complexity:** Low
+
+---
+
+### Phase 2: VisionHelper Service
+
+**Source:** `Advanced-LLM-Chat/backend/services/vision_helper.py`
+**Target:** `src/services/vision_helper.py`
+
+**Porting Map:**
+| Fessi | Graph-RAG | Changes |
+|-------|-----------|---------|
+| `VisionHelper.__init__()` | `VisionHelper.__init__()` | Same pattern |
+| `describe_image()` | `describe_image()` | Add sync wrapper |
+| `analyze_document_page()` | `describe_document_page()` | Rename, add sync wrapper |
+| `get_vision_helper()` singleton | ToolContext service | Register in tool context |
+
+**Tasks:**
+| # | Task | Details |
+|---|------|---------|
+| 2.1 | Create `src/services/vision_helper.py` | Port class structure |
+| 2.2 | Port `describe_image()` | Keep async, add sync wrapper |
+| 2.3 | Port `analyze_document_page()` as `describe_document_page()` | Adjust prompts |
+| 2.4 | Add `run_async()` helper | For sync tool signatures |
+| 2.5 | Register in ToolContext | As `vision_helper` service |
+| 2.6 | Add unit tests | Mock AsyncOpenAI client |
+
+**Code to Reuse:**
+```python
+# Can copy directly with minimal changes:
+# - __init__() constructor pattern
+# - Base64 encoding logic
+# - Message format for vision API
+# - Default prompts
+```
+
+**Estimated Complexity:** Medium
+
+---
+
+### Phase 3: DocumentRenderer
+
+**Source:** `Advanced-LLM-Chat/backend/services/document_handler.py` (partial)
+**Target:** `src/services/document_renderer.py`
+
+**Porting Map:**
+| Fessi | Graph-RAG | Changes |
+|-------|-----------|---------|
+| `render_pdf_pages()` | `render_pdf_page()` | Single page, return bytes |
+| N/A | `render_pptx_slide()` | New implementation |
+| N/A | `render_docx_page()` | New implementation |
+| `MAX_PDF_PAGES` constant | `max_pages` config | Make configurable |
+
+**Tasks:**
+| # | Task | Details |
+|---|------|---------|
+| 3.1 | Create `src/services/document_renderer.py` | Class skeleton |
+| 3.2 | Port `render_pdf_page()` | From `render_pdf_pages()`, single page |
+| 3.3 | Implement `render_pptx_slide()` | LibreOffice → PDF → image |
+| 3.4 | Implement `render_docx_page()` | LibreOffice → PDF → image |
+| 3.5 | Implement `get_page_count()` | For each format |
+| 3.6 | Register in ToolContext | As `document_renderer` service |
+| 3.7 | Add unit tests | Test each format |
+
+**Code to Reuse:**
+```python
+# From Fessi document_handler.py:
+# - pdf2image convert_from_path() pattern
+# - DPI settings (150)
+# - PNG save to BytesIO pattern
+```
+
+**New Implementation Needed:**
+```python
+# PPTX/DOCX rendering via LibreOffice headless:
+def _convert_to_pdf(file_path: Path) -> Path:
+    """Convert PPTX/DOCX to PDF using LibreOffice."""
+    import subprocess
+    output_dir = Path(tempfile.mkdtemp())
+    subprocess.run([
+        'soffice', '--headless', '--convert-to', 'pdf',
+        '--outdir', str(output_dir), str(file_path)
+    ], check=True)
+    return output_dir / f"{file_path.stem}.pdf"
+```
+
+**Estimated Complexity:** Medium-High (PPTX/DOCX are new)
+
+---
+
+### Phase 4: DescriptionCache
+
+**Source:** `Advanced-LLM-Chat/backend/services/cache/description_cache.py`
+**Target:** `src/services/description_cache.py`
+
+**Porting Map:**
+| Fessi | Graph-RAG | Changes |
+|-------|-----------|---------|
+| `_make_key(file_id, query)` | `_make_key(file_path, page, query)` | Content hash instead of file_id |
+| PostgreSQL storage | File-based storage | Simpler, no DB dependency |
+| `get()` async | `get()` sync | File I/O is fast |
+| `set()` async | `set()` sync | File I/O is fast |
+| `delete_by_file()` | Not needed | Content-addressable keys |
+
+**Tasks:**
+| # | Task | Details |
+|---|------|---------|
+| 4.1 | Create `src/services/description_cache.py` | Class skeleton |
+| 4.2 | Implement `_hash_file_content()` | SHA256 of file bytes |
+| 4.3 | Implement `_make_key()` | Hash(content_hash + page + query) |
+| 4.4 | Implement `get()` | Read from `{key}.txt` |
+| 4.5 | Implement `set()` | Write to `{key}.txt` |
+| 4.6 | Create cache directory on init | `workspace/.vision_cache/` |
+| 4.7 | Register in ToolContext | As `description_cache` service |
+| 4.8 | Add unit tests | Test cache hit/miss |
+
+**Code to Reuse:**
+```python
+# From Fessi:
+# - SHA256 key generation pattern
+# - json.dumps(key_data, sort_keys=True) for deterministic keys
+```
+
+**Estimated Complexity:** Low
+
+---
+
+### Phase 5: Enhanced read_file Tool
+
+**Source:** `Advanced-LLM-Chat/backend/services/file_retrieval_service.py`
+**Target:** `src/tools/workspace_tools.py` (modify existing `read_file`)
+
+**Porting Map:**
+| Fessi | Graph-RAG | Changes |
+|-------|-----------|---------|
+| `FileContentResult` dataclass | Return dict or formatted string | Simpler |
+| `get_content()` method | `_read_file_impl()` | Integrate into tool |
+| `model_receives_images` param | `context.config.model.multimodal` | From config |
+| `file_id` lookup | Direct path | Workspace-relative |
+
+**Tasks:**
+| # | Task | Details |
+|---|------|---------|
+| 5.1 | Add `describe` parameter | To existing `read_file` signature |
+| 5.2 | Create `_handle_image_file()` | Port image handling logic |
+| 5.3 | Create `_handle_document_file()` | Port document handling logic |
+| 5.4 | Implement `_get_mime_type()` | Helper for image types |
+| 5.5 | Implement `_format_results()` | Format output for agent |
+| 5.6 | Update tool description | Document new capabilities |
+| 5.7 | Add integration tests | Test with real files |
+
+**Code to Reuse:**
+```python
+# From Fessi file_retrieval_service.py:
+# - Dual output path logic (model_receives_images check)
+# - Cache check before vision call pattern
+# - Base64 encoding for multimodal output
+# - Text + description formatting
+```
+
+**Estimated Complexity:** High (core integration point)
+
+---
+
+### Phase 6: Environment Configuration
+
+**Source:** `Advanced-LLM-Chat/backend/config.py`
+**Target:** `.env.example`
+
+**Porting Map:**
+| Fessi | Graph-RAG | Changes |
+|-------|-----------|---------|
+| `VISION_API_KEY` | `VISION_API_KEY` | Same |
+| `VISION_BASE_URL` | `VISION_BASE_URL` | Same |
+| `VISION_MODEL` | `VISION_MODEL` | Same, default gpt-4o-mini |
+| `MODEL_RECEIVE_IMAGES` | `model.multimodal` in config | Moved to agent config |
+| `WHISPER_*` vars | `WHISPER_*` vars | Same pattern |
+
+**Tasks:**
+| # | Task | Details |
+|---|------|---------|
+| 6.1 | Add vision env vars to `.env.example` | With comments |
+| 6.2 | Add whisper env vars to `.env.example` | Optional section |
+| 6.3 | Update README/docs | Document new configuration |
+
+**Estimated Complexity:** Low
+
+---
+
+### Implementation Order
+
+```
+Week 1: Foundation
+├── Phase 1: Agent Configuration (1 day)
+├── Phase 4: DescriptionCache (1 day)
+└── Phase 2: VisionHelper (2-3 days)
+
+Week 2: Rendering + Integration
+├── Phase 3: DocumentRenderer (3-4 days)
+│   ├── PDF rendering (1 day - port from Fessi)
+│   ├── PPTX rendering (1-2 days - new)
+│   └── DOCX rendering (1 day - new)
+└── Phase 6: Environment (0.5 day)
+
+Week 3: Tool Integration
+└── Phase 5: Enhanced read_file (3-4 days)
+    ├── Image handling (1 day)
+    ├── Document handling (2 days)
+    └── Testing + polish (1 day)
+```
+
+### File Mapping Summary
+
+| Fessi Source | Graph-RAG Target | Status |
+|--------------|------------------|--------|
+| `services/vision_helper.py` | `src/services/vision_helper.py` | Port |
+| `services/document_handler.py` | `src/services/document_renderer.py` | Partial port + extend |
+| `services/cache/description_cache.py` | `src/services/description_cache.py` | Port + simplify |
+| `services/file_retrieval_service.py` | `src/tools/workspace_tools.py` | Integrate into read_file |
+| `services/audio_handler.py` | `src/services/audio_handler.py` | Future (optional) |
+| `config.py` | `.env.example` + `config/defaults.yaml` | Adapt |
+
+---
 
 ## Implementation Plan
 
