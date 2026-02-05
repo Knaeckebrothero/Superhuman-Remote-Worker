@@ -15,6 +15,7 @@ References:
 """
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import Any, Callable, Dict, List, Optional
@@ -270,7 +271,7 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
                 msg_type = type(msg).__name__
                 debug_details.append(f"[{i}] {msg_type}: {content_tokens}t content, {tool_call_tokens}t tools, {len(content)} chars")
 
-        if debug_details and total > 50000:
+        if debug_details and total > 50000 and os.getenv("DEBUG_TOKEN_BREAKDOWN", "").strip() in ("1", "true"):
             logger.debug(f"Token count breakdown ({len(messages)} msgs, {total} total tokens):\n  " + "\n  ".join(debug_details))
 
         return total
