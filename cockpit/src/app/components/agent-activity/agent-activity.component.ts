@@ -84,12 +84,12 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
               [class.expanded]="isExpanded(entry._id)"
               [class.phase-strategic]="entry.phase === 'strategic'"
               [class.phase-tactical]="entry.phase === 'tactical'"
-              [style.border-left-color]="getStepColor(entry.step_type)"
+              [style.border-left-color]="getStepColor(entry.step_type, entry)"
             >
               <div class="entry-header" (click)="toggleExpanded(entry._id)">
                 <span class="step-number">#{{ entry.step_number }}</span>
-                <span class="step-badge" [style.background]="getStepColor(entry.step_type)">
-                  {{ getStepBadge(entry.step_type) }}
+                <span class="step-badge" [style.background]="getStepColor(entry.step_type, entry)">
+                  {{ getStepBadge(entry.step_type, entry) }}
                 </span>
                 <span class="node-name">{{ entry.node_name }}</span>
                 @if (isPending(entry)) {
@@ -180,7 +180,7 @@ import { AuditEntry, AuditFilterCategory, AuditStepType } from '../../core/model
                         <span class="detail-label">Tool Calls:</span>
                         <div class="tool-calls">
                           @for (tc of entry.llm.tool_calls; track tc.name) {
-                            <span class="tool-chip">{{ tc.name }}</span>
+                            <span class="tool-chip" [style.background]="getToolColor(tc.name)">{{ tc.name }}</span>
                           }
                         </div>
                       </div>
@@ -735,15 +735,66 @@ export class AgentActivityComponent {
     return `${visible}/${total}`;
   });
 
-  // Step type color mapping
+  // Step type color mapping (fallback for non-tool steps)
   private readonly stepColors: Record<AuditStepType, string> = {
     initialize: '#89b4fa',    // Blue
     llm: '#a6e3a1',           // Green (combined LLM call+response)
-    tool: '#cba6f7',          // Purple (combined tool call+result)
+    tool: '#cba6f7',          // Purple (default for unknown tools)
     check: '#fab387',         // Peach
     routing: '#94e2d5',       // Teal
     phase_complete: '#74c7ec',// Sapphire
     error: '#f38ba8',         // Red
+  };
+
+  // Tool category color mapping (Catppuccin Mocha palette)
+  private readonly toolCategoryColors: Record<string, string> = {
+    workspace: '#89b4fa',     // Blue - file operations
+    core: '#cba6f7',          // Purple - todo/job management
+    document: '#fab387',      // Peach - document processing
+    research: '#94e2d5',      // Teal - web search
+    citation: '#f9e2af',      // Yellow - citations
+    graph: '#f5c2e7',         // Pink - Neo4j graph
+  };
+
+  // Map tool names to their categories
+  private readonly toolCategories: Record<string, string> = {
+    // Workspace tools
+    read_file: 'workspace',
+    write_file: 'workspace',
+    edit_file: 'workspace',
+    list_files: 'workspace',
+    delete_file: 'workspace',
+    search_files: 'workspace',
+    file_exists: 'workspace',
+    move_file: 'workspace',
+    rename_file: 'workspace',
+    copy_file: 'workspace',
+    get_workspace_summary: 'workspace',
+    get_document_info: 'workspace',
+    // Core tools
+    next_phase_todos: 'core',
+    todo_complete: 'core',
+    todo_list: 'core',
+    todo_rewind: 'core',
+    mark_complete: 'core',
+    job_complete: 'core',
+    // Document tools
+    extract_document_text: 'document',
+    chunk_document: 'document',
+    identify_requirement_candidates: 'document',
+    // Research tools
+    web_search: 'research',
+    // Citation tools
+    cite_document: 'citation',
+    cite_web: 'citation',
+    list_sources: 'citation',
+    get_citation: 'citation',
+    list_citations: 'citation',
+    edit_citation: 'citation',
+    // Graph tools
+    execute_cypher_query: 'graph',
+    get_database_schema: 'graph',
+    validate_schema_compliance: 'graph',
   };
 
   // Step type badge labels
@@ -774,11 +825,46 @@ export class AgentActivityComponent {
     return this.expandedIds().has(entryId);
   }
 
-  getStepColor(stepType: AuditStepType): string {
+  getStepColor(stepType: AuditStepType, entry?: AuditEntry): string {
+    // For tool steps, use category-based coloring
+    if (stepType === 'tool' && entry?.tool?.name) {
+      const category = this.toolCategories[entry.tool.name];
+      if (category && this.toolCategoryColors[category]) {
+        return this.toolCategoryColors[category];
+      }
+    }
     return this.stepColors[stepType] || '#6c7086';
   }
 
-  getStepBadge(stepType: AuditStepType): string {
+  getToolCategory(toolName: string): string | undefined {
+    return this.toolCategories[toolName];
+  }
+
+  getToolColor(toolName: string): string {
+    const category = this.toolCategories[toolName];
+    if (category && this.toolCategoryColors[category]) {
+      return this.toolCategoryColors[category];
+    }
+    return this.stepColors.tool; // Default purple for unknown tools
+  }
+
+  getStepBadge(stepType: AuditStepType, entry?: AuditEntry): string {
+    // For tool steps, show the category as the badge
+    if (stepType === 'tool' && entry?.tool?.name) {
+      const category = this.toolCategories[entry.tool.name];
+      if (category) {
+        // Abbreviate category names for badge display
+        const categoryBadges: Record<string, string> = {
+          workspace: 'FILE',
+          core: 'CORE',
+          document: 'DOC',
+          research: 'WEB',
+          citation: 'CITE',
+          graph: 'GRAPH',
+        };
+        return categoryBadges[category] || 'TOOL';
+      }
+    }
     return this.stepBadges[stepType] || stepType.toUpperCase();
   }
 
@@ -791,10 +877,11 @@ export class AgentActivityComponent {
 
   formatTime(timestamp: string): string {
     const date = new Date(timestamp);
-    return date.toLocaleTimeString('en-GB', {
+    return date.toLocaleTimeString(undefined, {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
+      hour12: false,
     });
   }
 

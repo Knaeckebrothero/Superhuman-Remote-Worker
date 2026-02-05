@@ -14,8 +14,26 @@ This is the canonical database layer for the orchestrator.
 import math
 import os
 import logging
-from datetime import datetime as dt
+from datetime import datetime as dt, timezone
 from typing import Optional, List, Dict, Any, Literal
+
+
+def _to_iso_utc(timestamp: Any) -> str:
+    """Convert a datetime to ISO string with UTC timezone indicator.
+
+    MongoDB stores dates in UTC but returns naive datetime objects.
+    This ensures the 'Z' suffix is included so JavaScript parses them correctly.
+    """
+    if hasattr(timestamp, "isoformat"):
+        # If naive datetime, assume UTC and add Z suffix
+        if hasattr(timestamp, "tzinfo") and timestamp.tzinfo is None:
+            return timestamp.isoformat() + "Z"
+        # If already has timezone, convert to UTC and use Z suffix
+        elif hasattr(timestamp, "astimezone"):
+            utc_dt = timestamp.astimezone(timezone.utc)
+            return utc_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        return timestamp.isoformat()
+    return str(timestamp)
 
 try:
     from bson import ObjectId
@@ -295,10 +313,8 @@ class MongoDB:
             return None
 
         # Convert datetime objects to ISO strings
-        start_ts = first["timestamp"]
-        end_ts = last["timestamp"]
-        start_str = start_ts.isoformat() if hasattr(start_ts, 'isoformat') else str(start_ts)
-        end_str = end_ts.isoformat() if hasattr(end_ts, 'isoformat') else str(end_ts)
+        start_str = _to_iso_utc(first["timestamp"])
+        end_str = _to_iso_utc(last["timestamp"])
 
         return {"start": start_str, "end": end_str}
 
@@ -476,8 +492,8 @@ class MongoDB:
         async for doc in cursor:
             doc["_id"] = str(doc["_id"])
             # Convert timestamp to ISO string
-            if "timestamp" in doc and hasattr(doc["timestamp"], "isoformat"):
-                doc["timestamp"] = doc["timestamp"].isoformat()
+            if "timestamp" in doc:
+                doc["timestamp"] = _to_iso_utc(doc["timestamp"])
             entries.append(doc)
 
         return {
@@ -531,8 +547,8 @@ class MongoDB:
         entries = []
         async for doc in cursor:
             doc["_id"] = str(doc["_id"])
-            if "timestamp" in doc and hasattr(doc["timestamp"], "isoformat"):
-                doc["timestamp"] = doc["timestamp"].isoformat()
+            if "timestamp" in doc:
+                doc["timestamp"] = _to_iso_utc(doc["timestamp"])
             entries.append(doc)
 
         return {
@@ -595,8 +611,7 @@ class MongoDB:
             # Extract relevant data for graph delta
             query_text = doc.get("tool", {}).get("arguments", {}).get("query", "")
             timestamp = doc.get("timestamp")
-            if hasattr(timestamp, "isoformat"):
-                timestamp = timestamp.isoformat()
+            timestamp = _to_iso_utc(timestamp) if timestamp else None
 
             deltas.append({
                 "toolCallIndex": index,
@@ -656,8 +671,7 @@ class MongoDB:
 
         last_update = None
         if last_entry and "timestamp" in last_entry:
-            ts = last_entry["timestamp"]
-            last_update = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            last_update = _to_iso_utc(last_entry["timestamp"])
 
         # Version is a hash of counts - if any count changes, version changes
         version = hash((audit_count, chat_count, graph_count))

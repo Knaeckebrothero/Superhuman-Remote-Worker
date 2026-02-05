@@ -236,24 +236,42 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
 
     try:
         # Try to get encoding for specific model
+        # Strip provider prefix (e.g., "openai/gpt-oss-120b" -> "gpt-oss-120b")
+        model_name = model.split("/")[-1] if "/" in model else model
         try:
-            enc = tiktoken.encoding_for_model(model)
+            enc = tiktoken.encoding_for_model(model_name)
+            logger.debug(f"Using tiktoken encoding for model {model_name}: {enc.name}")
         except KeyError:
             # Fall back to cl100k_base (used by GPT-4)
             enc = tiktoken.get_encoding("cl100k_base")
+            logger.debug(f"Model {model_name} not found in tiktoken, using cl100k_base")
 
         total = 0
-        for msg in messages:
+        debug_details = []
+        for i, msg in enumerate(messages):
+            msg_tokens = 0
             # Count message content
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            total += len(enc.encode(content))
+            content_tokens = len(enc.encode(content))
+            msg_tokens += content_tokens
 
             # Count tool calls if present
+            tool_call_tokens = 0
             if hasattr(msg, "tool_calls") and msg.tool_calls:
-                total += len(enc.encode(str(msg.tool_calls)))
+                tool_call_tokens = len(enc.encode(str(msg.tool_calls)))
+                msg_tokens += tool_call_tokens
 
             # Add overhead for message structure (role, etc.)
-            total += 4  # Approximate overhead per message
+            msg_tokens += 4  # Approximate overhead per message
+            total += msg_tokens
+
+            # Log large messages
+            if msg_tokens > 1000:
+                msg_type = type(msg).__name__
+                debug_details.append(f"[{i}] {msg_type}: {content_tokens}t content, {tool_call_tokens}t tools, {len(content)} chars")
+
+        if debug_details and total > 50000:
+            logger.debug(f"Token count breakdown ({len(messages)} msgs, {total} total tokens):\n  " + "\n  ".join(debug_details))
 
         return total
 

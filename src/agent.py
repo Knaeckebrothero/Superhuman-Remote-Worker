@@ -232,6 +232,7 @@ class UniversalAgent:
         stream: bool = False,
         resume: bool = False,
         feedback: Optional[str] = None,
+        resume_config_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Process a single job.
 
@@ -244,6 +245,8 @@ class UniversalAgent:
             stream: If True, return an async iterator of state updates
             resume: If True, resume from checkpoint (if exists)
             feedback: Optional feedback message to inject when resuming a frozen job
+            resume_config_name: Config name to use for checkpoint lookup when resuming
+                (allows a different agent to resume a job started by another config)
 
         Returns:
             Final state dictionary with results
@@ -330,9 +333,16 @@ class UniversalAgent:
             )
 
             # Execute graph
+            # Use resume_config_name for thread_id when resuming (allows different agent
+            # to resume a job started by another config). Otherwise use self.config.agent_id.
+            config_for_thread = (
+                resume_config_name
+                if resume and resume_config_name
+                else self.config.agent_id
+            )
             thread_config = {
                 "configurable": {
-                    "thread_id": f"{self.config.agent_id}_{job_id}",
+                    "thread_id": f"{config_for_thread}_{job_id}",
                 },
                 "recursion_limit": 1000000,  # Effectively unlimited
             }
