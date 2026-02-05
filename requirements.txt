@@ -27,11 +27,12 @@ pdfplumber>=0.10.0
 pdf2image>=1.16.0  # PDF page rendering (requires poppler system package)
 Pillow>=10.0.0  # Image handling for document rendering
 python-docx>=1.1.0
+docx2txt>=0.8  # Required by langchain Docx2txtLoader
 python-pptx>=0.6.21
 openpyxl>=3.1.0
 beautifulsoup4>=4.12.0
 # Optional: Semantic similarity for advanced duplicate detection
-# sentence-transformers>=2.2.0
+sentence-transformers>=2.2.0
 # Vector search for workspace semantic search (Phase 8)
 pgvector>=0.2.0
 langchain-postgres>=0.0.6
@@ -45,4 +46,4 @@ pymongo>=4.6.0
 # System metrics for agent heartbeats
 psutil>=5.9.0
 # Install the citation engine from local directory:
-# -e ./citation_tool[full]
+-e ./citation_tool[full]
