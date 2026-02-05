@@ -141,7 +141,7 @@ For visual content (charts, diagrams), the VisionHelper will automatically descr
 
 Use `get_document_info` to get metadata about documents before reading them fully.
 
-Use `extract_document_text` for full text extraction from documents.
+Use `read_file` to read any document (PDF, DOCX, PPTX, images, text files).
 
 ### Citing Sources
 
