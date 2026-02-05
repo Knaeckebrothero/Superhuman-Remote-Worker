@@ -133,6 +133,10 @@ class TodoManager:
         self._staged_phase_name: str = ""
         # Phase state tracking (for job_complete validation)
         self._is_strategic_phase: bool = True
+        # Phase number tracking (for git versioning and archive naming)
+        # Paired numbering: strategic and tactical phases share the same number
+        self._phase_number: int = 1
+        self._current_phase_name: str = ""  # Human-readable name for current phase
 
     @property
     def is_strategic_phase(self) -> bool:
@@ -144,6 +148,53 @@ class TodoManager:
         """Set the current phase state."""
         self._is_strategic_phase = value
         logger.debug(f"Phase state updated: is_strategic={value}")
+
+    @property
+    def phase_number(self) -> int:
+        """Get the current phase number."""
+        return self._phase_number
+
+    @property
+    def current_phase_name(self) -> str:
+        """Get the current phase name."""
+        return self._current_phase_name or self._staged_phase_name
+
+    def get_phase_info(self) -> Dict[str, Any]:
+        """Get current phase information for commits and state files.
+
+        Returns:
+            Dictionary containing:
+            - phase_number: Current phase number (paired numbering)
+            - phase_type: "strategic" or "tactical"
+            - phase_name: Human-readable phase name
+        """
+        return {
+            "phase_number": self._phase_number,
+            "phase_type": "strategic" if self._is_strategic_phase else "tactical",
+            "phase_name": self._current_phase_name or self._staged_phase_name,
+        }
+
+    def increment_phase_number(self) -> int:
+        """Increment phase number (called on tactical → strategic transition).
+
+        In the paired numbering model, the phase number increments when
+        transitioning from tactical back to strategic (starting a new pair).
+
+        Returns:
+            The new phase number
+        """
+        self._phase_number += 1
+        logger.info(f"Phase number incremented to {self._phase_number}")
+        return self._phase_number
+
+    def set_phase_name(self, name: str) -> None:
+        """Set the current phase name.
+
+        Args:
+            name: Human-readable phase name
+        """
+        self._current_phase_name = name
+        logger.debug(f"Phase name set to: {name}")
 
     def add(self, content: str, priority: str = "medium") -> TodoItem:
         """Add a new todo item.
@@ -169,7 +220,11 @@ class TodoManager:
     def complete(
         self, todo_id: str, notes: Optional[List[str]] = None
     ) -> Optional[TodoItem]:
-        """Mark a todo as completed.
+        """Mark a todo as completed and commit changes.
+
+        Marks the todo as completed, then auto-commits workspace changes
+        if git versioning is active. Commit failures are logged but don't
+        prevent the todo from being marked complete.
 
         Args:
             todo_id: Todo ID to complete
@@ -184,6 +239,10 @@ class TodoManager:
                 if notes:
                     todo.notes.extend(notes)
                 logger.info(f"Completed todo: {todo_id}")
+
+                # Auto-commit if git versioning is active
+                self._commit_todo_completion(todo)
+
                 return todo
 
         logger.warning(f"Todo not found: {todo_id}")
@@ -330,14 +389,76 @@ class TodoManager:
 
         return "\n".join(lines)
 
+    def _build_commit_message(self, todo: TodoItem) -> str:
+        """Build structured commit message for completed todo.
+
+        Format:
+            [Phase N Strategic/Tactical] todo_X: Task description
+
+            Completed: 2026-02-01T14:23:00Z
+            Notes: Note 1; Note 2
+
+        Args:
+            todo: The completed TodoItem
+
+        Returns:
+            Formatted commit message
+        """
+        phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
+        header = f"[Phase {self._phase_number} {phase_type}] {todo.id}: {todo.content}"
+
+        body_lines = [
+            f"Completed: {datetime.now(timezone.utc).isoformat()}",
+        ]
+
+        if todo.notes:
+            body_lines.append(f"Notes: {'; '.join(todo.notes)}")
+
+        return header + "\n\n" + "\n".join(body_lines)
+
+    def _commit_todo_completion(self, todo: TodoItem) -> bool:
+        """Commit workspace changes for completed todo.
+
+        Auto-commits when git versioning is active. Uses the commit message
+        format defined by _build_commit_message().
+
+        Args:
+            todo: The completed TodoItem
+
+        Returns:
+            True if commit succeeded or git not active, False if commit failed
+
+        Note:
+            Empty commits are allowed (allow_empty=True) because a todo might
+            involve read-only analysis. This maintains the audit trail.
+            Commit failures are logged but don't fail the todo completion.
+        """
+        git_mgr = self._workspace.git_manager
+        if git_mgr is None or not git_mgr.is_active:
+            # Git not available - this is fine, just skip
+            return True
+
+        message = self._build_commit_message(todo)
+        success = git_mgr.commit(message, allow_empty=True)
+
+        if not success:
+            logger.warning(f"Git commit failed for {todo.id}")
+            return False
+
+        logger.debug(f"Committed changes for {todo.id}")
+        return True
+
     def archive(self, phase_name: str = "") -> str:
         """Archive todos to workspace and clear the list.
 
         Writes completed todos as markdown to archive/ directory,
         then clears the internal list for the next phase.
 
+        Uses phase-aware naming: todos_phase_{N}_{type}_{ts}.md
+        Example: todos_phase_2_tactical_20260201_140000.md
+
         Args:
-            phase_name: Optional name for the archived phase
+            phase_name: Optional name for the archived phase (used in header)
 
         Returns:
             Path to archive file
@@ -346,15 +467,19 @@ class TodoManager:
             logger.info("No todos to archive")
             return ""
 
+        # Get phase info for naming
+        phase_info = self.get_phase_info()
+        phase_type = phase_info["phase_type"]
+        phase_num = phase_info["phase_number"]
+
         # Generate archive content
         lines = []
         timestamp = datetime.now(timezone.utc)
 
-        # Header
-        if phase_name:
-            lines.append(f"# Archived Todos: {phase_name}")
-        else:
-            lines.append("# Archived Todos")
+        # Header with phase info
+        header_name = phase_name or phase_info["phase_name"] or f"Phase {phase_num} {phase_type.title()}"
+        lines.append(f"# Archived Todos: {header_name}")
+        lines.append(f"Phase: {phase_num} ({phase_type})")
         lines.append(f"Archived: {timestamp.isoformat()}")
         lines.append("")
 
@@ -385,13 +510,10 @@ class TodoManager:
 
         content = "\n".join(lines)
 
-        # Generate filename
+        # Generate filename with phase-aware naming
+        # Format: todos_phase_{N}_{type}_{ts}.md
         ts_str = timestamp.strftime("%Y%m%d_%H%M%S")
-        if phase_name:
-            safe_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in phase_name)
-            filename = f"todos_{safe_name}_{ts_str}.md"
-        else:
-            filename = f"todos_{ts_str}.md"
+        filename = f"todos_phase_{phase_num}_{phase_type}_{ts_str}.md"
 
         archive_path = f"archive/{filename}"
 
@@ -798,12 +920,18 @@ class TodoManager:
             - staged_todos: List of staged todo dicts
             - next_id: Next todo ID counter
             - staged_phase_name: Name of the staged phase
+            - phase_number: Current phase number (paired numbering)
+            - current_phase_name: Human-readable phase name
+            - is_strategic_phase: Current phase type
         """
         return {
             "todos": [t.to_dict() for t in self._todos],
             "staged_todos": [t.to_dict() for t in self._staged_todos],
             "next_id": self._next_id,
             "staged_phase_name": self._staged_phase_name,
+            "phase_number": self._phase_number,
+            "current_phase_name": self._current_phase_name,
+            "is_strategic_phase": self._is_strategic_phase,
         }
 
     def restore_state(self, state: Dict[str, Any]) -> None:
@@ -815,6 +943,9 @@ class TodoManager:
                 - staged_todos: List of staged todo dicts (optional)
                 - next_id or todo_next_id: Next todo ID counter (optional)
                 - staged_phase_name: Name of the staged phase (optional)
+                - phase_number: Current phase number (optional, default: 1)
+                - current_phase_name: Human-readable phase name (optional)
+                - is_strategic_phase: Current phase type (optional)
         """
         todos_data = state.get("todos") or []
         self._todos = [TodoItem.from_dict(t) for t in todos_data]
@@ -827,8 +958,15 @@ class TodoManager:
 
         self._staged_phase_name = state.get("staged_phase_name") or ""
 
+        # Restore phase tracking fields
+        self._phase_number = state.get("phase_number", 1)
+        self._current_phase_name = state.get("current_phase_name", "")
+        if "is_strategic_phase" in state:
+            self._is_strategic_phase = state["is_strategic_phase"]
+
         logger.info(
             f"Restored TodoManager: {len(self._todos)} todos, "
-            f"{len(self._staged_todos)} staged, next_id={self._next_id}"
+            f"{len(self._staged_todos)} staged, next_id={self._next_id}, "
+            f"phase={self._phase_number} ({('strategic' if self._is_strategic_phase else 'tactical')})"
         )
 

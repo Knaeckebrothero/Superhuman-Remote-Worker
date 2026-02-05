@@ -124,6 +124,19 @@
           "type": "integer",
           "minimum": 1000,
           "description": "DEPRECATED: Use max_read_words instead. If max_read_words is not set, falls back to max_read_size / 5.5."
+        },
+        "git_versioning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable git versioning for workspace history. Creates a git repository in the workspace for automatic change tracking."
+        },
+        "git_ignore_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"],
+          "description": "Patterns for .gitignore when git versioning is enabled"
         }
       }
     },
@@ -179,6 +192,14 @@
           },
           "description": "Neo4j graph operation tools (src/tools/graph/)",
           "examples": [["execute_cypher_query", "get_database_schema"]]
+        },
+        "git": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Git version control tools for workspace history (src/tools/git/)",
+          "examples": [["git_log", "git_show", "git_diff", "git_status", "git_tags"]]
         }
       }
     },

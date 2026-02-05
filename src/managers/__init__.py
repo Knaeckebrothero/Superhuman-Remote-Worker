@@ -38,11 +38,13 @@ Example:
     ```
 """
 
+from .git_manager import GitManager
 from .memory import MemoryManager
 from .plan import PlanManager
 from .todo import TodoItem, TodoManager, TodoStatus
 
 __all__ = [
+    "GitManager",
     "TodoManager",
     "TodoItem",
     "TodoStatus",

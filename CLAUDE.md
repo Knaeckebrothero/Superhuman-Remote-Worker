@@ -190,16 +190,20 @@ agent_id: my_agent
 display_name: My Custom Agent
 
 tools:
-  domain:
+  research:
     - web_search
+  citation:
     - cite_web
 ```
 
 Tool categories in config:
-- `workspace`: File operations (read_file, write_file, etc.)
-- `todo`: Task management (next_phase_todos, todo_complete, todo_rewind)
-- `domain`: Agent-specific tools (set per config)
-- `completion`: Phase/job signaling (mark_complete, job_complete)
+- `workspace`: File operations (read_file, write_file, list_files, etc.)
+- `core`: Task management + completion (next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete)
+- `document`: Document processing (extract_document_text, chunk_document, identify_requirement_candidates)
+- `research`: Web search (web_search)
+- `citation`: Citation management (cite_document, cite_web, list_sources, etc.)
+- `graph`: Neo4j operations (execute_cypher_query, get_database_schema, validate_schema_compliance)
+- `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
 
 **Phase-specific tool filtering**: `job_complete` is only available during strategic phases. Tactical phases cannot signal job completion directly.
 
@@ -221,19 +225,17 @@ Per-job directory: `workspace/job_<uuid>/`
 - `documents/` - Input documents
 - `tools/` - Auto-generated tool documentation (one `.md` file per tool)
 - `analysis/` - Validator working files (e.g., `requirement_input.md`)
+- `.git/` - Git repository for workspace versioning (when `workspace.git_versioning: true`)
 - Checkpoints: `workspace/checkpoints/job_<id>.db` (SQLite)
+
+**Git Versioning**: When enabled (`workspace.git_versioning: true` in config), each workspace is a git repo. Auto-commits on todo completion, tags mark phase boundaries. Use `git_log`, `git_show`, `git_diff` tools to query history.
 
 ### Context Management
 
 Token limits trigger automatic summarization:
-- `context_threshold_tokens`: 60000 (default in defaults.yaml)
+- `context_threshold_tokens`: 80000 (default in defaults.yaml)
 - `message_count_threshold`: 200 messages
 - `keep_recent_tool_results`: 10 most recent preserved during compaction
-
-### Todo Limits
-
-Todo constraints (in `todo` config section):
-- `max_items`: 20 (maximum todos allowed per phase)
 
 ## Key Source Directories
 
@@ -307,10 +309,17 @@ Supports: PDF, PPTX, DOCX, PNG, JPG, GIF, WebP, BMP, TIFF
 ## Environment Variables
 
 Required in `.env`:
-- `OPENAI_API_KEY` - LLM API key
+- `OPENAI_API_KEY` - LLM API key (or compatible API)
+- `DATABASE_URL` - PostgreSQL connection string
 - `LLM_BASE_URL` - Custom endpoint (optional, for vLLM/Ollama)
-- `TAVILY_API_KEY` - Web search (Creator agent)
-- Database URLs configured in `.env.example`
+
+**Optional providers:**
+- `ANTHROPIC_API_KEY` - For Claude models (claude-*)
+- `GOOGLE_API_KEY` - For Gemini models (gemini-*)
+- `GROQ_API_KEY` - For Groq fast inference
+- `TAVILY_API_KEY` - Web search
+- `MONGODB_URL` - LLM request archiving (audit trail)
+- `NEO4J_URI` - Knowledge graph (if connections.neo4j: true)
 
 **Vision Model** (for text-only agents):
 - `VISION_API_KEY` - API key for vision model (defaults to `OPENAI_API_KEY`)
@@ -334,6 +343,8 @@ Required in `.env`:
 **Workspace files**: `workspace/job_<uuid>/` (workspace.md, todos.yaml, plan.md)
 
 **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite for resume)
+
+**Phase Snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/` - Created at phase boundaries for recovery. Each snapshot includes checkpoint.db, workspace.md, plan.md, todos.yaml, and archive/.
 
 **Logs**: `workspace/logs/job_<id>.log`
 

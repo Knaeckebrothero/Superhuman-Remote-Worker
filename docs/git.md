@@ -23,6 +23,7 @@ Each agent workspace becomes a local git repository. The agent commits its work 
 | **Rollback capability** | Mistakes can be reverted with `git reset` or `git revert` |
 | **Familiar tooling** | Developers can debug with standard git commands |
 | **Forward-looking** | When agents work on actual codebases, git infrastructure is already in place |
+| **Phase tracking** | Solves the phase numbering issues in `docs/phase_number_issues.md` - git tags and `phase_state.yaml` survive context compaction |
 
 ### Why Not Just Improve workspace.md?
 
@@ -49,6 +50,7 @@ Create `src/tools/git/` with read-only git inspection tools.
 | `git_show` | Inspect a specific commit's changes | Both |
 | `git_diff` | Compare current state to previous commits | Both |
 | `git_status` | See uncommitted changes | Both |
+| `git_tags` | List phase milestone tags | Both |
 
 #### Deferred Tools (v2+)
 
@@ -70,26 +72,48 @@ git_log(max_count: int = 10, oneline: bool = True) -> str
 
 **git_show**
 ```
-git_show(commit_ref: str = "HEAD", stat_only: bool = False) -> str
+git_show(commit_ref: str = "HEAD", stat_only: bool = False, max_lines: int = 500) -> str
 ```
 - Shows full commit details and diff
 - `stat_only=True` for just file list without full diff (context-friendly)
+- `max_lines` limits output to prevent context bloat (default: 500)
 
 **git_diff**
 ```
-git_diff(ref1: str = None, ref2: str = None, file_path: str = None) -> str
+git_diff(ref1: str = None, ref2: str = None, file_path: str = None, max_lines: int = 500) -> str
 ```
 - No args: show uncommitted changes (working directory vs HEAD)
 - One ref: compare that ref to working directory
 - Two refs: compare between refs
 - `file_path`: limit to specific file
+- `max_lines` limits output to prevent context bloat (default: 500)
 
 **git_status**
 ```
 git_status() -> str
 ```
 - Shows current branch, uncommitted changes, untracked files
+- Provides clear indication of workspace state:
+  - `clean`: No uncommitted changes
+  - `dirty`: Modified/staged files exist (lists them)
+  - `untracked`: New files not yet tracked
 - Useful before committing to verify state
+
+**git_tags**
+```
+git_tags(pattern: str = "phase-*") -> str
+```
+- Lists git tags, filtered by pattern (default: phase tags)
+- Returns tags in chronological order
+- Useful for understanding phase progression after context compaction
+- Example output: `phase-1-strategic-complete, phase-1-tactical-complete, phase-2-strategic-complete`
+
+#### Output Truncation
+
+All git tools that can produce large output implement truncation:
+- `max_lines` parameter (default: 500 lines)
+- Hard limit: 10,000 words maximum regardless of `max_lines`
+- Truncated output includes count of omitted lines/words
 
 ### 2. Workspace Git Initialization
 
@@ -101,13 +125,18 @@ Modify `WorkspaceManager.initialize()` to optionally create a git repository.
 1. Create workspace directory structure (existing)
 2. Copy template files (existing)
 3. IF git_versioning enabled:
-   a. Run `git init`
-   b. Create .gitignore from configured patterns
-   c. Configure local git user (agent@workspace.local)
-   d. Stage all initial files
-   e. Create initial commit: "Initialize workspace"
+   a. Check if .git already exists
+      - If yes: log "Git repository already exists, skipping initialization" and continue
+      - If no: proceed with initialization
+   b. Run `git init`
+   c. Create .gitignore from configured patterns
+   d. Configure local git user (agent@workspace.local)
+   e. Stage all initial files
+   f. Create initial commit: "Initialize workspace"
 4. Continue with normal initialization
 ```
+
+**Handling existing .git directories**: If the workspace already has a `.git` directory (e.g., resumed job, or workspace created from an existing repository), skip initialization but still enable git tools. This allows the agent to work with pre-existing repositories.
 
 #### Configuration
 
@@ -149,6 +178,9 @@ Create a shared `GitManager` class that encapsulates all git operations. This al
 class GitManager:
     """Manages git operations for a workspace directory."""
 
+    # Subprocess timeout for git commands (seconds)
+    DEFAULT_TIMEOUT = 60
+
     def __init__(self, workspace_path: Path):
         self._workspace_path = workspace_path
         self._git_available = self._check_git_available()
@@ -159,7 +191,13 @@ class GitManager:
         return self._git_available and (self._workspace_path / ".git").exists()
 
     def init_repository(self, ignore_patterns: List[str]) -> bool:
-        """Initialize git repository with .gitignore."""
+        """Initialize git repository with .gitignore.
+
+        Returns False if .git already exists (no-op).
+        """
+        if (self._workspace_path / ".git").exists():
+            logger.info("Git repository already exists, skipping initialization")
+            return True
         ...
 
     def commit(self, message: str, allow_empty: bool = True) -> bool:
@@ -170,28 +208,94 @@ class GitManager:
         """Get commit history."""
         ...
 
-    def show(self, commit_ref: str = "HEAD", stat_only: bool = False) -> str:
-        """Show commit details."""
+    def show(self, commit_ref: str = "HEAD", stat_only: bool = False, max_lines: int = 500) -> str:
+        """Show commit details with output truncation."""
         ...
 
-    def diff(self, ref1: str = None, ref2: str = None, file_path: str = None) -> str:
-        """Show differences."""
+    def diff(self, ref1: str = None, ref2: str = None, file_path: str = None, max_lines: int = 500) -> str:
+        """Show differences with output truncation."""
         ...
 
     def status(self) -> str:
-        """Get current status."""
+        """Get current status with clear dirty/clean indication."""
         ...
 
-    def _run_git(self, args: List[str]) -> subprocess.CompletedProcess:
-        """Execute git command in workspace directory."""
+    def has_uncommitted_changes(self) -> bool:
+        """Check if there are uncommitted changes in the workspace."""
         ...
+
+    def tag(self, tag_name: str, message: str = None) -> bool:
+        """Create a git tag at current HEAD."""
+        ...
+
+    def list_tags(self, pattern: str = None) -> List[str]:
+        """List git tags, optionally filtered by pattern."""
+        ...
+
+    def _run_git(self, args: List[str], timeout: int = DEFAULT_TIMEOUT) -> subprocess.CompletedProcess:
+        """Execute git command in workspace directory with timeout."""
+        ...
+
+    def _truncate_output(self, output: str, max_lines: int = 500, max_words: int = 10000) -> str:
+        """Truncate output to prevent context bloat."""
+        lines = output.splitlines()
+        words = output.split()
+
+        truncated = False
+        result = output
+
+        if len(lines) > max_lines:
+            result = "\n".join(lines[:max_lines])
+            truncated = True
+
+        if len(words) > max_words:
+            result = " ".join(words[:max_words])
+            truncated = True
+
+        if truncated:
+            result += f"\n\n... truncated ({len(lines)} lines, {len(words)} words total)"
+
+        return result
+```
+
+#### Storage Location
+
+**GitManager is stored on WorkspaceManager**, not ToolContext. This is because:
+- TodoManager takes `workspace` in its constructor and needs git access for auto-commits
+- WorkspaceManager is the natural owner of workspace-level infrastructure
+- ToolContext can access git via `context.workspace_manager.git_manager`
+
+```python
+# WorkspaceManager
+class WorkspaceManager:
+    def __init__(self, ...):
+        ...
+        self._git_manager: Optional[GitManager] = None
+
+    @property
+    def git_manager(self) -> Optional[GitManager]:
+        return self._git_manager
+```
+
+#### ToolContext Addition
+
+Add convenience method to ToolContext for tools:
+
+```python
+# ToolContext
+def has_git(self) -> bool:
+    """Check if git manager is available and active."""
+    if not self.has_workspace():
+        return False
+    gm = self.workspace_manager.git_manager
+    return gm is not None and gm.is_active
 ```
 
 #### Usage Across Modules
 
-- **WorkspaceManager**: Uses `GitManager.init_repository()` during workspace creation
-- **TodoManager**: Uses `GitManager.commit()` on todo completion
-- **Git Tools**: Use `GitManager.log/show/diff/status()` for agent queries
+- **WorkspaceManager**: Creates GitManager during `initialize()`, stores as `_git_manager`
+- **TodoManager**: Accesses via `self._workspace.git_manager` for auto-commits
+- **Git Tools**: Access via `context.workspace_manager.git_manager` for queries
 
 ### 4. Auto-Commit on Todo Completion
 
@@ -204,34 +308,240 @@ def complete(self, todo_id: str, notes: Optional[List[str]] = None) -> Optional[
     """Mark a todo as completed and commit changes."""
     # ... existing completion logic ...
 
-    # Auto-commit if git versioning is active
-    if self._git_manager and self._git_manager.is_active:
-        self._commit_todo_completion(todo)
+    # Auto-commit if git versioning is active (access via workspace)
+    git_mgr = self._workspace.git_manager
+    if git_mgr and git_mgr.is_active:
+        self._commit_todo_completion(todo, git_mgr)
 
     return todo
 
-def _commit_todo_completion(self, todo: TodoItem) -> None:
+def _commit_todo_completion(self, todo: TodoItem, git_mgr: GitManager) -> None:
     """Commit workspace changes for completed todo."""
     message = self._build_commit_message(todo)
-    success = self._git_manager.commit(message, allow_empty=True)
+    success = git_mgr.commit(message, allow_empty=True)
     if not success:
         logger.warning(f"Git commit failed for {todo.id}")
     # Don't fail the todo completion - just log and continue
 ```
+
+**Note**: TodoManager accesses GitManager via `self._workspace.git_manager` rather than storing a separate reference. This keeps the dependency chain simple: TodoManager → WorkspaceManager → GitManager.
 
 **Note on `allow_empty=True`**: Empty commits are allowed intentionally. A todo might involve read-only analysis that doesn't change files. Empty commits won't bloat diffs and maintain the audit trail. Can be revisited if they cause noise.
 
 #### Commit Message Format
 
 ```
-[Phase 3] todo_4: Extract requirements from chapter 2
+[Phase 3 Tactical] todo_4: Extract requirements from chapter 2
 
 Completed: 2026-02-01T14:23:00Z
-Phase: tactical
 Notes: Found 12 requirements, 3 marked as ambiguous
 ```
 
+```
+[Phase 3 Strategic] todo_2: Review phase results
+
+Completed: 2026-02-01T15:10:00Z
+Notes: Updated workspace.md with findings
+```
+
 Structured format enables programmatic parsing for debugging and analysis.
+
+### 6. Phase Tracking Integration
+
+Git versioning solves the phase numbering issues documented in `docs/phase_number_issues.md`. Instead of maintaining phase state only in memory (which gets lost during context compaction), git becomes the authoritative source of phase progress.
+
+#### Problem Recap
+
+From `phase_number_issues.md`:
+- Phase identity is implicit - agent reconstructs from context, degrades over time
+- Context compaction destroys state
+- Separate counters for strategic/tactical create confusion
+
+#### Solution: Paired Numbering with Git as Ground Truth
+
+**`phase_state.yaml`** - Single source of truth at workspace root:
+
+```yaml
+phase_number: 3
+phase_type: tactical
+phase_name: "Requirement Extraction"
+started_at: 2026-02-01T14:00:00Z
+```
+
+**Git tags** - Queryable milestones at phase boundaries:
+
+```
+phase-1-strategic-complete
+phase-1-tactical-complete
+phase-2-strategic-complete
+phase-2-tactical-complete
+phase-3-strategic-complete
+```
+
+**Archive files** - Extended naming with phase number:
+
+```
+archive/todos_phase_1_strategic_20260201_120000.md
+archive/todos_phase_1_tactical_20260201_130000.md
+archive/todos_phase_2_strategic_20260201_140000.md
+```
+
+#### Paired Numbering Model
+
+Strategic and tactical phases share the same number since they're logically paired:
+
+```
+Phase 1: Strategic (plan) → Tactical (execute)
+Phase 2: Strategic (plan) → Tactical (execute)
+Phase 3: Strategic (plan) → Tactical (execute)
+```
+
+- `phase_number` starts at 1
+- Increments when transitioning from tactical → strategic (starting a new pair)
+- Both strategic and tactical in a pair share the same number
+
+#### Phase Transition Flow
+
+```
+Tactical Phase 2 completes
+    │
+    ├─ 1. Archive todos → archive/todos_phase_2_tactical_{ts}.md
+    ├─ 2. Update phase_state.yaml → {phase_number: 3, phase_type: strategic, ...}
+    ├─ 3. Git commit: "[Phase 2 Tactical] Complete - archived N todos"
+    └─ 4. Git tag: phase-2-tactical-complete
+    │
+    ▼
+Strategic Phase 3 begins
+```
+
+#### Recovery After Context Compaction
+
+When the agent needs to know where it is:
+
+1. **Read `phase_state.yaml`** → Current phase number and type
+2. **Run `git tag -l "phase-*"`** → See completed phases
+3. **Run `git log --oneline -5`** → See recent work
+
+This survives any context compaction because it queries files and git, not memory.
+
+#### TodoManager Additions
+
+```python
+class TodoManager:
+    def __init__(self, ...):
+        ...
+        self._phase_number: int = 1  # Paired phase counter
+        self._current_phase_name: str = ""  # Human-readable name
+
+    def get_phase_info(self) -> dict:
+        """Get current phase information for commits and state files."""
+        return {
+            "phase_number": self._phase_number,
+            "phase_type": "strategic" if self._is_strategic_phase else "tactical",
+            "phase_name": self._current_phase_name or self._staged_phase_name,
+        }
+
+    def increment_phase_number(self) -> None:
+        """Increment phase number (called on tactical → strategic transition)."""
+        self._phase_number += 1
+```
+
+#### Commit Message Builder
+
+```python
+def _build_commit_message(self, todo: TodoItem) -> str:
+    """Build structured commit message for completed todo."""
+    phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
+    header = f"[Phase {self._phase_number} {phase_type}] {todo.id}: {todo.content}"
+
+    body_lines = [
+        f"Completed: {datetime.now(timezone.utc).isoformat()}",
+    ]
+
+    if todo.notes:
+        body_lines.append(f"Notes: {'; '.join(todo.notes)}")
+
+    return header + "\n\n" + "\n".join(body_lines)
+```
+
+#### GitManager Tag Method
+
+```python
+def tag(self, tag_name: str, message: str = None) -> bool:
+    """Create a git tag at current HEAD.
+
+    Args:
+        tag_name: Tag name (e.g., "phase-2-tactical-complete")
+        message: Optional tag message (creates annotated tag)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    args = ["tag"]
+    if message:
+        args.extend(["-a", tag_name, "-m", message])
+    else:
+        args.append(tag_name)
+
+    result = self._run_git(args)
+    return result.returncode == 0
+
+def list_tags(self, pattern: str = None) -> List[str]:
+    """List git tags, optionally filtered by pattern.
+
+    Args:
+        pattern: Glob pattern (e.g., "phase-*")
+
+    Returns:
+        List of tag names
+    """
+    args = ["tag", "-l"]
+    if pattern:
+        args.append(pattern)
+
+    result = self._run_git(args)
+    if result.returncode != 0:
+        return []
+
+    return result.stdout.strip().split("\n") if result.stdout.strip() else []
+```
+
+#### Phase State File Updates
+
+The graph transition logic handles `phase_state.yaml` updates:
+
+```python
+def update_phase_state(workspace: WorkspaceManager, todo_manager: TodoManager) -> None:
+    """Update phase_state.yaml during transition."""
+    info = todo_manager.get_phase_info()
+
+    state = {
+        "phase_number": info["phase_number"],
+        "phase_type": info["phase_type"],
+        "phase_name": info["phase_name"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    workspace.write_file("phase_state.yaml", yaml.dump(state, default_flow_style=False))
+```
+
+#### Integration with Archive
+
+Update `TodoManager.archive()` to use phase-aware naming:
+
+```python
+def archive(self, phase_name: str = "") -> str:
+    """Archive todos with phase-aware naming."""
+    # Use phase info for filename
+    phase_type = "strategic" if self._is_strategic_phase else "tactical"
+    ts_str = timestamp.strftime("%Y%m%d_%H%M%S")
+
+    # New naming: todos_phase_{N}_{type}_{ts}.md
+    filename = f"todos_phase_{self._phase_number}_{phase_type}_{ts_str}.md"
+    archive_path = f"archive/{filename}"
+
+    # ... rest of archive logic ...
+```
 
 ### 5. Agent Instructions: Todo-as-Feature Model
 
@@ -340,6 +650,7 @@ All git tools are read-only and available in both phases:
 | `git_show` | Yes | Yes | Inspect commits anytime |
 | `git_diff` | Yes | Yes | Compare states anytime |
 | `git_status` | Yes | Yes | Check current state anytime |
+| `git_tags` | Yes | Yes | Check phase progression anytime |
 
 Destructive tools (reset, revert) are deferred until we design TodoManager synchronization.
 
@@ -388,35 +699,78 @@ If multiple agents work on the same workspace:
 ## Implementation Checklist
 
 ### Phase 1: GitManager Class
-- [ ] Create `src/managers/git_manager.py`
-- [ ] Implement `GitManager` with init, commit, log, show, diff, status methods
-- [ ] Add graceful degradation when git unavailable
-- [ ] Write tests for GitManager
+- [x] Create `src/managers/git_manager.py`
+- [x] Implement `GitManager` with:
+  - [x] `init_repository()` - skip if .git exists
+  - [x] `commit()` - stage all and commit
+  - [x] `log()` - commit history
+  - [x] `show()` - commit details with truncation
+  - [x] `diff()` - differences with truncation
+  - [x] `status()` - current state with dirty/clean indication
+  - [x] `has_uncommitted_changes()` - boolean check
+  - [x] `tag()` - create git tag at HEAD
+  - [x] `list_tags()` - list tags with optional pattern filter
+  - [x] `_run_git()` - subprocess wrapper with timeout (60s default)
+  - [x] `_truncate_output()` - max 500 lines / 10k words
+- [x] Add graceful degradation when git unavailable
+- [x] Export from `src/managers/__init__.py`
+- [x] Write tests for GitManager (57 tests)
 
 ### Phase 2: Git Tools Package
-- [ ] Create `src/tools/git/__init__.py`
-- [ ] Create `src/tools/git/git_tools.py` with git_log, git_show, git_diff, git_status
-- [ ] Tools should use GitManager (injected via ToolContext)
-- [ ] Add GIT_TOOLS_METADATA with proper phase configuration
-- [ ] Register in `src/tools/registry.py`
-- [ ] Add `git` category to `config/defaults.yaml`
-- [ ] Write tests for git tools
+- [x] Create `src/tools/git/__init__.py`
+- [x] Create `src/tools/git/git_tools.py` with git_log, git_show, git_diff, git_status, git_tags
+- [x] Tools access GitManager via `context.workspace_manager.git_manager`
+- [x] Add GIT_TOOLS_METADATA with proper phase configuration (both phases)
+- [x] Register in `src/tools/registry.py`
+- [x] Add `git` category to `config/defaults.yaml`
+- [x] Add `has_git()` convenience method to ToolContext
+- [x] Write tests for git tools (24 tests)
 
 ### Phase 3: Workspace Initialization
-- [ ] Add `git_versioning` and `git_ignore_patterns` to workspace config schema
-- [ ] Update `WorkspaceManager.initialize()` to create GitManager and call `init_repository()`
-- [ ] Store GitManager reference on WorkspaceManager
-- [ ] Update `config/defaults.yaml` with git config
-- [ ] Write tests for git initialization
+- [x] Add `git_versioning` and `git_ignore_patterns` to workspace config schema
+- [x] Update `WorkspaceManager.initialize()` to:
+  - [x] Create GitManager instance
+  - [x] Call `init_repository()` if git_versioning enabled
+  - [x] Create initial `phase_state.yaml` file
+  - [x] Store as `self._git_manager`
+- [x] Add `git_manager` property to WorkspaceManager
+- [x] Add `has_git()` convenience method to ToolContext (done in Phase 2)
+- [x] Update `config/defaults.yaml` with git config
+- [x] Update `config/schema.json` with git fields
+- [x] Update `src/core/loader.py` WorkspaceConfig and ToolsConfig with git fields
+- [x] Update `src/agent.py` to pass git config to WorkspaceManagerConfig
+- [x] Write tests for git initialization (16 tests)
 
-### Phase 4: Auto-Commit Integration
-- [ ] Pass GitManager to TodoManager (via ToolContext or constructor)
-- [ ] Add `_commit_todo_completion()` to TodoManager
-- [ ] Add `_build_commit_message()` helper
-- [ ] Hook into `TodoManager.complete()`
-- [ ] Write tests for auto-commit
+### Phase 4: Phase Tracking Integration
+- [x] Add to TodoManager:
+  - [x] `_phase_number: int` field (starts at 1)
+  - [x] `_current_phase_name: str` field
+  - [x] `get_phase_info()` method
+  - [x] `increment_phase_number()` method
+  - [x] `set_phase_name()` method
+  - [x] `phase_number` and `current_phase_name` properties
+- [x] Update `TodoManager.archive()` for phase-aware naming:
+  - [x] Filename format: `todos_phase_{N}_{type}_{ts}.md`
+  - [x] Header includes phase info
+- [x] Add `_build_commit_message()` with phase info
+- [x] Add phase state persistence to `export_state()` / `restore_state()`
+- [x] Write tests for phase tracking (18 new tests)
 
-### Phase 5: Agent Instructions
-- [ ] Update `config/prompts/tactical.txt` with feature-oriented language
-- [ ] Update `config/prompts/strategic.txt` with git review instructions
-- [ ] Test agent behavior with new prompts
+### Phase 5: Auto-Commit Integration
+- [x] Add `_commit_todo_completion()` to TodoManager
+- [x] Hook into `TodoManager.complete()` - access git via `self._workspace.git_manager`
+- [x] Write tests for auto-commit (6 tests)
+
+### Phase 6: Phase Transition Updates
+- [x] Update graph transition logic to:
+  - [x] Update `phase_state.yaml` on transitions
+  - [x] Create git tag on phase completion (e.g., `phase-2-tactical-complete`)
+  - [x] Commit phase state changes
+  - [x] Increment `phase_number` on tactical → strategic transition
+- [x] Write tests for phase transitions with git (14 tests)
+
+### Phase 7: Agent Instructions
+- [x] Update `config/prompts/tactical.txt` with feature-oriented language
+- [x] Update `config/prompts/strategic.txt` with git review instructions
+- [x] Add instructions for reading `phase_state.yaml` on context recovery
+- [ ] Test agent behavior with new prompts (manual testing)

@@ -314,6 +314,10 @@ class WorkspaceConfig:
     instructions_template: str = ""
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
+    git_versioning: bool = True  # Enable git versioning for workspace history
+    git_ignore_patterns: List[str] = field(
+        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+    )
 
 
 @dataclass
@@ -326,6 +330,7 @@ class ToolsConfig:
     research: List[str] = field(default_factory=list)
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
+    git: List[str] = field(default_factory=list)
 
 
 @dataclass
