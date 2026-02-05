@@ -167,7 +167,7 @@
             "type": "string"
           },
           "description": "Document processing tools (src/tools/document/)",
-          "examples": [["extract_document_text", "chunk_document"]]
+          "examples": [["chunk_document", "identify_requirement_candidates"]]
         },
         "research": {
           "type": "array",

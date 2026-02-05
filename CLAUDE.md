@@ -200,7 +200,7 @@ tools:
 Tool categories in config:
 - `workspace`: File operations (read_file, write_file, list_files, etc.)
 - `core`: Task management + completion (next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete)
-- `document`: Document processing (extract_document_text, chunk_document, identify_requirement_candidates)
+- `document`: Document processing (chunk_document, identify_requirement_candidates)
 - `research`: Web search (web_search)
 - `citation`: Citation management (cite_document, cite_web, list_sources, etc.)
 - `graph`: Neo4j operations (execute_cypher_query, get_database_schema, validate_schema_compliance)
