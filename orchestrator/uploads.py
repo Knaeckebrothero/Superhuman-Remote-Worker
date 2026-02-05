@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 UPLOADS_DIR = Path("workspace/uploads")
 
 # Limits
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB per file
+MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024  # 5GB per file
 MAX_FILES_PER_UPLOAD = 100
 
 

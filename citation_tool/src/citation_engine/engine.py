@@ -758,6 +758,8 @@ class CitationEngine:
 
         if ext == ".pdf":
             return self._extract_pdf_content(file_path)
+        elif ext == ".docx":
+            return self._extract_docx_content(file_path)
         elif ext in (".md", ".txt", ".json", ".csv", ".xml", ".html", ".htm"):
             with open(file_path, encoding="utf-8") as f:
                 content = f.read()
@@ -774,7 +776,7 @@ class CitationEngine:
                 log.error(f"Cannot extract text from binary file: {file_path}")
                 raise ValueError(
                     f"Cannot extract text from binary file: {file_path}. "
-                    "Supported formats: PDF, markdown, txt, json, csv, xml, html."
+                    "Supported formats: PDF, DOCX, markdown, txt, json, csv, xml, html."
                 ) from e
 
     def _extract_pdf_content(self, file_path: str) -> str:
@@ -810,6 +812,30 @@ class CitationEngine:
             log.error("PyMuPDF not installed, cannot extract PDF content")
             raise ImportError(
                 "PyMuPDF is required for PDF extraction. Install it with: pip install pymupdf"
+            ) from e
+
+    def _extract_docx_content(self, file_path: str) -> str:
+        """
+        Extract text content from a DOCX file using docx2txt.
+
+        Args:
+            file_path: Path to the DOCX file
+
+        Returns:
+            Extracted text content
+        """
+        try:
+            import docx2txt
+
+            log.debug(f"Extracting content from DOCX: {file_path}")
+            content = docx2txt.process(file_path)
+            log.debug(f"Extracted {len(content)} characters from DOCX")
+            return content
+
+        except ImportError as e:
+            log.error("docx2txt not installed, cannot extract DOCX content")
+            raise ImportError(
+                "docx2txt is required for DOCX extraction. Install it with: pip install docx2txt"
             ) from e
 
     def _fetch_web_content(self, url: str) -> tuple[str, dict[str, Any]]:

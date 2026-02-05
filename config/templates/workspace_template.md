@@ -1,28 +1,32 @@
 # Workspace Memory
 
-This file is your persistent memory. It survives context compaction and is included in every system prompt.
-Use it to track critical information that you need to remember across the entire task.
+This file is your persistent memory. It survives context compaction and is always in your system prompt.
 
-**Update this file regularly.** When in doubt, write it down here.
+**COMPACT, don't append.** Rewrite sections to remove redundancy. Target: under 50 lines.
+
+**Don't duplicate plan.md.** Phase status and completion tracking belong in plan.md, not here.
 
 ## Status
 
-Track your current position in the plan and overall progress.
+Current position (update each strategic phase):
 
-- **Phase**: (current phase name)
-- **Progress**: (brief progress indicator)
-- **Blocked**: (any blockers, or "none")
+- **Phase**: (name from plan.md)
+- **Blocked**: (active blockers, or "none")
 
 ## Key Decisions
 
-Document decisions AND their reasoning. Future-you needs to understand WHY.
-Without reasoning, you may revisit the same decision unnecessarily.
+Decisions AND their reasoning. Without the WHY, you may revisit unnecessarily.
 
-(Example: "Processing pages sequentially rather than by section - cross-references span sections")
+(Keep only decisions that affect future work. Remove resolved ones.)
 
 ## Entities
 
-Track resolved entity IDs, names, and relationships. This is your reference table
-for anything you'll need to look up repeatedly.
+Reference table for IDs, names, relationships you need to look up repeatedly.
 
-(Example: "Customer: BO-042 | Invoice: BO-015 | Payment: BO-023")
+(Example: "Customer: BO-042 | Invoice: BO-015")
+
+## Critical Context
+
+Information that MUST survive context compaction. Use sparingly.
+
+(Example: "API rate limit: 100/min - batch accordingly")
