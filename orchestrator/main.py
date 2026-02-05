@@ -470,7 +470,9 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             )
 
         # Determine which agent to use
-        agent_id = request.agent_id or job.get("assigned_agent_id")
+        # Convert to string since DB returns asyncpg UUID objects
+        assigned_agent_id = job.get("assigned_agent_id")
+        agent_id = request.agent_id or (str(assigned_agent_id) if assigned_agent_id else None)
         agent = None
 
         # Try to get the specified/assigned agent
@@ -486,7 +488,7 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
                     detail="No ready agents available to resume job.",
                 )
             agent = ready_agents[0]
-            agent_id = agent["id"]
+            agent_id = str(agent["id"])
             logger.info(f"Auto-selected agent {agent_id} for job resume")
 
         if agent["status"] not in ("ready", "completed"):
@@ -502,14 +504,34 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             )
 
         # Build resume request payload
-        # Include config_name so agent can find the correct checkpoint
-        # (thread_id is constructed as {config_name}_{job_id})
+        # Include full config info so agent can restore the original job configuration
         job_config_name = job.get("config_name", "default")
+
+        # Handle context - might be dict or JSON string depending on DB driver
+        job_context = job.get("context") or {}
+        if isinstance(job_context, str):
+            import json
+            try:
+                job_context = json.loads(job_context)
+            except json.JSONDecodeError:
+                job_context = {}
+
+        # Same for config_override
+        config_override = job.get("config_override")
+        if isinstance(config_override, str):
+            import json
+            try:
+                config_override = json.loads(config_override)
+            except json.JSONDecodeError:
+                config_override = None
+
         resume_payload = {
             "job_id": job_id,
             "config_name": job_config_name,
+            "config_upload_id": job_context.get("config_upload_id") if job_context else None,
+            "config_override": config_override,
         }
-        if request.feedback:
+        if request and request.feedback:
             resume_payload["feedback"] = request.feedback
 
         # Send request to agent pod
@@ -541,7 +563,7 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             current_job_id=job_id,
         )
 
-        return {"status": "resumed", "job_id": job_id, "agent_id": agent_id}
+        return {"status": "resumed", "job_id": job_id, "agent_id": str(agent_id)}
 
     except HTTPException:
         raise
@@ -551,6 +573,7 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             detail=f"Failed to connect to agent: {str(e)}. Agent may be offline.",
         ) from e
     except Exception as e:
+        logger.exception(f"Failed to resume job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
