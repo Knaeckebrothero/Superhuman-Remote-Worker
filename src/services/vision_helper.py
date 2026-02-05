@@ -52,7 +52,7 @@ class VisionHelper:
 
     Configuration is via environment variables:
     - VISION_API_KEY: API key for vision model (falls back to OPENAI_API_KEY)
-    - VISION_BASE_URL: Base URL for vision API (falls back to OPENAI_BASE_URL)
+    - VISION_BASE_URL: Base URL for vision API (defaults to OpenAI: https://api.openai.com/v1)
     - VISION_MODEL: Model to use (default: gpt-4o-mini)
     - VISION_TIMEOUT: Request timeout in seconds (default: 120)
 
@@ -68,17 +68,22 @@ class VisionHelper:
         ```
     """
 
+    # Default to OpenAI API - vision models like gpt-4o-mini are only available there
+    OPENAI_API_URL = "https://api.openai.com/v1"
+
     def __init__(self):
         """Initialize the Vision Helper with configuration from environment."""
         # Load vision-specific config (separate from primary LLM)
-        # This allows using a different provider for vision tasks (e.g., OpenAI gpt-4o)
-        # while the primary agent uses a text-only model
+        # This allows using OpenAI for vision tasks (e.g., gpt-4o-mini)
+        # while the primary agent uses a text-only model on a custom endpoint
         primary_key = os.getenv("OPENAI_API_KEY", "")
-        primary_base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
-        # Vision-specific overrides (fall back to primary OpenAI config)
+        # Vision-specific overrides
+        # API key: Use VISION_API_KEY if set, otherwise fall back to OPENAI_API_KEY
+        # Base URL: Use VISION_BASE_URL if set, otherwise default to OpenAI
+        #           (NOT LLM_BASE_URL - vision models are typically only on OpenAI)
         self.api_key = os.getenv("VISION_API_KEY", primary_key)
-        self.api_base = os.getenv("VISION_BASE_URL", primary_base)
+        self.api_base = os.getenv("VISION_BASE_URL", self.OPENAI_API_URL)
         self.model = os.getenv("VISION_MODEL", "gpt-4o-mini")
         self.timeout = float(os.getenv("VISION_TIMEOUT", "120"))
 
@@ -95,7 +100,7 @@ class VisionHelper:
 
         # Log configuration (hiding API key)
         key_source = "VISION_API_KEY" if os.getenv("VISION_API_KEY") else "OPENAI_API_KEY"
-        base_source = "VISION_BASE_URL" if os.getenv("VISION_BASE_URL") else "OPENAI_BASE_URL"
+        base_source = "VISION_BASE_URL" if os.getenv("VISION_BASE_URL") else "default (OpenAI)"
         logger.info(
             f"VisionHelper initialized: model={self.model}, "
             f"base_url={self.api_base} (from {base_source}), "

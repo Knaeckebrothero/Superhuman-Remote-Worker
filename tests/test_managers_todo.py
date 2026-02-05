@@ -400,14 +400,20 @@ class TestTodoManagerArchive:
         assert workspace_manager.exists(archive_path)
 
     def test_archive_with_phase_name(self, todo_manager, workspace_manager):
-        """Test archiving with a phase name."""
+        """Test archiving with a phase name uses phase-aware naming."""
         todo_manager.add("Task 1")
         todo_manager.complete("todo_1")
 
         archive_path = todo_manager.archive(phase_name="extraction")
 
-        assert "extraction" in archive_path
+        # New format: todos_phase_{N}_{type}_{ts}.md
+        # phase_name is now used in content header, not filename
+        assert "todos_phase_1_strategic_" in archive_path
         assert workspace_manager.exists(archive_path)
+
+        # Verify phase_name appears in content
+        content = workspace_manager.read_file(archive_path)
+        assert "extraction" in content
 
     def test_archive_content(self, todo_manager, workspace_manager):
         """Test archive file content."""
@@ -623,3 +629,325 @@ class TestTodoManagerStatePersistence:
         assert state["staged_todos"] == new_state["staged_todos"]
         assert state["next_id"] == new_state["next_id"]
         assert state["staged_phase_name"] == new_state["staged_phase_name"]
+
+
+class TestTodoManagerPhaseTracking:
+    """Tests for phase number tracking functionality."""
+
+    def test_initial_phase_number(self, todo_manager):
+        """Test that phase number starts at 1."""
+        assert todo_manager.phase_number == 1
+
+    def test_get_phase_info_strategic(self, todo_manager):
+        """Test get_phase_info in strategic mode."""
+        todo_manager.is_strategic_phase = True
+        todo_manager.set_phase_name("Planning Phase")
+
+        info = todo_manager.get_phase_info()
+
+        assert info["phase_number"] == 1
+        assert info["phase_type"] == "strategic"
+        assert info["phase_name"] == "Planning Phase"
+
+    def test_get_phase_info_tactical(self, todo_manager):
+        """Test get_phase_info in tactical mode."""
+        todo_manager.is_strategic_phase = False
+        todo_manager.set_phase_name("Execution Phase")
+
+        info = todo_manager.get_phase_info()
+
+        assert info["phase_number"] == 1
+        assert info["phase_type"] == "tactical"
+        assert info["phase_name"] == "Execution Phase"
+
+    def test_increment_phase_number(self, todo_manager):
+        """Test incrementing phase number."""
+        assert todo_manager.phase_number == 1
+
+        new_num = todo_manager.increment_phase_number()
+
+        assert new_num == 2
+        assert todo_manager.phase_number == 2
+
+    def test_set_phase_name(self, todo_manager):
+        """Test setting phase name."""
+        todo_manager.set_phase_name("Test Phase")
+        assert todo_manager.current_phase_name == "Test Phase"
+
+    def test_current_phase_name_falls_back_to_staged(self, todo_manager):
+        """Test that current_phase_name falls back to staged_phase_name."""
+        # Stage some todos with a phase name
+        todos = [f"Task {i}: meaningful description here" for i in range(1, 6)]
+        todo_manager.stage_tactical_todos(todos, "Staged Phase Name")
+
+        # current_phase_name should fall back to staged_phase_name
+        assert todo_manager.current_phase_name == "Staged Phase Name"
+
+
+class TestTodoManagerPhaseAwareArchive:
+    """Tests for phase-aware archive naming."""
+
+    def test_archive_filename_format(self, todo_manager, workspace_manager):
+        """Test that archive uses phase-aware filename format."""
+        todo_manager.add("Task 1")
+        todo_manager.complete("todo_1")
+
+        archive_path = todo_manager.archive()
+
+        # Should be: todos_phase_{N}_{type}_{ts}.md
+        assert "todos_phase_1_strategic_" in archive_path
+        assert archive_path.endswith(".md")
+
+    def test_archive_filename_tactical(self, todo_manager, workspace_manager):
+        """Test archive filename in tactical phase."""
+        todo_manager.is_strategic_phase = False
+        todo_manager.add("Task 1")
+        todo_manager.complete("todo_1")
+
+        archive_path = todo_manager.archive()
+
+        assert "todos_phase_1_tactical_" in archive_path
+
+    def test_archive_filename_with_phase_number(self, todo_manager, workspace_manager):
+        """Test archive filename includes correct phase number."""
+        todo_manager._phase_number = 3
+        todo_manager.is_strategic_phase = False
+        todo_manager.add("Task 1")
+        todo_manager.complete("todo_1")
+
+        archive_path = todo_manager.archive()
+
+        assert "todos_phase_3_tactical_" in archive_path
+
+    def test_archive_content_includes_phase_info(self, todo_manager, workspace_manager):
+        """Test that archive content includes phase information."""
+        todo_manager._phase_number = 2
+        todo_manager.is_strategic_phase = False
+        todo_manager.set_phase_name("Extraction Phase")
+        todo_manager.add("Extract data")
+        todo_manager.complete("todo_1")
+
+        archive_path = todo_manager.archive()
+        content = workspace_manager.read_file(archive_path)
+
+        assert "Phase: 2 (tactical)" in content
+        assert "# Archived Todos: Extraction Phase" in content
+
+
+class TestTodoManagerBuildCommitMessage:
+    """Tests for commit message building."""
+
+    def test_build_commit_message_strategic(self, todo_manager):
+        """Test commit message format for strategic phase."""
+        todo_manager.is_strategic_phase = True
+        todo_manager._phase_number = 1
+
+        todo = TodoItem(id="todo_1", content="Review and plan next steps")
+        message = todo_manager._build_commit_message(todo)
+
+        assert "[Phase 1 Strategic]" in message
+        assert "todo_1:" in message
+        assert "Review and plan next steps" in message
+        assert "Completed:" in message
+
+    def test_build_commit_message_tactical(self, todo_manager):
+        """Test commit message format for tactical phase."""
+        todo_manager.is_strategic_phase = False
+        todo_manager._phase_number = 2
+
+        todo = TodoItem(id="todo_3", content="Extract requirements from document")
+        message = todo_manager._build_commit_message(todo)
+
+        assert "[Phase 2 Tactical]" in message
+        assert "todo_3:" in message
+        assert "Extract requirements from document" in message
+
+    def test_build_commit_message_with_notes(self, todo_manager):
+        """Test commit message includes notes."""
+        todo_manager.is_strategic_phase = True
+        todo_manager._phase_number = 1
+
+        todo = TodoItem(id="todo_1", content="Task description")
+        todo.notes = ["Found 5 items", "All validated"]
+        message = todo_manager._build_commit_message(todo)
+
+        assert "Notes:" in message
+        assert "Found 5 items; All validated" in message
+
+
+class TestTodoManagerPhaseStatePersistence:
+    """Tests for phase state in export/restore."""
+
+    def test_export_state_includes_phase_info(self, todo_manager):
+        """Test that export_state includes phase tracking fields."""
+        todo_manager._phase_number = 3
+        todo_manager.is_strategic_phase = False
+        todo_manager.set_phase_name("Test Phase")
+
+        state = todo_manager.export_state()
+
+        assert state["phase_number"] == 3
+        assert state["is_strategic_phase"] is False
+        assert state["current_phase_name"] == "Test Phase"
+
+    def test_restore_state_restores_phase_info(self, todo_manager):
+        """Test that restore_state restores phase tracking fields."""
+        state = {
+            "todos": [],
+            "staged_todos": [],
+            "next_id": 1,
+            "staged_phase_name": "",
+            "phase_number": 5,
+            "is_strategic_phase": False,
+            "current_phase_name": "Restored Phase",
+        }
+
+        todo_manager.restore_state(state)
+
+        assert todo_manager.phase_number == 5
+        assert todo_manager.is_strategic_phase is False
+        assert todo_manager.current_phase_name == "Restored Phase"
+
+    def test_restore_state_defaults_phase_number(self, todo_manager):
+        """Test that restore_state defaults phase_number to 1."""
+        state = {
+            "todos": [],
+            "staged_todos": [],
+            "next_id": 1,
+        }
+
+        todo_manager.restore_state(state)
+
+        assert todo_manager.phase_number == 1
+
+    def test_export_restore_roundtrip_with_phase(self, todo_manager):
+        """Test export/restore roundtrip preserves phase info."""
+        todo_manager._phase_number = 4
+        todo_manager.is_strategic_phase = False
+        todo_manager.set_phase_name("Phase 4 Tactical")
+        todo_manager.add("Task 1")
+
+        state = todo_manager.export_state()
+
+        # Create new manager and restore
+        from src.managers.todo import TodoManager
+        new_manager = TodoManager(todo_manager._workspace)
+        new_manager.restore_state(state)
+
+        assert new_manager.phase_number == 4
+        assert new_manager.is_strategic_phase is False
+        assert new_manager.current_phase_name == "Phase 4 Tactical"
+
+
+class TestTodoManagerAutoCommit:
+    """Tests for auto-commit on todo completion."""
+
+    def test_commit_todo_completion_without_git(self, todo_manager):
+        """Test that _commit_todo_completion works when git is not available."""
+        # By default, workspace doesn't have git_manager set up in these tests
+        # (WorkspaceManagerConfig defaults to git_versioning=True but the
+        # direct module import tests don't trigger full initialization)
+        todo = TodoItem(id="todo_1", content="Test task")
+
+        # Should return True (success) when git not active
+        result = todo_manager._commit_todo_completion(todo)
+        assert result is True
+
+    def test_complete_calls_commit(self, todo_manager, workspace_manager):
+        """Test that complete() calls _commit_todo_completion."""
+        from unittest.mock import patch, MagicMock
+
+        todo_manager.add("Task 1")
+
+        # Mock the _commit_todo_completion method
+        with patch.object(todo_manager, '_commit_todo_completion') as mock_commit:
+            mock_commit.return_value = True
+            todo_manager.complete("todo_1")
+
+            # Verify commit was called
+            mock_commit.assert_called_once()
+            # Verify it was called with the todo
+            call_args = mock_commit.call_args[0]
+            assert call_args[0].id == "todo_1"
+
+    def test_complete_succeeds_even_if_commit_fails(self, todo_manager):
+        """Test that complete() succeeds even if commit fails."""
+        from unittest.mock import patch
+
+        todo_manager.add("Task 1")
+
+        # Mock commit to fail
+        with patch.object(todo_manager, '_commit_todo_completion', return_value=False):
+            result = todo_manager.complete("todo_1")
+
+            # Todo should still be marked complete
+            assert result is not None
+            assert result.status.value == "completed"
+
+    def test_commit_message_used_in_commit(self, todo_manager, workspace_manager):
+        """Test that the correct commit message is used."""
+        from unittest.mock import MagicMock
+
+        # Create a mock git manager
+        mock_git = MagicMock()
+        mock_git.is_active = True
+        mock_git.commit.return_value = True
+
+        # Set the mock on the workspace's private attribute
+        workspace_manager._git_manager = mock_git
+
+        todo_manager.add("Extract requirements")
+        todo_manager._phase_number = 2
+        todo_manager.is_strategic_phase = False
+
+        todo_manager.complete("todo_1")
+
+        # Verify commit was called with correct message format
+        mock_git.commit.assert_called_once()
+        call_args = mock_git.commit.call_args
+        message = call_args[0][0]
+
+        assert "[Phase 2 Tactical]" in message
+        assert "todo_1:" in message
+        assert "Extract requirements" in message
+
+        # Clean up
+        workspace_manager._git_manager = None
+
+    def test_commit_with_notes(self, todo_manager, workspace_manager):
+        """Test that notes are included in commit message."""
+        from unittest.mock import MagicMock
+
+        mock_git = MagicMock()
+        mock_git.is_active = True
+        mock_git.commit.return_value = True
+
+        workspace_manager._git_manager = mock_git
+
+        todo_manager.add("Process data")
+        todo_manager.complete("todo_1", notes=["Found 10 items"])
+
+        message = mock_git.commit.call_args[0][0]
+        assert "Notes:" in message
+        assert "Found 10 items" in message
+
+        workspace_manager._git_manager = None
+
+    def test_commit_allow_empty(self, todo_manager, workspace_manager):
+        """Test that commits allow empty (for read-only todos)."""
+        from unittest.mock import MagicMock
+
+        mock_git = MagicMock()
+        mock_git.is_active = True
+        mock_git.commit.return_value = True
+
+        workspace_manager._git_manager = mock_git
+
+        todo_manager.add("Review document")
+        todo_manager.complete("todo_1")
+
+        # Verify allow_empty=True was passed
+        call_kwargs = mock_git.commit.call_args[1]
+        assert call_kwargs.get("allow_empty") is True
+
+        workspace_manager._git_manager = None
