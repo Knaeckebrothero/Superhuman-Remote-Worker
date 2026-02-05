@@ -38,6 +38,7 @@ class PhaseSnapshot:
     timestamp: str
     todos_completed: int = 0
     todos_total: int = 0
+    thread_id: Optional[str] = None  # LangGraph thread_id for checkpoint lookup
 
     @classmethod
     def from_dict(cls, data: dict) -> "PhaseSnapshot":
@@ -50,11 +51,58 @@ class PhaseSnapshot:
             timestamp=data["timestamp"],
             todos_completed=data.get("todos_completed", 0),
             todos_total=data.get("todos_total", 0),
+            thread_id=data.get("thread_id"),  # May be None for old snapshots
         )
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
         return asdict(self)
+
+
+def discover_thread_id_from_checkpoint(checkpoint_path: Path, job_id: str) -> Optional[str]:
+    """Discover the thread_id used in a checkpoint database.
+
+    For backward compatibility with old snapshots that don't store thread_id,
+    this function queries the checkpoint database to find the thread_id.
+
+    Args:
+        checkpoint_path: Path to the checkpoint.db file
+        job_id: The job ID to match against
+
+    Returns:
+        The thread_id with most checkpoints, or None if not found
+    """
+    import sqlite3
+
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        conn = sqlite3.connect(checkpoint_path)
+        cursor = conn.cursor()
+
+        # Find all thread_ids and their checkpoint counts
+        cursor.execute(
+            "SELECT thread_id, COUNT(*) as count FROM checkpoints GROUP BY thread_id ORDER BY count DESC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            return None
+
+        # Filter to thread_ids that contain this job_id
+        matching = [(tid, count) for tid, count in rows if job_id in tid]
+
+        if not matching:
+            return None
+
+        # Return the one with most checkpoints (most likely the real one)
+        return matching[0][0]
+
+    except Exception as e:
+        logger.warning(f"Failed to discover thread_id from checkpoint: {e}")
+        return None
 
 
 def get_phase_snapshots_path() -> Path:
@@ -139,6 +187,7 @@ class PhaseSnapshotManager:
         is_strategic_phase: bool = True,
         todos_completed: int = 0,
         todos_total: int = 0,
+        thread_id: Optional[str] = None,
     ) -> Optional["PhaseSnapshot"]:
         """Create a phase snapshot.
 
@@ -153,6 +202,7 @@ class PhaseSnapshotManager:
             is_strategic_phase: Whether in strategic phase
             todos_completed: Number of completed todos
             todos_total: Total number of todos
+            thread_id: LangGraph thread_id for checkpoint lookup on resume
 
         Returns:
             PhaseSnapshot with metadata, or None if failed
@@ -203,6 +253,7 @@ class PhaseSnapshotManager:
                 timestamp=datetime.now(UTC).isoformat(),
                 todos_completed=todos_completed,
                 todos_total=todos_total,
+                thread_id=thread_id,
             )
 
             metadata_path = snapshot_dir / "metadata.json"

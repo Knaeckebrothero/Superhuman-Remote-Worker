@@ -238,6 +238,7 @@ async def _process_orchestrator_job(
     document_dir: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     instructions: Optional[str] = None,
+    config_override: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Process a job assigned by the orchestrator.
 
@@ -272,6 +273,8 @@ async def _process_orchestrator_job(
             metadata["context"] = context
         if instructions:
             metadata["instructions"] = instructions
+        if config_override:
+            metadata["config_override"] = config_override
 
         # Process the job with streaming for iteration logging
         final_state = None
@@ -472,6 +475,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 document_dir=request.document_dir,
                 context=request.context,
                 instructions=request.instructions,
+                config_override=request.config_override,
             )
         )
 
@@ -542,15 +546,22 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         request: JobResumeRequest,
         background_tasks: BackgroundTasks,
     ) -> JobStartResponse:
-        """Resume a job from checkpoint.
+        """Resume a job from last completed phase snapshot.
 
-        This endpoint resumes a previously started job from its last checkpoint.
+        This endpoint resumes a previously started job from its last phase snapshot.
         Optional feedback can be injected before resuming.
         """
         global _current_job_id, _current_job_task
 
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        # Log config mismatch as warning (don't reject - checkpoint discovery handles it)
+        if request.config_name and request.config_name != _agent.config.agent_id:
+            logger.warning(
+                f"Config mismatch: job has config '{request.config_name}' but this agent is '{_agent.config.agent_id}'. "
+                f"Will attempt to discover correct checkpoint."
+            )
 
         # Check if already processing a job
         if _current_job_id is not None:
@@ -564,7 +575,14 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
         # Capture for closure
         feedback = request.feedback
-        resume_config_name = request.config_name
+        config_name = request.config_name
+
+        # Build metadata with config info for resume
+        resume_metadata = {}
+        if request.config_upload_id:
+            resume_metadata["config_upload_id"] = request.config_upload_id
+        if request.config_override:
+            resume_metadata["config_override"] = request.config_override
 
         # Start processing in background
         async def _resume_job():
@@ -572,9 +590,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             try:
                 result = await _agent.process_job(
                     request.job_id,
+                    metadata=resume_metadata if resume_metadata else None,
                     resume=True,
                     feedback=feedback,
-                    resume_config_name=resume_config_name,
+                    original_config_name=config_name,
                 )
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
             except asyncio.CancelledError:

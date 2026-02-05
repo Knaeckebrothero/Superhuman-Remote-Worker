@@ -313,12 +313,20 @@ class JobCancelByOrchestratorRequest(BaseModel):
 
 
 class JobResumeRequest(BaseModel):
-    """Request to resume a job from checkpoint."""
+    """Request to resume a job from last completed phase snapshot."""
 
     job_id: str = Field(..., description="Job ID to resume")
     config_name: Optional[str] = Field(
         default=None,
-        description="Original config name for checkpoint lookup (thread_id = config_name_job_id)",
+        description="Job's config name (for validation that agent has correct config)",
+    )
+    config_upload_id: Optional[str] = Field(
+        default=None,
+        description="Config upload ID to reload the original job configuration",
+    )
+    config_override: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Inline config overrides from the original job",
     )
     feedback: Optional[str] = Field(
         default=None,
