@@ -71,6 +71,11 @@
           "default": 3,
           "description": "Number of retries for failed LLM requests with exponential backoff"
         },
+        "multimodal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the primary model can process images directly. When true, visual content (document screenshots, images) is sent as base64-encoded images. When false, visual content is converted to text descriptions via a separate vision model."
+        },
         "strategic": {
           "$ref": "#/$defs/llmPhaseOverride",
           "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."

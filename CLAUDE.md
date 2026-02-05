@@ -247,6 +247,10 @@ Todo constraints (in `todo` config section):
   - `loader.py` - Config loading, LLM creation, tool registry
   - `context.py` - ContextManager for token counting/compaction
 - `src/managers/` - TodoManager, MemoryManager, PlanManager
+- `src/services/` - Helper services
+  - `vision_helper.py` - VisionHelper for image/document descriptions
+  - `document_renderer.py` - DocumentRenderer for PDF/PPTX/DOCX to PNG
+  - `description_cache.py` - DescriptionCache for caching vision outputs
 - `src/tools/` - Tool implementations and registry
   - `registry.py` - Tool metadata registry with phase filtering
   - `context.py` - ToolContext dependency injection
@@ -265,6 +269,41 @@ Todo constraints (in `todo` config section):
 - `cockpit/` - Angular frontend for debugging and job management
 - `citation_tool/` - Separate installable package for citation management
 
+### Vision Services
+
+The agent supports visual content analysis from documents and images via `src/services/`:
+
+| Service | Purpose |
+|---------|---------|
+| `VisionHelper` | Generates text descriptions of images using a multimodal model |
+| `DocumentRenderer` | Renders PDF/PPTX/DOCX pages as PNG images |
+| `DescriptionCache` | Caches vision descriptions to avoid repeated API calls |
+
+**Multimodal Configuration** (`config/defaults.yaml`):
+```yaml
+llm:
+  model: gpt-4o
+  multimodal: true   # Model can process images directly
+  # OR
+  multimodal: false  # Model is text-only, uses VisionHelper for descriptions
+```
+
+**How it works:**
+- `multimodal: true` → Agent receives base64-encoded page screenshots
+- `multimodal: false` → Agent receives AI-generated text descriptions of visual content
+
+**Enhanced `read_file` tool:**
+```python
+read_file(
+    path="doc.pdf",
+    page_start=1,
+    page_end=3,
+    describe="What values are shown in this chart?"  # Optional visual query
+)
+```
+
+Supports: PDF, PPTX, DOCX, PNG, JPG, GIF, WebP, BMP, TIFF
+
 ## Environment Variables
 
 Required in `.env`:
@@ -272,6 +311,12 @@ Required in `.env`:
 - `LLM_BASE_URL` - Custom endpoint (optional, for vLLM/Ollama)
 - `TAVILY_API_KEY` - Web search (Creator agent)
 - Database URLs configured in `.env.example`
+
+**Vision Model** (for text-only agents):
+- `VISION_API_KEY` - API key for vision model (defaults to `OPENAI_API_KEY`)
+- `VISION_BASE_URL` - Vision API endpoint (defaults to `OPENAI_BASE_URL`)
+- `VISION_MODEL` - Model to use (default: `gpt-4o-mini`)
+- `VISION_TIMEOUT` - Request timeout in seconds (default: `120`)
 
 ## Service Ports
 

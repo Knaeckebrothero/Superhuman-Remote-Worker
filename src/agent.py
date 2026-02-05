@@ -981,8 +981,12 @@ class UniversalAgent:
         (workspace manager, todo manager, connections).
         """
         # Create tool context with dependencies
-        # Merge agent_id into config for citation audit trails
-        tool_config = {**self.config.extra, "agent_id": self.config.agent_id}
+        # Merge agent_id and LLM settings into config for tools
+        tool_config = {
+            **self.config.extra,
+            "agent_id": self.config.agent_id,
+            "multimodal": self.config.llm.multimodal,  # For vision-aware file reading
+        }
         context = ToolContext(
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,

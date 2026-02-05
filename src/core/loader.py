@@ -242,6 +242,7 @@ class LLMConfig:
         llm:
           model: claude-sonnet-4-20250514
           temperature: 0.3
+          multimodal: true  # Model can process images directly
           strategic:
             model: claude-opus-4-5-20250514
           tactical:
@@ -259,6 +260,7 @@ class LLMConfig:
     api_key: Optional[str] = None
     timeout: Optional[float] = 600.0  # 10 minutes default
     max_retries: int = 3
+    multimodal: bool = False  # Whether model can process images directly
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -292,6 +294,7 @@ class LLMConfig:
             api_key=override.api_key if override.api_key is not None else self.api_key,
             timeout=override.timeout if override.timeout is not None else self.timeout,
             max_retries=override.max_retries if override.max_retries is not None else self.max_retries,
+            multimodal=self.multimodal,  # Multimodal is not phase-specific
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -451,6 +454,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         api_key=llm_data.get("api_key"),
         timeout=llm_data.get("timeout", 600.0),
         max_retries=llm_data.get("max_retries", 3),
+        multimodal=llm_data.get("multimodal", False),
         # Phase-specific overrides
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),

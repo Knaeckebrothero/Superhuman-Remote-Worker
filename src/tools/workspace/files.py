@@ -2,10 +2,18 @@
 
 Provides core file read/write/edit operations within the workspace.
 These are the most commonly used tools for interacting with workspace files.
+
+Enhanced with visual content support:
+- Multimodal models receive rendered page screenshots (base64)
+- Text-only models receive AI-generated descriptions of visual content
+- Configurable via `llm.multimodal` in agent config
 """
 
+import base64
 import logging
-from typing import Any, Dict, List, Optional
+import mimetypes
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.tools import tool
 
@@ -13,6 +21,12 @@ from ..context import ToolContext
 from src.utils.pdf import PDFReader, format_document_info, format_read_info
 
 logger = logging.getLogger(__name__)
+
+# Supported image file extensions
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"}
+
+# Document extensions that support visual rendering
+VISUAL_DOCUMENT_EXTENSIONS = {".pdf", ".pptx", ".docx"}
 
 # Tool metadata for registry
 # Phase availability: file tools are available in both strategic and tactical modes
@@ -41,6 +55,22 @@ FILE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _get_mime_type(file_path: Path) -> str:
+    """Get MIME type for a file based on extension."""
+    mime_type, _ = mimetypes.guess_type(str(file_path))
+    return mime_type or "application/octet-stream"
+
+
+def _is_image_file(file_path: Path) -> bool:
+    """Check if file is a supported image format."""
+    return file_path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _is_visual_document(file_path: Path) -> bool:
+    """Check if file is a document that supports visual rendering."""
+    return file_path.suffix.lower() in VISUAL_DOCUMENT_EXTENSIONS
+
+
 def create_file_tools(context: ToolContext) -> List[Any]:
     """Create file operation tools with injected context.
 
@@ -67,6 +97,9 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
     # Initialize PDF reader with word limit
     pdf_reader = PDFReader(max_words_per_read=max_read_words)
+
+    # Check if model is multimodal (from agent config)
+    is_multimodal = context.get_config("multimodal", False)
 
     # Line-based reading constants (matching Claude Code behavior)
     DEFAULT_LINE_LIMIT = 2000
@@ -115,13 +148,313 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             logger.error(f"PDF read error for {relative_path}: {e}")
             return f"Error reading PDF: {str(e)}"
 
+    def _handle_image_file(
+        full_path: Path,
+        describe: Optional[str],
+    ) -> str:
+        """Handle standalone image files.
+
+        For multimodal models: Returns base64-encoded image data.
+        For text-only models: Returns AI-generated description.
+        """
+        if is_multimodal:
+            # Return image for multimodal model to see directly
+            try:
+                image_data = full_path.read_bytes()
+                base64_image = base64.b64encode(image_data).decode()
+                mime_type = _get_mime_type(full_path)
+
+                # Return in a format that can be parsed by the agent
+                # The LLM will receive this as text, but we format it clearly
+                return (
+                    f"[IMAGE: {full_path.name}]\n"
+                    f"Type: {mime_type}\n"
+                    f"Size: {len(image_data):,} bytes\n\n"
+                    f"<image_data mime_type=\"{mime_type}\">\n"
+                    f"{base64_image}\n"
+                    f"</image_data>"
+                )
+            except Exception as e:
+                logger.error(f"Error reading image {full_path}: {e}")
+                return f"Error reading image: {str(e)}"
+        else:
+            # Get AI description for text-only model
+            try:
+                from src.services.vision_helper import get_vision_helper
+                from src.services.description_cache import get_description_cache
+
+                cache = get_description_cache()
+                vision = get_vision_helper()
+
+                # Check cache first
+                cached = cache.get(full_path, query=describe)
+                if cached:
+                    logger.debug(f"Cache hit for image: {full_path.name}")
+                    return f"[IMAGE: {full_path.name}]\n\n{cached}"
+
+                # Generate description
+                image_data = full_path.read_bytes()
+                description = vision.describe_image_sync(
+                    image_data,
+                    mime_type=_get_mime_type(full_path),
+                    query=describe,
+                )
+
+                # Cache for future use
+                cache.set(full_path, description, query=describe)
+
+                return f"[IMAGE: {full_path.name}]\n\n{description}"
+
+            except ImportError as e:
+                logger.warning(f"Vision services not available: {e}")
+                return (
+                    f"[IMAGE: {full_path.name}]\n"
+                    f"(Visual description not available - vision services not configured)"
+                )
+            except Exception as e:
+                logger.error(f"Error describing image {full_path}: {e}")
+                return f"[IMAGE: {full_path.name}]\n(Error generating description: {str(e)})"
+
+    def _get_visual_content(
+        full_path: Path,
+        page_num: int,
+        describe: Optional[str],
+    ) -> str:
+        """Get visual content description for a document page.
+
+        For multimodal models: Returns base64-encoded page screenshot.
+        For text-only models: Returns AI-generated description.
+        """
+        try:
+            from src.services.document_renderer import get_document_renderer
+            from src.services.vision_helper import get_vision_helper
+            from src.services.description_cache import get_description_cache
+
+            renderer = get_document_renderer()
+
+            # Render the page as PNG
+            try:
+                page_image = renderer.render_page(full_path, page_num)
+            except Exception as e:
+                logger.warning(f"Could not render page {page_num} of {full_path.name}: {e}")
+                return ""  # No visual content available
+
+            if is_multimodal:
+                # Return base64 image for multimodal model
+                base64_image = base64.b64encode(page_image).decode()
+                return (
+                    f"\n<page_image page=\"{page_num}\" mime_type=\"image/png\">\n"
+                    f"{base64_image}\n"
+                    f"</page_image>"
+                )
+            else:
+                # Get AI description for text-only model
+                cache = get_description_cache()
+                vision = get_vision_helper()
+
+                # Check cache first
+                cached = cache.get(full_path, page=page_num, query=describe)
+                if cached:
+                    logger.debug(f"Cache hit for page {page_num} of {full_path.name}")
+                    return f"\n[PAGE {page_num} - VISUAL CONTENT]\n{cached}"
+
+                # Generate description
+                description = vision.describe_document_page_sync(
+                    page_image,
+                    page_num=page_num,
+                    query=describe,
+                )
+
+                # Cache for future use
+                cache.set(full_path, description, page=page_num, query=describe)
+
+                if describe:
+                    return f"\n[PAGE {page_num} - VISUAL CONTENT (Query: \"{describe[:50]}...\")]\n{description}"
+                else:
+                    return f"\n[PAGE {page_num} - VISUAL CONTENT]\n{description}"
+
+        except ImportError as e:
+            logger.debug(f"Vision services not available: {e}")
+            return ""  # Silently skip visual content if services not available
+        except Exception as e:
+            logger.warning(f"Error getting visual content for page {page_num}: {e}")
+            return ""
+
+    def _read_visual_document(
+        full_path: Path,
+        relative_path: str,
+        page_start: Optional[int],
+        page_end: Optional[int],
+        describe: Optional[str],
+    ) -> str:
+        """Read a document with visual content (PDF, PPTX, DOCX).
+
+        Combines text extraction with visual content based on multimodal setting.
+        """
+        suffix = full_path.suffix.lower()
+
+        # For PDF, use existing reader for text
+        if suffix == ".pdf":
+            text_result = _read_pdf_file(full_path, relative_path, page_start, page_end)
+
+            # If there was an error, return it
+            if text_result.startswith("Error:"):
+                return text_result
+
+            # Get page range that was read
+            try:
+                from src.services.document_renderer import get_document_renderer
+                renderer = get_document_renderer()
+                total_pages = renderer.get_page_count(full_path)
+
+                start = page_start or 1
+                end = min(page_end or total_pages, total_pages)
+
+                # Add visual content for each page read
+                visual_parts = []
+                for page_num in range(start, end + 1):
+                    visual_content = _get_visual_content(full_path, page_num, describe)
+                    if visual_content:
+                        visual_parts.append(visual_content)
+
+                if visual_parts:
+                    return text_result + "\n" + "\n".join(visual_parts)
+                return text_result
+
+            except Exception as e:
+                logger.debug(f"Could not add visual content: {e}")
+                return text_result
+
+        # For PPTX and DOCX, we need different text extraction
+        elif suffix == ".pptx":
+            return _read_pptx_file(full_path, relative_path, page_start, page_end, describe)
+        elif suffix == ".docx":
+            return _read_docx_file(full_path, relative_path, page_start, page_end, describe)
+        else:
+            return f"Error: Unsupported visual document type: {suffix}"
+
+    def _read_pptx_file(
+        full_path: Path,
+        relative_path: str,
+        slide_start: Optional[int],
+        slide_end: Optional[int],
+        describe: Optional[str],
+    ) -> str:
+        """Read a PowerPoint file with text and visual content."""
+        try:
+            from pptx import Presentation
+
+            prs = Presentation(full_path)
+            total_slides = len(prs.slides)
+
+            start = slide_start or 1
+            end = min(slide_end or total_slides, total_slides)
+
+            if start > total_slides:
+                return f"Error: slide_start ({start}) exceeds total slides ({total_slides})"
+
+            result_parts = [f"[Slides {start}-{end} of {total_slides}]", ""]
+
+            for slide_num in range(start, end + 1):
+                slide = prs.slides[slide_num - 1]
+
+                # Extract text from slide
+                slide_text = []
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text.strip():
+                        slide_text.append(shape.text.strip())
+
+                result_parts.append(f"[SLIDE {slide_num}]")
+                if slide_text:
+                    result_parts.append("\n".join(slide_text))
+                else:
+                    result_parts.append("(No text content)")
+
+                # Add visual content
+                visual_content = _get_visual_content(full_path, slide_num, describe)
+                if visual_content:
+                    result_parts.append(visual_content)
+
+                result_parts.append("")  # Blank line between slides
+
+            return "\n".join(result_parts)
+
+        except ImportError:
+            return "Error: python-pptx not installed. Install with: pip install python-pptx"
+        except Exception as e:
+            logger.error(f"PPTX read error for {relative_path}: {e}")
+            return f"Error reading PowerPoint: {str(e)}"
+
+    def _read_docx_file(
+        full_path: Path,
+        relative_path: str,
+        page_start: Optional[int],
+        page_end: Optional[int],
+        describe: Optional[str],
+    ) -> str:
+        """Read a Word document with text and visual content."""
+        try:
+            from docx import Document
+
+            doc = Document(full_path)
+
+            # Extract all text first
+            text_parts = []
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    text_parts.append(para.text)
+
+            # Also extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if row_text:
+                        text_parts.append(" | ".join(row_text))
+
+            text_content = "\n\n".join(text_parts)
+
+            # Try to get page count and visual content
+            try:
+                from src.services.document_renderer import get_document_renderer
+                renderer = get_document_renderer()
+                total_pages = renderer.get_page_count(full_path)
+
+                start = page_start or 1
+                end = min(page_end or total_pages, total_pages)
+
+                result_parts = [f"[Pages {start}-{end} of {total_pages}]", "", text_content]
+
+                # Add visual content for requested pages
+                visual_parts = []
+                for page_num in range(start, end + 1):
+                    visual_content = _get_visual_content(full_path, page_num, describe)
+                    if visual_content:
+                        visual_parts.append(visual_content)
+
+                if visual_parts:
+                    result_parts.append("\n" + "\n".join(visual_parts))
+
+                return "\n".join(result_parts)
+
+            except Exception as e:
+                # If visual rendering fails, just return text
+                logger.debug(f"Could not add visual content for DOCX: {e}")
+                return f"[Document: {full_path.name}]\n\n{text_content}"
+
+        except ImportError:
+            return "Error: python-docx not installed. Install with: pip install python-docx"
+        except Exception as e:
+            logger.error(f"DOCX read error for {relative_path}: {e}")
+            return f"Error reading Word document: {str(e)}"
+
     @tool
     def read_file(
         path: str,
         offset: Optional[int] = None,
         limit: Optional[int] = None,
         page_start: Optional[int] = None,
-        page_end: Optional[int] = None
+        page_end: Optional[int] = None,
+        describe: Optional[str] = None,
     ) -> str:
         """Read content from a file in the workspace.
 
@@ -129,19 +462,26 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         - read_file("doc.txt") - reads first 2000 lines
         - read_file("doc.txt", offset=500, limit=100) - lines 500-599
 
-        For PDF files, supports page-based access:
+        For documents (PDF, PPTX, DOCX), supports page-based access:
         - read_file("doc.pdf") - reads first pages within word limit
         - read_file("doc.pdf", page_start=5, page_end=10) - specific pages
+        - Visual content (charts, diagrams) is automatically included
+
+        For image files (PNG, JPG, etc.):
+        - Returns image data or AI-generated description
 
         Args:
             path: Relative path to the file (e.g., "workspace.md")
             offset: For text files: starting line number (1-indexed, default: 1)
             limit: For text files: number of lines to read (default/max: 2000)
-            page_start: For PDFs: first page to read (1-indexed)
-            page_end: For PDFs: last page to read
+            page_start: For documents: first page/slide to read (1-indexed)
+            page_end: For documents: last page/slide to read
+            describe: Optional query for visual analysis (e.g., "What values are in this chart?")
 
         Returns:
             File content with line numbers, or error message.
+            For documents: includes text + visual content descriptions.
+            For images: includes image data or description.
         """
         try:
             # Check file exists
@@ -152,17 +492,23 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             if full_path.is_dir():
                 return f"Error: '{path}' is a directory, not a file. Use list_files to see its contents."
 
-            # Handle PDF files with page-based reading
-            if full_path.suffix.lower() == '.pdf':
-                result = _read_pdf_file(full_path, path, page_start, page_end)
-                # Record successful PDF read for read-before-write tracking
+            # Handle image files
+            if _is_image_file(full_path):
+                result = _handle_image_file(full_path, describe)
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result
 
-            # For non-PDF files, page parameters are ignored
+            # Handle visual documents (PDF, PPTX, DOCX) with page-based reading + visual content
+            if _is_visual_document(full_path):
+                result = _read_visual_document(full_path, path, page_start, page_end, describe)
+                if not result.startswith("Error:"):
+                    context.record_file_read(path)
+                return result
+
+            # For non-document files, page parameters are ignored
             if page_start is not None or page_end is not None:
-                logger.warning(f"page_start/page_end ignored for non-PDF file: {path}")
+                logger.warning(f"page_start/page_end ignored for non-document file: {path}")
 
             # Apply line-based reading defaults
             start_line = offset if offset is not None else 1
