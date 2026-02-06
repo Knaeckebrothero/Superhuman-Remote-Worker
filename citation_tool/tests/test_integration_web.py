@@ -170,31 +170,39 @@ class TestWebSourceErrors:
     """Tests for error handling in web source operations."""
 
     def test_add_web_source_invalid_url(self, temp_db_path):
-        """Test error handling for invalid URL."""
+        """Test graceful degradation for invalid URL - registers with metadata only."""
         with CitationEngine(mode="basic", db_path=temp_db_path) as engine:
-            with pytest.raises(ConnectionError):
-                engine.add_web_source(
-                    url="https://this-domain-does-not-exist-12345.invalid",
-                    name="Invalid URL Test",
-                )
+            source = engine.add_web_source(
+                url="https://this-domain-does-not-exist-12345.invalid",
+                name="Invalid URL Test",
+            )
+            assert source.id is not None
+            assert "[CONTENT NOT ACCESSIBLE]" in source.content
+            assert source.metadata.get("fetch_error") is not None
 
     def test_add_web_source_404(self, temp_db_path):
-        """Test error handling for 404 response."""
+        """Test graceful degradation for 404 response - registers with metadata only."""
         with CitationEngine(mode="basic", db_path=temp_db_path) as engine:
-            with pytest.raises(ConnectionError):
-                engine.add_web_source(
-                    url="https://httpbin.org/status/404",
-                    name="404 Test",
-                )
+            source = engine.add_web_source(
+                url="https://httpbin.org/status/404",
+                name="404 Test",
+            )
+            assert source.id is not None
+            assert "[CONTENT NOT ACCESSIBLE]" in source.content
+            assert source.metadata.get("fetch_error") is not None
+            assert source.metadata.get("status_code") == 404
 
     def test_add_web_source_500(self, temp_db_path):
-        """Test error handling for 500 response."""
+        """Test graceful degradation for 500 response - registers with metadata only."""
         with CitationEngine(mode="basic", db_path=temp_db_path) as engine:
-            with pytest.raises(ConnectionError):
-                engine.add_web_source(
-                    url="https://httpbin.org/status/500",
-                    name="500 Test",
-                )
+            source = engine.add_web_source(
+                url="https://httpbin.org/status/500",
+                name="500 Test",
+            )
+            assert source.id is not None
+            assert "[CONTENT NOT ACCESSIBLE]" in source.content
+            assert source.metadata.get("fetch_error") is not None
+            assert source.metadata.get("status_code") == 500
 
 
 # =============================================================================
