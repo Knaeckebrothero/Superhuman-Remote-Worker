@@ -14,7 +14,13 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 pip install -e ./citation_tool[full]
 cp .env.example .env  # Then configure API keys
+
+# System dependencies
+sudo apt-get install poppler-utils    # Required for PDF page rendering (pdf2image)
+playwright install chromium           # Required for browser-based research tools
 ```
+
+Citation tool install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
 
 ### Database Management
 ```bash
@@ -71,6 +77,13 @@ python agent.py --port 8001
 
 # Resume from checkpoint
 python agent.py --job-id <id> --resume
+
+# Phase snapshot management
+python agent.py --job-id <id> --list-phases          # List available snapshots
+python agent.py --job-id <id> --recover-phase 2 --resume  # Recover to specific phase
+
+# Approve a frozen job (marks as completed)
+python agent.py --config validator --job-id <id> --approve
 ```
 
 **Environment Variables:**
@@ -134,7 +147,9 @@ Config structure:
 - `config/defaults.yaml` - Framework defaults (all configs extend this)
 - `config/schema.json` - JSON Schema for config validation
 - `config/prompts/` - System prompts (strategic.txt, tactical.txt, systemprompt.txt)
-- `config/templates/` - File templates (workspace_template.md, strategic_todos_*.yaml, phase_retrospective_template.md)
+- `config/templates/` - File templates (workspace_template.md, phase_retrospective_template.md)
+  - `strategic_todos_initial.yaml` - First strategic phase (job startup)
+  - `strategic_todos_transition.yaml` - Subsequent strategic phases (phase transitions)
 - `config/my_agent.yaml` - Custom single-file config
 - `config/my_agent/config.yaml` - Custom directory config (with prompt overrides)
 
@@ -212,7 +227,7 @@ Tool categories in config:
 
 | Database | Purpose | Connection |
 |----------|---------|------------|
-| PostgreSQL | Jobs, agents, requirements, citations | Async with asyncpg, namespace pattern: `db.jobs.create()` |
+| PostgreSQL | Jobs, agents, requirements, citations | Async with asyncpg, namespace pattern: `db.jobs.create()`, queries in `src/database/queries/postgres/*.sql` |
 | MongoDB | LLM request logging (optional) | Audit trail and token tracking |
 | Neo4j | Knowledge graph (optional) | Graph visualization and querying |
 
@@ -229,7 +244,7 @@ Per-job directory: `workspace/job_<uuid>/`
 - `.git/` - Git repository for workspace versioning (when `workspace.git_versioning: true`)
 - Checkpoints: `workspace/checkpoints/job_<id>.db` (SQLite)
 
-**Git Versioning**: When enabled (`workspace.git_versioning: true` in config), each workspace is a git repo. Auto-commits on todo completion, tags mark phase boundaries. Use `git_log`, `git_show`, `git_diff` tools to query history.
+**Git Versioning**: When enabled (`workspace.git_versioning: true` in config), each workspace is a git repo. Auto-commits on todo completion with formatted messages, `.gitignore` auto-configured from `workspace.git_ignore_patterns`, tags mark phase boundaries (`phase_N_start`, `phase_N_end`). Use `git_log`, `git_show`, `git_diff` tools to query history.
 
 ### Context Management
 
@@ -254,10 +269,12 @@ Token limits trigger automatic summarization:
   - `vision_helper.py` - VisionHelper for image/document descriptions
   - `document_renderer.py` - DocumentRenderer for PDF/PPTX/DOCX to PNG
   - `description_cache.py` - DescriptionCache for caching vision outputs
+- `src/llm/` - LLM wrappers
+  - `reasoning_chat.py` - ReasoningChatOpenAI: captures `reasoning_content` from DeepSeek R1-style models, Layer 0 context overflow protection
 - `src/tools/` - Tool implementations and registry
   - `registry.py` - Tool metadata registry with phase filtering
   - `context.py` - ToolContext dependency injection
-  - `description_generator.py` - Generates tool documentation for workspace
+  - `description_manager.py` - Auto-generates per-tool markdown docs into `workspace/job_<id>/tools/`
 - `src/database/` - PostgreSQL (asyncpg), MongoDB managers
   - `postgres_db.py` - Async PostgreSQL with namespaces
   - `schema.sql` - PostgreSQL schema
@@ -265,7 +282,7 @@ Token limits trigger automatic summarization:
 - `config/` - Configuration files, defaults, schema, and prompt templates
 - `orchestrator/` - Backend API for monitoring and agent orchestration
   - `orchestrator/init.py` - Database initialization (PostgreSQL, MongoDB)
-  - `orchestrator/main.py` - FastAPI endpoints
+  - `orchestrator/main.py` - FastAPI endpoints (includes agent registration/heartbeat with 3-min stale timeout)
   - `orchestrator/database/` - Database layer (postgres.py, mongodb.py, schema.sql)
   - `orchestrator/services/` - Services (workspace)
   - `orchestrator/mcp/` - MCP server for Claude Code integration

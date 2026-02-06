@@ -61,6 +61,9 @@ tools:
   # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
   research:
     - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
     - search_papers
     - download_paper
     - get_paper_info
