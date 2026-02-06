@@ -539,6 +539,11 @@ def load_agent_config(
         instructions_template=workspace_data.get("instructions_template", ""),
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
+        git_versioning=workspace_data.get("git_versioning", True),
+        git_ignore_patterns=workspace_data.get(
+            "git_ignore_patterns",
+            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+        ),
     )
 
     tools_data = data.get("tools", {})
@@ -549,6 +554,7 @@ def load_agent_config(
         research=tools_data.get("research", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
+        git=tools_data.get("git", []),
     )
 
     todo_data = data.get("todo", {})
@@ -662,6 +668,11 @@ def load_agent_config_from_dict(
         instructions_template=workspace_data.get("instructions_template", ""),
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
+        git_versioning=workspace_data.get("git_versioning", True),
+        git_ignore_patterns=workspace_data.get(
+            "git_ignore_patterns",
+            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+        ),
     )
 
     tools_data = data.get("tools", {})
@@ -672,6 +683,7 @@ def load_agent_config_from_dict(
         research=tools_data.get("research", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
+        git=tools_data.get("git", []),
     )
 
     todo_data = data.get("todo", {})
@@ -1309,7 +1321,8 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.document +
         config.tools.research +
         config.tools.citation +
-        config.tools.graph
+        config.tools.graph +
+        config.tools.git
     )
 
 

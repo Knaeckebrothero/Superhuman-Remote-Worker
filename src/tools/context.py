@@ -56,6 +56,7 @@ class ToolContext:
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
     _source_registry: Dict[str, int] = field(default_factory=dict)  # path/url -> source_id
+    _inaccessible_sources: Dict[str, str] = field(default_factory=dict)  # url -> error message
     _recent_reads: Deque[str] = field(default_factory=lambda: deque(maxlen=10))  # Recently read file paths
 
     def __post_init__(self):
@@ -191,28 +192,39 @@ class ToolContext:
         self._source_registry[file_path] = source.id
         return source.id
 
-    def get_or_register_web_source(self, url: str, name: Optional[str] = None) -> int:
+    def get_or_register_web_source(
+        self, url: str, name: Optional[str] = None
+    ) -> tuple[int, Optional[str]]:
         """Get cached source_id or register new web source.
 
         Checks the source registry first to avoid re-registering the same URL.
+        If the URL cannot be fetched (e.g. 403 Forbidden), the source is still
+        registered with metadata only and a fetch_error is returned.
 
         Args:
             url: URL of the web source
             name: Optional human-readable name for the source
 
         Returns:
-            source_id for use in citations
-
-        Raises:
-            ConnectionError: If URL cannot be fetched
+            Tuple of (source_id, fetch_error). fetch_error is None if content
+            was fetched successfully, or a string describing the error.
         """
         if url in self._source_registry:
-            return self._source_registry[url]
+            source_id = self._source_registry[url]
+            fetch_error = self._inaccessible_sources.get(url)
+            return source_id, fetch_error
 
         engine = self.get_citation_engine()
         source = engine.add_web_source(url, name=name)
         self._source_registry[url] = source.id
-        return source.id
+
+        # Check if content was actually fetched
+        fetch_error = None
+        if source.metadata and source.metadata.get("fetch_error"):
+            fetch_error = source.metadata["fetch_error"]
+            self._inaccessible_sources[url] = fetch_error
+
+        return source.id, fetch_error
 
     def close_citation_engine(self) -> None:
         """Close CitationEngine connection if open.

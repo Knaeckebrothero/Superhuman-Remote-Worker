@@ -859,8 +859,34 @@ class CitationEngine:
             from bs4 import BeautifulSoup
 
             log.debug(f"Fetching web content from: {url}")
-            response = requests.get(url, timeout=30)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; CitationEngine/1.0)",
+            }
+            response = requests.get(url, timeout=30, headers=headers)
             response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "")
+
+            # Handle PDF content (binary) - extract text via PyMuPDF
+            if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+                import tempfile
+
+                log.debug("Detected PDF content, extracting text with PyMuPDF")
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+                    tmp.write(response.content)
+                    tmp.flush()
+                    text = self._extract_pdf_content(tmp.name)
+
+                metadata = {
+                    "url": url,
+                    "accessed_at": datetime.now(timezone.utc).isoformat(),
+                    "status_code": response.status_code,
+                    "content_type": content_type,
+                    "title": None,
+                }
+
+                log.debug(f"Extracted {len(text)} characters from PDF")
+                return text, metadata
 
             # Parse HTML
             soup = BeautifulSoup(response.text, "html.parser")
@@ -872,12 +898,15 @@ class CitationEngine:
             # Extract text
             text = soup.get_text(separator="\n", strip=True)
 
+            # Strip any NUL bytes that may have slipped through
+            text = text.replace("\x00", "")
+
             # Build metadata
             metadata = {
                 "url": url,
                 "accessed_at": datetime.now(timezone.utc).isoformat(),
                 "status_code": response.status_code,
-                "content_type": response.headers.get("content-type"),
+                "content_type": content_type,
                 "title": soup.title.string if soup.title else None,
             }
 
@@ -890,9 +919,40 @@ class CitationEngine:
                 "requests and beautifulsoup4 are required for web fetching. "
                 "Install with: pip install requests beautifulsoup4"
             ) from e
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            log.warning(
+                f"HTTP {status_code} for {url} - registering with metadata only"
+            )
+            placeholder = (
+                f"[CONTENT NOT ACCESSIBLE] This URL returned HTTP {status_code}. "
+                f"The content could not be fetched automatically. "
+                f"Use the browser tool to manually download the content from: {url}"
+            )
+            metadata = {
+                "url": url,
+                "accessed_at": datetime.now(timezone.utc).isoformat(),
+                "status_code": status_code,
+                "content_type": None,
+                "title": None,
+                "fetch_error": str(e),
+            }
+            return placeholder, metadata
         except Exception as e:
-            log.error(f"Failed to fetch URL {url}: {e}")
-            raise ConnectionError(f"Failed to fetch URL {url}: {e}") from e
+            log.warning(f"Failed to fetch URL {url}: {e} - registering with metadata only")
+            placeholder = (
+                f"[CONTENT NOT ACCESSIBLE] Failed to fetch this URL: {e}. "
+                f"Use the browser tool to manually download the content from: {url}"
+            )
+            metadata = {
+                "url": url,
+                "accessed_at": datetime.now(timezone.utc).isoformat(),
+                "status_code": None,
+                "content_type": None,
+                "title": None,
+                "fetch_error": str(e),
+            }
+            return placeholder, metadata
 
     # =========================================================================
     # CITATION METHODS

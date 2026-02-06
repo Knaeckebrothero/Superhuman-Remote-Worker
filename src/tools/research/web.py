@@ -87,14 +87,17 @@ def _direct_web_search(query: str, max_results: int, context: Optional[ToolConte
 
         # Register each result as a citation source if context available
         registered_sources = []
+        inaccessible_sources = []
         if context is not None:
             for r in results:
                 url = r.get('url', '')
                 title = r.get('title', 'Untitled')
                 if url:
                     try:
-                        source_id = context.get_or_register_web_source(url, name=title)
+                        source_id, fetch_error = context.get_or_register_web_source(url, name=title)
                         registered_sources.append((url, source_id))
+                        if fetch_error:
+                            inaccessible_sources.append((url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register web source {url}: {e}")
 
@@ -108,11 +111,24 @@ def _direct_web_search(query: str, max_results: int, context: Optional[ToolConte
         for i, r in enumerate(results, 1):
             url = r.get('url', 'N/A')
             source_id = next((sid for u, sid in registered_sources if u == url), None)
+            is_inaccessible = any(u == url for u, _ in inaccessible_sources)
             result += f"{i}. {r.get('title', 'Untitled')}\n"
             result += f"   URL: {url}\n"
-            if source_id:
+            if source_id and is_inaccessible:
+                result += f"   Source ID: {source_id} (INACCESSIBLE - content not fetched)\n"
+            elif source_id:
                 result += f"   Source ID: {source_id} (archived)\n"
             result += f"   {r.get('content', '')[:300]}...\n\n"
+
+        if inaccessible_sources:
+            result += (
+                f"\nWARNING: {len(inaccessible_sources)} source(s) could not be fetched automatically "
+                f"(HTTP 403 or similar). Use the browser tool to manually download content from these URLs "
+                f"if you need to cite them:\n"
+            )
+            for url, _ in inaccessible_sources:
+                result += f"  - {url}\n"
+            result += "\n"
 
         if registered_sources:
             result += "To cite: use cite_web(text, url) - sources are already archived."

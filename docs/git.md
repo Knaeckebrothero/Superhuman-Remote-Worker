@@ -681,6 +681,10 @@ When implementing `git_reset`:
 
 This requires commit messages to be machine-parseable (already designed for this).
 
+### Git-Based Deliverables
+
+Push the agent's workspace (or a curated subset) to a remote repository when the job completes, so users can fetch/clone it. This extends the existing git infrastructure with remote operations (`push`, `remote add`). See [docs/deliverables.md](deliverables.md) for the full design discussion including three approaches: push whole workspace, separate deliverables directory, or branch-based separation.
+
 ### Code Repository Integration
 
 When agents work on actual codebases (not just workspaces):

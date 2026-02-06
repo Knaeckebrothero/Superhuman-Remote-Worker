@@ -289,9 +289,7 @@ Similarity Score: {similarity}
 
             # Register source and create citation
             try:
-                source_id = context.get_or_register_web_source(url, name=title)
-            except ConnectionError as e:
-                return f"Error: Could not fetch URL {url}: {e}"
+                source_id, fetch_error = context.get_or_register_web_source(url, name=title)
             except Exception as e:
                 logger.warning(f"Could not register web source: {e}")
                 citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"

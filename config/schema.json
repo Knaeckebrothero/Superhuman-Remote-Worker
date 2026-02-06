@@ -386,6 +386,52 @@
           "enum": ["minimal", "standard", "deep"],
           "default": "standard",
           "description": "Depth of research to perform"
+        },
+        "proxy": {
+          "type": "object",
+          "description": "Proxy configuration for institutional access (e.g., SSH tunnel to university VPN)",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable proxy for research tool requests"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["none", "http", "socks5"],
+              "default": "socks5",
+              "description": "Proxy type"
+            },
+            "host": {
+              "type": ["string", "null"],
+              "description": "Proxy host (e.g., 'localhost' for SSH tunnel)"
+            },
+            "port": {
+              "type": ["integer", "null"],
+              "description": "Proxy port (e.g., 1080 for SOCKS)"
+            }
+          }
+        }
+      }
+    },
+    "browser": {
+      "type": "object",
+      "description": "Browser automation configuration (browser-use + Playwright)",
+      "properties": {
+        "headless": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run browser without visible UI"
+        },
+        "timeout": {
+          "type": "integer",
+          "default": 60000,
+          "description": "Browser operation timeout in milliseconds"
+        },
+        "use_vision": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use screenshot-based navigation instead of DOM/accessibility tree"
         }
       }
     },

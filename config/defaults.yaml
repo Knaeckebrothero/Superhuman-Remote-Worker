@@ -58,9 +58,15 @@ tools:
   document:
     - chunk_document
     - identify_requirement_candidates
-  # Research tools - web search (src/tools/research/)
+  # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
   research:
     - web_search
+    - search_papers
+    - download_paper
+    - get_paper_info
+    - browse_website
+    - download_from_website
+    - research_topic
   # Citation tools - citation management (src/tools/citation/)
   citation:
     - cite_document
@@ -116,6 +122,18 @@ research:
   web_search_enabled: false
   graph_search_enabled: false
   research_depth: standard
+  # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
+  proxy:
+    enabled: false
+    type: socks5  # "http", "socks5", or "none"
+    host: null
+    port: null
+
+# Browser automation settings (browser-use + Playwright)
+browser:
+  headless: true
+  timeout: 60000  # Milliseconds
+  use_vision: false  # DOM-based by default (works with any LLM)
 
 validation:
   duplicate_threshold: 0.9
