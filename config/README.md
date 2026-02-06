@@ -35,8 +35,10 @@ display_name: My Custom Agent
 description: Does custom things
 
 tools:
-  domain:
+  research:
     - web_search
+    - search_papers
+  citation:
     - cite_web
 ```
 
@@ -95,29 +97,110 @@ workspace:
 
 ### Tool Categories
 
-Tools are organized into categories:
+Tools are organized into categories. Each category maps to a module under `src/tools/`:
 
 ```yaml
 tools:
+  # File operations (src/tools/workspace/)
   workspace:
     - read_file
     - write_file
+    - edit_file
     - list_files
-    # ...
-  todo:
-    - next_phase_todos
-    - todo_complete
-    - todo_rewind
-  domain:
-    - web_search
+    - delete_file
+    - search_files
+    - file_exists
+    - move_file
+    - rename_file
+    - copy_file
+    - get_workspace_summary
+    - get_document_info
+
+  # Task management + completion (src/tools/core/)
+  core:
+    - next_phase_todos      # Stage todos for next tactical phase
+    - todo_complete          # Mark current todo done
+    - todo_rewind            # Roll back failed todo
+    - mark_complete          # Signal phase/task completion
+    - job_complete           # Signal final completion (strategic only)
+
+  # Document processing (src/tools/document/)
+  document:
+    - chunk_document
+    - identify_requirement_candidates
+
+  # Research: web, papers, browser, workflows (src/tools/research/)
+  research:
+    - web_search             # Tavily web search
+    - search_papers          # Search arXiv or Semantic Scholar
+    - download_paper         # Download PDF (arXiv → Unpaywall → browser fallback)
+    - get_paper_info         # Paper metadata via Semantic Scholar
+    - browse_website         # AI browser automation (browser-use)
+    - download_from_website  # Download files via browser automation
+    - research_topic         # Multi-database literature search + download
+
+  # Citation management (src/tools/citation/)
+  citation:
+    - cite_document
     - cite_web
-    # ...
-  completion:
-    - mark_complete
-    - job_complete
+    - list_sources
+    - get_citation
+    - list_citations
+    - edit_citation
+
+  # Neo4j graph operations (src/tools/graph/)
+  graph:
+    - execute_cypher_query
+    - get_database_schema
+    - validate_schema_compliance
+
+  # Workspace version control (src/tools/git/)
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
 ```
 
-**Domain tools** are agent-specific and should be customized. See `defaults.yaml` for all available workspace, todo, and completion tools.
+Select which tools your agent needs. For example, a research-focused agent:
+
+```yaml
+tools:
+  research:
+    - web_search
+    - search_papers
+    - download_paper
+    - research_topic
+  citation:
+    - cite_web
+    - cite_document
+```
+
+See `defaults.yaml` for the full default tool set.
+
+### Research & Browser Configuration
+
+```yaml
+research:
+  web_search_enabled: false
+  graph_search_enabled: false
+  research_depth: standard
+  proxy:
+    enabled: false       # Enable proxy for paywalled content
+    type: socks5         # "http", "socks5", or "none"
+    host: localhost       # Proxy host (e.g., SSH tunnel)
+    port: 1080            # Proxy port
+
+browser:
+  headless: true          # Run browser without GUI
+  timeout: 60000          # Navigation timeout (ms)
+  use_vision: false       # DOM-based (default) vs screenshot-based navigation
+```
+
+Proxy can also be set via environment variables: `RESEARCH_PROXY_TYPE`, `RESEARCH_PROXY_HOST`, `RESEARCH_PROXY_PORT`, `RESEARCH_PROXY_USER`, `RESEARCH_PROXY_PASS`.
+
+Browser LLM is configured separately: `BROWSER_LLM_MODEL` (default: `gpt-4o-mini`), `BROWSER_LLM_API_KEY`, `BROWSER_LLM_BASE_URL`.
 
 ### Database Connections
 
@@ -155,7 +238,7 @@ Example clearing an inherited array:
 $extends: defaults
 
 tools:
-  domain: null  # Clears all domain tools
+  research: null  # Clears all research tools
 ```
 
 ## Schema Validation
