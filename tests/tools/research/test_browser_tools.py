@@ -702,6 +702,9 @@ class TestResearchToolsRegistry:
 
         # Web tools
         assert "web_search" in metadata
+        assert "extract_webpage" in metadata
+        assert "crawl_website" in metadata
+        assert "map_website" in metadata
 
         # Paper tools
         assert "search_papers" in metadata
@@ -722,6 +725,9 @@ class TestResearchToolsRegistry:
         names = {t.name for t in tools}
 
         assert "web_search" in names
+        assert "extract_webpage" in names
+        assert "crawl_website" in names
+        assert "map_website" in names
         assert "search_papers" in names
         assert "download_paper" in names
         assert "get_paper_info" in names
