@@ -528,6 +528,16 @@ def finalize_job(
     # Clear the final phase data
     clear_final_phase_data(job_id)
 
+    # Final git commit and push for workspace delivery
+    git_mgr = workspace.git_manager
+    if git_mgr and git_mgr.is_active:
+        try:
+            git_mgr.commit("Job frozen for review", allow_empty=True)
+            git_mgr.tag("job-frozen", "Job frozen for human review")
+            git_mgr.push()
+        except Exception as e:
+            logger.warning(f"[{job_id}] Final git push failed: {e}")
+
     # Archive todos if any remain
     if todo_manager:
         todo_manager.archive("final")
@@ -591,6 +601,9 @@ def _complete_phase_with_git(
         )
         git_mgr.commit(commit_msg, allow_empty=True)
         logger.debug(f"Committed phase completion: {commit_msg}")
+
+        # Push to remote for workspace delivery
+        git_mgr.push()
 
     except Exception as e:
         logger.warning(f"Git operations failed during phase transition: {e}")

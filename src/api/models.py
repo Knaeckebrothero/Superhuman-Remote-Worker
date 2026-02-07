@@ -280,6 +280,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Additional inline instructions for the agent",
     )
+    git_remote_url: Optional[str] = Field(
+        default=None,
+        description="Git remote URL for workspace delivery (set by orchestrator)",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={

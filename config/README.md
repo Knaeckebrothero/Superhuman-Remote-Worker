@@ -127,7 +127,6 @@ tools:
   # Document processing (src/tools/document/)
   document:
     - chunk_document
-    - identify_requirement_candidates
 
   # Research: web, papers, browser, workflows (src/tools/research/)
   research:

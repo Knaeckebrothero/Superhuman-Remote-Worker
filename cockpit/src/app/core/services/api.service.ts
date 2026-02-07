@@ -5,6 +5,7 @@ import {
   TableInfo,
   TableDataResponse,
   ColumnDef,
+  Expert,
   Agent,
   Job,
   JobCreateRequest,
@@ -353,6 +354,17 @@ export class ApiService {
         console.error(`Failed to fetch job version for ${jobId}:`, error);
         return of(null);
       }),
+    );
+  }
+
+  // ===== Expert Discovery Endpoints =====
+
+  /**
+   * Get list of available expert configurations.
+   */
+  getExperts(): Observable<Expert[]> {
+    return this.http.get<Expert[]>(`${this.baseUrl}/experts`).pipe(
+      catchError(() => of([])),
     );
   }
 
