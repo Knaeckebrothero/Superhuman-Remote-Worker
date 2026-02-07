@@ -824,6 +824,41 @@ class UniversalAgent:
                 except Exception as e:
                     logger.warning(f"Failed to initialize {dest_path}: {e}")
 
+        # Clone git repository if git_url is provided (for coding agents)
+        if metadata.get("git_url") and not resume:
+            git_url = metadata["git_url"]
+            git_branch = metadata.get("git_branch", "main")
+            repo_dir = self._workspace_manager.get_path("repo")
+            logger.info(f"Cloning {git_url} (branch: {git_branch}) into workspace/repo/")
+            try:
+                import subprocess
+                # Clone the repository
+                clone_result = subprocess.run(
+                    ["git", "clone", "--branch", git_branch, git_url, str(repo_dir)],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if clone_result.returncode == 0:
+                    logger.info(f"Repository cloned successfully into {repo_dir}")
+                else:
+                    # Try cloning without --branch (branch might not exist yet)
+                    clone_result2 = subprocess.run(
+                        ["git", "clone", git_url, str(repo_dir)],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if clone_result2.returncode == 0:
+                        # Create and checkout the branch
+                        subprocess.run(
+                            ["git", "checkout", "-b", git_branch],
+                            cwd=str(repo_dir), capture_output=True, text=True,
+                        )
+                        logger.info(f"Repository cloned, created branch: {git_branch}")
+                    else:
+                        logger.error(f"Git clone failed: {clone_result2.stderr}")
+            except subprocess.TimeoutExpired:
+                logger.error(f"Git clone timed out after 300s")
+            except Exception as e:
+                logger.error(f"Git clone failed: {e}")
+
         # Copy documents to workspace if provided
         updated_metadata = dict(metadata)
 

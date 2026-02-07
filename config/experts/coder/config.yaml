@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=../../schema.json
+# Coding Agent - implements features, fixes bugs, runs tests, submits PRs
+$extends: defaults
+
+agent_id: coder
+display_name: Coding Agent
+description: |
+  Implements features, fixes bugs, runs tests, and submits pull requests.
+  Needs a git repository URL (--git-url) to clone into the workspace.
+icon: code
+color: "#a6e3a1"
+tags:
+  - coding
+  - development
+  - automation
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - output/
+    - repo/
+  git_versioning: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - search_files
+    - file_exists
+    - move_file
+    - copy_file
+    - delete_file
+    - create_directory
+    - delete_directory
+  coding:
+    - run_command
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  git:
+    - git_log
+    - git_diff
+    - git_show
+    - git_status
+    - git_tags
+  # Disable unused tool categories
+  document: null
+  research: null
+  citation: null
+  graph: null

@@ -221,6 +221,7 @@ Tool categories in config:
 - `citation`: Citation management (cite_document, cite_web, list_sources, etc.)
 - `graph`: Neo4j operations (execute_cypher_query, get_database_schema, validate_schema_compliance)
 - `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
+- `coding`: Shell command execution (run_command)
 
 **Phase-specific tool filtering**: Tools declare their phase availability via `phases` metadata in `TOOL_REGISTRY` (`src/tools/registry.py`). Each tool entry specifies `phases: ["strategic", "tactical"]` or a subset. `filter_tools_by_phase()` removes tools not available in the current phase before binding to the LLM. `job_complete` is strategic-only; tactical phases cannot signal job completion directly.
 
