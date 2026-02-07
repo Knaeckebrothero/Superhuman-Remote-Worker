@@ -102,6 +102,10 @@ def _message_to_dict(msg: BaseMessage) -> Dict[str, Any]:
     if hasattr(msg, "additional_kwargs") and msg.additional_kwargs:
         result["additional_kwargs"] = msg.additional_kwargs
 
+    # Include response_metadata if present (token_usage, model_name, finish_reason, etc.)
+    if hasattr(msg, "response_metadata") and msg.response_metadata:
+        result["response_metadata"] = msg.response_metadata
+
     return result
 
 
@@ -267,6 +271,8 @@ class LLMArchiver:
         metadata: Optional[Dict[str, Any]] = None,
         phase: Optional[str] = None,
         phase_number: Optional[int] = None,
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        model_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Archive an LLM request/response.
 
@@ -281,6 +287,8 @@ class LLMArchiver:
             metadata: Additional metadata to store
             phase: Current phase ("strategic" or "tactical")
             phase_number: Current phase number
+            tool_schemas: Tool definition schemas sent to the LLM (OpenAI format)
+            model_kwargs: Model parameters (temperature, tool_choice, etc.)
 
         Returns:
             Inserted document ID, or None if archiving failed.
@@ -290,15 +298,22 @@ class LLMArchiver:
 
         try:
             # Build document
+            request_data: Dict[str, Any] = {
+                "messages": [_message_to_dict(m) for m in messages],
+                "message_count": len(messages),
+            }
+            if tool_schemas:
+                request_data["tools"] = tool_schemas
+                request_data["tool_count"] = len(tool_schemas)
+            if model_kwargs:
+                request_data["model_kwargs"] = model_kwargs
+
             doc = {
                 "job_id": job_id,
                 "agent_type": agent_type,
                 "timestamp": datetime.now(timezone.utc),
                 "model": model,
-                "request": {
-                    "messages": [_message_to_dict(m) for m in messages],
-                    "message_count": len(messages),
-                },
+                "request": request_data,
                 "response": _message_to_dict(response),
             }
 
@@ -1023,6 +1038,8 @@ def archive_llm_request(
     metadata: Optional[Dict[str, Any]] = None,
     phase: Optional[str] = None,
     phase_number: Optional[int] = None,
+    tool_schemas: Optional[List[Dict[str, Any]]] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Convenience function to archive an LLM request using default archiver.
 
@@ -1041,5 +1058,7 @@ def archive_llm_request(
             metadata=metadata,
             phase=phase,
             phase_number=phase_number,
+            tool_schemas=tool_schemas,
+            model_kwargs=model_kwargs,
         )
     return None

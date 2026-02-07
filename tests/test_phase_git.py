@@ -110,15 +110,12 @@ class TestCompletePhaseWithGit:
         )
 
         content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_number: 1" in content
+        assert "phase_number: 2" in content  # Sequential: always increments
         assert "phase_type: tactical" in content
         assert "Extraction Phase" in content
 
     def test_updates_phase_state_yaml_tactical_to_strategic(self, workspace_with_git):
-        """Test that phase_state.yaml is updated when going tactical -> strategic.
-
-        Phase number should increment when transitioning from tactical to strategic.
-        """
+        """Test that phase_state.yaml is updated when going tactical -> strategic."""
         _complete_phase_with_git(
             workspace=workspace_with_git,
             phase_number=1,
