@@ -221,6 +221,14 @@
           },
           "description": "Git version control tools for workspace history (src/tools/git/)",
           "examples": [["git_log", "git_show", "git_diff", "git_status", "git_tags"]]
+        },
+        "coding": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Coding/execution tools for shell command execution (src/tools/coding/)",
+          "examples": [["run_command"]]
         }
       }
     },

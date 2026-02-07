@@ -335,6 +335,17 @@ def parse_args():
         help="Approve a frozen job (marks as completed, requires --job-id)",
     )
 
+    # Coding agent options
+    parser.add_argument(
+        "--git-url",
+        help="Git repository URL to clone into workspace/repo/ (for coding agents)",
+    )
+    parser.add_argument(
+        "--git-branch",
+        default="main",
+        help="Git branch to checkout after cloning (default: main)",
+    )
+
     # Phase recovery options
     parser.add_argument(
         "--list-phases",
@@ -650,6 +661,19 @@ def main():
             context = json.loads(args.context)
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in --context: {e}")
+            sys.exit(1)
+
+    # Add git repo info to context for coding agents
+    if args.git_url:
+        if context is None:
+            context = {}
+        context["git_url"] = args.git_url
+        context["git_branch"] = args.git_branch
+
+    # Validate git-url if provided
+    if args.git_url:
+        if not args.description:
+            logger.error("--git-url requires --description")
             sys.exit(1)
 
     # Validate and fetch requirement if --requirement-id provided

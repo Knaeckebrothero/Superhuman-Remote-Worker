@@ -5,6 +5,9 @@ output/*
 orchestrator/workspace/*
 project_documentation/*
 
+# VPN credentials (config.example is tracked, config is not)
+docker/vpn/config
+
 # MCP configuration files
 .mcp.json
 
