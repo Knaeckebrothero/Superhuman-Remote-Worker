@@ -103,6 +103,26 @@ services:
       timeout: 5s
       retries: 5
 
+  vpn-sidecar:
+    build: ./docker/vpn
+    container_name: graphrag-vpn-dev
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./docker/vpn/config:/etc/openfortivpn/config:ro,Z
+    ports:
+      - "${VPN_SOCKS_PORT:-1080}:1080"
+    environment:
+      SOCKS_PORT: 1080
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   orchestrator:
     image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-orchestrator:${IMAGE_TAG:-latest}
     container_name: graphrag-orchestrator-dev

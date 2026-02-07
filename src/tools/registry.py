@@ -28,6 +28,7 @@ from .research import create_research_tools, get_research_metadata
 from .citation import create_citation_tools, get_citation_metadata
 from .graph import create_graph_tools, get_graph_metadata
 from .git import create_git_tools, get_git_metadata
+from .coding import create_coding_tools, get_coding_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
@@ -53,6 +54,7 @@ TOOL_REGISTRY.update(get_research_metadata())
 TOOL_REGISTRY.update(get_citation_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
+TOOL_REGISTRY.update(get_coding_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -339,6 +341,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded git tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load git tools: {e}")
+
+    # Coding tools
+    if "coding" in tools_by_category:
+        if not context.has_workspace():
+            logger.warning("Coding tools require workspace_manager in ToolContext")
+        else:
+            try:
+                coding_tools = create_coding_tools(context)
+                requested = set(tools_by_category["coding"])
+                for tool in coding_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded coding tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load coding tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

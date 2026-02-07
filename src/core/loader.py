@@ -331,6 +331,7 @@ class ToolsConfig:
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
     git: List[str] = field(default_factory=list)
+    coding: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -544,6 +545,7 @@ def load_agent_config(
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
         git=tools_data.get("git", []),
+        coding=tools_data.get("coding", []),
     )
 
     connections_data = data.get("connections", {})
@@ -664,6 +666,7 @@ def load_agent_config_from_dict(
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
         git=tools_data.get("git", []),
+        coding=tools_data.get("coding", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1193,6 +1196,7 @@ def load_instructions(
         all_tools.extend(config.tools.research)
         all_tools.extend(config.tools.citation)
         all_tools.extend(config.tools.graph)
+        all_tools.extend(config.tools.coding)
         tools_str = ", ".join(all_tools) if all_tools else "(none configured)"
 
         return f"""# {config.display_name} Instructions
@@ -1293,7 +1297,8 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.research +
         config.tools.citation +
         config.tools.graph +
-        config.tools.git
+        config.tools.git +
+        config.tools.coding
     )
 
 

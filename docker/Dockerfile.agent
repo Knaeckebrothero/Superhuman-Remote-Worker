@@ -45,32 +45,39 @@ FROM python:3.11-slim
 LABEL maintainer="Graph-RAG Team"
 LABEL description="Universal Agent for document processing and requirement validation"
 
+# Create non-root user early so COPY --chown can reference it
+RUN groupadd -r graphrag && useradd -r -g graphrag -m graphrag
+
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     AGENT_CONFIG=defaults \
-    AGENT_PORT=8001
+    AGENT_PORT=8001 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 
 WORKDIR /app
 
 # Install runtime dependencies
+# Note: ripgrep and jq support the coding agent's run_command tool
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
     git \
     poppler-utils \
+    ripgrep \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder
+# Copy installed packages from builder (system-owned, read-only is fine)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy source code
-COPY src/ ./src/
-COPY config/ ./config/
-COPY citation_tool/ ./citation_tool/
-COPY agent.py ./
+# Copy source code with correct ownership (avoids expensive chown -R later)
+COPY --chown=graphrag:graphrag src/ ./src/
+COPY --chown=graphrag:graphrag config/ ./config/
+COPY --chown=graphrag:graphrag citation_tool/ ./citation_tool/
+COPY --chown=graphrag:graphrag agent.py ./
 
 # Install citation tool
 RUN if [ -d "./citation_tool" ] && [ -f "./citation_tool/pyproject.toml" ]; then \
@@ -80,12 +87,10 @@ RUN if [ -d "./citation_tool" ] && [ -f "./citation_tool/pyproject.toml" ]; then
 # Install Playwright chromium for browser-based research tools
 RUN playwright install --with-deps chromium
 
-# Create directories
-RUN mkdir -p /app/workspace /app/logs
+# Create runtime directories with correct ownership
+RUN mkdir -p /app/workspace /app/logs && \
+    chown -R graphrag:graphrag /app/workspace /app/logs
 
-# Create non-root user
-RUN groupadd -r graphrag && useradd -r -g graphrag graphrag
-RUN chown -R graphrag:graphrag /app
 USER graphrag
 
 # Expose default port (can be overridden)
@@ -97,4 +102,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:${AGENT_PORT}/health || exit 1
 
 # Run the Universal Agent with config from environment
-CMD python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0
+CMD ["sh", "-c", "python agent.py --config ${AGENT_CONFIG} --port ${AGENT_PORT} --host 0.0.0.0"]
