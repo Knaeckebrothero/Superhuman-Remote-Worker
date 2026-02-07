@@ -494,26 +494,55 @@ def _format_graph_changes(changes: dict[str, Any]) -> str:
 
 
 def _format_llm_request(request: dict[str, Any]) -> str:
-    """Format LLM request/response."""
+    """Format LLM request/response from MongoDB llm_requests document."""
     lines = [f"LLM Request: {request.get('_id', 'unknown')}\n"]
 
     lines.append(f"Job: {request.get('job_id', 'N/A')}")
     lines.append(f"Model: {request.get('model', 'N/A')}")
     lines.append(f"Timestamp: {request.get('timestamp', 'N/A')}")
+    if request.get("iteration") is not None:
+        lines.append(f"Iteration: {request['iteration']}")
+    if request.get("latency_ms") is not None:
+        lines.append(f"Latency: {request['latency_ms']}ms")
 
-    # Token usage
-    usage = request.get("usage", {})
+    # Token usage from metrics
+    metrics = request.get("metrics", {})
+    usage = metrics.get("token_usage", {})
     if usage:
-        lines.append(
-            f"Tokens: {usage.get('prompt_tokens', 0)} prompt, "
-            f"{usage.get('completion_tokens', 0)} completion"
-        )
+        parts = [f"{usage.get('prompt_tokens', 0)} prompt"]
+        parts.append(f"{usage.get('completion_tokens', 0)} completion")
+        if usage.get("reasoning_tokens"):
+            parts.append(f"{usage['reasoning_tokens']} reasoning")
+        lines.append(f"Tokens: {', '.join(parts)}")
 
-    # Messages
-    messages = request.get("messages", [])
+    # Response metadata
+    resp = request.get("response", {})
+    resp_meta = resp.get("response_metadata", {})
+    if resp_meta.get("finish_reason"):
+        lines.append(f"Finish reason: {resp_meta['finish_reason']}")
+    if resp_meta.get("system_fingerprint"):
+        lines.append(f"System fingerprint: {resp_meta['system_fingerprint']}")
+
+    # Tool definitions
+    req_data = request.get("request", {})
+    tools = req_data.get("tools", [])
+    if tools:
+        tool_names = [t.get("function", {}).get("name", "?") for t in tools]
+        lines.append(f"\n=== Tool Definitions ({len(tools)}) ===")
+        lines.append(", ".join(tool_names))
+
+    # Model kwargs
+    model_kwargs = req_data.get("model_kwargs", {})
+    if model_kwargs:
+        lines.append(f"\n=== Model Parameters ===")
+        for k, v in model_kwargs.items():
+            lines.append(f"  {k}: {v}")
+
+    # Messages (last 5)
+    messages = req_data.get("messages", [])
     if messages:
         lines.append(f"\n=== Messages ({len(messages)}) ===")
-        for msg in messages[-5:]:  # Last 5 messages
+        for msg in messages[-5:]:
             role = msg.get("role", "unknown")
             content = msg.get("content", "")
             if isinstance(content, str):
@@ -524,19 +553,22 @@ def _format_llm_request(request: dict[str, Any]) -> str:
                 preview = str(content)[:200]
             lines.append(f"[{role}]: {preview}")
 
-    # Response
-    response = request.get("response", {})
-    if response:
+    # Response content
+    if resp:
         lines.append("\n=== Response ===")
-        choices = response.get("choices", [])
-        for choice in choices[:1]:  # First choice
-            message = choice.get("message", {})
-            content = message.get("content", "")
-            if content:
-                preview = content[:500]
-                if len(content) > 500:
-                    preview += "..."
-                lines.append(preview)
+        content = resp.get("content", "")
+        if content:
+            preview = content[:500]
+            if len(content) > 500:
+                preview += "..."
+            lines.append(preview)
+
+        # Tool calls in response
+        tool_calls = resp.get("tool_calls", [])
+        if tool_calls:
+            lines.append(f"\nTool calls ({len(tool_calls)}):")
+            for tc in tool_calls:
+                lines.append(f"  - {tc.get('name', '?')} (id: {tc.get('id', '?')})")
 
     return "\n".join(lines)
 
