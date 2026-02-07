@@ -1,6 +1,7 @@
 import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
 import { ApiService } from '../../core/services/api.service';
 import { DataService } from '../../core/services/data.service';
+import { environment } from '../../core/environment';
 import { JobStatus } from '../../core/models/api.model';
 import { JobSummary } from '../../core/models/audit.model';
 
@@ -104,6 +105,17 @@ type StatusFilter = 'all' | JobStatus;
                     >
                       View
                     </button>
+                    @if (getWorkspaceUrl(job.id)) {
+                      <a
+                        class="action-btn workspace"
+                        [href]="getWorkspaceUrl(job.id)"
+                        target="_blank"
+                        (click)="$event.stopPropagation()"
+                        title="Browse workspace in Gitea"
+                      >
+                        Workspace
+                      </a>
+                    }
                     @if (job.status === 'processing') {
                       <button
                         class="action-btn cancel"
@@ -303,7 +315,7 @@ type StatusFilter = 'all' | JobStatus;
       .col-prompt { width: auto; }
       .col-progress { width: 140px; }
       .col-created { width: 120px; }
-      .col-actions { width: 150px; }
+      .col-actions { width: 200px; }
 
       .job-table td {
         padding: 10px 12px;
@@ -443,6 +455,12 @@ type StatusFilter = 'all' | JobStatus;
         border-color: #a6e3a1;
       }
 
+      .action-btn.workspace {
+        color: #94e2d5;
+        border-color: #94e2d5;
+        text-decoration: none;
+      }
+
       .action-btn:hover {
         background: rgba(255, 255, 255, 0.1);
       }
@@ -528,6 +546,12 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   selectJob(jobId: string): void {
     this.selectedJobId.set(jobId);
+  }
+
+  getWorkspaceUrl(jobId: string): string | null {
+    const giteaUrl = environment.giteaUrl;
+    if (!giteaUrl) return null;
+    return `${giteaUrl}/job-${jobId}`;
   }
 
   viewJob(jobId: string): void {

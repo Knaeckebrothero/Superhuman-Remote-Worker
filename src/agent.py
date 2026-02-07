@@ -96,6 +96,7 @@ class UniversalAgent:
             neo4j_conn: Neo4j connection (optional, created if needed)
         """
         self.config = config
+        self._base_config = config  # Immutable snapshot for reset between jobs
         self.postgres_conn = postgres_conn
         self.neo4j_conn = neo4j_conn
 
@@ -319,6 +320,9 @@ class UniversalAgent:
         """
         if not self._initialized:
             await self.initialize()
+
+        # Reset config to base snapshot before applying per-job overrides
+        self.config = self._base_config
 
         self._current_job_id = job_id
         logger.info(f"Processing job {job_id}")
@@ -687,6 +691,11 @@ class UniversalAgent:
             self.config = load_agent_config_from_dict(merged_config_data)
             logger.info("Applied inline config overrides")
 
+        # Recreate LLMs if config was modified for this job
+        if metadata.get("config_upload_id") or metadata.get("config_override"):
+            logger.info("Config changed for this job — recreating LLMs")
+            self._create_phase_llms()
+
         # Create workspace manager
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
         self._workspace_manager = WorkspaceManager(
@@ -695,8 +704,22 @@ class UniversalAgent:
                 structure=self.config.workspace.structure,
                 git_versioning=self.config.workspace.git_versioning,
                 git_ignore_patterns=self.config.workspace.git_ignore_patterns,
+                git_remote_url=metadata.get("git_remote_url"),
             )
         )
+
+        # Pod handoff: clone workspace from Gitea if resuming on a new pod
+        if resume and not self._workspace_manager.path.exists() and metadata.get("git_remote_url"):
+            from .managers.git_manager import GitManager
+            logger.info(f"Pod handoff: cloning workspace for job {job_id}")
+            git_mgr = GitManager.clone(metadata["git_remote_url"], self._workspace_manager.path)
+            if git_mgr:
+                self._workspace_manager._git_manager = git_mgr
+                self._workspace_manager._initialized = True
+                self._todo_manager = TodoManager(workspace=self._workspace_manager)
+                logger.info(f"Pod handoff complete for job {job_id}")
+                return metadata or {}
+            logger.warning(f"Pod handoff clone failed for job {job_id}, falling through to normal init")
 
         # Check if resuming an existing workspace
         if resume and self._workspace_manager.path.exists():
@@ -708,6 +731,10 @@ class UniversalAgent:
                 instructions = load_instructions(self.config)
                 self._workspace_manager.write_file("instructions.md", instructions)
                 logger.debug("Wrote missing instructions.md to workspace")
+
+            # Ensure git remote is configured for workspace delivery
+            if metadata.get("git_remote_url") and self._workspace_manager.git_manager:
+                self._workspace_manager.git_manager.add_remote("origin", metadata["git_remote_url"])
 
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(workspace=self._workspace_manager)

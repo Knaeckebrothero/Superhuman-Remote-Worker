@@ -449,6 +449,201 @@ class GitManager:
         except Exception:
             return []
 
+    # =========================================================================
+    # Remote Operations
+    # =========================================================================
+
+    def has_remote(self, name: str = "origin") -> bool:
+        """Check if a named remote is configured.
+
+        Args:
+            name: Remote name (default: "origin")
+
+        Returns:
+            True if remote exists, False otherwise
+        """
+        if not self.is_active:
+            return False
+
+        try:
+            result = self._run_git(["remote", "get-url", name])
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def add_remote(self, name: str, url: str) -> bool:
+        """Add or update a git remote.
+
+        If the remote already exists, updates its URL instead.
+
+        Args:
+            name: Remote name (e.g. "origin")
+            url: Remote URL (may contain credentials)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.is_active:
+            return False
+
+        masked = self._mask_url(url)
+
+        try:
+            if self.has_remote(name):
+                result = self._run_git(["remote", "set-url", name, url])
+                if result.returncode == 0:
+                    logger.debug(f"Updated remote '{name}' -> {masked}")
+                    return True
+            else:
+                result = self._run_git(["remote", "add", name, url])
+                if result.returncode == 0:
+                    logger.debug(f"Added remote '{name}' -> {masked}")
+                    return True
+
+            logger.warning(f"Failed to configure remote '{name}': {result.stderr}")
+            return False
+
+        except Exception as e:
+            logger.error(f"Failed to configure remote '{name}': {e}")
+            return False
+
+    def push(self, remote: str = "origin", branch: Optional[str] = None, tags: bool = True) -> bool:
+        """Push commits and optionally tags to remote.
+
+        Gracefully returns False if no remote is configured.
+
+        Args:
+            remote: Remote name (default: "origin")
+            branch: Branch to push (auto-detected if None)
+            tags: Also push tags (default: True)
+
+        Returns:
+            True if push succeeded, False otherwise
+        """
+        if not self.is_active or not self.has_remote(remote):
+            return False
+
+        try:
+            # Auto-detect branch
+            if branch is None:
+                result = self._run_git(["branch", "--show-current"])
+                branch = result.stdout.strip() if result.returncode == 0 else "main"
+
+            # Push branch
+            result = self._run_git(
+                ["push", "-u", remote, branch],
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logger.warning(f"git push failed: {result.stderr}")
+                return False
+
+            # Push tags
+            if tags:
+                tag_result = self._run_git(
+                    ["push", remote, "--tags"],
+                    timeout=120,
+                )
+                if tag_result.returncode != 0:
+                    logger.warning(f"git push --tags failed: {tag_result.stderr}")
+                    # Don't fail overall push if only tags failed
+
+            logger.debug(f"Pushed to {remote}/{branch}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Push failed: {e}")
+            return False
+
+    def pull(self, remote: str = "origin", branch: Optional[str] = None) -> bool:
+        """Pull from remote (fast-forward only).
+
+        Gracefully returns False if no remote is configured.
+
+        Args:
+            remote: Remote name (default: "origin")
+            branch: Branch to pull (auto-detected if None)
+
+        Returns:
+            True if pull succeeded, False otherwise
+        """
+        if not self.is_active or not self.has_remote(remote):
+            return False
+
+        try:
+            if branch is None:
+                result = self._run_git(["branch", "--show-current"])
+                branch = result.stdout.strip() if result.returncode == 0 else "main"
+
+            result = self._run_git(
+                ["pull", remote, branch, "--ff-only"],
+                timeout=120,
+            )
+            if result.returncode != 0:
+                logger.warning(f"git pull failed: {result.stderr}")
+                return False
+
+            logger.debug(f"Pulled from {remote}/{branch}")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Pull failed: {e}")
+            return False
+
+    @classmethod
+    def clone(cls, url: str, target_path: Path) -> Optional["GitManager"]:
+        """Clone a repository to a target path.
+
+        Args:
+            url: Repository URL (may contain credentials)
+            target_path: Local path to clone into
+
+        Returns:
+            GitManager instance for the cloned repo, or None on failure
+        """
+        masked = cls._mask_url_static(url)
+
+        if shutil.which("git") is None:
+            logger.warning("Cannot clone: git not available")
+            return None
+
+        try:
+            result = subprocess.run(
+                ["git", "clone", url, str(target_path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"git clone failed for {masked}: {result.stderr}")
+                return None
+
+            mgr = cls(target_path)
+            # Configure local user for the cloned repo
+            mgr._run_git(["config", "user.email", "agent@workspace.local"])
+            mgr._run_git(["config", "user.name", "Agent"])
+
+            logger.info(f"Cloned {masked} to {target_path}")
+            return mgr
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"git clone timed out for {masked}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to clone {masked}: {e}")
+            return None
+
+    @staticmethod
+    def _mask_url_static(url: str) -> str:
+        """Mask credentials in a URL for safe logging."""
+        import re
+        return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", url)
+
+    def _mask_url(self, url: str) -> str:
+        """Instance method wrapper for URL masking."""
+        return self._mask_url_static(url)
+
     def _run_git(
         self, args: List[str], timeout: int = DEFAULT_TIMEOUT
     ) -> subprocess.CompletedProcess:

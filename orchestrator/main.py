@@ -10,7 +10,9 @@ Or from orchestrator directory:
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -20,6 +22,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+import yaml
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -28,6 +31,7 @@ from pydantic import BaseModel, Field
 
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory
 from services.workspace import workspace_service
+from services.gitea import GiteaClient
 from graph_routes import router as graph_router, set_mongodb
 from uploads import router as uploads_router
 
@@ -39,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 postgres_db = PostgresDB()
 mongodb = MongoDB()
+gitea_client = GiteaClient()
 
 
 # =============================================================================
@@ -145,6 +150,7 @@ class JobStartRequest(BaseModel):
     config_override: dict[str, Any] | None = None
     context: dict[str, Any] | None = None
     instructions: str | None = None
+    git_remote_url: str | None = None
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -195,6 +201,9 @@ async def lifespan(app: FastAPI):
     # Share MongoDB instance with graph_routes
     set_mongodb(mongodb)
 
+    # Initialize Gitea workspace delivery (graceful if unavailable)
+    await gitea_client.ensure_initialized()
+
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
@@ -204,6 +213,9 @@ async def lifespan(app: FastAPI):
     # Signal shutdown to background tasks
     _shutdown_event.set()
     await stale_detector_task
+
+    # Cleanup clients
+    await gitea_client.close()
 
     # Disconnect from databases
     await mongodb.disconnect()
@@ -374,7 +386,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
         if job.instructions_upload_id:
             context["instructions_upload_id"] = job.instructions_upload_id
 
-        return await postgres_db.create_job(
+        result = await postgres_db.create_job(
             description=job.description,
             document_path=job.document_path,
             document_dir=job.document_dir,
@@ -382,6 +394,17 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             config_override=job.config_override,
             context=context if context else None,
         )
+
+        # Create Gitea repo for workspace delivery
+        if gitea_client.is_initialized:
+            job_id_str = str(result["id"])
+            git_remote_url = await gitea_client.create_repo(f"job-{job_id_str}")
+            if git_remote_url:
+                ctx = dict(context) if context else {}
+                ctx["git_remote_url"] = git_remote_url
+                await postgres_db.update_job_context(job_id_str, ctx)
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -1010,6 +1033,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
         upload_id = job_context.get("upload_id")
         config_upload_id = job_context.get("config_upload_id")
         instructions_upload_id = job_context.get("instructions_upload_id")
+        git_remote_url = job_context.get("git_remote_url")
 
         # Parse config_override if stored as string
         config_override = job.get("config_override")
@@ -1027,6 +1051,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             document_path=job.get("document_path"),
             config_name=job.get("config_name", "default"),
             config_override=config_override,
+            git_remote_url=git_remote_url,
         )
 
         # Send request to agent pod
@@ -1236,3 +1261,114 @@ async def delete_agent(agent_id: str) -> dict[str, str]:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Expert Discovery
+# =============================================================================
+
+
+class ExpertInfo(BaseModel):
+    """Expert configuration metadata for discovery."""
+
+    id: str
+    display_name: str
+    description: str
+    icon: str = "psychology"
+    color: str = "#cba6f7"
+    tags: list[str] = []
+
+
+def _get_config_dir() -> Path:
+    """Resolve the config directory path."""
+    config_dir_env = os.environ.get("CONFIG_DIR")
+    if config_dir_env:
+        return Path(config_dir_env)
+    # Orchestrator runs from orchestrator/ or project root
+    candidates = [
+        Path(__file__).parent.parent / "config",  # from orchestrator/
+        Path("/app/config"),  # in container
+    ]
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+def _scan_experts() -> list[ExpertInfo]:
+    """Scan config/experts/ for expert configurations."""
+    config_dir = _get_config_dir()
+    experts_dir = config_dir / "experts"
+    experts: list[ExpertInfo] = []
+
+    # Add synthetic defaults entry
+    experts.append(
+        ExpertInfo(
+            id="defaults",
+            display_name="Generalist Agent",
+            description="General-purpose agent with balanced capabilities for requirement extraction, validation, and compliance checking.",
+            icon="psychology",
+            color="#cba6f7",
+            tags=["general", "requirements", "compliance"],
+        )
+    )
+
+    if not experts_dir.is_dir():
+        return experts
+
+    for entry in sorted(experts_dir.iterdir()):
+        config_path = entry / "config.yaml"
+        if not entry.is_dir() or not config_path.exists():
+            continue
+
+        try:
+            with open(config_path) as f:
+                data = yaml.safe_load(f) or {}
+
+            description = data.get("description", "").strip()
+
+            # Summarize tools if no description
+            if not description:
+                tools = data.get("tools", {})
+                tool_categories = [k for k in tools if tools[k]]
+                description = f"Agent with {', '.join(tool_categories)} tools." if tool_categories else "Custom agent configuration."
+
+            experts.append(
+                ExpertInfo(
+                    id=entry.name,
+                    display_name=data.get("display_name", entry.name.replace("_", " ").title()),
+                    description=description,
+                    icon=data.get("icon", "psychology"),
+                    color=data.get("color", "#cba6f7"),
+                    tags=data.get("tags", []),
+                )
+            )
+        except Exception as e:
+            logger.warning(f"Failed to parse expert config {config_path}: {e}")
+
+    return experts
+
+
+# Cache experts at startup
+_experts_cache: list[ExpertInfo] | None = None
+
+
+@app.get("/api/experts")
+async def list_experts() -> list[dict[str, Any]]:
+    """List available expert configurations.
+
+    Scans config/experts/ for expert configs and returns metadata
+    for expert selection in the cockpit UI.
+    """
+    global _experts_cache
+    if _experts_cache is None:
+        _experts_cache = _scan_experts()
+    return [e.model_dump() for e in _experts_cache]
+
+
+@app.post("/api/experts/reload")
+async def reload_experts() -> dict[str, Any]:
+    """Force reload of expert configurations cache."""
+    global _experts_cache
+    _experts_cache = _scan_experts()
+    return {"status": "reloaded", "count": len(_experts_cache)}
