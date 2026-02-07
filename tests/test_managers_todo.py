@@ -350,10 +350,20 @@ class TestTodoManagerDisplay:
         todo_manager.add("Task 2")
 
         result = todo_manager.format_for_display()
-        assert "## Current Todos" in result
+        assert "## Phase 1 (Strategic)" in result
         assert "**Pending:**" in result
         assert "Task 1" in result
         assert "Task 2" in result
+
+    def test_format_includes_phase_info(self, todo_manager):
+        """Test that format_for_display includes phase number, type, and name."""
+        todo_manager.phase_number = 3
+        todo_manager.is_strategic_phase = False
+        todo_manager.set_phase_name("Data Extraction")
+        todo_manager.add("Task 1")
+
+        result = todo_manager.format_for_display()
+        assert "## Phase 3 (Tactical): Data Extraction" in result
 
     def test_format_with_in_progress(self, todo_manager):
         """Test formatting with in progress todos."""

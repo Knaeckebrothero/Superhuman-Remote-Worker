@@ -105,26 +105,6 @@ class TestWorkspaceGitInitialization:
         for pattern in patterns:
             assert pattern in content
 
-    def test_phase_state_created(self, temp_base):
-        """Test that phase_state.yaml is created."""
-        ws = WorkspaceManager(
-            job_id="test-job",
-            config=WorkspaceManagerConfig(
-                structure=["archive/"],
-                git_versioning=True,
-            ),
-            base_path=temp_base,
-        )
-        ws.initialize()
-
-        phase_state = ws.path / "phase_state.yaml"
-        assert phase_state.exists()
-
-        content = phase_state.read_text()
-        assert "phase_number: 1" in content
-        assert "phase_type: strategic" in content
-        assert "started_at:" in content
-
     def test_initial_commit_created(self, temp_base):
         """Test that initial commit is created."""
         ws = WorkspaceManager(
@@ -162,31 +142,6 @@ class TestWorkspaceGitInitialization:
         # Git history should be preserved
         log = ws.git_manager.log()
         assert "Add test file" in log
-
-    def test_phase_state_uncommitted_after_init(self, temp_base):
-        """Test that phase_state.yaml is uncommitted after initialization.
-
-        This is intentional - phase_state.yaml is created after the initial
-        commit so it can be committed with the first todo completion.
-        """
-        ws = WorkspaceManager(
-            job_id="test-job",
-            config=WorkspaceManagerConfig(
-                structure=["archive/", "output/"],
-                git_versioning=True,
-            ),
-            base_path=temp_base,
-        )
-        ws.initialize()
-
-        # phase_state.yaml should exist but be uncommitted
-        assert (ws.path / "phase_state.yaml").exists()
-        assert ws.git_manager.has_uncommitted_changes() is True
-
-        # Committing should work
-        ws.git_manager.commit("Initial phase state")
-        assert ws.git_manager.has_uncommitted_changes() is False
-
 
 class TestWorkspaceGitConfig:
     """Tests for workspace git configuration."""
@@ -283,19 +238,20 @@ class TestWorkspaceGitOperations:
         )
         ws.initialize()
 
-        # Commit initial state (phase_state.yaml is uncommitted after init)
+        # Commit initial state and add a tracked file
+        ws.write_file("test_tracked.txt", "initial content")
         ws.git_manager.commit("Initial state")
         assert ws.git_manager.has_uncommitted_changes() is False
 
         # Make a change to an existing tracked file
-        ws.write_file("phase_state.yaml", "phase_number: 2\nphase_type: tactical\n")
+        ws.write_file("test_tracked.txt", "modified content")
 
         # Now dirty
         assert ws.git_manager.has_uncommitted_changes() is True
 
         # Diff shows changes (for tracked files)
         diff = ws.git_manager.diff()
-        assert "phase_state.yaml" in diff or "phase" in diff.lower()
+        assert "test_tracked.txt" in diff
 
 
 class TestWorkspaceGitGracefulDegradation:
