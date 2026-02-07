@@ -25,6 +25,13 @@ export interface LLMMessage {
     reasoning_content?: string;  // Model reasoning (for supported models)
     [key: string]: unknown;
   };
+  response_metadata?: {
+    token_usage?: TokenUsage;
+    model_name?: string;
+    system_fingerprint?: string;
+    finish_reason?: string;
+    [key: string]: unknown;
+  };
 }
 
 /**
@@ -47,6 +54,18 @@ export interface RequestMetrics {
 }
 
 /**
+ * Tool definition schema (OpenAI format).
+ */
+export interface LLMToolSchema {
+  type: string;
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+/**
  * Full LLM request document from MongoDB.
  */
 export interface LLMRequest {
@@ -60,6 +79,9 @@ export interface LLMRequest {
   request: {
     messages: LLMMessage[];
     message_count: number;
+    tools?: LLMToolSchema[];
+    tool_count?: number;
+    model_kwargs?: Record<string, unknown>;
   };
   response: LLMMessage;
   metrics?: RequestMetrics;

@@ -95,7 +95,44 @@ import { LLMMessage } from '../../core/models/request.model';
                 </span>
               </div>
             }
+            @if (requestService.request()?.response?.response_metadata; as meta) {
+              @if (meta['finish_reason']) {
+                <div class="metadata-row">
+                  <span class="meta-label">Finish:</span>
+                  <span class="meta-value mono">{{ meta['finish_reason'] }}</span>
+                </div>
+              }
+              @if (meta['system_fingerprint']) {
+                <div class="metadata-row">
+                  <span class="meta-label">Fingerprint:</span>
+                  <span class="meta-value mono">{{ meta['system_fingerprint'] }}</span>
+                </div>
+              }
+            }
+            @if (requestService.request()?.request?.model_kwargs; as kwargs) {
+              <div class="metadata-row">
+                <span class="meta-label">Params:</span>
+                <span class="meta-value mono">{{ formatJson(kwargs) }}</span>
+              </div>
+            }
           </div>
+
+          <!-- Tool Definitions Section (collapsible) -->
+          @if (requestService.request()?.request?.tools; as tools) {
+            <details class="tools-section">
+              <summary class="section-header clickable">
+                Tool Definitions ({{ tools.length }})
+              </summary>
+              <div class="tools-list">
+                @for (tool of tools; track tool.function.name) {
+                  <div class="tool-def-item">
+                    <span class="tool-name">{{ tool.function.name }}</span>
+                    <span class="tool-desc">{{ tool.function.description }}</span>
+                  </div>
+                }
+              </div>
+            </details>
+          }
 
           <!-- Request Messages Section -->
           <div class="section-header">
@@ -491,6 +528,53 @@ import { LLMMessage } from '../../core/models/request.model';
       .tool-value {
         font-family: 'JetBrains Mono', monospace;
         color: #cba6f7;
+      }
+
+      /* Tool Definitions Section */
+      .tools-section {
+        margin-top: 8px;
+        background: var(--surface-0, #313244);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .section-header.clickable {
+        cursor: pointer;
+        user-select: none;
+        border-bottom: none;
+        padding: 8px 12px;
+        margin: 0;
+      }
+
+      .section-header.clickable:hover {
+        background: rgba(255, 255, 255, 0.05);
+      }
+
+      .tools-list {
+        padding: 8px 12px;
+        border-top: 1px solid var(--border-color, #45475a);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .tool-def-item {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        font-size: 12px;
+      }
+
+      .tool-def-item .tool-name {
+        flex-shrink: 0;
+      }
+
+      .tool-desc {
+        color: var(--text-muted, #6c7086);
+        font-size: 11px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
       }
 
       /* Reasoning Section */

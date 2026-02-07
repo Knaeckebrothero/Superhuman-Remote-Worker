@@ -134,7 +134,7 @@ class TodoManager:
         # Phase state tracking (for job_complete validation)
         self._is_strategic_phase: bool = True
         # Phase number tracking (for git versioning and archive naming)
-        # Paired numbering: strategic and tactical phases share the same number
+        # Sequential numbering: phase 1, 2, 3, 4... (increments every transition)
         self._phase_number: int = 1
         self._current_phase_name: str = ""  # Human-readable name for current phase
 
@@ -154,6 +154,12 @@ class TodoManager:
         """Get the current phase number."""
         return self._phase_number
 
+    @phase_number.setter
+    def phase_number(self, value: int) -> None:
+        """Set the current phase number (synced from state on transitions)."""
+        self._phase_number = value
+        logger.debug(f"Phase number updated to {value}")
+
     @property
     def current_phase_name(self) -> str:
         """Get the current phase name."""
@@ -164,7 +170,7 @@ class TodoManager:
 
         Returns:
             Dictionary containing:
-            - phase_number: Current phase number (paired numbering)
+            - phase_number: Current phase number (sequential)
             - phase_type: "strategic" or "tactical"
             - phase_name: Human-readable phase name
         """
@@ -175,10 +181,9 @@ class TodoManager:
         }
 
     def increment_phase_number(self) -> int:
-        """Increment phase number (called on tactical → strategic transition).
+        """Increment phase number (called on phase transitions).
 
-        In the paired numbering model, the phase number increments when
-        transitioning from tactical back to strategic (starting a new pair).
+        Sequential numbering: increments at every phase transition.
 
         Returns:
             The new phase number
@@ -920,7 +925,7 @@ class TodoManager:
             - staged_todos: List of staged todo dicts
             - next_id: Next todo ID counter
             - staged_phase_name: Name of the staged phase
-            - phase_number: Current phase number (paired numbering)
+            - phase_number: Current phase number (sequential)
             - current_phase_name: Human-readable phase name
             - is_strategic_phase: Current phase type
         """

@@ -226,6 +226,7 @@ def create_init_strategic_todos_node(
 
         # Initialize phase state on TodoManager for tool access
         todo_manager.is_strategic_phase = True
+        todo_manager.phase_number = state.get("phase_number", 1)
 
         logger.info(
             f"[{job_id}] Loaded {len(strategic_todos)} predefined strategic todos"
@@ -303,6 +304,36 @@ def create_execute_node(
         summarization_llm: LLM for context summarization
         summarization_prompt: Prompt template for summarization
     """
+
+    # Extract tool schemas from bound LLMs once at creation time for archiving
+    def _extract_tool_schemas(bound_llm: BaseChatModel) -> Optional[List[Dict[str, Any]]]:
+        """Extract OpenAI-format tool schemas from a bound LLM."""
+        if hasattr(bound_llm, 'kwargs'):
+            return bound_llm.kwargs.get('tools')
+        return None
+
+    strategic_tool_schemas = _extract_tool_schemas(strategic_llm_with_tools)
+    tactical_tool_schemas = _extract_tool_schemas(tactical_llm_with_tools)
+
+    # Extract model kwargs (temperature, etc.) for archiving
+    def _extract_model_kwargs(bound_llm: BaseChatModel) -> Dict[str, Any]:
+        """Extract model configuration from LLM."""
+        kwargs: Dict[str, Any] = {}
+        for attr in ('temperature', 'model_name', 'max_tokens'):
+            if hasattr(bound_llm, attr):
+                val = getattr(bound_llm, attr)
+                if val is not None:
+                    kwargs[attr] = val
+        # For bound LLMs, check the underlying LLM too
+        if hasattr(bound_llm, 'bound'):
+            for attr in ('temperature', 'model_name', 'max_tokens'):
+                if hasattr(bound_llm.bound, attr):
+                    val = getattr(bound_llm.bound, attr)
+                    if val is not None:
+                        kwargs[attr] = val
+        return kwargs
+
+    model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
@@ -511,6 +542,7 @@ def create_execute_node(
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
                 if auditor:
+                    current_tool_schemas = strategic_tool_schemas if is_strategic else tactical_tool_schemas
                     request_id = auditor.archive(
                         job_id=job_id,
                         agent_type=config.agent_id,
@@ -522,6 +554,8 @@ def create_execute_node(
                         metadata=state.get("metadata"),
                         phase=phase_str,
                         phase_number=phase_number,
+                        tool_schemas=current_tool_schemas,
+                        model_kwargs=model_kwargs,
                     )
 
                     # Build tool calls preview
@@ -981,6 +1015,8 @@ def create_handle_transition_node(
             # Update phase state on TodoManager for tool access
             new_is_strategic = result.state_updates.get("is_strategic_phase", is_strategic)
             todo_manager.is_strategic_phase = new_is_strategic
+            new_phase_number = result.state_updates.get("phase_number", phase_number)
+            todo_manager.phase_number = new_phase_number
         else:
             logger.warning(
                 f"[{job_id}] Phase transition rejected: {result.error_message}"
@@ -1264,6 +1300,7 @@ def create_restore_todo_state_node(
         # Also restore phase state on TodoManager for tool access
         is_strategic = state.get("is_strategic_phase", True)
         todo_manager.is_strategic_phase = is_strategic
+        todo_manager.phase_number = state.get("phase_number", 1)
 
         return {}
 

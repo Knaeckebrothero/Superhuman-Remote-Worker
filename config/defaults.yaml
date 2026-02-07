@@ -110,8 +110,9 @@ limits:
 
 context_management:
   compact_on_archive: true
-  keep_recent_tool_results: 15
-  keep_recent_messages: 15
+  # TODO: This is somewhat "bad practice" and should be reworked
+  keep_recent_tool_results: 200
+  keep_recent_messages: 10
   summarization_template: summarization_prompt.txt
 
 document_processing:

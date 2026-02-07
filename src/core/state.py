@@ -162,7 +162,7 @@ def create_initial_state(
 
         # Phase alternation (start in strategic mode)
         is_strategic_phase=True,
-        phase_number=0,
+        phase_number=1,
         is_final_phase=False,
 
         # File-based context

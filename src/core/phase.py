@@ -590,9 +590,8 @@ def _complete_phase_with_git(
         logger.debug(f"Created git tag: {tag_name}")
 
         # Update phase_state.yaml for next phase
-        # Note: for tactical->strategic, phase_number increments (done by caller)
-        # For strategic->tactical, phase_number stays same
-        next_phase_number = phase_number + 1 if phase_type == "tactical" else phase_number
+        # Sequential numbering: always increment
+        next_phase_number = phase_number + 1
         workspace.update_phase_state(
             phase_number=next_phase_number,
             phase_type=next_phase_type,
