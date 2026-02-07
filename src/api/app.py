@@ -271,7 +271,7 @@ async def _process_orchestrator_job(
         if document_dir:
             metadata["document_dir"] = document_dir
         if context:
-            metadata["context"] = context
+            metadata.update(context)
         if instructions:
             metadata["instructions"] = instructions
         if config_override:

@@ -280,16 +280,105 @@ The `Dockerfile.agent` already includes `ripgrep` and `jq` for coding support. F
 - [ ] Consider enhancing `search_files` with regex support (currently plain text only)
 
 ### Phase 3: Delivery Integration
-- [ ] `run_command("git commit ...")` + `run_command("git push ...")` for branch delivery
-- [ ] `run_command("gh pr create ...")` for PR creation (needs `gh` in container + auth)
+- [x] `run_command("git commit ...")` + `run_command("git push ...")` for branch delivery
+- [x] PR creation via Gitea REST API (curl) — no `gh` CLI needed
+- [x] Orchestrator passes `git_url`/`git_branch` context through to agent
+- [x] Agent API merges context into top-level metadata (matches CLI behavior)
+- [x] Repo context (remote URL, branch, Gitea API) injected into `workspace.md` after clone
 - [ ] Connect to Gitea integration (existing, commit `a4f7d24`) for repo provisioning
-- [ ] Orchestrator: "coding job" type that bootstraps a repo clone
 
 ### Phase 4: Container + Production
 - [ ] Create `Dockerfile.coder` extending `Dockerfile.agent` with Node, gh CLI
 - [ ] Test in container: verify `run_command` works correctly inside pod
 - [ ] Apply cloud_workspace.md security (NetworkPolicy, secrets mount, etc.)
 - [ ] Test on k3s cluster with real job submission via cockpit
+
+## Local Testing
+
+Full-stack local testing with databases and Gitea in containers, orchestrator and agent running from your IDE.
+
+### 1. Start Infrastructure
+
+```bash
+# Start PostgreSQL, MongoDB, and Gitea
+podman-compose -f docker-compose.dev.yaml up -d postgres mongodb gitea
+```
+
+Gitea will be at `http://localhost:3000`. On first run, complete the initial setup (SQLite is fine for local dev).
+
+### 2. Initialize Databases
+
+```bash
+python init.py
+```
+
+### 3. Start Orchestrator
+
+```bash
+cd orchestrator
+GITEA_URL=http://localhost:3000 uvicorn main:app --reload --port 8085
+```
+
+### 4. Start Agent
+
+In a separate terminal:
+
+```bash
+python agent.py --config coder --port 8001
+```
+
+The agent registers with the orchestrator automatically.
+
+### 5. Prepare a Test Repository
+
+1. Create a user + repo in Gitea (`http://localhost:3000`)
+2. Push some code to it (or use an existing repo)
+3. Note the clone URL: `http://localhost:3000/<user>/<repo>.git`
+
+For authenticated push, embed credentials in the URL:
+```
+http://<user>:<password-or-token>@localhost:3000/<user>/<repo>.git
+```
+
+### 6. Submit a Coding Job
+
+```bash
+# Create the job
+curl -s -X POST http://localhost:8085/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "description": "Add a hello world endpoint to the FastAPI app",
+    "config_name": "coder",
+    "context": {
+      "git_url": "http://user:pass@localhost:3000/user/my-repo.git",
+      "git_branch": "feature/hello-world"
+    }
+  }' | jq .
+
+# Note the job_id from the response, then assign it to the agent
+curl -s -X POST http://localhost:8085/api/jobs/<job_id>/assign/<agent_id> | jq .
+```
+
+### 7. Monitor Progress
+
+```bash
+# Check job status
+curl -s http://localhost:8085/api/jobs/<job_id> | jq .
+
+# Watch agent logs
+tail -f workspace/logs/job_<job_id>.log
+
+# Check workspace files
+ls workspace/job_<job_id>/
+cat workspace/job_<job_id>/workspace.md
+```
+
+### What to Verify
+
+- Repository is cloned into `workspace/job_<id>/repo/`
+- `workspace.md` contains the "Repository Context" section with remote URL, branch, and Gitea API info
+- Context fields (`git_url`, `git_branch`) flow through orchestrator -> agent API -> metadata
+- Agent can push to Gitea and create PRs via the API
 
 ## Open Questions
 

@@ -6,7 +6,11 @@ todos:
     content: >-
       EXPLORE: Read instructions.md to understand the task. List available
       tools in the tools/ directory. Check documents/ for input files.
-      Understand the scope before planning.
+      Understand the scope before planning. Then PIN critical rules:
+      extract core constraints, required output formats, and style
+      guidelines from instructions.md and write them to workspace.md
+      under a "## Pinned Instructions" section. These survive context
+      compaction; the original instructions.md content will not.
   - id: 2
     content: >-
       PLAN: Create plan.md with phases to complete the task. For each phase,

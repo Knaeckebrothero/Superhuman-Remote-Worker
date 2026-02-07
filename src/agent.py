@@ -591,6 +591,61 @@ class UniversalAgent:
             raise FileNotFoundError(f"Workspace template not found: {template_path}")
         return template_path.read_text(encoding="utf-8")
 
+    def _inject_repo_context_to_workspace(
+        self, git_url: str, git_branch: str
+    ) -> None:
+        """Append repository context to workspace.md after clone.
+
+        This gives the agent persistent knowledge of the git remote URL,
+        branch, and Gitea API endpoint so it can push and create PRs.
+        The info survives context compaction since workspace.md is re-injected
+        on every LLM call.
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(git_url)
+        # Gitea API base: scheme://host/api/v1
+        gitea_api_base = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port:
+            gitea_api_base += f":{parsed.port}"
+        gitea_api_base += "/api/v1"
+
+        # Repo path: strip .git suffix and leading slash
+        repo_path = parsed.path.rstrip("/")
+        if repo_path.endswith(".git"):
+            repo_path = repo_path[:-4]
+        repo_path = repo_path.lstrip("/")
+        # owner/repo
+        owner_repo = repo_path  # e.g. "user/my-repo"
+
+        section = f"""
+
+## Repository Context
+
+- **Remote URL**: `{git_url}` (credentials embedded — use for push)
+- **Branch**: `{git_branch}`
+- **Gitea API**: `{gitea_api_base}`
+- **Repo path**: `{owner_repo}`
+
+### Push & PR Workflow
+
+```bash
+# Push (credentials are in the remote URL)
+git push origin {git_branch}
+
+# Create PR via Gitea API
+curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"title": "PR_TITLE", "head": "{git_branch}", "base": "main", "body": "PR_DESCRIPTION"}}'
+```
+"""
+        try:
+            existing = self._workspace_manager.read_file("workspace.md")
+            self._workspace_manager.write_file("workspace.md", existing + section)
+            logger.info("Injected repository context into workspace.md")
+        except Exception as e:
+            logger.warning(f"Failed to inject repo context into workspace.md: {e}")
+
     async def _setup_job_workspace(
         self,
         job_id: str,
@@ -858,6 +913,10 @@ class UniversalAgent:
                 logger.error(f"Git clone timed out after 300s")
             except Exception as e:
                 logger.error(f"Git clone failed: {e}")
+
+            # Inject repo context into workspace.md if clone succeeded
+            if repo_dir.exists() and any(repo_dir.iterdir()):
+                self._inject_repo_context_to_workspace(git_url, git_branch)
 
         # Copy documents to workspace if provided
         updated_metadata = dict(metadata)

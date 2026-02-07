@@ -41,6 +41,8 @@ class ConversationSummary(BaseModel):
     key_decisions: str = Field(description="Important decisions made")
     current_state: str = Field(description="Current progress and immediate next steps")
     blockers: str = Field(default="", description="Errors or blockers encountered, empty if none")
+    state_changes: str = Field(default="", description="Files created, modified, or deleted during this period")
+    pinned_instructions: str = Field(default="", description="Rules from instructions/config that must persist")
 
 
 def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int:
@@ -784,6 +786,10 @@ Conversation:
                 parts.append(f"**Current State:**\n{result.current_state.strip()}")
             if result.blockers and result.blockers.strip():
                 parts.append(f"**Blockers:**\n{result.blockers.strip()}")
+            if result.state_changes and result.state_changes.strip():
+                parts.append(f"**State Changes:**\n{result.state_changes.strip()}")
+            if result.pinned_instructions and result.pinned_instructions.strip():
+                parts.append(f"**Pinned Instructions:**\n{result.pinned_instructions.strip()}")
             summary = "\n\n".join(parts)
 
             return summary
