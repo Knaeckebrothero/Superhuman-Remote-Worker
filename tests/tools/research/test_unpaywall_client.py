@@ -8,6 +8,9 @@ import pytest
 from src.tools.research.utils.paper_types import AccessStatus, PaperSource
 from src.tools.research.utils.unpaywall_client import UnpaywallClient
 
+# Patch target: research_request is imported locally inside UnpaywallClient methods
+_RESEARCH_REQUEST_PATCH = "src.tools.research.utils.network.research_request"
+
 
 # Sample Unpaywall API response for an open access paper
 SAMPLE_OA_RESPONSE = {
@@ -50,40 +53,25 @@ def _make_mock_response(status=200, json_data=None, content=None):
     return resp
 
 
-def _mock_aiohttp_session(responses):
-    """Create a mock aiohttp.ClientSession that returns given responses in order.
+def _mock_research_request(responses):
+    """Create a mock research_request context manager that yields responses in order.
 
     Args:
-        responses: List of mock responses (or a single response) to return
-                   from session.get() calls in order.
+        responses: List of mock responses (or a single response) to yield
+                   from research_request() calls in order.
     """
     if not isinstance(responses, list):
         responses = [responses]
 
-    call_idx = 0
+    call_idx = [0]
 
-    class MockContextManager:
-        async def __aenter__(self):
-            nonlocal call_idx
-            idx = min(call_idx, len(responses) - 1)
-            call_idx += 1
-            return responses[idx]
+    @asynccontextmanager
+    async def mock_request(method, url, **kwargs):
+        idx = min(call_idx[0], len(responses) - 1)
+        call_idx[0] += 1
+        yield responses[idx]
 
-        async def __aexit__(self, *args):
-            pass
-
-    class MockSession:
-        def get(self, *args, **kwargs):
-            return MockContextManager()
-
-    class MockSessionContextManager:
-        async def __aenter__(self):
-            return MockSession()
-
-        async def __aexit__(self, *args):
-            pass
-
-    return MockSessionContextManager()
+    return mock_request
 
 
 class TestUnpaywallClientConfiguration:
@@ -118,7 +106,7 @@ class TestUnpaywallGetPaper:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(200, json_data=SAMPLE_OA_RESPONSE)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             paper = await client.get_paper("10.1038/nature12373")
 
         assert paper is not None
@@ -135,7 +123,7 @@ class TestUnpaywallGetPaper:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(200, json_data=SAMPLE_PAYWALLED_RESPONSE)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             paper = await client.get_paper("10.1016/j.cell.2021.01.001")
 
         assert paper is not None
@@ -147,7 +135,7 @@ class TestUnpaywallGetPaper:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(404)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             paper = await client.get_paper("10.9999/nonexistent")
 
         assert paper is None
@@ -157,7 +145,7 @@ class TestUnpaywallGetPaper:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(422)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             paper = await client.get_paper("invalid-doi-format")
 
         assert paper is None
@@ -178,7 +166,7 @@ class TestUnpaywallGetPdfUrl:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(200, json_data=SAMPLE_OA_RESPONSE)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             url = await client.get_pdf_url("10.1038/nature12373")
 
         assert url == "https://europepmc.org/articles/pmc4329834?pdf=render"
@@ -188,7 +176,7 @@ class TestUnpaywallGetPdfUrl:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(200, json_data=SAMPLE_PAYWALLED_RESPONSE)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             url = await client.get_pdf_url("10.1016/j.cell.2021.01.001")
 
         assert url is None
@@ -208,8 +196,8 @@ class TestUnpaywallDownload:
         mock_pdf_resp = _make_mock_response(200, content=pdf_content)
 
         with patch(
-            "aiohttp.ClientSession",
-            return_value=_mock_aiohttp_session([mock_paper_resp, mock_pdf_resp]),
+            _RESEARCH_REQUEST_PATCH,
+            _mock_research_request([mock_paper_resp, mock_pdf_resp]),
         ):
             result = await client.download("10.1038/nature12373", temp_docs_dir)
 
@@ -222,7 +210,7 @@ class TestUnpaywallDownload:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(404)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             result = await client.download("10.9999/nonexistent", temp_docs_dir)
 
         assert result.success is False
@@ -233,7 +221,7 @@ class TestUnpaywallDownload:
         client = UnpaywallClient(email="test@example.com")
         mock_resp = _make_mock_response(200, json_data=SAMPLE_PAYWALLED_RESPONSE)
 
-        with patch("aiohttp.ClientSession", return_value=_mock_aiohttp_session(mock_resp)):
+        with patch(_RESEARCH_REQUEST_PATCH, _mock_research_request(mock_resp)):
             result = await client.download("10.1016/j.cell.2021.01.001", temp_docs_dir)
 
         assert result.success is False

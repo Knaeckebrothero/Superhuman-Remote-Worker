@@ -21,6 +21,7 @@ psycopg2-binary>=2.9.0  # Required by citation engine
 langchain-tavily>=0.1.0
 arxiv>=2.1.0
 aiohttp>=3.9.0
+aiohttp-socks>=0.8.0  # SOCKS5/HTTP proxy for aiohttp (research tools VPN)
 # Browser automation (requires: playwright install chromium)
 browser-use>=0.11.0
 playwright>=1.40.0
