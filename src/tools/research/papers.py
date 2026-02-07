@@ -70,6 +70,9 @@ def _get_documents_dir(context: ToolContext) -> Path:
 
 def create_paper_tools(context: ToolContext) -> List[Any]:
     """Create academic paper tools."""
+    from .utils.network import get_proxy_from_context
+
+    proxy = get_proxy_from_context(context)
 
     @tool
     async def search_papers(
@@ -92,7 +95,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if source == "arxiv":
             return await _search_arxiv(query, max_results)
         elif source == "semantic_scholar":
-            return await _search_semantic_scholar(query, max_results)
+            return await _search_semantic_scholar(query, max_results, proxy=proxy)
         else:
             return f"Unknown source: {source}. Use 'arxiv' or 'semantic_scholar'."
 
@@ -138,7 +141,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if identifier_type == "doi":
             doi = DOI_PATTERN.search(identifier)
             if doi:
-                result = await _try_unpaywall_download(doi.group(), dest_dir)
+                result = await _try_unpaywall_download(doi.group(), dest_dir, proxy=proxy)
                 if result.success:
                     _register_downloaded_paper(context, result)
                     return (
@@ -154,7 +157,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         # Try browser automation as final fallback
         if use_browser_fallback:
             browser_result = await _try_browser_download(
-                identifier, identifier_type, dest_dir, context
+                identifier, identifier_type, dest_dir, context, proxy=proxy
             )
             if browser_result:
                 return browser_result
@@ -194,7 +197,7 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         id_type = _detect_identifier_type(identifier)
 
         # Try Semantic Scholar first (richer metadata)
-        info = await _get_semantic_scholar_info(identifier)
+        info = await _get_semantic_scholar_info(identifier, proxy=proxy)
         if info:
             return info
 
@@ -232,11 +235,15 @@ async def _search_arxiv(query: str, max_results: int) -> str:
     return "\n".join(lines)
 
 
-async def _search_semantic_scholar(query: str, max_results: int) -> str:
+async def _search_semantic_scholar(
+    query: str, max_results: int, *, proxy=None
+) -> str:
     """Search Semantic Scholar and format results."""
     import os
 
     import aiohttp
+
+    from .utils.network import research_request
 
     api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
     headers = {}
@@ -251,17 +258,15 @@ async def _search_semantic_scholar(query: str, max_results: int) -> str:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status == 429:
-                    return "Semantic Scholar rate limit hit. Try again in a few minutes or set SEMANTIC_SCHOLAR_API_KEY."
-                resp.raise_for_status()
-                data = await resp.json()
+        async with research_request(
+            "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
+        ) as resp:
+            if resp.status == 429:
+                return "Semantic Scholar rate limit hit. Try again in a few minutes or set SEMANTIC_SCHOLAR_API_KEY."
+            resp.raise_for_status()
+            data = await resp.json()
+    except ConnectionError as e:
+        return f"Semantic Scholar search error (connection): {e}"
     except aiohttp.ClientError as e:
         return f"Semantic Scholar search error: {e}"
 
@@ -309,12 +314,12 @@ async def _try_arxiv_download(identifier: str, dest_dir: Path) -> "DownloadResul
     return await client.download(arxiv_id, dest_dir)
 
 
-async def _try_unpaywall_download(doi: str, dest_dir: Path) -> "DownloadResult":
+async def _try_unpaywall_download(doi: str, dest_dir: Path, *, proxy=None) -> "DownloadResult":
     """Try downloading via Unpaywall."""
     from .utils.paper_types import DownloadResult
     from .utils.unpaywall_client import UnpaywallClient
 
-    client = UnpaywallClient()
+    client = UnpaywallClient(proxy=proxy)
     if not client.is_configured():
         return DownloadResult(
             success=False,
@@ -323,26 +328,24 @@ async def _try_unpaywall_download(doi: str, dest_dir: Path) -> "DownloadResult":
     return await client.download(doi, dest_dir)
 
 
-async def _resolve_doi_url(doi: str) -> Optional[str]:
+async def _resolve_doi_url(doi: str, *, proxy=None) -> Optional[str]:
     """Resolve a DOI to its publisher URL by following the redirect.
 
     Args:
         doi: DOI string (e.g., "10.1038/nature12373")
+        proxy: Optional ProxyConfig for routing through VPN.
 
     Returns:
         Publisher URL or None if resolution fails
     """
-    import aiohttp
+    from .utils.network import research_request
 
     doi_url = f"https://doi.org/{doi}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.head(
-                doi_url,
-                allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                return str(resp.url)
+        async with research_request(
+            "HEAD", doi_url, proxy=proxy, timeout=15, allow_redirects=True
+        ) as resp:
+            return str(resp.url)
     except Exception as e:
         logger.debug(f"DOI resolution failed for {doi}: {e}")
         return doi_url  # Fall back to doi.org URL
@@ -353,6 +356,8 @@ async def _try_browser_download(
     identifier_type: str,
     dest_dir: Path,
     context: "ToolContext",
+    *,
+    proxy=None,
 ) -> Optional[str]:
     """Try downloading a paper using browser automation.
 
@@ -379,7 +384,7 @@ async def _try_browser_download(
     if identifier_type == "doi":
         doi_match = DOI_PATTERN.search(identifier)
         if doi_match:
-            url = await _resolve_doi_url(doi_match.group())
+            url = await _resolve_doi_url(doi_match.group(), proxy=proxy)
         else:
             return None
     elif identifier_type == "arxiv":
@@ -439,11 +444,13 @@ async def _try_browser_download(
                 pass
 
 
-async def _get_semantic_scholar_info(identifier: str) -> Optional[str]:
+async def _get_semantic_scholar_info(identifier: str, *, proxy=None) -> Optional[str]:
     """Get paper info from Semantic Scholar."""
     import os
 
     import aiohttp
+
+    from .utils.network import research_request
 
     api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
     headers = {}
@@ -464,19 +471,17 @@ async def _get_semantic_scholar_info(identifier: str) -> Optional[str]:
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status == 404:
-                    return None
-                if resp.status == 429:
-                    return "Semantic Scholar rate limit hit. Try again in a few minutes."
-                resp.raise_for_status()
-                data = await resp.json()
+        async with research_request(
+            "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
+        ) as resp:
+            if resp.status == 404:
+                return None
+            if resp.status == 429:
+                return "Semantic Scholar rate limit hit. Try again in a few minutes."
+            resp.raise_for_status()
+            data = await resp.json()
+    except ConnectionError:
+        return None
     except aiohttp.ClientError:
         return None
 

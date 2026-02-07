@@ -37,6 +37,9 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
+    from .utils.network import get_proxy_from_context
+
+    proxy = get_proxy_from_context(context)
 
     @tool
     async def research_topic(
@@ -65,7 +68,7 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
         # Search both databases concurrently
         arxiv_papers, s2_papers = await asyncio.gather(
             _search_arxiv_raw(topic, num_papers),
-            _search_semantic_scholar_raw(topic, num_papers),
+            _search_semantic_scholar_raw(topic, num_papers, proxy=proxy),
             return_exceptions=True,
         )
 
@@ -96,7 +99,7 @@ def create_workflow_tools(context: ToolContext) -> List[Any]:
         download_results: List[str] = []
         if download_available and context.has_workspace():
             download_results = await _download_available_papers(
-                unique_papers, context
+                unique_papers, context, proxy=proxy
             )
 
         # Format report
@@ -123,12 +126,11 @@ async def _search_arxiv_raw(query: str, max_results: int):
     return await client.search(query, max_results)
 
 
-async def _search_semantic_scholar_raw(query: str, max_results: int):
+async def _search_semantic_scholar_raw(query: str, max_results: int, *, proxy=None):
     """Search Semantic Scholar and return Paper objects."""
     import os
 
-    import aiohttp
-
+    from .utils.network import research_request
     from .utils.paper_types import AccessStatus, Paper, PaperSource
 
     api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
@@ -143,17 +145,13 @@ async def _search_semantic_scholar_raw(query: str, max_results: int):
         "fields": "title,authors,year,abstract,citationCount,openAccessPdf,externalIds,venue",
     }
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status == 429:
-                raise Exception("Semantic Scholar rate limit hit")
-            resp.raise_for_status()
-            data = await resp.json()
+    async with research_request(
+        "GET", url, proxy=proxy, timeout=30, params=params, headers=headers
+    ) as resp:
+        if resp.status == 429:
+            raise Exception("Semantic Scholar rate limit hit")
+        resp.raise_for_status()
+        data = await resp.json()
 
     results = data.get("data", [])
     papers = []
@@ -230,6 +228,8 @@ def _deduplicate_papers(arxiv_papers, s2_papers):
 async def _download_available_papers(
     papers,
     context: ToolContext,
+    *,
+    proxy=None,
 ) -> List[str]:
     """Download open access papers to workspace.
 
@@ -260,7 +260,7 @@ async def _download_available_papers(
             if paper.arxiv_id:
                 result = await _download_single_arxiv(paper.arxiv_id, dest_dir)
             elif paper.pdf_url:
-                result = await _download_single_url(paper.pdf_url, paper.title, dest_dir)
+                result = await _download_single_url(paper.pdf_url, paper.title, dest_dir, proxy=proxy)
             else:
                 continue
 
@@ -292,30 +292,28 @@ async def _download_single_arxiv(arxiv_id: str, dest_dir: Path) -> Optional[Path
     return result.path if result.success else None
 
 
-async def _download_single_url(url: str, title: str, dest_dir: Path) -> Optional[Path]:
+async def _download_single_url(
+    url: str, title: str, dest_dir: Path, *, proxy=None
+) -> Optional[Path]:
     """Download a PDF from a direct URL."""
-    import aiohttp
+    from .utils.network import research_request
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                if resp.status != 200:
-                    return None
+        async with research_request("GET", url, proxy=proxy, timeout=60) as resp:
+            if resp.status != 200:
+                return None
 
-                # Generate filename from title
-                safe_title = "".join(
-                    c if c.isalnum() or c in " -_" else "_"
-                    for c in title[:80]
-                ).strip()
-                filename = f"{safe_title}.pdf"
-                path = dest_dir / filename
+            # Generate filename from title
+            safe_title = "".join(
+                c if c.isalnum() or c in " -_" else "_"
+                for c in title[:80]
+            ).strip()
+            filename = f"{safe_title}.pdf"
+            path = dest_dir / filename
 
-                content = await resp.read()
-                path.write_bytes(content)
-                return path
+            content = await resp.read()
+            path.write_bytes(content)
+            return path
 
     except Exception as e:
         logger.debug(f"URL download failed for {url}: {e}")
