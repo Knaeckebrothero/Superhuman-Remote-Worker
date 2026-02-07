@@ -53,10 +53,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies only
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
+    git \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder
@@ -73,6 +75,9 @@ COPY agent.py ./
 RUN if [ -d "./citation_tool" ] && [ -f "./citation_tool/pyproject.toml" ]; then \
         pip install --no-cache-dir -e ./citation_tool[full]; \
     fi
+
+# Install Playwright chromium for browser-based research tools
+RUN playwright install --with-deps chromium
 
 # Create directories
 RUN mkdir -p /app/workspace /app/logs
