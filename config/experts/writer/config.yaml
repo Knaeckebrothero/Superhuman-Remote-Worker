@@ -1,18 +1,19 @@
 # yaml-language-server: $schema=../../schema.json
-# Documentation Writer Agent
+# Writer Agent
 $extends: defaults
 
-agent_id: doc_writer
-display_name: Documentation Writer
+agent_id: writer
+display_name: Writer
 description: |
-  Writes comprehensive project documentation by analyzing source materials
-  including documents, presentations, spreadsheets, and code.
+  Versatile writer that produces high-quality texts of any kind — documentation,
+  articles, stories, reports, essays, and more. Analyzes source materials and
+  adapts tone, style, and structure to the target format.
 icon: edit_note
 color: "#a6e3a1"
 tags:
-  - documentation
   - writing
-  - academic
+  - documentation
+  - creative
 
 # Only override tool categories that differ from defaults
 tools:

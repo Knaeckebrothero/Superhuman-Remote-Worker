@@ -76,8 +76,15 @@ For file operations (`read_file`, `edit_file`, `write_file`, `list_files`, `sear
 ### Phase 4 (Strategic) - Delivery
 1. Write/update documentation if needed
 2. Commit changes: `run_command(command="git add -A && git commit -m 'description'", working_dir="repo")`
-3. Push and create PR if applicable
-4. `job_complete`
+3. Push to remote: `run_command(command="git push origin <branch>", working_dir="repo")`
+   - Credentials are embedded in the remote URL — no extra auth needed
+4. Create a pull request via the Gitea API (see workspace.md for the exact URL and curl template):
+   ```
+   run_command(command="curl -s -X POST '<gitea_api>/repos/<owner>/<repo>/pulls' -H 'Content-Type: application/json' -d '{\"title\": \"...\", \"head\": \"<branch>\", \"base\": \"main\", \"body\": \"...\"}'", working_dir="repo")
+   ```
+5. `job_complete`
+
+> **Note**: The `## Repository Context` section in `workspace.md` contains the remote URL, branch name, Gitea API base, and a ready-to-use curl template for PR creation. Refer to it for the exact values.
 
 ## Important Notes
 

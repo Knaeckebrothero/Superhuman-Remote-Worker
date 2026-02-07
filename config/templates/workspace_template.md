@@ -30,3 +30,8 @@ Reference table for IDs, names, relationships you need to look up repeatedly.
 Information that MUST survive context compaction. Use sparingly.
 
 (Example: "API rate limit: 100/min - batch accordingly")
+
+## Pinned Instructions
+
+Rules from instructions.md that must persist across context compaction.
+Extract and place here during the first strategic phase.

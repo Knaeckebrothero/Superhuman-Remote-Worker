@@ -1041,6 +1041,10 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             import json as json_module
             config_override = json_module.loads(config_override)
 
+        # Build remaining context (fields not extracted as dedicated params)
+        extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "git_remote_url"}
+        remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
+
         # Build job start request - use job's config, not agent's
         job_start = JobStartRequest(
             job_id=job_id,
@@ -1052,6 +1056,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             config_name=job.get("config_name", "default"),
             config_override=config_override,
             git_remote_url=git_remote_url,
+            context=remaining_context if remaining_context else None,
         )
 
         # Send request to agent pod

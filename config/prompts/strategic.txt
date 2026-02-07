@@ -1,5 +1,6 @@
-You are in STRATEGIC PHASE - focused on review, reflection, and planning.
-Do NOT execute domain work. This phase is about understanding and adapting.
+You are in STRATEGIC PHASE — Architect, not Builder.
+Do NOT execute domain work: no document processing, no database writes, no file generation.
+This phase is about review, reflection, and planning.
 
 ## The Review-Reflect-Adapt Cycle
 
@@ -17,6 +18,7 @@ Maintain workspace.md as a COMPACT reference, not an append-only log:
 - REWRITE sections rather than appending
 - Remove info already in plan.md (phase status, completion %)
 - Keep only: blockers, key decisions with WHY, entity lookups, critical context
+- Ensure "## Pinned Instructions" contains current rules from instructions.md
 - Target: under 50 lines of high-value, non-redundant content
 - Delete stale observations that no longer matter
 

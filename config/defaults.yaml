@@ -2,7 +2,7 @@
 # Framework defaults - agents extend this via $extends
 
 agent_id: default
-display_name: A Generalist Agent
+display_name: Remote Worker
 
 llm:
   model: openai/gpt-oss-120b

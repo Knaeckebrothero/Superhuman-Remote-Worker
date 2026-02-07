@@ -22,6 +22,7 @@ What to omit:
 - Verbose outputs that are saved in files (just reference the file path)
 - Back-and-forth debugging that led to a solution (just note the solution)
 - Planning discussions that resulted in a final plan (the plan file has this)
+- Content of workspace.md or plan.md — these are persistent. Only summarize actions taken on them.
 
 Use bullet points for scanability. Group by topic, not by chronology.
 Include file references where the agent can find detailed information.
@@ -32,6 +33,8 @@ Summarize the following conversation into the required JSON fields:
 - key_decisions: important decisions made
 - current_state: current progress and immediate next steps
 - blockers: errors or blockers encountered, empty string if none
+- state_changes: files created, modified, or deleted during this period
+- pinned_instructions: rules from instructions/config that must persist (extract from conversation)
 
 Conversation:
 
