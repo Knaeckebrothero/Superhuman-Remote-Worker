@@ -3,11 +3,14 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import aiohttp
 
 from .paper_types import AccessStatus, DownloadResult, Paper, PaperSource
+
+if TYPE_CHECKING:
+    from .network import ProxyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +20,13 @@ class UnpaywallClient:
 
     BASE_URL = "https://api.unpaywall.org/v2"
 
-    def __init__(self, email: Optional[str] = None):
+    def __init__(
+        self,
+        email: Optional[str] = None,
+        proxy: Optional["ProxyConfig"] = None,
+    ):
         self.email = email or os.getenv("UNPAYWALL_EMAIL")
+        self.proxy = proxy
 
     def is_configured(self) -> bool:
         """Check if the client has required configuration."""
@@ -37,18 +45,24 @@ class UnpaywallClient:
             logger.warning("UNPAYWALL_EMAIL not configured, skipping Unpaywall lookup")
             return None
 
+        from .network import research_request
+
         url = f"{self.BASE_URL}/{doi}?email={self.email}"
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 404:
-                        return None
-                    if resp.status == 422:
-                        logger.warning(f"Unpaywall: invalid DOI format: {doi}")
-                        return None
-                    resp.raise_for_status()
-                    data = await resp.json()
+            async with research_request(
+                "GET", url, proxy=self.proxy, timeout=30
+            ) as resp:
+                if resp.status == 404:
+                    return None
+                if resp.status == 422:
+                    logger.warning(f"Unpaywall: invalid DOI format: {doi}")
+                    return None
+                resp.raise_for_status()
+                data = await resp.json()
+        except ConnectionError as e:
+            logger.error(f"Unpaywall connection error for {doi}: {e}")
+            return None
         except aiohttp.ClientError as e:
             logger.error(f"Unpaywall API error for {doi}: {e}")
             return None
@@ -90,13 +104,14 @@ class UnpaywallClient:
                 paper=paper,
             )
 
+        from .network import research_request
+
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    paper.pdf_url, timeout=aiohttp.ClientTimeout(total=60)
-                ) as resp:
-                    resp.raise_for_status()
-                    content = await resp.read()
+            async with research_request(
+                "GET", paper.pdf_url, proxy=self.proxy, timeout=60
+            ) as resp:
+                resp.raise_for_status()
+                content = await resp.read()
 
             # Create filename from DOI
             safe_doi = doi.replace("/", "_").replace(".", "_")
