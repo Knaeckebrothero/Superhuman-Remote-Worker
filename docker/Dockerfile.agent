@@ -34,9 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements
+# Copy and install requirements (exclude local editable citation_tool - installed later)
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN grep -v "citation_tool" requirements.txt > requirements_docker.txt && \
+    pip install --no-cache-dir -r requirements_docker.txt
 
 # Production image
 FROM python:3.11-slim
