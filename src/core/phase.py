@@ -562,21 +562,16 @@ def _complete_phase_with_git(
     workspace: "WorkspaceManager",
     phase_number: int,
     phase_type: str,
-    next_phase_type: str,
-    next_phase_name: str = "",
     todos_archived: int = 0,
 ) -> None:
     """Complete a phase with git operations.
 
-    Creates a git tag for the completed phase, updates phase_state.yaml
-    for the next phase, and commits the changes.
+    Creates a git tag for the completed phase and commits any pending changes.
 
     Args:
         workspace: WorkspaceManager with git_manager
         phase_number: Current phase number
         phase_type: Completed phase type ("strategic" or "tactical")
-        next_phase_type: Next phase type ("strategic" or "tactical")
-        next_phase_name: Name for the next phase (optional)
         todos_archived: Number of todos archived in this phase
     """
     git_mgr = workspace.git_manager
@@ -589,21 +584,12 @@ def _complete_phase_with_git(
         git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
         logger.debug(f"Created git tag: {tag_name}")
 
-        # Update phase_state.yaml for next phase
-        # Sequential numbering: always increment
-        next_phase_number = phase_number + 1
-        workspace.update_phase_state(
-            phase_number=next_phase_number,
-            phase_type=next_phase_type,
-            phase_name=next_phase_name,
-        )
-
-        # Commit the phase state change
+        # Commit any pending changes from this phase
         commit_msg = (
             f"[Phase {phase_number} {phase_type.title()}] Complete - "
             f"archived {todos_archived} todos"
         )
-        git_mgr.commit(commit_msg, allow_empty=False)
+        git_mgr.commit(commit_msg, allow_empty=True)
         logger.debug(f"Committed phase completion: {commit_msg}")
 
     except Exception as e:
@@ -690,13 +676,11 @@ def on_strategic_phase_complete(
     # Export todo state for checkpointing
     todo_state = todo_manager.export_state()
 
-    # Git operations: tag completed phase, update phase_state.yaml, commit
+    # Git operations: tag completed phase, commit
     _complete_phase_with_git(
         workspace=workspace,
         phase_number=phase_number,
         phase_type="strategic",
-        next_phase_type="tactical",
-        next_phase_name=phase_name,
         todos_archived=completed_todos,
     )
 
@@ -769,14 +753,11 @@ def on_tactical_phase_complete(
     # Export todo state for checkpointing
     todo_state = todo_manager.export_state()
 
-    # Git operations: tag completed phase, update phase_state.yaml, commit
-    # Note: tactical->strategic increments phase_number (handled by _complete_phase_with_git)
+    # Git operations: tag completed phase, commit
     _complete_phase_with_git(
         workspace=workspace,
         phase_number=phase_number,
         phase_type="tactical",
-        next_phase_type="strategic",
-        next_phase_name="",  # Strategic phases use predefined todos, no custom name
         todos_archived=completed_todos,
     )
 

@@ -362,7 +362,12 @@ class TodoManager:
         if not self._todos:
             return "No active todos."
 
-        lines = ["## Current Todos"]
+        phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
+        phase_name = self._current_phase_name or self._staged_phase_name
+        if phase_name:
+            lines = [f"## Phase {self._phase_number} ({phase_type}): {phase_name}"]
+        else:
+            lines = [f"## Phase {self._phase_number} ({phase_type})"]
 
         # In progress
         in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]

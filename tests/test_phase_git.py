@@ -1,7 +1,6 @@
 """Unit tests for phase transition git operations.
 
-Tests that phase transitions correctly update phase_state.yaml,
-create git tags, and commit changes.
+Tests that phase transitions correctly create git tags and commit changes.
 """
 
 import pytest
@@ -76,8 +75,6 @@ class TestCompletePhaseWithGit:
             workspace=workspace_with_git,
             phase_number=1,
             phase_type="strategic",
-            next_phase_type="tactical",
-            next_phase_name="Execution",
             todos_archived=4,
         )
 
@@ -90,44 +87,11 @@ class TestCompletePhaseWithGit:
             workspace=workspace_with_git,
             phase_number=1,
             phase_type="tactical",
-            next_phase_type="strategic",
-            next_phase_name="",
             todos_archived=10,
         )
 
         tags = workspace_with_git.git_manager.list_tags("phase-*")
         assert "phase-1-tactical-complete" in tags
-
-    def test_updates_phase_state_yaml_strategic_to_tactical(self, workspace_with_git):
-        """Test that phase_state.yaml is updated when going strategic -> tactical."""
-        _complete_phase_with_git(
-            workspace=workspace_with_git,
-            phase_number=1,
-            phase_type="strategic",
-            next_phase_type="tactical",
-            next_phase_name="Extraction Phase",
-            todos_archived=4,
-        )
-
-        content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_number: 2" in content  # Sequential: always increments
-        assert "phase_type: tactical" in content
-        assert "Extraction Phase" in content
-
-    def test_updates_phase_state_yaml_tactical_to_strategic(self, workspace_with_git):
-        """Test that phase_state.yaml is updated when going tactical -> strategic."""
-        _complete_phase_with_git(
-            workspace=workspace_with_git,
-            phase_number=1,
-            phase_type="tactical",
-            next_phase_type="strategic",
-            next_phase_name="",
-            todos_archived=10,
-        )
-
-        content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_number: 2" in content  # Incremented
-        assert "phase_type: strategic" in content
 
     def test_creates_commit_with_phase_info(self, workspace_with_git):
         """Test that a commit is created with phase information."""
@@ -135,8 +99,6 @@ class TestCompletePhaseWithGit:
             workspace=workspace_with_git,
             phase_number=2,
             phase_type="tactical",
-            next_phase_type="strategic",
-            next_phase_name="",
             todos_archived=8,
         )
 
@@ -154,8 +116,6 @@ class TestCompletePhaseWithGit:
             workspace=workspace_with_git,
             phase_number=1,
             phase_type="strategic",
-            next_phase_type="tactical",
-            next_phase_name="",
             todos_archived=4,
         )
 
@@ -170,8 +130,6 @@ class TestCompletePhaseWithGit:
             workspace=workspace_with_git,
             phase_number=1,
             phase_type="strategic",
-            next_phase_type="tactical",
-            next_phase_name="",
             todos_archived=4,
         )
 
@@ -214,36 +172,6 @@ class TestOnStrategicPhaseComplete:
         tags = workspace_with_git.git_manager.list_tags("phase-*")
         assert "phase-1-strategic-complete" in tags
 
-    def test_updates_phase_state_on_transition(self, workspace_with_git, todo_manager):
-        """Test that phase_state.yaml is updated on transition."""
-        # Stage some todos (minimum 5 required)
-        todo_manager.stage_tactical_todos(
-            [
-                "First task to complete with enough content",
-                "Second task to complete with enough content",
-                "Third task to complete with enough content",
-                "Fourth task to complete with enough content",
-                "Fifth task to complete with enough content",
-            ],
-            phase_name="Execution Phase",
-        )
-
-        state = {
-            "job_id": "test-job",
-            "phase_number": 1,
-            "is_strategic_phase": True,
-        }
-
-        on_strategic_phase_complete(
-            state=state,
-            workspace=workspace_with_git,
-            todo_manager=todo_manager,
-        )
-
-        content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_type: tactical" in content
-        assert "Execution Phase" in content
-
 
 class TestOnTacticalPhaseComplete:
     """Tests for on_tactical_phase_complete with git integration."""
@@ -270,24 +198,6 @@ class TestOnTacticalPhaseComplete:
         tags = workspace_with_git.git_manager.list_tags("phase-*")
         assert "phase-1-tactical-complete" in tags
 
-    def test_updates_phase_state_on_transition(self, workspace_with_git, todo_manager):
-        """Test that phase_state.yaml is updated on transition."""
-        state = {
-            "job_id": "test-job",
-            "phase_number": 1,
-            "is_strategic_phase": False,
-        }
-
-        on_tactical_phase_complete(
-            state=state,
-            workspace=workspace_with_git,
-            todo_manager=todo_manager,
-        )
-
-        content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_number: 2" in content  # Incremented
-        assert "phase_type: strategic" in content
-
     def test_commits_phase_completion(self, workspace_with_git, todo_manager):
         """Test that phase completion creates a commit."""
         # Set up completed todos to get an accurate count
@@ -311,34 +221,3 @@ class TestOnTacticalPhaseComplete:
         log = workspace_with_git.git_manager.log(max_count=1, oneline=True)
         assert "[Phase 1 Tactical]" in log
         assert "Complete" in log
-
-
-class TestPhaseStateYamlUpdate:
-    """Tests for WorkspaceManager.update_phase_state()."""
-
-    def test_update_phase_state_basic(self, workspace_with_git):
-        """Test basic phase state update."""
-        workspace_with_git.update_phase_state(
-            phase_number=3,
-            phase_type="tactical",
-            phase_name="Data Extraction",
-        )
-
-        content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_number: 3" in content
-        assert "phase_type: tactical" in content
-        assert "Data Extraction" in content
-        assert "started_at:" in content
-
-    def test_update_phase_state_empty_name(self, workspace_with_git):
-        """Test phase state update with empty name."""
-        workspace_with_git.update_phase_state(
-            phase_number=2,
-            phase_type="strategic",
-            phase_name="",
-        )
-
-        content = workspace_with_git.read_file("phase_state.yaml")
-        assert "phase_number: 2" in content
-        assert "phase_type: strategic" in content
-        assert 'phase_name: ""' in content

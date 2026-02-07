@@ -242,8 +242,7 @@ class WorkspaceManager:
     def _initialize_git(self) -> None:
         """Initialize git versioning for the workspace.
 
-        Creates GitManager, initializes repository with .gitignore,
-        and creates initial phase_state.yaml.
+        Creates GitManager and initializes repository with .gitignore.
         """
         try:
             from ..managers.git_manager import GitManager
@@ -261,60 +260,9 @@ class WorkspaceManager:
 
         if success:
             logger.info("Git versioning enabled for workspace")
-
-            # Create initial phase_state.yaml if it doesn't exist
-            phase_state_path = self._workspace_path / "phase_state.yaml"
-            if not phase_state_path.exists():
-                self._create_initial_phase_state()
         else:
             logger.warning("Failed to initialize git repository")
             self._git_manager = None
-
-    def _create_initial_phase_state(self) -> None:
-        """Create initial phase_state.yaml file."""
-        from datetime import datetime, timezone
-
-        initial_state = (
-            "# Phase state - tracks current phase for recovery after context compaction\n"
-            "phase_number: 1\n"
-            "phase_type: strategic\n"
-            "phase_name: \"\"\n"
-            f"started_at: {datetime.now(timezone.utc).isoformat()}\n"
-        )
-
-        phase_state_path = self._workspace_path / "phase_state.yaml"
-        phase_state_path.write_text(initial_state)
-        logger.debug("Created initial phase_state.yaml")
-
-    def update_phase_state(
-        self,
-        phase_number: int,
-        phase_type: str,
-        phase_name: str = "",
-    ) -> None:
-        """Update phase_state.yaml with new phase information.
-
-        Called during phase transitions to track the current phase.
-        This file survives context compaction and enables recovery.
-
-        Args:
-            phase_number: Current phase number (paired numbering)
-            phase_type: "strategic" or "tactical"
-            phase_name: Optional human-readable phase name
-        """
-        from datetime import datetime, timezone
-
-        state_content = (
-            "# Phase state - tracks current phase for recovery after context compaction\n"
-            f"phase_number: {phase_number}\n"
-            f"phase_type: {phase_type}\n"
-            f"phase_name: \"{phase_name}\"\n"
-            f"started_at: {datetime.now(timezone.utc).isoformat()}\n"
-        )
-
-        phase_state_path = self._workspace_path / "phase_state.yaml"
-        phase_state_path.write_text(state_content)
-        logger.debug(f"Updated phase_state.yaml: phase {phase_number} {phase_type}")
 
     def _copy_instructions_template(self) -> None:
         """Copy instructions template to workspace."""
