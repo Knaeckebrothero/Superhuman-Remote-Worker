@@ -334,15 +334,6 @@ class ToolsConfig:
 
 
 @dataclass
-class TodoConfig:
-    """Todo manager configuration."""
-
-    max_items: int = 25
-    archive_on_reset: bool = True
-    archive_path: str = "archive/"
-
-
-@dataclass
 class ConnectionsConfig:
     """Database connections configuration."""
 
@@ -385,7 +376,6 @@ class PhaseSettings:
 
     min_todos: int = 5  # Minimum todos required for strategic->tactical transition
     max_todos: int = 20  # Maximum todos allowed for strategic->tactical transition
-    archive_on_transition: bool = True  # Archive todos on tactical->strategic transition
 
 
 @dataclass
@@ -401,7 +391,6 @@ class AgentConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     workspace: WorkspaceConfig = field(default_factory=WorkspaceConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
-    todo: TodoConfig = field(default_factory=TodoConfig)
     connections: ConnectionsConfig = field(default_factory=ConnectionsConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     context_management: ContextManagementConfig = field(
@@ -557,13 +546,6 @@ def load_agent_config(
         git=tools_data.get("git", []),
     )
 
-    todo_data = data.get("todo", {})
-    todo_config = TodoConfig(
-        max_items=todo_data.get("max_items", 25),
-        archive_on_reset=todo_data.get("archive_on_reset", True),
-        archive_path=todo_data.get("archive_path", "archive/"),
-    )
-
     connections_data = data.get("connections", {})
     connections_config = ConnectionsConfig(
         postgres=connections_data.get("postgres", True),
@@ -598,13 +580,12 @@ def load_agent_config(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
-        archive_on_transition=phase_data.get("archive_on_transition", True),
     )
 
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
-        "tools", "todo", "connections", "polling", "limits", "context_management",
+        "tools", "connections", "polling", "limits", "context_management",
         "phase_settings"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
@@ -616,7 +597,6 @@ def load_agent_config(
         llm=llm_config,
         workspace=workspace_config,
         tools=tools_config,
-        todo=todo_config,
         connections=connections_config,
         limits=limits_config,
         context_management=context_config,
@@ -686,13 +666,6 @@ def load_agent_config_from_dict(
         git=tools_data.get("git", []),
     )
 
-    todo_data = data.get("todo", {})
-    todo_config = TodoConfig(
-        max_items=todo_data.get("max_items", 25),
-        archive_on_reset=todo_data.get("archive_on_reset", True),
-        archive_path=todo_data.get("archive_path", "archive/"),
-    )
-
     connections_data = data.get("connections", {})
     connections_config = ConnectionsConfig(
         postgres=connections_data.get("postgres", True),
@@ -727,13 +700,12 @@ def load_agent_config_from_dict(
     phase_config = PhaseSettings(
         min_todos=phase_data.get("min_todos", 5),
         max_todos=phase_data.get("max_todos", 20),
-        archive_on_transition=phase_data.get("archive_on_transition", True),
     )
 
     # Collect extra fields
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
-        "tools", "todo", "connections", "polling", "limits", "context_management",
+        "tools", "connections", "polling", "limits", "context_management",
         "phase_settings"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
@@ -745,7 +717,6 @@ def load_agent_config_from_dict(
         llm=llm_config,
         workspace=workspace_config,
         tools=tools_config,
-        todo=todo_config,
         connections=connections_config,
         limits=limits_config,
         context_management=context_config,

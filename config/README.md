@@ -182,9 +182,6 @@ See `defaults.yaml` for the full default tool set.
 
 ```yaml
 research:
-  web_search_enabled: false
-  graph_search_enabled: false
-  research_depth: standard
   proxy:
     enabled: false       # Enable proxy for paywalled content
     type: socks5         # "http", "socks5", or "none"

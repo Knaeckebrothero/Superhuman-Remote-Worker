@@ -135,6 +135,20 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Get PDF/document metadata (pages, size) for planning access.",
         "phases": ["strategic", "tactical"],
     },
+    "create_directory": {
+        "module": "workspace.filesystem",
+        "function": "create_directory",
+        "description": "Create a directory (and parents) in the workspace",
+        "category": "workspace",
+        "phases": ["strategic", "tactical"],
+    },
+    "delete_directory": {
+        "module": "workspace.filesystem",
+        "function": "delete_directory",
+        "description": "Delete a directory and all its contents",
+        "category": "workspace",
+        "phases": ["strategic", "tactical"],
+    },
 }
 
 
@@ -602,6 +616,55 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             logger.error(f"get_document_info error for {path}: {e}")
             return f"Error: {str(e)}"
 
+    @tool
+    def create_directory(path: str) -> str:
+        """Create a directory (and any parent directories) in the workspace.
+
+        Use this to explicitly create directory structures before writing files.
+
+        Args:
+            path: Relative path of the directory to create
+
+        Returns:
+            Confirmation or error message
+        """
+        try:
+            workspace.create_directory(path)
+            return f"Created directory: {path}"
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"create_directory error for {path}: {e}")
+            return f"Error creating directory: {str(e)}"
+
+    @tool
+    def delete_directory(path: str) -> str:
+        """Delete a directory and all its contents from the workspace.
+
+        WARNING: This recursively deletes everything inside the directory.
+        Cannot delete the workspace root.
+
+        Args:
+            path: Relative path of the directory to delete
+
+        Returns:
+            Confirmation or error message
+        """
+        try:
+            success = workspace.delete_directory(path)
+
+            if success:
+                return f"Deleted directory and all contents: {path}"
+            else:
+                return f"Not found: {path}"
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"delete_directory error for {path}: {e}")
+            return f"Error deleting directory: {str(e)}"
+
     return [
         list_files,
         delete_file,
@@ -612,4 +675,6 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         copy_file,
         get_workspace_summary,
         get_document_info,
+        create_directory,
+        delete_directory,
     ]

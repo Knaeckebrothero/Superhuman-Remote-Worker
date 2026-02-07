@@ -31,9 +31,3 @@ tools:
     - get_citation
     - list_citations
   graph: null
-
-research:
-  research_depth: deep
-
-validation:
-  require_citations: true

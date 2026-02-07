@@ -391,6 +391,50 @@ class WorkspaceManager:
 
         return file_path
 
+    def create_directory(self, relative_path: str) -> Path:
+        """Create a directory (and parents) in workspace.
+
+        Args:
+            relative_path: Path relative to workspace root
+
+        Returns:
+            Absolute path to created directory
+
+        Raises:
+            ValueError: If path escapes workspace
+        """
+        dir_path = self.get_path(relative_path)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        logger.debug(f"Created directory: {relative_path}")
+        return dir_path
+
+    def delete_directory(self, relative_path: str) -> bool:
+        """Delete a directory and all its contents.
+
+        Args:
+            relative_path: Path relative to workspace root
+
+        Returns:
+            True if deleted, False if didn't exist
+
+        Raises:
+            ValueError: If path escapes workspace or is the workspace root
+        """
+        dir_path = self.get_path(relative_path)
+
+        if dir_path == self._workspace_path.resolve():
+            raise ValueError("Cannot delete workspace root directory")
+
+        if not dir_path.exists():
+            return False
+
+        if not dir_path.is_dir():
+            raise ValueError(f"Not a directory: {relative_path}")
+
+        shutil.rmtree(dir_path)
+        logger.debug(f"Deleted directory: {relative_path}")
+        return True
+
     def delete_file(self, relative_path: str) -> bool:
         """Delete a file or empty directory from workspace.
 
