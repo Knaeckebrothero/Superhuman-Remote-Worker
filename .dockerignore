@@ -1,0 +1,72 @@
+# =============================================================================
+# Docker build context exclusions
+# =============================================================================
+# Reduces build context size and prevents sensitive/unnecessary files
+# from being sent to the Docker daemon.
+
+# Git
+.git/
+.gitignore
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Workspace data (runtime, not build-time)
+workspace/
+backups/
+output/
+
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node / Angular build cache
+node_modules/
+cockpit/node_modules/
+cockpit/.angular/
+cockpit/dist/
+
+# Documentation (not needed in images)
+docs/
+project_documentation/
+*.md
+!requirements.txt
+
+# Advanced-LLM-Chat subproject (separate deployment)
+Advanced-LLM-Chat/
+
+# SQLite databases
+*.db
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (don't need to copy themselves)
+docker-compose*.yml
+docker-compose*.yaml
+.dockerignore
