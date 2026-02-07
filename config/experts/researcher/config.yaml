@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=../../schema.json
+# Autonomous Researcher Expert - Academic research and literature review
+$extends: defaults
+
+agent_id: researcher
+display_name: Autonomous Researcher
+description: |
+  Conducts systematic literature reviews and academic research using
+  web search, academic paper tools, and citation management.
+icon: science
+color: "#89b4fa"
+tags:
+  - research
+  - literature-review
+  - academic
+
+# Only override tool categories that differ from defaults
+tools:
+  research:
+    - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
+    - search_arxiv
+    - get_arxiv_paper
+    - search_unpaywall
+  citation:
+    - cite_document
+    - cite_web
+    - list_sources
+    - get_citation
+    - list_citations
+  graph: null
+
+research:
+  research_depth: deep
+
+validation:
+  require_citations: true

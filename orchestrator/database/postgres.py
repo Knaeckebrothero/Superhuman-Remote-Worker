@@ -648,6 +648,29 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def update_job_context(self, job_id: str, context: Dict[str, Any]) -> bool:
+        """Update the context JSONB column for a job.
+
+        Args:
+            job_id: Job UUID as string
+            context: New context dictionary
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = "UPDATE jobs SET context = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(context), uuid_val)
+
+        return result == "UPDATE 1"
+
     async def get_requirements(
         self,
         job_id: str,

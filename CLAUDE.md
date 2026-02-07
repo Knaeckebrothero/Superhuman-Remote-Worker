@@ -15,9 +15,10 @@ pip install -r requirements.txt
 pip install -e ./citation_tool[full]
 cp .env.example .env  # Then configure API keys
 
-# System dependencies
-sudo apt-get install poppler-utils    # Required for PDF page rendering (pdf2image)
-playwright install chromium           # Required for browser-based research tools
+# System dependencies (Fedora)
+sudo dnf install poppler-utils         # Required for PDF page rendering (pdf2image)
+# Debian/Ubuntu: sudo apt-get install poppler-utils
+playwright install chromium            # Required for browser-based research tools
 ```
 
 Citation tool install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
@@ -215,13 +216,13 @@ tools:
 Tool categories in config:
 - `workspace`: File operations (read_file, write_file, list_files, etc.)
 - `core`: Task management + completion (next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete)
-- `document`: Document processing (chunk_document, identify_requirement_candidates)
+- `document`: Document processing (chunk_document)
 - `research`: Web search (web_search)
 - `citation`: Citation management (cite_document, cite_web, list_sources, etc.)
 - `graph`: Neo4j operations (execute_cypher_query, get_database_schema, validate_schema_compliance)
 - `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
 
-**Phase-specific tool filtering**: `job_complete` is only available during strategic phases. Tactical phases cannot signal job completion directly.
+**Phase-specific tool filtering**: Tools declare their phase availability via `phases` metadata in `TOOL_REGISTRY` (`src/tools/registry.py`). Each tool entry specifies `phases: ["strategic", "tactical"]` or a subset. `filter_tools_by_phase()` removes tools not available in the current phase before binding to the LLM. `job_complete` is strategic-only; tactical phases cannot signal job completion directly.
 
 ### Multi-Database Architecture
 
@@ -246,12 +247,30 @@ Per-job directory: `workspace/job_<uuid>/`
 
 **Git Versioning**: When enabled (`workspace.git_versioning: true` in config), each workspace is a git repo. Auto-commits on todo completion with formatted messages, `.gitignore` auto-configured from `workspace.git_ignore_patterns`, tags mark phase boundaries (`phase_N_start`, `phase_N_end`). Use `git_log`, `git_show`, `git_diff` tools to query history.
 
-### Context Management
+### Context Safety (Three-Layer System)
 
-Token limits trigger automatic summarization:
-- `context_threshold_tokens`: 80000 (default in defaults.yaml)
-- `message_count_threshold`: 200 messages
-- `keep_recent_tool_results`: 10 most recent preserved during compaction
+The agent has a three-layer defense against context window overflow:
+
+- **Layer 0** (HTTP-level): `ReasoningChatOpenAI` in `src/llm/reasoning_chat.py` catches token limit errors at the HTTP request layer, raising `ContextOverflowError`
+- **Layer 1** (Pre-request): The `execute` node in `src/graph.py` validates token count *before* calling the LLM, triggering compaction proactively
+- **Layer 2** (Emergency recovery): If an overflow still occurs, the graph catches `ContextOverflowError` and performs emergency compaction, then retries
+
+Compaction preserves the 10 most recent tool results and sanitizes orphaned `ToolMessage`s (via `sanitize_message_history` in `src/core/context.py`).
+
+Config keys:
+- `limits.context_threshold_tokens`: 80000 (default)
+- `limits.message_count_threshold`: 200 messages
+- `context_management.keep_recent_tool_results`: 10
+
+### Workspace-Centric Memory Model
+
+Long-term memory lives in files, not in LLM context:
+
+- `workspace.md` is injected into every LLM call as a transient fake tool result (see `src/core/workspace_injection.py`). It is never stored in state, preventing it from being summarized away during context compaction. This is the agent's persistent memory across context windows.
+- `plan.md` holds the strategic plan, updated at phase boundaries.
+- `archive/` preserves phase history (retrospectives + archived todos) for review during strategic phases.
+
+This separation means workspace.md survives context compaction while the conversation history gets summarized.
 
 ## Key Source Directories
 
@@ -263,8 +282,12 @@ Token limits trigger automatic summarization:
   - `state.py` - UniversalAgentState TypedDict
   - `workspace.py` - WorkspaceManager for job directories
   - `loader.py` - Config loading, LLM creation, tool registry
-  - `context.py` - ContextManager for token counting/compaction
-- `src/managers/` - TodoManager, MemoryManager, PlanManager
+  - `context.py` - ContextManager for token counting/compaction (three-layer safety)
+  - `phase.py` - Phase transition logic (strategic ↔ tactical)
+  - `phase_snapshot.py` - Phase boundary snapshots for recovery
+  - `workspace_injection.py` - Transient workspace.md injection into LLM calls
+  - `archiver.py` - MongoDB audit trail logging
+- `src/managers/` - TodoManager, MemoryManager, PlanManager, GitManager
 - `src/services/` - Helper services
   - `vision_helper.py` - VisionHelper for image/document descriptions
   - `document_renderer.py` - DocumentRenderer for PDF/PPTX/DOCX to PNG
@@ -362,7 +385,11 @@ Required in `.env`:
 
 **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite for resume)
 
-**Phase Snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/` - Created at phase boundaries for recovery. Each snapshot includes checkpoint.db, workspace.md, plan.md, todos.yaml, and archive/.
+**Phase Snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/` - Created automatically at phase boundaries by `PhaseSnapshotManager` (`src/core/phase_snapshot.py`). Each snapshot includes checkpoint.db, workspace.md, plan.md, todos.yaml, and archive/. To recover a corrupted job to a specific phase:
+```bash
+python agent.py --job-id <id> --list-phases            # See available snapshots
+python agent.py --job-id <id> --recover-phase 2 --resume  # Roll back to phase 2 and continue
+```
 
 **Logs**: `workspace/logs/job_<id>.log`
 

@@ -780,7 +780,6 @@ export class AgentActivityComponent {
     job_complete: 'core',
     // Document tools
     chunk_document: 'document',
-    identify_requirement_candidates: 'document',
     // Research tools
     web_search: 'research',
     // Citation tools

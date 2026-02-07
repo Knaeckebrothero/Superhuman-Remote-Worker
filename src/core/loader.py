@@ -1360,6 +1360,13 @@ def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:
     if deployment_config.exists():
         return (str(deployment_config), str(deployment_dir))
 
+    # Try experts directory (config/experts/{name}/config.yaml)
+    experts_dir = config_dir / "experts" / config_name
+    experts_config = experts_dir / "config.yaml"
+
+    if experts_config.exists():
+        return (str(experts_config), str(experts_dir))
+
     # Fall back to single file config (config/{name}.yaml)
     single_file_config = config_dir / f"{config_name}.yaml"
 

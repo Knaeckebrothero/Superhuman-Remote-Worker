@@ -40,6 +40,22 @@ export interface PaginationState {
 }
 
 // =============================================================================
+// Expert Models
+// =============================================================================
+
+/**
+ * Expert configuration for discovery and selection.
+ */
+export interface Expert {
+  id: string;
+  display_name: string;
+  description: string;
+  icon: string;
+  color: string;
+  tags: string[];
+}
+
+// =============================================================================
 // Agent Models
 // =============================================================================
 

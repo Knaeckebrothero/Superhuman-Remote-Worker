@@ -58,6 +58,9 @@ class WorkspaceManagerConfig:
         default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
     )
 
+    # Git remote URL for workspace delivery (set by orchestrator via Gitea)
+    git_remote_url: Optional[str] = None
+
     @classmethod
     def from_dict(cls, data: dict) -> "WorkspaceManagerConfig":
         """Create config from dictionary."""
@@ -70,6 +73,7 @@ class WorkspaceManagerConfig:
                 "git_ignore_patterns",
                 cls.__dataclass_fields__["git_ignore_patterns"].default_factory()
             ),
+            git_remote_url=data.get("git_remote_url"),
         )
 
 
@@ -260,6 +264,9 @@ class WorkspaceManager:
 
         if success:
             logger.info("Git versioning enabled for workspace")
+            # Configure remote for workspace delivery if URL provided
+            if self.config.git_remote_url:
+                self._git_manager.add_remote("origin", self.config.git_remote_url)
         else:
             logger.warning("Failed to initialize git repository")
             self._git_manager = None

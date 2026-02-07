@@ -57,7 +57,6 @@ tools:
   # Document tools - document processing (src/tools/document/)
   document:
     - chunk_document
-    - identify_requirement_candidates
   # Research tools - web search, academic papers, browser & workflows (src/tools/research/)
   research:
     - web_search

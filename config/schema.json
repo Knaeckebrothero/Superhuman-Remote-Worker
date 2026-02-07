@@ -25,6 +25,27 @@
       "type": "string",
       "description": "Brief description of what this agent does"
     },
+    "icon": {
+      "type": "string",
+      "description": "Material Symbols icon name for expert discovery UI",
+      "default": "psychology",
+      "examples": ["science", "edit_note", "search"]
+    },
+    "color": {
+      "type": "string",
+      "description": "Accent color (hex) for expert discovery UI",
+      "default": "#cba6f7",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "examples": ["#89b4fa", "#a6e3a1", "#f9e2af"]
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Tags for categorization and filtering in expert discovery",
+      "examples": [["research", "academic"], ["documentation", "writing"]]
+    },
     "llm": {
       "type": "object",
       "description": "LLM configuration with optional phase-specific overrides",
@@ -167,7 +188,7 @@
             "type": "string"
           },
           "description": "Document processing tools (src/tools/document/)",
-          "examples": [["chunk_document", "identify_requirement_candidates"]]
+          "examples": [["chunk_document"]]
         },
         "research": {
           "type": "array",

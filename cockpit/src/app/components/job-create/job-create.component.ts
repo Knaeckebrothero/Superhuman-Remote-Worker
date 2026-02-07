@@ -1,8 +1,8 @@
-import { Component, inject, signal, ElementRef, ViewChild } from '@angular/core';
+import { Component, inject, signal, ElementRef, ViewChild, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import { FileHandlingService } from '../../core/services/file-handling.service';
-import { JobCreateRequest } from '../../core/models/api.model';
+import { JobCreateRequest, Expert } from '../../core/models/api.model';
 import { FilePreview, FileType, UploadStatus } from '../../core/models/file.model';
 
 /**
@@ -52,6 +52,51 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
               [disabled]="isSubmitting()"
             ></textarea>
             <span class="field-hint">Describe what you want the agent to do</span>
+          </div>
+
+          <!-- Expert Selector -->
+          <div class="form-group">
+            <label class="form-label">Agent Expert</label>
+            @if (isLoadingExperts()) {
+              <div class="expert-loading">
+                <span class="spinner-small"></span>
+                Loading experts...
+              </div>
+            } @else if (experts().length > 0) {
+              <div class="expert-grid">
+                @for (expert of experts(); track expert.id) {
+                  <button
+                    type="button"
+                    class="expert-card"
+                    [class.selected]="selectedExpert()?.id === expert.id"
+                    [style.--expert-color]="expert.color"
+                    (click)="toggleExpert(expert)"
+                    [disabled]="isSubmitting()"
+                  >
+                    @if (selectedExpert()?.id === expert.id) {
+                      <span class="expert-check">check_circle</span>
+                    }
+                    <span class="expert-icon" [style.color]="expert.color">{{ expert.icon }}</span>
+                    <span class="expert-name">{{ expert.display_name }}</span>
+                    <span class="expert-desc">{{ expert.description }}</span>
+                    @if (expert.tags.length > 0) {
+                      <div class="expert-tags">
+                        @for (tag of expert.tags; track tag) {
+                          <span class="expert-tag">{{ tag }}</span>
+                        }
+                      </div>
+                    }
+                  </button>
+                }
+              </div>
+            }
+            <span class="field-hint">
+              @if (selectedExpert()) {
+                Selected: {{ selectedExpert()!.display_name }}
+              } @else {
+                Select an expert profile or leave unselected for the default agent
+              }
+            </span>
           </div>
 
           <!-- File Upload Dropzone -->
@@ -382,6 +427,100 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         margin-top: 4px;
         font-size: 11px;
         color: #f38ba8;
+      }
+
+      /* Expert Selector */
+      .expert-loading {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 16px;
+        color: var(--text-muted, #6c7086);
+        font-size: 13px;
+      }
+
+      .expert-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 10px;
+      }
+
+      .expert-card {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        padding: 14px;
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 8px;
+        background: var(--surface-0, #313244);
+        cursor: pointer;
+        text-align: left;
+        transition: all 0.15s ease;
+        font-family: inherit;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .expert-card:hover:not(:disabled) {
+        border-color: var(--expert-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.05);
+      }
+
+      .expert-card.selected {
+        border-color: var(--expert-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.08);
+        box-shadow: 0 0 0 1px var(--expert-color, #cba6f7);
+      }
+
+      .expert-card:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .expert-check {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        font-family: 'Material Symbols Outlined';
+        font-size: 18px;
+        color: var(--expert-color, #cba6f7);
+      }
+
+      .expert-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 28px;
+      }
+
+      .expert-name {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .expert-desc {
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+        line-height: 1.4;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+
+      .expert-tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 2px;
+      }
+
+      .expert-tag {
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: rgba(205, 214, 244, 0.08);
+        color: var(--text-muted, #6c7086);
       }
 
       /* Dropzone */
@@ -758,7 +897,7 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
     `,
   ],
 })
-export class JobCreateComponent {
+export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
   readonly fileService = inject(FileHandlingService);
 
@@ -775,6 +914,11 @@ export class JobCreateComponent {
   readonly errorMessage = signal<string | null>(null);
   readonly filePreviews = signal<FilePreview[]>([]);
 
+  // Expert selector state
+  readonly experts = signal<Expert[]>([]);
+  readonly selectedExpert = signal<Expert | null>(null);
+  readonly isLoadingExperts = signal(false);
+
   // Advanced section state
   readonly showAdvanced = signal(false);
   readonly configFile = signal<FilePreview | null>(null);
@@ -788,6 +932,31 @@ export class JobCreateComponent {
   formData: JobCreateRequest = {
     description: '',
   };
+
+  ngOnInit(): void {
+    this.loadExperts();
+  }
+
+  private loadExperts(): void {
+    this.isLoadingExperts.set(true);
+    this.api.getExperts().subscribe({
+      next: (experts) => {
+        this.experts.set(experts);
+        this.isLoadingExperts.set(false);
+      },
+      error: () => {
+        this.isLoadingExperts.set(false);
+      },
+    });
+  }
+
+  toggleExpert(expert: Expert): void {
+    if (this.selectedExpert()?.id === expert.id) {
+      this.selectedExpert.set(null);
+    } else {
+      this.selectedExpert.set(expert);
+    }
+  }
 
   // ===== File Upload Methods =====
 
@@ -1029,6 +1198,12 @@ export class JobCreateComponent {
       description: this.formData.description,
     };
 
+    // Set expert config if selected (and not the defaults entry)
+    const expert = this.selectedExpert();
+    if (expert && expert.id !== 'defaults') {
+      request.config_name = expert.id;
+    }
+
     if (this.uploadId) {
       request.upload_id = this.uploadId;
     }
@@ -1179,6 +1354,8 @@ export class JobCreateComponent {
     };
     this.filePreviews.set([]);
     this.uploadId = null;
+    // Reset expert selection
+    this.selectedExpert.set(null);
     // Reset advanced options
     this.showAdvanced.set(false);
     this.configFile.set(null);

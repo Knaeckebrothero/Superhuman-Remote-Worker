@@ -1,11 +1,10 @@
 """Document processing tools for the Universal Agent.
 
-Provides document extraction, chunking, and basic candidate identification
-using langchain document loaders and text splitters.
+Provides document extraction and chunking using langchain document loaders
+and text splitters.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -26,15 +25,6 @@ DOCUMENT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "document",
         "defer_to_workspace": True,
         "short_description": "Split document into chunks (legal/technical/general strategies).",
-        "phases": ["tactical"],
-    },
-    "identify_requirement_candidates": {
-        "module": "document.processing",
-        "function": "identify_requirement_candidates",
-        "description": "Identify requirement-like statements in text",
-        "category": "document",
-        "defer_to_workspace": True,
-        "short_description": "Find requirement-like statements in text.",
         "phases": ["tactical"],
     },
 }
@@ -174,87 +164,6 @@ def _chunk_text(text: str, strategy: str, max_chunk_size: int, overlap: int) -> 
     ]
 
 
-def _identify_candidates(text: str, mode: str) -> List[Dict[str, Any]]:
-    """Identify requirement-like statements using pattern matching.
-
-    This is a simplified implementation. For production, consider
-    using an LLM-based approach for better accuracy.
-
-    Args:
-        text: Text to analyze
-        mode: 'strict', 'balanced', or 'permissive'
-
-    Returns:
-        List of candidate dictionaries
-    """
-    candidates = []
-
-    # Modal verb patterns indicating requirements
-    modal_patterns = [
-        (r'\b(must|shall|will|should)\b[^.]*\.', 0.8, "functional"),
-        (r'\b(is required to|has to|needs to)\b[^.]*\.', 0.7, "functional"),
-        (r'\b(ensure|verify|validate|confirm)\b[^.]*\.', 0.6, "compliance"),
-    ]
-
-    # GoBD/GDPR indicator patterns
-    gobd_patterns = [
-        r'\b(GoBD|Aufbewahrung|Archivierung|revisionssicher)\b',
-        r'\b(Buchführung|Belege?|steuerlich relevant)\b',
-    ]
-
-    gdpr_patterns = [
-        r'\b(DSGVO|GDPR|personenbezogen|Datenschutz)\b',
-        r'\b(Einwilligung|Löschung|Auskunft)\b',
-    ]
-
-    # Adjust confidence thresholds based on mode
-    min_confidence = {
-        "strict": 0.8,
-        "balanced": 0.6,
-        "permissive": 0.4,
-    }.get(mode, 0.6)
-
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if len(sentence) < 20:
-            continue
-
-        for pattern, base_confidence, req_type in modal_patterns:
-            if re.search(pattern, sentence, re.IGNORECASE):
-                # Check for GoBD/GDPR relevance
-                gobd_relevant = any(
-                    re.search(p, sentence, re.IGNORECASE)
-                    for p in gobd_patterns
-                )
-                gdpr_relevant = any(
-                    re.search(p, sentence, re.IGNORECASE)
-                    for p in gdpr_patterns
-                )
-
-                # Boost confidence for compliance-related sentences
-                confidence = base_confidence
-                if gobd_relevant or gdpr_relevant:
-                    confidence = min(confidence + 0.1, 1.0)
-
-                if confidence >= min_confidence:
-                    candidates.append({
-                        "text": sentence,
-                        "type": req_type,
-                        "confidence": confidence,
-                        "gobd_relevant": gobd_relevant,
-                        "gdpr_relevant": gdpr_relevant,
-                        "gobd_indicators": ["GoBD"] if gobd_relevant else [],
-                    })
-                break
-
-    # Sort by confidence
-    candidates.sort(key=lambda x: x["confidence"], reverse=True)
-
-    return candidates
-
-
 def create_processing_tools(context: ToolContext) -> List[Any]:
     """Create document processing tools with injected context.
 
@@ -337,45 +246,6 @@ Chunk Statistics:
             logger.error(f"Document chunking error: {e}")
             return f"Error chunking document: {str(e)}"
 
-    @tool
-    def identify_requirement_candidates(
-        text: str,
-        mode: str = "balanced"
-    ) -> str:
-        """Identify requirement-like statements in text.
-
-        Args:
-            text: Text to analyze for requirements
-            mode: Detection mode ('strict', 'balanced', 'permissive')
-
-        Returns:
-            List of identified candidates with confidence scores
-        """
-        try:
-            candidates = _identify_candidates(text, mode)
-
-            result = f"Requirement Candidate Identification\n"
-            result += f"Mode: {mode}\n"
-            result += f"Candidates Found: {len(candidates)}\n\n"
-
-            for i, cand in enumerate(candidates[:10], 1):
-                result += f"{i}. [{cand.get('type', 'unknown').upper()}] "
-                result += f"Confidence: {cand.get('confidence', 0):.2f}\n"
-                result += f"   Text: {cand.get('text', '')[:150]}...\n"
-                if cand.get('gobd_relevant'):
-                    result += f"   GoBD Relevant: Yes ({', '.join(cand.get('gobd_indicators', []))})\n"
-                result += "\n"
-
-            if len(candidates) > 10:
-                result += f"... and {len(candidates) - 10} more candidates\n"
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Candidate identification error: {e}")
-            return f"Error identifying candidates: {str(e)}"
-
     return [
         chunk_document,
-        identify_requirement_candidates,
     ]
