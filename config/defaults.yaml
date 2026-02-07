@@ -46,6 +46,8 @@ tools:
     - copy_file
     - get_workspace_summary
     - get_document_info
+    - create_directory
+    - delete_directory
   # Core tools - to-do + job management (src/tools/core/)
   core:
     - next_phase_todos
@@ -90,10 +92,6 @@ tools:
     - git_status
     - git_tags
 
-todo:
-  archive_on_reset: true
-  archive_path: archive/
-
 connections:
   postgres: true
   neo4j: false
@@ -114,17 +112,7 @@ context_management:
   keep_recent_messages: 10
   summarization_template: summarization_prompt.txt
 
-document_processing:
-  chunking_strategy: general
-  max_chunk_size: 1000
-  chunk_overlap: 200
-  extraction_mode: balanced
-  min_confidence_threshold: 0.5
-
 research:
-  web_search_enabled: false
-  graph_search_enabled: false
-  research_depth: standard
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
   proxy:
     enabled: false
@@ -138,9 +126,3 @@ browser:
   timeout: 60000  # Milliseconds
   use_vision: false  # DOM-based by default (works with any LLM)
 
-validation:
-  duplicate_threshold: 0.9
-  require_citations: false
-  metamodel_validation_strict: false
-  fulfillment_confidence_threshold: 0.5
-  auto_integrate: false
