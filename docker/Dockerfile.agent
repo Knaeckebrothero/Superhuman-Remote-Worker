@@ -34,9 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements (exclude local editable citation_tool - installed later)
+# Copy and install requirements (exclude local editable CitationEngine - installed later)
 COPY requirements.txt .
-RUN grep -v "citation_tool" requirements.txt > requirements_docker.txt && \
+RUN grep -v "CitationEngine" requirements.txt > requirements_docker.txt && \
     pip install --no-cache-dir -r requirements_docker.txt
 
 # Production image
@@ -76,12 +76,12 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy source code with correct ownership (avoids expensive chown -R later)
 COPY --chown=graphrag:graphrag src/ ./src/
 COPY --chown=graphrag:graphrag config/ ./config/
-COPY --chown=graphrag:graphrag citation_tool/ ./citation_tool/
+COPY --chown=graphrag:graphrag CitationEngine/ ./CitationEngine/
 COPY --chown=graphrag:graphrag agent.py ./
 
-# Install citation tool
-RUN if [ -d "./citation_tool" ] && [ -f "./citation_tool/pyproject.toml" ]; then \
-        pip install --no-cache-dir -e ./citation_tool[full]; \
+# Install citation engine
+RUN if [ -d "./CitationEngine" ] && [ -f "./CitationEngine/pyproject.toml" ]; then \
+        pip install --no-cache-dir -e ./CitationEngine[full]; \
     fi
 
 # Install Playwright chromium for browser-based research tools

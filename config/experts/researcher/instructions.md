@@ -138,6 +138,15 @@ When writing synthesis (literature review, findings report), organize around **t
 arguments**, not around individual sources. Never write "Source A says X. Source B says Y.
 Source C says Z." Instead, write about the theme and weave sources in as evidence.
 
+**Before writing each synthesis section**, refresh the citations you plan to reference:
+```
+get_citation(1)  # → returns source name, quote, page, context
+get_citation(2)  # → returns source name, quote, page, context
+```
+This puts the original quotes and source details back in your context window so you can
+accurately paraphrase and attribute. This is especially important after context compaction,
+when earlier tool results may have been summarized away.
+
 Use the **Claim-Evidence-Reasoning** pattern:
 
 1. **Claim** — State the finding or conclusion in your own words
@@ -175,6 +184,8 @@ Create citations the moment you encounter a useful source, during search and rea
 after you've finished researching. This prevents two failure modes:
 - Losing track of where you found something after context compaction
 - Misattributing claims to the wrong source when writing from memory
+
+When writing synthesis later, refresh citations with `get_citation()` before each section to ensure accurate attribution.
 
 ```
 web_search(query="retrieval augmented generation survey 2024")

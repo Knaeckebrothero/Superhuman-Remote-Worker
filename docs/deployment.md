@@ -299,111 +299,20 @@ Each job gets: `/app/workspace/job_<uuid>/`
 
 Checkpoints: `/app/workspace/checkpoints/job_<uuid>.db`
 
-## Docker Compose (Target)
+## Docker Compose
 
-```yaml
-# docker-compose.yaml - Full stack deployment
-services:
-  # === Core Databases (required) ===
-  postgres:
-    image: postgres:15-alpine
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./src/database/queries/postgres/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+The production compose file is [`docker-compose.yaml`](../docker-compose.yaml) (uses pre-built GHCR images). For development, use [`docker-compose.dev.yaml`](../docker-compose.dev.yaml) (databases only, with exposed ports for local development).
 
-  mongodb:
-    image: mongo:7
-    volumes:
-      - mongodb-data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+Services in the production stack:
+- **postgres** - PostgreSQL 15 (jobs, agents, requirements)
+- **mongodb** - MongoDB 7 (LLM request logging, audit trail)
+- **gitea** - Gitea 1.22 (Git server for agent workspaces)
+- **orchestrator** - FastAPI backend (job management, agent coordination)
+- **vpn-sidecar** - OpenFortiVPN + SOCKS proxy for institutional research access
+- **agent** - Universal agent workers (defaults to 2 replicas via `AGENT_REPLICAS`)
+- **cockpit** - Angular frontend (job management UI)
 
-  # === Optional: Neo4j (only if neo4j toolkit needed) ===
-  # neo4j:
-  #   image: neo4j:5.15-community
-  #   profiles: ["neo4j"]  # Only starts with --profile neo4j
-  #   volumes:
-  #     - neo4j-data:/data
-  #   environment:
-  #     NEO4J_AUTH: ${NEO4J_USER}/${NEO4J_PASSWORD}
-
-  # === Agent Workers ===
-  agent:
-    image: graphrag-agent:latest
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.agent
-    deploy:
-      replicas: 2  # Scale this in K8s
-    volumes:
-      - workspace-data:/app/workspace
-    environment:
-      AGENT_CONFIG: generic
-      TOOLKITS: "workspace,todo,citation,web,document"  # Default toolkits
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      MONGODB_URL: mongodb://mongodb:27017/graphrag_logs
-      # LLM backends
-      LLM_BASE_URL: ${LLM_BASE_URL}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
-      # Optional Neo4j (if toolkit enabled)
-      NEO4J_URI: ${NEO4J_URI:-}
-      NEO4J_USERNAME: ${NEO4J_USERNAME:-}
-      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-}
-    depends_on:
-      postgres: { condition: service_healthy }
-      mongodb: { condition: service_healthy }
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # === Cockpit UI ===
-  cockpit-api:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit-api:latest
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      MONGODB_URL: mongodb://mongodb:27017/graphrag_logs
-      WORKSPACE_PATH: /workspace
-      JWT_SECRET: ${JWT_SECRET}  # For auth
-    volumes:
-      - workspace-data:/workspace:ro
-    depends_on:
-      postgres: { condition: service_healthy }
-      mongodb: { condition: service_healthy }
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8085/api/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  cockpit-frontend:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit-frontend:latest
-    environment:
-      API_URL: http://cockpit-api:8085
-    depends_on:
-      cockpit-api: { condition: service_healthy }
-
-volumes:
-  postgres-data:
-  mongodb-data:
-  workspace-data:
-  # neo4j-data:  # Uncomment if using neo4j profile
-```
+Exposed ports (production): orchestrator (8085), cockpit (4000), gitea (3000). Database ports are internal-only.
 
 ## Image Documentation
 

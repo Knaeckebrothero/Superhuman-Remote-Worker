@@ -179,6 +179,15 @@ Before writing prose, review the annotated outline:
 Now go through the outline **section by section** and convert bullet points into flowing text.
 This is where the writing happens, but the hard work of citation placement is already done.
 
+**Before writing each section**, look up every citation you plan to reference in that section:
+```
+get_citation(1)  # → returns source name, quote, page, context
+get_citation(3)  # → returns source name, quote, page, context
+```
+This refreshes the source text and attribution details in your context window. With the original
+quote and source name fresh in memory, you can properly paraphrase, use signal phrases, and place
+the `[N]` marker at the right location. Do not write a section from memory alone — always refresh first.
+
 For each paragraph that includes source material, use the **Claim-Evidence-Reasoning** pattern:
 
 1. **Claim** — State your point in your own words (your voice leads)
@@ -230,7 +239,7 @@ These rules are non-negotiable for source-based writing:
 
 ### Cite During Planning, Not After
 
-- Create citations while building the annotated outline (Step 4), not after writing prose
+- Create citations while building the annotated outline (Step 4), not after writing prose. When converting the outline to prose (Step 6), refresh each citation's context by calling `get_citation()` before writing the section that uses it.
 - This prevents the failure mode of writing text first and then hunting for citations to fit
   pre-written claims, which leads to cherry-picked or misattributed sources
 

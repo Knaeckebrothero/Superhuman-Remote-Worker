@@ -8,9 +8,9 @@
 --   jobs              - Job tracking and orchestration
 --   agents            - Registered agent pods for orchestration
 --   requirements      - Primary storage for extracted requirements
---   sources           - Document sources for citations (citation_tool)
---   citations         - Citation records linking claims to sources (citation_tool)
---   schema_migrations - Schema versioning for citation_tool
+--   sources           - Document sources for citations (CitationEngine)
+--   citations         - Citation records linking claims to sources (CitationEngine)
+--   schema_migrations - Schema versioning for CitationEngine
 --
 -- Note: LLM logging is handled by MongoDB (llm_archiver.py).
 -- Note: Agent checkpointing is handled by LangGraph's AsyncPostgresSaver.
@@ -215,7 +215,7 @@ CREATE INDEX IF NOT EXISTS idx_requirements_created_at ON requirements(created_a
 CREATE INDEX IF NOT EXISTS idx_requirements_unprocessed ON requirements(job_id, created_at) WHERE neo4j_id IS NULL;
 
 -- ============================================================================
--- 4. CITATION ENGINE TABLES (from citation_tool)
+-- 4. CITATION ENGINE TABLES (from CitationEngine)
 -- Used by Creator agent for document citations and source tracking
 -- ============================================================================
 
@@ -294,7 +294,7 @@ CREATE INDEX IF NOT EXISTS idx_citations_created_at ON citations(created_at);
 CREATE INDEX IF NOT EXISTS idx_citations_locator ON citations USING GIN (locator);
 CREATE INDEX IF NOT EXISTS idx_sources_metadata ON sources USING GIN (metadata);
 
--- Schema migrations table (for citation_tool versioning)
+-- Schema migrations table (for CitationEngine versioning)
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),

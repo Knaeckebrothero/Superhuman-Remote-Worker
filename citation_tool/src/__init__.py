@@ -1,3 +1,0 @@
-"""
-Citation Engine Source Package
-"""
