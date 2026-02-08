@@ -51,9 +51,14 @@ podman-compose up -d
 
 This starts:
 - **PostgreSQL** - Job tracking and data cache
-- **Neo4j** - Knowledge graph storage (optional)
+- **MongoDB** - LLM request logging and audit trail
+- **Gitea** - Git server for agent workspace repositories
 - **Orchestrator** - Backend API for job management and agent coordination
+- **VPN sidecar** - SOCKS proxy for institutional research access
+- **Agent** - Universal agent workers (defaults to 2 replicas via `AGENT_REPLICAS` env var)
 - **Cockpit** - Angular UI for job management and debugging
+
+Database ports (PostgreSQL, MongoDB) are internal-only in production. Only the services below are exposed to the host.
 
 ### 4. Access Services
 
@@ -61,7 +66,7 @@ This starts:
 |---------|-----|
 | Cockpit | http://localhost:4000 |
 | Orchestrator API | http://localhost:8085 |
-| Neo4j Browser | http://localhost:7474 |
+| Gitea | http://localhost:3000 |
 
 ### 5. Common Operations
 
@@ -72,6 +77,9 @@ podman-compose logs -f agent
 
 # Check service status
 podman-compose ps
+
+# Scale agent replicas
+podman-compose up -d --scale agent=4
 
 # Restart services
 podman-compose restart
@@ -97,7 +105,7 @@ python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 
 pip install -r requirements.txt
-pip install -e ./citation_tool[full]
+pip install -e ./CitationEngine[full]
 ```
 
 ### 2. Configure Environment
