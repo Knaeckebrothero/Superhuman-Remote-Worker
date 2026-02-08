@@ -779,21 +779,6 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     return merged
 
 
-def _get_llm_proxy_url() -> Optional[str]:
-    """Build LLM proxy URL from LLM_PROXY_* environment variables."""
-    proxy_type = os.getenv("LLM_PROXY_TYPE", "none").lower()
-    if proxy_type == "none":
-        return None
-    host = os.getenv("LLM_PROXY_HOST")
-    port = os.getenv("LLM_PROXY_PORT")
-    if not host or not port:
-        return None
-    user = os.getenv("LLM_PROXY_USER", "")
-    password = os.getenv("LLM_PROXY_PASS", "")
-    auth = f"{user}:{password}@" if user else ""
-    return f"{proxy_type}://{auth}{host}:{port}"
-
-
 def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str:
     """Detect LLM provider from model name or explicit setting.
 
@@ -903,12 +888,6 @@ def _create_openai_llm(
     max_context_tokens = limits.model_max_context_tokens if limits else None
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
-
-    # Add proxy support for VPN-gated endpoints
-    proxy_url = _get_llm_proxy_url()
-    if proxy_url:
-        llm_kwargs["proxy_url"] = proxy_url
-        logger.info(f"LLM using proxy: {proxy_url.split('@')[-1]}")
 
     llm = ReasoningChatOpenAI(**llm_kwargs)
 

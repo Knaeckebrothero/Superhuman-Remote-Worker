@@ -9,9 +9,10 @@
 # Usage:
 #   podman-compose -f docker-compose.yaml -f docker-compose.vpn.yaml up -d
 #
-# Prerequisites:
-#   - docker/vpn/cluster.conf (copy from cluster.conf.example)
-#   - docker/vpn/research.conf (copy from research.conf.example)
+# Configuration:
+#   Set VPN_CLUSTER_* and VPN_RESEARCH_* variables in .env, OR mount config
+#   files at docker/vpn/cluster.conf and docker/vpn/research.conf.
+#   Env vars take effect only when no config file is mounted.
 #
 # =============================================================================
 
@@ -23,10 +24,15 @@ services:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
-    volumes:
-      - ./docker/vpn/cluster.conf:/etc/openfortivpn/config:ro,Z
     environment:
       SOCKS_PORT: 1080
+      FORWARD_PORT: 8080
+      FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
+      VPN_HOST: ${VPN_CLUSTER_HOST:-}
+      VPN_PORT: ${VPN_CLUSTER_PORT:-443}
+      VPN_USER: ${VPN_CLUSTER_USER:-}
+      VPN_PASS: ${VPN_CLUSTER_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
     healthcheck:
       test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
       interval: 30s
@@ -41,10 +47,13 @@ services:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
-    volumes:
-      - ./docker/vpn/research.conf:/etc/openfortivpn/config:ro,Z
     environment:
       SOCKS_PORT: 1080
+      VPN_HOST: ${VPN_RESEARCH_HOST:-}
+      VPN_PORT: ${VPN_RESEARCH_PORT:-443}
+      VPN_USER: ${VPN_RESEARCH_USER:-}
+      VPN_PASS: ${VPN_RESEARCH_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
     healthcheck:
       test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
       interval: 30s
@@ -54,11 +63,9 @@ services:
 
   agent:
     environment:
-      # LLM API traffic -> cluster VPN
-      LLM_PROXY_TYPE: socks5
-      LLM_PROXY_HOST: vpn-cluster
-      LLM_PROXY_PORT: "1080"
-      # Research traffic -> research VPN
+      # LLM API traffic -> cluster VPN via TCP port forward
+      LLM_BASE_URL: http://vpn-cluster:8080/v1
+      # Research traffic -> research VPN via SOCKS proxy
       RESEARCH_PROXY_TYPE: socks5
       RESEARCH_PROXY_HOST: vpn-research
       RESEARCH_PROXY_PORT: "1080"
