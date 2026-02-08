@@ -245,6 +245,7 @@ class TestLLMVerificationEdgeCases:
 
         finally:
             import os
+
             os.unlink(long_file_path)
 
     def test_verify_non_english_content(self, temp_db_path):
@@ -292,6 +293,7 @@ class TestLLMVerificationEdgeCases:
 
         finally:
             import os
+
             os.unlink(german_file_path)
 
     def test_verify_with_inference(self, temp_db_path, sample_text_file):
@@ -358,7 +360,9 @@ class TestLLMClient:
             # Retrieve citation to verify parsing
             citation = engine.get_citation(result.citation_id)
             assert citation is not None
-            print(f"\nCitation stored with verification_status: {citation.verification_status.value}")
+            print(
+                f"\nCitation stored with verification_status: {citation.verification_status.value}"
+            )
             print(f"Stored similarity_score: {citation.similarity_score}")
 
 

@@ -921,9 +921,7 @@ class CitationEngine:
             ) from e
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
-            log.warning(
-                f"HTTP {status_code} for {url} - registering with metadata only"
-            )
+            log.warning(f"HTTP {status_code} for {url} - registering with metadata only")
             placeholder = (
                 f"[CONTENT NOT ACCESSIBLE] This URL returned HTTP {status_code}. "
                 f"The content could not be fetched automatically. "

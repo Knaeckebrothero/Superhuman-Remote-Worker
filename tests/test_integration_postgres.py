@@ -113,9 +113,7 @@ class TestPostgreSQLConnection:
 class TestPostgreSQLSourceRegistration:
     """Tests for source registration with PostgreSQL backend."""
 
-    def test_add_doc_source_postgresql(
-        self, postgres_db_url, sample_text_file, monkeypatch
-    ):
+    def test_add_doc_source_postgresql(self, postgres_db_url, sample_text_file, monkeypatch):
         """Test document source registration in PostgreSQL."""
         monkeypatch.setenv("CITATION_DB_URL", postgres_db_url)
 
@@ -140,10 +138,12 @@ class TestPostgreSQLSourceRegistration:
         monkeypatch.setenv("CITATION_DB_URL", postgres_db_url)
 
         with CitationEngine(mode="multi-agent") as engine:
-            content = json.dumps([
-                {"id": 1, "name": "Item 1"},
-                {"id": 2, "name": "Item 2"},
-            ])
+            content = json.dumps(
+                [
+                    {"id": 1, "name": "Item 1"},
+                    {"id": 2, "name": "Item 2"},
+                ]
+            )
 
             source = engine.add_db_source(
                 identifier="test_database.items_pg",
@@ -170,9 +170,7 @@ class TestPostgreSQLSourceRegistration:
             assert source.id is not None
             assert source.type == SourceType.CUSTOM
 
-    def test_list_sources_postgresql(
-        self, postgres_db_url, sample_text_file, monkeypatch
-    ):
+    def test_list_sources_postgresql(self, postgres_db_url, sample_text_file, monkeypatch):
         """Test listing sources from PostgreSQL."""
         monkeypatch.setenv("CITATION_DB_URL", postgres_db_url)
 
@@ -201,9 +199,7 @@ class TestPostgreSQLCitations:
     """Tests for citation operations with PostgreSQL backend."""
 
     @patch.object(CitationEngine, "_verify_citation")
-    def test_cite_doc_postgresql(
-        self, mock_verify, postgres_db_url, sample_text_file, monkeypatch
-    ):
+    def test_cite_doc_postgresql(self, mock_verify, postgres_db_url, sample_text_file, monkeypatch):
         """Test document citation in PostgreSQL."""
         mock_verify.return_value = VerificationResult(
             is_verified=True,
@@ -266,9 +262,7 @@ class TestPostgreSQLCitations:
 
             # Filter by status
             verified = engine.list_citations(verification_status="verified")
-            assert all(
-                c.verification_status == VerificationStatus.VERIFIED for c in verified
-            )
+            assert all(c.verification_status == VerificationStatus.VERIFIED for c in verified)
 
 
 # =============================================================================
@@ -318,9 +312,7 @@ class TestPostgreSQLJSONB:
             assert citation.locator["line_range"] == [10, 15]
             assert citation.locator["metadata"]["chapter"] == "Regulations"
 
-    def test_jsonb_metadata_storage(
-        self, postgres_db_url, sample_text_file, monkeypatch
-    ):
+    def test_jsonb_metadata_storage(self, postgres_db_url, sample_text_file, monkeypatch):
         """Test that metadata is properly stored as JSONB."""
         monkeypatch.setenv("CITATION_DB_URL", postgres_db_url)
 
@@ -378,9 +370,7 @@ class TestPostgreSQLConcurrency:
                 assert engine2._conn is not None
 
                 # Agent 1 creates a source
-                source1 = engine1.add_doc_source(
-                    sample_text_file, name="Agent1 Source"
-                )
+                source1 = engine1.add_doc_source(sample_text_file, name="Agent1 Source")
 
                 # Agent 2 should be able to see it
                 sources = engine2.list_sources()
@@ -412,9 +402,7 @@ class TestPostgreSQLCleanup:
     """Tests for database cleanup and statistics."""
 
     @patch.object(CitationEngine, "_verify_citation")
-    def test_get_statistics(
-        self, mock_verify, postgres_db_url, sample_text_file, monkeypatch
-    ):
+    def test_get_statistics(self, mock_verify, postgres_db_url, sample_text_file, monkeypatch):
         """Test getting database statistics."""
         mock_verify.return_value = VerificationResult(
             is_verified=True,

@@ -154,10 +154,12 @@ class TestSourceRegistration:
 
     def test_add_db_source(self, engine):
         """Test database source registration."""
-        content = json.dumps([
-            {"id": 1, "name": "Item 1"},
-            {"id": 2, "name": "Item 2"},
-        ])
+        content = json.dumps(
+            [
+                {"id": 1, "name": "Item 1"},
+                {"id": 2, "name": "Item 2"},
+            ]
+        )
 
         source = engine.add_db_source(
             identifier="test_database.items",
