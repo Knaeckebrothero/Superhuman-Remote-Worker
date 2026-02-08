@@ -407,15 +407,38 @@ Similarity Score: {similarity}
             source = engine.get_source(citation.source_id)
 
             similarity = f"{citation.similarity_score:.2f}" if citation.similarity_score else "N/A"
-            output = f"""Citation [{citation_id}]
+            source_name = source.name if source else "Unknown"
+            source_type = f" ({source.type.value})" if source else ""
 
-Claim: {citation.claim[:300]}{"..." if len(citation.claim) > 300 else ""}
-Source: [{source.id}] {source.name if source else 'Unknown'}
-Status: {citation.verification_status.value.upper()}
-Confidence: {citation.confidence.value}
-Similarity: {similarity}
-Created: {citation.created_at}
-"""
+            output = f"Citation [{citation_id}]\n"
+            output += f"\nSource: [{source.id}] {source_name}{source_type}"
+
+            if citation.locator:
+                loc_parts = [f"{k.capitalize()} {v}" for k, v in citation.locator.items() if v]
+                if loc_parts:
+                    output += f"\nLocation: {', '.join(loc_parts)}"
+
+            output += f"\nClaim: {citation.claim}"
+
+            if citation.verbatim_quote:
+                quote = citation.verbatim_quote[:500] + "..." if len(citation.verbatim_quote) > 500 else citation.verbatim_quote
+                output += f'\n\nQuote: "{quote}"'
+
+            if citation.quote_context:
+                ctx = citation.quote_context[:500] + "..." if len(citation.quote_context) > 500 else citation.quote_context
+                output += f"\nContext: {ctx}"
+
+            if citation.quote_language:
+                output += f"\nLanguage: {citation.quote_language}"
+
+            if citation.extraction_method:
+                output += f"\nExtraction: {citation.extraction_method.value}"
+
+            if citation.relevance_reasoning:
+                output += f"\nReasoning: {citation.relevance_reasoning}"
+
+            output += f"\n\nStatus: {citation.verification_status.value.upper()} | Confidence: {citation.confidence.value} | Similarity: {similarity}"
+
             if citation.verification_notes:
                 output += f"\nNotes: {citation.verification_notes}"
 

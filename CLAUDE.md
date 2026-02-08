@@ -12,7 +12,7 @@ Graph-RAG system for requirement traceability and compliance checking. Uses Lang
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-pip install -e ./citation_tool[full]
+pip install -e ./CitationEngine[full]
 cp .env.example .env  # Then configure API keys
 
 # System dependencies (Fedora)
@@ -21,7 +21,7 @@ sudo dnf install poppler-utils         # Required for PDF page rendering (pdf2im
 playwright install chromium            # Required for browser-based research tools
 ```
 
-Citation tool install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
+CitationEngine install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
 
 ### Database Management
 ```bash
@@ -103,9 +103,9 @@ pytest tests/ -k "todo"                    # Tests matching pattern
 pytest tests/ --cov=src                    # With coverage
 ```
 
-### Linting (citation_tool only)
+### Linting (CitationEngine only)
 ```bash
-cd citation_tool
+cd CitationEngine
 ruff check src/ tests/          # Lint
 ruff format src/ tests/         # Format
 mypy src/                       # Type check
@@ -311,7 +311,7 @@ This separation means workspace.md survives context compaction while the convers
   - `orchestrator/services/` - Services (workspace)
   - `orchestrator/mcp/` - MCP server for Claude Code integration
 - `cockpit/` - Angular frontend for debugging and job management
-- `citation_tool/` - Separate installable package for citation management
+- `CitationEngine/` - Separate installable package for citation management
 
 ### Vision Services
 
@@ -377,6 +377,7 @@ Required in `.env`:
 | Orchestrator API | 8085 |
 | Cockpit Frontend (docker) | 4000 |
 | Cockpit Frontend (npm start) | 4200 |
+| Gitea | 3000 |
 | PostgreSQL | 5432 |
 | MongoDB | 27017 |
 
