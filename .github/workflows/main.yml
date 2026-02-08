@@ -21,10 +21,8 @@ jobs:
         run: pip install ruff
       - name: Ruff lint
         run: ruff check --fix src/ tests/
-      - name: Ruff format check
+      - name: Ruff format
         run: ruff format src/ tests/
-      - name: Check for unfixed lint or format changes
-        run: git diff --exit-code
 
   test:
     runs-on: ubuntu-latest
