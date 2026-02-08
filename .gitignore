@@ -7,6 +7,8 @@ project_documentation/*
 
 # VPN credentials (config.example is tracked, config is not)
 docker/vpn/config
+docker/vpn/cluster.conf
+docker/vpn/research.conf
 
 # MCP configuration files
 .mcp.json
