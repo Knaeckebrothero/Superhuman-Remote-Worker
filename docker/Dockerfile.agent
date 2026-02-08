@@ -72,13 +72,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy source code with correct ownership (avoids expensive chown -R later)
+# Install Playwright chromium BEFORE source code (only rebuilds when playwright version changes)
+RUN playwright install --with-deps chromium
+
+# Copy source code LAST (changes most frequently, avoids busting playwright cache)
 COPY --chown=graphrag:graphrag src/ ./src/
 COPY --chown=graphrag:graphrag config/ ./config/
 COPY --chown=graphrag:graphrag agent.py ./
-
-# Install Playwright chromium for browser-based research tools
-RUN playwright install --with-deps chromium
 
 # Create runtime directories with correct ownership
 RUN mkdir -p /app/workspace /app/logs && \
