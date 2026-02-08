@@ -28,16 +28,15 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies (git needed for pip install from git URLs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install requirements (exclude local editable CitationEngine - installed later)
 COPY requirements.txt .
-RUN grep -v "CitationEngine" requirements.txt > requirements_docker.txt && \
-    pip install --no-cache-dir -r requirements_docker.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Production image
 FROM python:3.11-slim
@@ -76,13 +75,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy source code with correct ownership (avoids expensive chown -R later)
 COPY --chown=graphrag:graphrag src/ ./src/
 COPY --chown=graphrag:graphrag config/ ./config/
-COPY --chown=graphrag:graphrag CitationEngine/ ./CitationEngine/
 COPY --chown=graphrag:graphrag agent.py ./
-
-# Install citation engine
-RUN if [ -d "./CitationEngine" ] && [ -f "./CitationEngine/pyproject.toml" ]; then \
-        pip install --no-cache-dir -e ./CitationEngine[full]; \
-    fi
 
 # Install Playwright chromium for browser-based research tools
 RUN playwright install --with-deps chromium

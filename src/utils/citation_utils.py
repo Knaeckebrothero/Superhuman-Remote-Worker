@@ -23,7 +23,7 @@ except ImportError:
     Source = None
     logger.warning(
         "Citation Engine not installed. "
-        "Install with: pip install -e ./CitationEngine[full]"
+        "Install with: pip install 'citation-engine[full] @ git+https://github.com/Knaeckebrothero/CitationEngine.git'"
     )
 
 
