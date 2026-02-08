@@ -12,7 +12,6 @@ Graph-RAG system for requirement traceability and compliance checking. Uses Lang
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-pip install -e ./CitationEngine[full]
 cp .env.example .env  # Then configure API keys
 
 # System dependencies (Fedora)
@@ -21,7 +20,7 @@ sudo dnf install poppler-utils         # Required for PDF page rendering (pdf2im
 playwright install chromium            # Required for browser-based research tools
 ```
 
-CitationEngine install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
+CitationEngine is a [separate repository](https://github.com/Knaeckebrothero/CitationEngine) installed via git URL in `requirements.txt`. Install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
 
 ### Database Management
 ```bash
@@ -103,7 +102,8 @@ pytest tests/ -k "todo"                    # Tests matching pattern
 pytest tests/ --cov=src                    # With coverage
 ```
 
-### Linting (CitationEngine only)
+### Linting (CitationEngine)
+CitationEngine lives in its own repo: https://github.com/Knaeckebrothero/CitationEngine
 ```bash
 cd CitationEngine
 ruff check src/ tests/          # Lint
@@ -311,7 +311,7 @@ This separation means workspace.md survives context compaction while the convers
   - `orchestrator/services/` - Services (workspace)
   - `orchestrator/mcp/` - MCP server for Claude Code integration
 - `cockpit/` - Angular frontend for debugging and job management
-- `CitationEngine/` - Separate installable package for citation management
+- [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) - Citation management (separate repo, installed via git URL)
 
 ### Vision Services
 
