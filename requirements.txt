@@ -51,5 +51,5 @@ python-multipart>=0.0.6
 pymongo>=4.6.0
 # System metrics for agent heartbeats
 psutil>=5.9.0
-# Install the citation engine from local directory:
--e ./CitationEngine[full]
+# Citation engine (separate repo):
+citation-engine[full] @ git+https://github.com/Knaeckebrothero/CitationEngine.git
