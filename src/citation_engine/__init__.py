@@ -38,6 +38,8 @@ Author: Claude Code Assistant
 Version: 0.1.0
 """
 
+from .chunking import SemanticChunker
+from .embeddings import EmbeddingService, EmbeddingServiceError, EmbeddingServiceNotConfigured
 from .engine import CitationEngine
 from .models import (
     Annotation,
@@ -57,8 +59,6 @@ from .models import (
     VerificationResult,
     VerificationStatus,
 )
-from .chunking import SemanticChunker
-from .embeddings import EmbeddingService, EmbeddingServiceError, EmbeddingServiceNotConfigured
 from .schema import (
     SCHEMA_VERSION,
     get_current_schema_version,

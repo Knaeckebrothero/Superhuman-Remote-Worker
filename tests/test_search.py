@@ -2,18 +2,16 @@
 
 import os
 import tempfile
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from citation_engine import CitationEngine, CitationContext, SearchResult, SearchResults
+from citation_engine import CitationContext, CitationEngine, SearchResult, SearchResults
 from citation_engine.search import (
     _RankedHit,
     label_evidence,
     overall_label,
     rrf_merge,
 )
-
 
 # =============================================================================
 # RRF Merge Tests

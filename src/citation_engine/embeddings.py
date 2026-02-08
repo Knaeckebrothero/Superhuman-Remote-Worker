@@ -156,7 +156,7 @@ class EmbeddingService:
             raise EmbeddingServiceError(
                 "httpx is required for embedding service. "
                 "Install with: pip install citation-engine[vector]"
-            )
+            ) from None
 
         url = f"{self.api_url}/embeddings"
         headers = {"Content-Type": "application/json"}

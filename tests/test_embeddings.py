@@ -1,20 +1,17 @@
 """Tests for embedding service, semantic chunking, and auto-embed."""
 
-import json
 import os
 import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from citation_engine import CitationEngine, CitationContext
+from citation_engine import CitationContext, CitationEngine
 from citation_engine.chunking import SemanticChunker, _cosine_similarity, _split_sentences
 from citation_engine.embeddings import (
     EmbeddingService,
-    EmbeddingServiceError,
     EmbeddingServiceNotConfigured,
 )
-
 
 # =============================================================================
 # EmbeddingService Tests
@@ -215,8 +212,6 @@ class TestSemanticChunker:
 
         # Windows spanning the topic boundary will mix A and B vectors,
         # producing low similarity. We track call index to control this.
-        call_count = [0]
-
         def fake_embed_batch(texts):
             """Return similar vectors for same-topic windows, dissimilar at boundary."""
             results = []
