@@ -50,6 +50,7 @@ cockpit/dist/
 docs/
 project_documentation/
 *.md
+!config/**/*.md
 !requirements.txt
 
 # Advanced-LLM-Chat subproject (separate deployment)

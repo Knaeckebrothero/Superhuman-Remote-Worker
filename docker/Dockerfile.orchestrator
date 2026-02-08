@@ -39,6 +39,9 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     PORT=8085
 
+# Create non-root user early so COPY --chown can reference it
+RUN groupadd -r graphrag && useradd -r -g graphrag graphrag
+
 WORKDIR /app
 
 # Install runtime dependencies only
@@ -47,16 +50,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from builder
+# Copy installed packages from builder (system-owned, read-only is fine)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Copy orchestrator source code
-COPY orchestrator/ ./
-
-# Create non-root user
-RUN groupadd -r graphrag && useradd -r -g graphrag graphrag && \
-    chown -R graphrag:graphrag /app
+# Copy orchestrator source code with correct ownership
+COPY --chown=graphrag:graphrag orchestrator/ ./
 
 USER graphrag
 
