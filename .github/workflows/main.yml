@@ -20,9 +20,11 @@ jobs:
       - name: Install dependencies
         run: pip install ruff
       - name: Ruff lint
-        run: ruff check src/ tests/
+        run: ruff check --fix src/ tests/
       - name: Ruff format check
-        run: ruff format --check src/ tests/
+        run: ruff format src/ tests/
+      - name: Check for unfixed lint or format changes
+        run: git diff --exit-code
 
   test:
     runs-on: ubuntu-latest
