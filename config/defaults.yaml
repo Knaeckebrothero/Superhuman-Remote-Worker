@@ -79,6 +79,10 @@ tools:
     - get_citation
     - list_citations
     - edit_citation
+    - annotate_source
+    - get_annotations
+    - tag_source
+    - search_library
   # Graph tools - Neo4j operations (src/tools/graph/)
   graph:
     - execute_cypher_query

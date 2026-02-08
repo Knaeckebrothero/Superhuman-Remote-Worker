@@ -38,7 +38,7 @@ Allow the agent to attach notes to sources and citations. This is how a research
 CREATE TABLE source_annotations (
     id SERIAL PRIMARY KEY,
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,  -- Per-job: same source can have different annotations per job
     annotation_type TEXT NOT NULL DEFAULT 'note',  -- 'note', 'highlight', 'summary', 'question', 'critique'
     content TEXT NOT NULL,
     page_reference TEXT,          -- Optional: specific page/section
@@ -62,19 +62,19 @@ CREATE INDEX idx_annotations_type ON source_annotations(annotation_type);
 - Agent reads a PDF, highlights key passages with `annotate_source(source_id, type="highlight", content="...", page="12")`
 - Agent writes a summary after reading: `annotate_source(source_id, type="summary", content="This paper argues...")`
 - Agent flags a question for later: `annotate_source(source_id, type="question", content="Does this contradict Source [3]?")`
-- During the strategic phase review, agent can recall its own annotations to inform plan updates
+- All tools are available in both strategic and tactical phases — the agent can review its library while planning
 
-### 2. Tags & Collections
+### 2. Tags
 
-Categorize sources for structured browsing and retrieval. Tags are flat labels, collections are hierarchical folders.
+Flat tags for categorizing sources. Simple, no hierarchy — the agent can use search + tags together for any level of organization. Collections/folders were considered but dropped: an agent doesn't need visual folder structure, tags + search cover the same use cases with less complexity.
 
-**New database tables:**
+**New database table:**
 
 ```sql
 CREATE TABLE source_tags (
     id SERIAL PRIMARY KEY,
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,  -- Per-job: same source can have different tags per job
     tag TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(source_id, job_id, tag)
@@ -82,135 +82,113 @@ CREATE TABLE source_tags (
 
 CREATE INDEX idx_tags_tag ON source_tags(tag);
 CREATE INDEX idx_tags_job ON source_tags(job_id);
-
-CREATE TABLE collections (
-    id SERIAL PRIMARY KEY,
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    name TEXT NOT NULL,
-    parent_id INTEGER REFERENCES collections(id) ON DELETE CASCADE,
-    description TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(job_id, name, parent_id)
-);
-
-CREATE TABLE collection_sources (
-    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    PRIMARY KEY (collection_id, source_id)
-);
-```
-
-**Agent tools:**
-
-| Tool | Purpose |
-|------|---------|
-| `tag_source` | Add one or more tags to a source |
-| `search_by_tag` | Find sources matching given tags |
-| `create_collection` | Create a named collection (optionally nested) |
-| `add_to_collection` | Add a source to a collection |
-| `browse_collection` | List sources in a collection |
-
-**Use cases:**
-- `tag_source(source_id=3, tags=["GoBD", "retention", "compliance"])`
-- `search_by_tag(tags=["GDPR", "erasure"])` — find all sources tagged with both
-- `create_collection(name="Legal Framework", description="Regulatory documents")` then add sources to it
-
-### 3. Full-Text Search
-
-The CitationEngine PostgreSQL schema already has a GIN index on `to_tsvector` for the claims column. Extend this to cover source content, annotations, and metadata.
-
-**Schema additions:**
-
-```sql
--- Full-text search on source content (sources already store full text in 'content' column)
-CREATE INDEX idx_sources_content_fts ON sources
-    USING GIN (to_tsvector('english', content));
-
--- Full-text search on annotations
-CREATE INDEX idx_annotations_content_fts ON source_annotations
-    USING GIN (to_tsvector('english', content));
 ```
 
 **Agent tool:**
 
 | Tool | Purpose |
 |------|---------|
-| `search_sources` | Full-text keyword search across source content, claims, and annotations |
+| `tag_source` | Add or remove tags on a source |
 
-**Example query behind the tool:**
+Tag-based filtering is handled through the unified `search_library` tool (see [Section 4](#4-unified-search)).
+
+### 3. Full-Text Search Infrastructure
+
+Extend the existing tsvector indexes to cover source content and annotations. Uses `'simple'` text search config (language-agnostic) since sources may be German, English, or mixed.
+
+**Schema additions:**
 
 ```sql
-SELECT s.id, s.name, s.type, ts_rank(to_tsvector('english', s.content), query) AS rank
-FROM sources s, plainto_tsquery('english', 'data retention requirement') AS query
-WHERE to_tsvector('english', s.content) @@ query
-  AND s.job_id = $1
-ORDER BY rank DESC
-LIMIT 10;
+CREATE INDEX idx_sources_content_fts ON sources
+    USING GIN (to_tsvector('simple', content));
+
+CREATE INDEX idx_annotations_content_fts ON source_annotations
+    USING GIN (to_tsvector('simple', content));
 ```
 
-### 4. Vector / Semantic Search
+### 4. Unified Search
 
-This is the headline feature. Make citation sources searchable by meaning, not just keywords. Builds on the infrastructure planned in [vectorization.md](vectorization.md) but applied specifically to the citation library rather than workspace files.
+All search functionality is exposed through a **single `search_library` tool** instead of separate keyword/semantic/evidence tools. This keeps the tool surface small while giving the agent full flexibility.
 
-See [citation_issues.md](citation_issues.md) for the research background on Dense X Retrieval and hybrid retrieval strategies (Section: "Matching Algorithms").
+#### The `search_library` Tool
 
-#### Why Vector Search on Citations Specifically?
+```python
+search_library(
+    query: str,                    # Natural language query or keyword
+    mode: str = "hybrid",          # "hybrid" | "keyword" | "semantic"
+    tags: list[str] | None = None, # Filter by tags (AND logic)
+    source_type: str | None = None,# Filter: "document" | "website" | ...
+    scope: str = "content",        # "content" | "annotations" | "all"
+    top_k: int = 10,               # Max results
+) -> SearchResults
+```
 
-The [vectorization.md](vectorization.md) plan targets workspace files (notes, plans, outputs). Citation source content is different:
+**Return format — explainable labels, not raw scores:**
 
-- **Source documents are large** (full PDFs, web pages) — chunking and indexing is essential
-- **Queries are claim-shaped** — the agent wants to find "which source supports this claim?" not "which file mentions X"
-- **Cross-job reuse potential** — the same regulatory document may be cited across many jobs
-- **Hybrid retrieval is critical** — legal/compliance text needs keyword precision (section numbers, article references) alongside semantic matching (see [citation_issues.md § Matching Algorithms](citation_issues.md#step-2-matching-algorithms-connecting-claims-to-sources))
+```
+Evidence: HIGH — 3 sources support this, strongest match from "GoBD-Handbuch.pdf" p.42
+  [1] "Aufbewahrungsfrist beträgt 10 Jahre..." (GoBD-Handbuch.pdf, p.42) — HIGH
+  [2] "Retention period for tax documents..." (GDPR-Compliance-Guide.pdf, p.15) — MEDIUM (paraphrase)
+  [3] "§ 147 AO defines retention..." (AO-Commentary.pdf, p.201) — MEDIUM (related statute)
+```
 
-#### pgvector Setup
+Evidence labels with reasons:
+- **HIGH** — verbatim or near-verbatim match, multiple corroborating sources
+- **MEDIUM** — paraphrase, related but not exact, or single source only
+- **LOW** — tangentially related, weak similarity, or source may be outdated
+
+#### Why One Tool?
+
+The prior art (PaperQA2, scienceOS) shows that fewer, more powerful tools work better for agents. Three separate search tools (`search_sources`, `search_literature`, `find_evidence`) would force the agent to choose which to call — when in practice it almost always wants hybrid search. The `mode` parameter covers edge cases where the agent explicitly wants keyword-only or semantic-only.
+
+The common `find_evidence(claim)` pattern from [citation_issues.md](citation_issues.md) is simply `search_library(query=claim, mode="hybrid")`.
+
+#### Vector Search Infrastructure
 
 PostgreSQL supports vector search via the [pgvector](https://github.com/pgvector/pgvector) extension. Already in `requirements.txt` as a dependency but not enabled.
 
-**Infrastructure changes:**
+See [citation_issues.md](citation_issues.md) for research background on Dense X Retrieval and hybrid retrieval strategies.
+
+**Schema:**
 
 ```sql
 -- Enable extension (requires superuser, done once)
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Source content embeddings (chunked)
+-- Dimension depends on configured model: text-embedding-3-small = 1536, all-MiniLM-L6-v2 = 384
 CREATE TABLE source_embeddings (
     id SERIAL PRIMARY KEY,
     source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,  -- Per-job: allows different chunking/embedding per job
     chunk_index INTEGER NOT NULL DEFAULT 0,
     chunk_text TEXT NOT NULL,
-    embedding vector(384),   -- all-MiniLM-L6-v2 dimensions
+    embedding vector,             -- Dimension set at insert time, varies by model
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(source_id, chunk_index)
+    UNIQUE(source_id, job_id, chunk_index)
 );
 
 CREATE INDEX idx_source_embeddings_source ON source_embeddings(source_id);
 CREATE INDEX idx_source_embeddings_job ON source_embeddings(job_id);
+
+-- HNSW index: better than IVFFlat for our scale (hundreds to low thousands of chunks)
+-- IVFFlat needs ~4000+ rows to be effective; HNSW works well at any scale
 CREATE INDEX idx_source_embeddings_vector ON source_embeddings
-    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 ```
 
 **Embedding strategy:**
 - Chunk source content on registration (when `add_doc_source` / `add_web_source` is called)
-- Use configurable embedding backend (env vars, same as [vectorization.md](vectorization.md) plan):
-  - `EMBEDDING_MODEL` — model name (default: `sentence-transformers/all-MiniLM-L6-v2`)
-  - `EMBEDDING_API_URL` — optional remote endpoint (OpenAI-compatible)
-  - `EMBEDDING_API_KEY` — optional API key
+- Use `content_hash` to skip re-embedding unchanged sources (incremental indexing)
+- Configurable embedding backend via env vars (see [Design Decisions #2](#design-decisions)):
+  - `CITATION_EMBEDDING_MODEL` — model name (default: `text-embedding-3-small`)
+  - `CITATION_EMBEDDING_URL` — optional custom endpoint (OpenAI-compatible, e.g. Ollama)
+  - `CITATION_EMBEDDING_KEY` — API key (defaults to `OPENAI_API_KEY`)
 - Store chunk text alongside embedding for retrieval without join
+- Vector dimension is not hardcoded — varies by model (1536 for text-embedding-3-small, 384 for MiniLM, etc.)
 
-**Agent tools:**
-
-| Tool | Purpose |
-|------|---------|
-| `search_literature` | Semantic search across all source content in current job |
-| `find_evidence` | Given a claim, find the best-matching source passages (for the [academic workflow](citation_issues.md#option-e-academic-workflow--plan-with-citations-refresh-before-writing--recommended)) |
-
-**`find_evidence` is the key tool.** From [citation_issues.md § Pattern 3](citation_issues.md#pattern-3-the-claim-to-source-tool):
-
-> `find_evidence(claim: str)` → `(source_id, quote, confidence_score)`
-
-This enables the agent to write a claim and then find supporting evidence, rather than the current workflow of finding evidence first and hoping to remember it later.
+**Chunking strategy: semantic chunking.**
+Uses the embedding model itself to detect topic shifts. Embed overlapping windows of text, split where cosine similarity between adjacent windows drops below a threshold. This naturally respects paragraph boundaries, section breaks, and topic changes without parsing document structure. Slower than fixed-size splitting (needs embedding calls at index time), but indexing only happens once per source and is not latency-sensitive.
 
 #### Hybrid Retrieval
 
@@ -234,55 +212,99 @@ def hybrid_search(query: str, job_id: str, top_k: int = 10):
     return rrf_merge(vector_results, fts_results, top_k=top_k)
 ```
 
-### 5. Cross-Job Source Reuse (Future)
+**Reranking** (future enhancement): A cross-encoder reranker could be added as an optional post-RRF step to further improve precision. Skipped for v1 — hybrid search is already a large improvement over the current state (no search at all). Can be revisited if precision proves insufficient.
 
-Currently sources are isolated per job via `job_id` FK. A full literature management system should allow the agent to reference sources from previous jobs — the same way a researcher's Zotero library persists across papers.
+### 5. Shared Source Library
 
-**Possible approach:**
-- Introduce a `library` concept separate from per-job sources
-- When the agent registers a source, check by `content_hash` if it already exists in the library
-- If so, create a lightweight reference (join table) rather than duplicating content
-- Agent can "import" sources from previous jobs into the current job
+Sources are shared across jobs; all project-specific metadata is per-job.
 
-This is a larger architectural change and should come after the core features above are stable.
+#### Shared Source Library Schema
+
+The `sources` table becomes a global library. When the agent registers a source, CitationEngine checks `content_hash` — if the source already exists, it reuses it instead of duplicating. A `job_sources` join table links jobs to their sources.
+
+**Schema changes to existing `sources` table:**
+
+```sql
+-- sources table: REMOVE job_id FK, add deduplication
+CREATE TABLE sources (
+    id SERIAL PRIMARY KEY,
+    type source_type NOT NULL,        -- document | website | database | custom
+    identifier TEXT NOT NULL,         -- path/URL
+    name TEXT NOT NULL,
+    version TEXT,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL UNIQUE, -- Dedup key
+    metadata JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_sources_identifier ON sources(identifier);
+CREATE INDEX idx_sources_content_hash ON sources(content_hash);
+
+-- Join table: which jobs use which sources
+CREATE TABLE job_sources (
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    added_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (job_id, source_id)
+);
+```
+
+**Per-job tables remain scoped:** `citations`, `source_annotations`, `source_tags`, `source_embeddings` all keep their `job_id` FK. This means:
+- The same PDF can be used by 5 different jobs without storing the content 5 times
+- Each job has its own annotations, tags, and citations for that source
+- Deleting a job removes its metadata but preserves the source for other jobs
+
+**Impact on existing tools:**
+- `list_sources` filters via `job_sources` join instead of `sources.job_id`
+- `add_doc_source` / `add_web_source` check `content_hash` first, create `job_sources` link if source exists
+- `get_citation` still works — citations already reference `source_id` directly
 
 ---
 
 ## Implementation Roadmap
 
-### Phase 1: Annotations & Tags (Low complexity)
+All core logic lives in **CitationEngine**. Agent layer only adds thin tool wrappers.
 
-New tables + new agent tools. No new infrastructure needed.
+### Phase 1: Schema Rework & Annotations/Tags
 
-1. Add `source_annotations`, `source_tags`, `collections`, `collection_sources` tables to schema
-2. Implement `annotate_source`, `get_annotations`, `tag_source`, `search_by_tag` tools
-3. Register tools in `TOOL_REGISTRY` under a new `literature` category
-4. Add full-text indexes on source content and annotations
+Refactor sources to shared library model, add literature management tables. No new infrastructure beyond PostgreSQL.
+
+1. **Shared source library:** Remove `job_id` from `sources` table, add `content_hash UNIQUE`, create `job_sources` join table
+2. **Migrate existing data:** Update existing sources to populate `content_hash`, create `job_sources` entries from current `sources.job_id` values
+3. Add `source_annotations` and `source_tags` tables
+4. Add full-text indexes (`'simple'` config) on source content and annotations
+5. Implement CitationEngine methods: `annotate_source()`, `get_annotations()`, `tag_source()`
+6. Implement agent tools as thin wrappers (`annotate_source`, `get_annotations`, `tag_source`), register under `literature` category in `TOOL_REGISTRY`
+7. Update all existing citation tools to use `job_sources` join instead of `sources.job_id`
+8. Mark all literature + citation tools as available in all phases (remove tactical-only restriction)
 
 ### Phase 2: Vector Search Infrastructure
 
 Depends on deploying an embedding model. Builds on [vectorization.md](vectorization.md) infrastructure plan.
 
 1. Enable `pgvector` extension in PostgreSQL (docker-compose update)
-2. Add `source_embeddings` table
-3. Implement embedding service (configurable backend: local sentence-transformers or API)
-4. Hook into `add_doc_source` / `add_web_source` to auto-embed on registration
-5. Implement chunking strategy for source content
+2. Add `source_embeddings` table with HNSW index
+3. Implement configurable embedding service in CitationEngine (OpenAI-compatible API by default, custom endpoint via env vars)
+4. Hook into `add_doc_source` / `add_web_source` to auto-embed + chunk on registration
+5. Use `content_hash` to skip re-embedding unchanged sources (incremental indexing)
+6. Implement semantic chunking (sliding window similarity, see [Design Decision #7](#design-decisions))
 
-### Phase 3: Search Tools
+### Phase 3: Unified Search Tool
 
-1. Implement `search_literature` (semantic search over source content)
-2. Implement `find_evidence` (claim-to-source matching for the [academic workflow](citation_issues.md#option-e-academic-workflow--plan-with-citations-refresh-before-writing--recommended))
-3. Implement hybrid retrieval (vector + full-text + RRF fusion)
-4. Test with real compliance documents
+1. Implement `search_library()` in CitationEngine with `mode` parameter (hybrid/keyword/semantic)
+2. Implement hybrid retrieval backend (vector + full-text + RRF fusion)
+3. Implement explainable evidence labels (HIGH/MEDIUM/LOW with reasons)
+4. Add `search_library` agent tool wrapper with tag/type/scope filters
+5. Test with real compliance documents (mixed German/English)
 
 ### Phase 4: Integration with Citation Workflow
 
 Connect the new literature management features to the existing citation workflow improvements from [citation_issues.md](citation_issues.md):
 
-- `find_evidence` feeds directly into `cite_document` — agent finds evidence semantically, then creates a verified citation
-- Annotations serve as the agent's "reading notes" during the planning phase
-- Tags/collections help the agent organize sources during multi-document research jobs
+- `search_library` feeds directly into `cite_document` — agent finds evidence semantically, then creates a verified citation
+- Annotations serve as the agent's "reading notes" during any phase
+- Tags help the agent organize sources during multi-document research jobs
 - The [academic workflow](citation_issues.md#option-e-academic-workflow--plan-with-citations-refresh-before-writing--recommended) (plan-refresh-write) benefits from semantic search: agent can refresh context by searching for relevant passages rather than re-reading entire documents
 
 ---
@@ -353,15 +375,35 @@ Research into existing projects that have built similar literature management / 
 
 ---
 
+## Design Decisions
+
+1. **Where does the code live?** Core logic + database models live in **CitationEngine**. The agent layer (`src/tools/`) only implements thin tool wrappers that call CitationEngine methods — same pattern as the existing citation tools. CitationEngine owns the schema, the embedding service, the search logic.
+
+2. **Embedding model.** **Configurable from the start.** Default to an OpenAI-compatible model (e.g. `text-embedding-3-small`), but allow a custom endpoint URL + model name for self-hosted models (Ollama, vLLM, etc.). Env vars:
+   - `CITATION_EMBEDDING_MODEL` — model name (default: `text-embedding-3-small`)
+   - `CITATION_EMBEDDING_URL` — optional custom endpoint (OpenAI-compatible API)
+   - `CITATION_EMBEDDING_KEY` — API key (defaults to `OPENAI_API_KEY`)
+
+3. **Cross-job source sharing.** **Sources are shared across jobs; metadata is per-job.** The `sources` table becomes a shared library (no `job_id` FK), deduplicated by `content_hash`. A `job_sources` join table links jobs to their sources. Citations, annotations, tags, and embeddings remain scoped to a job. See [updated schema below](#shared-source-library-schema).
+
+4. **Phase access.** **All literature/citation tools are available in all phases.** No strategic/tactical filtering for these tools — the agent should be able to search, annotate, and cite at any time.
+
+5. **Tool consolidation.** **One unified `search_library` tool** with `mode`, `tags`, `scope` parameters instead of 3 separate search tools. **Tags only, no collections** — the agent doesn't need visual folder hierarchy; tags + search cover the same use cases with less complexity. Total new tools: `annotate_source`, `get_annotations`, `tag_source`, `search_library` (4 new tools, down from the original 10).
+
+6. **Reranking.** **Skip for v1.** Hybrid search (vector + FTS + RRF) is already a major improvement. Reranking can be added later as an optional post-RRF step if precision proves insufficient.
+
+7. **Chunking strategy.** **Semantic chunking.** Use the embedding model to detect topic shifts via sliding window similarity. Naturally respects document structure without explicit parsing. Slower at index time but indexing only happens once per source.
+
+8. **Confidence output.** **Explainable labels** (HIGH/MEDIUM/LOW with reasons) instead of raw similarity scores. Follows Buzzi.ai's finding that labeled evidence is more actionable for both agents and humans.
+
 ## Open Questions
 
-1. **Where should the code live?** Annotations/tags/search could live in CitationEngine (making it a reusable library) or in the Graph-RAG agent layer (`src/tools/`, `src/database/`). CitationEngine is cleaner but increases scope of the separate repo.
+No major open questions remain. All design decisions have been resolved — see [Design Decisions](#design-decisions) above.
 
-2. **Embedding model choice.** Local sentence-transformers (free, private, 384d) vs OpenAI API (higher quality, costs money, 1536d) vs configurable (more code). The [vectorization.md](vectorization.md) doc recommends local `all-MiniLM-L6-v2`.
-
-3. **Cross-job source sharing.** How much isolation do we want? Strict per-job isolation is simpler and matches the current FK model. Shared library is more powerful but adds complexity (permissions, versioning, deduplication).
-
-4. **Strategic vs tactical phase access.** Current citation tools are tactical-only. Literature management tools (annotations, search, browsing) might be useful in strategic phases too — the agent could review its library while planning the next phase.
+Minor implementation details to figure out during development:
+- Semantic chunking parameters: window size, overlap, similarity drop threshold
+- Exact evidence label thresholds (what cosine similarity = HIGH vs MEDIUM vs LOW)
+- Whether `search_library` with `scope="annotations"` should also return the source metadata or just the annotation text
 
 ---
 
