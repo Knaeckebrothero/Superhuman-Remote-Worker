@@ -20,7 +20,7 @@ sudo dnf install poppler-utils         # Required for PDF page rendering (pdf2im
 playwright install chromium            # Required for browser-based research tools
 ```
 
-CitationEngine is a [separate repository](https://github.com/Knaeckebrothero/CitationEngine) installed via git URL in `requirements.txt`. Install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[dev]`, `[full]` (all).
+CitationEngine is a [separate repository](https://github.com/Knaeckebrothero/CitationEngine) installed via git URL in `requirements.txt`. Install extras: `[pdf]`, `[web]`, `[langchain]`, `[postgresql]`, `[vector]`, `[dev]`, `[full]` (all).
 
 ### Database Management
 ```bash
@@ -218,7 +218,7 @@ Tool categories in config:
 - `core`: Task management + completion (next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete)
 - `document`: Document processing (chunk_document)
 - `research`: Web search (web_search)
-- `citation`: Citation management (cite_document, cite_web, list_sources, etc.)
+- `citation`: Citation & literature management (cite_document, cite_web, list_sources, search_library, annotate_source, get_annotations, tag_source, etc.)
 - `graph`: Neo4j operations (execute_cypher_query, get_database_schema, validate_schema_compliance)
 - `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
 - `coding`: Shell command execution (run_command)
@@ -311,7 +311,7 @@ This separation means workspace.md survives context compaction while the convers
   - `orchestrator/services/` - Services (workspace)
   - `orchestrator/mcp/` - MCP server for Claude Code integration
 - `cockpit/` - Angular frontend for debugging and job management
-- [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) - Citation management (separate repo, installed via git URL)
+- [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) - Citation & literature management with hybrid search (separate repo, installed via git URL)
 
 ### Vision Services
 

@@ -30,4 +30,9 @@ tools:
     - list_sources
     - get_citation
     - list_citations
+    - edit_citation
+    - annotate_source
+    - get_annotations
+    - tag_source
+    - search_library
   graph: null
