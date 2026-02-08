@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from .models import (
+    Annotation,
+    AnnotationType,
     Citation,
     CitationContext,
     CitationResult,
@@ -25,12 +27,18 @@ from .models import (
     ExtractionMethod,
     Locator,
     Metadata,
+    SearchResults,
     Source,
     SourceType,
     VerificationResult,
     VerificationStatus,
 )
-from .schema import get_schema
+from .schema import (
+    get_migration_insert,
+    get_pending_migrations,
+    get_schema,
+    get_version_query,
+)
 
 # Set up logging
 log = logging.getLogger(__name__)
@@ -135,6 +143,10 @@ class CitationEngine:
         self._cursor = None
         self._llm_client = None
 
+        # Embedding service (lazy init, optional)
+        self._embedding_service = None
+        self._chunker = None
+
         log.info(
             f"CitationEngine initialized: mode={mode}, "
             f"reasoning_required={self.reasoning_required}, "
@@ -231,7 +243,7 @@ class CitationEngine:
             ) from e
 
     def _initialize_schema(self) -> None:
-        """Create database tables if they don't exist."""
+        """Create database tables if they don't exist, then apply pending migrations."""
         log.debug("Initializing database schema...")
         schema = get_schema(self._db_type)
 
@@ -245,6 +257,43 @@ class CitationEngine:
         except Exception as e:
             self._conn.rollback()
             log.error(f"Failed to initialize schema: {e}")
+            raise
+
+        # Apply pending migrations
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """Apply any pending schema migrations."""
+        try:
+            version_query = get_version_query(self._db_type)
+            self._cursor.execute(version_query)
+            row = self._cursor.fetchone()
+            current_version = row["version"] if isinstance(row, dict) else row[0]
+            log.debug(f"Current schema version: {current_version}")
+
+            pending = get_pending_migrations(current_version, self._db_type)
+            if not pending:
+                log.debug("No pending migrations")
+                return
+
+            for version, description, sql in pending:
+                log.info(f"Applying migration v{version}: {description}")
+                try:
+                    if self._db_type == "sqlite":
+                        self._cursor.executescript(sql)
+                    else:
+                        self._cursor.execute(sql)
+
+                    insert_sql = get_migration_insert(self._db_type, version, description)
+                    self._cursor.execute(insert_sql)
+                    self._conn.commit()
+                    log.info(f"Migration v{version} applied successfully")
+                except Exception as e:
+                    self._conn.rollback()
+                    log.error(f"Migration v{version} failed: {e}")
+                    raise
+        except Exception as e:
+            log.error(f"Migration check failed: {e}")
             raise
 
     def close(self) -> None:
@@ -667,6 +716,9 @@ class CitationEngine:
         """
         Internal method to register a source in the database.
 
+        Uses content_hash for deduplication: if a source with the same hash
+        already exists, reuses it and creates a job_sources link only.
+
         Args:
             source_type: Type of source
             identifier: Unique identifier (path, URL, etc.)
@@ -687,42 +739,53 @@ class CitationEngine:
         # Get job_id from context (session_id is the job_id)
         job_id = self.context.session_id if self.context else None
 
-        # Prepare insert query based on database type
-        if self._db_type == "sqlite":
-            query = """
-                INSERT INTO sources (job_id, type, identifier, name, version, content, content_hash, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """
-            params = (
-                job_id,
-                source_type.value,
-                identifier,
-                name,
-                version,
-                content,
-                content_hash,
-                metadata_json,
-            )
+        # Check for existing source by content_hash (dedup)
+        existing_source = None
+        if content_hash:
+            existing_source = self._find_source_by_hash(content_hash)
+
+        if existing_source:
+            source_id = existing_source.id
+            log.info(f"Source with content_hash already exists [{source_id}], reusing")
         else:
-            query = """
-                INSERT INTO sources (job_id, type, identifier, name, version, content, content_hash, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """
-            params = (
-                job_id,
-                source_type.value,
-                identifier,
-                name,
-                version,
-                content,
-                content_hash,
-                metadata_json,
-            )
+            # Insert new source (without job_id — sources are shared)
+            if self._db_type == "sqlite":
+                query = """
+                    INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+                params = (
+                    source_type.value,
+                    identifier,
+                    name,
+                    version,
+                    content,
+                    content_hash,
+                    metadata_json,
+                )
+            else:
+                query = """
+                    INSERT INTO sources (type, identifier, name, version, content, content_hash, metadata)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """
+                params = (
+                    source_type.value,
+                    identifier,
+                    name,
+                    version,
+                    content,
+                    content_hash,
+                    metadata_json,
+                )
 
-        source_id = self._insert(query, params)
+            source_id = self._insert(query, params)
 
-        return Source(
+        # Create job_sources link
+        if job_id:
+            self._link_source_to_job(source_id, job_id)
+
+        source = Source(
             id=source_id,
             type=source_type,
             identifier=identifier,
@@ -733,6 +796,36 @@ class CitationEngine:
             metadata=metadata,
             created_at=datetime.now(timezone.utc),
         )
+
+        # Auto-embed if embedding service is available (non-blocking)
+        if job_id:
+            self._auto_embed_source(source_id, content, job_id)
+
+        return source
+
+    def _find_source_by_hash(self, content_hash: str) -> Source | None:
+        """Find an existing source by content_hash."""
+        if self._db_type == "sqlite":
+            query = "SELECT * FROM sources WHERE content_hash = ?"
+        else:
+            query = "SELECT * FROM sources WHERE content_hash = %s"
+
+        results = self._query(query, (content_hash,))
+        if results:
+            return self._row_to_source(results[0])
+        return None
+
+    def _link_source_to_job(self, source_id: int, job_id: str) -> None:
+        """Create a job_sources link (idempotent)."""
+        if self._db_type == "sqlite":
+            query = "INSERT OR IGNORE INTO job_sources (job_id, source_id) VALUES (?, ?)"
+        else:
+            query = "INSERT INTO job_sources (job_id, source_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+
+        self._ensure_connected()
+        self._cursor.execute(query, (job_id, source_id))
+        self._conn.commit()
+        log.debug(f"Linked source [{source_id}] to job {job_id}")
 
     def _extract_document_content(self, file_path: str) -> str:
         """
@@ -1693,14 +1786,14 @@ Respond in JSON format."""
 
     def get_source(self, source_id: int, job_id: str | None = None) -> Source | None:
         """
-        Get a source by ID, optionally verifying job_id ownership.
+        Get a source by ID, optionally verifying job ownership via job_sources.
 
         Args:
             source_id: The ID of the source to retrieve
             job_id: Optional job_id to verify ownership (defaults to context.session_id)
 
         Returns:
-            Source object or None if not found or job_id doesn't match
+            Source object or None if not found or not linked to job
         """
         # Default to context's job_id if not provided
         if job_id is None and self.context:
@@ -1710,9 +1803,13 @@ Respond in JSON format."""
 
         if job_id is not None:
             if self._db_type == "sqlite":
-                query = "SELECT * FROM sources WHERE id = ? AND job_id = ?"
+                query = """SELECT s.* FROM sources s
+                    JOIN job_sources js ON s.id = js.source_id
+                    WHERE s.id = ? AND js.job_id = ?"""
             else:
-                query = "SELECT * FROM sources WHERE id = %s AND job_id = %s"
+                query = """SELECT s.* FROM sources s
+                    JOIN job_sources js ON s.id = js.source_id
+                    WHERE s.id = %s AND js.job_id = %s"""
             results = self._query(query, (source_id, job_id))
         else:
             if self._db_type == "sqlite":
@@ -1827,7 +1924,7 @@ Respond in JSON format."""
         job_id: str | None = None,
     ) -> list[Source]:
         """
-        List registered sources, filtered by job_id and optionally by type.
+        List registered sources, filtered by job_id (via job_sources join) and optionally by type.
 
         Args:
             source_type: Optional type filter (document, website, database, custom)
@@ -1846,17 +1943,21 @@ Respond in JSON format."""
         params = []
 
         if job_id is not None:
-            conditions.append("job_id = ?")
+            conditions.append("js.job_id = ?")
             params.append(job_id)
 
         if source_type is not None:
-            conditions.append("type = ?")
+            conditions.append("s.type = ?")
             params.append(source_type)
 
-        query = "SELECT * FROM sources"
+        if job_id is not None:
+            query = "SELECT s.* FROM sources s JOIN job_sources js ON s.id = js.source_id"
+        else:
+            query = "SELECT s.* FROM sources s"
+
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
+        query += " ORDER BY s.created_at DESC"
 
         # Adjust placeholders for PostgreSQL
         if self._db_type == "postgresql":
@@ -1979,6 +2080,500 @@ Respond in JSON format."""
             verification_notes=row.get("verification_notes"),
             similarity_score=row.get("similarity_score"),
             matched_location=matched_location,
+            created_at=created_at,
+            created_by=row.get("created_by"),
+        )
+
+    # =========================================================================
+    # EMBEDDING METHODS
+    # =========================================================================
+
+    def _get_embedding_service(self):
+        """Lazy-init the embedding service. Returns None if not configured."""
+        if self._embedding_service is None:
+            try:
+                from .embeddings import EmbeddingService, EmbeddingServiceNotConfigured
+
+                self._embedding_service = EmbeddingService()
+            except EmbeddingServiceNotConfigured:
+                log.debug("Embedding service not configured, vector features disabled")
+                self._embedding_service = False  # Sentinel: tried but not available
+            except Exception as e:
+                log.debug(f"Could not initialize embedding service: {e}")
+                self._embedding_service = False
+
+        return self._embedding_service if self._embedding_service is not False else None
+
+    def _get_chunker(self):
+        """Lazy-init the semantic chunker."""
+        if self._chunker is None:
+            from .chunking import SemanticChunker
+
+            service = self._get_embedding_service()
+            self._chunker = SemanticChunker(embedding_service=service)
+
+        return self._chunker
+
+    def _auto_embed_source(self, source_id: int, content: str, job_id: str) -> None:
+        """Auto-embed source content after registration. Silently skips on failure."""
+        if self._db_type == "sqlite":
+            return  # Vector search is PostgreSQL-only
+
+        service = self._get_embedding_service()
+        if not service:
+            return
+
+        try:
+            # Check if already embedded for this job
+            if self._db_type == "sqlite":
+                query = "SELECT COUNT(*) as cnt FROM source_embeddings WHERE source_id = ? AND job_id = ?"
+            else:
+                query = "SELECT COUNT(*) as cnt FROM source_embeddings WHERE source_id = %s AND job_id = %s"
+
+            results = self._query(query, (source_id, job_id))
+            if results and results[0].get("cnt", 0) > 0:
+                log.debug(f"Source [{source_id}] already embedded for job {job_id}")
+                return
+
+            self._embed_source_content(source_id, content, job_id, service)
+        except Exception as e:
+            log.warning(f"Auto-embed failed for source [{source_id}], skipping: {e}")
+
+    def _embed_source_content(
+        self,
+        source_id: int,
+        content: str,
+        job_id: str,
+        service=None,
+    ) -> int:
+        """
+        Chunk and embed source content, storing in source_embeddings.
+
+        Args:
+            source_id: Source ID
+            content: Text content to embed
+            job_id: Job ID
+            service: Optional EmbeddingService (uses default if None)
+
+        Returns:
+            Number of chunks embedded
+        """
+        if service is None:
+            service = self._get_embedding_service()
+            if not service:
+                raise RuntimeError("Embedding service not available")
+
+        chunker = self._get_chunker()
+        chunks = chunker.chunk(content)
+
+        if not chunks:
+            return 0
+
+        # Embed all chunks in one batch
+        embeddings = service.embed_batch(chunks)
+
+        # Insert into source_embeddings
+        for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+            embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+
+            if self._db_type == "sqlite":
+                # SQLite stub: no embedding column
+                query = """
+                    INSERT OR REPLACE INTO source_embeddings (source_id, job_id, chunk_index, chunk_text)
+                    VALUES (?, ?, ?, ?)
+                """
+                self._cursor.execute(query, (source_id, job_id, idx, chunk_text))
+            else:
+                query = """
+                    INSERT INTO source_embeddings (source_id, job_id, chunk_index, chunk_text, embedding)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (source_id, job_id, chunk_index)
+                    DO UPDATE SET chunk_text = EXCLUDED.chunk_text, embedding = EXCLUDED.embedding
+                """
+                self._cursor.execute(query, (source_id, job_id, idx, chunk_text, embedding_str))
+
+        self._conn.commit()
+        log.info(f"Embedded source [{source_id}]: {len(chunks)} chunks")
+        return len(chunks)
+
+    def reindex_source(self, source_id: int) -> int:
+        """
+        Force re-chunk and re-embed a source for the current job.
+
+        Deletes existing embeddings and re-creates them from source content.
+
+        Args:
+            source_id: The source to reindex
+
+        Returns:
+            Number of chunks embedded
+
+        Raises:
+            ValueError: If source not found
+            RuntimeError: If embedding service not available
+            NotImplementedError: If using SQLite mode
+        """
+        if self._db_type == "sqlite":
+            raise NotImplementedError("Vector search requires PostgreSQL mode")
+
+        service = self._get_embedding_service()
+        if not service:
+            raise RuntimeError(
+                "Embedding service not configured. "
+                "Set CITATION_EMBEDDING_KEY or CITATION_EMBEDDING_URL."
+            )
+
+        job_id = self.context.session_id if self.context else None
+        source = self.get_source(source_id, job_id=job_id)
+        if not source:
+            raise ValueError(f"Source [{source_id}] not found")
+
+        # Delete existing embeddings for this source+job
+        if self._db_type == "postgresql":
+            query = "DELETE FROM source_embeddings WHERE source_id = %s AND job_id = %s"
+        else:
+            query = "DELETE FROM source_embeddings WHERE source_id = ? AND job_id = ?"
+        self._cursor.execute(query, (source_id, job_id))
+        self._conn.commit()
+
+        return self._embed_source_content(source_id, source.content, job_id, service)
+
+    # =========================================================================
+    # SEARCH METHODS
+    # =========================================================================
+
+    def search_library(
+        self,
+        query: str,
+        mode: str = "hybrid",
+        tags: list[str] | None = None,
+        source_type: str | None = None,
+        scope: str = "content",
+        top_k: int = 10,
+    ) -> SearchResults:
+        """
+        Search the source library with keyword, semantic, or hybrid retrieval.
+
+        Args:
+            query: Natural language query or keywords
+            mode: Search mode — "hybrid", "keyword", or "semantic"
+            tags: Optional tag filter (AND logic)
+            source_type: Optional source type filter ("document", "website", etc.)
+            scope: What to search — "content", "annotations", or "all"
+            top_k: Maximum number of results
+
+        Returns:
+            SearchResults with labeled evidence
+
+        Raises:
+            ValueError: If query is empty or mode is invalid
+        """
+        from .search import (
+            keyword_search,
+            label_evidence,
+            overall_label,
+            rrf_merge,
+            semantic_search,
+        )
+
+        self._ensure_connected()
+
+        if not query or not query.strip():
+            raise ValueError("Search query cannot be empty")
+
+        if mode not in ("hybrid", "keyword", "semantic"):
+            raise ValueError(f"Invalid search mode '{mode}'. Use: hybrid, keyword, semantic")
+
+        if scope not in ("content", "annotations", "all"):
+            raise ValueError(f"Invalid scope '{scope}'. Use: content, annotations, all")
+
+        job_id = self.context.session_id if self.context else None
+
+        # Determine what search modes are available
+        can_semantic = (
+            self._db_type == "postgresql"
+            and self._get_embedding_service() is not None
+        )
+
+        effective_mode = mode
+        if mode == "semantic" and not can_semantic:
+            log.warning("Semantic search unavailable, falling back to keyword")
+            effective_mode = "keyword"
+        elif mode == "hybrid" and not can_semantic:
+            log.info("Semantic search unavailable, hybrid falling back to keyword-only")
+            effective_mode = "keyword"
+
+        # Fetch more than top_k for each method so RRF has enough to merge
+        fetch_k = top_k * 2
+
+        keyword_hits = []
+        semantic_hits = []
+
+        if effective_mode in ("keyword", "hybrid"):
+            keyword_hits = keyword_search(
+                cursor=self._cursor,
+                db_type=self._db_type,
+                query=query,
+                job_id=job_id,
+                top_k=fetch_k,
+                source_type=source_type,
+                tags=tags,
+                scope=scope,
+            )
+
+        if effective_mode in ("semantic", "hybrid"):
+            service = self._get_embedding_service()
+            if service:
+                try:
+                    query_embedding = service.embed(query)
+                    semantic_hits = semantic_search(
+                        cursor=self._cursor,
+                        db_type=self._db_type,
+                        query_embedding=query_embedding,
+                        job_id=job_id,
+                        top_k=fetch_k,
+                        source_type=source_type,
+                        tags=tags,
+                    )
+                except Exception as e:
+                    log.warning(f"Semantic search failed: {e}")
+
+        # Merge results
+        if effective_mode == "hybrid" and keyword_hits and semantic_hits:
+            merged = rrf_merge(keyword_hits, semantic_hits, top_k=top_k)
+        elif keyword_hits:
+            merged = keyword_hits[:top_k]
+        elif semantic_hits:
+            merged = semantic_hits[:top_k]
+        else:
+            merged = []
+
+        # Apply evidence labels
+        labeled = label_evidence(merged)
+        summary = overall_label(labeled)
+
+        return SearchResults(
+            query=query,
+            results=labeled,
+            overall_label=summary,
+            mode=effective_mode,
+        )
+
+    # =========================================================================
+    # ANNOTATION & TAG METHODS
+    # =========================================================================
+
+    def annotate_source(
+        self,
+        source_id: int,
+        content: str,
+        annotation_type: str = "note",
+        page_reference: str | None = None,
+    ) -> Annotation:
+        """
+        Add an annotation to a source.
+
+        Args:
+            source_id: The source to annotate
+            content: Annotation text
+            annotation_type: Type of annotation (note, highlight, summary, question, critique)
+            page_reference: Optional page/section reference
+
+        Returns:
+            The created Annotation object
+
+        Raises:
+            ValueError: If source not found or annotation_type invalid
+        """
+        self._ensure_connected()
+        job_id = self.context.session_id if self.context else None
+
+        # Validate annotation type
+        try:
+            ann_type = AnnotationType(annotation_type)
+        except ValueError:
+            valid = ", ".join(t.value for t in AnnotationType)
+            raise ValueError(f"Invalid annotation_type '{annotation_type}'. Valid: {valid}")
+
+        # Validate source exists and belongs to job
+        source = self.get_source(source_id, job_id=job_id)
+        if not source:
+            raise ValueError(f"Source [{source_id}] not found or not linked to current job")
+
+        created_by = None
+        if self.context:
+            created_by = self.context.agent_id or self.context.session_id
+
+        if self._db_type == "sqlite":
+            query = """
+                INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """
+            params = (source_id, job_id, ann_type.value, content, page_reference, created_by)
+        else:
+            query = """
+                INSERT INTO source_annotations (source_id, job_id, annotation_type, content, page_reference, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """
+            params = (source_id, job_id, ann_type.value, content, page_reference, created_by)
+
+        ann_id = self._insert(query, params)
+        log.info(f"Created {ann_type.value} annotation [{ann_id}] on source [{source_id}]")
+
+        return Annotation(
+            id=ann_id,
+            source_id=source_id,
+            job_id=job_id,
+            annotation_type=ann_type,
+            content=content,
+            page_reference=page_reference,
+            created_at=datetime.now(timezone.utc),
+            created_by=created_by,
+        )
+
+    def get_annotations(
+        self,
+        source_id: int,
+        annotation_type: str | None = None,
+    ) -> list[Annotation]:
+        """
+        Get annotations for a source in the current job.
+
+        Args:
+            source_id: The source to get annotations for
+            annotation_type: Optional type filter
+
+        Returns:
+            List of Annotation objects, newest first
+        """
+        self._ensure_connected()
+        job_id = self.context.session_id if self.context else None
+
+        conditions = ["source_id = ?"]
+        params: list = [source_id]
+
+        if job_id is not None:
+            conditions.append("job_id = ?")
+            params.append(job_id)
+
+        if annotation_type is not None:
+            conditions.append("annotation_type = ?")
+            params.append(annotation_type)
+
+        query = "SELECT * FROM source_annotations WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+
+        if self._db_type == "postgresql":
+            query = query.replace("?", "%s")
+
+        results = self._query(query, tuple(params))
+        return [self._row_to_annotation(row) for row in results]
+
+    def tag_source(self, source_id: int, tags: list[str]) -> list[str]:
+        """
+        Add tags to a source in the current job.
+
+        Args:
+            source_id: The source to tag
+            tags: List of tag strings to add
+
+        Returns:
+            Current list of all tags for this source+job
+        """
+        self._ensure_connected()
+        job_id = self.context.session_id if self.context else None
+
+        # Validate source exists and belongs to job
+        source = self.get_source(source_id, job_id=job_id)
+        if not source:
+            raise ValueError(f"Source [{source_id}] not found or not linked to current job")
+
+        for tag in tags:
+            tag = tag.strip()
+            if not tag:
+                continue
+            if self._db_type == "sqlite":
+                query = "INSERT OR IGNORE INTO source_tags (source_id, job_id, tag) VALUES (?, ?, ?)"
+            else:
+                query = "INSERT INTO source_tags (source_id, job_id, tag) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
+            self._cursor.execute(query, (source_id, job_id, tag))
+
+        self._conn.commit()
+        log.info(f"Tagged source [{source_id}] with {tags}")
+
+        return self.get_tags(source_id)
+
+    def remove_tags(self, source_id: int, tags: list[str]) -> list[str]:
+        """
+        Remove tags from a source in the current job.
+
+        Args:
+            source_id: The source to remove tags from
+            tags: List of tag strings to remove
+
+        Returns:
+            Remaining list of tags for this source+job
+        """
+        self._ensure_connected()
+        job_id = self.context.session_id if self.context else None
+
+        for tag in tags:
+            tag = tag.strip()
+            if not tag:
+                continue
+            if self._db_type == "sqlite":
+                query = "DELETE FROM source_tags WHERE source_id = ? AND job_id = ? AND tag = ?"
+            else:
+                query = "DELETE FROM source_tags WHERE source_id = %s AND job_id = %s AND tag = %s"
+            self._cursor.execute(query, (source_id, job_id, tag))
+
+        self._conn.commit()
+        log.info(f"Removed tags {tags} from source [{source_id}]")
+
+        return self.get_tags(source_id)
+
+    def get_tags(self, source_id: int) -> list[str]:
+        """
+        Get all tags for a source in the current job.
+
+        Args:
+            source_id: The source to get tags for
+
+        Returns:
+            List of tag strings, sorted alphabetically
+        """
+        self._ensure_connected()
+        job_id = self.context.session_id if self.context else None
+
+        if job_id is not None:
+            if self._db_type == "sqlite":
+                query = "SELECT tag FROM source_tags WHERE source_id = ? AND job_id = ? ORDER BY tag"
+            else:
+                query = "SELECT tag FROM source_tags WHERE source_id = %s AND job_id = %s ORDER BY tag"
+            results = self._query(query, (source_id, job_id))
+        else:
+            if self._db_type == "sqlite":
+                query = "SELECT tag FROM source_tags WHERE source_id = ? ORDER BY tag"
+            else:
+                query = "SELECT tag FROM source_tags WHERE source_id = %s ORDER BY tag"
+            results = self._query(query, (source_id,))
+
+        return [row["tag"] for row in results]
+
+    def _row_to_annotation(self, row: dict[str, Any]) -> Annotation:
+        """Convert a database row to an Annotation object."""
+        created_at = row.get("created_at")
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+
+        return Annotation(
+            id=row["id"],
+            source_id=row["source_id"],
+            job_id=str(row["job_id"]),
+            annotation_type=AnnotationType(row["annotation_type"]),
+            content=row["content"],
+            page_reference=row.get("page_reference"),
             created_at=created_at,
             created_by=row.get("created_by"),
         )

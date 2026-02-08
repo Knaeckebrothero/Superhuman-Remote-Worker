@@ -40,6 +40,8 @@ Version: 0.1.0
 
 from .engine import CitationEngine
 from .models import (
+    Annotation,
+    AnnotationType,
     Citation,
     CitationContext,
     CitationError,
@@ -48,11 +50,15 @@ from .models import (
     ExtractionMethod,
     Locator,
     Metadata,
+    SearchResult,
+    SearchResults,
     Source,
     SourceType,
     VerificationResult,
     VerificationStatus,
 )
+from .chunking import SemanticChunker
+from .embeddings import EmbeddingService, EmbeddingServiceError, EmbeddingServiceNotConfigured
 from .schema import (
     SCHEMA_VERSION,
     get_current_schema_version,
@@ -65,6 +71,7 @@ __all__ = [
     "CitationEngine",
     # Models
     "Source",
+    "Annotation",
     "Citation",
     "CitationResult",
     "VerificationResult",
@@ -72,12 +79,21 @@ __all__ = [
     "CitationError",
     # Enums
     "SourceType",
+    "AnnotationType",
     "VerificationStatus",
     "ExtractionMethod",
     "Confidence",
     # Type aliases
     "Locator",
     "Metadata",
+    # Search
+    "SearchResult",
+    "SearchResults",
+    # Embedding & chunking
+    "EmbeddingService",
+    "EmbeddingServiceError",
+    "EmbeddingServiceNotConfigured",
+    "SemanticChunker",
     # Schema utilities
     "get_schema",
     "get_current_schema_version",
