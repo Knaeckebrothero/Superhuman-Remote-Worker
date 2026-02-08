@@ -10,7 +10,7 @@ All search is scoped to a job via the job_sources join table.
 import logging
 from dataclasses import dataclass
 
-from .models import SearchResult, SearchResults
+from .models import SearchResult
 
 log = logging.getLogger(__name__)
 
@@ -541,6 +541,6 @@ def _rows_to_dicts(rows, cursor) -> list[dict]:
     # Try to get column names from cursor description
     if cursor.description:
         columns = [desc[0] for desc in cursor.description]
-        return [dict(zip(columns, row)) for row in rows]
+        return [dict(zip(columns, row, strict=False)) for row in rows]
 
     return []

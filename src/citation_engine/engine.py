@@ -2173,7 +2173,7 @@ Respond in JSON format."""
         embeddings = service.embed_batch(chunks)
 
         # Insert into source_embeddings
-        for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
+        for idx, (chunk_text, embedding) in enumerate(zip(chunks, embeddings, strict=False)):
             embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
 
             if self._db_type == "sqlite":
@@ -2391,9 +2391,9 @@ Respond in JSON format."""
         # Validate annotation type
         try:
             ann_type = AnnotationType(annotation_type)
-        except ValueError:
+        except ValueError as err:
             valid = ", ".join(t.value for t in AnnotationType)
-            raise ValueError(f"Invalid annotation_type '{annotation_type}'. Valid: {valid}")
+            raise ValueError(f"Invalid annotation_type '{annotation_type}'. Valid: {valid}") from err
 
         # Validate source exists and belongs to job
         source = self.get_source(source_id, job_id=job_id)
