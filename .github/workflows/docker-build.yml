@@ -59,7 +59,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Inspect pushed image
         if: success()
@@ -107,7 +107,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Inspect pushed image
         if: success()
@@ -155,7 +155,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Inspect pushed image
         if: success()
@@ -203,7 +203,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Inspect pushed image
         if: success()
@@ -251,7 +251,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to: type=gha,mode=min
 
       - name: Inspect pushed image
         if: success()

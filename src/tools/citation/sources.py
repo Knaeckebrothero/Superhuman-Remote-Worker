@@ -28,7 +28,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "Create verified citation for document content.",
-        "phases": ["tactical"],
+        "phases": ["strategic", "tactical"],
     },
     "cite_web": {
         "module": "citation.sources",
@@ -37,7 +37,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "Create verified citation for web content.",
-        "phases": ["tactical"],
+        "phases": ["strategic", "tactical"],
     },
     "list_sources": {
         "module": "citation.sources",
@@ -46,7 +46,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "List all registered citation sources.",
-        "phases": ["tactical"],
+        "phases": ["strategic", "tactical"],
     },
     "get_citation": {
         "module": "citation.sources",
@@ -55,7 +55,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "Get details about a specific citation by ID.",
-        "phases": ["tactical"],
+        "phases": ["strategic", "tactical"],
     },
     "list_citations": {
         "module": "citation.sources",
@@ -64,7 +64,7 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "List all citations with status and source info.",
-        "phases": ["tactical"],
+        "phases": ["strategic", "tactical"],
     },
     "edit_citation": {
         "module": "citation.sources",
@@ -73,7 +73,43 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "Edit citation fields (claim, quote, confidence, etc.).",
-        "phases": ["tactical"],
+        "phases": ["strategic", "tactical"],
+    },
+    "annotate_source": {
+        "module": "citation.sources",
+        "function": "annotate_source",
+        "description": "Add a note, highlight, summary, question, or critique to a source",
+        "category": "citation",
+        "defer_to_workspace": True,
+        "short_description": "Add annotation to a citation source.",
+        "phases": ["strategic", "tactical"],
+    },
+    "get_annotations": {
+        "module": "citation.sources",
+        "function": "get_annotations",
+        "description": "Get annotations for a source",
+        "category": "citation",
+        "defer_to_workspace": True,
+        "short_description": "Get annotations for a citation source.",
+        "phases": ["strategic", "tactical"],
+    },
+    "tag_source": {
+        "module": "citation.sources",
+        "function": "tag_source",
+        "description": "Add or remove tags on a citation source",
+        "category": "citation",
+        "defer_to_workspace": True,
+        "short_description": "Add or remove tags on a citation source.",
+        "phases": ["strategic", "tactical"],
+    },
+    "search_library": {
+        "module": "citation.sources",
+        "function": "search_library",
+        "description": "Search the source library using keyword, semantic, or hybrid search",
+        "category": "citation",
+        "defer_to_workspace": True,
+        "short_description": "Search source library with hybrid retrieval and evidence labels.",
+        "phases": ["strategic", "tactical"],
     },
 }
 
@@ -163,6 +199,9 @@ def create_source_tools(context: ToolContext) -> List[Any]:
         Registers the document as a source (if not already registered) and creates
         a citation linking your claim to the quoted text. The citation is verified
         against the source content using an LLM.
+
+        Tip: Use search_library first to find relevant evidence across all sources,
+        then cite the specific passage with this tool.
 
         Args:
             text: Quoted text from the document (the evidence)
@@ -261,6 +300,9 @@ Similarity Score: {similarity}
         Registers the URL as a source (fetching and archiving its content) and creates
         a citation linking your claim to the quoted text. The citation is verified
         against the archived content using an LLM.
+
+        Tip: Use search_library first to find relevant evidence across all sources,
+        then cite the specific passage with this tool.
 
         Args:
             text: Quoted/paraphrased text from the web (the evidence)
@@ -588,6 +630,225 @@ Similarity Score: {similarity}
             logger.error(f"Error editing citation: {e}")
             return f"error: {str(e)}"
 
+    @tool
+    def annotate_source(
+        source_id: int,
+        content: str,
+        type: Optional[str] = "note",
+        page: Optional[str] = None,
+    ) -> str:
+        """Add a note, highlight, summary, question, or critique to a source.
+
+        Build understanding of sources by annotating them with notes, highlights,
+        summaries, questions, or critiques. Annotations are per-job.
+
+        Args:
+            source_id: The numeric source ID
+            content: The annotation text
+            type: Annotation type: note, highlight, summary, question, critique (default: note)
+            page: Optional page/section reference (e.g., "p.12", "§ 3.1")
+
+        Returns:
+            Confirmation with annotation ID, or error message
+        """
+        try:
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+            except ImportError:
+                return "CitationEngine not installed."
+
+            engine = context.get_citation_engine()
+            annotation = engine.annotate_source(
+                source_id=source_id,
+                content=content,
+                annotation_type=type or "note",
+                page_reference=page,
+            )
+
+            return (
+                f"Annotation [{annotation.id}] created\n"
+                f"Type: {annotation.annotation_type.value}\n"
+                f"Source: [{source_id}]"
+                + (f"\nPage: {page}" if page else "")
+            )
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error creating annotation: {e}")
+            return f"Error creating annotation: {str(e)}"
+
+    @tool
+    def get_annotations(
+        source_id: int,
+        type: Optional[str] = None,
+    ) -> str:
+        """Get annotations for a source in the current job.
+
+        Retrieve all notes, highlights, summaries, questions, and critiques
+        attached to a source. Optionally filter by annotation type.
+
+        Args:
+            source_id: The numeric source ID
+            type: Optional filter: note, highlight, summary, question, critique
+
+        Returns:
+            Formatted list of annotations, or message if none found
+        """
+        try:
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+            except ImportError:
+                return "CitationEngine not installed."
+
+            engine = context.get_citation_engine()
+            annotations = engine.get_annotations(
+                source_id=source_id,
+                annotation_type=type,
+            )
+
+            if not annotations:
+                filter_msg = f" of type '{type}'" if type else ""
+                return f"No annotations{filter_msg} found for source [{source_id}]."
+
+            lines = [f"Annotations for source [{source_id}] ({len(annotations)} total):", ""]
+            for ann in annotations:
+                preview = ann.content[:200] + "..." if len(ann.content) > 200 else ann.content
+                page_str = f" (p.{ann.page_reference})" if ann.page_reference else ""
+                lines.append(f"  [{ann.id}] {ann.annotation_type.value}{page_str}: {preview}")
+
+            return "\n".join(lines)
+
+        except Exception as e:
+            logger.error(f"Error getting annotations: {e}")
+            return f"Error getting annotations: {str(e)}"
+
+    @tool
+    def tag_source(
+        source_id: int,
+        tags: str,
+        action: Optional[str] = "add",
+    ) -> str:
+        """Add or remove tags on a citation source.
+
+        Tags help organize sources for later retrieval. Tags are per-job.
+        Provide tags as a comma-separated string.
+
+        Args:
+            source_id: The numeric source ID
+            tags: Comma-separated tag strings (e.g., "compliance, GoBD, retention")
+            action: "add" (default) or "remove"
+
+        Returns:
+            Current list of tags for the source, or error message
+        """
+        try:
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+            except ImportError:
+                return "CitationEngine not installed."
+
+            engine = context.get_citation_engine()
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+            if not tag_list:
+                return "Error: no tags provided"
+
+            if action == "remove":
+                current_tags = engine.remove_tags(source_id=source_id, tags=tag_list)
+                verb = "Removed"
+            else:
+                current_tags = engine.tag_source(source_id=source_id, tags=tag_list)
+                verb = "Added"
+
+            return (
+                f"{verb} tags on source [{source_id}]\n"
+                f"Current tags: {', '.join(current_tags) if current_tags else '(none)'}"
+            )
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error tagging source: {e}")
+            return f"Error tagging source: {str(e)}"
+
+    @tool
+    def search_library(
+        query: str,
+        mode: Optional[str] = "hybrid",
+        tags: Optional[str] = None,
+        source_type: Optional[str] = None,
+        scope: Optional[str] = "content",
+        top_k: Optional[int] = 10,
+    ) -> str:
+        """Search the source library using keyword, semantic, or hybrid retrieval.
+
+        Find evidence across all registered sources. Returns results with
+        explainable evidence labels (HIGH/MEDIUM/LOW). Use this to find
+        supporting evidence before creating citations.
+
+        Args:
+            query: Natural language query or keywords to search for
+            mode: Search mode: "hybrid" (default, recommended), "keyword", or "semantic"
+            tags: Optional comma-separated tags to filter by (AND logic)
+            source_type: Optional filter: "document", "website", "database", "custom"
+            scope: What to search: "content" (default), "annotations", or "all"
+            top_k: Maximum results to return (default: 10)
+
+        Returns:
+            Formatted search results with evidence labels and source references
+        """
+        try:
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+            except ImportError:
+                return "CitationEngine not installed."
+
+            engine = context.get_citation_engine()
+
+            # Parse tags from comma-separated string
+            tag_list = None
+            if tags:
+                tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+
+            results = engine.search_library(
+                query=query,
+                mode=mode or "hybrid",
+                tags=tag_list,
+                source_type=source_type,
+                scope=scope or "content",
+                top_k=top_k or 10,
+            )
+
+            if not results.results:
+                return f"No results found for: {query}\nMode: {results.mode}"
+
+            lines = [
+                f"Search Results ({len(results.results)} found)",
+                f"Query: {query}",
+                f"Mode: {results.mode}",
+                f"Evidence: {results.overall_label}",
+                "",
+            ]
+
+            for i, r in enumerate(results.results, 1):
+                source_ref = f"[{r.source_id}] {r.source_name}"
+                page_str = f", {r.page_reference}" if r.page_reference else ""
+                preview = r.chunk_text[:300] + "..." if len(r.chunk_text) > 300 else r.chunk_text
+
+                lines.append(f"  {i}. {r.evidence_label} ({r.evidence_reason})")
+                lines.append(f"     Source: {source_ref}{page_str}")
+                lines.append(f'     "{preview}"')
+                lines.append("")
+
+            return "\n".join(lines)
+
+        except ValueError as e:
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Error searching library: {e}")
+            return f"Error searching library: {str(e)}"
+
     return [
         cite_document,
         cite_web,
@@ -595,4 +856,8 @@ Similarity Score: {similarity}
         get_citation,
         list_citations,
         edit_citation,
+        annotate_source,
+        get_annotations,
+        tag_source,
+        search_library,
     ]
