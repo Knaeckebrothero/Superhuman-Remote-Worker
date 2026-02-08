@@ -43,7 +43,8 @@ LABEL description="VPN sidecar providing SOCKS5 proxy via university FortiClient
 RUN echo "@testing https://dl-cdn.alpinelinux.org/alpine/edge/testing" >> /etc/apk/repositories \
     && apk add --no-cache \
     openfortivpn@testing \
-    ppp
+    ppp \
+    socat
 
 COPY --from=builder /build/microsocks/microsocks /usr/local/bin/microsocks
 COPY entrypoint.sh /entrypoint.sh

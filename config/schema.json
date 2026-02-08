@@ -97,31 +97,6 @@
           "default": false,
           "description": "Whether the primary model can process images directly. When true, visual content (document screenshots, images) is sent as base64-encoded images. When false, visual content is converted to text descriptions via a separate vision model."
         },
-        "proxy": {
-          "type": "object",
-          "description": "Proxy for LLM API requests (e.g., route through VPN to compute cluster). Can also be set via LLM_PROXY_* environment variables.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "default": false,
-              "description": "Enable proxy for LLM API requests"
-            },
-            "type": {
-              "type": "string",
-              "enum": ["none", "http", "socks5"],
-              "default": "socks5",
-              "description": "Proxy type"
-            },
-            "host": {
-              "type": ["string", "null"],
-              "description": "Proxy host"
-            },
-            "port": {
-              "type": ["integer", "null"],
-              "description": "Proxy port"
-            }
-          }
-        },
         "strategic": {
           "$ref": "#/$defs/llmPhaseOverride",
           "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."

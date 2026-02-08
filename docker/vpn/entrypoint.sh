@@ -13,6 +13,23 @@ set -e
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 VPN_CONFIG="${VPN_CONFIG:-/etc/openfortivpn/config}"
 
+# ── Generate config from env vars if no config file mounted ────────────────
+if [ ! -f "$VPN_CONFIG" ] && [ -n "$VPN_HOST" ]; then
+    echo "[vpn] No config file found, generating from environment variables..."
+    mkdir -p "$(dirname "$VPN_CONFIG")"
+    cat > "$VPN_CONFIG" <<VPNEOF
+host = ${VPN_HOST}
+port = ${VPN_PORT:-443}
+username = ${VPN_USER}
+password = ${VPN_PASS}
+VPNEOF
+    if [ -n "$VPN_TRUSTED_CERT" ]; then
+        echo "trusted-cert = ${VPN_TRUSTED_CERT}" >> "$VPN_CONFIG"
+    fi
+    chmod 600 "$VPN_CONFIG"
+    echo "[vpn] Config generated for ${VPN_HOST}:${VPN_PORT:-443}"
+fi
+
 # ── /dev/ppp setup (required by pppd) ──────────────────────────────────────
 # In production, /dev/ppp is passed via --device=/dev/ppp. The mknod fallback
 # handles cases where the device isn't mapped but the container has NET_ADMIN.
@@ -26,10 +43,12 @@ fi
 # ── Graceful shutdown ──────────────────────────────────────────────────────
 MICROSOCKS_PID=""
 VPN_PID=""
+FORWARD_PID=""
 
 cleanup() {
     echo "[vpn] Shutting down..."
     [ -n "$VPN_PID" ] && kill "$VPN_PID" 2>/dev/null
+    [ -n "$FORWARD_PID" ] && kill "$FORWARD_PID" 2>/dev/null
     [ -n "$MICROSOCKS_PID" ] && kill "$MICROSOCKS_PID" 2>/dev/null
     wait
     echo "[vpn] Stopped."
@@ -50,6 +69,14 @@ if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
     exit 1
 fi
 echo "[vpn] microsocks running (PID ${MICROSOCKS_PID})"
+
+# ── Start TCP forward (if configured) ────────────────────────────────────
+if [ -n "$FORWARD_PORT" ] && [ -n "$FORWARD_TARGET" ]; then
+    echo "[vpn] Starting TCP forward: port ${FORWARD_PORT} -> ${FORWARD_TARGET}"
+    socat TCP-LISTEN:${FORWARD_PORT},fork,reuseaddr TCP:${FORWARD_TARGET} &
+    FORWARD_PID=$!
+    echo "[vpn] TCP forward running (PID ${FORWARD_PID})"
+fi
 
 # ── VPN reconnection loop ─────────────────────────────────────────────────
 BACKOFF=5
