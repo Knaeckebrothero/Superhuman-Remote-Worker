@@ -1,0 +1,8 @@
+# Research VPN (for paywalled paper access)
+# Copy to research.conf and fill in credentials:
+#   cp research.conf.example research.conf
+host = vpn.your-university.de
+port = 443
+username = your_username
+password = your_password
+# trusted-cert = <hash>

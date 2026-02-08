@@ -122,11 +122,14 @@ class ReasoningCapturingClient(httpx.Client):
         timeout: Optional[float] = None,
         max_context_tokens: Optional[int] = None,
         model: str = "gpt-4",
+        proxy_url: Optional[str] = None,
         **kwargs,
     ):
         # Apply timeout if specified
         if timeout is not None:
             kwargs["timeout"] = httpx.Timeout(timeout)
+        if proxy_url:
+            kwargs["proxy"] = proxy_url
         super().__init__(*args, **kwargs)
 
         self._last_reasoning_content: Optional[str] = None
@@ -225,7 +228,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
     # Use PrivateAttr for Pydantic compatibility
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
 
-    def __init__(self, max_context_tokens: Optional[int] = None, **kwargs):
+    def __init__(self, max_context_tokens: Optional[int] = None, proxy_url: Optional[str] = None, **kwargs):
         # Extract config for our custom client
         timeout = kwargs.get("timeout")
         model = kwargs.get("model", "gpt-4")
@@ -235,6 +238,7 @@ class ReasoningChatOpenAI(ChatOpenAI):
             timeout=timeout,
             max_context_tokens=max_context_tokens,
             model=model,
+            proxy_url=proxy_url,
         )
         kwargs["http_client"] = reasoning_client
         super().__init__(**kwargs)

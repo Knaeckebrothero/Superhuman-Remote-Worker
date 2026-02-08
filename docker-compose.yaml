@@ -25,7 +25,7 @@
 
 services:
   postgres:
-    image: docker.io/library/postgres:15-alpine
+    image: docker.io/pgvector/pgvector:pg15
     container_name: graphrag-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-graphrag}
@@ -109,24 +109,6 @@ services:
       retries: 5
     restart: unless-stopped
 
-  vpn-sidecar:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-vpn:${IMAGE_TAG:-latest}
-    container_name: graphrag-vpn
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/ppp:/dev/ppp
-    volumes:
-      - ./docker/vpn/config:/etc/openfortivpn/config:ro,Z
-    environment:
-      SOCKS_PORT: 1080
-    healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
   agent:
     image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-agent:${IMAGE_TAG:-latest}
     environment:
@@ -147,10 +129,6 @@ services:
       VISION_API_KEY: ${VISION_API_KEY:-}
       VISION_BASE_URL: ${VISION_BASE_URL:-}
       VISION_MODEL: ${VISION_MODEL:-}
-      # Research proxy (routes through VPN sidecar)
-      RESEARCH_PROXY_TYPE: socks5
-      RESEARCH_PROXY_HOST: vpn-sidecar
-      RESEARCH_PROXY_PORT: "1080"
     volumes:
       - workspace_data:/workspace:Z
     deploy:
@@ -160,8 +138,6 @@ services:
         condition: service_healthy
       orchestrator:
         condition: service_healthy
-      vpn-sidecar:
-        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
