@@ -1,0 +1,69 @@
+# =============================================================================
+# Graph-RAG - VPN Overlay
+# =============================================================================
+#
+# Adds VPN sidecars for university network access:
+#   - vpn-cluster: Routes LLM API traffic to the compute cluster
+#   - vpn-research: Routes research traffic for paywalled paper access
+#
+# Usage:
+#   podman-compose -f docker-compose.yaml -f docker-compose.vpn.yaml up -d
+#
+# Prerequisites:
+#   - docker/vpn/cluster.conf (copy from cluster.conf.example)
+#   - docker/vpn/research.conf (copy from research.conf.example)
+#
+# =============================================================================
+
+services:
+  vpn-cluster:
+    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-vpn:${IMAGE_TAG:-latest}
+    container_name: graphrag-vpn-cluster
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./docker/vpn/cluster.conf:/etc/openfortivpn/config:ro,Z
+    environment:
+      SOCKS_PORT: 1080
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  vpn-research:
+    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-vpn:${IMAGE_TAG:-latest}
+    container_name: graphrag-vpn-research
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./docker/vpn/research.conf:/etc/openfortivpn/config:ro,Z
+    environment:
+      SOCKS_PORT: 1080
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  agent:
+    environment:
+      # LLM API traffic -> cluster VPN
+      LLM_PROXY_TYPE: socks5
+      LLM_PROXY_HOST: vpn-cluster
+      LLM_PROXY_PORT: "1080"
+      # Research traffic -> research VPN
+      RESEARCH_PROXY_TYPE: socks5
+      RESEARCH_PROXY_HOST: vpn-research
+      RESEARCH_PROXY_PORT: "1080"
+    depends_on:
+      vpn-cluster:
+        condition: service_started
+      vpn-research:
+        condition: service_started

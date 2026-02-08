@@ -1,0 +1,8 @@
+# Compute cluster VPN (for LLM API access)
+# Copy to cluster.conf and fill in credentials:
+#   cp cluster.conf.example cluster.conf
+host = vpn.your-university-cluster.de
+port = 443
+username = your_username
+password = your_password
+# trusted-cert = <hash>

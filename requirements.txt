@@ -45,7 +45,7 @@ langchain-postgres>=0.0.6
 langdetect>=1.0.9
 fastapi>=0.109.0
 uvicorn>=0.27.0
-httpx>=0.26.0
+httpx[socks]>=0.26.0
 python-multipart>=0.0.6
 # Optional: MongoDB for LLM request archiving
 pymongo>=4.6.0

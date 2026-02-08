@@ -11,6 +11,21 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff lint
+        run: ruff check --fix src/ orchestrator/ tests/
+      - name: Ruff format
+        run: ruff format src/ orchestrator/ tests/
+
   build-agent:
     runs-on: ubuntu-latest
     timeout-minutes: 30

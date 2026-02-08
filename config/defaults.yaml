@@ -13,6 +13,13 @@ llm:
   timeout: 600
   max_retries: 3
   multimodal: false  # Set to true if model can process images directly
+  # Proxy for LLM API requests (e.g., route through VPN to university cluster)
+  # Override via LLM_PROXY_* env vars in Docker/K8s deployments
+  proxy:
+    enabled: false
+    type: socks5  # "http", "socks5", or "none"
+    host: null
+    port: null
 
 workspace:
   structure:
