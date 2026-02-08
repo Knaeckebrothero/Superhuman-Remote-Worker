@@ -1,0 +1,56 @@
+# Podman Compose file for Citation Engine development
+# ====================================================
+#
+# Usage:
+#   Start:    podman-compose up -d
+#   Stop:     podman-compose down
+#   Logs:     podman-compose logs -f postgres
+#   Reset:    podman-compose down -v && podman-compose up -d
+#
+# The database will be available at localhost:5432 with the credentials
+# defined in .env (or the defaults below).
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    container_name: citation-engine-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-citations}
+      POSTGRES_USER: ${POSTGRES_USER:-citation_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-citation_pass}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - citation_postgres_data:/var/lib/postgresql/data
+      # Optional: mount init scripts
+      # - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-citation_user} -d ${POSTGRES_DB:-citations}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:latest
+    container_name: citation-engine-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@local.dev
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - citation_pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - admin  # Only start with: podman-compose --profile admin up -d
+
+volumes:
+  citation_postgres_data:
+  citation_pgadmin_data:
