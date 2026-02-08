@@ -37,18 +37,10 @@ except ImportError:
 
 def pytest_configure(config):
     """Register custom markers."""
-    config.addinivalue_line(
-        "markers", "postgres: mark test as requiring PostgreSQL database"
-    )
-    config.addinivalue_line(
-        "markers", "llm: mark test as requiring LLM endpoint"
-    )
-    config.addinivalue_line(
-        "markers", "web: mark test as requiring network access"
-    )
-    config.addinivalue_line(
-        "markers", "integration: mark test as integration test"
-    )
+    config.addinivalue_line("markers", "postgres: mark test as requiring PostgreSQL database")
+    config.addinivalue_line("markers", "llm: mark test as requiring LLM endpoint")
+    config.addinivalue_line("markers", "web: mark test as requiring network access")
+    config.addinivalue_line("markers", "integration: mark test as integration test")
 
 
 # =============================================================================
