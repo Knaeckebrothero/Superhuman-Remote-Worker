@@ -20,6 +20,11 @@ The Citation Engine is a Python library that provides AI agents with a structure
 - Synchronous LLM-based verification
 - Support for documents (PDF, markdown, txt), websites, databases, and custom artifacts
 - Two operation modes: Basic (SQLite) and Multi-Agent (PostgreSQL)
+- **Shared source library** with cross-job deduplication via content hash
+- **Annotations** (notes, highlights, summaries, questions, critiques) on sources
+- **Tags** for organizing sources per job
+- **Hybrid search** (vector + full-text + RRF fusion) with explainable evidence labels
+- **Semantic chunking** and auto-embedding on source registration (PostgreSQL + pgvector)
 - LangGraph/LangChain tool integration
 - Multiple citation export formats (Harvard, IEEE, BibTeX, APA)
 
@@ -64,6 +69,7 @@ pip install -e ".[pdf]"        # PDF extraction with PyMuPDF
 pip install -e ".[web]"        # Web page fetching
 pip install -e ".[langchain]"  # LangChain/LangGraph integration
 pip install -e ".[postgresql]" # PostgreSQL for multi-agent mode
+pip install -e ".[vector]"     # Vector search (pgvector + httpx for embeddings)
 
 # Development installation
 pip install -e ".[dev]"
@@ -145,6 +151,62 @@ with CitationTool(mode="basic", db_path="./citations.db") as tool:
 
     print(f"Citation: {result}")  # [1]
 ```
+
+## Literature Management
+
+### Annotations
+
+Attach notes, highlights, summaries, questions, or critiques to sources:
+
+```python
+# Add a note to a source
+annotation = engine.annotate_source(
+    source_id=source.id,
+    content="Key finding: 10-year retention required",
+    annotation_type="highlight",
+    page_reference="p.42"
+)
+
+# Retrieve annotations
+notes = engine.get_annotations(source_id=source.id, annotation_type="highlight")
+```
+
+### Tags
+
+Organize sources with per-job tags:
+
+```python
+engine.tag_source(source_id=source.id, tags=["compliance", "GoBD", "retention"])
+current_tags = engine.get_tags(source_id=source.id)
+engine.remove_tags(source_id=source.id, tags=["retention"])
+```
+
+### Hybrid Search
+
+Search across all sources with keyword, semantic, or hybrid retrieval:
+
+```python
+results = engine.search_library(
+    query="retention period for tax documents",
+    mode="hybrid",        # "hybrid", "keyword", or "semantic"
+    tags=["compliance"],   # Optional: filter by tags
+    scope="content",       # "content", "annotations", or "all"
+    top_k=10,
+)
+
+print(results.overall_label)  # "HIGH — 3 sources support this, strongest from GoBD-Handbuch.pdf"
+for r in results.results:
+    print(f"  [{r.source_id}] {r.evidence_label} ({r.evidence_reason}): {r.chunk_text[:100]}")
+```
+
+Hybrid search combines:
+- **Dense retrieval** (pgvector cosine similarity) for semantic matching
+- **Sparse retrieval** (PostgreSQL tsvector) for keyword precision
+- **Reciprocal Rank Fusion (RRF)** to merge both ranked lists
+
+Results are labeled with explainable evidence levels (HIGH/MEDIUM/LOW).
+
+> **Note:** Vector search requires PostgreSQL with pgvector (`[vector]` extra). On SQLite, search falls back to keyword-only mode automatically.
 
 ## Operation Modes
 
@@ -289,6 +351,9 @@ bibliography = engine.export_bibliography(
 | `CITATION_LLM_MODEL` | LLM model for verification | `gpt-4o-mini` |
 | `OPENAI_API_KEY` | OpenAI API key | - |
 | `CITATION_REASONING_REQUIRED` | When reasoning is required | `low` |
+| `CITATION_EMBEDDING_MODEL` | Embedding model name | `text-embedding-3-small` |
+| `CITATION_EMBEDDING_URL` | Embedding API base URL (OpenAI-compatible) | `https://api.openai.com/v1` |
+| `CITATION_EMBEDDING_KEY` | Embedding API key (falls back to `OPENAI_API_KEY`) | - |
 
 ## Development
 
@@ -418,18 +483,23 @@ podman-compose down -v
 ### Project Structure
 
 ```
-citation_tool/
+CitationEngine/
 ├── src/
 │   └── citation_engine/
 │       ├── __init__.py      # Package exports
-│       ├── engine.py        # CitationEngine class
-│       ├── models.py        # Data models (Source, Citation, etc.)
-│       ├── schema.py        # Database schemas (SQLite, PostgreSQL)
+│       ├── engine.py        # CitationEngine class (sources, citations, annotations, tags, search)
+│       ├── models.py        # Data models (Source, Citation, Annotation, SearchResult, etc.)
+│       ├── schema.py        # Database schemas + migrations (SQLite, PostgreSQL)
+│       ├── embeddings.py    # EmbeddingService (OpenAI-compatible API client)
+│       ├── chunking.py      # SemanticChunker (sliding window similarity)
+│       ├── search.py        # Unified search: keyword, semantic, hybrid RRF, evidence labels
 │       └── tool.py          # LangChain tool wrappers
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py          # Pytest fixtures and configuration
-│   ├── test_engine.py       # Unit tests
+│   ├── test_engine.py       # Core engine unit tests
+│   ├── test_embeddings.py   # Embedding service, chunker, auto-embed tests
+│   ├── test_search.py       # Search, RRF merge, evidence labeling tests
 │   ├── test_integration_postgres.py  # PostgreSQL tests
 │   ├── test_integration_llm.py       # LLM verification tests
 │   └── test_integration_web.py       # Web source tests

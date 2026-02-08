@@ -12,7 +12,7 @@ import logging
 log = logging.getLogger(__name__)
 
 # Current schema version
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 
 # =============================================================================
@@ -218,8 +218,186 @@ SELECT COALESCE(MAX(version), 0) as version FROM schema_migrations;
 
 MIGRATIONS: list[tuple[int, str, str, str]] = [
     # Version 1 is the initial schema, handled above
-    # Add future migrations here as tuples:
-    # (2, "Description", "SQLITE SQL...", "POSTGRESQL SQL..."),
+    (
+        2,
+        "Shared source library with annotations and tags",
+        # ---- SQLite migration v2 ----
+        """
+        -- 1. Create job_sources join table
+        CREATE TABLE IF NOT EXISTS job_sources (
+            job_id TEXT NOT NULL,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            added_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (job_id, source_id)
+        );
+
+        -- 2. Populate job_sources from existing sources.job_id
+        INSERT OR IGNORE INTO job_sources (job_id, source_id)
+        SELECT job_id, id FROM sources WHERE job_id IS NOT NULL;
+
+        -- 3. Recreate sources without job_id (SQLite lacks DROP COLUMN before 3.35)
+        CREATE TABLE IF NOT EXISTS sources_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL CHECK(type IN ('document', 'website', 'database', 'custom')),
+            identifier TEXT NOT NULL,
+            name TEXT NOT NULL,
+            version TEXT,
+            content TEXT NOT NULL,
+            content_hash TEXT UNIQUE,
+            metadata TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        INSERT OR IGNORE INTO sources_new (id, type, identifier, name, version, content, content_hash, metadata, created_at)
+        SELECT id, type, identifier, name, version, content, content_hash, metadata, created_at FROM sources;
+
+        DROP TABLE IF EXISTS sources;
+        ALTER TABLE sources_new RENAME TO sources;
+
+        -- Recreate indexes on new sources table
+        CREATE INDEX IF NOT EXISTS idx_sources_identifier ON sources(identifier);
+        CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
+        CREATE INDEX IF NOT EXISTS idx_sources_name ON sources(name);
+        CREATE INDEX IF NOT EXISTS idx_sources_content_hash ON sources(content_hash);
+
+        -- 4. Source annotations table
+        CREATE TABLE IF NOT EXISTS source_annotations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL,
+            annotation_type TEXT NOT NULL DEFAULT 'note',
+            content TEXT NOT NULL,
+            page_reference TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_by TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_annotations_source ON source_annotations(source_id);
+        CREATE INDEX IF NOT EXISTS idx_annotations_job ON source_annotations(job_id);
+        CREATE INDEX IF NOT EXISTS idx_annotations_type ON source_annotations(annotation_type);
+
+        -- 5. Source tags table
+        CREATE TABLE IF NOT EXISTS source_tags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_id, job_id, tag)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tags_tag ON source_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_tags_job ON source_tags(job_id);
+        """,
+        # ---- PostgreSQL migration v2 ----
+        """
+        -- 1. Create job_sources join table
+        CREATE TABLE IF NOT EXISTS job_sources (
+            job_id UUID NOT NULL,
+            source_id INTEGER NOT NULL REFERENCES sources(id),
+            added_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (job_id, source_id)
+        );
+
+        -- 2. Populate job_sources from existing sources.job_id
+        INSERT INTO job_sources (job_id, source_id)
+        SELECT job_id, id FROM sources WHERE job_id IS NOT NULL
+        ON CONFLICT DO NOTHING;
+
+        -- 3. Drop job_id column and add content_hash uniqueness
+        ALTER TABLE sources DROP COLUMN IF EXISTS job_id;
+
+        -- Add unique constraint on content_hash (skip if already unique)
+        DO $$ BEGIN
+            ALTER TABLE sources ADD CONSTRAINT uq_sources_content_hash UNIQUE (content_hash);
+        EXCEPTION
+            WHEN duplicate_table THEN NULL;
+            WHEN duplicate_object THEN NULL;
+        END $$;
+
+        CREATE INDEX IF NOT EXISTS idx_sources_content_hash ON sources(content_hash);
+
+        -- 4. Source annotations table
+        CREATE TABLE IF NOT EXISTS source_annotations (
+            id SERIAL PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            job_id UUID NOT NULL,
+            annotation_type TEXT NOT NULL DEFAULT 'note',
+            content TEXT NOT NULL,
+            page_reference TEXT,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            created_by TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_annotations_source ON source_annotations(source_id);
+        CREATE INDEX IF NOT EXISTS idx_annotations_job ON source_annotations(job_id);
+        CREATE INDEX IF NOT EXISTS idx_annotations_type ON source_annotations(annotation_type);
+
+        -- 5. Source tags table
+        CREATE TABLE IF NOT EXISTS source_tags (
+            id SERIAL PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            job_id UUID NOT NULL,
+            tag TEXT NOT NULL,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            UNIQUE(source_id, job_id, tag)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tags_tag ON source_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_tags_job ON source_tags(job_id);
+
+        -- 6. Full-text search indexes (language-agnostic)
+        CREATE INDEX IF NOT EXISTS idx_sources_content_fts ON sources
+            USING GIN (to_tsvector('simple', content));
+        CREATE INDEX IF NOT EXISTS idx_annotations_content_fts ON source_annotations
+            USING GIN (to_tsvector('simple', content));
+        """,
+    ),
+    (
+        3,
+        "Vector search with source embeddings",
+        # ---- SQLite migration v3 ----
+        # SQLite doesn't support pgvector. Create a stub table for schema
+        # compatibility (no vector column, no HNSW index).
+        """
+        CREATE TABLE IF NOT EXISTS source_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            job_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            chunk_text TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_id, job_id, chunk_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_embeddings_source ON source_embeddings(source_id);
+        CREATE INDEX IF NOT EXISTS idx_source_embeddings_job ON source_embeddings(job_id);
+        """,
+        # ---- PostgreSQL migration v3 ----
+        """
+        -- Enable pgvector extension
+        CREATE EXTENSION IF NOT EXISTS vector;
+
+        -- Source content embeddings (chunked, with vector column)
+        CREATE TABLE IF NOT EXISTS source_embeddings (
+            id SERIAL PRIMARY KEY,
+            source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+            job_id UUID NOT NULL,
+            chunk_index INTEGER NOT NULL DEFAULT 0,
+            chunk_text TEXT NOT NULL,
+            embedding vector,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            UNIQUE(source_id, job_id, chunk_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_embeddings_source ON source_embeddings(source_id);
+        CREATE INDEX IF NOT EXISTS idx_source_embeddings_job ON source_embeddings(job_id);
+
+        -- HNSW index for cosine similarity search
+        CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector ON source_embeddings
+            USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+        """,
+    ),
 ]
 
 

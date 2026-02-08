@@ -191,10 +191,10 @@ class TestSourceRegistration:
 
     def test_list_sources(self, engine, sample_text_file):
         """Test listing all registered sources."""
-        # Add multiple sources
+        # Add multiple sources (each with unique content to avoid dedup)
         engine.add_doc_source(sample_text_file, name="Doc 1")
-        engine.add_custom_source(name="Custom 1", content="test")
-        engine.add_db_source(identifier="db1", name="DB 1", content="test")
+        engine.add_custom_source(name="Custom 1", content="custom test content")
+        engine.add_db_source(identifier="db1", name="DB 1", content="database test content")
 
         sources = engine.list_sources()
         assert len(sources) == 3

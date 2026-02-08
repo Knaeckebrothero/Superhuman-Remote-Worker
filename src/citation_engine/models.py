@@ -48,6 +48,16 @@ class Confidence(str, Enum):
     LOW = "low"
 
 
+class AnnotationType(str, Enum):
+    """Types of annotations on sources."""
+
+    NOTE = "note"
+    HIGHLIGHT = "highlight"
+    SUMMARY = "summary"
+    QUESTION = "question"
+    CRITIQUE = "critique"
+
+
 @dataclass
 class Source:
     """
@@ -90,6 +100,48 @@ class Source:
             "content_hash": self.content_hash,
             "metadata": self.metadata,
             "created_at": self.created_at.isoformat(),
+        }
+
+
+@dataclass
+class Annotation:
+    """
+    A note, highlight, summary, question, or critique attached to a source.
+
+    Annotations are per-job: the same source can have different annotations
+    in different jobs.
+
+    Attributes:
+        id: Auto-incrementing primary key
+        source_id: Reference to the source
+        job_id: The job this annotation belongs to
+        annotation_type: Type of annotation
+        content: The annotation text
+        page_reference: Optional page/section reference
+        created_at: When the annotation was created
+        created_by: Agent/session identifier
+    """
+
+    id: int
+    source_id: int
+    job_id: str
+    annotation_type: AnnotationType
+    content: str
+    created_at: datetime
+    page_reference: str | None = None
+    created_by: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert annotation to dictionary for JSON serialization."""
+        return {
+            "id": self.id,
+            "source_id": self.source_id,
+            "job_id": self.job_id,
+            "annotation_type": self.annotation_type.value,
+            "content": self.content,
+            "page_reference": self.page_reference,
+            "created_at": self.created_at.isoformat(),
+            "created_by": self.created_by,
         }
 
 
@@ -290,6 +342,73 @@ class CitationError:
             "message": self.message,
             "suggestion": self.suggestion,
             "partial_result": self.partial_result,
+        }
+
+
+@dataclass
+class SearchResult:
+    """
+    A single search result from the library search.
+
+    Attributes:
+        source_id: ID of the matching source
+        source_name: Human-readable source name
+        source_type: Source type (document, website, etc.)
+        chunk_text: The matching text chunk
+        page_reference: Optional page/section reference
+        evidence_label: Explainable label: HIGH, MEDIUM, or LOW
+        evidence_reason: Why this label was assigned
+        score: Internal RRF/ranking score (for ordering)
+    """
+
+    source_id: int
+    source_name: str
+    source_type: str
+    chunk_text: str
+    evidence_label: str
+    evidence_reason: str
+    score: float
+    page_reference: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "source_id": self.source_id,
+            "source_name": self.source_name,
+            "source_type": self.source_type,
+            "chunk_text": self.chunk_text[:500] + "..." if len(self.chunk_text) > 500 else self.chunk_text,
+            "page_reference": self.page_reference,
+            "evidence_label": self.evidence_label,
+            "evidence_reason": self.evidence_reason,
+            "score": self.score,
+        }
+
+
+@dataclass
+class SearchResults:
+    """
+    Container for library search results with aggregate evidence label.
+
+    Attributes:
+        query: The original search query
+        results: List of individual search results
+        overall_label: Aggregate evidence summary
+        mode: Search mode used (hybrid, keyword, semantic)
+    """
+
+    query: str
+    results: list[SearchResult]
+    overall_label: str
+    mode: str
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "query": self.query,
+            "results": [r.to_dict() for r in self.results],
+            "overall_label": self.overall_label,
+            "mode": self.mode,
+            "count": len(self.results),
         }
 
 

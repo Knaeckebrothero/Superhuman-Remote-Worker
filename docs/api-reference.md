@@ -9,16 +9,25 @@ Complete reference for all public classes, methods, and types in the Citation En
   - [Source Registration Methods](#source-registration-methods)
   - [Citation Methods](#citation-methods)
   - [Query Methods](#query-methods)
+  - [Annotation & Tag Methods](#annotation--tag-methods)
+  - [Search Methods](#search-methods)
   - [Formatting Methods](#formatting-methods)
 - [Data Models](#data-models)
   - [Source](#source)
   - [Citation](#citation)
   - [CitationResult](#citationresult)
   - [VerificationResult](#verificationresult)
+  - [Annotation](#annotation)
+  - [SearchResult](#searchresult)
+  - [SearchResults](#searchresults)
 - [Enums](#enums)
   - [SourceType](#sourcetype)
   - [VerificationStatus](#verificationstatus)
   - [ExtractionMethod](#extractionmethod)
+  - [AnnotationType](#annotationtype)
+- [Support Classes](#support-classes)
+  - [EmbeddingService](#embeddingservice)
+  - [SemanticChunker](#semanticchunker)
 - [LangChain Tools](#langchain-tools)
 - [Exceptions](#exceptions)
 
@@ -506,6 +515,139 @@ get_citation(citation_id: str) -> Citation | None
 
 ---
 
+### Annotation & Tag Methods
+
+#### annotate_source
+
+Add an annotation to a source.
+
+```python
+annotate_source(
+    source_id: int,
+    content: str,
+    annotation_type: str = "note",
+    page_reference: str | None = None
+) -> Annotation
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `source_id` | `int` | *required* | ID of the source to annotate |
+| `content` | `str` | *required* | Annotation text |
+| `annotation_type` | `str` | `"note"` | Type: `note`, `highlight`, `summary`, `question`, `critique` |
+| `page_reference` | `str \| None` | `None` | Optional page/section reference |
+
+**Returns:** [`Annotation`](#annotation)
+
+**Raises:** `ValueError` if source not found or annotation_type invalid
+
+---
+
+#### get_annotations
+
+Retrieve annotations for a source in the current job.
+
+```python
+get_annotations(
+    source_id: int,
+    annotation_type: str | None = None
+) -> list[Annotation]
+```
+
+**Returns:** List of [`Annotation`](#annotation), newest first
+
+---
+
+#### tag_source
+
+Add tags to a source.
+
+```python
+tag_source(source_id: int, tags: list[str]) -> list[str]
+```
+
+**Returns:** Current list of all tags for this source+job
+
+---
+
+#### remove_tags
+
+Remove tags from a source.
+
+```python
+remove_tags(source_id: int, tags: list[str]) -> list[str]
+```
+
+**Returns:** Remaining list of tags
+
+---
+
+#### get_tags
+
+Get all tags for a source in the current job.
+
+```python
+get_tags(source_id: int) -> list[str]
+```
+
+**Returns:** List of tag strings, sorted alphabetically
+
+---
+
+### Search Methods
+
+#### search_library
+
+Search the source library with keyword, semantic, or hybrid retrieval.
+
+```python
+search_library(
+    query: str,
+    mode: str = "hybrid",
+    tags: list[str] | None = None,
+    source_type: str | None = None,
+    scope: str = "content",
+    top_k: int = 10
+) -> SearchResults
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | `str` | *required* | Natural language query or keywords |
+| `mode` | `str` | `"hybrid"` | Search mode: `"hybrid"`, `"keyword"`, or `"semantic"` |
+| `tags` | `list[str] \| None` | `None` | Filter by tags (AND logic) |
+| `source_type` | `str \| None` | `None` | Filter: `"document"`, `"website"`, `"database"`, `"custom"` |
+| `scope` | `str` | `"content"` | What to search: `"content"`, `"annotations"`, `"all"` |
+| `top_k` | `int` | `10` | Maximum number of results |
+
+**Returns:** [`SearchResults`](#searchresults)
+
+**Raises:** `ValueError` if query empty or mode/scope invalid
+
+**Fallback behavior:**
+- SQLite mode: always uses keyword search (no vector support)
+- No embedding service configured: hybrid/semantic fall back to keyword
+
+---
+
+#### reindex_source
+
+Force re-chunk and re-embed a source (PostgreSQL only).
+
+```python
+reindex_source(source_id: int) -> int
+```
+
+**Returns:** Number of chunks embedded
+
+**Raises:** `NotImplementedError` on SQLite, `RuntimeError` if embedding service unavailable
+
+---
+
 ### Formatting Methods
 
 #### format_citation
@@ -630,6 +772,71 @@ from citation_engine.models import VerificationResult
 
 ---
 
+### Annotation
+
+Represents a note, highlight, summary, question, or critique on a source.
+
+```python
+from citation_engine import Annotation
+```
+
+**Attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `id` | `int` | Auto-incrementing primary key |
+| `source_id` | `int` | Reference to the source |
+| `job_id` | `str` | Job this annotation belongs to |
+| `annotation_type` | [`AnnotationType`](#annotationtype) | Type of annotation |
+| `content` | `str` | The annotation text |
+| `page_reference` | `str \| None` | Optional page/section reference |
+| `created_at` | `datetime` | When the annotation was created |
+| `created_by` | `str \| None` | Agent/session identifier |
+
+---
+
+### SearchResult
+
+A single search result with evidence labeling.
+
+```python
+from citation_engine import SearchResult
+```
+
+**Attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `source_id` | `int` | ID of the matching source |
+| `source_name` | `str` | Human-readable source name |
+| `source_type` | `str` | Source type (document, website, etc.) |
+| `chunk_text` | `str` | The matching text chunk |
+| `page_reference` | `str \| None` | Optional page/section reference |
+| `evidence_label` | `str` | `"HIGH"`, `"MEDIUM"`, or `"LOW"` |
+| `evidence_reason` | `str` | Human-readable reason for the label |
+| `score` | `float` | Internal ranking score |
+
+---
+
+### SearchResults
+
+Container for search results with aggregate evidence label.
+
+```python
+from citation_engine import SearchResults
+```
+
+**Attributes:**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `query` | `str` | The original search query |
+| `results` | `list[SearchResult]` | Individual results, ordered by relevance |
+| `overall_label` | `str` | Aggregate evidence summary (e.g., "HIGH — 3 sources support this") |
+| `mode` | `str` | Search mode used (`"hybrid"`, `"keyword"`, `"semantic"`) |
+
+---
+
 ## Enums
 
 ### SourceType
@@ -673,6 +880,65 @@ from citation_engine.models import ExtractionMethod
 | `ExtractionMethod.PARAPHRASE` | Reworded content |
 | `ExtractionMethod.INFERENCE` | Derived from multiple facts |
 | `ExtractionMethod.AGGREGATION` | Computed from data |
+
+---
+
+### AnnotationType
+
+```python
+from citation_engine import AnnotationType
+```
+
+| Value | Description |
+|-------|-------------|
+| `AnnotationType.NOTE` | General note |
+| `AnnotationType.HIGHLIGHT` | Key passage highlight |
+| `AnnotationType.SUMMARY` | Summary of content |
+| `AnnotationType.QUESTION` | Question for further investigation |
+| `AnnotationType.CRITIQUE` | Critical assessment |
+
+---
+
+## Support Classes
+
+### EmbeddingService
+
+OpenAI-compatible embedding API client. Supports OpenAI, Ollama, vLLM, and any `/v1/embeddings` endpoint.
+
+```python
+from citation_engine import EmbeddingService
+
+service = EmbeddingService()  # Uses env vars
+vector = service.embed("Hello world")
+vectors = service.embed_batch(["Hello", "World"])
+dim = service.dimension
+```
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CITATION_EMBEDDING_MODEL` | `text-embedding-3-small` | Model name |
+| `CITATION_EMBEDDING_URL` | `https://api.openai.com/v1` | API base URL |
+| `CITATION_EMBEDDING_KEY` | `OPENAI_API_KEY` | API key |
+
+**Raises:** `EmbeddingServiceNotConfigured` if no API key and using OpenAI URL.
+
+---
+
+### SemanticChunker
+
+Splits text into semantically coherent chunks using embedding similarity.
+
+```python
+from citation_engine import SemanticChunker, EmbeddingService
+
+service = EmbeddingService()
+chunker = SemanticChunker(embedding_service=service)
+chunks = chunker.chunk("Long document text...")
+```
+
+Falls back to fixed-size splitting (512 chars, 64 overlap) when embedding service is unavailable.
 
 ---
 
@@ -732,14 +998,15 @@ response = agent.run("Register the file report.pdf and cite the key findings.")
 
 ## Exceptions
 
-The Citation Engine uses standard Python exceptions:
-
 | Exception | When Raised |
 |-----------|-------------|
 | `ValueError` | Invalid parameters, unsupported file format, source not found |
 | `FileNotFoundError` | Document file does not exist |
 | `ConnectionError` | Web source fetch failed |
-| `RuntimeError` | Database connection issues |
+| `RuntimeError` | Database connection issues, embedding service unavailable |
+| `NotImplementedError` | Vector search on SQLite (requires PostgreSQL) |
+| `EmbeddingServiceError` | Embedding API call failed |
+| `EmbeddingServiceNotConfigured` | No API key configured for embedding service |
 
 **Example error handling:**
 
