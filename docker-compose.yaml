@@ -2,8 +2,11 @@
 # Graph-RAG - Production Stack
 # =============================================================================
 #
-# Full-stack deployment: databases, orchestrator, agents, and cockpit.
+# Full-stack deployment: databases, VPN sidecars, orchestrator, agents, and cockpit.
 # All services run as containers with shared workspace volume.
+#
+# VPN sidecars route LLM and research traffic through the university network.
+# Agent containers reach VPN services over the Docker network (no host ports).
 #
 # Usage:
 #   podman-compose up -d                   # Start all services
@@ -14,7 +17,7 @@
 #   podman-compose logs -f agent           # Follow agent logs
 #
 # Prerequisites:
-#   - Copy .env.example to .env and configure API keys
+#   - Copy .env.example to .env and configure API keys + VPN credentials
 #   - Ensure GHCR images are accessible (or build locally)
 #
 # Exposed ports:
@@ -81,6 +84,60 @@ services:
       retries: 5
     restart: unless-stopped
 
+  vpn-cluster:
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
+    container_name: graphrag-vpn-cluster
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
+    environment:
+      SOCKS_PORT: 1080
+      FORWARD_PORT: 8080
+      FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
+      VPN_HOST: ${VPN_CLUSTER_HOST:-}
+      VPN_PORT: ${VPN_CLUSTER_PORT:-443}
+      VPN_REALM: ${VPN_CLUSTER_REALM:-}
+      VPN_USER: ${VPN_CLUSTER_USER:-}
+      VPN_PASS: ${VPN_CLUSTER_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
+    healthcheck:
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  vpn-research:
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
+    container_name: graphrag-vpn-research
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
+    environment:
+      SOCKS_PORT: 1080
+      VPN_HOST: ${VPN_RESEARCH_HOST:-}
+      VPN_PORT: ${VPN_RESEARCH_PORT:-443}
+      VPN_REALM: ${VPN_RESEARCH_REALM:-}
+      VPN_USER: ${VPN_RESEARCH_USER:-}
+      VPN_PASS: ${VPN_RESEARCH_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
+    healthcheck:
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   orchestrator:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator:${IMAGE_TAG:-latest}
     container_name: graphrag-orchestrator
@@ -121,15 +178,17 @@ services:
       WORKSPACE_PATH: /workspace
       # LLM provider keys — set in .env
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      LLM_BASE_URL: ${LLM_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
-      # Research proxy (for VPN-routed web research)
-      RESEARCH_PROXY_TYPE: ${RESEARCH_PROXY_TYPE:-}
-      RESEARCH_PROXY_HOST: ${RESEARCH_PROXY_HOST:-}
-      RESEARCH_PROXY_PORT: ${RESEARCH_PROXY_PORT:-}
+      # VPN routing — agent containers reach VPN sidecars over Docker network
+      LLM_BASE_URL: http://vpn-cluster:8080/v1
+      BROWSER_LLM_BASE_URL: http://vpn-cluster:8080/v1
+      CITATION_LLM_URL: http://vpn-cluster:8080/v1
+      RESEARCH_PROXY_TYPE: socks5
+      RESEARCH_PROXY_HOST: vpn-research
+      RESEARCH_PROXY_PORT: 1080
       # Vision model (for text-only agents)
       VISION_API_KEY: ${VISION_API_KEY:-}
       VISION_BASE_URL: ${VISION_BASE_URL:-}
@@ -142,6 +201,8 @@ services:
       postgres:
         condition: service_healthy
       orchestrator:
+        condition: service_healthy
+      vpn-cluster:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
