@@ -6,8 +6,17 @@
 #   - vpn-cluster: Routes LLM API traffic to the compute cluster
 #   - vpn-research: Routes research traffic for paywalled paper access
 #
-# Usage:
+# Usage (production):
 #   podman-compose -f docker-compose.yaml -f docker-compose.vpn.yaml up -d
+#
+# Usage (development):
+#   podman-compose -f docker-compose.dev.yaml -f docker-compose.vpn.yaml up -d
+#
+# Agent routing — set in .env when using VPN:
+#   LLM_BASE_URL=http://vpn-cluster:8080/v1
+#   RESEARCH_PROXY_TYPE=socks5
+#   RESEARCH_PROXY_HOST=vpn-research
+#   RESEARCH_PROXY_PORT=1080
 #
 # Configuration:
 #   Set VPN_CLUSTER_* and VPN_RESEARCH_* variables in .env, OR mount config
@@ -69,17 +78,3 @@ services:
       timeout: 5s
       retries: 3
     restart: unless-stopped
-
-  agent:
-    environment:
-      # LLM API traffic -> cluster VPN via TCP port forward
-      LLM_BASE_URL: http://vpn-cluster:8080/v1
-      # Research traffic -> research VPN via SOCKS proxy
-      RESEARCH_PROXY_TYPE: socks5
-      RESEARCH_PROXY_HOST: vpn-research
-      RESEARCH_PROXY_PORT: "1080"
-    depends_on:
-      vpn-cluster:
-        condition: service_started
-      vpn-research:
-        condition: service_started
