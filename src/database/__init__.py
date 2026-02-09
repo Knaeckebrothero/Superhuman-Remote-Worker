@@ -31,9 +31,9 @@ SCHEMA_FILE = SCHEMA_DIR / "queries" / "postgres" / "schema.sql"
 SCHEMA_VECTOR_FILE = SCHEMA_DIR / "schema_vector.sql"  # TODO: Move to queries/ if exists
 
 # Database classes
-from .postgres_db import PostgresDB
-from .neo4j_db import Neo4jDB
-from .mongo_db import MongoDB
+from .postgres_db import PostgresDB  # noqa: E402
+from .neo4j_db import Neo4jDB  # noqa: E402
+from .mongo_db import MongoDB  # noqa: E402
 
 __all__ = [
     # Database classes

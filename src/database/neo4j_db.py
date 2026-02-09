@@ -518,7 +518,7 @@ class RelationshipsNamespace:
         RETURN elementId(rel) as element_id
         """
 
-        result = self.db.execute_write(
+        self.db.execute_write(
             query,
             {'req_rid': req_rid, 'target_name': target_name, 'props': props}
         )

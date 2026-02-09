@@ -27,6 +27,19 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkpoints_path
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.loader import get_project_root
+from .managers import TodoManager
+from .tools import ToolContext, load_tools
+from .core.state import UniversalAgentState, create_initial_state
+from .core.loader import (
+    AgentConfig,
+    load_agent_config,
+    create_llm,
+    load_instructions,
+    get_all_tool_names,
+    resolve_config_path,
+)
+from .tools.description_manager import generate_workspace_tool_docs, apply_description_overrides
+from .graph import build_phase_alternation_graph, run_graph_with_streaming
 
 
 class _AiosqliteConnectionWrapper:
@@ -46,22 +59,6 @@ class _AiosqliteConnectionWrapper:
     def __getattr__(self, name):
         """Delegate all other attributes to the wrapped connection."""
         return getattr(self._conn, name)
-
-
-from .managers import TodoManager
-from .tools import ToolContext, load_tools
-
-from .core.state import UniversalAgentState, create_initial_state
-from .core.loader import (
-    AgentConfig,
-    load_agent_config,
-    create_llm,
-    load_instructions,
-    get_all_tool_names,
-    resolve_config_path,
-)
-from .tools.description_manager import generate_workspace_tool_docs, apply_description_overrides
-from .graph import build_phase_alternation_graph, run_graph_with_streaming
 
 
 logger = logging.getLogger(__name__)
@@ -340,7 +337,7 @@ class UniversalAgent:
                     logger.info(f"Resuming frozen job {job_id}")
                     # Remove the frozen marker so the graph can continue
                     frozen_path.unlink()
-                    logger.info(f"Removed job_frozen.json to allow continuation")
+                    logger.info("Removed job_frozen.json to allow continuation")
 
                     # Inject feedback if provided
                     if feedback:
@@ -351,7 +348,7 @@ class UniversalAgent:
                             f"{feedback}\n"
                         )
                         self._workspace_manager.append_file("instructions.md", feedback_section)
-                        logger.info(f"Injected human feedback into instructions.md")
+                        logger.info("Injected human feedback into instructions.md")
 
                     # Update database status back to processing
                     if self.postgres_conn:
@@ -360,7 +357,7 @@ class UniversalAgent:
                                 "UPDATE jobs SET status = 'processing' WHERE id = $1::uuid",
                                 job_id
                             )
-                            logger.info(f"Updated job status to 'processing' for resumed frozen job")
+                            logger.info("Updated job status to 'processing' for resumed frozen job")
                         except Exception as e:
                             logger.warning(f"Failed to update job status: {e}")
 
@@ -476,7 +473,7 @@ class UniversalAgent:
                                     thread_id = legacy_thread_id
                                 else:
                                     logger.warning(
-                                        f"No checkpoint found with any thread_id format, starting fresh"
+                                        "No checkpoint found with any thread_id format, starting fresh"
                                     )
                                     graph_input = create_initial_state(
                                         job_id=job_id,
@@ -910,7 +907,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     else:
                         logger.error(f"Git clone failed: {clone_result2.stderr}")
             except subprocess.TimeoutExpired:
-                logger.error(f"Git clone timed out after 300s")
+                logger.error("Git clone timed out after 300s")
             except Exception as e:
                 logger.error(f"Git clone failed: {e}")
 
@@ -1083,7 +1080,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             analysis_dir = self._workspace_manager.get_path("analysis")
             analysis_dir.mkdir(parents=True, exist_ok=True)
             self._workspace_manager.write_file("analysis/requirement_input.md", requirement_md)
-            logger.info(f"Wrote requirement to analysis/requirement_input.md")
+            logger.info("Wrote requirement to analysis/requirement_input.md")
 
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(workspace=self._workspace_manager)

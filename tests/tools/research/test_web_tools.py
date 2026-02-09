@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.tools.research.web import (
-    MAX_RAW_CONTENT_WORDS,
     RESEARCH_TOOLS_METADATA,
     _get_tavily_api_key,
     _parse_comma_list,

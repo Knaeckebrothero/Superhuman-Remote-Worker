@@ -50,7 +50,6 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
-    BaseMessage,
     HumanMessage,
     RemoveMessage,
     SystemMessage,
@@ -69,11 +68,10 @@ from .core.loader import (
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
-from .core.context import ContextManager, ContextConfig, ToolRetryManager, find_safe_slice_start, sanitize_message_history
+from .core.context import ContextManager, ContextConfig, ToolRetryManager, sanitize_message_history
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.phase import (
     handle_phase_transition,
-    TransitionResult,
     get_initial_strategic_todos,
     get_transition_strategic_todos,
 )
@@ -528,7 +526,6 @@ def create_execute_node(
 
         # Retry loop for LLM call with exponential backoff
         attempt = 0
-        last_error = None
 
         while True:
             try:
@@ -683,7 +680,6 @@ def create_execute_node(
                 }
 
             except Exception as e:
-                last_error = e
                 retry_manager.record_failure("llm_invoke")
 
                 if retry_manager.should_retry("llm_invoke", attempt):
@@ -745,7 +741,6 @@ def create_check_todos_node(
     def check_todos(state: UniversalAgentState) -> Dict[str, Any]:
         """Check if all todos are complete."""
         job_id = state.get("job_id", "unknown")
-        iteration = state.get("iteration", 0)
 
         # Validate todos exist before checking completion
         todos = todo_manager.list_all()

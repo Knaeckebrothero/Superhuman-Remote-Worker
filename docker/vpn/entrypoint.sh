@@ -23,11 +23,19 @@ port = ${VPN_PORT:-443}
 username = ${VPN_USER}
 password = ${VPN_PASS}
 VPNEOF
+    if [ -n "$VPN_REALM" ]; then
+        echo "realm = ${VPN_REALM}" >> "$VPN_CONFIG"
+    fi
+    # SSL verification: ca-file (proper CA chain) takes priority over trusted-cert (hash shortcut)
     if [ -n "$VPN_TRUSTED_CERT" ]; then
         echo "trusted-cert = ${VPN_TRUSTED_CERT}" >> "$VPN_CONFIG"
     fi
+    if [ -f /etc/vpn/certs/ca.crt ]; then
+        echo "ca-file = /etc/vpn/certs/ca.crt" >> "$VPN_CONFIG"
+        echo "[vpn] Using CA certificate from /etc/vpn/certs/ca.crt"
+    fi
     chmod 600 "$VPN_CONFIG"
-    echo "[vpn] Config generated for ${VPN_HOST}:${VPN_PORT:-443}"
+    echo "[vpn] Config generated for ${VPN_HOST}:${VPN_PORT:-443}${VPN_REALM:+ realm=${VPN_REALM}}"
 fi
 
 # ── /dev/ppp setup (required by pppd) ──────────────────────────────────────

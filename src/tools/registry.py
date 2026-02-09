@@ -15,7 +15,7 @@ Usage:
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from .context import ToolContext
 
@@ -32,8 +32,6 @@ from .coding import create_coding_tools, get_coding_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
-from .core.todo import create_todo_tools
-from .core.job import create_job_tools
 
 logger = logging.getLogger(__name__)
 
