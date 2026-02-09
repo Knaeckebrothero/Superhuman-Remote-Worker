@@ -6,6 +6,7 @@ Integrates with CitationEngine for verified, persistent citations.
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -109,6 +110,15 @@ CITATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "citation",
         "defer_to_workspace": True,
         "short_description": "Search source library with hybrid retrieval and evidence labels.",
+        "phases": ["strategic", "tactical"],
+    },
+    "generate_bibliography": {
+        "module": "citation.sources",
+        "function": "generate_bibliography",
+        "description": "Generate a formatted bibliography/references file from citations",
+        "category": "citation",
+        "defer_to_workspace": True,
+        "short_description": "Generate formatted bibliography file from citations.",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -849,6 +859,136 @@ Similarity Score: {similarity}
             logger.error(f"Error searching library: {e}")
             return f"Error searching library: {str(e)}"
 
+    @tool
+    def generate_bibliography(
+        style: Optional[str] = "bibtex",
+        citation_ids: Optional[str] = None,
+        output_path: Optional[str] = None,
+    ) -> str:
+        """Generate a formatted bibliography/references section from citations.
+
+        Produces a bibliography from all citations in the current job, or from
+        a specific subset. Can write directly to a file (e.g., references.bib)
+        or return the formatted text. When writing to an existing file, only
+        new entries are appended — duplicates are skipped.
+
+        Args:
+            style: Format style: "bibtex" (default), "harvard", "ieee", "apa", "inline"
+            citation_ids: Comma-separated citation IDs to include (e.g., "1,3,7").
+                          If omitted, includes all citations for the current job.
+            output_path: Workspace-relative path to write (e.g., "references.bib").
+                         If omitted, returns the formatted text directly.
+
+        Returns:
+            Formatted bibliography text, or write confirmation with counts
+        """
+        try:
+            try:
+                from citation_engine import CitationEngine  # noqa: F401
+            except ImportError:
+                return "CitationEngine not installed."
+
+            engine = context.get_citation_engine()
+            effective_style = style or "bibtex"
+
+            # Get citations — filtered subset or all
+            if citation_ids:
+                ids = []
+                for part in citation_ids.split(","):
+                    part = part.strip()
+                    if part.isdigit():
+                        ids.append(int(part))
+                    else:
+                        return f"Error: invalid citation ID '{part}' — must be numeric"
+
+                entries = []
+                for cid in ids:
+                    try:
+                        entry = engine.format_citation(cid, effective_style)
+                        entries.append(entry)
+                    except ValueError as e:
+                        entries.append(f"% Error for citation {cid}: {e}")
+            else:
+                # All citations for this job
+                all_citations = engine.list_citations()
+                if not all_citations:
+                    return "No citations found. Use cite_document or cite_web first."
+                entries = []
+                for c in all_citations:
+                    try:
+                        entry = engine.format_citation(c.id, effective_style)
+                        entries.append(entry)
+                    except ValueError as e:
+                        entries.append(f"% Error for citation {c.id}: {e}")
+
+            if not entries:
+                return "No entries generated."
+
+            bibliography = "\n\n".join(entries)
+
+            # Return text directly if no output path
+            if not output_path:
+                header = f"Bibliography ({len(entries)} entries, style: {effective_style})\n"
+                return header + "\n" + bibliography
+
+            # Write to file in workspace
+            if workspace is None:
+                return "Error: no workspace available for file output"
+
+            resolved = workspace.get_path(output_path)
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+
+            new_count = len(entries)
+            skipped = 0
+
+            if resolved.exists():
+                existing_content = resolved.read_text(encoding="utf-8")
+
+                if effective_style == "bibtex":
+                    # Extract existing BibTeX keys to avoid duplicates
+                    existing_keys = set(re.findall(r"@\w+\{(\w+),", existing_content))
+                    new_entries = []
+                    for entry in entries:
+                        match = re.search(r"@\w+\{(\w+),", entry)
+                        if match and match.group(1) in existing_keys:
+                            skipped += 1
+                        else:
+                            new_entries.append(entry)
+                    new_count = len(new_entries)
+
+                    if new_entries:
+                        append_text = "\n\n" + "\n\n".join(new_entries)
+                        with open(resolved, "a", encoding="utf-8") as f:
+                            f.write(append_text)
+                else:
+                    # For non-bibtex styles, use exact string matching
+                    existing_entries = set(existing_content.strip().split("\n\n"))
+                    new_entries = []
+                    for entry in entries:
+                        if entry.strip() in existing_entries:
+                            skipped += 1
+                        else:
+                            new_entries.append(entry)
+                    new_count = len(new_entries)
+
+                    if new_entries:
+                        append_text = "\n\n" + "\n\n".join(new_entries)
+                        with open(resolved, "a", encoding="utf-8") as f:
+                            f.write(append_text)
+
+                return (
+                    f"Updated {output_path}: {new_count} new entries appended, "
+                    f"{skipped} duplicates skipped"
+                )
+            else:
+                with open(resolved, "w", encoding="utf-8") as f:
+                    f.write(bibliography + "\n")
+                return f"Written {output_path}: {len(entries)} entries ({effective_style} style)"
+
+        except Exception as e:
+            logger.error(f"Error generating bibliography: {e}")
+            return f"Error generating bibliography: {str(e)}"
+
     return [
         cite_document,
         cite_web,
@@ -860,4 +1000,5 @@ Similarity Score: {similarity}
         get_annotations,
         tag_source,
         search_library,
+        generate_bibliography,
     ]
