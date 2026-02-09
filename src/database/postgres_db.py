@@ -15,7 +15,6 @@ import re
 from pathlib import Path
 from typing import Optional, Any, List, Dict
 from contextlib import asynccontextmanager
-from datetime import datetime
 import json
 import uuid
 
@@ -473,7 +472,7 @@ class JobsNamespace:
         if not updates:
             return
 
-        updates.append(f"updated_at = NOW()")
+        updates.append("updated_at = NOW()")
         values.append(job_id)
 
         query = f"""

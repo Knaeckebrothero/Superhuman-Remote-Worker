@@ -25,7 +25,7 @@ from .config import load_config, load_prompt, get_project_root
 
 # Citation utilities (optional - requires citation_engine)
 try:
-    from .citation_utils import (
+    from .citation_utils import (  # noqa: F401
         CitationHelper,
         create_citation_engine,
         is_citation_engine_available,

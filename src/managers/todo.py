@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-import yaml
 
 if TYPE_CHECKING:
     from ..core.workspace import WorkspaceManager

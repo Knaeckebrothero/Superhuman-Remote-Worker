@@ -13,7 +13,6 @@ Ported from Advanced-LLM-Chat/backend/services/document_handler.py with extensio
 
 import io
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -101,7 +100,7 @@ class DocumentRenderer:
     def _check_pdf2image(self) -> bool:
         """Check if pdf2image and poppler are available."""
         try:
-            from pdf2image import convert_from_path
+            import pdf2image  # noqa: F401
             # Quick test to see if poppler is installed
             # This will fail fast if poppler is missing
             return True
@@ -477,7 +476,7 @@ class DocumentRenderer:
             raise RuntimeError(
                 f"LibreOffice conversion timed out for {file_path}"
             )
-        except Exception as e:
+        except Exception:
             # Clean up temp dir on error
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise

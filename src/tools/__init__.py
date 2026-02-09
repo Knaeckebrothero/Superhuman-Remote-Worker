@@ -42,8 +42,6 @@ from .workspace import create_workspace_tools, get_workspace_metadata
 from .document import create_document_tools, get_document_metadata
 from .research import create_research_tools, get_research_metadata
 
-# Backward compatibility alias
-create_search_tools = create_research_tools
 from .citation import create_citation_tools, get_citation_metadata
 # Note: cache_tools removed (deprecated, not used in configs)
 from .graph import create_graph_tools, get_graph_metadata
@@ -72,6 +70,9 @@ from .description_manager import (
     get_deferred_tools,
     get_core_tools,
 )
+
+# Backward compatibility alias
+create_search_tools = create_research_tools
 
 __all__ = [
     # Context

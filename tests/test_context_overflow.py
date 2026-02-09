@@ -12,7 +12,6 @@ from src.llm.reasoning_chat import (
     ReasoningCapturingClient,
     count_request_tokens,
     DEFAULT_MAX_CONTEXT_TOKENS,
-    WARNING_THRESHOLD_RATIO,
 )
 
 
@@ -244,7 +243,7 @@ class TestReasoningCapturingClient:
         When JSON parsing fails, the request should still be sent
         (we log a warning but don't block the request).
         """
-        client = ReasoningCapturingClient(max_context_tokens=100)
+        ReasoningCapturingClient(max_context_tokens=100)
 
         # The actual behavior depends on the implementation:
         # Our code catches JSONDecodeError and re-raises it
@@ -259,7 +258,7 @@ class TestReasoningCapturingClient:
         # The JSONDecodeError should propagate
         with pytest.raises(json.JSONDecodeError):
             # This will fail at JSON parsing, before reaching super().send()
-            body = json.loads(request.content)  # Simulate what the client does
+            json.loads(request.content)  # Simulate what the client does
 
     def test_logs_warning_at_threshold(self, caplog):
         """Should log warning when approaching limit."""

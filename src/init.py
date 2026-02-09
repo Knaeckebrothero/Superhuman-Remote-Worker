@@ -29,14 +29,13 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Optional
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -98,7 +97,7 @@ def init_workspace() -> bool:
     try:
         # Create base directory
         base_path.mkdir(parents=True, exist_ok=True)
-        logger.info(f"  Created/verified workspace directory")
+        logger.info("  Created/verified workspace directory")
 
         # Create standard subdirectories
         subdirs = ["checkpoints", "logs"]
@@ -131,7 +130,7 @@ def cleanup_workspace() -> bool:
 
     items = list(base_path.iterdir())
     if not items:
-        logger.info(f"  Workspace directory is already empty")
+        logger.info("  Workspace directory is already empty")
         return True
 
     removed = 0
@@ -356,7 +355,7 @@ def main() -> int:
 
         logger.info(f"Workspace path: {result['path']}")
         if result["exists"]:
-            logger.info(f"  Status: exists")
+            logger.info("  Status: exists")
             logger.info(f"  Jobs: {result['job_count']}")
             logger.info(f"  Checkpoints: {result['checkpoint_count']}")
             logger.info(f"  Logs: {result['log_count']}")

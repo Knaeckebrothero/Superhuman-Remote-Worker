@@ -4,8 +4,7 @@ Tests the new PostgresDB, Neo4jDB, and MongoDB classes.
 """
 
 import pytest
-import asyncio
-from unittest.mock import Mock, patch, AsyncMock
+from unittest.mock import patch
 from src.database import PostgresDB, Neo4jDB, MongoDB
 
 

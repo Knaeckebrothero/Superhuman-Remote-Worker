@@ -14,9 +14,9 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 # Import from src package
-from src.core.workspace import WorkspaceManager
-from src.tools.context import ToolContext
-from src.tools.workspace import create_workspace_tools
+from src.core.workspace import WorkspaceManager  # noqa: E402
+from src.tools.context import ToolContext  # noqa: E402
+from src.tools.workspace import create_workspace_tools  # noqa: E402
 
 
 @pytest.fixture

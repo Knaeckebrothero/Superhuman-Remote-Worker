@@ -4,10 +4,15 @@ Provides tools for searching academic databases (arXiv, Semantic Scholar)
 and downloading open access papers via arXiv and Unpaywall fallback chain.
 """
 
+from __future__ import annotations
+
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .utils.paper_types import DownloadResult
 
 from langchain_core.tools import tool
 
@@ -307,7 +312,6 @@ async def _search_semantic_scholar(
 async def _try_arxiv_download(identifier: str, dest_dir: Path) -> "DownloadResult":
     """Try downloading from arXiv."""
     from .utils.arxiv_client import ArxivClient, extract_arxiv_id
-    from .utils.paper_types import DownloadResult
 
     arxiv_id = extract_arxiv_id(identifier) or identifier
     client = ArxivClient()

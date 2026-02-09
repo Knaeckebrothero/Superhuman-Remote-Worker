@@ -236,7 +236,7 @@ Chunk Statistics:
 
             if chunk_files:
                 result += f"\nChunks written to: chunks/chunk_001.txt through chunks/chunk_{len(chunks):03d}.txt"
-                result += f"\nUse read_file(\"chunks/chunk_001.txt\") to start processing."
+                result += "\nUse read_file(\"chunks/chunk_001.txt\") to start processing."
             else:
                 result += "\nNote: No workspace available, chunks not persisted."
 
