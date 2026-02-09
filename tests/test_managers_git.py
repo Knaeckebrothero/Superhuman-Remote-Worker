@@ -9,14 +9,14 @@ import subprocess
 import tempfile
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.managers.git_manager import GitManager
+from src.managers.git_manager import GitManager  # noqa: E402
 
 
 @pytest.fixture
@@ -199,7 +199,7 @@ class TestGitManagerLog:
 
         log = initialized_git.log(max_count=3)
         # Should only have 3 commits
-        lines = [l for l in log.split("\n") if l.strip()]
+        lines = [line for line in log.split("\n") if line.strip()]
         assert len(lines) <= 3
 
     def test_log_oneline_format(self, initialized_git, temp_workspace):
@@ -505,7 +505,6 @@ class TestGitManagerTruncation:
         output = "\n".join([f"Line {i}" for i in range(1000)])
         truncated = initialized_git._truncate_output(output, max_lines=100)
 
-        lines = truncated.split("\n")
         # Should be truncated with message
         assert "truncated" in truncated
         assert "1000 lines" in truncated

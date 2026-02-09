@@ -7,7 +7,7 @@ import pytest
 import tempfile
 import sys
 import importlib.util
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
@@ -865,7 +865,7 @@ class TestTodoManagerAutoCommit:
 
     def test_complete_calls_commit(self, todo_manager, workspace_manager):
         """Test that complete() calls _commit_todo_completion."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
 
         todo_manager.add("Task 1")
 

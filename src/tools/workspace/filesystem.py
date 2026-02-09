@@ -8,8 +8,7 @@ Provides filesystem operations within the workspace including:
 """
 
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from langchain_core.tools import tool
 
@@ -509,8 +508,8 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             summary = workspace.get_summary()
 
             lines = [
-                f"Workspace Summary",
-                f"================",
+                "Workspace Summary",
+                "================",
                 f"Job ID: {summary['job_id']}",
                 f"Total Files: {summary['total_files']}",
                 f"Total Size: {summary['total_size_bytes']:,} bytes",
@@ -602,7 +601,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             ]
 
             if estimated_words <= max_read_words:
-                lines.append(f"\nThis file fits in a single read.")
+                lines.append("\nThis file fits in a single read.")
                 lines.append(f'Use: read_file("{path}")')
             else:
                 lines.append(f"\nFile exceeds single-read limit (~{max_read_words:,} words).")

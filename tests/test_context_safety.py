@@ -5,7 +5,7 @@ that prevent LLM requests from exceeding the model context limit.
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.core.context import ContextManager, ContextConfig, ConversationSummary
@@ -390,7 +390,7 @@ class TestEnsureWithinLimitsForce:
             AIMessage(content="Response 3"),
         ]
 
-        result = await context_manager.ensure_within_limits(
+        await context_manager.ensure_within_limits(
             messages=messages,
             llm=mock_llm,
             force=True,

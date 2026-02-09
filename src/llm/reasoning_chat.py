@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 from langchain_openai import ChatOpenAI

@@ -6,7 +6,7 @@ Environment variables take precedence over config file values.
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 
 def get_project_root() -> Path:

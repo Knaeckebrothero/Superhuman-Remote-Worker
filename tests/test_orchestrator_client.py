@@ -1,6 +1,5 @@
 """Tests for the orchestrator client module."""
 
-import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 

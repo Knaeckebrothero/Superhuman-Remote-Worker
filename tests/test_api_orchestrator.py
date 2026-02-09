@@ -1,12 +1,10 @@
 """Tests for orchestrator integration endpoints in the agent API."""
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.models import JobStartRequest, JobStartResponse
 
 
 class TestJobStartEndpoint:
@@ -48,7 +46,6 @@ class TestJobStartEndpoint:
         app_module._orchestrator_client = None
 
         # Create app without lifespan (we're mocking the agent)
-        from fastapi import FastAPI
         from src.api.app import create_app
 
         # We need to create a fresh app instance
@@ -310,7 +307,6 @@ class TestGetCurrentJobEndpoint:
 
 def create_app_for_testing():
     """Create app instance for testing without lifespan management."""
-    from fastapi import FastAPI
     from src.api.app import create_app
 
     return create_app()

@@ -17,23 +17,23 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())
-from datetime import date, datetime, timezone
-from decimal import Decimal
-from typing import Any
-from uuid import UUID
+from datetime import date, datetime, timezone  # noqa: E402
+from decimal import Decimal  # noqa: E402
+from typing import Any  # noqa: E402
+from uuid import UUID  # noqa: E402
 
-import yaml
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import yaml  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field  # noqa: E402
 
-from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory
-from services.workspace import workspace_service
-from services.gitea import GiteaClient
-from graph_routes import router as graph_router, set_mongodb
-from uploads import router as uploads_router
+from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
+from services.workspace import workspace_service  # noqa: E402
+from services.gitea import GiteaClient  # noqa: E402
+from graph_routes import router as graph_router, set_mongodb  # noqa: E402
+from uploads import router as uploads_router  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

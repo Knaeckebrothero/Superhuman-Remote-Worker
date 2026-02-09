@@ -71,8 +71,8 @@ class ComplianceReport:
         """Format a human-readable summary of the report."""
         status = "PASSED" if self.passed else "FAILED"
         lines = [
-            f"Metamodel Compliance Report",
-            f"=" * 40,
+            "Metamodel Compliance Report",
+            "=" * 40,
             f"Timestamp: {self.timestamp.isoformat()}",
             f"Status: {status}",
             f"Errors: {self.error_count}",

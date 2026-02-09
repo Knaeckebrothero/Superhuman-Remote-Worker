@@ -14,7 +14,6 @@ from datetime import datetime
 from .document_models import (
     DocumentChunk,
     DocumentMetadata,
-    DocumentType,
     DocumentCategory,
 )
 
@@ -475,8 +474,6 @@ class DocumentExtractor:
             sheet = wb[sheet_name]
             sheet_texts = [f"[SHEET: {sheet_name}]"]
 
-            # Get header row (first row)
-            headers = []
             for row_num, row in enumerate(sheet.iter_rows(values_only=True), 1):
                 # Skip completely empty rows
                 if not any(cell is not None for cell in row):
@@ -485,7 +482,6 @@ class DocumentExtractor:
                 # Format row as table-like structure
                 row_values = [str(cell) if cell is not None else "" for cell in row]
                 if row_num == 1:
-                    headers = row_values
                     sheet_texts.append("| " + " | ".join(row_values) + " |")
                     sheet_texts.append("|" + "|".join(["---"] * len(row_values)) + "|")
                 else:
@@ -694,7 +690,6 @@ class DocumentChunker:
         # Add end marker
         sections_with_end = sections + [{"header": "", "position": len(text)}]
 
-        current_pos = 0
         current_hierarchy = []
 
         for i in range(len(sections_with_end) - 1):

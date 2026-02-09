@@ -253,7 +253,7 @@ async def _process_orchestrator_job(
         return
 
     # Set up per-job file logging for crash safety
-    log_file = _setup_job_file_logging(job_id)
+    _setup_job_file_logging(job_id)
 
     try:
         logger.info(f"Starting orchestrator job {job_id}")

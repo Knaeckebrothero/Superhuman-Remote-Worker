@@ -1,6 +1,6 @@
 """Shared data types for academic paper tools."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional

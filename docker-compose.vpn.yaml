@@ -14,6 +14,9 @@
 #   files at docker/vpn/cluster.conf and docker/vpn/research.conf.
 #   Env vars take effect only when no config file is mounted.
 #
+#   SSL verification: place your university CA certificate at ./certs/ca.crt
+#   (auto-detected), or use VPN_*_TRUSTED_CERT with a certificate hash.
+#
 # =============================================================================
 
 services:
@@ -24,12 +27,15 @@ services:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
     environment:
       SOCKS_PORT: 1080
       FORWARD_PORT: 8080
       FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
       VPN_HOST: ${VPN_CLUSTER_HOST:-}
       VPN_PORT: ${VPN_CLUSTER_PORT:-443}
+      VPN_REALM: ${VPN_CLUSTER_REALM:-}
       VPN_USER: ${VPN_CLUSTER_USER:-}
       VPN_PASS: ${VPN_CLUSTER_PASS:-}
       VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
@@ -47,10 +53,13 @@ services:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
     environment:
       SOCKS_PORT: 1080
       VPN_HOST: ${VPN_RESEARCH_HOST:-}
       VPN_PORT: ${VPN_RESEARCH_PORT:-443}
+      VPN_REALM: ${VPN_RESEARCH_REALM:-}
       VPN_USER: ${VPN_RESEARCH_USER:-}
       VPN_PASS: ${VPN_RESEARCH_PASS:-}
       VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}

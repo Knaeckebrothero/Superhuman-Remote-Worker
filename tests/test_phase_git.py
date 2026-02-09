@@ -8,20 +8,20 @@ import shutil
 import tempfile
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig
-from src.core.phase import (
+from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
+from src.core.phase import (  # noqa: E402
     _complete_phase_with_git,
     on_strategic_phase_complete,
     on_tactical_phase_complete,
 )
-from src.managers.todo import TodoManager
+from src.managers.todo import TodoManager  # noqa: E402
 
 
 def git_available():

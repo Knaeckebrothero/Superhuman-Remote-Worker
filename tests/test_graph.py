@@ -8,7 +8,7 @@ import pytest
 import tempfile
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock, AsyncMock
 
 # Add project root src to path for imports
 project_root = Path(__file__).parent.parent
@@ -17,9 +17,9 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 # Import from src package (requires langgraph in environment)
-from src.core.workspace import WorkspaceManager
-from src.managers import TodoManager, PlanManager, MemoryManager
-from src.graph import (
+from src.core.workspace import WorkspaceManager  # noqa: E402
+from src.managers import TodoManager, PlanManager, MemoryManager  # noqa: E402
+from src.graph import (  # noqa: E402
     route_entry,
     route_after_execute,
     route_after_check_todos,
@@ -32,7 +32,7 @@ from src.graph import (
     create_handle_transition_node,
     get_managers_from_workspace,
 )
-from src.core.phase import (
+from src.core.phase import (  # noqa: E402
     get_initial_strategic_todos,
     get_transition_strategic_todos,
     validate_todos_yaml,
@@ -1316,7 +1316,6 @@ class TestEnsureWithinLimits:
     @pytest.fixture
     def mock_llm(self):
         """Create a mock LLM that returns a summary."""
-        from langchain_core.messages import AIMessage
         llm = MagicMock()
         # with_structured_output returns an LLM that can be awaited
         structured_llm = MagicMock()

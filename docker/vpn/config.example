@@ -18,8 +18,12 @@
 
 host = vpn.your-university.de
 port = 443
+realm = pub-all
 username = your_username
 password = your_password
 
-# Certificate hash from first connection attempt (see instructions above)
+# SSL verification (pick one):
+# Option A: Certificate hash from first connection attempt (see instructions above)
 # trusted-cert = 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+# Option B: CA certificate file (e.g. from university IT, mounted into container)
+# ca-file = /etc/ssl/certs/your-ca.crt

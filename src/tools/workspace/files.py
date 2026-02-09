@@ -13,12 +13,12 @@ import base64
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
 from ..context import ToolContext
-from src.utils.pdf import PDFReader, format_document_info, format_read_info
+from src.utils.pdf import PDFReader, format_read_info
 
 logger = logging.getLogger(__name__)
 
@@ -590,7 +590,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"Read the file first, then call write_file again."
                 )
 
-            result_path = workspace.write_file(path, content)
+            workspace.write_file(path, content)
             size = len(content.encode('utf-8'))
 
             return f"Written: {path} ({size:,} bytes)"

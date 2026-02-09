@@ -8,15 +8,14 @@ import shutil
 import tempfile
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.managers.git_manager import GitManager
-from src.tools.git.git_tools import create_git_tools, GIT_TOOLS_METADATA
+from src.managers.git_manager import GitManager  # noqa: E402
+from src.tools.git.git_tools import create_git_tools, GIT_TOOLS_METADATA  # noqa: E402
 
 
 def git_available():
@@ -169,7 +168,7 @@ class TestGitLogTool:
         result = git_log.invoke({"max_count": 3})
 
         # Should only show 3 commits
-        lines = [l for l in result.split("\n") if l.strip()]
+        lines = [line for line in result.split("\n") if line.strip()]
         assert len(lines) <= 3
 
     def test_log_full_format(self, tools):

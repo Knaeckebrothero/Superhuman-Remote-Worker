@@ -534,7 +534,7 @@ def _format_llm_request(request: dict[str, Any]) -> str:
     # Model kwargs
     model_kwargs = req_data.get("model_kwargs", {})
     if model_kwargs:
-        lines.append(f"\n=== Model Parameters ===")
+        lines.append("\n=== Model Parameters ===")
         for k, v in model_kwargs.items():
             lines.append(f"  {k}: {v}")
 
