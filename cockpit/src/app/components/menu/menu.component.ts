@@ -1,6 +1,7 @@
 import { Component, signal, HostListener, ElementRef, inject } from '@angular/core';
 import { LayoutService } from '../../core/services/layout.service';
 import { LayoutPickerComponent } from '../layout-picker/layout-picker.component';
+import { environment } from '../../core/environment';
 
 interface MenuLink {
   label: string;
@@ -313,6 +314,21 @@ export class MenuComponent {
         },
       ],
     },
+    ...(environment.dozzleUrl
+      ? [
+          {
+            title: 'Monitoring',
+            items: [
+              {
+                label: 'Dozzle',
+                url: environment.dozzleUrl,
+                icon: '📋',
+                description: 'Container log viewer',
+              },
+            ],
+          },
+        ]
+      : []),
   ];
 
   @HostListener('document:click', ['$event'])

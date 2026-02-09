@@ -12,7 +12,15 @@ const getGiteaUrl = (): string | null => {
   return null;
 };
 
+const getDozzleUrl = (): string | null => {
+  if (typeof window !== 'undefined') {
+    return (window as any)['env']?.['dozzleUrl'] || null;
+  }
+  return null;
+};
+
 export const environment = {
   apiUrl: getApiUrl(),
   giteaUrl: getGiteaUrl(),
+  dozzleUrl: getDozzleUrl(),
 };
