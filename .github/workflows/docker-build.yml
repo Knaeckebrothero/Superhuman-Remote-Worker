@@ -73,8 +73,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
 
       - name: Inspect pushed image
         if: success()
@@ -121,8 +121,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
 
       - name: Inspect pushed image
         if: success()
@@ -169,8 +169,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
 
       - name: Inspect pushed image
         if: success()
@@ -217,8 +217,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
 
       - name: Inspect pushed image
         if: success()
@@ -265,8 +265,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
+          cache-from: type=gha,ignore-error=true
+          cache-to: type=gha,mode=min,ignore-error=true
 
       - name: Inspect pushed image
         if: success()
