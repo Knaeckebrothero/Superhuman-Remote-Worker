@@ -85,6 +85,33 @@ services:
       timeout: 5s
       retries: 5
 
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:latest
+    container_name: graphrag-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@graphrag.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mongo-express:
+    image: docker.io/library/mongo-express:latest
+    container_name: graphrag-mongo-express
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_BASICAUTH: "false"
+    ports:
+      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+
   gitea:
     image: docker.io/gitea/gitea:1.22-rootless
     container_name: graphrag-gitea
