@@ -98,19 +98,54 @@ services:
       timeout: 5s
       retries: 5
 
-  vpn-sidecar:
+  vpn-cluster:
     build: ./docker/vpn
-    container_name: graphrag-vpn-dev
+    container_name: graphrag-vpn-cluster-dev
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/ppp:/dev/ppp
     volumes:
-      - ./docker/vpn/config:/etc/openfortivpn/config:ro,Z
+      - ./certs:/etc/vpn/certs:ro
     ports:
-      - "${VPN_SOCKS_PORT:-1080}:1080"
+      - "${VPN_CLUSTER_FORWARD_PORT:-8080}:8080"
+      - "${VPN_CLUSTER_SOCKS_PORT:-1080}:1080"
     environment:
       SOCKS_PORT: 1080
+      FORWARD_PORT: 8080
+      FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
+      VPN_HOST: ${VPN_CLUSTER_HOST:-}
+      VPN_PORT: ${VPN_CLUSTER_PORT:-443}
+      VPN_REALM: ${VPN_CLUSTER_REALM:-}
+      VPN_USER: ${VPN_CLUSTER_USER:-}
+      VPN_PASS: ${VPN_CLUSTER_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  vpn-research:
+    build: ./docker/vpn
+    container_name: graphrag-vpn-research-dev
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
+    ports:
+      - "${VPN_RESEARCH_SOCKS_PORT:-1081}:1080"
+    environment:
+      SOCKS_PORT: 1080
+      VPN_HOST: ${VPN_RESEARCH_HOST:-}
+      VPN_PORT: ${VPN_RESEARCH_PORT:-443}
+      VPN_REALM: ${VPN_RESEARCH_REALM:-}
+      VPN_USER: ${VPN_RESEARCH_USER:-}
+      VPN_PASS: ${VPN_RESEARCH_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
     healthcheck:
       test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
       interval: 30s
