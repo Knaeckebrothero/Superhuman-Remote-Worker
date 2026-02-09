@@ -40,7 +40,7 @@ services:
       VPN_PASS: ${VPN_CLUSTER_PASS:-}
       VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
       interval: 30s
       timeout: 5s
       retries: 3
@@ -64,7 +64,7 @@ services:
       VPN_PASS: ${VPN_RESEARCH_PASS:-}
       VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'"]
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
       interval: 30s
       timeout: 5s
       retries: 3
