@@ -581,6 +581,22 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         Returns:
             Confirmation message with file path and size
         """
+        # Block binary file extensions — write_file is text-only
+        BINARY_EXTENSIONS = {
+            ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+            ".exe", ".dll", ".so", ".dylib",
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
+            ".pdf", ".docx", ".xlsx", ".pptx",
+            ".db", ".sqlite", ".pickle", ".pkl",
+        }
+        from pathlib import Path as _P
+        if _P(path).suffix.lower() in BINARY_EXTENSIONS:
+            return (
+                f"Error: Cannot write binary file '{path}'. "
+                f"write_file only supports text content. "
+                f"Use git tools to commit and push your results for delivery."
+            )
+
         try:
             # Enforce read-before-write for existing files
             if workspace.exists(path) and not context.was_recently_read(path):
