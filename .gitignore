@@ -1,9 +1,11 @@
 # Project-specific contents go here
 backups/*
 workspace/*
+./workspace/*
 output/*
 orchestrator/workspace/*
 project_documentation/*
+certs/*
 
 # VPN credentials (config.example is tracked, config is not)
 docker/vpn/config
