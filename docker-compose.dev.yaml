@@ -26,7 +26,7 @@
 services:
   postgres:
     image: docker.io/pgvector/pgvector:pg15
-    container_name: graphrag-postgres-dev
+    container_name: graphrag-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-graphrag}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-graphrag_password}
@@ -44,7 +44,7 @@ services:
 
   neo4j:
     image: docker.io/library/neo4j:5.15-community
-    container_name: graphrag-neo4j-dev
+    container_name: graphrag-neo4j
     environment:
       NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-neo4j_password}
       NEO4J_PLUGINS: '["apoc"]'
@@ -64,7 +64,7 @@ services:
 
   mongodb:
     image: docker.io/library/mongo:7
-    container_name: graphrag-mongodb-dev
+    container_name: graphrag-mongodb
     environment:
       MONGO_INITDB_DATABASE: graphrag_logs
     volumes:
@@ -79,7 +79,7 @@ services:
 
   gitea:
     image: docker.io/gitea/gitea:1.22-rootless
-    container_name: graphrag-gitea-dev
+    container_name: graphrag-gitea
     environment:
       GITEA__database__DB_TYPE: sqlite3
       GITEA__database__PATH: /var/lib/gitea/data/gitea.db
