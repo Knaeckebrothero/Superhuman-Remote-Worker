@@ -93,7 +93,7 @@ services:
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-graphrag}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-graphrag_gitea}
     volumes:
-      - workspace_data:/workspace:Z
+      - workspace_data:/workspace:z
     ports:
       - "${ORCHESTRATOR_PORT:-8085}:8085"
     depends_on:
@@ -131,7 +131,7 @@ services:
       VISION_BASE_URL: ${VISION_BASE_URL:-}
       VISION_MODEL: ${VISION_MODEL:-}
     volumes:
-      - workspace_data:/workspace:Z
+      - workspace_data:/workspace:z
     deploy:
       replicas: ${AGENT_REPLICAS:-2}
     depends_on:

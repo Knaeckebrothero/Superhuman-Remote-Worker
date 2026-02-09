@@ -13,8 +13,8 @@ set -e
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 VPN_CONFIG="${VPN_CONFIG:-/etc/openfortivpn/config}"
 
-# ── Generate config from env vars if no config file mounted ────────────────
-if [ ! -f "$VPN_CONFIG" ] && [ -n "$VPN_HOST" ]; then
+# ── Generate config from env vars (overrides default/example config) ────────
+if [ -n "$VPN_HOST" ]; then
     echo "[vpn] No config file found, generating from environment variables..."
     mkdir -p "$(dirname "$VPN_CONFIG")"
     cat > "$VPN_CONFIG" <<VPNEOF
