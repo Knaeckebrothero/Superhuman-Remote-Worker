@@ -2,4 +2,5 @@
   window['env'] = window['env'] || {};
   window['env']['apiUrl'] = 'http://localhost:8085/api';
   window['env']['giteaUrl'] = 'http://localhost:3000/graphrag';
+  window['env']['dozzleUrl'] = 'http://localhost:9999';
 })(this);

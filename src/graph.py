@@ -428,26 +428,8 @@ def create_execute_node(
             if not isinstance(msg, SystemMessage):
                 prepared_messages.append(msg)
 
-        # Handle consecutive AI messages — inject dynamic todo reminder
-        if prepared_messages and isinstance(prepared_messages[-1], AIMessage):
-            if not getattr(prepared_messages[-1], 'tool_calls', None):
-                remaining = todo_manager.list_pending()
-                if remaining:
-                    todo_lines = "\n".join(
-                        f"  - {t.id}: {t.content}"
-                        for t in remaining
-                    )
-                    reminder = (
-                        f"You have {len(remaining)} incomplete todo(s):\n"
-                        f"{todo_lines}\n\n"
-                        "Continue working on these items. "
-                        "Use `todo_complete(todo_id=\"<id>\")` to mark a todo as done, "
-                        "or call `todo_complete()` with no arguments to complete the next pending item. "
-                        "Use `todo_list()` to view the full list with completed and remaining todos."
-                    )
-                else:
-                    reminder = "All todos are complete. Continue with the current task."
-                prepared_messages.append(HumanMessage(content=reminder))
+        # Todo reminders are injected post-LLM-response (see below) so they
+        # persist in conversation history and survive context compaction.
 
         # LAYER 1 SAFETY CHECK: Ensure we don't exceed model context limit
         # This catches bad configs and edge cases that slip through normal compaction
@@ -575,17 +557,46 @@ def create_execute_node(
                             latency_ms=latency_ms,
                         )
 
+                # Post-response todo reminder: if the model responded without tool calls
+                # and there are pending todos, append a reminder to state so it persists
+                # in conversation history. The model will see it on the next execute loop.
+                injected_reminder = None
+                if not (hasattr(response, 'tool_calls') and response.tool_calls):
+                    remaining = todo_manager.list_pending()
+                    if remaining:
+                        todo_lines = "\n".join(
+                            f"  - {t.id}: {t.content}"
+                            for t in remaining
+                        )
+                        injected_reminder = HumanMessage(content=(
+                            f"You have {len(remaining)} incomplete todo(s):\n"
+                            f"{todo_lines}\n\n"
+                            "IMPORTANT: Tasks are NOT considered complete until you explicitly call "
+                            "the `todo_complete` tool for each one. Performing the work alone is not "
+                            "enough — you MUST mark each task done using the tool.\n\n"
+                            "Use `todo_complete(todo_id=\"<id>\")` to mark a specific todo as done, "
+                            "or call `todo_complete()` with no arguments to complete the next pending item. "
+                            "If you have already done the work for a todo, call `todo_complete` now to "
+                            "record it. Use `todo_list()` to review the full list."
+                        ))
+
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
                 if context_was_compacted:
                     # Include RemoveMessage markers so state reducer removes old messages
+                    result_messages = remove_markers + messages + [response]
+                    if injected_reminder:
+                        result_messages.append(injected_reminder)
                     return {
-                        "messages": remove_markers + messages + [response],
+                        "messages": result_messages,
                         "iteration": iteration + 1,
                         "error": None,
                     }
+                result_messages = [response]
+                if injected_reminder:
+                    result_messages.append(injected_reminder)
                 return {
-                    "messages": [response],
+                    "messages": result_messages,
                     "iteration": iteration + 1,
                     "error": None,
                 }

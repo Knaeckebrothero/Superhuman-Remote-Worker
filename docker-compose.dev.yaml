@@ -20,6 +20,10 @@
 # Start only databases:
 #   podman-compose -f docker-compose.dev.yaml up -d postgres neo4j mongodb
 #
+#
+# Start only databases + MCP:
+#   podman-compose -f docker-compose.dev.yaml up -d postgres neo4j mongodb mcp
+#
 # Run application components locally:
 #   cd orchestrator && uvicorn main:app --reload --port 8085
 #   python agent.py --config defaults --port 8001
@@ -106,6 +110,23 @@ services:
       timeout: 5s
       retries: 5
 
+  mcp:
+    build: ./orchestrator/mcp
+    container_name: graphrag-mcp
+    environment:
+      COCKPIT_API_URL: http://host.docker.internal:8085
+      MCP_TRANSPORT: http
+      MCP_PORT: 8055
+    ports:
+      - "${MCP_PORT:-8055}:8055"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8055/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   vpn-cluster:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
     container_name: graphrag-vpn-cluster
@@ -161,6 +182,46 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Container log viewer (Dozzle) with read-only socket proxy
+  # ---------------------------------------------------------------------------
+  # Socket path varies by runtime:
+  #   Rootless Podman: /run/user/<UID>/podman/podman.sock  (default below)
+  #   Rootful Podman:  /run/podman/podman.sock
+  #   Docker:          /var/run/docker.sock
+  socket-proxy:
+    image: lscr.io/linuxserver/socket-proxy:latest
+    container_name: graphrag-socket-proxy
+    environment:
+      - CONTAINERS=1
+      - IMAGES=0
+      - EXEC=0
+      - POST=0
+      - SYSTEM=0
+      - AUTH=0
+      - SECRETS=0
+      - NETWORKS=0
+      - VOLUMES=0
+      - BUILD=0
+    volumes:
+      - /run/user/${HOST_UID:-1000}/podman/podman.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /run
+    restart: unless-stopped
+
+  dozzle:
+    image: docker.io/amir20/dozzle:latest
+    container_name: graphrag-dozzle
+    environment:
+      - DOCKER_HOST=tcp://socket-proxy:2375
+      - DOZZLE_NO_ANALYTICS=true
+    ports:
+      - "${DOZZLE_PORT:-9999}:8080"
+    depends_on:
+      - socket-proxy
+    restart: unless-stopped
 
 volumes:
   postgres_dev_data:
