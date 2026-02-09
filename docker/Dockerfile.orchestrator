@@ -57,6 +57,9 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy orchestrator source code with correct ownership
 COPY --chown=graphrag:graphrag orchestrator/ ./
 
+# Copy agent config directory (expert definitions, defaults, prompts, templates)
+COPY --chown=graphrag:graphrag config/ ./config/
+
 USER graphrag
 
 EXPOSE 8085
