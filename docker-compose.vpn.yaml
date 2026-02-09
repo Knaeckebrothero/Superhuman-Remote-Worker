@@ -32,7 +32,12 @@ services:
   vpn-cluster:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
     container_name: graphrag-vpn-cluster
-    privileged: true
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
     volumes:
       - ./certs:/etc/vpn/certs:ro
     environment:
@@ -55,7 +60,12 @@ services:
   vpn-research:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
     container_name: graphrag-vpn-research
-    privileged: true
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
     volumes:
       - ./certs:/etc/vpn/certs:ro
     environment:
