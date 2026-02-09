@@ -11,6 +11,7 @@ when creating jobs.
 
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -35,8 +36,15 @@ class UploadType(str, Enum):
 router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
 logger = logging.getLogger(__name__)
 
-# Storage directory (relative to where orchestrator runs)
-UPLOADS_DIR = Path("workspace/uploads")
+def _get_uploads_dir() -> Path:
+    """Resolve uploads directory, respecting WORKSPACE_PATH env var."""
+    env_path = os.getenv("WORKSPACE_PATH")
+    if env_path:
+        return Path(env_path) / "uploads"
+    return Path(__file__).parent.parent / "workspace" / "uploads"
+
+
+UPLOADS_DIR = _get_uploads_dir()
 
 # Limits
 MAX_FILE_SIZE = 5 * 1024 * 1024 * 1024  # 5GB per file
