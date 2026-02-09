@@ -21,7 +21,7 @@
 
 services:
   vpn-cluster:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-vpn:${IMAGE_TAG:-latest}
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
     container_name: graphrag-vpn-cluster
     cap_add:
       - NET_ADMIN
@@ -47,7 +47,7 @@ services:
     restart: unless-stopped
 
   vpn-research:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-vpn:${IMAGE_TAG:-latest}
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
     container_name: graphrag-vpn-research
     cap_add:
       - NET_ADMIN

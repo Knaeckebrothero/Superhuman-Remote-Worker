@@ -82,7 +82,7 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-orchestrator:${IMAGE_TAG:-latest}
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator:${IMAGE_TAG:-latest}
     container_name: graphrag-orchestrator
     environment:
       PORT: 8085
@@ -111,7 +111,7 @@ services:
     restart: unless-stopped
 
   agent:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-agent:${IMAGE_TAG:-latest}
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${IMAGE_TAG:-latest}
     environment:
       AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
       AGENT_PORT: 8001
@@ -148,7 +148,7 @@ services:
     restart: unless-stopped
 
   cockpit:
-    image: ghcr.io/knaeckebrothero/uni-projekt-graph-rag-cockpit:${IMAGE_TAG:-latest}
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit:${IMAGE_TAG:-latest}
     container_name: graphrag-cockpit
     environment:
       PORT: 4000

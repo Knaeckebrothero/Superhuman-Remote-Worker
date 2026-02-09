@@ -80,6 +80,9 @@ COPY --chown=graphrag:graphrag src/ ./src/
 COPY --chown=graphrag:graphrag config/ ./config/
 COPY --chown=graphrag:graphrag agent.py ./
 
+# Marker so get_project_root() finds /app (no .git in container)
+RUN touch /app/pyproject.toml && chown graphrag:graphrag /app/pyproject.toml
+
 # Create runtime directories with correct ownership
 RUN mkdir -p /app/workspace /app/logs && \
     chown -R graphrag:graphrag /app/workspace /app/logs
