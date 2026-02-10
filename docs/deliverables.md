@@ -93,20 +93,20 @@ Agent calls job_complete
     → loop repeats until user approves
 ```
 
-#### What's partially in place
+#### What was already in place (before this work)
 
-- **Orchestrator resume API** — `POST /api/jobs/{job_id}/resume` exists with optional `feedback` field (`orchestrator/main.py:462+`)
-- **Cockpit resume service** — `api.service.ts:553` has `resumeJob(jobId, feedback?)` calling the API
-- **Cockpit resume button** — basic "Resume" button in job list (`job-list.component.ts:130`), but no feedback text field
+- **Orchestrator resume API** — `POST /api/jobs/{job_id}/resume` with optional `feedback` field (`orchestrator/main.py`)
+- **Cockpit resume service** — `api.service.ts` has `resumeJob(jobId, feedback?)` calling the API
+- **Cockpit resume button** — basic "Resume" button in job list (`job-list.component.ts`)
 
-#### What needs to be built
+#### What was built (Phases 1–3)
 
-1. **Orchestrator approve API** — no `POST /api/jobs/{job_id}/approve` endpoint exists yet. Approval is CLI-only (`agent.py --approve`). The orchestrator needs an endpoint that writes `job_completion.json` and sets DB status to `completed`.
-2. **Cockpit review component** — a dedicated review UI:
-   - **Job status visibility** — show jobs in `pending_review` state prominently (notification, badge, filtered view)
-   - **Workspace browser** — display the full workspace contents (the entire workspace is pushed to Gitea, including internal files like `workspace.md`, `plan.md`, `archive/` — the user should see everything since the agent isn't reliable enough yet to curate outputs)
-   - **Approve button** — calls the new orchestrator approve endpoint
-   - **Feedback + Continue** — text field for the user to write feedback/instructions, plus a "Continue" button that calls the existing resume endpoint with feedback
+1. **Orchestrator approve API** — `POST /api/jobs/{job_id}/approve` endpoint. Runs server-side, writes `job_completion.json`, removes `job_frozen.json`, sets DB status to `completed`. See Phase 1 below.
+2. **Cockpit review component** — dedicated review UI with:
+   - **Job status visibility** — `pending_review` filter chip, orange badge, "Review" action button in job list
+   - **Review panel** — shows frozen job summary, confidence, deliverables, notes; Approve button; feedback textarea + Continue button
+   - **Workspace browser** — custom file browser proxying Gitea API through orchestrator; split-pane with file tree + content viewer
+   - See Phases 2 and 3 below.
 
 ## Git-Based Delivery (Implemented)
 
@@ -124,16 +124,21 @@ We push everything as-is. The user sees the full workspace including internal re
 
 **Rationale:** The agent isn't reliable enough yet to curate outputs. Working documents, reasoning trails, and internal files are just as important as the final result for the human reviewer to understand what happened and decide whether the job is actually complete. Separate deliverables directories or branch-based separation can be revisited later when agent output quality is more consistent.
 
+## Resolved Questions
+
+### Workspace browser approach
+**Decision:** Custom file browser via orchestrator proxy. Orchestrator proxies Gitea API calls (`list_contents`, `get_file_content`) so the cockpit doesn't need Gitea credentials and avoids iframe auth issues.
+
+### Orchestrator approve endpoint approach
+**Decision:** Replicate the agent's `approve_frozen_job` logic server-side. The approve endpoint runs entirely in the orchestrator — no agent pod needed. It reads `job_frozen.json` from Gitea (falls back to local workspace), writes `job_completion.json`, removes the frozen file, and updates the DB.
+
 ## Open Questions
 
-### Cockpit review component
-- What should the workspace browser look like? Embed Gitea's web UI? Build a custom file browser? Pull files via Gitea API?
-- How should notifications work when a job enters `pending_review`?
-- Should the review component show a diff of what changed since the last review cycle (for jobs that were continued with feedback)?
+### Notifications
+- How should notifications work when a job enters `pending_review`? (Currently the user must check the job list or use the "Review" filter chip.)
 
-### Orchestrator approve endpoint
-- The resume endpoint exists (`POST /api/jobs/{job_id}/resume` with feedback), but there is no approve endpoint. This needs to be added so the cockpit can approve jobs without going through the CLI.
-- Should the approve endpoint call the agent's `approve_frozen_job` directly, or replicate its logic (write `job_completion.json`, update DB status)? The latter is simpler since it doesn't require the agent pod to be running.
+### Review diffs
+- Should the review component show a diff of what changed since the last review cycle (for jobs that were continued with feedback)?
 
 ### Types of deliverables
 - Written reports/summaries (Markdown, PDF)
