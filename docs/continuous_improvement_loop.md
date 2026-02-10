@@ -55,6 +55,39 @@ New expert type that can introspect completed jobs. Needs a new tool category (`
 
 The tools accept a `target_job_id` parameter (not the evaluator's own job). Implementation reuses the sync `CockpitClient` from `orchestrator/mcp/client.py` which already wraps every needed endpoint.
 
+#### Direct data access
+
+In addition to the orchestrator REST API proxy tools, the evaluator gets direct access to underlying data sources for deeper analysis:
+
+| Access | Tool / Mechanism | Purpose |
+|--------|-----------------|---------|
+| **MongoDB** | `mongo_query`, `mongo_aggregate` (via datasource connector) | Query raw LLM request/response logs, aggregate token usage, find patterns across multiple jobs |
+| **Git** | `git_log`, `git_diff`, `git_show` (workspace tools) | Inspect the target job's workspace git history — what files changed per phase, diff sizes, reverted edits |
+| **MCP** | Direct MCP client (same as Claude Code integration) | Access the full MCP tool surface for job introspection without REST overhead |
+
+The evaluator config attaches the system MongoDB as a datasource and mounts the target job's workspace directory (read-only) so git tools operate on the target's history, not the evaluator's own workspace.
+
+```yaml
+# config/experts/evaluator/config.yaml (relevant excerpt)
+tools:
+  evaluation:
+    - get_job_details
+    - get_job_audit
+    - get_job_chat
+    - get_job_todos
+    - get_job_workspace_file
+    - search_job_audit
+  mongodb:
+    - mongo_query
+    - mongo_aggregate
+    - mongo_schema
+  git:
+    - git_log
+    - git_diff
+    - git_show
+    - git_status
+```
+
 #### What the evaluator analyzes
 
 - **Iteration efficiency**: loops where the agent repeated the same action, wasted iterations
@@ -103,6 +136,53 @@ Structured JSON report in `output/evaluation_report.json`:
   ]
 }
 ```
+
+### Live Debugging
+
+Beyond post-mortem analysis, the evaluator can attach to the agent's runtime state for deeper diagnostics. This uses a Python remote debugger embedded in the agent process.
+
+#### Debug server
+
+When `debug.enable_remote_debugger: true` is set in the agent config, the agent starts a `debugpy` server on a configurable port at process startup. The evaluator (or a human) can attach to inspect live state.
+
+```yaml
+# config/defaults.yaml (new keys)
+debug:
+  enable_remote_debugger: false        # Off by default
+  debugger_port: 5678                  # debugpy listen port
+  debugger_host: "0.0.0.0"            # Bind address
+  wait_for_client: false               # Don't block startup
+  snapshot_on_error: true              # Auto-dump state on unhandled exceptions
+```
+
+#### What live debugging enables
+
+- **State snapshots**: Dump the full `UniversalAgentState` (messages, todos, phase info, token counts) at any point during execution, not just at phase boundaries
+- **Breakpoint injection**: Set conditional breakpoints on specific tool calls (e.g., break when `edit_file` fails 3 times in a row) to capture the exact agent state at failure points
+- **Memory inspection**: Examine `workspace.md` contents, plan state, and context window composition in real-time to understand what the agent "sees"
+- **Post-mortem on crashes**: When `snapshot_on_error` is enabled, unhandled exceptions trigger a full state dump to `workspace/debug/crash_<timestamp>.json` before the process exits
+
+#### Implementation
+
+```python
+# src/core/debugger.py
+import debugpy
+
+def start_debug_server(config: dict):
+    """Start debugpy server if enabled in config."""
+    debug_cfg = config.get("debug", {})
+    if not debug_cfg.get("enable_remote_debugger", False):
+        return
+
+    host = debug_cfg.get("debugger_host", "0.0.0.0")
+    port = debug_cfg.get("debugger_port", 5678)
+    debugpy.listen((host, port))
+
+    if debug_cfg.get("wait_for_client", False):
+        debugpy.wait_for_client()
+```
+
+The evaluator can request a state snapshot from a running job via a new orchestrator endpoint (`POST /api/jobs/{id}/debug/snapshot`) which signals the agent process to serialize its current state.
 
 ### Pipeline Script
 
@@ -167,33 +247,128 @@ pipeline_results/<source_job_id>/
   summary.json            # aggregate improvement over iterations
 ```
 
+### Training Data Generation
+
+The evaluator extracts examples from each job run to build a fine-tuning dataset. Good and bad examples are captured from the audit trail and stored in a structured format.
+
+#### Example types
+
+| Type | Source | Description |
+|------|--------|-------------|
+| **Good tool calls** | Audit trail entries where a tool succeeded on the first attempt | Positive examples of correct tool usage with proper arguments |
+| **Bad tool calls** | Sequences where the same tool was retried 2+ times | Negative examples showing incorrect arguments, missing context, wrong tool choice |
+| **Recovery patterns** | Sequences where the agent recovered from an error | Teaches self-correction behavior |
+| **Wasted loops** | Sequences flagged as wasted iterations | Negative examples of repetitive, unproductive behavior |
+| **Phase planning** | Strategic phase outputs (plan.md, todos) vs actual execution | Examples of good/bad task decomposition and estimation |
+
+#### Output format
+
+Training examples are saved to `output/training_data.jsonl` in the evaluator's workspace. Each line is a self-contained example:
+
+```json
+{
+  "id": "TRAIN-001",
+  "source_job_id": "uuid",
+  "type": "bad_tool_call",
+  "category": "retry_storm",
+  "messages": [
+    {"role": "assistant", "content": "I'll edit the file...", "tool_calls": [...]},
+    {"role": "tool", "content": "Error: old_string not found in file"},
+    {"role": "assistant", "content": "Let me try again...", "tool_calls": [...]}
+  ],
+  "correction": {
+    "role": "assistant",
+    "content": "I should read the file first to get the exact content.",
+    "tool_calls": [{"name": "read_file", "arguments": {"path": "..."}}]
+  },
+  "lesson": "Always read a file before attempting to edit it",
+  "tags": ["edit_file", "read_before_write", "retry_prevention"]
+}
+```
+
+The `messages` field contains the raw conversation turns from the audit trail. The `correction` field is generated by the evaluator as the ideal response that should have been produced instead. Over time, this dataset can be used for:
+
+- Fine-tuning smaller models to match the behavior of corrected runs
+- Few-shot prompt examples injected into agent instructions
+- Regression testing — replay scenarios to verify improvements
+
+### Automated Re-run and Loop Control
+
+After the coder finishes implementing improvements, the pipeline automatically re-runs the original job with the improved codebase. This creates a true closed loop.
+
+#### Loop control
+
+The pipeline enforces safety boundaries to prevent runaway loops:
+
+```
+pipeline.py --job-id <uuid>                          # Default: max 3 iterations
+pipeline.py --job-id <uuid> --max-iterations 5       # Custom limit
+pipeline.py --job-id <uuid> --min-score-delta 0.05   # Stop if improvement < 5%
+pipeline.py --job-id <uuid> --require-approval        # Pause for human review between iterations
+```
+
+#### Convergence criteria
+
+The loop stops when any of these conditions are met:
+
+1. **Max iterations reached** (default: 3)
+2. **Score plateau**: evaluator score delta between iterations drops below `--min-score-delta` (default: 0.05)
+3. **No issues found**: evaluator reports zero high/medium severity issues
+4. **Regression detected**: evaluator score decreases compared to the previous iteration — the coder's changes made things worse, so the pipeline rolls back and stops
+5. **Human halt**: user sends `SIGINT` or sets a stop flag via `pipeline.py --stop <source_job_id>`
+
+#### Rollback on regression
+
+If iteration N scores lower than iteration N-1, the pipeline:
+1. Reverts the coder's branch (`git reset` to pre-iteration commit)
+2. Records the regression in `pipeline_results/<id>/iteration_N/regression.json`
+3. Stops the loop and reports which changes caused the regression
+
 ## Implementation Steps
 
-### Phase 1: Evaluation tools
+### Phase 1: Evaluation tools + direct access
 - Create `src/tools/evaluation/__init__.py` and `evaluation_tools.py`
 - Register in `src/tools/registry.py`, `src/core/loader.py`
 - Add to `config/defaults.yaml` and `config/schema.json`
+- Configure MongoDB datasource attachment for evaluator
+- Implement read-only target workspace mounting for git tool access
 
-### Phase 2: Evaluator expert
-- Create `config/experts/evaluator/config.yaml`
+### Phase 2: Live debugging infrastructure
+- Create `src/core/debugger.py` with `debugpy` integration
+- Add `debug` config keys to `config/defaults.yaml` and `config/schema.json`
+- Add `POST /api/jobs/{id}/debug/snapshot` endpoint to orchestrator
+- Implement `snapshot_on_error` crash dump to `workspace/debug/`
+
+### Phase 3: Evaluator expert
+- Create `config/experts/evaluator/config.yaml` (with mongodb + git tools)
 - Create `config/experts/evaluator/instructions.md`
+- Include training data extraction logic in evaluator instructions
 
-### Phase 3: Pipeline script
+### Phase 4: Pipeline script
 - Create `pipeline.py` at project root
 - Uses `httpx` to call orchestrator API
 - Polls for job completion
 - Reads workspace output files
 - Chains jobs with results forwarding
+- Implement loop control (max iterations, score delta, regression rollback)
+- Implement convergence detection and automatic stopping
 
-### Phase 4: Integration
+### Phase 5: Training data pipeline
+- Define JSONL schema for training examples
+- Implement extraction of good/bad tool call pairs from audit trail
+- Implement correction generation in evaluator instructions
+- Add training data aggregation across iterations in `pipeline_results/`
+
+### Phase 6: Integration
 - Test with a real completed job
-- Verify evaluator can access audit trails
+- Verify evaluator can access audit trails, MongoDB, and target workspace git
 - Verify researcher receives evaluation context
 - Verify coder receives actionable implementation brief
+- Run a full multi-iteration loop and verify convergence/rollback behavior
 
 ## Open Questions
 
-- **Automated re-run**: Should the pipeline automatically re-run the original job after the coder finishes, creating a true infinite loop? Or should a human review the coder's PR first?
-- **Training data generation**: The evaluator could extract good/bad tool call examples for fine-tuning. Format TBD.
 - **Scope constraints**: How to limit what the coder can change per iteration (only prompts? configs? tool code? core agent code?)
-- **Quality gate**: What metric determines if an iteration actually improved things? Evaluator score delta? Token usage reduction?
+- **Quality gate weighting**: The evaluator score is the primary convergence metric, but what sub-metrics should be weighted most? Iteration count, token usage, error count, phase count — relative importance TBD.
+- **Training data volume**: How many iterations/jobs are needed before the training dataset is large enough to be useful for fine-tuning? Minimum viable dataset size TBD.
+- **Debug server security**: The `debugpy` server exposes internal state. In multi-tenant or networked setups, authentication/access control for the debug port needs consideration.

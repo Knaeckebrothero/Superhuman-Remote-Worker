@@ -4,11 +4,18 @@ Provides a container for dependencies that tools need access to,
 such as workspace managers, database connections, and configuration.
 """
 
+import hashlib
+import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Deque, Dict, Optional
+from urllib.parse import urlparse
 
 from ..core.workspace import WorkspaceManager
+
+logger = logging.getLogger(__name__)
 
 # Avoid circular imports with TYPE_CHECKING
 if TYPE_CHECKING:
@@ -234,6 +241,76 @@ class ToolContext:
             self._inaccessible_sources[url] = fetch_error
 
         return source.id, fetch_error
+
+    def save_web_content_to_disk(
+        self,
+        url: str,
+        content: str,
+        title: Optional[str] = None,
+        source_id: Optional[int] = None,
+    ) -> Optional[str]:
+        """Save web content as a markdown file with YAML front-matter.
+
+        Generates deterministic filenames from URL (same URL = same file).
+        Skips write if file already exists (first save wins).
+
+        Args:
+            url: Source URL
+            content: Raw text content to save
+            title: Optional page title
+            source_id: Optional CitationEngine source ID
+
+        Returns:
+            Workspace-relative path (e.g. "documents/external/example_com_a1b2c3d4.md"),
+            or None if no workspace is available.
+        """
+        if not self.has_workspace():
+            return None
+
+        # Generate deterministic filename from URL
+        url_hash = hashlib.sha256(url.encode()).hexdigest()[:8]
+        parsed = urlparse(url)
+        domain = parsed.netloc or "unknown"
+        # Sanitize domain for filesystem
+        safe_domain = re.sub(r"[^a-zA-Z0-9_.-]", "_", domain)
+        filename = f"{safe_domain}_{url_hash}.md"
+        relative_path = f"documents/external/{filename}"
+
+        # Skip if file already exists (first save wins)
+        full_path = self.workspace_manager.get_path(relative_path)
+        if full_path.exists():
+            return relative_path
+
+        # Ensure directory exists
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build YAML front-matter
+        front_matter_lines = [
+            "---",
+            f"url: {url}",
+        ]
+        if title:
+            # Escape quotes in title for YAML
+            safe_title = title.replace('"', '\\"')
+            front_matter_lines.append(f'title: "{safe_title}"')
+        front_matter_lines.append(
+            f"fetched_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        )
+        if source_id is not None:
+            front_matter_lines.append(f"source_id: {source_id}")
+        front_matter_lines.append("---")
+        front_matter_lines.append("")
+
+        file_content = "\n".join(front_matter_lines) + content
+
+        try:
+            self.workspace_manager.write_file(relative_path, file_content)
+            logger.debug(f"Saved web content to {relative_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save web content to disk: {e}")
+            return None
+
+        return relative_path
 
     def close_citation_engine(self) -> None:
         """Close CitationEngine connection if open.

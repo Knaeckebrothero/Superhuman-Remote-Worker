@@ -1147,6 +1147,66 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         logger.debug(f"Loaded {len(self._tools)} tools")
 
+        # Auto-register input documents as CitationEngine sources
+        self._register_initial_documents(context)
+
+    def _register_initial_documents(self, context: "ToolContext") -> None:
+        """Register input documents in documents/ as CitationEngine sources.
+
+        Scans the documents/ directory for supported file types and registers
+        each as a source, enabling hybrid vector search via search_library.
+        Skips documents/external/ (web content registered separately).
+
+        Non-fatal: failures are logged but do not block job execution.
+
+        Args:
+            context: ToolContext with workspace and citation engine
+        """
+        if not context.has_workspace():
+            return
+
+        SUPPORTED_EXTENSIONS = {
+            ".pdf", ".txt", ".md", ".docx", ".doc", ".pptx",
+            ".html", ".htm", ".csv", ".json", ".xml", ".rtf",
+        }
+
+        try:
+            docs_path = context.workspace_manager.get_path("documents")
+            if not docs_path.exists():
+                return
+
+            registered_count = 0
+            for file_path in sorted(docs_path.rglob("*")):
+                if not file_path.is_file():
+                    continue
+
+                # Skip documents/external/ (web content, registered by research tools)
+                try:
+                    file_path.relative_to(docs_path / "external")
+                    continue
+                except ValueError:
+                    pass  # Not under external/, proceed
+
+                # Filter to supported extensions
+                if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                    continue
+
+                try:
+                    context.get_or_register_doc_source(
+                        str(file_path), name=file_path.name
+                    )
+                    registered_count += 1
+                except Exception as e:
+                    logger.debug(f"Could not register document {file_path.name}: {e}")
+
+            if registered_count > 0:
+                logger.info(
+                    f"Auto-registered {registered_count} input document(s) as citation sources"
+                )
+
+        except Exception as e:
+            logger.warning(f"Auto-registration of input documents failed (non-fatal): {e}")
+
     def _create_datasource_connection(self, ds: Dict[str, Any]) -> Any:
         """Create a connection to an external datasource.
 

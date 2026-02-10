@@ -293,6 +293,17 @@ def _direct_web_search(
                     except Exception as e:
                         logger.warning(f"Could not register web source {url}: {e}")
 
+        # Save web content to disk for persistence
+        if context is not None:
+            for r in results:
+                url = r.get('url', '')
+                if url:
+                    content = r.get('raw_content', r.get('content', ''))
+                    if content and len(content) > 50:
+                        title = r.get('title', 'Untitled')
+                        source_id = next((sid for u, sid in registered_sources if u == url), None)
+                        context.save_web_content_to_disk(url, content, title=title, source_id=source_id)
+
         # Format output
         result = f"Web Search Results for: {query}\n"
         if registered_sources:
@@ -394,6 +405,15 @@ def _extract_webpage(
                         registered.append((url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register source {url}: {e}")
+
+        # Save web content to disk for persistence (before truncation)
+        if context is not None:
+            for r in results:
+                url = r.get("url", "")
+                raw = r.get("raw_content", "")
+                if url and raw:
+                    source_id = next((sid for u, sid in registered if u == url), None)
+                    context.save_web_content_to_disk(url, raw, source_id=source_id)
 
         # Format output
         output = f"Extracted Content from {len(results)} URL(s)"
@@ -503,6 +523,15 @@ def _crawl_website(
                         registered.append((page_url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register source {page_url}: {e}")
+
+        # Save web content to disk for persistence (before truncation)
+        if context is not None:
+            for r in results:
+                page_url = r.get("url", "")
+                raw = r.get("raw_content", "")
+                if page_url and raw:
+                    source_id = next((sid for u, sid in registered if u == page_url), None)
+                    context.save_web_content_to_disk(page_url, raw, source_id=source_id)
 
         # Format output
         output = f"Website Crawl Results for: {url}\n"

@@ -263,6 +263,9 @@ class OrchestratorClient:
         """Run the heartbeat loop.
 
         Sends heartbeats at the configured interval until stopped.
+        If not yet registered, attempts registration each interval before
+        switching to heartbeat mode. This makes startup order irrelevant
+        and recovers from transient registration failures.
 
         Args:
             get_status: Callback that returns current agent status
@@ -274,11 +277,18 @@ class OrchestratorClient:
 
         while not self._stop_heartbeat.is_set():
             try:
-                status = get_status()
-                job_id = get_job_id()
-                metrics = get_metrics()
+                if not self.agent_id:
+                    # Not registered yet — keep trying
+                    if await self.register():
+                        logger.info("Registration succeeded, switching to heartbeat mode")
+                    else:
+                        logger.warning("Registration attempt failed, will retry next interval")
+                else:
+                    status = get_status()
+                    job_id = get_job_id()
+                    metrics = get_metrics()
 
-                await self.heartbeat(status, job_id, metrics)
+                    await self.heartbeat(status, job_id, metrics)
 
             except Exception as e:
                 logger.error(f"Error in heartbeat loop: {e}")

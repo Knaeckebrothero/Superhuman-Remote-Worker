@@ -55,7 +55,7 @@ class WorkspaceManagerConfig:
     # Git versioning settings
     git_versioning: bool = True  # Enable git versioning for workspace history
     git_ignore_patterns: List[str] = field(
-        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
     )
 
     # Git remote URL for workspace delivery (set by orchestrator via Gitea)

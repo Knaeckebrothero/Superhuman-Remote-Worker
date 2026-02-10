@@ -96,7 +96,7 @@ def _get_browser_config(context: ToolContext, downloads_path: Optional[Path] = N
     # Downloads directory
     if downloads_path is None:
         if context.has_workspace():
-            downloads_path = Path(context.workspace_manager.workspace_dir) / "documents"
+            downloads_path = context.workspace_manager.get_path("documents")
         else:
             downloads_path = Path("./downloads")
 
@@ -125,7 +125,7 @@ def _get_browser_config(context: ToolContext, downloads_path: Optional[Path] = N
 def _get_documents_dir(context: ToolContext) -> Path:
     """Get the documents directory from workspace, or a fallback."""
     if context.has_workspace():
-        return Path(context.workspace_manager.workspace_dir) / "documents"
+        return context.workspace_manager.get_path("documents")
     return Path("./downloads")
 
 
