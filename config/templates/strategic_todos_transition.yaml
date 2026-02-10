@@ -1,36 +1,140 @@
 # Strategic todos for phase transitions (between tactical phases)
 # These todos guide the agent through a review-reflect-adapt cycle
 # that ensures quality planning and accurate progress tracking.
+#
+# IMPORTANT: The PLAN todo (id 4) starts with the stop condition.
+# If all deliverables are done, call job_complete. Do NOT invent new work.
 todos:
   - id: 1
     content: >-
-      REVIEW: Use git_log (max_count=15) to see commits from the previous
-      tactical phase. Then use git_diff with the phase tag (e.g., phase_2_start)
-      to see all changes. Write a phase retrospective to archive/phase_N_retrospective.md
-      covering: (1) what was accomplished with specific file changes, (2) what
-      was attempted but didn't work, (3) unexpected discoveries or blockers,
-      (4) how many todos were completed vs planned, and (5) time/effort observations.
+      REVIEW: Examine what the previous tactical phase actually accomplished
+      using git evidence — not memory (which may be wrong after context compaction).
+
+      Steps:
+      (1) Use git_tags() to confirm phase boundary tags exist.
+      (2) Use git_log(max_count=15) to see commits from the previous phase.
+      (3) Use git_diff with the phase start tag (e.g., ref="phase_N_start") to see
+          all file changes made during the phase.
+
+      Then write a retrospective to archive/phase_N_retrospective.md with these
+      five sections:
+      1. **Accomplished**: What was completed, with specific file paths that changed.
+      2. **Incomplete**: What was attempted but didn't fully succeed, and why.
+      3. **Discoveries**: Unexpected findings or blockers encountered.
+      4. **Todo Stats**: How many todos were completed vs planned (e.g., "8/10 completed").
+      5. **Deliverable Status**: Which deliverables from instructions.md are now done
+         vs still remaining. List them explicitly.
+
+      COMPLETION CRITERIA: archive/phase_N_retrospective.md written with all 5 sections,
+      backed by git evidence (commit hashes, file paths from git_diff).
+
+      ANTI-PATTERNS:
+      - Do NOT write the retrospective from memory alone — use git_log and git_diff.
+      - Do NOT skip section 5 (Deliverable Status). This is what determines whether
+        the job is done in todo 4.
+
   - id: 2
     content: >-
-      REFLECT on workspace.md: Read it fully, then REWRITE it (don't append).
-      Remove redundant info already tracked in plan.md (like phase completion status).
-      Merge related items. Keep only: current blockers, key decisions with reasoning,
-      entity references needed for lookups, and critical context that survives compaction.
-      Target: under 50 lines of high-value content. Delete stale observations.
+      REFLECT on workspace.md: Read it fully, then REWRITE it from scratch.
+      Do NOT append — replace the entire content.
+
+      workspace.md is injected into every LLM call. Stale or bloated content wastes
+      tokens and confuses future decisions. After rewriting, it should contain ONLY:
+      - "## Pinned Instructions" — the rules from instructions.md (re-read instructions.md
+        if you're unsure these are still accurate and complete)
+      - "## Key Decisions" — significant choices made so far, with brief reasoning
+      - "## Entities" — key entities being tracked (if applicable)
+      - "## Critical Context" — current blockers, important discoveries, anything
+        that must survive context compaction
+
+      Remove: progress percentages, phase completion status, todo summaries,
+      document inventories, anything already tracked in plan.md.
+
+      COMPLETION CRITERIA: workspace.md fully rewritten (not appended to),
+      under 50 lines, "## Pinned Instructions" section present and accurate.
+
+      ANTI-PATTERNS:
+      - Do NOT append new sections to the existing content. REWRITE the whole file.
+      - Do NOT duplicate information from plan.md (phase status, progress tracking).
+      - Do NOT let workspace.md grow beyond 50 lines. Prune aggressively.
+
   - id: 3
     content: >-
-      ADAPT plan.md based on the retrospective: (1) Mark completed phases with
-      actual outcomes (not just "done"). (2) Evaluate phase sizing - were 20 todos
-      too many? Should next phase be smaller? (3) If the phase is incomplete,
-      create a continuation phase (e.g., "Phase 2.5: Complete remaining extraction")
-      rather than forcing everything into the next planned phase. (4) Adjust
-      upcoming phases based on discoveries - maybe a planned phase is now unnecessary,
-      or a new phase is needed. The plan is a living document, not a contract.
+      ADAPT plan.md based on the retrospective. Read plan.md, then update it.
+
+      For each action below, REWRITE the relevant parts of plan.md (don't append
+      a second copy of the plan):
+      (1) Mark completed phases with actual outcomes — not just "done" but what
+          was produced (e.g., "Phase 2: Completed. Produced output/analysis.md
+          with 15 requirement entries extracted from 8 source documents.").
+      (2) Evaluate phase sizing: Was the todo count appropriate? If the phase had
+          20 todos and only 12 were completed, plan smaller next time. If 10 todos
+          were done in the first half, plan bigger.
+      (3) If the phase was incomplete, create a continuation phase (e.g., "Phase 2.5:
+          Complete remaining extraction") rather than overloading the next phase.
+      (4) Remove phases that are no longer needed based on what you've learned.
+      (5) Cross-check remaining phases against instructions.md — are all required
+          deliverables still covered by at least one upcoming phase?
+
+      COMPLETION CRITERIA: plan.md updated with outcomes on completed phases,
+      phase sizing adjusted, upcoming phases verified against instructions.md.
+
+      ANTI-PATTERNS:
+      - Do NOT append a new copy of the plan below the existing one. REWRITE in place.
+      - Do NOT add phases for housekeeping tasks (archiving, cleanup, packaging,
+        PDF generation, database status updates, file reorganization). The system
+        handles versioning and delivery automatically via git and Gitea.
+      - Do NOT keep phases that no longer map to a required deliverable.
+
   - id: 4
     content: >-
-      PLAN the next phase: Based on the adapted plan, create todos using
-      next_phase_todos. Consider: (1) Start with 5-10 todos for complex work,
-      up to 15-20 only for simple repetitive tasks. (2) Each todo should be
-      completable in 1-3 tool calls. (3) Include a verification todo at the end
-      to confirm phase goals were met. If the plan is fully executed and verified,
-      call job_complete instead.
+      PLAN OR COMPLETE — Read this todo carefully. The stop condition comes FIRST.
+
+      === STOP CONDITION (check this FIRST) ===
+
+      Re-read your "## Pinned Instructions" in workspace.md (or re-read instructions.md
+      directly). List every required deliverable. Then check which ones actually exist
+      in output/ using list_files. If ALL required deliverables exist AND the REVIEW
+      phase (todo 1) confirmed their quality, then the job is DONE.
+
+      Call job_complete with:
+      - summary: What was accomplished across all phases
+      - deliverables: List of output file paths (e.g., ["output/report.md", "output/data.csv"])
+      - confidence: Your honest quality assessment (0.0-1.0)
+      - notes: Any caveats, known gaps, or areas a reviewer should check
+
+      The system will freeze the job, commit all workspace files, and push everything
+      to Gitea for human review. You do NOT need to:
+      - Archive or reorganize files (git handles history)
+      - Generate PDFs or summaries (the reviewer reads your output directly)
+      - Update database status (the system does this automatically)
+      - Clean up temporary files (the workspace is preserved as-is)
+
+      === CONTINUE CONDITION (only if deliverables are still missing) ===
+
+      If required deliverables are still missing:
+
+      (1) FIRST read_file('todo_guide.md') — the next_phase_todos tool will reject
+          your call if you haven't read the guide recently.
+      (2) Then call next_phase_todos to create the next tactical phase.
+
+      Guidelines:
+      - Target 5 todos per phase — short phases, frequent reviews
+      - Each todo should be completable in 1-3 tool calls
+      - Each todo must be specific: name exact files, sections, tools, and outcomes
+      - Each todo must directly advance a deliverable from instructions.md
+      - Include a verification todo at the end of the list
+      - If the next work involves an unfamiliar topic, make it a RESEARCH phase
+        (web search first, then summarize findings) before an execution phase
+
+      COMPLETION CRITERIA: Either job_complete called (job is done) OR
+      next_phase_todos called (more work needed). Exactly one of these must happen.
+
+      ANTI-PATTERNS:
+      - Do NOT skip reading todo_guide.md — the tool enforces this.
+      - Do NOT create a new phase if all deliverables already exist. Call job_complete.
+      - Do NOT continue "just because there might be more to do" — check the instructions.
+      - Do NOT create todos for archiving, cleanup, packaging, PDF generation,
+        status updates, or file reorganization. These are never part of the job.
+      - Do NOT invent deliverables not mentioned in instructions.md.
+      - Do NOT create a "final review" phase if the current review already confirmed quality.

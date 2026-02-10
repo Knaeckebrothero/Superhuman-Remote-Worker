@@ -2161,7 +2161,7 @@ async def send_builder_message(
         Server-side tools (like web_search) are executed between LLM calls.
         Artifact mutation tools are forwarded to the frontend via SSE.
         """
-        MAX_ITERATIONS = 5
+        MAX_ITERATIONS = 50
         loop_messages = list(context_messages)
         final_text = ""
         final_tool_calls = []
@@ -2171,6 +2171,7 @@ async def send_builder_message(
             model = get_builder_model()
 
             for iteration in range(MAX_ITERATIONS):
+                yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': 'Analyzing request...' if iteration == 0 else 'Processing tool results...'})}\n\n"
                 turn_text = ""
                 turn_tool_calls = []  # {"name", "args", "id"} dicts
                 error_occurred = False
@@ -2215,10 +2216,8 @@ async def send_builder_message(
                 if error_occurred:
                     break
 
-                # Check if any server-side tools were called
-                server_calls = [tc for tc in turn_tool_calls if tc["name"] in SERVER_SIDE_TOOLS]
-                if not server_calls:
-                    # No server-side tools — we're done
+                # If no tool calls at all, the LLM is done (pure text response)
+                if not turn_tool_calls:
                     break
 
                 # Build assistant message and tool results for next iteration

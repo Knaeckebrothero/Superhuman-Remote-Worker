@@ -3,11 +3,24 @@ import { FormsModule } from '@angular/forms';
 import { JobArtifactService } from '../../core/services/job-artifact.service';
 import { BuilderStreamService, BuilderMessage } from '../../core/services/builder-stream.service';
 
+type BuilderStepType = 'thought' | 'tool_call' | 'tool_result';
+type BuilderStepStatus = 'active' | 'complete';
+
+interface BuilderStep {
+  id: string;
+  type: BuilderStepType;
+  title: string;
+  content: string;
+  status: BuilderStepStatus;
+  timestamp: number;
+}
+
 /** Local chat message for display purposes. */
 interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   toolCalls?: { tool: string; args: Record<string, unknown> }[];
+  steps?: BuilderStep[];
 }
 
 @Component({
@@ -49,6 +62,30 @@ interface ChatMessage {
                 {{ msg.role === 'user' ? 'person' : 'smart_toy' }}
               </div>
               <div class="message-body">
+                @if (msg.steps && msg.steps.length > 0) {
+                  <details class="thought-process-panel">
+                    <summary class="thought-process-summary">
+                      <span class="thought-process-icon">psychology</span>
+                      <span>Thought process ({{ msg.steps.length }} steps)</span>
+                      <span class="chevron-icon">expand_more</span>
+                    </summary>
+                    <div class="thought-process-steps">
+                      @for (step of msg.steps; track step.id) {
+                        <details class="step-item">
+                          <summary class="step-header" [class]="'step-header--' + step.type">
+                            <span class="step-icon" [class]="'step-icon--' + step.type">
+                              {{ getStepIcon(step.type) }}
+                            </span>
+                            <span class="step-title">{{ step.title }}</span>
+                          </summary>
+                          @if (step.content) {
+                            <div class="step-content">{{ step.content }}</div>
+                          }
+                        </details>
+                      }
+                    </div>
+                  </details>
+                }
                 <div class="message-content">{{ msg.content }}</div>
                 @if (msg.toolCalls && msg.toolCalls.length > 0) {
                   <div class="tool-calls">
@@ -64,20 +101,36 @@ interface ChatMessage {
             </div>
           }
 
-          @if (streamingText()) {
+          @if (streamingText() || streamingSteps().length > 0) {
             <div class="message message-assistant">
               <div class="message-avatar">smart_toy</div>
               <div class="message-body">
-                <div class="message-content streaming">{{ streamingText() }}<span class="cursor-blink">|</span></div>
+                @if (streamingSteps().length > 0) {
+                  <details class="thought-process-panel" open>
+                    <summary class="thought-process-summary">
+                      <span class="thought-process-icon">psychology</span>
+                      <span>Thought process ({{ streamingSteps().length }} steps)</span>
+                      <span class="spinner-small"></span>
+                    </summary>
+                    <div class="thought-process-steps">
+                      @for (step of streamingSteps(); track step.id) {
+                        <div class="step-item-flat" [class]="'step-flat--' + step.type">
+                          <span class="step-icon" [class]="'step-icon--' + step.type">
+                            {{ getStepIcon(step.type) }}
+                          </span>
+                          <span class="step-title">{{ step.title }}</span>
+                          @if (step.status === 'active') {
+                            <span class="spinner-tiny"></span>
+                          }
+                        </div>
+                      }
+                    </div>
+                  </details>
+                }
+                @if (streamingText()) {
+                  <div class="message-content streaming">{{ streamingText() }}<span class="cursor-blink">|</span></div>
+                }
               </div>
-            </div>
-          }
-
-          @if (researchStatus()) {
-            <div class="research-status">
-              <span class="research-icon">travel_explore</span>
-              <span class="research-text">{{ researchStatus() }}</span>
-              <span class="spinner-small"></span>
             </div>
           }
         </div>
@@ -345,6 +398,142 @@ interface ChatMessage {
         font-size: 13px;
       }
 
+      /* Thought Process Panel */
+      .thought-process-panel {
+        border-radius: 8px;
+        background: rgba(139, 92, 246, 0.06);
+        border: 1px solid rgba(139, 92, 246, 0.15);
+        overflow: hidden;
+      }
+
+      .thought-process-panel[open] > .thought-process-summary .chevron-icon {
+        transform: rotate(180deg);
+      }
+
+      .thought-process-summary {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: #a78bfa;
+        cursor: pointer;
+        user-select: none;
+        list-style: none;
+      }
+
+      .thought-process-summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .thought-process-summary:hover {
+        background: rgba(139, 92, 246, 0.08);
+      }
+
+      .thought-process-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+        flex-shrink: 0;
+      }
+
+      .chevron-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+        margin-left: auto;
+        transition: transform 0.2s ease;
+      }
+
+      .thought-process-steps {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 0 6px 6px;
+      }
+
+      /* Individual step (collapsible, for finalized messages) */
+      .step-item {
+        border-radius: 6px;
+        overflow: hidden;
+      }
+
+      .step-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        font-size: 11px;
+        cursor: pointer;
+        user-select: none;
+        list-style: none;
+        border-radius: 6px;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .step-header::-webkit-details-marker {
+        display: none;
+      }
+
+      .step-header:hover {
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .step-content {
+        padding: 6px 8px 8px 36px;
+        font-size: 11px;
+        line-height: 1.4;
+        color: var(--text-muted, #6c7086);
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+
+      /* Individual step (flat, non-collapsible, for streaming) */
+      .step-item-flat {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 8px;
+        font-size: 11px;
+        border-radius: 6px;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      /* Step icons with gradient backgrounds */
+      .step-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 14px;
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        color: #fff;
+      }
+
+      .step-icon--thought {
+        background: linear-gradient(135deg, #8b5cf6, #a78bfa);
+      }
+
+      .step-icon--tool_call {
+        background: linear-gradient(135deg, #f59e0b, #fbbf24);
+      }
+
+      .step-icon--tool_result {
+        background: linear-gradient(135deg, #10b981, #34d399);
+      }
+
+      .step-title {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       /* Session loading */
       .session-loading {
         display: flex;
@@ -505,44 +694,28 @@ interface ChatMessage {
       }
 
       .spinner-small {
-        width: 16px;
-        height: 16px;
-        border: 2px solid rgba(0, 0, 0, 0.2);
+        width: 14px;
+        height: 14px;
+        border: 2px solid rgba(167, 139, 250, 0.2);
+        border-top-color: #a78bfa;
+        border-radius: 50%;
+        animation: spin 0.6s linear infinite;
+        flex-shrink: 0;
+      }
+
+      .spinner-tiny {
+        width: 12px;
+        height: 12px;
+        border: 1.5px solid rgba(255, 255, 255, 0.15);
         border-top-color: currentColor;
         border-radius: 50%;
         animation: spin 0.6s linear infinite;
+        flex-shrink: 0;
+        margin-left: auto;
       }
 
       @keyframes spin {
         to { transform: rotate(360deg); }
-      }
-
-      .research-status {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 8px 14px;
-        border-radius: 8px;
-        background: rgba(250, 179, 135, 0.08);
-        border: 1px solid rgba(250, 179, 135, 0.15);
-        font-size: 12px;
-        color: #fab387;
-        align-self: flex-start;
-        max-width: 80%;
-      }
-
-      .research-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-        flex-shrink: 0;
-      }
-
-      .research-text {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
       }
     `,
   ],
@@ -556,13 +729,14 @@ export class InstructionBuilderComponent implements AfterViewChecked {
 
   readonly messages = signal<ChatMessage[]>([]);
   readonly streamingText = signal<string>('');
-  readonly researchStatus = signal<string | null>(null);
+  readonly streamingSteps = signal<BuilderStep[]>([]);
   readonly error = signal<string | null>(null);
   readonly isCreatingSession = signal(false);
   readonly lastFailedMessage = signal<string | null>(null);
 
   inputText = '';
   private shouldScrollToBottom = false;
+  private stepCounter = 0;
 
   ngAfterViewChecked(): void {
     if (this.shouldScrollToBottom) {
@@ -607,43 +781,69 @@ export class InstructionBuilderComponent implements AfterViewChecked {
 
   private async streamResponse(sessionId: string, text: string): Promise<void> {
     this.streamingText.set('');
+    this.streamingSteps.set([]);
+    this.stepCounter = 0;
     const toolCalls: { tool: string; args: Record<string, unknown> }[] = [];
 
     await this.stream.sendMessage(sessionId, text, {
       onToken: (token) => {
+        // Complete any active thought step when text starts arriving
+        this.completeActiveSteps('thought');
         this.streamingText.update((current) => current + token);
+        this.shouldScrollToBottom = true;
+      },
+      onStep: (type, title) => {
+        // Complete any previously active steps
+        this.completeActiveSteps();
+        this.addStep(type as BuilderStepType, title, '', 'active');
         this.shouldScrollToBottom = true;
       },
       onToolCall: (tool, args) => {
         toolCalls.push({ tool, args });
-      },
-      onToolExecuting: (tool, args) => {
-        if (tool === 'web_search') {
-          this.researchStatus.set(`Researching: ${(args as Record<string, string>)['query']}...`);
-        }
+        // Artifact mutation tools appear as immediately-complete tool_call steps
+        this.completeActiveSteps();
+        this.addStep('tool_call', this.formatToolName(tool), JSON.stringify(args, null, 2), 'complete');
         this.shouldScrollToBottom = true;
       },
-      onToolResult: () => {
-        this.researchStatus.set(null);
+      onToolExecuting: (tool, args) => {
+        // Complete any active thought step and show executing tool
+        this.completeActiveSteps();
+        const title = tool === 'web_search'
+          ? `Searching: ${(args as Record<string, string>)['query']}`
+          : `Running: ${this.formatToolName(tool)}`;
+        this.addStep('tool_call', title, JSON.stringify(args, null, 2), 'active');
+        this.shouldScrollToBottom = true;
+      },
+      onToolResult: (tool) => {
+        // Complete the active tool_call step and add a result step
+        this.completeActiveSteps('tool_call');
+        this.addStep('tool_result', `Result: ${this.formatToolName(tool)}`, '', 'complete');
+        this.shouldScrollToBottom = true;
       },
       onDone: () => {
         const content = this.streamingText();
+        const steps = this.streamingSteps();
+        // Mark remaining active steps as complete
+        const finalSteps = steps.map((s) => ({ ...s, status: 'complete' as BuilderStepStatus }));
         this.streamingText.set('');
-        this.researchStatus.set(null);
+        this.streamingSteps.set([]);
         this.messages.update((msgs) => [
           ...msgs,
           {
             role: 'assistant',
             content: content || '(applied changes)',
             toolCalls: toolCalls.length > 0 ? [...toolCalls] : undefined,
+            steps: finalSteps.length > 0 ? finalSteps : undefined,
           },
         ]);
         this.shouldScrollToBottom = true;
       },
       onError: (message) => {
         const content = this.streamingText();
+        const steps = this.streamingSteps();
+        const finalSteps = steps.map((s) => ({ ...s, status: 'complete' as BuilderStepStatus }));
         this.streamingText.set('');
-        this.researchStatus.set(null);
+        this.streamingSteps.set([]);
         if (content) {
           this.messages.update((msgs) => [
             ...msgs,
@@ -651,6 +851,7 @@ export class InstructionBuilderComponent implements AfterViewChecked {
               role: 'assistant',
               content,
               toolCalls: toolCalls.length > 0 ? [...toolCalls] : undefined,
+              steps: finalSteps.length > 0 ? finalSteps : undefined,
             },
           ]);
         }
@@ -691,6 +892,40 @@ export class InstructionBuilderComponent implements AfterViewChecked {
 
   formatToolName(tool: string): string {
     return tool.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+
+  getStepIcon(type: BuilderStepType): string {
+    switch (type) {
+      case 'thought': return 'psychology';
+      case 'tool_call': return 'build';
+      case 'tool_result': return 'check_circle';
+    }
+  }
+
+  private addStep(type: BuilderStepType, title: string, content: string, status: BuilderStepStatus): void {
+    const step: BuilderStep = {
+      id: `step-${++this.stepCounter}`,
+      type,
+      title,
+      content,
+      status,
+      timestamp: Date.now(),
+    };
+    this.streamingSteps.update((steps) => [...steps, step]);
+  }
+
+  private completeActiveSteps(typeFilter?: BuilderStepType): void {
+    this.streamingSteps.update((steps) => {
+      let changed = false;
+      const updated = steps.map((s) => {
+        if (s.status === 'active' && (!typeFilter || s.type === typeFilter)) {
+          changed = true;
+          return { ...s, status: 'complete' as BuilderStepStatus };
+        }
+        return s;
+      });
+      return changed ? updated : steps;
+    });
   }
 
   private resetTextareaHeight(): void {
