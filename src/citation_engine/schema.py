@@ -140,7 +140,12 @@ CREATE TABLE IF NOT EXISTS sources (
 );
 
 -- Index on identifier for quick lookups
-CREATE INDEX IF NOT EXISTS idx_sources_job_id ON sources(job_id);
+-- job_id index: column may not exist if v2 migration already ran (uses job_sources join table)
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_sources_job_id ON sources(job_id);
+EXCEPTION
+    WHEN undefined_column THEN null;
+END $$;
 CREATE INDEX IF NOT EXISTS idx_sources_identifier ON sources(identifier);
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
 CREATE INDEX IF NOT EXISTS idx_sources_name ON sources(name);
@@ -385,7 +390,7 @@ MIGRATIONS: list[tuple[int, str, str, str]] = [
             job_id UUID NOT NULL,
             chunk_index INTEGER NOT NULL DEFAULT 0,
             chunk_text TEXT NOT NULL,
-            embedding vector,
+            embedding vector(1536),
             created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
             UNIQUE(source_id, job_id, chunk_index)
         );

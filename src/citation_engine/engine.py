@@ -911,6 +911,10 @@ class CitationEngine:
         """
         Extract text content from a DOCX file using docx2txt.
 
+        Falls back to direct XML parsing when the archive uses a non-standard
+        main document name (e.g. ``word/document2.xml`` instead of
+        ``word/document.xml``), which some newer Word versions produce.
+
         Args:
             file_path: Path to the DOCX file
 
@@ -921,7 +925,12 @@ class CitationEngine:
             import docx2txt
 
             log.debug(f"Extracting content from DOCX: {file_path}")
-            content = docx2txt.process(file_path)
+            try:
+                content = docx2txt.process(file_path)
+            except KeyError:
+                # docx2txt hard-codes 'word/document.xml'; some files use
+                # 'word/document2.xml' or similar. Fall back to direct extraction.
+                content = self._extract_docx_fallback(file_path)
             log.debug(f"Extracted {len(content)} characters from DOCX")
             return content
 
@@ -930,6 +939,40 @@ class CitationEngine:
             raise ImportError(
                 "docx2txt is required for DOCX extraction. Install it with: pip install docx2txt"
             ) from e
+
+    @staticmethod
+    def _extract_docx_fallback(file_path: str) -> str:
+        """Extract text from a DOCX whose main document entry is non-standard."""
+        import re
+        import zipfile
+        from xml.etree.ElementTree import XML
+
+        log.debug(f"Falling back to direct XML extraction for: {file_path}")
+        nsmap = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        text_parts: list[str] = []
+
+        with zipfile.ZipFile(file_path) as zf:
+            # Find all word/document*.xml entries
+            doc_entries = sorted(
+                n for n in zf.namelist() if re.match(r"word/document\d*\.xml$", n)
+            )
+            if not doc_entries:
+                raise FileNotFoundError(
+                    f"No word/document*.xml found in {file_path}"
+                )
+
+            for entry in doc_entries:
+                tree = XML(zf.read(entry))
+                for para in tree.iter(f"{nsmap}p"):
+                    texts = [
+                        node.text
+                        for node in para.iter(f"{nsmap}t")
+                        if node.text
+                    ]
+                    if texts:
+                        text_parts.append("".join(texts))
+
+        return "\n\n".join(text_parts)
 
     def _fetch_web_content(self, url: str) -> tuple[str, dict[str, Any]]:
         """
