@@ -112,6 +112,14 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             )
         """
         try:
+            # Enforce read-before-create: AI must read todo_guide.md first
+            if not context.was_recently_read("todo_guide.md"):
+                return (
+                    "Error: You must read_file('todo_guide.md') before creating todos. "
+                    "The guide contains critical instructions on how to craft effective, "
+                    "focused todos. Read it first, then call next_phase_todos again."
+                )
+
             # Convert to list if it's a string (JSON)
             if isinstance(todos, str):
                 import json

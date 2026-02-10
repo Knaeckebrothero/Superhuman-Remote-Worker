@@ -65,6 +65,8 @@ class ToolContext:
     _source_registry: Dict[str, int] = field(default_factory=dict)  # path/url -> source_id
     _inaccessible_sources: Dict[str, str] = field(default_factory=dict)  # url -> error message
     _recent_reads: Deque[str] = field(default_factory=lambda: deque(maxlen=10))  # Recently read file paths
+    _current_phase: Optional[str] = None
+    _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -359,6 +361,29 @@ class ToolContext:
             Number of recent reads to track (default 10)
         """
         return self.get_config("read_tracking_limit", 10)
+
+    def set_current_phase(self, phase: str) -> None:
+        """Set the current execution phase for phase-aware behavior.
+
+        Args:
+            phase: Phase name ("strategic" or "tactical")
+        """
+        self._current_phase = phase
+
+    def get_phase_multimodal(self) -> bool:
+        """Get the effective multimodal setting for the current phase.
+
+        If an LLMConfig is available and phase is set, uses the phase-specific
+        config (which may override the base multimodal setting). Otherwise
+        falls back to the static config value.
+
+        Returns:
+            True if the current phase's model supports multimodal input
+        """
+        if self._llm_config is not None and self._current_phase is not None:
+            phase_config = self._llm_config.get_phase_config(self._current_phase)
+            return phase_config.multimodal
+        return self.get_config("multimodal", False)
 
     async def update_job_status(
         self,

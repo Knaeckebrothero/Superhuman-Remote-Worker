@@ -98,9 +98,6 @@ def create_file_tools(context: ToolContext) -> List[Any]:
     # Initialize PDF reader with word limit
     pdf_reader = PDFReader(max_words_per_read=max_read_words)
 
-    # Check if model is multimodal (from agent config)
-    is_multimodal = context.get_config("multimodal", False)
-
     # Line-based reading constants (matching Claude Code behavior)
     DEFAULT_LINE_LIMIT = 2000
     MAX_LINE_LIMIT = 2000
@@ -157,7 +154,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         For multimodal models: Returns base64-encoded image data.
         For text-only models: Returns AI-generated description.
         """
-        if is_multimodal:
+        if context.get_phase_multimodal():
             # Return image for multimodal model to see directly
             try:
                 image_data = full_path.read_bytes()
@@ -239,7 +236,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 logger.warning(f"Could not render page {page_num} of {full_path.name}: {e}")
                 return ""  # No visual content available
 
-            if is_multimodal:
+            if context.get_phase_multimodal():
                 # Return base64 image for multimodal model
                 base64_image = base64.b64encode(page_image).decode()
                 return (
