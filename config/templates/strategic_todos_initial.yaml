@@ -1,31 +1,117 @@
 # Strategic todos for job initialization (first strategic phase)
 # These todos guide the agent through initial workspace setup,
 # plan creation, and first phase todo generation.
+#
+# Each todo includes explicit completion criteria and anti-patterns
+# to prevent scope creep and busywork phases.
 todos:
   - id: 1
     content: >-
-      EXPLORE: Read instructions.md to understand the task. List available
-      tools in the tools/ directory. Check documents/ for input files.
-      Understand the scope before planning. Then PIN critical rules:
-      extract core constraints, required output formats, and style
-      guidelines from instructions.md and write them to workspace.md
-      under a "## Pinned Instructions" section. These survive context
-      compaction; the original instructions.md content will not.
+      EXPLORE: Thoroughly understand the task before doing anything else.
+
+      Steps:
+      (1) Use read_file to read instructions.md in full. Do NOT skim — read every line.
+      (2) Use list_files on the tools/ directory to understand your available capabilities.
+      (3) Use list_files on documents/ to inventory all input materials.
+
+      Then PIN critical rules to workspace.md under a "## Pinned Instructions" section.
+      Extract and write down:
+      - Required output files (exact paths and formats from instructions.md)
+      - Style/language constraints (tone, formatting, language requirements)
+      - Hard rules (things explicitly forbidden or required)
+      - Delivery expectations (what "done" looks like)
+
+      These pinned instructions survive context compaction; the original instructions.md
+      content will NOT. If you don't pin it now, you may forget it later.
+
+      COMPLETION CRITERIA: workspace.md exists and contains a "## Pinned Instructions"
+      section with the four categories above populated from instructions.md.
+
+      ANTI-PATTERNS:
+      - Do NOT start writing output files yet. This phase is read-only exploration.
+      - Do NOT skip reading instructions.md — every task failure starts with skipping this.
+
   - id: 2
     content: >-
-      PLAN: Create plan.md with phases to complete the task. For each phase,
-      estimate complexity: exploratory/complex (5-10 todos), moderate (10-15),
-      or simple/repetitive (15-20). Plans are living documents - they WILL
-      be adapted as you learn. Don't over-plan; focus on the first 2-3 phases.
+      PLAN: Create plan.md with a phased execution strategy.
+
+      Structure the plan as a phase table where each phase has:
+      - Phase name and description
+      - Phase type: research, elaboration, execution, integration, or verification
+      - Expected output: the specific deliverable(s) this phase produces
+
+      PHASE SIZING: Target 5 todos per tactical phase. Prefer many short phases
+      over few long ones. Each phase should be one coherent unit of work (e.g.,
+      "research the topic," "write section 3," "verify chapter 2 citations").
+
+      PHASE ORDERING: Don't jump straight to execution. Plan research phases first
+      to gather context, then elaboration phases to detail the approach, then
+      execution phases to produce deliverables. Use web_search before writing about
+      any topic — your training data may be outdated.
+
+      Focus on the first 2-3 phases in detail. Later phases can be sketches — they
+      WILL be adapted as you learn. Don't over-plan.
+
+      Every phase must map to a concrete deliverable or milestone from instructions.md.
+      If a phase doesn't produce something listed in the instructions, it shouldn't exist.
+
+      COMPLETION CRITERIA: plan.md exists with at least 2 phases defined, each with
+      an expected deliverable that traces back to instructions.md.
+
+      ANTI-PATTERNS:
+      - Do NOT plan "cleanup", "archiving", "packaging", or "final review" phases.
+        Git versioning handles all history automatically, and Gitea handles delivery.
+        The system pushes your workspace to Gitea when you call job_complete.
+      - Do NOT create phases that don't produce deliverables listed in instructions.md.
+      - Do NOT over-plan — you will adapt the plan after every tactical phase.
+
   - id: 3
     content: >-
-      INITIALIZE workspace.md: Set up the Status section with current phase
-      and "Starting" progress. Add any Key Decisions made during planning
-      (with reasoning). Add Entities section only if you already identified
-      key entities. Keep it minimal - you'll update it after each phase.
+      INITIALIZE workspace.md: Set up the long-term memory structure.
+
+      workspace.md is injected into EVERY LLM call as your persistent memory.
+      It must be compact and high-value. Structure it with these sections:
+      - "## Pinned Instructions" (already populated from todo 1)
+      - "## Key Decisions" — record significant choices with brief reasoning
+      - "## Entities" — only if you already identified key entities to track
+      - "## Critical Context" — anything else that must survive context compaction
+
+      COMPLETION CRITERIA: workspace.md has the sections above and is under 50 lines.
+
+      ANTI-PATTERNS:
+      - Do NOT dump full document inventories or file listings here.
+        Use compact references (e.g., "12 input PDFs in documents/").
+      - Do NOT include progress tracking or phase status — that belongs in plan.md.
+      - Do NOT exceed 50 lines. Every line costs tokens on every LLM call.
+
   - id: 4
     content: >-
-      CREATE first phase todos using next_phase_todos. Start conservative:
-      prefer 5-10 todos for the first phase to calibrate effort. Include
-      a final todo to verify the phase goals were met. You can adjust
-      phase sizing in future strategic phases based on how this goes.
+      CREATE first phase todos using the next_phase_todos tool.
+
+      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      The tool will reject your call if you haven't read the guide. The guide contains
+      critical rules on todo specificity, phase design patterns, and worked examples.
+
+      After reading the guide, create 5 todos for the first tactical phase.
+      Each todo must be:
+      - A concrete action completable in 1-3 tool calls
+      - Specific: names exact files, sections, page ranges, or tool calls
+      - Directly advancing the task from instructions.md
+      - Clear on what "done" looks like
+
+      The first tactical phase should usually be a RESEARCH phase — gather context
+      and sources before producing deliverables. Don't skip straight to writing.
+
+      Include a final verification todo (e.g., "Verify Phase 1 outputs: confirm
+      [specific files] exist and contain [specific content]").
+
+      COMPLETION CRITERIA: next_phase_todos called successfully with ~5 todos.
+
+      ANTI-PATTERNS:
+      - Do NOT skip reading todo_guide.md — the tool enforces this.
+      - Do NOT create vague todos like "research the topic" — be specific about
+        what to search for and where to save results.
+      - Do NOT create meta-todos about workspace management, archiving, status
+        updates, or file reorganization. Every todo must advance the actual task.
+      - Do NOT create todos like "update workspace.md" or "commit progress" —
+        the system handles these automatically at phase boundaries.

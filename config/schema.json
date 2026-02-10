@@ -444,6 +444,10 @@
           "minimum": 0,
           "maximum": 10,
           "description": "Retry count override"
+        },
+        "multimodal": {
+          "type": "boolean",
+          "description": "Override whether this phase's model can process images directly"
         }
       },
       "additionalProperties": false

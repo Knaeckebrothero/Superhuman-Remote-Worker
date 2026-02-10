@@ -195,7 +195,7 @@ import { environment } from '../../core/environment';
                   <div class="preset-chips">
                     @for (preset of availablePresets; track preset.label) {
                       <button type="button" class="preset-chip"
-                        [class.active]="configStrategicModel() === preset.strategic && configTacticalModel() === preset.tactical"
+                        [class.active]="strategicModel() === preset.strategic && tacticalModel() === preset.tactical"
                         (click)="applyPreset(preset)" [disabled]="isSubmitting()">
                         {{ preset.label }}
                       </button>
@@ -204,102 +204,177 @@ import { environment } from '../../core/environment';
                 </div>
               }
 
-              <!-- Strategic Model -->
-              <div class="form-group">
-                <label class="form-label">Strategic Model (Planning)</label>
-                <div class="model-combo">
-                  <input
-                    type="text"
-                    class="form-input"
-                    [ngModel]="configStrategicModel()"
-                    (ngModelChange)="configStrategicModel.set($event)"
-                    name="configStrategicModel"
-                    placeholder="Select or type a model name..."
-                    list="strategicModelList"
-                    [disabled]="isSubmitting()"
-                    autocomplete="off"
-                  >
-                  <datalist id="strategicModelList">
-                    @for (group of availableModels; track group.group) {
-                      @for (model of group.models; track model) {
-                        <option [value]="model">{{ group.group }}</option>
+              <!-- Per-Phase LLM Settings -->
+              <div class="phase-cards">
+                <!-- Strategic Phase Card -->
+                <div class="phase-card">
+                  <div class="phase-card-header">
+                    <span class="phase-icon">psychology</span>
+                    Strategic (Planning)
+                  </div>
+
+                  <div class="form-group compact">
+                    <label class="form-label">Model</label>
+                    <div class="model-combo">
+                      <input
+                        type="text"
+                        class="form-input"
+                        [ngModel]="strategicModel()"
+                        (ngModelChange)="strategicModel.set($event)"
+                        name="strategicModel"
+                        placeholder="Select or type a model..."
+                        list="strategicModelList"
+                        [disabled]="isSubmitting()"
+                        autocomplete="off"
+                      >
+                      <datalist id="strategicModelList">
+                        @for (group of availableModels; track group.group) {
+                          @for (model of group.models; track model) {
+                            <option [value]="model">{{ group.group }}</option>
+                          }
+                        }
+                      </datalist>
+                    </div>
+                  </div>
+
+                  <div class="form-group compact">
+                    <label class="form-label">Reasoning</label>
+                    <select
+                      class="form-input"
+                      [ngModel]="strategicReasoning()"
+                      (ngModelChange)="strategicReasoning.set($event)"
+                      name="strategicReasoning"
+                      [disabled]="isSubmitting()"
+                    >
+                      <option [ngValue]="null">Default</option>
+                      <option value="none">None</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
+                    <span class="field-hint">
+                      @if (getExpertPhaseDefault('strategic', 'reasoning_level'); as defaultLevel) {
+                        Expert default: {{ defaultLevel }}
                       }
-                    }
-                  </datalist>
-                </div>
-                <span class="field-hint">Used for review, reflection, and planning phases</span>
-              </div>
+                    </span>
+                  </div>
 
-              <!-- Tactical Model -->
-              <div class="form-group">
-                <label class="form-label">Tactical Model (Execution)</label>
-                <div class="model-combo">
-                  <input
-                    type="text"
-                    class="form-input"
-                    [ngModel]="configTacticalModel()"
-                    (ngModelChange)="configTacticalModel.set($event)"
-                    name="configTacticalModel"
-                    placeholder="Select or type a model name..."
-                    list="tacticalModelList"
-                    [disabled]="isSubmitting()"
-                    autocomplete="off"
-                  >
-                  <datalist id="tacticalModelList">
-                    @for (group of availableModels; track group.group) {
-                      @for (model of group.models; track model) {
-                        <option [value]="model">{{ group.group }}</option>
+                  <div class="form-group compact">
+                    <label class="form-label">
+                      Temperature: {{ strategicTemperature() !== null ? strategicTemperature() : '(default)' }}
+                    </label>
+                    <div class="slider-row">
+                      <span class="slider-label">0</span>
+                      <input
+                        type="range"
+                        class="form-range"
+                        min="0"
+                        max="2"
+                        step="0.1"
+                        [ngModel]="strategicTemperature() ?? getExpertPhaseDefault('strategic', 'temperature') ?? 0"
+                        (ngModelChange)="onPhaseTemperatureChange('strategic', $event)"
+                        name="strategicTemperature"
+                        [disabled]="isSubmitting()"
+                      >
+                      <span class="slider-label">2</span>
+                    </div>
+                  </div>
+
+                  <label class="multimodal-toggle">
+                    <input
+                      type="checkbox"
+                      [checked]="strategicMultimodal() ?? getExpertPhaseDefault('strategic', 'multimodal') ?? false"
+                      (change)="onMultimodalChange('strategic', $event)"
+                      [disabled]="isSubmitting()"
+                    >
+                    <span>Multimodal (images)</span>
+                  </label>
+                </div>
+
+                <!-- Tactical Phase Card -->
+                <div class="phase-card">
+                  <div class="phase-card-header">
+                    <span class="phase-icon">construction</span>
+                    Tactical (Execution)
+                  </div>
+
+                  <div class="form-group compact">
+                    <label class="form-label">Model</label>
+                    <div class="model-combo">
+                      <input
+                        type="text"
+                        class="form-input"
+                        [ngModel]="tacticalModel()"
+                        (ngModelChange)="tacticalModel.set($event)"
+                        name="tacticalModel"
+                        placeholder="Select or type a model..."
+                        list="tacticalModelList"
+                        [disabled]="isSubmitting()"
+                        autocomplete="off"
+                      >
+                      <datalist id="tacticalModelList">
+                        @for (group of availableModels; track group.group) {
+                          @for (model of group.models; track model) {
+                            <option [value]="model">{{ group.group }}</option>
+                          }
+                        }
+                      </datalist>
+                    </div>
+                  </div>
+
+                  <div class="form-group compact">
+                    <label class="form-label">Reasoning</label>
+                    <select
+                      class="form-input"
+                      [ngModel]="tacticalReasoning()"
+                      (ngModelChange)="tacticalReasoning.set($event)"
+                      name="tacticalReasoning"
+                      [disabled]="isSubmitting()"
+                    >
+                      <option [ngValue]="null">Default</option>
+                      <option value="none">None</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="high">High</option>
+                    </select>
+                    <span class="field-hint">
+                      @if (getExpertPhaseDefault('tactical', 'reasoning_level'); as defaultLevel) {
+                        Expert default: {{ defaultLevel }}
                       }
-                    }
-                  </datalist>
-                </div>
-                <span class="field-hint">Used for task execution phases</span>
-              </div>
+                    </span>
+                  </div>
 
-              <!-- Temperature -->
-              <div class="form-group">
-                <label class="form-label">
-                  Temperature: {{ configTemperature() !== null ? configTemperature() : '(default)' }}
-                </label>
-                <div class="slider-row">
-                  <span class="slider-label">0</span>
-                  <input
-                    type="range"
-                    class="form-range"
-                    min="0"
-                    max="2"
-                    step="0.1"
-                    [ngModel]="configTemperature() ?? getExpertDefault('llm.temperature') ?? 0"
-                    (ngModelChange)="onTemperatureChange($event)"
-                    name="configTemperature"
-                    [disabled]="isSubmitting()"
-                  >
-                  <span class="slider-label">2</span>
-                </div>
-                <span class="field-hint">Controls randomness. 0 = deterministic, higher = more creative</span>
-              </div>
+                  <div class="form-group compact">
+                    <label class="form-label">
+                      Temperature: {{ tacticalTemperature() !== null ? tacticalTemperature() : '(default)' }}
+                    </label>
+                    <div class="slider-row">
+                      <span class="slider-label">0</span>
+                      <input
+                        type="range"
+                        class="form-range"
+                        min="0"
+                        max="2"
+                        step="0.1"
+                        [ngModel]="tacticalTemperature() ?? getExpertPhaseDefault('tactical', 'temperature') ?? 0"
+                        (ngModelChange)="onPhaseTemperatureChange('tactical', $event)"
+                        name="tacticalTemperature"
+                        [disabled]="isSubmitting()"
+                      >
+                      <span class="slider-label">2</span>
+                    </div>
+                  </div>
 
-              <!-- Reasoning Level -->
-              <div class="form-group">
-                <label class="form-label">Reasoning Level</label>
-                <select
-                  class="form-input"
-                  [ngModel]="configReasoning()"
-                  (ngModelChange)="configReasoning.set($event)"
-                  name="configReasoning"
-                  [disabled]="isSubmitting()"
-                >
-                  <option [ngValue]="null">Default</option>
-                  <option value="none">None</option>
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                </select>
-                <span class="field-hint">
-                  @if (getExpertDefault('llm.reasoning_level'); as defaultLevel) {
-                    Expert default: {{ defaultLevel }}
-                  }
-                </span>
+                  <label class="multimodal-toggle">
+                    <input
+                      type="checkbox"
+                      [checked]="tacticalMultimodal() ?? getExpertPhaseDefault('tactical', 'multimodal') ?? false"
+                      (change)="onMultimodalChange('tactical', $event)"
+                      [disabled]="isSubmitting()"
+                    >
+                    <span>Multimodal (images)</span>
+                  </label>
+                </div>
               </div>
 
               <!-- Tool Category Toggles -->
@@ -694,6 +769,62 @@ import { environment } from '../../core/environment';
 
       .form-range:disabled {
         opacity: 0.5;
+      }
+
+      /* Phase cards */
+      .phase-cards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+
+      @container (max-width: 600px) {
+        .phase-cards {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .phase-card {
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 8px;
+        background: var(--surface-0, #313244);
+        padding: 14px;
+        min-width: 0;
+      }
+
+      .phase-card-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--accent-color, #cba6f7);
+        margin-bottom: 12px;
+      }
+
+      .phase-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+      }
+
+      .form-group.compact {
+        margin-bottom: 12px;
+      }
+
+      .multimodal-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--text-secondary, #a6adc8);
+        cursor: pointer;
+        padding: 4px 0;
+      }
+
+      .multimodal-toggle input[type="checkbox"] {
+        margin: 0;
+        accent-color: var(--accent-color, #cba6f7);
       }
 
       /* Select dropdown */
@@ -1343,11 +1474,17 @@ export class JobCreateComponent implements OnInit {
   // Instructions editor state
   readonly instructionsContent = signal<string | null>(null);
 
-  // Config settings form state
-  readonly configStrategicModel = signal<string | null>(null);
-  readonly configTacticalModel = signal<string | null>(null);
-  readonly configTemperature = signal<number | null>(null);
-  readonly configReasoning = signal<string | null>(null);
+  // Per-phase LLM settings
+  readonly strategicModel = signal<string | null>(null);
+  readonly strategicReasoning = signal<string | null>(null);
+  readonly strategicTemperature = signal<number | null>(null);
+  readonly strategicMultimodal = signal<boolean | null>(null);
+
+  readonly tacticalModel = signal<string | null>(null);
+  readonly tacticalReasoning = signal<string | null>(null);
+  readonly tacticalTemperature = signal<number | null>(null);
+  readonly tacticalMultimodal = signal<boolean | null>(null);
+
   readonly disabledToolCategories = signal<Set<string>>(new Set());
 
   // Model list for combo-box (loaded from env.js at runtime)
@@ -1401,10 +1538,14 @@ export class JobCreateComponent implements OnInit {
       this.expertDetail.set(null);
       this.instructionsContent.set(null);
       this.artifacts.instructions.set(null);
-      this.configStrategicModel.set(null);
-      this.configTacticalModel.set(null);
-      this.configTemperature.set(null);
-      this.configReasoning.set(null);
+      this.strategicModel.set(null);
+      this.strategicReasoning.set(null);
+      this.strategicTemperature.set(null);
+      this.strategicMultimodal.set(null);
+      this.tacticalModel.set(null);
+      this.tacticalReasoning.set(null);
+      this.tacticalTemperature.set(null);
+      this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
     } else {
       this.selectedExpert.set(expert);
@@ -1460,20 +1601,34 @@ export class JobCreateComponent implements OnInit {
 
   // ===== Config Settings Methods =====
 
-  /** Clamp temperature to valid 0-2 range. */
-  onTemperatureChange(value: number): void {
-    this.configTemperature.set(Math.round(Math.min(2, Math.max(0, value)) * 10) / 10);
+  /** Clamp temperature to valid 0-2 range per phase. */
+  onPhaseTemperatureChange(phase: 'strategic' | 'tactical', value: number): void {
+    const clamped = Math.round(Math.min(2, Math.max(0, value)) * 10) / 10;
+    if (phase === 'strategic') this.strategicTemperature.set(clamped);
+    else this.tacticalTemperature.set(clamped);
+  }
+
+  onMultimodalChange(phase: 'strategic' | 'tactical', event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    if (phase === 'strategic') this.strategicMultimodal.set(checked);
+    else this.tacticalMultimodal.set(checked);
   }
 
   applyPreset(preset: { label: string; strategic: string; tactical: string }): void {
-    this.configStrategicModel.set(preset.strategic);
-    this.configTacticalModel.set(preset.tactical);
+    this.strategicModel.set(preset.strategic);
+    this.tacticalModel.set(preset.tactical);
   }
 
   getExpertDefault(path: string): unknown {
     const detail = this.expertDetail();
     if (!detail?.config) return null;
     return path.split('.').reduce((obj: any, key) => obj?.[key], detail.config) ?? null;
+  }
+
+  /** Read phase-specific override, falling back to base llm value. */
+  getExpertPhaseDefault(phase: string, field: string): unknown {
+    return this.getExpertDefault(`llm.${phase}.${field}`)
+      ?? this.getExpertDefault(`llm.${field}`);
   }
 
   isToolCategoryEnabled(category: string): boolean {
@@ -1497,25 +1652,41 @@ export class JobCreateComponent implements OnInit {
     const override: Record<string, unknown> = {};
     const llm: Record<string, unknown> = {};
 
-    const strategicModel = this.configStrategicModel();
-    if (strategicModel) {
-      llm['strategic'] = { model: strategicModel };
+    // Build strategic phase override
+    const strategic: Record<string, unknown> = {};
+    const sm = this.strategicModel();
+    if (sm) strategic['model'] = sm;
+    const sr = this.strategicReasoning();
+    if (sr !== null && sr !== this.getExpertPhaseDefault('strategic', 'reasoning_level')) {
+      strategic['reasoning_level'] = sr;
     }
+    const st = this.strategicTemperature();
+    if (st !== null && st !== this.getExpertPhaseDefault('strategic', 'temperature')) {
+      strategic['temperature'] = st;
+    }
+    const smm = this.strategicMultimodal();
+    if (smm !== null && smm !== this.getExpertPhaseDefault('strategic', 'multimodal')) {
+      strategic['multimodal'] = smm;
+    }
+    if (Object.keys(strategic).length > 0) llm['strategic'] = strategic;
 
-    const tacticalModel = this.configTacticalModel();
-    if (tacticalModel) {
-      llm['tactical'] = { model: tacticalModel };
+    // Build tactical phase override
+    const tactical: Record<string, unknown> = {};
+    const tm = this.tacticalModel();
+    if (tm) tactical['model'] = tm;
+    const tr = this.tacticalReasoning();
+    if (tr !== null && tr !== this.getExpertPhaseDefault('tactical', 'reasoning_level')) {
+      tactical['reasoning_level'] = tr;
     }
-
-    const temp = this.configTemperature();
-    if (temp !== null && temp !== this.getExpertDefault('llm.temperature')) {
-      llm['temperature'] = temp;
+    const tt = this.tacticalTemperature();
+    if (tt !== null && tt !== this.getExpertPhaseDefault('tactical', 'temperature')) {
+      tactical['temperature'] = tt;
     }
-
-    const reasoning = this.configReasoning();
-    if (reasoning !== null && reasoning !== this.getExpertDefault('llm.reasoning_level')) {
-      llm['reasoning_level'] = reasoning;
+    const tmm = this.tacticalMultimodal();
+    if (tmm !== null && tmm !== this.getExpertPhaseDefault('tactical', 'multimodal')) {
+      tactical['multimodal'] = tmm;
     }
+    if (Object.keys(tactical).length > 0) llm['tactical'] = tactical;
 
     if (Object.keys(llm).length > 0) {
       override['llm'] = llm;
@@ -1537,23 +1708,36 @@ export class JobCreateComponent implements OnInit {
   private prefillConfigFromExpert(): void {
     const detail = this.expertDetail();
     if (!detail?.config) {
-      this.configStrategicModel.set(null);
-      this.configTacticalModel.set(null);
-      this.configTemperature.set(null);
-      this.configReasoning.set(null);
+      this.strategicModel.set(null);
+      this.strategicReasoning.set(null);
+      this.strategicTemperature.set(null);
+      this.strategicMultimodal.set(null);
+      this.tacticalModel.set(null);
+      this.tacticalReasoning.set(null);
+      this.tacticalTemperature.set(null);
+      this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
       return;
     }
 
     // Pre-fill from expert config (user can then change)
     const llm = detail.config['llm'] as Record<string, unknown> | undefined;
-    const strategicOverride = llm?.['strategic'] as Record<string, unknown> | undefined;
-    const tacticalOverride = llm?.['tactical'] as Record<string, unknown> | undefined;
+    const stratOverride = llm?.['strategic'] as Record<string, unknown> | undefined;
+    const tactOverride = llm?.['tactical'] as Record<string, unknown> | undefined;
     const baseModel = (llm?.['model'] as string) ?? null;
-    this.configStrategicModel.set((strategicOverride?.['model'] as string) ?? baseModel);
-    this.configTacticalModel.set((tacticalOverride?.['model'] as string) ?? baseModel);
-    this.configTemperature.set((llm?.['temperature'] as number) ?? null);
-    this.configReasoning.set((llm?.['reasoning_level'] as string) ?? null);
+    const baseReasoning = (llm?.['reasoning_level'] as string) ?? null;
+    const baseTemp = (llm?.['temperature'] as number) ?? null;
+    const baseMultimodal = (llm?.['multimodal'] as boolean) ?? null;
+
+    this.strategicModel.set((stratOverride?.['model'] as string) ?? baseModel);
+    this.strategicReasoning.set((stratOverride?.['reasoning_level'] as string) ?? baseReasoning);
+    this.strategicTemperature.set((stratOverride?.['temperature'] as number) ?? baseTemp);
+    this.strategicMultimodal.set((stratOverride?.['multimodal'] as boolean) ?? baseMultimodal);
+
+    this.tacticalModel.set((tactOverride?.['model'] as string) ?? baseModel);
+    this.tacticalReasoning.set((tactOverride?.['reasoning_level'] as string) ?? baseReasoning);
+    this.tacticalTemperature.set((tactOverride?.['temperature'] as number) ?? baseTemp);
+    this.tacticalMultimodal.set((tactOverride?.['multimodal'] as boolean) ?? baseMultimodal);
 
     // Detect which tool categories are empty (disabled)
     const tools = detail.config['tools'] as Record<string, unknown[]> | undefined;
@@ -1820,10 +2004,14 @@ export class JobCreateComponent implements OnInit {
     // Reset instructions editor
     this.instructionsContent.set(null);
     // Reset config settings
-    this.configStrategicModel.set(null);
-    this.configTacticalModel.set(null);
-    this.configTemperature.set(null);
-    this.configReasoning.set(null);
+    this.strategicModel.set(null);
+    this.strategicReasoning.set(null);
+    this.strategicTemperature.set(null);
+    this.strategicMultimodal.set(null);
+    this.tacticalModel.set(null);
+    this.tacticalReasoning.set(null);
+    this.tacticalTemperature.set(null);
+    this.tacticalMultimodal.set(null);
     this.disabledToolCategories.set(new Set());
     // Reset advanced options
     this.showAdvanced.set(false);

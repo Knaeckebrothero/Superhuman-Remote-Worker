@@ -30,6 +30,7 @@ export interface StreamCallbacks {
   onToolCall?: (tool: string, args: Record<string, unknown>) => void;
   onToolExecuting?: (tool: string, args: Record<string, unknown>) => void;
   onToolResult?: (tool: string, summary: string) => void;
+  onStep?: (type: string, title: string) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
 }
@@ -200,6 +201,10 @@ export class BuilderStreamService {
 
       case 'tool_result':
         callbacks.onToolResult?.(data['tool'] as string, data['summary'] as string);
+        break;
+
+      case 'step':
+        callbacks.onStep?.(data['type'] as string, data['title'] as string);
         break;
 
       case 'done':

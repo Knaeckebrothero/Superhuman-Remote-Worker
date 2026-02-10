@@ -109,6 +109,9 @@ class UniversalAgent:
         self._strategic_llm_with_tools: Optional[BaseChatModel] = None
         self._tactical_llm_with_tools: Optional[BaseChatModel] = None
 
+        # Tool context (for phase-aware behavior)
+        self._tool_context: Optional[ToolContext] = None
+
         # Current job state
         self._workspace_manager: Optional[WorkspaceManager] = None
         self._todo_manager: Optional[TodoManager] = None
@@ -217,7 +220,12 @@ class UniversalAgent:
                 self._tactical_llm = create_llm(tactical_config, limits=limits)
                 logger.info(f"Created tactical LLM: {tactical_config.model}")
 
-            if summarization_config.model == strategic_config.model:
+            if not llm_config.summarization:
+                # No explicit summarization override — reuse strategic LLM
+                # (avoids creating a separate LLM with potentially unreachable base config)
+                self._summarization_llm = self._strategic_llm
+                logger.info(f"Summarization LLM: reusing strategic ({strategic_config.model}) (no override)")
+            elif summarization_config.model == strategic_config.model:
                 self._summarization_llm = self._strategic_llm
                 logger.info(f"Summarization LLM: reusing strategic ({summarization_config.model})")
             elif summarization_config.model == tactical_config.model:
@@ -368,6 +376,7 @@ class UniversalAgent:
                 checkpointer=self._checkpointer,
                 summarization_llm=self._summarization_llm,
                 snapshot_manager=snapshot_manager,
+                tool_context=self._tool_context,
             )
 
             # Execute graph
@@ -1076,6 +1085,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         tools_dir = self._workspace_manager.get_path("tools")
         generate_workspace_tool_docs(tool_names, tools_dir)
 
+        # Copy todo crafting guide to workspace
+        todo_guide_src = get_project_root() / "config" / "templates" / "todo_guide.md"
+        if todo_guide_src.exists():
+            self._workspace_manager.write_file(
+                "todo_guide.md", todo_guide_src.read_text(encoding="utf-8")
+            )
+            logger.debug("Copied todo_guide.md to workspace")
+
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
         return updated_metadata
@@ -1118,7 +1135,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             datasources=datasources_dict,
             config=tool_config,
             _job_id=self._current_job_id,
+            _llm_config=self.config.llm,
         )
+        self._tool_context = context
 
         # Load tools from registry
         tool_names = get_all_tool_names(self.config)

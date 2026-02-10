@@ -229,6 +229,7 @@ class PhaseLLMOverride:
     api_key: Optional[str] = None
     timeout: Optional[float] = None
     max_retries: Optional[int] = None
+    multimodal: Optional[bool] = None
 
 
 @dataclass
@@ -294,7 +295,7 @@ class LLMConfig:
             api_key=override.api_key if override.api_key is not None else self.api_key,
             timeout=override.timeout if override.timeout is not None else self.timeout,
             max_retries=override.max_retries if override.max_retries is not None else self.max_retries,
-            multimodal=self.multimodal,  # Multimodal is not phase-specific
+            multimodal=override.multimodal if override.multimodal is not None else self.multimodal,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -427,6 +428,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         api_key=data.get("api_key"),
         timeout=data.get("timeout"),
         max_retries=data.get("max_retries"),
+        multimodal=data.get("multimodal"),
     )
 
 
@@ -794,6 +796,8 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
         return explicit_provider.lower()
 
     model_lower = model.lower()
+    if model_lower.startswith("groq/"):
+        return "groq"
     if model_lower.startswith("claude"):
         return "anthropic"
     if model_lower.startswith("gemini"):
@@ -1001,8 +1005,13 @@ def _create_groq_llm(
             "Set it in your environment or provide api_key in config."
         )
 
+    # Strip groq/ prefix — Groq API expects bare model names
+    model = config.model
+    if model.lower().startswith("groq/"):
+        model = model[len("groq/"):]
+
     llm_kwargs = {
-        "model": config.model,
+        "model": model,
         "temperature": config.temperature,
         "api_key": api_key,
         "max_retries": config.max_retries,
@@ -1018,7 +1027,7 @@ def _create_groq_llm(
     llm = ChatGroq(**llm_kwargs)
 
     logger.info(
-        f"Created Groq LLM: model={config.model}, temp={config.temperature}, "
+        f"Created Groq LLM: model={model}, temp={config.temperature}, "
         f"timeout={config.timeout}s, max_retries={config.max_retries}"
     )
 

@@ -10,7 +10,11 @@
 --   requirements      - Primary storage for extracted requirements
 --   datasources       - External database connections for agent jobs
 --   sources           - Document sources for citations (CitationEngine)
+--   job_sources        - Job-source mapping (many-to-many, CitationEngine v2)
 --   citations         - Citation records linking claims to sources (CitationEngine)
+--   source_annotations - Source annotations (CitationEngine v2)
+--   source_tags        - Source tags (CitationEngine v2)
+--   source_embeddings  - Vector embeddings for semantic search (CitationEngine v3)
 --   schema_migrations - Schema versioning for CitationEngine
 --   builder_sessions  - Instruction builder chat sessions
 --   builder_messages  - Messages within builder sessions
@@ -248,10 +252,9 @@ EXCEPTION
 END $$;
 
 -- Sources table: canonical documents, websites, databases, or custom artifacts
--- Each source belongs to a specific job for isolation between agents
+-- Sources are shared across jobs via the job_sources join table (CitationEngine v2)
 CREATE TABLE IF NOT EXISTS sources (
     id SERIAL PRIMARY KEY,
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     type source_type NOT NULL,
     identifier TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -262,10 +265,26 @@ CREATE TABLE IF NOT EXISTS sources (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_sources_job_id ON sources(job_id);
+-- Unique constraint on content_hash for deduplication
+DO $$ BEGIN
+    ALTER TABLE sources ADD CONSTRAINT uq_sources_content_hash UNIQUE (content_hash);
+EXCEPTION
+    WHEN duplicate_table THEN NULL;
+    WHEN duplicate_object THEN NULL;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_sources_identifier ON sources(identifier);
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
 CREATE INDEX IF NOT EXISTS idx_sources_name ON sources(name);
+CREATE INDEX IF NOT EXISTS idx_sources_content_hash ON sources(content_hash);
+
+-- Job-source mapping (many-to-many, shared source library)
+CREATE TABLE IF NOT EXISTS job_sources (
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES sources(id),
+    added_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (job_id, source_id)
+);
 
 -- Citations table: links claims to their supporting evidence
 -- Each citation belongs to a specific job for isolation between agents
@@ -297,6 +316,40 @@ CREATE INDEX IF NOT EXISTS idx_citations_created_at ON citations(created_at);
 CREATE INDEX IF NOT EXISTS idx_citations_locator ON citations USING GIN (locator);
 CREATE INDEX IF NOT EXISTS idx_sources_metadata ON sources USING GIN (metadata);
 
+-- Full-text search indexes (CitationEngine v2)
+CREATE INDEX IF NOT EXISTS idx_citations_claim_fts ON citations USING GIN (to_tsvector('english', claim));
+CREATE INDEX IF NOT EXISTS idx_sources_content_fts ON sources USING GIN (to_tsvector('simple', content));
+
+-- Source annotations table (CitationEngine v2)
+CREATE TABLE IF NOT EXISTS source_annotations (
+    id SERIAL PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL,
+    annotation_type TEXT NOT NULL DEFAULT 'note',
+    content TEXT NOT NULL,
+    page_reference TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    created_by TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_annotations_source ON source_annotations(source_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_job ON source_annotations(job_id);
+CREATE INDEX IF NOT EXISTS idx_annotations_type ON source_annotations(annotation_type);
+CREATE INDEX IF NOT EXISTS idx_annotations_content_fts ON source_annotations USING GIN (to_tsvector('simple', content));
+
+-- Source tags table (CitationEngine v2)
+CREATE TABLE IF NOT EXISTS source_tags (
+    id SERIAL PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL,
+    tag TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE(source_id, job_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tags_tag ON source_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_tags_job ON source_tags(job_id);
+
 -- Schema migrations table (for CitationEngine versioning)
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -304,8 +357,41 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     description TEXT
 );
 
+-- Record v1 and v2 as already applied (schema above includes both)
 INSERT INTO schema_migrations (version, description)
 VALUES (1, 'Initial schema with sources and citations tables')
+ON CONFLICT (version) DO NOTHING;
+
+INSERT INTO schema_migrations (version, description)
+VALUES (2, 'Shared source library with annotations and tags')
+ON CONFLICT (version) DO NOTHING;
+
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+-- CitationEngine v3: Source Embeddings (pgvector)
+-- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS source_embeddings (
+    id SERIAL PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    job_id UUID NOT NULL,
+    chunk_index INTEGER NOT NULL DEFAULT 0,
+    chunk_text TEXT NOT NULL,
+    embedding vector(1536),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE(source_id, job_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_embeddings_source ON source_embeddings(source_id);
+CREATE INDEX IF NOT EXISTS idx_source_embeddings_job ON source_embeddings(job_id);
+
+-- HNSW index for cosine similarity search
+CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector ON source_embeddings
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+INSERT INTO schema_migrations (version, description)
+VALUES (3, 'Vector search with source embeddings')
 ON CONFLICT (version) DO NOTHING;
 
 -- ============================================================================

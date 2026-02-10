@@ -77,6 +77,7 @@ from .core.phase import (
 )
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .llm.exceptions import ContextOverflowError
+from .tools.context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +285,7 @@ def create_execute_node(
     retry_manager: ToolRetryManager,
     summarization_llm: BaseChatModel,
     summarization_prompt: str,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
 
@@ -342,6 +344,10 @@ def create_execute_node(
 
         # Select LLM based on current phase
         llm_with_tools = strategic_llm_with_tools if is_strategic else tactical_llm_with_tools
+
+        # Update tool context for phase-aware behavior (e.g., multimodal override)
+        if tool_context is not None:
+            tool_context.set_current_phase("strategic" if is_strategic else "tactical")
 
         logger.debug(f"[{job_id}] Execute iteration {iteration}")
 
@@ -1463,6 +1469,7 @@ def build_phase_alternation_graph(
     checkpointer: Optional[BaseCheckpointSaver] = None,
     summarization_llm: Optional[BaseChatModel] = None,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
+    tool_context: Optional[ToolContext] = None,
     # Backwards compatibility
     llm_with_tools: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
@@ -1557,6 +1564,7 @@ def build_phase_alternation_graph(
         retry_manager=retry_manager,
         summarization_llm=llm_for_summarization,
         summarization_prompt=summarization_prompt,
+        tool_context=tool_context,
     )
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(
