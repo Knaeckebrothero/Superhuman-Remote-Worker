@@ -6,6 +6,7 @@ import {
   TableDataResponse,
   ColumnDef,
   Expert,
+  ExpertDetail,
   Agent,
   Job,
   JobCreateRequest,
@@ -369,6 +370,15 @@ export class ApiService {
   getExperts(): Observable<Expert[]> {
     return this.http.get<Expert[]>(`${this.baseUrl}/experts`).pipe(
       catchError(() => of([])),
+    );
+  }
+
+  /**
+   * Get full expert detail including merged config and instructions.
+   */
+  getExpertDetail(expertId: string): Observable<ExpertDetail | null> {
+    return this.http.get<ExpertDetail>(`${this.baseUrl}/experts/${expertId}`).pipe(
+      catchError(() => of(null)),
     );
   }
 

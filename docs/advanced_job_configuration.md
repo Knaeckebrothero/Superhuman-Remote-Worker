@@ -72,7 +72,7 @@ The key insight: the chat conversation is **separate from the work product**. Th
 
 - User describes what they want in natural language
 - AI responds with conversational text (explaining rationale) **and** structured tool calls (mutations to artifacts)
-- The form fields update in real-time as tool-call events arrive via SSE
+- The form fields update in real-time as tool-call events arrive via SSE; the editor is **locked** during AI streaming to prevent conflicting edits
 - User can also edit artifacts directly in the form; changes are visible to the AI on the next turn
 - Iterative conversation ("make it more formal", "add output format requirements")
 - Chat session is tied to the job (lazy-created on first message, linked on job submission)
@@ -101,7 +101,8 @@ POST /api/jobs
     config_override: {
       "llm": { "model": "gpt-4o", "temperature": 0.2 }
     },
-    datasource_ids: [...]
+    datasource_ids: [...],
+    builder_session_id: "uuid"  // optional, links builder chat to this job
   }
   |
   v
@@ -118,13 +119,13 @@ Agent: merges config_override over expert's base config
 
 The existing `instructions` field needs to be connected end-to-end:
 
-1. **Orchestrator `create_job`** (main.py ~line 406): Store `job.instructions` in context:
+1. **Orchestrator `create_job`**: Store `job.instructions` in context:
    ```python
    if job.instructions:
        context["instructions"] = job.instructions
    ```
 
-2. **Orchestrator `assign_job`** (main.py ~line 1437): Extract and forward:
+2. **Orchestrator `assign_job`**: Extract and forward:
    ```python
    instructions_text = job_context.get("instructions")
    # ...
@@ -135,7 +136,7 @@ The existing `instructions` field needs to be connected end-to-end:
    ```
    Also add `"instructions"` to `extracted_keys` set.
 
-3. **Agent `_setup_job_workspace`** (agent.py ~line 782): Add handling before the upload check:
+3. **Agent `_setup_job_workspace`**: Add handling before the upload check:
    ```python
    if metadata.get("instructions"):
        # Inline instructions take priority
@@ -148,6 +149,8 @@ The existing `instructions` field needs to be connected end-to-end:
        instructions = load_instructions(self.config)
        ...
    ```
+
+**Note**: `config_override` is already fully wired end-to-end (stored as JSONB in the jobs table, forwarded on assignment, deep-merged by the agent at startup with LLM recreation). No additional backend work is needed for config overrides.
 
 #### New Endpoint: `GET /api/experts/{expert_id}`
 
@@ -188,7 +191,7 @@ Implementation: Read `config/experts/{id}/config.yaml`, merge with `config/defau
 
 #### New Endpoint: `POST /api/builder/sessions`
 
-Creates a new builder chat session. Called lazily on the user's first message.
+Creates a new builder chat session. Called lazily on the user's first message. The session starts unlinked to any job — the link is established after job submission.
 
 ```json
 // Request
@@ -198,8 +201,7 @@ Creates a new builder chat session. Called lazily on the user's first message.
 
 // Response
 {
-  "session_id": "uuid",
-  "job_id": "uuid"  // pre-generated, used when submitting the job later
+  "session_id": "uuid"
 }
 ```
 
@@ -227,9 +229,10 @@ Response is an SSE stream with these event types:
 | Event | Payload | Purpose |
 |-------|---------|---------|
 | `token` | `{ "text": "Sure, I'll..." }` | Streamed conversational text (displayed in chat) |
-| `tool_call` | `{ "tool": "update_instructions", "args": { "content": "..." } }` | Artifact mutation (applied to form) |
-| `tool_call` | `{ "tool": "update_section", "args": { "heading": "## Output Format", "content": "..." } }` | Section-level artifact mutation |
-| `tool_call` | `{ "tool": "update_config", "args": { "llm": { "temperature": 0.3 } } }` | Config artifact mutation |
+| `tool_call` | `{ "tool": "update_instructions", "args": { "content": "..." } }` | Replace full instructions content |
+| `tool_call` | `{ "tool": "edit_instructions", "args": { "old_text": "...", "new_text": "..." } }` | String replacement in instructions |
+| `tool_call` | `{ "tool": "insert_instructions", "args": { "content": "...", "line": 42 } }` | Insert at line (omit `line` to append) |
+| `tool_call` | `{ "tool": "update_config", "args": { "llm": { "temperature": 0.3 } } }` | Config artifact mutation (objects merge, arrays replace) |
 | `tool_call` | `{ "tool": "update_description", "args": { "content": "..." } }` | Description artifact mutation |
 | `done` | `{ "usage": { "input_tokens": 500, "output_tokens": 800 } }` | Stream complete |
 | `error` | `{ "message": "..." }` | Error information |
@@ -253,6 +256,8 @@ Uses the same LLM provider configuration as the rest of the system:
 
 This reuses the existing provider patterns from `src/core/loader.py` rather than introducing new LLM client code. The system prompt instructs the LLM to act as an instruction writer that understands the agent's phase alternation model, workspace structure, and tool capabilities.
 
+Auto-summarization uses the same `BUILDER_MODEL` for simplicity.
+
 #### Artifact Tool Definitions (Given to Builder LLM)
 
 The builder LLM receives these as tool/function definitions:
@@ -260,11 +265,12 @@ The builder LLM receives these as tool/function definitions:
 | Tool | Parameters | Behavior |
 |------|-----------|----------|
 | `update_instructions` | `content: str` | Replace the full instructions.md content |
-| `update_section` | `heading: str, content: str` | Replace a specific section by heading match (e.g., `## Task`, `## Output Format`) |
-| `update_config` | `llm?: {model?, temperature?, reasoning_level?}, tools?: {category: tool_list}` | Merge partial config changes over current state |
+| `edit_instructions` | `old_text: str, new_text: str` | Find `old_text` in instructions and replace with `new_text` (exact string match, like the agent's `edit_file` tool) |
+| `insert_instructions` | `content: str, line?: int` | Insert `content` at line number. If `line` is omitted, append to end |
+| `update_config` | `llm?: {model?, temperature?, reasoning_level?}, tools?: {category: tool_list}` | Merge partial config changes. **Objects merge recursively, arrays replace entirely** (matching the agent's config inheritance semantics) |
 | `update_description` | `content: str` | Replace the job description |
 
-The AI can return **both** conversational text and tool calls in a single response. The frontend streams the text to the chat panel and applies tool-call events to the job form as they arrive.
+The AI can return **both** conversational text and tool calls in a single response. The frontend streams the text to the chat panel and applies tool-call events to the job form as they arrive. The instructions editor is **locked** (read-only) while an AI response is streaming to prevent conflicting edits.
 
 #### Auto-Summarization
 
@@ -278,12 +284,13 @@ The artifact state is **never** summarized — it is injected fresh from the req
 -- Chat sessions for the instruction builder
 CREATE TABLE builder_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id UUID,                    -- pre-generated, linked to jobs table after submission
+    job_id UUID,                    -- NULL at creation, set after job submission via update
     expert_id VARCHAR(100),         -- expert used as starting point (nullable)
     created_at TIMESTAMPTZ DEFAULT now(),
     updated_at TIMESTAMPTZ DEFAULT now(),
     summary TEXT                    -- auto-summary of older messages (for context compaction)
 );
+-- No FK on job_id: the job may not exist yet (lazy linking after submission)
 
 CREATE TABLE builder_messages (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -300,10 +307,10 @@ CREATE INDEX idx_builder_messages_session ON builder_messages(session_id, create
 
 **Session lifecycle:**
 1. User opens job creation form → no session yet
-2. User sends first message in builder chat → `POST /api/builder/sessions` creates session with pre-generated `job_id`
+2. User sends first message in builder chat → `POST /api/builder/sessions` creates session (no job link yet)
 3. Each message → `POST /api/builder/sessions/{id}/message` streams response
-4. User submits job → job is created with the pre-generated `job_id`, session is now linked
-5. User abandons without submitting → orphaned session (cleaned up by periodic background task, e.g., sessions older than 24h with no linked job)
+4. User submits job → `POST /api/jobs` creates job normally → backend updates `builder_sessions.job_id` using the `builder_session_id` field from `JobCreate`
+5. User abandons without submitting → orphaned session (`job_id` stays NULL, cleaned up manually as needed)
 
 ### Cockpit Components
 
@@ -338,7 +345,9 @@ export class JobArtifactService {
 
   /** Session tracking */
   readonly sessionId = signal<string | null>(null);
-  readonly jobId = signal<string | null>(null);
+
+  /** Whether AI is currently streaming (locks editor to prevent conflicts) */
+  readonly streaming = signal<boolean>(false);
 
   /** Apply an artifact mutation from a builder tool call */
   applyToolCall(tool: string, args: Record<string, any>): void {
@@ -346,10 +355,19 @@ export class JobArtifactService {
       case 'update_instructions':
         this.instructions.set(args['content']);
         break;
-      case 'update_section':
+      case 'edit_instructions':
         this.instructions.update(current =>
-          replaceSectionByHeading(current, args['heading'], args['content'])
+          current?.replace(args['old_text'], args['new_text']) ?? current
         );
+        break;
+      case 'insert_instructions':
+        this.instructions.update(current => {
+          if (!current) return args['content'];
+          if (args['line'] == null) return current + '\n' + args['content'];
+          const lines = current.split('\n');
+          lines.splice(args['line'] - 1, 0, args['content']);
+          return lines.join('\n');
+        });
         break;
       case 'update_config':
         this.config.update(current => deepMerge(current ?? {}, args));
@@ -366,20 +384,21 @@ export class JobArtifactService {
     this.config.set(null);
     this.description.set(null);
     this.sessionId.set(null);
-    this.jobId.set(null);
+    this.streaming.set(false);
   }
 }
 ```
 
 **Bidirectional sync:**
-- **Builder → Form**: SSE tool-call events call `applyToolCall()`, form reactively updates
-- **Form → Builder**: User edits in the form update the signals directly. On the next chat message, the current artifact state from the signals is sent in the request payload so the AI sees the user's manual edits
+- **Builder → Form**: SSE tool-call events call `applyToolCall()`, form reactively updates. The `streaming` signal is `true` during AI response, which locks the instructions editor to read-only
+- **Form → Builder**: User edits in the form update the signals directly (only when `streaming` is `false`). On the next chat message, the current artifact state from the signals is sent in the request payload so the AI sees the user's manual edits
 
 ### Model List for Settings Dropdown
 
 Hardcoded in the frontend as a curated list of commonly available models. Grouped by provider:
 
 ```typescript
+// Example — update with current models at implementation time
 const AVAILABLE_MODELS = [
   { group: 'OpenAI', models: ['gpt-4o', 'gpt-4o-mini', 'o3-mini'] },
   { group: 'Anthropic', models: ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001'] },
@@ -398,9 +417,9 @@ Users can also type a custom model name if theirs isn't listed (combo-box patter
 
 | Task | File | Detail |
 |------|------|--------|
-| Store inline instructions in job context | `orchestrator/main.py` ~line 406 | Add `if job.instructions: context["instructions"] = job.instructions` |
-| Forward instructions on assignment | `orchestrator/main.py` ~line 1437 | Extract from context, set on `JobStartRequest` |
-| Handle inline instructions in agent | `src/agent.py` ~line 782 | Prioritize `metadata["instructions"]` over upload and template |
+| Store inline instructions in job context | `orchestrator/main.py` (`create_job`) | Add `if job.instructions: context["instructions"] = job.instructions` |
+| Forward instructions on assignment | `orchestrator/main.py` (`assign_job`) | Extract from context, set on `JobStartRequest` |
+| Handle inline instructions in agent | `src/agent.py` (`_setup_job_workspace`) | Prioritize `metadata["instructions"]` over upload and template |
 | Add `GET /api/experts/{expert_id}` | `orchestrator/main.py` | Read instructions.md + merged config, return JSON |
 
 ### Phase 2: Instructions Editor in Job Creation
@@ -432,11 +451,13 @@ Users can also type a custom model name if theirs isn't listed (combo-box patter
 |------|------|--------|
 | Add builder tables to schema | `orchestrator/database/schema.sql` | `builder_sessions` + `builder_messages` tables |
 | Add builder DB queries | `orchestrator/database/postgres.py` | CRUD for sessions and messages |
-| Add `POST /api/builder/sessions` | `orchestrator/main.py` | Create session with pre-generated job_id |
+| Include builder tables in init | `orchestrator/init.py` | Ensure builder tables are created during `--only-orchestrator` init |
+| Add `builder_session_id` to `JobCreate` | `orchestrator/main.py` | Optional field; on job creation, update session's `job_id` to link them |
+| Add `POST /api/builder/sessions` | `orchestrator/main.py` | Create session (no job link yet) |
 | Add `POST /api/builder/sessions/{id}/message` | `orchestrator/main.py` | SSE endpoint: receive message + artifact state, stream response with tool calls |
-| Define artifact tool schemas | `orchestrator/services/builder_tools.py` | `update_instructions`, `update_section`, `update_config`, `update_description` |
+| Define artifact tool schemas | `orchestrator/services/builder_tools.py` | `update_instructions`, `edit_instructions`, `insert_instructions`, `update_config`, `update_description` |
 | Builder system prompt | `orchestrator/services/builder_prompt.py` | Instruction-writer persona, tool definitions, agent knowledge (phases, workspace, tools) |
-| Auto-summarization | `orchestrator/services/builder_tools.py` | Summarize older messages when approaching context limit |
+| Auto-summarization | `orchestrator/services/builder_tools.py` | Summarize older messages when approaching context limit (uses same `BUILDER_MODEL`) |
 
 ### Phase 5: Builder Frontend (Chat UI + Artifact Sync)
 
@@ -444,7 +465,7 @@ Users can also type a custom model name if theirs isn't listed (combo-box patter
 
 | Task | File | Detail |
 |------|------|--------|
-| Create `JobArtifactService` | `cockpit/.../services/job-artifact.service.ts` | Shared signal service for bidirectional artifact state |
+| Create `JobArtifactService` | `cockpit/.../services/job-artifact.service.ts` | Shared signal service for bidirectional artifact state + streaming lock |
 | Create `BuilderStreamService` | `cockpit/.../services/builder-stream.service.ts` | SSE client for builder endpoint (salvaged from Advanced-LLM-Chat `StreamingService`) |
 | Create `InstructionBuilderComponent` | `cockpit/.../components/instruction-builder/` | Chat UI with message list, input, markdown rendering |
 | Register component | `cockpit/.../app.ts` + `layout.model.ts` | Add to component registry and type union |
@@ -457,7 +478,6 @@ Users can also type a custom model name if theirs isn't listed (combo-box patter
 - Form validation (temperature range, non-empty instructions)
 - Markdown syntax highlighting in instructions editor (optional, textarea is fine for v1)
 - Responsive layout for settings form on narrow panels
-- Orphaned session cleanup (background task for sessions > 24h with no linked job)
 
 ## File Inventory
 
@@ -465,9 +485,10 @@ Users can also type a custom model name if theirs isn't listed (combo-box patter
 
 | File | Phase | Changes |
 |------|-------|---------|
-| `orchestrator/main.py` | 1, 4 | Wire `instructions` field, add expert detail endpoint, add builder session/message endpoints |
+| `orchestrator/main.py` | 1, 4 | Wire `instructions` field, add expert detail endpoint, add `builder_session_id` to `JobCreate`, add builder session/message endpoints |
 | `orchestrator/database/schema.sql` | 4 | Add `builder_sessions` + `builder_messages` tables |
 | `orchestrator/database/postgres.py` | 4 | Add builder session/message CRUD queries |
+| `orchestrator/init.py` | 4 | Include builder tables in database initialization |
 | `src/agent.py` | 1 | Handle `metadata["instructions"]` for workspace instructions |
 | `cockpit/src/app/components/job-create/job-create.component.ts` | 2, 3, 5 | Instructions editor, config settings form, artifact service integration |
 | `cockpit/src/app/core/services/api.service.ts` | 2, 5 | `getExpertDetail()`, builder session/message methods |
@@ -495,10 +516,13 @@ Users can also type a custom model name if theirs isn't listed (combo-box patter
 | Config form scope | Key settings only | Full schema form is complex and rarely needed; power users can still upload YAML |
 | Model list source | Hardcoded in frontend | Avoids backend complexity; easy to update; users can type custom models |
 | Instruction builder LLM | Env-configured (`BUILDER_MODEL` + `BUILDER_LLM_PROVIDER`), defaults to `gpt-4o-mini` | Reuses existing provider auto-detection. Supports OpenAI-compatible (including custom endpoints) and Anthropic. Users with local LLM setups (vLLM, Ollama) can point the builder at their own inference server |
-| Chat ↔ form communication | Artifact pattern via `JobArtifactService` | Inspired by Claude Artifacts / ChatGPT Canvas / Open Canvas. AI uses structured tool calls to mutate form fields; user edits are fed back to AI on next turn. Shared Angular signal service provides bidirectional reactivity |
+| Chat ↔ form communication | Artifact pattern via `JobArtifactService` | Inspired by Claude Artifacts / ChatGPT Canvas / Open Canvas. AI uses structured tool calls to mutate form fields; user edits are fed back to AI on next turn. Shared Angular signal service provides bidirectional reactivity. Editor locked during AI streaming to prevent conflicts |
 | Builder chat persistence | Server-side (PostgreSQL) | Enables context continuity across page reloads, auto-summarization for long sessions, and audit trail linking chat to job |
-| Session lifecycle | Lazy creation, tied to job | Session created on first message (not on form open), pre-generates job UUID. Avoids empty sessions for users who don't use the builder |
-| AI response format | SSE with text + tool calls | Conversational text streams to chat immediately; tool-call events apply artifact mutations to the form in real-time. Better UX than waiting for full response |
+| Session ↔ job linking | Post-submission update (option b) | Session created without job link. After `POST /api/jobs` with `builder_session_id`, backend updates session's `job_id`. Simpler than pre-generating job UUIDs; no need to accept external IDs on job creation |
+| Session lifecycle | Lazy creation, linked after submission | Session created on first message (not on form open). Avoids empty sessions for users who don't use the builder. Orphaned sessions (no linked job) left for manual cleanup |
+| Instruction edit tools | String replace + line insert (like agent's `edit_file`) | More precise than heading-based section replacement. Handles edge cases naturally (no match = no change). Familiar pattern already proven in the agent's workspace tools |
+| Config merge semantics | Objects merge recursively, arrays replace | Matches existing config inheritance behavior from `defaults.yaml`. Allows precise tool list replacement (e.g., set `research: ["web_search"]` to override the full list) |
+| AI response format | SSE with text + tool calls | Conversational text streams to chat immediately; tool-call events apply artifact mutations to the form in real-time. Required from day one by the artifact pattern |
 | Artifact state injection | Fresh per turn (never summarized) | Mirrors agent's workspace.md pattern. Only conversation history gets compacted; artifact state is always current |
 | LLM proxy | Orchestrator endpoints | Keeps API keys server-side; reuses existing infrastructure |
 
@@ -551,7 +575,7 @@ The Advanced-LLM-Chat `StreamingService` provides an excellent base: `fetch`-bas
 New cockpit dependencies needed for the instruction builder:
 - `ngx-markdown` — Markdown rendering in chat messages (already used and proven in Advanced-LLM-Chat)
 - `prismjs` — Syntax highlighting for code blocks in rendered markdown
-- `marked` — Markdown parser (peer dependency of ngx-markdown)
+- `marked` — Markdown parser (check actual peer dependency requirements of `ngx-markdown` version at implementation time)
 
 These are lightweight, well-maintained libraries with no security concerns.
 
@@ -562,4 +586,5 @@ These are lightweight, well-maintained libraries with no security concerns.
 - **Config presets**: Named config variations (e.g., "fast mode" = gpt-4o-mini + low reasoning) as quick-select options.
 - **Web search in builder**: Add Tavily web search capability to the instruction builder LLM (salvaged from Advanced-LLM-Chat) so it can look up documentation and best practices when helping users craft instructions.
 - **Builder session resume**: Allow users to resume a builder chat when editing an existing job's configuration (load session by job_id).
-- **Artifact diff view**: Show what the AI changed in the instructions (inline diff highlighting) before the user accepts the mutation.
+- **Artifact diff view**: Show what the AI changed in the instructions (inline diff highlighting) after each `edit_instructions` / `insert_instructions` tool call.
+- **Orphaned session cleanup**: Automated cleanup of builder sessions with no linked job (e.g., sessions older than 24h with `job_id IS NULL`). Not needed for v1 — manual cleanup is sufficient.
