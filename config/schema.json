@@ -211,8 +211,24 @@
           "items": {
             "type": "string"
           },
-          "description": "Neo4j graph operation tools (src/tools/graph/)",
+          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config.",
           "examples": [["execute_cypher_query", "get_database_schema"]]
+        },
+        "sql": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job.",
+          "examples": [["sql_query", "sql_schema", "sql_execute"]]
+        },
+        "mongodb": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job.",
+          "examples": [["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"]]
         },
         "git": {
           "type": "array",
@@ -240,11 +256,6 @@
         "postgres": {
           "type": "boolean",
           "description": "Whether PostgreSQL is required"
-        },
-        "neo4j": {
-          "type": "boolean",
-          "default": false,
-          "description": "Whether Neo4j is required"
         }
       }
     },

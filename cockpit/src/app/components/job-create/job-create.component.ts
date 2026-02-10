@@ -2,7 +2,7 @@ import { Component, inject, signal, ElementRef, ViewChild, OnInit } from '@angul
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import { FileHandlingService } from '../../core/services/file-handling.service';
-import { JobCreateRequest, Expert } from '../../core/models/api.model';
+import { JobCreateRequest, Expert, Datasource, DatasourceType } from '../../core/models/api.model';
 import { FilePreview, FileType, UploadStatus } from '../../core/models/file.model';
 
 /**
@@ -249,6 +249,48 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
                   style="display: none"
                 >
                 <span class="field-hint">Custom task instructions for the agent (replaces default)</span>
+              </div>
+
+              <!-- Datasource Picker -->
+              <div class="form-group">
+                <label class="form-label">Datasources</label>
+                @if (isLoadingDatasources()) {
+                  <div class="ds-loading">
+                    <span class="spinner-small"></span>
+                    Loading datasources...
+                  </div>
+                } @else if (availableDatasources().length === 0) {
+                  <div class="ds-empty">No global datasources configured</div>
+                } @else {
+                  <div class="ds-picker">
+                    @for (ds of availableDatasources(); track ds.id) {
+                      <label
+                        class="ds-option"
+                        [class.selected]="selectedDatasourceIds().has(ds.id)"
+                      >
+                        <input
+                          type="checkbox"
+                          [checked]="selectedDatasourceIds().has(ds.id)"
+                          (change)="toggleDatasource(ds.id)"
+                          [disabled]="isSubmitting()"
+                        >
+                        <span class="ds-type-icon" [class]="'ds-type-' + ds.type">
+                          {{ getDsTypeIcon(ds.type) }}
+                        </span>
+                        <span class="ds-info">
+                          <span class="ds-name">{{ ds.name }}</span>
+                          @if (ds.description) {
+                            <span class="ds-desc">{{ ds.description }}</span>
+                          }
+                        </span>
+                        @if (ds.read_only) {
+                          <span class="ds-ro-badge">RO</span>
+                        }
+                      </label>
+                    }
+                  </div>
+                }
+                <span class="field-hint">Select external databases the agent can access during this job</span>
               </div>
             </div>
           }
@@ -836,6 +878,91 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         color: #f38ba8;
       }
 
+      /* Datasource Picker */
+      .ds-loading,
+      .ds-empty {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px;
+        color: var(--text-muted, #6c7086);
+        font-size: 12px;
+      }
+
+      .ds-picker {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .ds-option {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 12px;
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 6px;
+        background: var(--surface-0, #313244);
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .ds-option:hover {
+        border-color: var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.05);
+      }
+
+      .ds-option.selected {
+        border-color: var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.08);
+      }
+
+      .ds-option input[type="checkbox"] {
+        margin: 0;
+        accent-color: var(--accent-color, #cba6f7);
+      }
+
+      .ds-type-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 20px;
+        width: 24px;
+        text-align: center;
+      }
+
+      .ds-type-postgresql { color: #89b4fa; }
+      .ds-type-neo4j { color: #a6e3a1; }
+      .ds-type-mongodb { color: #94e2d5; }
+
+      .ds-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .ds-name {
+        display: block;
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .ds-desc {
+        display: block;
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .ds-ro-badge {
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-size: 10px;
+        font-weight: 600;
+        background: rgba(137, 180, 250, 0.15);
+        color: #89b4fa;
+      }
+
       /* Form Actions */
       .form-actions {
         display: flex;
@@ -924,6 +1051,11 @@ export class JobCreateComponent implements OnInit {
   readonly configFile = signal<FilePreview | null>(null);
   readonly instructionsFile = signal<FilePreview | null>(null);
 
+  // Datasource picker state
+  readonly availableDatasources = signal<Datasource[]>([]);
+  readonly selectedDatasourceIds = signal<Set<string>>(new Set());
+  readonly isLoadingDatasources = signal(false);
+
   // Current upload_id after successful upload
   private uploadId: string | null = null;
   private configUploadId: string | null = null;
@@ -935,6 +1067,7 @@ export class JobCreateComponent implements OnInit {
 
   ngOnInit(): void {
     this.loadExperts();
+    this.loadDatasources();
   }
 
   private loadExperts(): void {
@@ -956,6 +1089,42 @@ export class JobCreateComponent implements OnInit {
     } else {
       this.selectedExpert.set(expert);
     }
+  }
+
+  // ===== Datasource Methods =====
+
+  private loadDatasources(): void {
+    this.isLoadingDatasources.set(true);
+    this.api.getDatasources('global').subscribe({
+      next: (datasources) => {
+        this.availableDatasources.set(datasources);
+        this.isLoadingDatasources.set(false);
+      },
+      error: () => {
+        this.isLoadingDatasources.set(false);
+      },
+    });
+  }
+
+  toggleDatasource(id: string): void {
+    this.selectedDatasourceIds.update((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  getDsTypeIcon(type: DatasourceType | string): string {
+    const icons: Record<string, string> = {
+      postgresql: 'database',
+      neo4j: 'hub',
+      mongodb: 'eco',
+    };
+    return icons[type] || 'storage';
   }
 
   // ===== File Upload Methods =====
@@ -1214,6 +1383,11 @@ export class JobCreateComponent implements OnInit {
       request.instructions_upload_id = this.instructionsUploadId;
     }
 
+    const dsIds = this.selectedDatasourceIds();
+    if (dsIds.size > 0) {
+      request.datasource_ids = Array.from(dsIds);
+    }
+
     this.api.createJob(request).subscribe({
       next: (job) => {
         this.isSubmitting.set(false);
@@ -1362,6 +1536,8 @@ export class JobCreateComponent implements OnInit {
     this.instructionsFile.set(null);
     this.configUploadId = null;
     this.instructionsUploadId = null;
+    // Reset datasource selections
+    this.selectedDatasourceIds.set(new Set());
   }
 
   clearSuccess(): void {

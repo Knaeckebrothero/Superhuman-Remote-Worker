@@ -34,10 +34,10 @@ QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 
 # Tables exposed to the cockpit
-ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "sources", "citations"})
+ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "sources", "citations"})
 
 # Required tables that must exist for the orchestrator to function
-REQUIRED_TABLES = ["jobs", "agents", "requirements", "sources", "citations"]
+REQUIRED_TABLES = ["jobs", "agents", "requirements", "datasources", "sources", "citations"]
 
 # Column type mapping from PostgreSQL types to frontend-friendly types
 PG_TYPE_MAP = {
@@ -382,7 +382,7 @@ class PostgresDB:
             columns = await self.get_table_schema(table_name)
 
             # Get data with ordering by created_at/registered_at if available, else by id
-            if table_name in ("jobs", "requirements", "citations"):
+            if table_name in ("jobs", "requirements", "citations", "datasources"):
                 order_col = "created_at"
             elif table_name == "agents":
                 order_col = "registered_at"
@@ -1214,6 +1214,313 @@ class PostgresDB:
             List of ready agent dicts
         """
         return await self.list_agents(status="ready")
+
+    # =========================================================================
+    # DATASOURCE OPERATIONS
+    # =========================================================================
+
+    async def list_datasources(
+        self,
+        job_id: str | None = None,
+        ds_type: str | None = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List datasources with optional filters.
+
+        Args:
+            job_id: Filter by job ID. Use "global" for global-only datasources.
+            ds_type: Filter by datasource type (e.g. 'neo4j', 'postgresql')
+            limit: Maximum datasources to return
+
+        Returns:
+            List of datasource dicts
+        """
+        conditions = []
+        values = []
+        param_count = 0
+
+        if job_id == "global":
+            conditions.append("job_id IS NULL")
+        elif job_id is not None:
+            try:
+                param_count += 1
+                conditions.append(f"job_id = ${param_count}")
+                values.append(UUID(job_id))
+            except ValueError:
+                return []
+
+        if ds_type:
+            param_count += 1
+            conditions.append(f"type = ${param_count}")
+            values.append(ds_type)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        param_count += 1
+        values.append(limit)
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT id, name, description, type, connection_url, credentials,
+                       read_only, job_id, created_at, updated_at
+                FROM datasources
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ${param_count}
+                """,
+                *values,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def get_datasource(self, datasource_id: str) -> Dict[str, Any] | None:
+        """Get a single datasource by ID.
+
+        Args:
+            datasource_id: Datasource UUID as string
+
+        Returns:
+            Datasource dict or None if not found
+        """
+        try:
+            uuid_val = UUID(datasource_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, name, description, type, connection_url, credentials,
+                       read_only, job_id, created_at, updated_at
+                FROM datasources
+                WHERE id = $1
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
+
+    async def create_datasource(
+        self,
+        name: str,
+        ds_type: str,
+        connection_url: str,
+        description: str | None = None,
+        credentials: Dict[str, Any] | None = None,
+        read_only: bool = True,
+        job_id: str | None = None,
+    ) -> Dict[str, Any]:
+        """Create a new datasource.
+
+        Args:
+            name: User-provided label
+            ds_type: Datasource type ('postgresql', 'neo4j', 'mongodb')
+            connection_url: Full connection string
+            description: What this datasource contains
+            credentials: Additional auth details (JSONB)
+            read_only: Whether the agent is allowed to write
+            job_id: Job UUID (None for global)
+
+        Returns:
+            Created datasource dict
+
+        Raises:
+            asyncpg.UniqueViolationError: If a datasource of this type
+                already exists for the given scope
+        """
+        job_uuid = UUID(job_id) if job_id else None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO datasources (name, description, type, connection_url,
+                                         credentials, read_only, job_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, name, description, type, connection_url, credentials,
+                          read_only, job_id, created_at, updated_at
+                """,
+                name,
+                description,
+                ds_type,
+                connection_url,
+                json.dumps(credentials) if credentials else "{}",
+                read_only,
+                job_uuid,
+            )
+
+        return dict(row)
+
+    async def update_datasource(
+        self,
+        datasource_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        connection_url: str | None = None,
+        credentials: Dict[str, Any] | None = None,
+        read_only: bool | None = None,
+    ) -> bool:
+        """Update a datasource.
+
+        Args:
+            datasource_id: Datasource UUID
+            name: New name
+            description: New description
+            connection_url: New connection URL
+            credentials: New credentials
+            read_only: New read_only flag
+
+        Returns:
+            True if updated, False if not found
+        """
+        try:
+            uuid_val = UUID(datasource_id)
+        except ValueError:
+            return False
+
+        updates = []
+        values = []
+        param_count = 0
+
+        if name is not None:
+            param_count += 1
+            updates.append(f"name = ${param_count}")
+            values.append(name)
+
+        if description is not None:
+            param_count += 1
+            updates.append(f"description = ${param_count}")
+            values.append(description)
+
+        if connection_url is not None:
+            param_count += 1
+            updates.append(f"connection_url = ${param_count}")
+            values.append(connection_url)
+
+        if credentials is not None:
+            param_count += 1
+            updates.append(f"credentials = ${param_count}")
+            values.append(json.dumps(credentials))
+
+        if read_only is not None:
+            param_count += 1
+            updates.append(f"read_only = ${param_count}")
+            values.append(read_only)
+
+        if not updates:
+            return False
+
+        param_count += 1
+        values.append(uuid_val)
+
+        query = f"UPDATE datasources SET {', '.join(updates)} WHERE id = ${param_count}"
+
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def delete_datasource(self, datasource_id: str) -> bool:
+        """Delete a datasource.
+
+        Args:
+            datasource_id: Datasource UUID
+
+        Returns:
+            True if deleted, False if not found
+        """
+        try:
+            uuid_val = UUID(datasource_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM datasources WHERE id = $1",
+                uuid_val,
+            )
+
+        return result == "DELETE 1"
+
+    async def resolve_datasources_for_job(
+        self, job_id: str
+    ) -> List[Dict[str, Any]]:
+        """Resolve datasources for a job (job-specific takes precedence over global).
+
+        For each datasource type, returns the job-specific one if it exists,
+        otherwise falls back to the global one.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            List of resolved datasource dicts (one per type)
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (type)
+                    id, name, description, type, connection_url, credentials,
+                    read_only, job_id, created_at, updated_at
+                FROM datasources
+                WHERE job_id = $1 OR job_id IS NULL
+                ORDER BY type, job_id NULLS LAST
+                """,
+                uuid_val,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def upsert_default_datasource(
+        self,
+        name: str,
+        ds_type: str,
+        connection_url: str,
+        credentials: Dict[str, Any] | None = None,
+        read_only: bool = True,
+    ) -> Dict[str, Any]:
+        """Create or update a global (job_id=NULL) datasource.
+
+        Used during init to seed default datasources from env vars.
+
+        Args:
+            name: Datasource label
+            ds_type: Datasource type
+            connection_url: Connection URL
+            credentials: Additional auth details
+            read_only: Read-only flag
+
+        Returns:
+            Created or updated datasource dict
+        """
+        creds_json = json.dumps(credentials) if credentials else "{}"
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO datasources (name, type, connection_url, credentials, read_only, job_id)
+                VALUES ($1, $2, $3, $4, $5, NULL)
+                ON CONFLICT (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'))
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    connection_url = EXCLUDED.connection_url,
+                    credentials = EXCLUDED.credentials,
+                    read_only = EXCLUDED.read_only
+                RETURNING id, name, description, type, connection_url, credentials,
+                          read_only, job_id, created_at, updated_at
+                """,
+                name,
+                ds_type,
+                connection_url,
+                creds_json,
+                read_only,
+            )
+
+        return dict(row)
 
     # =========================================================================
     # SCHEMA MANAGEMENT

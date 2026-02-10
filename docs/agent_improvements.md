@@ -24,7 +24,7 @@ Place static context (system instructions, tool docs) at the **start** of the pr
 
 Structurally prevent `job_complete` from succeeding unless a verification tool was invoked in the current phase. This addresses "Premature Completion" — where the agent declares success without validating its work.
 
-**Action:** Add a check in `job_complete` (or in the graph's transition logic) that inspects recent tool calls for verification actions (e.g., `validate_schema_compliance`, `execute_cypher_query` for read-back, or test commands). Reject completion if no verification was performed.
+**Action:** Add a check in `job_complete` (or in the graph's transition logic) that inspects recent tool calls for verification actions (e.g., `execute_cypher_query` for read-back, `sql_query` for data validation, or test commands). Reject completion if no verification was performed.
 
 **Files:** `src/tools/registry.py`, `src/core/phase.py`, `src/graph.py`
 

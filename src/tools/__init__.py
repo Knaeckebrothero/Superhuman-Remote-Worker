@@ -18,8 +18,7 @@ Usage:
     context = ToolContext(
         workspace_manager=workspace_mgr,
         todo_manager=todo_mgr,
-        postgres_conn=pg_conn,
-        neo4j_conn=neo4j_conn,
+        postgres_db=pg_conn,
     )
 
     # Load tools by name
@@ -45,6 +44,8 @@ from .research import create_research_tools, get_research_metadata
 from .citation import create_citation_tools, get_citation_metadata
 # Note: cache_tools removed (deprecated, not used in configs)
 from .graph import create_graph_tools, get_graph_metadata
+from .sql import create_sql_tools, get_sql_metadata
+from .mongodb import create_mongodb_tools, get_mongodb_metadata
 
 # Core toolkit exports (todo + job tools)
 from .core import create_core_tools, get_core_metadata
@@ -97,6 +98,10 @@ __all__ = [
     "get_citation_metadata",
     "create_graph_tools",
     "get_graph_metadata",
+    "create_sql_tools",
+    "get_sql_metadata",
+    "create_mongodb_tools",
+    "get_mongodb_metadata",
     # Registry
     "TOOL_REGISTRY",
     "load_tools",

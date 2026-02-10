@@ -240,6 +240,7 @@ async def _process_orchestrator_job(
     instructions: Optional[str] = None,
     config_override: Optional[Dict[str, Any]] = None,
     git_remote_url: Optional[str] = None,
+    datasources: Optional[list] = None,
 ) -> None:
     """Process a job assigned by the orchestrator.
 
@@ -278,6 +279,8 @@ async def _process_orchestrator_job(
             metadata["config_override"] = config_override
         if git_remote_url:
             metadata["git_remote_url"] = git_remote_url
+        if datasources:
+            metadata["datasources"] = datasources
 
         # Process the job with streaming for iteration logging
         final_state = None
@@ -480,6 +483,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 instructions=request.instructions,
                 config_override=request.config_override,
                 git_remote_url=request.git_remote_url,
+                datasources=request.datasources,
             )
         )
 
@@ -587,6 +591,8 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             resume_metadata["config_upload_id"] = request.config_upload_id
         if request.config_override:
             resume_metadata["config_override"] = request.config_override
+        if request.datasources:
+            resume_metadata["datasources"] = request.datasources
 
         # Start processing in background
         async def _resume_job():

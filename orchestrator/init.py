@@ -144,6 +144,9 @@ async def init_postgres(force_reset: bool = False) -> bool:
             if not exists:
                 all_exist = False
 
+        # Seed default datasources from environment variables
+        await _seed_default_datasources(db)
+
         return all_exist
 
     except Exception as e:
@@ -282,6 +285,70 @@ async def _reset_postgres_schema():
         await db.reset_schema()
     finally:
         await db.close()
+
+
+# =============================================================================
+# Default Datasource Seeding
+# =============================================================================
+
+async def _seed_default_datasources(db) -> None:
+    """Seed global datasources from DEFAULT_DS_* environment variables.
+
+    Creates or updates global datasources (job_id=NULL) based on env vars.
+    See docs/datasources.md for the full design.
+
+    Supported env var patterns:
+        DEFAULT_DS_POSTGRESQL_URL, DEFAULT_DS_POSTGRESQL_NAME, DEFAULT_DS_POSTGRESQL_READ_ONLY
+        DEFAULT_DS_NEO4J_URL, DEFAULT_DS_NEO4J_USERNAME, DEFAULT_DS_NEO4J_PASSWORD, DEFAULT_DS_NEO4J_NAME, DEFAULT_DS_NEO4J_READ_ONLY
+        DEFAULT_DS_MONGODB_URL, DEFAULT_DS_MONGODB_NAME, DEFAULT_DS_MONGODB_READ_ONLY
+    """
+    seeded = 0
+
+    # PostgreSQL datasource
+    pg_url = os.getenv("DEFAULT_DS_POSTGRESQL_URL")
+    if pg_url:
+        name = os.getenv("DEFAULT_DS_POSTGRESQL_NAME", "Default PostgreSQL")
+        read_only = os.getenv("DEFAULT_DS_POSTGRESQL_READ_ONLY", "true").lower() == "true"
+        await db.upsert_default_datasource(
+            name=name, ds_type="postgresql", connection_url=pg_url, read_only=read_only,
+        )
+        logger.info(f"    Seeded default datasource: postgresql ({name})")
+        seeded += 1
+
+    # Neo4j datasource
+    neo4j_url = os.getenv("DEFAULT_DS_NEO4J_URL")
+    if neo4j_url:
+        name = os.getenv("DEFAULT_DS_NEO4J_NAME", "Default Neo4j")
+        read_only = os.getenv("DEFAULT_DS_NEO4J_READ_ONLY", "true").lower() == "true"
+        credentials = {}
+        username = os.getenv("DEFAULT_DS_NEO4J_USERNAME")
+        password = os.getenv("DEFAULT_DS_NEO4J_PASSWORD")
+        if username:
+            credentials["username"] = username
+        if password:
+            credentials["password"] = password
+        await db.upsert_default_datasource(
+            name=name, ds_type="neo4j", connection_url=neo4j_url,
+            credentials=credentials if credentials else None, read_only=read_only,
+        )
+        logger.info(f"    Seeded default datasource: neo4j ({name})")
+        seeded += 1
+
+    # MongoDB datasource
+    mongo_url = os.getenv("DEFAULT_DS_MONGODB_URL")
+    if mongo_url:
+        name = os.getenv("DEFAULT_DS_MONGODB_NAME", "Default MongoDB")
+        read_only = os.getenv("DEFAULT_DS_MONGODB_READ_ONLY", "true").lower() == "true"
+        await db.upsert_default_datasource(
+            name=name, ds_type="mongodb", connection_url=mongo_url, read_only=read_only,
+        )
+        logger.info(f"    Seeded default datasource: mongodb ({name})")
+        seeded += 1
+
+    if seeded > 0:
+        logger.info(f"  Seeded {seeded} default datasource(s)")
+    else:
+        logger.info("  No default datasources configured (DEFAULT_DS_* env vars not set)")
 
 
 # =============================================================================
