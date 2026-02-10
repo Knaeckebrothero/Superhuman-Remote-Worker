@@ -28,6 +28,8 @@ export interface BuilderSession {
 export interface StreamCallbacks {
   onToken?: (text: string) => void;
   onToolCall?: (tool: string, args: Record<string, unknown>) => void;
+  onToolExecuting?: (tool: string, args: Record<string, unknown>) => void;
+  onToolResult?: (tool: string, summary: string) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
 }
@@ -191,6 +193,14 @@ export class BuilderStreamService {
         callbacks.onToolCall?.(tool, args);
         break;
       }
+
+      case 'tool_executing':
+        callbacks.onToolExecuting?.(data['tool'] as string, data['args'] as Record<string, unknown>);
+        break;
+
+      case 'tool_result':
+        callbacks.onToolResult?.(data['tool'] as string, data['summary'] as string);
+        break;
 
       case 'done':
         callbacks.onDone?.();
