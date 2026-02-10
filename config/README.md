@@ -147,11 +147,13 @@ tools:
     - list_citations
     - edit_citation
 
-  # Neo4j graph operations (src/tools/graph/)
-  graph:
-    - execute_cypher_query
-    - get_database_schema
-    - validate_schema_compliance
+  # Database tool categories (src/tools/graph/, sql/, mongodb/)
+  # These are injected/stripped automatically by the orchestrator based on
+  # which datasources are attached to the job. Usually left empty in config.
+  # See docs/datasources.md for details.
+  graph: []      # Neo4j: execute_cypher_query, get_database_schema
+  sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
+  mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
 
   # Workspace version control (src/tools/git/)
   git:
@@ -203,8 +205,25 @@ Browser LLM is configured separately: `BROWSER_LLM_MODEL` (default: `gpt-4o-mini
 ```yaml
 connections:
   postgres: true
-  neo4j: false
 ```
+
+External datasources (Neo4j, MongoDB, additional PostgreSQL) are managed through the datasource connector system. See `docs/datasources.md`.
+
+### Multi-Stage Config Pipeline (Database Tools)
+
+Database tool categories (`graph`, `sql`, `mongodb`) are **not** controlled by the agent config YAML. Instead, they go through a multi-stage pipeline:
+
+```
+1. Agent config (config/*.yaml)        → User defines base tools (workspace, research, etc.)
+2. Orchestrator datasource override    → System injects/strips database tools based on attached datasources
+3. Final resolved config               → What the agent actually receives
+```
+
+- If a datasource is attached to the job, the orchestrator **injects** the corresponding tool category (even if the config doesn't list it).
+- If no datasource of a type is attached, the orchestrator **strips** the category (even if the config lists it).
+- The `read_only` flag on the datasource controls whether write tools are included.
+
+This means the agent config controls non-database tools, while the orchestrator controls database tools based on what's actually connected. See `_build_datasource_tool_override()` in `orchestrator/main.py`.
 
 ### Context Management
 

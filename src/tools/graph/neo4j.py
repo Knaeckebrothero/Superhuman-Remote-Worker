@@ -1,9 +1,11 @@
 """Neo4j graph tools for the Universal Agent.
 
-Provides Neo4j graph operations for the Validator Agent:
-- Cypher query execution
+Provides Neo4j graph operations:
+- Cypher query execution (read and write)
 - Schema inspection
-- Metamodel validation
+
+These tools are injected automatically when a Neo4j datasource is
+attached to a job. See docs/datasources.md.
 """
 
 import logging
@@ -37,15 +39,6 @@ GRAPH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "short_description": "Get Neo4j schema (labels, relationships, properties).",
         "phases": ["tactical"],
     },
-    "validate_schema_compliance": {
-        "module": "graph.neo4j",
-        "function": "validate_schema_compliance",
-        "description": "Run metamodel compliance checks",
-        "category": "graph",
-        "defer_to_workspace": True,
-        "short_description": "Run metamodel compliance checks (structural/relationships/quality).",
-        "phases": ["tactical"],
-    },
 }
 
 
@@ -53,7 +46,7 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     """Create Neo4j graph tools with injected context.
 
     Args:
-        context: ToolContext with dependencies (must include neo4j connection)
+        context: ToolContext with dependencies (must include neo4j datasource)
 
     Returns:
         List of LangChain tool functions
@@ -61,9 +54,9 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     Raises:
         ValueError: If Neo4j database not available in context
     """
-    neo4j = context.graph
+    neo4j = context.get_datasource("neo4j")
     if not neo4j:
-        raise ValueError("Neo4j database not available in context")
+        raise ValueError("Neo4j datasource not available in context")
 
     # Schema cache
     _schema_cache: Optional[Dict] = None
@@ -71,7 +64,6 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     def get_schema() -> Dict:
         nonlocal _schema_cache
         if _schema_cache is None and neo4j:
-            # Neo4jDB uses get_schema(), old interface uses get_database_schema()
             _schema_cache = neo4j.get_schema() if hasattr(neo4j, 'get_schema') else neo4j.get_database_schema()
         return _schema_cache or {}
 
@@ -140,71 +132,7 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
 
         return schema_str
 
-    @tool
-    def validate_schema_compliance(check_type: str = "all") -> str:
-        """Run metamodel compliance checks against the graph.
-
-        Args:
-            check_type: Type of checks to run:
-                - "all": All checks (default)
-                - "structural": Node labels and properties (A1-A3)
-                - "relationships": Relationship types and directions (B1-B3)
-                - "quality": Quality gates (C1-C5)
-
-        Returns:
-            Compliance report with pass/fail status and violations
-        """
-        if not neo4j:
-            return "Error: No Neo4j connection available"
-
-        try:
-            from src.utils.metamodel_validator import MetamodelValidator, Severity
-            validator = MetamodelValidator(neo4j)
-
-            if check_type == "all":
-                report = validator.run_all_checks()
-            elif check_type == "structural":
-                report = validator.run_structural_checks()
-            elif check_type == "relationships":
-                report = validator.run_relationship_checks()
-            elif check_type == "quality":
-                report = validator.run_quality_gate_checks()
-            else:
-                return "Invalid check_type. Use 'all', 'structural', 'relationships', or 'quality'."
-
-            lines = [
-                "## Metamodel Compliance Report",
-                f"**Status:** {'PASSED' if report.passed else 'FAILED'}",
-                f"**Errors:** {report.error_count} | **Warnings:** {report.warning_count}",
-                "",
-            ]
-
-            if report.error_count > 0:
-                lines.append("### Errors (Must Fix)")
-                for result in report.results:
-                    if not result.passed and result.severity == Severity.ERROR:
-                        lines.append(f"\n**{result.check_id}: {result.check_name}**")
-                        lines.append(f"- {result.message}")
-                        if result.violations:
-                            for v in result.violations[:3]:
-                                lines.append(f"  - {v}")
-
-            if report.warning_count > 0:
-                lines.append("\n### Warnings")
-                for result in report.results:
-                    if not result.passed and result.severity == Severity.WARNING:
-                        lines.append(f"\n**{result.check_id}: {result.check_name}**")
-                        lines.append(f"- {result.message}")
-
-            return "\n".join(lines)
-
-        except ImportError:
-            return "Error: MetamodelValidator not available"
-        except Exception as e:
-            return f"Error running compliance check: {str(e)}"
-
     return [
         execute_cypher_query,
         get_database_schema,
-        validate_schema_compliance,
     ]

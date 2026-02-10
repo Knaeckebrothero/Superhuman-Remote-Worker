@@ -339,7 +339,6 @@ class ConnectionsConfig:
     """Database connections configuration."""
 
     postgres: bool = True
-    neo4j: bool = False
 
 
 @dataclass
@@ -551,7 +550,6 @@ def load_agent_config(
     connections_data = data.get("connections", {})
     connections_config = ConnectionsConfig(
         postgres=connections_data.get("postgres", True),
-        neo4j=connections_data.get("neo4j", False),
     )
 
     limits_data = data.get("limits", {})
@@ -672,7 +670,6 @@ def load_agent_config_from_dict(
     connections_data = data.get("connections", {})
     connections_config = ConnectionsConfig(
         postgres=connections_data.get("postgres", True),
-        neo4j=connections_data.get("neo4j", False),
     )
 
     limits_data = data.get("limits", {})

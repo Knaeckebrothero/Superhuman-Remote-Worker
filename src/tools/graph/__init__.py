@@ -1,9 +1,10 @@
 """Graph toolkit - Neo4j graph operations.
 
-This toolkit provides Neo4j graph operations for the Validator Agent:
+Provides Neo4j graph tools when a Neo4j datasource is attached to a job:
 - Cypher query execution
 - Schema inspection
-- Metamodel validation
+
+See docs/datasources.md for the datasource connector system.
 """
 
 from typing import Any, Dict, List
@@ -15,13 +16,13 @@ def create_graph_tools(context: ToolContext) -> List[Any]:
     """Create all graph tools with injected context.
 
     Args:
-        context: ToolContext with neo4j connection
+        context: ToolContext with neo4j datasource
 
     Returns:
         List of LangChain tool functions
 
     Raises:
-        ValueError: If Neo4j database not available in context
+        ValueError: If Neo4j datasource not available in context
     """
     from .neo4j import create_neo4j_tools
 

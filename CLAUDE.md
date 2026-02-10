@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Graph-RAG system for requirement traceability and compliance checking. Uses LangGraph and LLMs to extract requirements from documents, validate them, and track GoBD/GDPR compliance.
+General-purpose LLM agent system built on LangGraph. Agents are configured via YAML to perform document processing, research, database operations, and domain-specific tasks. External databases (PostgreSQL, Neo4j, MongoDB) are attached to jobs as datasources via the cockpit UI or environment defaults.
 
 ## Commands
 
@@ -133,11 +133,6 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8085
 ```
 
-### Validation
-```bash
-python validate_metamodel.py --check all --json
-```
-
 ## Architecture
 
 ### Universal Agent Pattern
@@ -219,7 +214,9 @@ Tool categories in config:
 - `document`: Document processing (chunk_document)
 - `research`: Web search (web_search)
 - `citation`: Citation & literature management (cite_document, cite_web, list_sources, search_library, annotate_source, get_annotations, tag_source, etc.)
-- `graph`: Neo4j operations (execute_cypher_query, get_database_schema, validate_schema_compliance)
+- `graph`: Neo4j operations (execute_cypher_query, get_database_schema) — injected by orchestrator when Neo4j datasource attached
+- `sql`: PostgreSQL operations (sql_query, sql_schema, sql_execute) — injected by orchestrator when PostgreSQL datasource attached
+- `mongodb`: MongoDB operations (mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update) — injected by orchestrator when MongoDB datasource attached
 - `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
 - `coding`: Shell command execution (run_command)
 
@@ -227,11 +224,22 @@ Tool categories in config:
 
 ### Multi-Database Architecture
 
+**System databases** (infrastructure, configured via environment variables):
+
 | Database | Purpose | Connection |
 |----------|---------|------------|
-| PostgreSQL | Jobs, agents, requirements, citations | Async with asyncpg, namespace pattern: `db.jobs.create()`, queries in `src/database/queries/postgres/*.sql` |
+| PostgreSQL | Jobs, agents, requirements, citations, datasources | Async with asyncpg, namespace pattern: `db.jobs.create()`, queries in `src/database/queries/postgres/*.sql` |
 | MongoDB | LLM request logging (optional) | Audit trail and token tracking |
-| Neo4j | Knowledge graph (optional) | Graph visualization and querying |
+
+**External datasources** (user-configured, attached to jobs via the cockpit UI or `DEFAULT_DS_*` env vars):
+
+| Type | Tools Provided | Connection |
+|------|---------------|------------|
+| PostgreSQL | sql_query, sql_schema, sql_execute | Via datasource connector (`src/tools/sql/`) |
+| Neo4j | execute_cypher_query, get_database_schema | Via datasource connector (`src/tools/graph/`) |
+| MongoDB | mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update | Via datasource connector (`src/tools/mongodb/`) |
+
+See `docs/datasources.md` for the full datasource connector architecture.
 
 ### Workspace Structure
 
@@ -299,8 +307,13 @@ This separation means workspace.md survives context compaction while the convers
   - `registry.py` - Tool metadata registry with phase filtering
   - `context.py` - ToolContext dependency injection
   - `description_manager.py` - Auto-generates per-tool markdown docs into `workspace/job_<id>/tools/`
-- `src/database/` - PostgreSQL (asyncpg), MongoDB managers
+- `src/tools/graph/` - Neo4j datasource tools (execute_cypher_query, get_database_schema)
+- `src/tools/sql/` - PostgreSQL datasource tools (sql_query, sql_schema, sql_execute)
+- `src/tools/mongodb/` - MongoDB datasource tools (mongo_query, mongo_aggregate, etc.)
+- `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
   - `postgres_db.py` - Async PostgreSQL with namespaces
+  - `neo4j_db.py` - Neo4j graph client (used via datasource connector)
+  - `mongo_db.py` - MongoDB audit trail client
   - `schema.sql` - PostgreSQL schema
 - `src/api/` - FastAPI application (agent API)
 - `config/` - Configuration files, defaults, schema, and prompt templates
@@ -361,7 +374,7 @@ Required in `.env`:
 - `GROQ_API_KEY` - For Groq fast inference
 - `TAVILY_API_KEY` - Web search
 - `MONGODB_URL` - LLM request archiving (audit trail)
-- `NEO4J_URI` - Knowledge graph (if connections.neo4j: true)
+- `DEFAULT_DS_*` - Default datasources (see `docs/datasources.md`)
 
 **Vision Model** (for text-only agents):
 - `VISION_API_KEY` - API key for vision model (defaults to `OPENAI_API_KEY`)
@@ -418,7 +431,7 @@ The project includes `.mcp.json` for MCP server configuration. Claude Code can u
 | `get_audit_trail` | Get paginated audit entries |
 | `get_chat_history` | Get conversation turns |
 | `get_todos` | Get current and archived todos |
-| `get_graph_changes` | Get Neo4j graph mutations timeline |
+| `get_graph_changes` | Get graph mutations timeline |
 | `get_llm_request` | Get full LLM request/response |
 | `search_audit` | Search audit entries by pattern |
 

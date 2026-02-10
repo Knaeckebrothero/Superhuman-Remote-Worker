@@ -13,7 +13,6 @@ from ..core.workspace import WorkspaceManager
 # Avoid circular imports with TYPE_CHECKING
 if TYPE_CHECKING:
     from ..database.postgres_db import PostgresDB
-    from ..database.neo4j_db import Neo4jDB
 
 
 @dataclass
@@ -27,8 +26,9 @@ class ToolContext:
     Attributes:
         workspace_manager: WorkspaceManager for file operations
         todo_manager: TodoManager for task tracking (optional)
-        postgres_db: PostgresDB instance for database operations
-        neo4j_db: Neo4jDB instance for graph operations
+        postgres_db: PostgresDB instance for orchestrator database operations
+        datasources: Dictionary of external datasource connections keyed by type
+            (e.g. {"neo4j": Neo4jDB(...), "postgresql": asyncpg_pool, ...})
         config: Additional configuration dictionary
         job_id: Override job ID (if not using workspace_manager)
         citation_engine: CitationEngine instance for citation management
@@ -51,7 +51,7 @@ class ToolContext:
     workspace_manager: Optional[WorkspaceManager] = None
     todo_manager: Optional[Any] = None  # TodoManager, imported later to avoid circular deps
     postgres_db: Optional["PostgresDB"] = None
-    neo4j_db: Optional["Neo4jDB"] = None
+    datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
@@ -97,9 +97,27 @@ class ToolContext:
         """Check if PostgreSQL connection is available."""
         return self.postgres_db is not None
 
-    def has_neo4j(self) -> bool:
-        """Check if Neo4j connection is available."""
-        return self.neo4j_db is not None
+    def has_datasource(self, ds_type: str) -> bool:
+        """Check if a datasource of the given type is available.
+
+        Args:
+            ds_type: Datasource type (e.g. "neo4j", "postgresql", "mongodb")
+
+        Returns:
+            True if datasource is available
+        """
+        return ds_type in self.datasources and self.datasources[ds_type] is not None
+
+    def get_datasource(self, ds_type: str) -> Optional[Any]:
+        """Get a datasource connection by type.
+
+        Args:
+            ds_type: Datasource type (e.g. "neo4j", "postgresql", "mongodb")
+
+        Returns:
+            Datasource connection object, or None if not available
+        """
+        return self.datasources.get(ds_type)
 
     def has_git(self) -> bool:
         """Check if git manager is available and active.
@@ -120,15 +138,6 @@ class ToolContext:
             PostgresDB instance if available, None otherwise
         """
         return self.postgres_db
-
-    @property
-    def graph(self) -> Optional["Neo4jDB"]:
-        """Get Neo4jDB instance.
-
-        Returns:
-            Neo4jDB instance if available, None otherwise
-        """
-        return self.neo4j_db
 
     def get_config(self, key: str, default: Any = None) -> Any:
         """Get a configuration value.
@@ -282,10 +291,6 @@ class ToolContext:
     ) -> bool:
         """Update job status in PostgreSQL (async version).
 
-        FIXED: Converted from sync psycopg2-style to async asyncpg.
-        This method now properly uses asyncpg's execute() method instead of
-        the old sync cursor() pattern that was causing runtime errors.
-
         Args:
             status: New status value (e.g., 'completed', 'failed')
             completed_at: Whether to set completed_at to NOW()
@@ -307,8 +312,6 @@ class ToolContext:
             import logging
             logger = logging.getLogger(__name__)
 
-            # Use asyncpg's execute method (no cursor needed)
-            # asyncpg uses $1, $2, $3 placeholders instead of %s
             if completed_at:
                 if error_message:
                     await self.postgres_db.execute(

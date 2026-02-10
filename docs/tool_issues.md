@@ -57,7 +57,9 @@ Tool metadata defines phase availability but it's not enforced:
 - Search: `web_search`
 - Citation: `cite_document`, `cite_web`, `list_sources`, `get_citation`
 - Cache: `add_requirement`, `list_requirements`, `get_requirement`
-- Graph: `execute_cypher_query`, `get_database_schema`, `validate_schema_compliance`
+- Graph: `execute_cypher_query`, `get_database_schema`
+- SQL: `sql_query`, `sql_schema`, `sql_execute`
+- MongoDB: `mongo_query`, `mongo_aggregate`, `mongo_schema`, `mongo_insert`, `mongo_update`
 
 ### Both Phases
 - Workspace: `read_file`, `write_file`, `list_files`, etc.

@@ -82,7 +82,6 @@ class UniversalAgent:
         self,
         config: AgentConfig,
         postgres_conn: Optional[Any] = None,
-        neo4j_conn: Optional[Any] = None,
     ):
         """
         Initialize the Universal Agent.
@@ -90,12 +89,10 @@ class UniversalAgent:
         Args:
             config: Agent configuration (from JSON file)
             postgres_conn: PostgreSQL connection (optional, created if needed)
-            neo4j_conn: Neo4j connection (optional, created if needed)
         """
         self.config = config
         self._base_config = config  # Immutable snapshot for reset between jobs
         self.postgres_conn = postgres_conn
-        self.neo4j_conn = neo4j_conn
 
         # Components (initialized lazily or via initialize())
         self._llm: Optional[BaseChatModel] = None
@@ -116,6 +113,9 @@ class UniversalAgent:
         self._workspace_manager: Optional[WorkspaceManager] = None
         self._todo_manager: Optional[TodoManager] = None
         self._current_job_id: Optional[str] = None
+        self._job_metadata: Optional[Dict[str, Any]] = None
+        self._datasource_connections: Dict[str, Any] = {}
+        self._datasource_clients: Dict[str, Any] = {}  # Parent clients for cleanup (e.g. MongoClient)
 
         # Control flags
         self._initialized = False
@@ -144,7 +144,6 @@ class UniversalAgent:
         cls,
         config_path: str,
         postgres_conn: Optional[Any] = None,
-        neo4j_conn: Optional[Any] = None,
     ) -> "UniversalAgent":
         """
         Create an agent from a configuration file.
@@ -152,14 +151,13 @@ class UniversalAgent:
         Args:
             config_path: Path to config file or config name (e.g., "creator")
             postgres_conn: Optional PostgreSQL connection
-            neo4j_conn: Optional Neo4j connection
 
         Returns:
             UniversalAgent instance
         """
         resolved_path, deployment_dir = resolve_config_path(config_path)
         config = load_agent_config(resolved_path, deployment_dir)
-        return cls(config, postgres_conn, neo4j_conn)
+        return cls(config, postgres_conn)
 
     async def initialize(self) -> None:
         """
@@ -240,10 +238,11 @@ class UniversalAgent:
             logger.info(f"Created single LLM for all phases: {llm_config.model}")
 
     async def _setup_connections(self) -> None:
-        """Set up required database connections using new DB classes.
+        """Set up required database connections.
 
-        Uses PostgresDB and Neo4jDB from Phase 1 refactoring.
         Falls back to environment variables for configuration.
+        External datasources (Neo4j, MongoDB, etc.) are resolved per-job
+        via the datasource connector system — see docs/datasources.md.
         """
         # PostgreSQL connection (always required for job management)
         if self.postgres_conn is None and self.config.connections.postgres:
@@ -256,29 +255,6 @@ class UniversalAgent:
                 logger.info("PostgreSQL connection established (PostgresDB)")
             else:
                 logger.warning("DATABASE_URL not set, PostgreSQL unavailable")
-
-        # Neo4j connection (optional, based on config)
-        if self.neo4j_conn is None and self.config.connections.neo4j:
-            from src.database.neo4j_db import Neo4jDB
-
-            neo4j_uri = os.getenv("NEO4J_URI")
-            neo4j_username = os.getenv("NEO4J_USERNAME", "neo4j")
-            neo4j_password = os.getenv("NEO4J_PASSWORD")
-
-            if neo4j_uri and neo4j_password:
-                self.neo4j_conn = Neo4jDB(
-                    uri=neo4j_uri,
-                    username=neo4j_username,
-                    password=neo4j_password,
-                )
-                # Neo4jDB.connect() is sync and returns bool
-                if self.neo4j_conn.connect():
-                    logger.info("Neo4j connection established (Neo4jDB)")
-                else:
-                    logger.error("Neo4j connection failed")
-                    self.neo4j_conn = None
-            else:
-                logger.warning("Neo4j credentials not set")
 
     async def process_job(
         self,
@@ -322,6 +298,9 @@ class UniversalAgent:
         self.config = self._base_config
 
         self._current_job_id = job_id
+        self._job_metadata = metadata or {}
+        self._datasource_connections = {}
+        self._datasource_clients = {}
         logger.info(f"Processing job {job_id}")
 
         try:
@@ -517,10 +496,12 @@ class UniversalAgent:
                     return dict(final_state)
                 finally:
                     self._current_job_id = None
+                    self._close_datasource_connections()
                     await self._cleanup_checkpointer()
 
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
+            self._close_datasource_connections()
             await self._cleanup_checkpointer()
             self._current_job_id = None
             error_state = {
@@ -572,6 +553,7 @@ class UniversalAgent:
         finally:
             # Clean up after streaming completes (or errors)
             self._current_job_id = None
+            self._close_datasource_connections()
             await self._cleanup_checkpointer()
 
     def _load_workspace_template(self) -> str:
@@ -1099,7 +1081,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         Loads tools based on configuration and injects dependencies
         (workspace manager, todo manager, connections).
+
+        Also creates datasource connections from job metadata (sent by orchestrator)
+        and injects them into the ToolContext.
         """
+        # Create datasource connections from job metadata (sent by orchestrator)
+        datasources_dict: Dict[str, Any] = {}
+        ds_configs = self._job_metadata.get("datasources", []) if self._job_metadata else []
+        for ds in ds_configs:
+            ds_type = ds.get("type")
+            if not ds_type:
+                continue
+            try:
+                conn = self._create_datasource_connection(ds)
+                datasources_dict[ds_type] = conn
+                self._datasource_connections[ds_type] = conn
+                logger.info(f"Connected to {ds_type} datasource: {ds.get('name', 'unnamed')}")
+            except Exception as e:
+                logger.warning(f"Failed to connect to {ds_type} datasource: {e}")
+
         # Create tool context with dependencies
         # Merge agent_id and LLM settings into config for tools
         tool_config = {
@@ -1111,7 +1111,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             workspace_manager=self._workspace_manager,
             todo_manager=self._todo_manager,
             postgres_db=self.postgres_conn,
-            neo4j_db=self.neo4j_conn,
+            datasources=datasources_dict,
             config=tool_config,
             _job_id=self._current_job_id,
         )
@@ -1146,6 +1146,77 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._llm_with_tools = self._strategic_llm_with_tools
 
         logger.debug(f"Loaded {len(self._tools)} tools")
+
+    def _create_datasource_connection(self, ds: Dict[str, Any]) -> Any:
+        """Create a connection to an external datasource.
+
+        Args:
+            ds: Datasource config dict with type, connection_url, credentials, etc.
+
+        Returns:
+            Connection object (e.g. Neo4jDB instance)
+
+        Raises:
+            NotImplementedError: If datasource type is not yet supported
+            ValueError: If datasource type is unknown
+        """
+        ds_type = ds["type"]
+        url = ds["connection_url"]
+        creds = ds.get("credentials") or {}
+
+        if ds_type == "neo4j":
+            from src.database.neo4j_db import Neo4jDB
+            db = Neo4jDB(
+                uri=url,
+                username=creds.get("username", "neo4j"),
+                password=creds.get("password", ""),
+            )
+            db.connect()
+            return db
+
+        elif ds_type == "postgresql":
+            import psycopg
+            conn = psycopg.connect(url, autocommit=False)
+            # Test connection
+            conn.execute("SELECT 1")
+            conn.rollback()  # Clean transaction state after test
+            return conn
+
+        elif ds_type == "mongodb":
+            from pymongo import MongoClient
+            from urllib.parse import urlparse
+            client = MongoClient(url, serverSelectionTimeoutMS=5000)
+            client.admin.command("ping")
+            # Extract database name from URL path
+            parsed = urlparse(url)
+            db_name = parsed.path.lstrip("/").split("?")[0] or "default"
+            db = client[db_name]
+            # Store client for cleanup (db object doesn't have close())
+            self._datasource_clients[ds_type] = client
+            return db
+
+        else:
+            raise ValueError(f"Unknown datasource type: {ds_type}")
+
+    def _close_datasource_connections(self) -> None:
+        """Close all datasource connections opened for the current job."""
+        for ds_type, conn in self._datasource_connections.items():
+            try:
+                if hasattr(conn, 'close'):
+                    conn.close()
+                    logger.debug(f"Closed {ds_type} datasource connection")
+            except Exception as e:
+                logger.warning(f"Error closing {ds_type} datasource: {e}")
+        self._datasource_connections = {}
+        # Close parent clients (e.g. MongoClient) that aren't in _datasource_connections
+        for ds_type, client in self._datasource_clients.items():
+            try:
+                if hasattr(client, 'close'):
+                    client.close()
+                    logger.debug(f"Closed {ds_type} datasource client")
+            except Exception as e:
+                logger.warning(f"Error closing {ds_type} datasource client: {e}")
+        self._datasource_clients = {}
 
     def _get_checkpoint_path(self, job_id: str) -> Path:
         """Get SQLite checkpoint file path for a job.
@@ -1498,13 +1569,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Error closing PostgreSQL: {e}")
 
-        if self.neo4j_conn:
-            try:
-                # Neo4jDB uses close() (sync)
-                self.neo4j_conn.close()
-            except Exception as e:
-                logger.warning(f"Error closing Neo4j: {e}")
-
         self._initialized = False
         logger.info(f"{self.config.display_name} shutdown complete")
 
@@ -1522,7 +1586,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "uptime_seconds": uptime,
             "connections": {
                 "postgres": self.postgres_conn is not None,
-                "neo4j": self.neo4j_conn is not None,
             },
             "config": {
                 "model": self.config.llm.model,

@@ -8,6 +8,7 @@
 --   jobs              - Job tracking and orchestration
 --   agents            - Registered agent pods for orchestration
 --   requirements      - Primary storage for extracted requirements
+--   datasources       - External database connections for agent jobs
 --   sources           - Document sources for citations (CitationEngine)
 --   citations         - Citation records linking claims to sources (CitationEngine)
 --   schema_migrations - Schema versioning for CitationEngine
@@ -306,7 +307,44 @@ VALUES (1, 'Initial schema with sources and citations tables')
 ON CONFLICT (version) DO NOTHING;
 
 -- ============================================================================
--- 5. HELPER FUNCTIONS
+-- 5. DATASOURCES TABLE
+-- External database connections that agents can use during job execution.
+-- See docs/datasources.md for the full connector system design.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS datasources (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+
+    -- User-provided metadata
+    name TEXT NOT NULL,                    -- Label (e.g. "Production Analytics DB")
+    description TEXT,                      -- What this datasource contains (included in agent context)
+
+    -- Connection details
+    type TEXT NOT NULL,                    -- 'postgresql', 'neo4j', 'mongodb'
+    connection_url TEXT NOT NULL,          -- Full connection string
+    credentials JSONB DEFAULT '{}',       -- Additional auth details beyond the URL
+
+    -- Access control
+    read_only BOOLEAN NOT NULL DEFAULT TRUE,
+
+    -- Scope: NULL = global (available to all jobs), UUID = job-specific
+    job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- One datasource of each type per job (or per global scope).
+-- COALESCE maps NULL job_ids to a sentinel UUID so uniqueness works across globals.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_type_job
+    ON datasources (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'));
+
+CREATE INDEX IF NOT EXISTS idx_datasources_type ON datasources(type);
+CREATE INDEX IF NOT EXISTS idx_datasources_job_id ON datasources(job_id);
+
+-- ============================================================================
+-- 6. HELPER FUNCTIONS
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -318,7 +356,7 @@ END;
 $$ language 'plpgsql';
 
 -- ============================================================================
--- 6. TRIGGERS
+-- 7. TRIGGERS
 -- ============================================================================
 
 DROP TRIGGER IF EXISTS update_jobs_updated_at ON jobs;
@@ -331,8 +369,13 @@ CREATE TRIGGER update_requirements_updated_at
     BEFORE UPDATE ON requirements
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_datasources_updated_at ON datasources;
+CREATE TRIGGER update_datasources_updated_at
+    BEFORE UPDATE ON datasources
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- ============================================================================
--- 7. VIEWS
+-- 8. VIEWS
 -- ============================================================================
 
 CREATE OR REPLACE VIEW job_summary AS

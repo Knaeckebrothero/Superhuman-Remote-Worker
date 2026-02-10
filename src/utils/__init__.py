@@ -2,12 +2,6 @@
 Core utilities for data processing and validation.
 """
 
-from .metamodel_validator import (
-    MetamodelValidator,
-    ComplianceReport,
-    CheckResult,
-    Severity,
-)
 from .document_processor import (
     DocumentProcessor,
     DocumentExtractor,
@@ -37,11 +31,6 @@ except ImportError:
     _citation_available = False
 
 __all__ = [
-    # Metamodel Validation
-    'MetamodelValidator',
-    'ComplianceReport',
-    'CheckResult',
-    'Severity',
     # Document Processing
     'DocumentProcessor',
     'DocumentExtractor',

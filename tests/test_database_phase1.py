@@ -72,21 +72,8 @@ class TestPostgresDB:
 class TestNeo4jDB:
     """Test Neo4jDB class."""
 
-    def test_init_without_uri_uses_env(self):
-        """Test that Neo4jDB reads from environment."""
-        with patch.dict('os.environ', {
-            'NEO4J_URI': 'bolt://test',
-            'NEO4J_USERNAME': 'neo4j',
-            'NEO4J_PASSWORD': 'password'
-        }):
-            db = Neo4jDB()
-            assert db._uri == 'bolt://test'
-            assert db._username == 'neo4j'
-            assert db._password == 'password'
-            assert not db.is_connected
-
     def test_init_with_explicit_params(self):
-        """Test Neo4jDB with explicit parameters."""
+        """Test Neo4jDB with explicit parameters (required)."""
         db = Neo4jDB(
             uri='bolt://custom',
             username='admin',
@@ -95,18 +82,11 @@ class TestNeo4jDB:
         assert db._uri == 'bolt://custom'
         assert db._username == 'admin'
         assert db._password == 'secret'
-
-    def test_namespaces_initialized(self):
-        """Test that namespaces are initialized."""
-        db = Neo4jDB()
-        assert hasattr(db, 'requirements')
-        assert hasattr(db, 'entities')
-        assert hasattr(db, 'relationships')
-        assert hasattr(db, 'statistics')
+        assert not db.is_connected
 
     def test_connect_disconnect_no_driver(self):
         """Test connection lifecycle without actual Neo4j."""
-        db = Neo4jDB(uri='bolt://nonexistent')
+        db = Neo4jDB(uri='bolt://nonexistent', username='neo4j', password='test')
         # Should return False if connection fails
         result = db.connect()
         assert isinstance(result, bool)
@@ -178,7 +158,7 @@ class TestDependencyInjection:
 
     def test_neo4j_instance_creation(self):
         """Test Neo4jDB instance creation."""
-        db = Neo4jDB()
+        db = Neo4jDB(uri='bolt://test', username='neo4j', password='test')
         assert isinstance(db, Neo4jDB)
 
     def test_mongo_instance_creation(self):
@@ -191,19 +171,25 @@ class TestBackwardCompatibility:
     """Test that old API still works."""
 
     def test_old_imports_work(self):
-        """Test that old classes can be imported."""
-        from src.database import PostgresConnection, Neo4jConnection
+        """Test that canonical classes can be imported."""
+        from src.database import PostgresDB, Neo4jDB
 
-        assert PostgresConnection is not None
-        assert Neo4jConnection is not None
+        assert PostgresDB is not None
+        assert Neo4jDB is not None
 
     def test_old_functions_work(self):
-        """Test that old utility functions can be imported."""
-        from src.database import create_job, get_job, update_job_status
+        """Test that database classes have core methods."""
+        from src.database import PostgresDB, Neo4jDB
 
-        assert callable(create_job)
-        assert callable(get_job)
-        assert callable(update_job_status)
+        # PostgresDB core methods
+        assert hasattr(PostgresDB, 'connect')
+        assert hasattr(PostgresDB, 'close')
+        assert hasattr(PostgresDB, 'execute')
+
+        # Neo4jDB core methods
+        assert hasattr(Neo4jDB, 'connect')
+        assert hasattr(Neo4jDB, 'close')
+        assert hasattr(Neo4jDB, 'execute_query')
 
 
 if __name__ == '__main__':

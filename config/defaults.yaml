@@ -84,10 +84,16 @@ tools:
     - tag_source
     - search_library
   # Graph tools - Neo4j operations (src/tools/graph/)
-  graph:
-    - execute_cypher_query
-    - get_database_schema
-    - validate_schema_compliance
+  # NOTE: Graph tools are no longer listed in defaults. They are injected
+  # automatically when a Neo4j datasource is attached to the job.
+  # See docs/datasources.md for the datasource connector system.
+  graph: []
+  # SQL tools - PostgreSQL operations (src/tools/sql/)
+  # Injected automatically via datasource system
+  sql: []
+  # MongoDB tools - MongoDB operations (src/tools/mongodb/)
+  # Injected automatically via datasource system
+  mongodb: []
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -98,7 +104,6 @@ tools:
 
 connections:
   postgres: true
-  neo4j: false
 
 limits:
   context_threshold_tokens: 80000

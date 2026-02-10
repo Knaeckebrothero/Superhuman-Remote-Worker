@@ -789,10 +789,19 @@ export class AgentActivityComponent {
     get_citation: 'citation',
     list_citations: 'citation',
     edit_citation: 'citation',
-    // Graph tools
+    // Graph tools (Neo4j datasource)
     execute_cypher_query: 'graph',
     get_database_schema: 'graph',
-    validate_schema_compliance: 'graph',
+    // SQL tools (PostgreSQL datasource)
+    sql_query: 'sql',
+    sql_schema: 'sql',
+    sql_execute: 'sql',
+    // MongoDB tools (MongoDB datasource)
+    mongo_query: 'mongodb',
+    mongo_aggregate: 'mongodb',
+    mongo_schema: 'mongodb',
+    mongo_insert: 'mongodb',
+    mongo_update: 'mongodb',
   };
 
   // Step type badge labels

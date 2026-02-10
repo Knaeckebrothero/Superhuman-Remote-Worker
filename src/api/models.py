@@ -283,6 +283,10 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Git remote URL for workspace delivery (set by orchestrator)",
     )
+    datasources: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Resolved datasource connection details (set by orchestrator)",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -334,4 +338,8 @@ class JobResumeRequest(BaseModel):
     feedback: Optional[str] = Field(
         default=None,
         description="Optional feedback to inject before resuming",
+    )
+    datasources: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Resolved datasource connection details (set by orchestrator)",
     )

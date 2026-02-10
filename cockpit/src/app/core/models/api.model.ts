@@ -56,6 +56,63 @@ export interface Expert {
 }
 
 // =============================================================================
+// Datasource Models
+// =============================================================================
+
+/**
+ * Supported datasource types.
+ */
+export type DatasourceType = 'postgresql' | 'neo4j' | 'mongodb';
+
+/**
+ * Datasource configuration from the orchestrator.
+ */
+export interface Datasource {
+  id: string;
+  name: string;
+  description: string | null;
+  type: DatasourceType;
+  connection_url: string;
+  credentials: Record<string, unknown>;
+  read_only: boolean;
+  job_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Request body for creating a new datasource.
+ */
+export interface DatasourceCreateRequest {
+  name: string;
+  type: DatasourceType;
+  connection_url: string;
+  description?: string;
+  credentials?: Record<string, unknown>;
+  read_only?: boolean;
+  job_id?: string;
+}
+
+/**
+ * Request body for updating a datasource.
+ */
+export interface DatasourceUpdateRequest {
+  name?: string;
+  description?: string;
+  connection_url?: string;
+  credentials?: Record<string, unknown>;
+  read_only?: boolean;
+}
+
+/**
+ * Result from testing a datasource connection.
+ */
+export interface DatasourceTestResult {
+  status: 'ok' | 'error';
+  message: string;
+}
+
+// =============================================================================
 // Agent Models
 // =============================================================================
 
@@ -124,6 +181,7 @@ export interface JobCreateRequest {
   config_override?: Record<string, unknown>;
   context?: Record<string, unknown>;
   instructions?: string;
+  datasource_ids?: string[];
 }
 
 /**
