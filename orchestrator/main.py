@@ -35,6 +35,7 @@ from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.builder_tools import (  # noqa: E402
     BUILDER_TOOLS,
+    SERVER_SIDE_TOOLS,
     build_message_context,
     build_summarization_prompt,
     get_builder_api_key,
@@ -42,6 +43,7 @@ from services.builder_tools import (  # noqa: E402
     get_builder_model,
     get_builder_provider,
 )
+from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -2154,42 +2156,133 @@ async def send_builder_message(
     )
 
     async def event_stream():
-        """Generate SSE events from LLM streaming response."""
-        full_text = ""
-        all_tool_calls = []
+        """Generate SSE events from LLM streaming response with agentic tool loop.
+
+        Server-side tools (like web_search) are executed between LLM calls.
+        Artifact mutation tools are forwarded to the frontend via SSE.
+        """
+        MAX_ITERATIONS = 5
+        loop_messages = list(context_messages)
+        final_text = ""
+        final_tool_calls = []
 
         try:
             provider = get_builder_provider()
             model = get_builder_model()
 
-            if provider == "anthropic":
-                async for event in _stream_anthropic(system_prompt, context_messages, model):
-                    yield event
-                    # Parse events to accumulate response
-                    if event.startswith("event: token\n"):
-                        data = json.loads(event.split("data: ", 1)[1].strip())
-                        full_text += data.get("text", "")
-                    elif event.startswith("event: tool_call\n"):
-                        data = json.loads(event.split("data: ", 1)[1].strip())
-                        all_tool_calls.append(data)
-                    elif event.startswith("event: done\n"):
-                        pass  # handled below
-            else:
-                async for event in _stream_openai(system_prompt, context_messages, model):
-                    yield event
-                    if event.startswith("event: token\n"):
-                        data = json.loads(event.split("data: ", 1)[1].strip())
-                        full_text += data.get("text", "")
-                    elif event.startswith("event: tool_call\n"):
-                        data = json.loads(event.split("data: ", 1)[1].strip())
-                        all_tool_calls.append(data)
+            for iteration in range(MAX_ITERATIONS):
+                turn_text = ""
+                turn_tool_calls = []  # {"name", "args", "id"} dicts
+                error_occurred = False
+
+                if provider == "anthropic":
+                    async for evt_type, evt_data in _stream_anthropic(
+                        system_prompt, loop_messages, model
+                    ):
+                        if evt_type == "token":
+                            turn_text += evt_data["text"]
+                            yield f"event: token\ndata: {json.dumps(evt_data)}\n\n"
+                        elif evt_type == "tool_call":
+                            turn_tool_calls.append(evt_data)
+                            if evt_data["name"] in SERVER_SIDE_TOOLS:
+                                yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                            else:
+                                yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                                final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
+                        elif evt_type == "error":
+                            yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
+                            error_occurred = True
+                else:
+                    async for evt_type, evt_data in _stream_openai(
+                        system_prompt, loop_messages, model
+                    ):
+                        if evt_type == "token":
+                            turn_text += evt_data["text"]
+                            yield f"event: token\ndata: {json.dumps(evt_data)}\n\n"
+                        elif evt_type == "tool_call":
+                            turn_tool_calls.append(evt_data)
+                            if evt_data["name"] in SERVER_SIDE_TOOLS:
+                                yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                            else:
+                                yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                                final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
+                        elif evt_type == "error":
+                            yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
+                            error_occurred = True
+
+                final_text += turn_text
+
+                if error_occurred:
+                    break
+
+                # Check if any server-side tools were called
+                server_calls = [tc for tc in turn_tool_calls if tc["name"] in SERVER_SIDE_TOOLS]
+                if not server_calls:
+                    # No server-side tools — we're done
+                    break
+
+                # Build assistant message and tool results for next iteration
+                if provider == "anthropic":
+                    # Anthropic format: assistant content blocks + user tool_result blocks
+                    assistant_content = []
+                    if turn_text:
+                        assistant_content.append({"type": "text", "text": turn_text})
+                    for tc in turn_tool_calls:
+                        assistant_content.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc["args"],
+                        })
+                    loop_messages.append({"role": "assistant", "content": assistant_content})
+
+                    # Execute server-side tools and build tool_result blocks
+                    tool_results = []
+                    for tc in turn_tool_calls:
+                        if tc["name"] in SERVER_SIDE_TOOLS:
+                            result = await _execute_server_tool(tc["name"], tc["args"])
+                            yield f"event: tool_result\ndata: {json.dumps({'tool': tc['name'], 'summary': result[:200]})}\n\n"
+                        else:
+                            result = "OK"
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tc["id"],
+                            "content": result,
+                        })
+                    loop_messages.append({"role": "user", "content": tool_results})
+                else:
+                    # OpenAI format: assistant message with tool_calls + tool role messages
+                    openai_tool_calls = []
+                    for tc in turn_tool_calls:
+                        openai_tool_calls.append({
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
+                        })
+                    assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": openai_tool_calls}
+                    if turn_text:
+                        assistant_msg["content"] = turn_text
+                    loop_messages.append(assistant_msg)
+
+                    # Execute server-side tools and append tool results
+                    for tc in turn_tool_calls:
+                        if tc["name"] in SERVER_SIDE_TOOLS:
+                            result = await _execute_server_tool(tc["name"], tc["args"])
+                            yield f"event: tool_result\ndata: {json.dumps({'tool': tc['name'], 'summary': result[:200]})}\n\n"
+                        else:
+                            result = "OK"
+                        loop_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        })
 
             # Store assistant message
             await postgres_db.create_builder_message(
                 session_id=session_id,
                 role="assistant",
-                content=full_text if full_text else None,
-                tool_calls=all_tool_calls if all_tool_calls else None,
+                content=final_text if final_text else None,
+                tool_calls=final_tool_calls if final_tool_calls else None,
             )
 
             # Handle auto-summarization if needed
@@ -2217,16 +2310,32 @@ async def send_builder_message(
     )
 
 
+async def _execute_server_tool(tool_name: str, args: dict) -> str:
+    """Execute a server-side builder tool and return the result string."""
+    if tool_name == "web_search":
+        return await tavily_search(
+            query=args.get("query", ""),
+            max_results=args.get("max_results", 5),
+        )
+    return f"Error: Unknown server tool: {tool_name}"
+
+
 async def _stream_openai(
     system_prompt: str,
-    context_messages: list[dict[str, str]],
+    context_messages: list[dict],
     model: str,
 ):
-    """Stream from OpenAI-compatible API with tool support."""
+    """Stream from OpenAI-compatible API, yielding structured events.
+
+    Yields tuples of (event_type, event_data):
+    - ("token", {"text": str})
+    - ("tool_call", {"name": str, "args": dict, "id": str})
+    - ("error", {"message": str})
+    """
     try:
         from openai import AsyncOpenAI
     except ImportError:
-        yield f"event: error\ndata: {json.dumps({'message': 'openai package not installed'})}\n\n"
+        yield ("error", {"message": "openai package not installed"})
         return
 
     client = AsyncOpenAI(
@@ -2255,14 +2364,16 @@ async def _stream_openai(
 
             # Text content
             if delta.content:
-                yield f"event: token\ndata: {json.dumps({'text': delta.content})}\n\n"
+                yield ("token", {"text": delta.content})
 
             # Tool calls (streamed incrementally)
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in tool_call_buffers:
-                        tool_call_buffers[idx] = {"name": "", "arguments": ""}
+                        tool_call_buffers[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc.id:
+                        tool_call_buffers[idx]["id"] = tc.id
                     if tc.function and tc.function.name:
                         tool_call_buffers[idx]["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
@@ -2272,24 +2383,30 @@ async def _stream_openai(
         for _idx, tc_buf in sorted(tool_call_buffers.items()):
             try:
                 args = json.loads(tc_buf["arguments"])
-                yield f"event: tool_call\ndata: {json.dumps({'tool': tc_buf['name'], 'args': args})}\n\n"
+                yield ("tool_call", {"name": tc_buf["name"], "args": args, "id": tc_buf["id"]})
             except json.JSONDecodeError:
                 logger.warning(f"Failed to parse tool call args: {tc_buf['arguments'][:100]}")
 
     except Exception as e:
-        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+        yield ("error", {"message": str(e)})
 
 
 async def _stream_anthropic(
     system_prompt: str,
-    context_messages: list[dict[str, str]],
+    context_messages: list[dict],
     model: str,
 ):
-    """Stream from Anthropic API with tool support."""
+    """Stream from Anthropic API, yielding structured events.
+
+    Yields tuples of (event_type, event_data):
+    - ("token", {"text": str})
+    - ("tool_call", {"name": str, "args": dict, "id": str})
+    - ("error", {"message": str})
+    """
     try:
         from anthropic import AsyncAnthropic
     except ImportError:
-        yield f"event: error\ndata: {json.dumps({'message': 'anthropic package not installed'})}\n\n"
+        yield ("error", {"message": "anthropic package not installed"})
         return
 
     client = AsyncAnthropic(api_key=get_builder_api_key())
@@ -2304,10 +2421,11 @@ async def _stream_anthropic(
             "input_schema": func["parameters"],
         })
 
-    # Filter out system messages from context (Anthropic uses system param)
-    filtered_messages = [m for m in context_messages if m["role"] != "system"]
+    # Separate system messages from conversation messages
+    filtered_messages = [m for m in context_messages if m.get("role") != "system"]
     extra_system = "\n".join(
-        m["content"] for m in context_messages if m["role"] == "system"
+        m["content"] for m in context_messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str)
     )
     full_system = system_prompt
     if extra_system:
@@ -2321,6 +2439,7 @@ async def _stream_anthropic(
             tools=anthropic_tools,
             max_tokens=4096,
         ) as stream:
+            current_tool_id = ""
             current_tool_name = ""
             current_tool_args = ""
 
@@ -2328,25 +2447,27 @@ async def _stream_anthropic(
                 if event.type == "content_block_start":
                     if hasattr(event.content_block, "type"):
                         if event.content_block.type == "tool_use":
+                            current_tool_id = event.content_block.id
                             current_tool_name = event.content_block.name
                             current_tool_args = ""
                 elif event.type == "content_block_delta":
                     if hasattr(event.delta, "text"):
-                        yield f"event: token\ndata: {json.dumps({'text': event.delta.text})}\n\n"
+                        yield ("token", {"text": event.delta.text})
                     elif hasattr(event.delta, "partial_json"):
                         current_tool_args += event.delta.partial_json
                 elif event.type == "content_block_stop":
                     if current_tool_name:
                         try:
                             args = json.loads(current_tool_args) if current_tool_args else {}
-                            yield f"event: tool_call\ndata: {json.dumps({'tool': current_tool_name, 'args': args})}\n\n"
+                            yield ("tool_call", {"name": current_tool_name, "args": args, "id": current_tool_id})
                         except json.JSONDecodeError:
                             logger.warning(f"Failed to parse Anthropic tool args: {current_tool_args[:100]}")
+                        current_tool_id = ""
                         current_tool_name = ""
                         current_tool_args = ""
 
     except Exception as e:
-        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+        yield ("error", {"message": str(e)})
 
 
 async def _summarize_builder_session(

@@ -188,22 +188,38 @@ import { environment } from '../../core/environment';
 
           @if (showAdvanced()) {
             <div class="advanced-section">
-              <!-- Model Settings -->
+              <!-- Model Preset -->
+              @if (availablePresets.length > 0) {
+                <div class="form-group">
+                  <label class="form-label">Model Preset</label>
+                  <div class="preset-chips">
+                    @for (preset of availablePresets; track preset.label) {
+                      <button type="button" class="preset-chip"
+                        [class.active]="configStrategicModel() === preset.strategic && configTacticalModel() === preset.tactical"
+                        (click)="applyPreset(preset)" [disabled]="isSubmitting()">
+                        {{ preset.label }}
+                      </button>
+                    }
+                  </div>
+                </div>
+              }
+
+              <!-- Strategic Model -->
               <div class="form-group">
-                <label class="form-label">Model</label>
+                <label class="form-label">Strategic Model (Planning)</label>
                 <div class="model-combo">
                   <input
                     type="text"
                     class="form-input"
-                    [ngModel]="configModel()"
-                    (ngModelChange)="configModel.set($event)"
-                    name="configModel"
+                    [ngModel]="configStrategicModel()"
+                    (ngModelChange)="configStrategicModel.set($event)"
+                    name="configStrategicModel"
                     placeholder="Select or type a model name..."
-                    list="modelList"
+                    list="strategicModelList"
                     [disabled]="isSubmitting()"
                     autocomplete="off"
                   >
-                  <datalist id="modelList">
+                  <datalist id="strategicModelList">
                     @for (group of availableModels; track group.group) {
                       @for (model of group.models; track model) {
                         <option [value]="model">{{ group.group }}</option>
@@ -211,13 +227,33 @@ import { environment } from '../../core/environment';
                     }
                   </datalist>
                 </div>
-                <span class="field-hint">
-                  @if (getExpertDefault('llm.model'); as defaultModel) {
-                    Expert default: {{ defaultModel }}
-                  } @else {
-                    Leave empty to use the expert's default model
-                  }
-                </span>
+                <span class="field-hint">Used for review, reflection, and planning phases</span>
+              </div>
+
+              <!-- Tactical Model -->
+              <div class="form-group">
+                <label class="form-label">Tactical Model (Execution)</label>
+                <div class="model-combo">
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="configTacticalModel()"
+                    (ngModelChange)="configTacticalModel.set($event)"
+                    name="configTacticalModel"
+                    placeholder="Select or type a model name..."
+                    list="tacticalModelList"
+                    [disabled]="isSubmitting()"
+                    autocomplete="off"
+                  >
+                  <datalist id="tacticalModelList">
+                    @for (group of availableModels; track group.group) {
+                      @for (model of group.models; track model) {
+                        <option [value]="model">{{ group.group }}</option>
+                      }
+                    }
+                  </datalist>
+                </div>
+                <span class="field-hint">Used for task execution phases</span>
               </div>
 
               <!-- Temperature -->
@@ -577,6 +613,41 @@ import { environment } from '../../core/environment';
       /* Model combo-box */
       .model-combo {
         position: relative;
+      }
+
+      /* Model preset chips */
+      .preset-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .preset-chip {
+        padding: 6px 14px;
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 16px;
+        background: var(--surface-0, #313244);
+        color: var(--text-secondary, #a6adc8);
+        font-size: 12px;
+        font-family: inherit;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .preset-chip:hover:not(:disabled) {
+        border-color: var(--accent-color, #cba6f7);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .preset-chip.active {
+        border-color: var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.15);
+        color: var(--accent-color, #cba6f7);
+      }
+
+      .preset-chip:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
       }
 
       /* Slider */
@@ -1273,13 +1344,15 @@ export class JobCreateComponent implements OnInit {
   readonly instructionsContent = signal<string | null>(null);
 
   // Config settings form state
-  readonly configModel = signal<string | null>(null);
+  readonly configStrategicModel = signal<string | null>(null);
+  readonly configTacticalModel = signal<string | null>(null);
   readonly configTemperature = signal<number | null>(null);
   readonly configReasoning = signal<string | null>(null);
   readonly disabledToolCategories = signal<Set<string>>(new Set());
 
   // Model list for combo-box (loaded from env.js at runtime)
   readonly availableModels = environment.models;
+  readonly availablePresets = environment.modelPresets;
 
   // Tool category metadata for toggles
   readonly toolCategories = [
@@ -1328,7 +1401,8 @@ export class JobCreateComponent implements OnInit {
       this.expertDetail.set(null);
       this.instructionsContent.set(null);
       this.artifacts.instructions.set(null);
-      this.configModel.set(null);
+      this.configStrategicModel.set(null);
+      this.configTacticalModel.set(null);
       this.configTemperature.set(null);
       this.configReasoning.set(null);
       this.disabledToolCategories.set(new Set());
@@ -1386,9 +1460,14 @@ export class JobCreateComponent implements OnInit {
 
   // ===== Config Settings Methods =====
 
-  /** Clamp temperature to valid 0–2 range. */
+  /** Clamp temperature to valid 0-2 range. */
   onTemperatureChange(value: number): void {
     this.configTemperature.set(Math.round(Math.min(2, Math.max(0, value)) * 10) / 10);
+  }
+
+  applyPreset(preset: { label: string; strategic: string; tactical: string }): void {
+    this.configStrategicModel.set(preset.strategic);
+    this.configTacticalModel.set(preset.tactical);
   }
 
   getExpertDefault(path: string): unknown {
@@ -1418,9 +1497,14 @@ export class JobCreateComponent implements OnInit {
     const override: Record<string, unknown> = {};
     const llm: Record<string, unknown> = {};
 
-    const model = this.configModel();
-    if (model && model !== this.getExpertDefault('llm.model')) {
-      llm['model'] = model;
+    const strategicModel = this.configStrategicModel();
+    if (strategicModel) {
+      llm['strategic'] = { model: strategicModel };
+    }
+
+    const tacticalModel = this.configTacticalModel();
+    if (tacticalModel) {
+      llm['tactical'] = { model: tacticalModel };
     }
 
     const temp = this.configTemperature();
@@ -1453,7 +1537,8 @@ export class JobCreateComponent implements OnInit {
   private prefillConfigFromExpert(): void {
     const detail = this.expertDetail();
     if (!detail?.config) {
-      this.configModel.set(null);
+      this.configStrategicModel.set(null);
+      this.configTacticalModel.set(null);
       this.configTemperature.set(null);
       this.configReasoning.set(null);
       this.disabledToolCategories.set(new Set());
@@ -1462,7 +1547,11 @@ export class JobCreateComponent implements OnInit {
 
     // Pre-fill from expert config (user can then change)
     const llm = detail.config['llm'] as Record<string, unknown> | undefined;
-    this.configModel.set((llm?.['model'] as string) ?? null);
+    const strategicOverride = llm?.['strategic'] as Record<string, unknown> | undefined;
+    const tacticalOverride = llm?.['tactical'] as Record<string, unknown> | undefined;
+    const baseModel = (llm?.['model'] as string) ?? null;
+    this.configStrategicModel.set((strategicOverride?.['model'] as string) ?? baseModel);
+    this.configTacticalModel.set((tacticalOverride?.['model'] as string) ?? baseModel);
     this.configTemperature.set((llm?.['temperature'] as number) ?? null);
     this.configReasoning.set((llm?.['reasoning_level'] as string) ?? null);
 
@@ -1731,7 +1820,8 @@ export class JobCreateComponent implements OnInit {
     // Reset instructions editor
     this.instructionsContent.set(null);
     // Reset config settings
-    this.configModel.set(null);
+    this.configStrategicModel.set(null);
+    this.configTacticalModel.set(null);
     this.configTemperature.set(null);
     this.configReasoning.set(null);
     this.disabledToolCategories.set(new Set());

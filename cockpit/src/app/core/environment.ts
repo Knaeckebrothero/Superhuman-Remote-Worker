@@ -26,9 +26,17 @@ const getModels = (): { group: string; models: string[] }[] => {
   return [];
 };
 
+const getModelPresets = (): { label: string; strategic: string; tactical: string }[] => {
+  if (typeof window !== 'undefined') {
+    return (window as any)['env']?.['modelPresets'] || [];
+  }
+  return [];
+};
+
 export const environment = {
   apiUrl: getApiUrl(),
   giteaUrl: getGiteaUrl(),
   dozzleUrl: getDozzleUrl(),
   models: getModels(),
+  modelPresets: getModelPresets(),
 };

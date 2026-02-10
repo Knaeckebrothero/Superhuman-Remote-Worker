@@ -72,6 +72,14 @@ interface ChatMessage {
               </div>
             </div>
           }
+
+          @if (researchStatus()) {
+            <div class="research-status">
+              <span class="research-icon">travel_explore</span>
+              <span class="research-text">{{ researchStatus() }}</span>
+              <span class="spinner-small"></span>
+            </div>
+          }
         </div>
       }
 
@@ -508,6 +516,34 @@ interface ChatMessage {
       @keyframes spin {
         to { transform: rotate(360deg); }
       }
+
+      .research-status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        border-radius: 8px;
+        background: rgba(250, 179, 135, 0.08);
+        border: 1px solid rgba(250, 179, 135, 0.15);
+        font-size: 12px;
+        color: #fab387;
+        align-self: flex-start;
+        max-width: 80%;
+      }
+
+      .research-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+        flex-shrink: 0;
+      }
+
+      .research-text {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
     `,
   ],
 })
@@ -520,6 +556,7 @@ export class InstructionBuilderComponent implements AfterViewChecked {
 
   readonly messages = signal<ChatMessage[]>([]);
   readonly streamingText = signal<string>('');
+  readonly researchStatus = signal<string | null>(null);
   readonly error = signal<string | null>(null);
   readonly isCreatingSession = signal(false);
   readonly lastFailedMessage = signal<string | null>(null);
@@ -580,9 +617,19 @@ export class InstructionBuilderComponent implements AfterViewChecked {
       onToolCall: (tool, args) => {
         toolCalls.push({ tool, args });
       },
+      onToolExecuting: (tool, args) => {
+        if (tool === 'web_search') {
+          this.researchStatus.set(`Researching: ${(args as Record<string, string>)['query']}...`);
+        }
+        this.shouldScrollToBottom = true;
+      },
+      onToolResult: () => {
+        this.researchStatus.set(null);
+      },
       onDone: () => {
         const content = this.streamingText();
         this.streamingText.set('');
+        this.researchStatus.set(null);
         this.messages.update((msgs) => [
           ...msgs,
           {
@@ -596,6 +643,7 @@ export class InstructionBuilderComponent implements AfterViewChecked {
       onError: (message) => {
         const content = this.streamingText();
         this.streamingText.set('');
+        this.researchStatus.set(null);
         if (content) {
           this.messages.update((msgs) => [
             ...msgs,
