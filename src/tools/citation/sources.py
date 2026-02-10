@@ -349,6 +349,10 @@ Similarity Score: {similarity}
                     citation_id, url, title, accessed_date, text
                 )
 
+            # Persist web content to disk (idempotent — no-op if already saved by research tools)
+            if text:
+                context.save_web_content_to_disk(url, text, title=title, source_id=source_id)
+
             # Build locator dict
             locator = {"accessed_at": accessed_date}
             if title:

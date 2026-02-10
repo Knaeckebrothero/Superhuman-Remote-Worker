@@ -316,7 +316,7 @@ class WorkspaceConfig:
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
     git_ignore_patterns: List[str] = field(
-        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
     )
 
 
@@ -531,7 +531,7 @@ def load_agent_config(
         git_versioning=workspace_data.get("git_versioning", True),
         git_ignore_patterns=workspace_data.get(
             "git_ignore_patterns",
-            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
         ),
     )
 
@@ -651,7 +651,7 @@ def load_agent_config_from_dict(
         git_versioning=workspace_data.get("git_versioning", True),
         git_ignore_patterns=workspace_data.get(
             "git_ignore_patterns",
-            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"]
+            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
         ),
     )
 

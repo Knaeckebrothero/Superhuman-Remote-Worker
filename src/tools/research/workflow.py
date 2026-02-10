@@ -242,7 +242,7 @@ async def _download_available_papers(
     from .utils.paper_types import AccessStatus
 
     results = []
-    dest_dir = Path(context.workspace_manager.workspace_dir) / "documents"
+    dest_dir = context.workspace_manager.get_path("documents")
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     downloadable = [

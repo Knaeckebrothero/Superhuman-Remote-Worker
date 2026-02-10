@@ -69,7 +69,7 @@ def _detect_identifier_type(identifier: str) -> str:
 def _get_documents_dir(context: ToolContext) -> Path:
     """Get the documents directory from workspace, or a fallback."""
     if context.has_workspace():
-        return Path(context.workspace_manager.workspace_dir) / "documents"
+        return context.workspace_manager.get_path("documents")
     return Path("./downloads")
 
 
