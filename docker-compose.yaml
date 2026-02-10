@@ -64,7 +64,7 @@ services:
     image: docker.io/dpage/pgadmin4:latest
     container_name: srw-pgadmin
     environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@srw.local}
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@srw.dev}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
       PGADMIN_CONFIG_SERVER_MODE: "False"
     ports:
@@ -269,43 +269,21 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Container log viewer (Dozzle) with read-only socket proxy
+  # Container log viewer (Dozzle)
   # ---------------------------------------------------------------------------
   # Socket path varies by runtime:
   #   Rootless Podman: /run/user/<UID>/podman/podman.sock  (default below)
   #   Rootful Podman:  /run/podman/podman.sock
   #   Docker:          /var/run/docker.sock
-  socket-proxy:
-    image: lscr.io/linuxserver/socket-proxy:latest
-    container_name: srw-socket-proxy
-    environment:
-      - CONTAINERS=1
-      - IMAGES=0
-      - EXEC=0
-      - POST=0
-      - SYSTEM=0
-      - AUTH=0
-      - SECRETS=0
-      - NETWORKS=0
-      - VOLUMES=0
-      - BUILD=0
-    volumes:
-      - /run/user/${HOST_UID:-1000}/podman/podman.sock:/var/run/docker.sock:ro
-    read_only: true
-    tmpfs:
-      - /run
-    restart: unless-stopped
-
   dozzle:
     image: docker.io/amir20/dozzle:latest
     container_name: srw-dozzle
     environment:
-      - DOCKER_HOST=tcp://socket-proxy:2375
       - DOZZLE_NO_ANALYTICS=true
+    volumes:
+      - /run/user/${HOST_UID:-1000}/podman/podman.sock:/var/run/docker.sock:ro
     ports:
       - "${DOZZLE_PORT:-9999}:8080"
-    depends_on:
-      - socket-proxy
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
       interval: 10s
