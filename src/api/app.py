@@ -82,20 +82,21 @@ async def lifespan(app: FastAPI):
     logger.info("Registering with orchestrator...")
     await _orchestrator_client.connect()
 
+    # Attempt initial registration (non-fatal if it fails)
     if await _orchestrator_client.register():
-        # Start heartbeat loop
-        _heartbeat_task = asyncio.create_task(
-            _orchestrator_client.run_heartbeat_loop(
-                get_status=_get_agent_status_for_heartbeat,
-                get_job_id=_get_current_job_id,
-                get_metrics=_get_agent_metrics,
-            )
-        )
-        logger.info("Orchestrator heartbeat loop started")
+        logger.info("Registered with orchestrator")
     else:
-        logger.error("Failed to register with orchestrator - agent will not receive jobs")
-        await _orchestrator_client.close()
-        _orchestrator_client = None
+        logger.warning("Initial registration failed - will keep retrying in background")
+
+    # Always start the heartbeat loop (handles registration retries too)
+    _heartbeat_task = asyncio.create_task(
+        _orchestrator_client.run_heartbeat_loop(
+            get_status=_get_agent_status_for_heartbeat,
+            get_job_id=_get_current_job_id,
+            get_metrics=_get_agent_metrics,
+        )
+    )
+    logger.info("Orchestrator heartbeat loop started")
 
     yield
 

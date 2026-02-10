@@ -30,6 +30,7 @@ workspace:
     - "__pycache__/"
     - ".DS_Store"
     - "*.pyc"
+    - "documents/"
 
 tools:
   # Workspace tools - file operations (src/tools/workspace/)

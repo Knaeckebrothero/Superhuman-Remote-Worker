@@ -278,6 +278,8 @@ services:
   dozzle:
     image: docker.io/amir20/dozzle:latest
     container_name: srw-dozzle
+    security_opt:
+      - label:disable
     environment:
       - DOZZLE_NO_ANALYTICS=true
     volumes:
