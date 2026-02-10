@@ -252,6 +252,245 @@ class GiteaClient:
         """
         return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", url)
 
+    async def get_file(self, repo_name: str, file_path: str, ref: str | None = None) -> dict | None:
+        """Read a file from a repository via Gitea API.
+
+        Args:
+            repo_name: Repository name (e.g. "job-abc123")
+            file_path: Path within the repo (e.g. "output/job_frozen.json")
+            ref: Branch/tag/commit (defaults to repo default branch)
+
+        Returns:
+            Decoded file content dict (parsed JSON) or None if not found/failed.
+        """
+        if not self._initialized:
+            return None
+
+        import base64
+
+        client = self._get_client()
+        params = {"ref": ref} if ref else {}
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                params=params,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to read {file_path} from {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            data = resp.json()
+            content_b64 = data.get("content", "")
+            decoded = base64.b64decode(content_b64).decode("utf-8")
+
+            import json
+            return json.loads(decoded)
+
+        except Exception as e:
+            logger.warning(f"Failed to read {file_path} from {repo_name}: {e}")
+            return None
+
+    async def create_or_update_file(
+        self, repo_name: str, file_path: str, content: str, message: str
+    ) -> bool:
+        """Create or update a file in a repository via Gitea API.
+
+        Args:
+            repo_name: Repository name (e.g. "job-abc123")
+            file_path: Path within the repo (e.g. "output/job_completion.json")
+            content: File content as string
+            message: Commit message
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not self._initialized:
+            return False
+
+        import base64
+
+        client = self._get_client()
+        content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+
+        try:
+            # Check if file already exists (need SHA for update)
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+            )
+
+            payload: dict = {
+                "content": content_b64,
+                "message": message,
+            }
+
+            if resp.status_code == 200:
+                # File exists — include SHA for update
+                existing = resp.json()
+                payload["sha"] = existing["sha"]
+
+            resp = await client.put(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                json=payload,
+            )
+
+            if resp.status_code in (200, 201):
+                return True
+
+            logger.warning(
+                f"Failed to write {file_path} to {repo_name} "
+                f"(status {resp.status_code}): {resp.text[:200]}"
+            )
+            return False
+
+        except Exception as e:
+            logger.warning(f"Failed to write {file_path} to {repo_name}: {e}")
+            return False
+
+    async def delete_file(self, repo_name: str, file_path: str, message: str) -> bool:
+        """Delete a file from a repository via Gitea API.
+
+        Args:
+            repo_name: Repository name
+            file_path: Path within the repo
+            message: Commit message
+
+        Returns:
+            True if deleted, False otherwise.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            # Get current SHA (required for delete)
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+            )
+            if resp.status_code == 404:
+                return True  # Already gone
+            if resp.status_code != 200:
+                return False
+
+            sha = resp.json()["sha"]
+
+            resp = await client.delete(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                json={"sha": sha, "message": message},
+            )
+
+            return resp.status_code == 200
+
+        except Exception as e:
+            logger.warning(f"Failed to delete {file_path} from {repo_name}: {e}")
+            return False
+
+    async def list_contents(
+        self, repo_name: str, path: str = "", ref: str | None = None
+    ) -> list[dict] | None:
+        """List directory contents from a repository.
+
+        Args:
+            repo_name: Repository name
+            path: Directory path within the repo (empty string for root)
+            ref: Branch/tag/commit
+
+        Returns:
+            List of file/dir entries with name, path, type, size, or None on failure.
+            Each entry has: name, path, type ("file"|"dir"|"submodule"), size.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+        params = {"ref": ref} if ref else {}
+        url_path = f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents"
+        if path:
+            url_path += f"/{path}"
+
+        try:
+            resp = await client.get(url_path, params=params)
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to list {path or '/'} in {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            data = resp.json()
+
+            # Gitea returns a list for directories, a single object for files
+            if isinstance(data, dict):
+                # Single file — wrap in list for consistency
+                return [data]
+
+            return [
+                {
+                    "name": entry["name"],
+                    "path": entry["path"],
+                    "type": entry["type"],
+                    "size": entry.get("size", 0),
+                }
+                for entry in data
+            ]
+
+        except Exception as e:
+            logger.warning(f"Failed to list {path or '/'} in {repo_name}: {e}")
+            return None
+
+    async def get_file_content(
+        self, repo_name: str, file_path: str, ref: str | None = None
+    ) -> str | None:
+        """Read raw file content as a string from a repository.
+
+        Unlike get_file() which parses JSON, this returns the raw text content.
+
+        Args:
+            repo_name: Repository name
+            file_path: Path within the repo
+            ref: Branch/tag/commit
+
+        Returns:
+            File content as string, or None if not found/failed.
+        """
+        if not self._initialized:
+            return None
+
+        import base64
+
+        client = self._get_client()
+        params = {"ref": ref} if ref else {}
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                params=params,
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to read {file_path} from {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            data = resp.json()
+            content_b64 = data.get("content", "")
+            return base64.b64decode(content_b64).decode("utf-8")
+
+        except Exception as e:
+            logger.warning(f"Failed to read {file_path} from {repo_name}: {e}")
+            return None
+
     async def close(self) -> None:
         """Close the httpx client."""
         if self._client and not self._client.is_closed:

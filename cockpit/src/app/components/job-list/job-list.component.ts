@@ -125,6 +125,15 @@ type StatusFilter = 'all' | JobStatus;
                         Cancel
                       </button>
                     }
+                    @if (job.status === 'pending_review') {
+                      <button
+                        class="action-btn review"
+                        (click)="reviewJob(job.id); $event.stopPropagation()"
+                        title="Review and approve/continue"
+                      >
+                        Review
+                      </button>
+                    }
                     @if (job.status !== 'completed' && job.status !== 'cancelled') {
                       <button
                         class="action-btn resume"
@@ -372,6 +381,12 @@ type StatusFilter = 'all' | JobStatus;
         color: #6c7086;
       }
 
+      .status-badge.status-pending_review {
+        background: rgba(250, 179, 135, 0.2);
+        color: #fab387;
+        font-weight: 600;
+      }
+
       /* Prompt Cell */
       .prompt-cell {
         max-width: 300px;
@@ -455,6 +470,12 @@ type StatusFilter = 'all' | JobStatus;
         border-color: #a6e3a1;
       }
 
+      .action-btn.review {
+        color: #fab387;
+        border-color: #fab387;
+        font-weight: 600;
+      }
+
       .action-btn.workspace {
         color: #94e2d5;
         border-color: #94e2d5;
@@ -495,6 +516,7 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   readonly statusFilters: { label: string; value: StatusFilter }[] = [
     { label: 'All', value: 'all' },
+    { label: 'Review', value: 'pending_review' },
     { label: 'Created', value: 'created' },
     { label: 'Processing', value: 'processing' },
     { label: 'Completed', value: 'completed' },
@@ -556,6 +578,12 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   viewJob(jobId: string): void {
     // Use DataService to switch to this job for debug panels
+    this.data.setCurrentJob(jobId);
+    this.selectedJobId.set(jobId);
+  }
+
+  reviewJob(jobId: string): void {
+    // Select the job and open it in debug panels (review component will detect pending_review)
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
   }

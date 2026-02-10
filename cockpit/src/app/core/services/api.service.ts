@@ -671,6 +671,43 @@ export class ApiService {
   }
 
   /**
+   * Approve a frozen job (pending_review → completed).
+   * @param jobId The job ID to approve
+   * @param notes Optional reviewer notes
+   */
+  approveJob(
+    jobId: string,
+    notes?: string,
+  ): Observable<{ status: string; job_id: string; summary: string; deliverables: string[] } | null> {
+    const body: { notes?: string } = {};
+    if (notes) body.notes = notes;
+
+    return this.http
+      .post<{ status: string; job_id: string; summary: string; deliverables: string[] }>(
+        `${this.baseUrl}/jobs/${jobId}/approve`,
+        body,
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to approve job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Get frozen job data (job_frozen.json) for a pending_review job.
+   */
+  getFrozenJobData(jobId: string): Observable<Record<string, unknown> | null> {
+    return this.http.get<Record<string, unknown>>(`${this.baseUrl}/jobs/${jobId}/frozen`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch frozen data for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
    * Assign a job to an agent.
    */
   assignJob(jobId: string, agentId: string): Observable<{ status: string; agent_id: string; job_id: string } | null> {
@@ -744,6 +781,48 @@ export class ApiService {
       .pipe(
         catchError((error) => {
           console.error(`Failed to fetch workspace file ${filename} for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  // ===== Repo Browser Endpoints (Gitea proxy) =====
+
+  /**
+   * List directory contents from a job's Gitea repository.
+   * @param jobId Job ID
+   * @param path Directory path within the repo (empty for root)
+   */
+  listRepoContents(
+    jobId: string,
+    path: string = '',
+  ): Observable<{ name: string; path: string; type: string; size: number }[]> {
+    const params = path ? new HttpParams().set('path', path) : new HttpParams();
+    return this.http
+      .get<{ name: string; path: string; type: string; size: number }[]>(
+        `${this.baseUrl}/jobs/${jobId}/repo/contents`,
+        { params },
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to list repo contents for job ${jobId} path=${path}:`, error);
+          return of([]);
+        }),
+      );
+  }
+
+  /**
+   * Get file content from a job's Gitea repository.
+   * @param jobId Job ID
+   * @param path File path within the repo
+   */
+  getRepoFile(jobId: string, path: string): Observable<{ path: string; content: string; size: number } | null> {
+    const params = new HttpParams().set('path', path);
+    return this.http
+      .get<{ path: string; content: string; size: number }>(`${this.baseUrl}/jobs/${jobId}/repo/file`, { params })
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch repo file ${path} for job ${jobId}:`, error);
           return of(null);
         }),
       );

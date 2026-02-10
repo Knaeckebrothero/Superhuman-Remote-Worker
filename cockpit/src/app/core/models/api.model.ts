@@ -145,7 +145,7 @@ export interface Agent {
 /**
  * Job status types.
  */
-export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'pending_review';
 
 /**
  * Job from the orchestrator.

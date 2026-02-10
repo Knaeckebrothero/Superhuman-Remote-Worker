@@ -666,6 +666,161 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+class JobApproveRequest(BaseModel):
+    """Request body for approving a frozen job."""
+
+    notes: str | None = Field(None, description="Optional reviewer notes")
+
+
+@app.post("/api/jobs/{job_id}/approve")
+async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> dict[str, Any]:
+    """Approve a frozen job, marking it as completed.
+
+    This endpoint mirrors the logic from agent.py:approve_frozen_job but runs
+    entirely on the orchestrator side — no agent pod needs to be running.
+
+    Steps:
+    1. Validates job exists and is in 'pending_review' status
+    2. Reads job_frozen.json from the Gitea repo
+    3. Writes job_completion.json to the Gitea repo
+    4. Removes job_frozen.json from the Gitea repo
+    5. Updates DB status to 'completed' with completed_at timestamp
+    """
+    if request is None:
+        request = JobApproveRequest()
+
+    try:
+        # 1. Validate job exists and is in pending_review
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job["status"] != "pending_review":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job cannot be approved (status: {job['status']}). "
+                       f"Only jobs in 'pending_review' status can be approved.",
+            )
+
+        # 2. Read job_frozen.json from Gitea
+        repo_name = f"job-{job_id}"
+        frozen_data = None
+
+        if gitea_client.is_initialized:
+            frozen_data = await gitea_client.get_file(repo_name, "output/job_frozen.json")
+
+        if frozen_data is None:
+            # Fallback: try local workspace filesystem
+            workspace_path = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+            if workspace_path.exists():
+                frozen_data = json.loads(workspace_path.read_text())
+            else:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No job_frozen.json found for job '{job_id}' "
+                           f"(checked Gitea repo and local workspace)",
+                )
+
+        # 3. Build completion data
+        completion_data = {
+            **frozen_data,
+            "status": "job_completed",
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+            "approved_by": "human_operator",
+        }
+        if request.notes:
+            completion_data["reviewer_notes"] = request.notes
+
+        completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
+
+        # 4. Write job_completion.json and remove job_frozen.json
+        wrote_to_gitea = False
+        if gitea_client.is_initialized:
+            wrote_completion = await gitea_client.create_or_update_file(
+                repo_name,
+                "output/job_completion.json",
+                completion_json,
+                "Approve job: write job_completion.json",
+            )
+            if wrote_completion:
+                await gitea_client.delete_file(
+                    repo_name,
+                    "output/job_frozen.json",
+                    "Approve job: remove job_frozen.json",
+                )
+                wrote_to_gitea = True
+
+        # Also write to local workspace if it exists
+        local_output = workspace_service.base_path / f"job_{job_id}" / "output"
+        if local_output.exists():
+            completion_path = local_output / "job_completion.json"
+            completion_path.write_text(completion_json)
+            frozen_path = local_output / "job_frozen.json"
+            if frozen_path.exists():
+                frozen_path.unlink()
+
+        # 5. Update DB: status → completed, set completed_at
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status = 'completed', completed_at = CURRENT_TIMESTAMP, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                job_id,
+            )
+
+        logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
+
+        return {
+            "status": "approved",
+            "job_id": job_id,
+            "summary": completion_data.get("summary", ""),
+            "deliverables": completion_data.get("deliverables", []),
+            "approved_at": completion_data["approved_at"],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to approve job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/frozen")
+async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
+    """Get the frozen job data (job_frozen.json) for a pending_review job.
+
+    Tries Gitea first, falls back to local workspace.
+
+    Returns:
+        Contents of job_frozen.json (summary, deliverables, confidence, notes, etc.)
+    """
+    try:
+        # Try Gitea first
+        repo_name = f"job-{job_id}"
+        frozen_data = None
+
+        if gitea_client.is_initialized:
+            frozen_data = await gitea_client.get_file(repo_name, "output/job_frozen.json")
+
+        if frozen_data is None:
+            # Fallback: local workspace
+            workspace_path = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+            if workspace_path.exists():
+                frozen_data = json.loads(workspace_path.read_text())
+
+        if frozen_data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No frozen job data found for job '{job_id}'",
+            )
+
+        return frozen_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/jobs/{job_id}/requirements")
 async def get_job_requirements(
     job_id: str,
@@ -814,6 +969,73 @@ async def get_job_chat_history(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Workspace Browser Endpoints (Gitea proxy)
+# =============================================================================
+
+
+@app.get("/api/jobs/{job_id}/repo/contents")
+async def list_repo_contents(
+    job_id: str,
+    path: str = Query(default="", description="Directory path within the repo"),
+) -> list[dict[str, Any]]:
+    """List directory contents of a job's Gitea repository.
+
+    Proxies the Gitea contents API so the cockpit doesn't need Gitea credentials.
+
+    Returns:
+        List of entries, each with: name, path, type ("file"|"dir"), size
+    """
+    if not gitea_client.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Gitea not available",
+        )
+
+    repo_name = f"job-{job_id}"
+    contents = await gitea_client.list_contents(repo_name, path)
+
+    if contents is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Path '{path or '/'}' not found in repo for job '{job_id}'",
+        )
+
+    return contents
+
+
+@app.get("/api/jobs/{job_id}/repo/file")
+async def get_repo_file(
+    job_id: str,
+    path: str = Query(..., description="File path within the repo"),
+) -> dict[str, Any]:
+    """Get file content from a job's Gitea repository.
+
+    Returns:
+        Dict with path, content (text), and size
+    """
+    if not gitea_client.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Gitea not available",
+        )
+
+    repo_name = f"job-{job_id}"
+    content = await gitea_client.get_file_content(repo_name, path)
+
+    if content is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"File '{path}' not found in repo for job '{job_id}'",
+        )
+
+    return {
+        "path": path,
+        "content": content,
+        "size": len(content),
+    }
 
 
 # =============================================================================
