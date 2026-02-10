@@ -1,5 +1,5 @@
 # =============================================================================
-# Graph-RAG - Development Infrastructure
+# Superhuman Remote Worker - Development Infrastructure
 # =============================================================================
 #
 # Supporting services for local development. Run agent, orchestrator, and
@@ -31,10 +31,12 @@
 #
 # =============================================================================
 
+name: superhuman-remote-worker
+
 services:
   postgres:
     image: docker.io/pgvector/pgvector:pg15
-    container_name: graphrag-postgres
+    container_name: srw-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-graphrag}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-graphrag_password}
@@ -52,7 +54,7 @@ services:
 
   mongodb:
     image: docker.io/library/mongo:7
-    container_name: graphrag-mongodb
+    container_name: srw-mongodb
     environment:
       MONGO_INITDB_DATABASE: graphrag_logs
     volumes:
@@ -67,9 +69,9 @@ services:
 
   pgadmin:
     image: docker.io/dpage/pgadmin4:latest
-    container_name: graphrag-pgadmin
+    container_name: srw-pgadmin
     environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@graphrag.local}
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@srw.local}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
       PGADMIN_CONFIG_SERVER_MODE: "False"
     ports:
@@ -81,7 +83,7 @@ services:
 
   mongo-express:
     image: docker.io/library/mongo-express:latest
-    container_name: graphrag-mongo-express
+    container_name: srw-mongo-express
     environment:
       ME_CONFIG_MONGODB_SERVER: mongodb
       ME_CONFIG_BASICAUTH: "false"
@@ -94,7 +96,7 @@ services:
 
   gitea:
     image: docker.io/gitea/gitea:1.22-rootless
-    container_name: graphrag-gitea
+    container_name: srw-gitea
     environment:
       GITEA__database__DB_TYPE: sqlite3
       GITEA__database__PATH: /var/lib/gitea/data/gitea.db
@@ -118,8 +120,8 @@ services:
       retries: 5
 
   mcp:
-    build: ./orchestrator/mcp
-    container_name: graphrag-mcp
+    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:${IMAGE_TAG:-latest}
+    container_name: srw-mcp
     environment:
       COCKPIT_API_URL: http://host.docker.internal:8085
       MCP_TRANSPORT: http
@@ -136,7 +138,7 @@ services:
 
   vpn-cluster:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
-    container_name: graphrag-vpn-cluster
+    container_name: srw-vpn-cluster
     cap_add:
       - NET_ADMIN
     security_opt:
@@ -165,7 +167,7 @@ services:
 
   vpn-research:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
-    container_name: graphrag-vpn-research
+    container_name: srw-vpn-research
     cap_add:
       - NET_ADMIN
     security_opt:
@@ -199,7 +201,7 @@ services:
   #   Docker:          /var/run/docker.sock
   socket-proxy:
     image: lscr.io/linuxserver/socket-proxy:latest
-    container_name: graphrag-socket-proxy
+    container_name: srw-socket-proxy
     environment:
       - CONTAINERS=1
       - IMAGES=0
@@ -220,7 +222,7 @@ services:
 
   dozzle:
     image: docker.io/amir20/dozzle:latest
-    container_name: graphrag-dozzle
+    container_name: srw-dozzle
     environment:
       - DOCKER_HOST=tcp://socket-proxy:2375
       - DOZZLE_NO_ANALYTICS=true
@@ -232,8 +234,8 @@ services:
 
 volumes:
   postgres_dev_data:
-    name: graphrag_postgres_dev_data
+    name: srw_postgres_dev_data
   mongodb_dev_data:
-    name: graphrag_mongodb_dev_data
+    name: srw_mongodb_dev_data
   gitea_dev_data:
-    name: graphrag_gitea_dev_data
+    name: srw_gitea_dev_data
