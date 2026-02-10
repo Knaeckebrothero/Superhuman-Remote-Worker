@@ -143,42 +143,75 @@ We push everything as-is. The user sees the full workspace including internal re
 
 ## Implementation Roadmap
 
-### Phase 1: Orchestrator Approve Endpoint
+### Phase 1: Orchestrator Approve Endpoint — DONE
 
-Add `POST /api/jobs/{job_id}/approve` to the orchestrator. This doesn't require the agent pod to be running — the orchestrator can write `job_completion.json` to the workspace (via Gitea or direct filesystem access) and update the DB status to `completed` directly. Mirror the logic in `agent.py:approve_frozen_job` but without needing an agent instance.
+`POST /api/jobs/{job_id}/approve` added to the orchestrator. Runs entirely server-side — no agent pod needed.
 
-**Files to change:**
-- `orchestrator/main.py` — new endpoint + request model
-- `orchestrator/services/gitea.py` — possibly add a method to write a file to a repo (or use the Gitea API's file creation endpoint)
+**What it does:**
+1. Validates job exists and is in `pending_review` status
+2. Reads `job_frozen.json` from Gitea repo (falls back to local workspace)
+3. Writes `job_completion.json` (with `approved_at`, `approved_by`, optional `reviewer_notes`)
+4. Removes `job_frozen.json`
+5. Updates DB: `status → completed`, sets `completed_at`
 
-**Depends on:** nothing — can be built now.
+**Files changed:**
+- `orchestrator/main.py` — `JobApproveRequest` model + `approve_job` endpoint
+- `orchestrator/services/gitea.py` — `get_file`, `create_or_update_file`, `delete_file` methods
 
-### Phase 2: Cockpit Review Component
+### Phase 2: Cockpit Review Component — DONE
 
-Build a review UI that ties together the approve and resume-with-feedback flows.
+Review UI that ties together the approve and resume-with-feedback flows.
 
-**Minimal version:**
-- Filter/highlight jobs with `pending_review` status in the job list
-- Job detail view shows the `job_frozen.json` summary, deliverables list, and confidence
-- "Approve" button calling `POST /api/jobs/{job_id}/approve`
-- Feedback text field + "Continue" button calling `POST /api/jobs/{job_id}/resume` with feedback
+**What was built:**
+- `pending_review` added to `JobStatus` type — cockpit now recognizes this status
+- Job list: "Review" filter chip, orange `pending_review` badge, "Review" action button
+- New `job-review` panel component registered in the layout system:
+  - Fetches job details and frozen job data (via `GET /api/jobs/{job_id}/frozen`)
+  - Shows summary, confidence bar, deliverables list, agent notes
+  - "Approve" button → calls `POST /api/jobs/{job_id}/approve`
+  - Feedback textarea + "Continue with Feedback" button → calls `POST /api/jobs/{job_id}/resume`
+  - Link to browse workspace in Gitea
+  - Graceful states: loading, not-review, empty, success/error messages
+- New orchestrator endpoint: `GET /api/jobs/{job_id}/frozen` (reads `job_frozen.json` from Gitea or local workspace)
 
-**Files to change:**
-- `cockpit/src/app/core/services/api.service.ts` — add `approveJob(jobId)` method
-- `cockpit/src/app/components/` — new review component (or extend job detail view)
+**Files changed:**
+- `cockpit/src/app/core/models/api.model.ts` — added `pending_review` to `JobStatus`
+- `cockpit/src/app/core/models/layout.model.ts` — added `job-review` to `ComponentType`
+- `cockpit/src/app/core/services/api.service.ts` — `approveJob()`, `getFrozenJobData()` methods
+- `cockpit/src/app/components/job-list/job-list.component.ts` — filter chip, badge, Review button
+- `cockpit/src/app/components/job-review/job-review.component.ts` — new component
+- `cockpit/src/app/app.ts` — registered `job-review` component
+- `orchestrator/main.py` — `GET /api/jobs/{job_id}/frozen` endpoint
 
-**Depends on:** Phase 1 (approve endpoint).
+### Phase 3: Workspace Browser — DONE
 
-### Phase 3: Workspace Browser
+Custom file browser that proxies the Gitea API through the orchestrator.
 
-Let the reviewer actually read the workspace contents, not just the frozen-job metadata.
+**Decision:** Built a custom file browser via orchestrator proxy (option 3). This avoids iframe auth issues and keeps the experience integrated in the cockpit. The orchestrator proxies Gitea API calls so the cockpit doesn't need Gitea credentials.
 
-**Options (decide during implementation):**
-- Embed Gitea's web UI in an iframe (simplest, Gitea already renders markdown)
-- Build a file browser that calls the Gitea API (`GET /api/v1/repos/{owner}/{repo}/contents/{path}`)
-- Pull files via orchestrator proxy endpoint
+**What was built:**
+- Orchestrator proxy endpoints:
+  - `GET /api/jobs/{job_id}/repo/contents?path=` — list directory contents
+  - `GET /api/jobs/{job_id}/repo/file?path=` — get file content
+- `GiteaClient.list_contents()` — directory listing from Gitea repos
+- `GiteaClient.get_file_content()` — raw text file content (unlike `get_file()` which parses JSON)
+- New `workspace-browser` panel component:
+  - Split pane: file tree (left) + file content viewer (right)
+  - Breadcrumb navigation with clickable path segments
+  - Directory listing with dirs first, files sorted alphabetically
+  - File icons by extension (md, yaml, json, py, etc.)
+  - File sizes displayed
+  - Parent directory navigation (..)
+  - Raw text file viewer with monospace font and pre-wrap
+  - Reacts to job selection changes from DataService
 
-**Depends on:** Phase 2 (review component to host the browser in).
+**Files changed:**
+- `orchestrator/services/gitea.py` — `list_contents()`, `get_file_content()` methods
+- `orchestrator/main.py` — `GET /api/jobs/{job_id}/repo/contents`, `GET /api/jobs/{job_id}/repo/file`
+- `cockpit/src/app/core/services/api.service.ts` — `listRepoContents()`, `getRepoFile()` methods
+- `cockpit/src/app/core/models/layout.model.ts` — added `workspace-browser` to `ComponentType`
+- `cockpit/src/app/components/workspace-browser/workspace-browser.component.ts` — new component
+- `cockpit/src/app/app.ts` — registered `workspace-browser` component
 
 ### Future: Agent Self-Verification
 

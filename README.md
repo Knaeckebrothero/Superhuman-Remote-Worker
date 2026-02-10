@@ -1,31 +1,62 @@
-# Graph-RAG Requirements Compliance System
+# Superhuman Remote Worker
 
-A Graph-RAG system for requirement traceability and compliance checking. Uses LangGraph and LLMs to extract requirements from documents, validate them against a Neo4j knowledge graph, and track GoBD/GDPR compliance.
+An AI agent you can treat like a remote employee. Message it a task — research, data analysis, document processing, database work, coding — and it gets it done autonomously. Built on LangGraph with a config-driven architecture that adapts to any role.
+
+## How It Works
+
+You describe a job in plain language. The agent breaks it down into phases, plans its approach, executes using the tools it needs, and delivers results — just like a remote worker on your team. It self-manages through strategic planning and tactical execution cycles, maintaining its own workspace, notes, and progress tracking across arbitrarily long tasks.
+
+**What it can do:**
+- Research topics on the web and synthesize findings
+- Process and analyze documents (PDF, DOCX, PPTX, images)
+- Query and manipulate databases (PostgreSQL, Neo4j, MongoDB)
+- Write, review, and manage structured output
+- Execute multi-step workflows with checkpointing and crash recovery
+- Manage citations and literature
+
+**What makes it different:**
+- **Persistent memory** — workspace files survive context window limits, so it never loses track of long tasks
+- **Phase-based execution** — alternates between strategic planning and tactical work, adapting its plan as it learns
+- **Crash recovery** — checkpoints at every step, resume any job from where it left off
+- **Config-driven roles** — same codebase, different YAML configs for different specializations
+- **Multi-database support** — attach PostgreSQL, Neo4j, or MongoDB datasources to any job
 
 ## Table of Contents
 
-- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
 - [Production Deployment](#production-deployment)
 - [Development Setup](#development-setup)
 - [Architecture](#architecture)
 - [Debugging](#debugging)
 - [License](#license)
 
-## Prerequisites
+## Quick Start
 
-- **Docker or Podman** with Compose support
-- **Git**
-- **Python 3.11+** (development only)
+```bash
+# Clone and set up
+git clone <repo-url>
+cd Superhuman-Remote-Worker
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # Add your API keys
+
+# Start databases
+podman-compose -f docker-compose.dev.yaml up -d
+python init.py
+
+# Give it a task
+python agent.py --description "Research the current state of EU AI regulation and summarize key requirements"
+```
 
 ## Production Deployment
 
-Deploy the complete system using pre-built container images.
+Deploy the complete system using containers.
 
 ### 1. Clone and Configure
 
 ```bash
-git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
-cd Uni-Projekt-Graph-RAG
+git clone <repo-url>
+cd Superhuman-Remote-Worker
 cp .env.example .env
 ```
 
@@ -34,14 +65,15 @@ cp .env.example .env
 Edit `.env` with your configuration:
 
 **Required:**
-- `OPENAI_API_KEY` - Your OpenAI API key, or compatible API key
-- `LLM_BASE_URL` - Custom endpoint URL (if using self-hosted models)
+- `OPENAI_API_KEY` — LLM API key (or compatible provider)
+- `LLM_BASE_URL` — Custom endpoint URL (if using self-hosted models)
 
 **Optional:**
-- `TAVILY_API_KEY` - For web search functionality
-- `NEO4J_PASSWORD`, `POSTGRES_PASSWORD` - Custom database passwords
-- `LOG_LEVEL` - DEBUG, INFO, WARNING, ERROR (default: INFO)
-- Port overrides: `AGENT_PORT`, `ORCHESTRATOR_PORT`, `COCKPIT_PORT`, etc.
+- `ANTHROPIC_API_KEY` — For Claude models
+- `GOOGLE_API_KEY` — For Gemini models
+- `TAVILY_API_KEY` — For web search
+- `MONGODB_URL` — LLM request logging and audit trail
+- `LOG_LEVEL` — DEBUG, INFO, WARNING, ERROR (default: INFO)
 
 ### 3. Start All Services
 
@@ -50,21 +82,18 @@ podman-compose up -d
 ```
 
 This starts:
-- **PostgreSQL** - Job tracking and data cache
-- **MongoDB** - LLM request logging and audit trail
-- **Gitea** - Git server for agent workspace repositories
-- **Orchestrator** - Backend API for job management and agent coordination
-- **VPN sidecar** - SOCKS proxy for institutional research access
-- **Agent** - Universal agent workers (defaults to 2 replicas via `AGENT_REPLICAS` env var)
-- **Cockpit** - Angular UI for job management and debugging
-
-Database ports (PostgreSQL, MongoDB) are internal-only in production. Only the services below are exposed to the host.
+- **PostgreSQL** — Job tracking and data storage
+- **MongoDB** — LLM request logging and audit trail (optional)
+- **Gitea** — Git server for agent workspace repositories
+- **Orchestrator** — Backend API for job management and agent coordination
+- **Agent** — Worker instances (defaults to 2 replicas via `AGENT_REPLICAS`)
+- **Cockpit** — Web UI for job management and monitoring
 
 ### 4. Access Services
 
 | Service | URL |
 |---------|-----|
-| Cockpit | http://localhost:4000 |
+| Cockpit (Web UI) | http://localhost:4000 |
 | Orchestrator API | http://localhost:8085 |
 | Gitea | http://localhost:3000 |
 
@@ -75,14 +104,8 @@ Database ports (PostgreSQL, MongoDB) are internal-only in production. Only the s
 podman-compose logs -f
 podman-compose logs -f agent
 
-# Check service status
-podman-compose ps
-
-# Scale agent replicas
+# Scale workers
 podman-compose up -d --scale agent=4
-
-# Restart services
-podman-compose restart
 
 # Stop all services
 podman-compose down
@@ -93,18 +116,22 @@ podman-compose down -v
 
 ## Development Setup
 
-Run databases in containers while developing agents locally with Python.
+Run databases in containers while developing locally with Python.
 
-### 1. Clone and Set Up Python Environment
+### 1. Set Up Python Environment
 
 ```bash
-git clone https://github.com/Knaeckebrothero/Uni-Projekt-Graph-RAG.git
-cd Uni-Projekt-Graph-RAG
+git clone <repo-url>
+cd Superhuman-Remote-Worker
 
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
-
 pip install -r requirements.txt
+
+# System dependencies (Fedora)
+sudo dnf install poppler-utils         # PDF rendering
+# Debian/Ubuntu: sudo apt-get install poppler-utils
+playwright install chromium            # Browser-based research
 ```
 
 ### 2. Configure Environment
@@ -120,239 +147,127 @@ cp .env.example .env
 podman-compose -f docker-compose.dev.yaml up -d
 ```
 
-This starts PostgreSQL, Neo4j, and MongoDB (for optional LLM request logging).
-
-### 4. Initialize Databases and Workspace
+### 4. Initialize
 
 ```bash
-# Initialize everything (databases + workspace)
-python init.py
-
-# Reset everything (WARNING: deletes all data)
-python init.py --force-reset
+python init.py                          # Initialize everything
+python init.py --force-reset            # Reset everything (WARNING: deletes all data)
+python init.py --only-orchestrator      # Databases only
+python init.py --only-agent             # Workspace only
 ```
 
-### 5. Run Agents Locally
+### 5. Run the Agent
 
 ```bash
-# Process a document (uses defaults config)
-python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements"
+# Give it a task
+python agent.py --description "Your task here"
 
-# Run as API server
-python agent.py --port 8001
+# With a custom agent config
+python agent.py --config my_agent --description "Your task"
 
-# Run with custom config
-python agent.py --config my_agent --port 8001
-
-# Run with streaming output
-python agent.py --document-path ./data/doc.pdf --prompt "Extract requirements" --stream --verbose
+# Process a document
+python agent.py --document-path ./data/doc.pdf --description "Extract key findings"
 
 # Process a directory of documents
-python agent.py --document-dir ./data/example_data/ --prompt "Identify possible requirements" --stream --verbose
+python agent.py --document-dir ./data/reports/ --description "Compare and summarize these reports"
+
+# Run as an API server
+python agent.py --port 8001
+
+# Resume a crashed job
+python agent.py --job-id <id> --resume
+
+# Debug mode
+LOG_LEVEL=DEBUG python agent.py --description "Your task"
 ```
 
-### 6. Crash Recovery & Checkpointing
-
-The agent automatically creates checkpoints during execution, enabling resume after crashes:
+### 6. Backup and Restore
 
 ```bash
-# Start a job with explicit job ID (for later resume)
-python agent.py --job-id my-job-123 --document-path ./data/doc.pdf --prompt "Extract requirements"
-
-# If the agent crashes, resume from the last checkpoint
-python agent.py --job-id my-job-123 --resume
-
-# Resume with streaming output
-python agent.py --job-id my-job-123 --resume --stream --verbose
+python init.py --create-backup                          # Auto-named backup
+python init.py --create-backup before_experiment        # Named backup
+python init.py --restore-backup backups/20260201_001    # Restore
 ```
 
-**How it works:**
-- Checkpoints: `workspace/checkpoints/job_<id>.db` (SQLite)
-- Logs: `workspace/logs/job_<id>.log`
-- LangGraph saves state after every graph node execution
-- Resuming with the same `--job-id` continues from the last checkpoint
-- Checkpoints and logs are kept after completion for debugging
-
-**Cleanup:**
-```bash
-# Remove all checkpoint files
-rm workspace/checkpoints/job_*.db
-
-# Remove all log files
-rm workspace/logs/job_*.log
-
-# Remove files for specific job
-rm workspace/checkpoints/job_my-job-123.db
-rm workspace/logs/job_my-job-123.log
-```
-
-### 7. Initialization Scripts
-
-The system provides modular initialization scripts for different deployment scenarios:
-
-**Root Initialization (Recommended for Development):**
-```bash
-# Initialize everything (databases + workspace)
-python init.py
-
-# Reset everything (WARNING: deletes all data)
-python init.py --force-reset
-
-# Initialize only databases (orchestrator components)
-python init.py --only-orchestrator
-
-# Initialize only workspace (agent components)
-python init.py --only-agent
-
-# Skip optional MongoDB
-python init.py --skip-mongodb
-```
-
-**Component-Specific Initialization:**
-```bash
-# Database initialization only (PostgreSQL + MongoDB)
-python -m orchestrator.init
-
-# Database initialization with options
-python -m orchestrator.init --force-reset       # Reset databases
-python -m orchestrator.init --skip-mongodb      # Skip MongoDB
-python -m orchestrator.init --verify            # Verify connectivity only
-
-# Workspace initialization only
-python -m src.init
-
-# Workspace initialization with options
-python -m src.init --force-reset                # Clean all workspaces
-python -m src.init --verify                     # Verify workspace structure
-```
-
-**Backup and Restore:**
-```bash
-# Create backup (auto-named: backups/YYYYMMDD_NNN/)
-python init.py --create-backup
-
-# Create backup with custom name
-python init.py --create-backup my_backup
-
-# Restore from backup
-python init.py --restore-backup backups/20260201_001_my_backup
-```
-
-**Nuclear Option:**
-```bash
-# Remove all Docker volumes and reinitialize
-podman-compose -f docker-compose.dev.yaml down -v
-podman-compose -f docker-compose.dev.yaml up -d
-python init.py
-```
-
-### 8. Stop Databases
+### 7. Testing
 
 ```bash
-podman-compose -f docker-compose.dev.yaml down      # Keep data
-podman-compose -f docker-compose.dev.yaml down -v   # Remove data
+pytest tests/                              # All tests
+pytest tests/test_graph.py -v              # Single file
+pytest tests/ -k "todo"                    # Pattern match
+pytest tests/ --cov=src                    # With coverage
 ```
 
 ## Architecture
 
-The system uses a **Universal Agent** pattern - a single config-driven agent that can be customized for different tasks by changing its YAML configuration:
-
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                            COCKPIT                                  │
-│              (Angular UI - Job Management & Debugging)              │
-└───────────────────────────────────┬─────────────────────────────────┘
-                                    │
-                                    ▼
-                    ┌───────────────────────────┐
-                    │       ORCHESTRATOR        │
-                    │                           │
-                    │ - Job management API      │
-                    │ - Agent coordination      │
-                    │ - Statistics & monitoring │
-                    └─────────────┬─────────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              │                   │                   │
-              ▼                   ▼                   ▼
-┌─────────────────────┐ ┌─────────────────┐ ┌─────────────────────┐
-│   UNIVERSAL AGENT   │ │   PostgreSQL    │ │       Neo4j         │
-│                     │ │  (Jobs & Data)  │ │  (Knowledge Graph)  │
-│ - Doc processing    │ └─────────────────┘ └─────────────────────┘
-│ - Tool execution    │
-│ - Phase planning    │
-└─────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                           COCKPIT                                │
+│                   (Web UI — Job Management)                      │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
+                               ▼
+                 ┌───────────────────────────┐
+                 │       ORCHESTRATOR        │
+                 │                           │
+                 │  Job queue & coordination │
+                 │  Agent health monitoring  │
+                 │  Statistics & API         │
+                 └─────────────┬─────────────┘
+                               │
+             ┌─────────────────┼─────────────────┐
+             │                 │                 │
+             ▼                 ▼                 ▼
+┌────────────────────┐  ┌───────────┐  ┌─────────────────┐
+│  UNIVERSAL AGENT   │  │ PostgreSQL│  │  Datasources    │
+│                    │  │ (system)  │  │  (per-job)      │
+│ Config-driven      │  └───────────┘  │                 │
+│ Phase planning     │                 │ PostgreSQL      │
+│ Tool execution     │                 │ Neo4j           │
+│ Crash recovery     │                 │ MongoDB         │
+└────────────────────┘                 └─────────────────┘
 ```
 
-**Universal Agent:**
+### Universal Agent
 
-Agent behavior is determined by YAML configuration in `config/`:
+A single agent codebase configured for different roles via YAML. Configs live in `config/` and use `$extends: defaults` for inheritance. See [config/README.md](config/README.md) for details.
 
-- `config/defaults.yaml` - Framework defaults (all configs extend this)
-- `config/my_agent.yaml` - Custom single-file config
-- `config/my_agent/config.yaml` - Directory config with prompt overrides
+### Phase Alternation
 
-Configs use `$extends: defaults` to inherit and override specific settings. See [config/README.md](config/README.md) for creating custom configs and [CLAUDE.md](CLAUDE.md) for development guidelines.
+The agent alternates between two modes:
+
+- **Strategic phase** — Reviews progress, reflects on what worked, updates the plan, creates the next batch of tasks
+- **Tactical phase** — Executes tasks using domain-specific tools until all todos are complete
+
+This loop continues until the job is done. Each phase boundary creates a snapshot for recovery.
+
+### Workspace-Centric Memory
+
+Long-term memory lives in files, not in the LLM context window:
+
+- `workspace.md` — Injected into every LLM call, survives context compaction
+- `plan.md` — Strategic plan, updated at phase boundaries
+- `archive/` — Phase retrospectives and completed task lists
+
+This means the agent can work on tasks that exceed any single context window.
 
 ## Debugging
 
-### Workspace Files and Logs
-
-Per-job files are stored in the workspace directory:
-- **Workspace files**: `workspace/job_<uuid>/` - Contains `workspace.md`, `todos.yaml`, `plan.md`, and subdirectories
-- **Checkpoints**: `workspace/checkpoints/job_<id>.db` - SQLite checkpoint for resume capability
-- **Logs**: `workspace/logs/job_<id>.log` - Agent execution logs
+- **Workspace files**: `workspace/job_<uuid>/` (workspace.md, todos.yaml, plan.md)
+- **Checkpoints**: `workspace/checkpoints/job_<id>.db` (SQLite)
+- **Logs**: `workspace/logs/job_<id>.log`
+- **Phase snapshots**: `workspace/phase_snapshots/job_<id>/phase_<n>/`
 
 ```bash
-# Clean up checkpoint/log files for a specific job
-rm workspace/checkpoints/job_<id>.db workspace/logs/job_<id>.log
+# Phase recovery
+python agent.py --job-id <id> --list-phases
+python agent.py --job-id <id> --recover-phase 2 --resume
 
-# Clean up all checkpoints and logs
+# Clean up
 rm workspace/checkpoints/job_*.db workspace/logs/job_*.log
 ```
 
-### MongoDB Conversation Viewer
-
-MongoDB stores LLM request/response history and agent audit trails for debugging. Enable by setting `MONGODB_URL` in `.env`:
-
-```bash
-MONGODB_URL=mongodb://localhost:27017/graphrag_logs
-```
-
-Use `scripts/view_llm_conversation.py` to inspect agent behavior:
-
-```bash
-# List all jobs with records
-python scripts/view_llm_conversation.py --list
-
-# View LLM conversation for a job
-python scripts/view_llm_conversation.py --job-id <uuid>
-
-# View job statistics (token usage, latency, duration)
-python scripts/view_llm_conversation.py --job-id <uuid> --stats
-
-# View complete agent audit trail (all steps)
-python scripts/view_llm_conversation.py --job-id <uuid> --audit
-
-# View only tool calls in audit trail
-python scripts/view_llm_conversation.py --job-id <uuid> --audit --step-type tool_call
-
-# View audit as timeline visualization
-python scripts/view_llm_conversation.py --job-id <uuid> --audit --timeline
-
-# Export conversation to JSON
-python scripts/view_llm_conversation.py --job-id <uuid> --export conversation.json
-
-# View single LLM request as HTML (opens in browser)
-python scripts/view_llm_conversation.py --doc-id <mongodb_objectid> --temp
-
-# View recent requests across all jobs
-python scripts/view_llm_conversation.py --recent 20
-```
-
-MongoDB collections:
-- `llm_requests` - Full LLM request/response with messages, model, latency, token usage
-- `agent_audit` - Step-by-step execution trace (tool calls, phase transitions, routing decisions)
+See [CLAUDE.md](CLAUDE.md) for full development documentation.
 
 ## License
 

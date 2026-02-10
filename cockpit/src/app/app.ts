@@ -17,6 +17,8 @@ import { JobListComponent } from './components/job-list/job-list.component';
 import { JobCreateComponent } from './components/job-create/job-create.component';
 import { StatisticsComponent } from './components/statistics/statistics.component';
 import { DatasourceListComponent } from './components/datasource-list/datasource-list.component';
+import { JobReviewComponent } from './components/job-review/job-review.component';
+import { WorkspaceBrowserComponent } from './components/workspace-browser/workspace-browser.component';
 
 @Component({
   selector: 'app-root',
@@ -144,6 +146,18 @@ export class App implements OnInit {
       type: 'datasource-list',
       displayName: 'Datasources',
       component: DatasourceListComponent,
+    });
+
+    this.registry.register({
+      type: 'job-review',
+      displayName: 'Job Review',
+      component: JobReviewComponent,
+    });
+
+    this.registry.register({
+      type: 'workspace-browser',
+      displayName: 'Workspace Browser',
+      component: WorkspaceBrowserComponent,
     });
   }
 }
