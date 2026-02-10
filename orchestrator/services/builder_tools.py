@@ -16,7 +16,35 @@ logger = logging.getLogger(__name__)
 # Artifact Tool Definitions (OpenAI function-calling format)
 # =============================================================================
 
+# Tools that are executed server-side (not forwarded to the frontend as artifact mutations)
+SERVER_SIDE_TOOLS = {"web_search"}
+
 BUILDER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web to research a topic before writing instructions. "
+                "Use this to learn about domain best practices, methodologies, and pitfalls."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Specific search query",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Number of results to return (1-10, default 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -104,6 +132,24 @@ BUILDER_TOOLS = [
                             "model": {"type": "string", "description": "Model name (e.g. 'gpt-4o', 'claude-sonnet-4-5-20250929')"},
                             "temperature": {"type": "number", "description": "Temperature (0.0 to 2.0)"},
                             "reasoning_level": {"type": "string", "description": "Reasoning level (low, medium, high)"},
+                            "strategic": {
+                                "type": "object",
+                                "description": "Overrides for strategic (planning) phases",
+                                "properties": {
+                                    "model": {"type": "string"},
+                                    "temperature": {"type": "number"},
+                                    "reasoning_level": {"type": "string", "enum": ["low", "medium", "high"]},
+                                },
+                            },
+                            "tactical": {
+                                "type": "object",
+                                "description": "Overrides for tactical (execution) phases",
+                                "properties": {
+                                    "model": {"type": "string"},
+                                    "temperature": {"type": "number"},
+                                    "reasoning_level": {"type": "string", "enum": ["low", "medium", "high"]},
+                                },
+                            },
                         },
                     },
                     "tools": {
