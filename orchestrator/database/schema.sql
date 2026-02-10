@@ -12,6 +12,8 @@
 --   sources           - Document sources for citations (CitationEngine)
 --   citations         - Citation records linking claims to sources (CitationEngine)
 --   schema_migrations - Schema versioning for CitationEngine
+--   builder_sessions  - Instruction builder chat sessions
+--   builder_messages  - Messages within builder sessions
 --
 -- Note: LLM logging is handled by MongoDB (llm_archiver.py).
 -- Note: Agent checkpointing is handled by LangGraph's AsyncPostgresSaver.
@@ -344,7 +346,36 @@ CREATE INDEX IF NOT EXISTS idx_datasources_type ON datasources(type);
 CREATE INDEX IF NOT EXISTS idx_datasources_job_id ON datasources(job_id);
 
 -- ============================================================================
--- 6. HELPER FUNCTIONS
+-- 6. BUILDER TABLES (Instruction Builder Chat)
+-- Chat sessions for the AI-powered instruction builder in the cockpit.
+-- ============================================================================
+
+-- Chat sessions for the instruction builder
+CREATE TABLE IF NOT EXISTS builder_sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id UUID,                        -- NULL at creation, set after job submission via update
+    expert_id VARCHAR(100),             -- expert used as starting point (nullable)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    summary TEXT                         -- auto-summary of older messages (for context compaction)
+);
+-- No FK on job_id: the job may not exist yet (lazy linking after submission)
+
+-- Chat messages within a builder session
+CREATE TABLE IF NOT EXISTS builder_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id UUID REFERENCES builder_sessions(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL,          -- 'user', 'assistant'
+    content TEXT,                        -- conversational text
+    tool_calls JSONB,                   -- structured artifact mutations (assistant only)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index for efficient message retrieval
+CREATE INDEX IF NOT EXISTS idx_builder_messages_session ON builder_messages(session_id, created_at);
+
+-- ============================================================================
+-- 7. HELPER FUNCTIONS
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -356,7 +387,7 @@ END;
 $$ language 'plpgsql';
 
 -- ============================================================================
--- 7. TRIGGERS
+-- 8. TRIGGERS
 -- ============================================================================
 
 DROP TRIGGER IF EXISTS update_jobs_updated_at ON jobs;
@@ -374,8 +405,13 @@ CREATE TRIGGER update_datasources_updated_at
     BEFORE UPDATE ON datasources
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_builder_sessions_updated_at ON builder_sessions;
+CREATE TRIGGER update_builder_sessions_updated_at
+    BEFORE UPDATE ON builder_sessions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- ============================================================================
--- 8. VIEWS
+-- 9. VIEWS
 -- ============================================================================
 
 CREATE OR REPLACE VIEW job_summary AS

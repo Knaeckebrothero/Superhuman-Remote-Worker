@@ -26,13 +26,23 @@ import asyncpg  # noqa: E402
 import yaml  # noqa: E402
 from fastapi import FastAPI, HTTPException, Query  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
 from pydantic import BaseModel, Field  # noqa: E402
 
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
+from services.builder_tools import (  # noqa: E402
+    BUILDER_TOOLS,
+    build_message_context,
+    build_summarization_prompt,
+    get_builder_api_key,
+    get_builder_base_url,
+    get_builder_model,
+    get_builder_provider,
+)
+from services.builder_prompt import build_system_prompt  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
 
@@ -158,6 +168,7 @@ class JobCreate(BaseModel):
     context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
     instructions: str | None = Field(None, description="Additional inline instructions for the agent")
     datasource_ids: list[str] | None = Field(None, description="Global datasource IDs to clone as job-scoped")
+    builder_session_id: str | None = Field(None, description="Builder session ID to link to this job")
 
 
 class JobStartRequest(BaseModel):
@@ -176,6 +187,21 @@ class JobStartRequest(BaseModel):
     instructions: str | None = None
     git_remote_url: str | None = None
     datasources: list[dict[str, Any]] | None = None
+
+
+class BuilderSessionCreate(BaseModel):
+    """Request body for creating a builder session."""
+
+    expert_id: str | None = Field(None, description="Expert used as starting point")
+
+
+class BuilderMessageRequest(BaseModel):
+    """Request body for sending a message to the builder."""
+
+    message: str = Field(..., description="User's message text")
+    instructions: str | None = Field(None, description="Current instructions content")
+    config: dict[str, Any] | None = Field(None, description="Current config override")
+    description: str | None = Field(None, description="Current job description")
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -410,6 +436,8 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             context["config_upload_id"] = job.config_upload_id
         if job.instructions_upload_id:
             context["instructions_upload_id"] = job.instructions_upload_id
+        if job.instructions:
+            context["instructions"] = job.instructions
 
         result = await postgres_db.create_job(
             description=job.description,
@@ -460,6 +488,16 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to clone datasource {ds_id} for job {new_job_id}: {e}")
+
+        # Link builder session to job (if provided)
+        if job.builder_session_id:
+            try:
+                await postgres_db.update_builder_session_job(
+                    session_id=job.builder_session_id,
+                    job_id=str(result["id"]),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to link builder session {job.builder_session_id}: {e}")
 
         return result
     except Exception as e:
@@ -1414,6 +1452,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
         upload_id = job_context.get("upload_id")
         config_upload_id = job_context.get("config_upload_id")
         instructions_upload_id = job_context.get("instructions_upload_id")
+        instructions = job_context.get("instructions")
         git_remote_url = job_context.get("git_remote_url")
 
         # Parse config_override if stored as string
@@ -1423,7 +1462,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             config_override = json_module.loads(config_override)
 
         # Build remaining context (fields not extracted as dedicated params)
-        extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "git_remote_url"}
+        extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "instructions", "git_remote_url"}
         remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
 
         # Resolve datasources for this job (job-specific > global fallback)
@@ -1441,6 +1480,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             upload_id=upload_id,
             config_upload_id=config_upload_id,
             instructions_upload_id=instructions_upload_id,
+            instructions=instructions,
             document_path=job.get("document_path"),
             config_name=job.get("config_name", "default"),
             config_override=config_override,
@@ -1939,3 +1979,429 @@ async def reload_experts() -> dict[str, Any]:
     global _experts_cache
     _experts_cache = _scan_experts()
     return {"status": "reloaded", "count": len(_experts_cache)}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep merge two dictionaries (objects merge, arrays replace, None clears)."""
+    result = base.copy()
+    for key, value in override.items():
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_expert_detail(expert_id: str) -> dict[str, Any]:
+    """Load full expert detail: merged config + instructions content."""
+    config_dir = _get_config_dir()
+
+    # Load defaults
+    defaults_path = config_dir / "defaults.yaml"
+    if defaults_path.exists():
+        with open(defaults_path) as f:
+            defaults = yaml.safe_load(f) or {}
+    else:
+        defaults = {}
+
+    # Load expert config
+    if expert_id == "defaults":
+        merged = dict(defaults)
+        expert_config_dir = config_dir
+    else:
+        expert_dir = config_dir / "experts" / expert_id
+        config_path = expert_dir / "config.yaml"
+        if not expert_dir.is_dir() or not config_path.exists():
+            return {}
+        with open(config_path) as f:
+            expert_data = yaml.safe_load(f) or {}
+        # Remove meta keys before merge
+        expert_data.pop("$extends", None)
+        merged = _deep_merge(defaults, expert_data)
+        expert_config_dir = expert_dir
+
+    # Load instructions content
+    instructions_content = None
+    # Check for expert-specific instructions.md first
+    instr_path = expert_config_dir / "instructions.md"
+    if expert_id != "defaults" and instr_path.exists():
+        instructions_content = instr_path.read_text(encoding="utf-8")
+    else:
+        # Fall back to template referenced in config
+        template_name = merged.get("workspace", {}).get("instructions_template", "instructions.md")
+        template_path = config_dir / "prompts" / template_name
+        if template_path.exists():
+            instructions_content = template_path.read_text(encoding="utf-8")
+
+    # Remove internal/sensitive keys from merged config
+    for key in ("$extends", "connections"):
+        merged.pop(key, None)
+
+    return {
+        "config": merged,
+        "instructions": instructions_content,
+    }
+
+
+@app.get("/api/experts/{expert_id}")
+async def get_expert(expert_id: str) -> dict[str, Any]:
+    """Get full expert detail including merged config and instructions content.
+
+    Returns the expert's configuration (merged with defaults) and the raw
+    instructions.md content, enabling the cockpit to pre-populate the job
+    creation form.
+    """
+    # Verify expert exists
+    global _experts_cache
+    if _experts_cache is None:
+        _experts_cache = _scan_experts()
+
+    expert_info = next((e for e in _experts_cache if e.id == expert_id), None)
+    if not expert_info:
+        raise HTTPException(status_code=404, detail=f"Expert not found: {expert_id}")
+
+    detail = _load_expert_detail(expert_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Expert config not found: {expert_id}")
+
+    return {
+        **expert_info.model_dump(),
+        **detail,
+    }
+
+
+# =============================================================================
+# Builder Session Endpoints
+# =============================================================================
+
+
+@app.post("/api/builder/sessions")
+async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
+    """Create a new builder chat session.
+
+    Called when the user sends their first message in the builder chat.
+    The session is not linked to a job yet (that happens on job submission).
+    """
+    try:
+        session = await postgres_db.create_builder_session(
+            expert_id=body.expert_id,
+        )
+        return session
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/builder/sessions/{session_id}")
+async def get_builder_session(session_id: str) -> dict[str, Any]:
+    """Get builder session details."""
+    session = await postgres_db.get_builder_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@app.get("/api/builder/sessions/{session_id}/messages")
+async def get_builder_messages(session_id: str) -> list[dict[str, Any]]:
+    """Get all messages for a builder session."""
+    session = await postgres_db.get_builder_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return await postgres_db.get_builder_messages(session_id)
+
+
+@app.post("/api/builder/sessions/{session_id}/message")
+async def send_builder_message(
+    session_id: str,
+    body: BuilderMessageRequest,
+) -> StreamingResponse:
+    """Send a message to the builder AI and stream the response via SSE.
+
+    The request includes the current artifact state (instructions, config,
+    description) which is injected into the system prompt fresh each turn.
+
+    Returns an SSE stream with events:
+    - token: streamed text chunks
+    - tool_call: artifact mutations
+    - done: stream complete with usage info
+    - error: error information
+    """
+    # Verify session exists
+    session = await postgres_db.get_builder_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Store user message
+    await postgres_db.create_builder_message(
+        session_id=session_id,
+        role="user",
+        content=body.message,
+    )
+
+    # Build context
+    messages = await postgres_db.get_builder_messages(session_id)
+    system_prompt = build_system_prompt(
+        instructions_content=body.instructions,
+        config_settings=body.config,
+        description=body.description,
+    )
+
+    # Build conversation context (with potential summarization)
+    context_messages, needs_summarization = build_message_context(
+        messages=messages,
+        summary=session.get("summary"),
+    )
+
+    async def event_stream():
+        """Generate SSE events from LLM streaming response."""
+        full_text = ""
+        all_tool_calls = []
+
+        try:
+            provider = get_builder_provider()
+            model = get_builder_model()
+
+            if provider == "anthropic":
+                async for event in _stream_anthropic(system_prompt, context_messages, model):
+                    yield event
+                    # Parse events to accumulate response
+                    if event.startswith("event: token\n"):
+                        data = json.loads(event.split("data: ", 1)[1].strip())
+                        full_text += data.get("text", "")
+                    elif event.startswith("event: tool_call\n"):
+                        data = json.loads(event.split("data: ", 1)[1].strip())
+                        all_tool_calls.append(data)
+                    elif event.startswith("event: done\n"):
+                        pass  # handled below
+            else:
+                async for event in _stream_openai(system_prompt, context_messages, model):
+                    yield event
+                    if event.startswith("event: token\n"):
+                        data = json.loads(event.split("data: ", 1)[1].strip())
+                        full_text += data.get("text", "")
+                    elif event.startswith("event: tool_call\n"):
+                        data = json.loads(event.split("data: ", 1)[1].strip())
+                        all_tool_calls.append(data)
+
+            # Store assistant message
+            await postgres_db.create_builder_message(
+                session_id=session_id,
+                role="assistant",
+                content=full_text if full_text else None,
+                tool_calls=all_tool_calls if all_tool_calls else None,
+            )
+
+            # Handle auto-summarization if needed
+            if needs_summarization:
+                try:
+                    await _summarize_builder_session(session_id, messages)
+                except Exception as e:
+                    logger.warning(f"Builder auto-summarization failed: {e}")
+
+            # Send done event
+            yield f"event: done\ndata: {json.dumps({'usage': {}})}\n\n"
+
+        except Exception as e:
+            logger.error(f"Builder stream error: {e}", exc_info=True)
+            yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _stream_openai(
+    system_prompt: str,
+    context_messages: list[dict[str, str]],
+    model: str,
+):
+    """Stream from OpenAI-compatible API with tool support."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        yield f"event: error\ndata: {json.dumps({'message': 'openai package not installed'})}\n\n"
+        return
+
+    client = AsyncOpenAI(
+        api_key=get_builder_api_key(),
+        base_url=get_builder_base_url(),
+    )
+
+    llm_messages = [{"role": "system", "content": system_prompt}]
+    llm_messages.extend(context_messages)
+
+    try:
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=llm_messages,
+            tools=BUILDER_TOOLS,
+            stream=True,
+        )
+
+        # Track tool call assembly across chunks
+        tool_call_buffers: dict[int, dict] = {}
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
+
+            # Text content
+            if delta.content:
+                yield f"event: token\ndata: {json.dumps({'text': delta.content})}\n\n"
+
+            # Tool calls (streamed incrementally)
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_call_buffers:
+                        tool_call_buffers[idx] = {"name": "", "arguments": ""}
+                    if tc.function and tc.function.name:
+                        tool_call_buffers[idx]["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        tool_call_buffers[idx]["arguments"] += tc.function.arguments
+
+        # Emit completed tool calls
+        for _idx, tc_buf in sorted(tool_call_buffers.items()):
+            try:
+                args = json.loads(tc_buf["arguments"])
+                yield f"event: tool_call\ndata: {json.dumps({'tool': tc_buf['name'], 'args': args})}\n\n"
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse tool call args: {tc_buf['arguments'][:100]}")
+
+    except Exception as e:
+        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+
+
+async def _stream_anthropic(
+    system_prompt: str,
+    context_messages: list[dict[str, str]],
+    model: str,
+):
+    """Stream from Anthropic API with tool support."""
+    try:
+        from anthropic import AsyncAnthropic
+    except ImportError:
+        yield f"event: error\ndata: {json.dumps({'message': 'anthropic package not installed'})}\n\n"
+        return
+
+    client = AsyncAnthropic(api_key=get_builder_api_key())
+
+    # Convert OpenAI tool format to Anthropic format
+    anthropic_tools = []
+    for tool in BUILDER_TOOLS:
+        func = tool["function"]
+        anthropic_tools.append({
+            "name": func["name"],
+            "description": func["description"],
+            "input_schema": func["parameters"],
+        })
+
+    # Filter out system messages from context (Anthropic uses system param)
+    filtered_messages = [m for m in context_messages if m["role"] != "system"]
+    extra_system = "\n".join(
+        m["content"] for m in context_messages if m["role"] == "system"
+    )
+    full_system = system_prompt
+    if extra_system:
+        full_system += "\n\n" + extra_system
+
+    try:
+        async with client.messages.stream(
+            model=model,
+            system=full_system,
+            messages=filtered_messages,
+            tools=anthropic_tools,
+            max_tokens=4096,
+        ) as stream:
+            current_tool_name = ""
+            current_tool_args = ""
+
+            async for event in stream:
+                if event.type == "content_block_start":
+                    if hasattr(event.content_block, "type"):
+                        if event.content_block.type == "tool_use":
+                            current_tool_name = event.content_block.name
+                            current_tool_args = ""
+                elif event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        yield f"event: token\ndata: {json.dumps({'text': event.delta.text})}\n\n"
+                    elif hasattr(event.delta, "partial_json"):
+                        current_tool_args += event.delta.partial_json
+                elif event.type == "content_block_stop":
+                    if current_tool_name:
+                        try:
+                            args = json.loads(current_tool_args) if current_tool_args else {}
+                            yield f"event: tool_call\ndata: {json.dumps({'tool': current_tool_name, 'args': args})}\n\n"
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse Anthropic tool args: {current_tool_args[:100]}")
+                        current_tool_name = ""
+                        current_tool_args = ""
+
+    except Exception as e:
+        yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n"
+
+
+async def _summarize_builder_session(
+    session_id: str,
+    messages: list[dict[str, Any]],
+) -> None:
+    """Summarize older builder messages to compress context.
+
+    Uses the same builder model for summarization.
+    """
+    from services.builder_tools import build_summarization_prompt
+
+    # Only summarize if we have enough messages
+    if len(messages) < 6:
+        return
+
+    # Summarize all but the last 4 messages
+    to_summarize = messages[:-4]
+    summary_prompt = build_summarization_prompt(to_summarize)
+
+    provider = get_builder_provider()
+    model = get_builder_model()
+
+    summary_text = ""
+
+    if provider == "anthropic":
+        try:
+            from anthropic import AsyncAnthropic
+            client = AsyncAnthropic(api_key=get_builder_api_key())
+            response = await client.messages.create(
+                model=model,
+                system=summary_prompt[0]["content"],
+                messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
+                max_tokens=1024,
+            )
+            summary_text = response.content[0].text
+        except Exception as e:
+            logger.warning(f"Anthropic summarization failed: {e}")
+            return
+    else:
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(
+                api_key=get_builder_api_key(),
+                base_url=get_builder_base_url(),
+            )
+            response = await client.chat.completions.create(
+                model=model,
+                messages=summary_prompt,
+                max_tokens=1024,
+            )
+            summary_text = response.choices[0].message.content or ""
+        except Exception as e:
+            logger.warning(f"OpenAI summarization failed: {e}")
+            return
+
+    if summary_text:
+        await postgres_db.update_builder_session_summary(session_id, summary_text)
