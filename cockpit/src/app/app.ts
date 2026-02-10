@@ -19,6 +19,7 @@ import { StatisticsComponent } from './components/statistics/statistics.componen
 import { DatasourceListComponent } from './components/datasource-list/datasource-list.component';
 import { JobReviewComponent } from './components/job-review/job-review.component';
 import { WorkspaceBrowserComponent } from './components/workspace-browser/workspace-browser.component';
+import { InstructionBuilderComponent } from './components/instruction-builder/instruction-builder.component';
 
 @Component({
   selector: 'app-root',
@@ -158,6 +159,12 @@ export class App implements OnInit {
       type: 'workspace-browser',
       displayName: 'Workspace Browser',
       component: WorkspaceBrowserComponent,
+    });
+
+    this.registry.register({
+      type: 'instruction-builder',
+      displayName: 'Instruction Builder',
+      component: InstructionBuilderComponent,
     });
   }
 }

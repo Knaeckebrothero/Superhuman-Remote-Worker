@@ -1,9 +1,11 @@
-import { Component, inject, signal, ElementRef, ViewChild, OnInit } from '@angular/core';
+import { Component, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import { FileHandlingService } from '../../core/services/file-handling.service';
-import { JobCreateRequest, Expert, Datasource, DatasourceType } from '../../core/models/api.model';
+import { JobArtifactService } from '../../core/services/job-artifact.service';
+import { JobCreateRequest, Expert, ExpertDetail, Datasource, DatasourceType } from '../../core/models/api.model';
 import { FilePreview, FileType, UploadStatus } from '../../core/models/file.model';
+import { environment } from '../../core/environment';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -46,10 +48,11 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
               name="description"
               class="form-textarea"
               [(ngModel)]="formData.description"
+              (ngModelChange)="onDescriptionEdit($event)"
               required
               rows="6"
               placeholder="Describe what the agent should accomplish..."
-              [disabled]="isSubmitting()"
+              [disabled]="isSubmitting() || artifacts.streaming()"
             ></textarea>
             <span class="field-hint">Describe what you want the agent to do</span>
           </div>
@@ -185,70 +188,149 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
 
           @if (showAdvanced()) {
             <div class="advanced-section">
-              <!-- Config Upload -->
+              <!-- Model Settings -->
               <div class="form-group">
-                <label class="form-label">Agent Config (YAML)</label>
-                <div
-                  class="single-file-upload"
-                  [class.has-file]="configFile()"
-                  [class.disabled]="isSubmitting()"
-                  [class.dragover]="isConfigDragOver()"
-                  (click)="triggerConfigInput()"
-                  (dragover)="onConfigDragOver($event)"
-                  (dragleave)="onConfigDragLeave($event)"
-                  (drop)="onConfigDrop($event)"
-                >
-                  @if (configFile()) {
-                    <div class="file-chip">
-                      <span class="chip-icon">settings</span>
-                      <span class="chip-name">{{ configFile()!.name }}</span>
-                      <button type="button" class="chip-remove" (click)="removeConfigFile($event)">close</button>
-                    </div>
-                  } @else {
-                    <span class="upload-hint">Drop YAML file or click to browse</span>
-                  }
+                <label class="form-label">Model</label>
+                <div class="model-combo">
+                  <input
+                    type="text"
+                    class="form-input"
+                    [ngModel]="configModel()"
+                    (ngModelChange)="configModel.set($event)"
+                    name="configModel"
+                    placeholder="Select or type a model name..."
+                    list="modelList"
+                    [disabled]="isSubmitting()"
+                    autocomplete="off"
+                  >
+                  <datalist id="modelList">
+                    @for (group of availableModels; track group.group) {
+                      @for (model of group.models; track model) {
+                        <option [value]="model">{{ group.group }}</option>
+                      }
+                    }
+                  </datalist>
                 </div>
-                <input
-                  #configInput
-                  type="file"
-                  accept=".yaml,.yml"
-                  (change)="onConfigFileSelected($event)"
-                  style="display: none"
-                >
-                <span class="field-hint">Override default agent configuration settings</span>
+                <span class="field-hint">
+                  @if (getExpertDefault('llm.model'); as defaultModel) {
+                    Expert default: {{ defaultModel }}
+                  } @else {
+                    Leave empty to use the expert's default model
+                  }
+                </span>
               </div>
 
-              <!-- Instructions Upload -->
+              <!-- Temperature -->
               <div class="form-group">
-                <label class="form-label">Instructions File (Markdown)</label>
-                <div
-                  class="single-file-upload"
-                  [class.has-file]="instructionsFile()"
-                  [class.disabled]="isSubmitting()"
-                  [class.dragover]="isInstructionsDragOver()"
-                  (click)="triggerInstructionsInput()"
-                  (dragover)="onInstructionsDragOver($event)"
-                  (dragleave)="onInstructionsDragLeave($event)"
-                  (drop)="onInstructionsDrop($event)"
+                <label class="form-label">
+                  Temperature: {{ configTemperature() !== null ? configTemperature() : '(default)' }}
+                </label>
+                <div class="slider-row">
+                  <span class="slider-label">0</span>
+                  <input
+                    type="range"
+                    class="form-range"
+                    min="0"
+                    max="2"
+                    step="0.1"
+                    [ngModel]="configTemperature() ?? getExpertDefault('llm.temperature') ?? 0"
+                    (ngModelChange)="onTemperatureChange($event)"
+                    name="configTemperature"
+                    [disabled]="isSubmitting()"
+                  >
+                  <span class="slider-label">2</span>
+                </div>
+                <span class="field-hint">Controls randomness. 0 = deterministic, higher = more creative</span>
+              </div>
+
+              <!-- Reasoning Level -->
+              <div class="form-group">
+                <label class="form-label">Reasoning Level</label>
+                <select
+                  class="form-input"
+                  [ngModel]="configReasoning()"
+                  (ngModelChange)="configReasoning.set($event)"
+                  name="configReasoning"
+                  [disabled]="isSubmitting()"
                 >
-                  @if (instructionsFile()) {
-                    <div class="file-chip">
-                      <span class="chip-icon">description</span>
-                      <span class="chip-name">{{ instructionsFile()!.name }}</span>
-                      <button type="button" class="chip-remove" (click)="removeInstructionsFile($event)">close</button>
-                    </div>
-                  } @else {
-                    <span class="upload-hint">Drop .md/.txt file or click to browse</span>
+                  <option [ngValue]="null">Default</option>
+                  <option value="none">None</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+                <span class="field-hint">
+                  @if (getExpertDefault('llm.reasoning_level'); as defaultLevel) {
+                    Expert default: {{ defaultLevel }}
+                  }
+                </span>
+              </div>
+
+              <!-- Tool Category Toggles -->
+              <div class="form-group">
+                <label class="form-label">Tool Categories</label>
+                <div class="tool-toggles">
+                  @for (cat of toolCategories; track cat.key) {
+                    <label class="tool-toggle" [class.disabled]="isSubmitting()">
+                      <input
+                        type="checkbox"
+                        [checked]="isToolCategoryEnabled(cat.key)"
+                        (change)="toggleToolCategory(cat.key)"
+                        [disabled]="isSubmitting()"
+                      >
+                      <span class="tool-toggle-icon">{{ cat.icon }}</span>
+                      <span class="tool-toggle-info">
+                        <span class="tool-toggle-name">{{ cat.label }}</span>
+                        <span class="tool-toggle-desc">{{ cat.description }}</span>
+                      </span>
+                    </label>
                   }
                 </div>
-                <input
-                  #instructionsInput
-                  type="file"
-                  accept=".md,.txt"
-                  (change)="onInstructionsFileSelected($event)"
-                  style="display: none"
-                >
+                <span class="field-hint">Enable or disable tool categories for this job</span>
+              </div>
+
+              <!-- Instructions Editor -->
+              <div class="form-group">
+                <label class="form-label">
+                  Instructions (Markdown)
+                  @if (isLoadingExpertDetail()) {
+                    <span class="spinner-small inline-spinner"></span>
+                  }
+                </label>
+                <textarea
+                  id="instructions"
+                  name="instructions"
+                  class="form-textarea mono"
+                  [ngModel]="instructionsContent()"
+                  (ngModelChange)="onInstructionsEdit($event)"
+                  rows="12"
+                  placeholder="Select an expert to pre-fill instructions, or type custom instructions..."
+                  [disabled]="isSubmitting() || isLoadingExpertDetail() || artifacts.streaming()"
+                ></textarea>
+                @if (artifacts.streaming()) {
+                  <span class="field-hint" style="color: var(--accent-color, #cba6f7)">
+                    <span class="spinner-small inline-spinner"></span>
+                    AI is editing instructions...
+                  </span>
+                }
+                <div class="instructions-actions">
+                  @if (instructionsContent()) {
+                    <button type="button" class="btn-text" (click)="clearInstructions()" [disabled]="isSubmitting()">
+                      Clear
+                    </button>
+                  }
+                  @if (selectedExpert() && expertDetail()) {
+                    <button type="button" class="btn-text" (click)="resetInstructionsToExpert()" [disabled]="isSubmitting() || isLoadingExpertDetail()">
+                      Reset to expert default
+                    </button>
+                  }
+                </div>
                 <span class="field-hint">Custom task instructions for the agent (replaces default)</span>
+                @if (selectedExpert() && !instructionsContent() && !isLoadingExpertDetail()) {
+                  <span class="field-warning">
+                    No instructions set — the agent will use the expert's default prompt
+                  </span>
+                }
               </div>
 
               <!-- Datasource Picker -->
@@ -308,7 +390,7 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
             <button
               type="submit"
               class="btn btn-primary"
-              [disabled]="!formData.description || isSubmitting() || isUploading()"
+              [disabled]="!formData.description || isSubmitting() || isUploading() || artifacts.streaming()"
             >
               @if (isSubmitting()) {
                 <span class="spinner-small"></span>
@@ -360,6 +442,7 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         flex: 1;
         overflow: auto;
         padding: 16px;
+        container-type: inline-size;
       }
 
       /* Messages */
@@ -455,6 +538,162 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
       .form-textarea.mono {
         font-family: 'JetBrains Mono', monospace;
         font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .instructions-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 4px;
+      }
+
+      .btn-text {
+        padding: 2px 8px;
+        border: none;
+        border-radius: 4px;
+        background: transparent;
+        color: var(--text-muted, #6c7086);
+        font-size: 11px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .btn-text:hover:not(:disabled) {
+        color: var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.1);
+      }
+
+      .btn-text:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+
+      .inline-spinner {
+        display: inline-block;
+        vertical-align: middle;
+        margin-left: 6px;
+      }
+
+      /* Model combo-box */
+      .model-combo {
+        position: relative;
+      }
+
+      /* Slider */
+      .slider-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .slider-label {
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+        min-width: 14px;
+        text-align: center;
+      }
+
+      .form-range {
+        flex: 1;
+        height: 4px;
+        -webkit-appearance: none;
+        appearance: none;
+        background: var(--border-color, #45475a);
+        border-radius: 2px;
+        outline: none;
+      }
+
+      .form-range::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--accent-color, #cba6f7);
+        cursor: pointer;
+      }
+
+      .form-range::-moz-range-thumb {
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--accent-color, #cba6f7);
+        cursor: pointer;
+        border: none;
+      }
+
+      .form-range:disabled {
+        opacity: 0.5;
+      }
+
+      /* Select dropdown */
+      select.form-input {
+        cursor: pointer;
+        -webkit-appearance: none;
+        appearance: none;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236c7086' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 12px center;
+        padding-right: 32px;
+      }
+
+      /* Tool toggles */
+      .tool-toggles {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .tool-toggle {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 6px;
+        background: var(--surface-0, #313244);
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .tool-toggle:hover:not(.disabled) {
+        border-color: var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.05);
+      }
+
+      .tool-toggle.disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .tool-toggle input[type="checkbox"] {
+        margin: 0;
+        accent-color: var(--accent-color, #cba6f7);
+      }
+
+      .tool-toggle-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 20px;
+        color: var(--text-muted, #6c7086);
+        width: 24px;
+        text-align: center;
+      }
+
+      .tool-toggle-info {
+        flex: 1;
+        min-width: 0;
+      }
+
+      .tool-toggle-name {
+        display: block;
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .tool-toggle-desc {
+        display: block;
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
       }
 
       .field-hint {
@@ -471,6 +710,13 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         color: #f38ba8;
       }
 
+      .field-warning {
+        display: block;
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--ctp-yellow, #f9e2af);
+      }
+
       /* Expert Selector */
       .expert-loading {
         display: flex;
@@ -483,8 +729,14 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
 
       .expert-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
         gap: 10px;
+      }
+
+      @container (max-width: 400px) {
+        .expert-grid {
+          grid-template-columns: 1fr;
+        }
       }
 
       .expert-card {
@@ -798,86 +1050,6 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
         border: 1px solid var(--border-color, #313244);
       }
 
-      .single-file-upload {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 16px;
-        border: 2px dashed var(--border-color, #45475a);
-        border-radius: 6px;
-        background: var(--surface-0, #313244);
-        cursor: pointer;
-        transition: all 0.15s ease;
-        min-height: 50px;
-      }
-
-      .single-file-upload:hover:not(.disabled) {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.05);
-      }
-
-      .single-file-upload.dragover {
-        border-color: var(--accent-color, #cba6f7);
-        background: rgba(203, 166, 247, 0.1);
-      }
-
-      .single-file-upload.has-file {
-        border-style: solid;
-        justify-content: flex-start;
-      }
-
-      .single-file-upload.disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
-      }
-
-      .upload-hint {
-        font-size: 13px;
-        color: var(--text-muted, #6c7086);
-      }
-
-      .file-chip {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 8px;
-        background: var(--panel-bg, #181825);
-        border-radius: 4px;
-        border: 1px solid var(--border-color, #313244);
-      }
-
-      .chip-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
-        color: var(--accent-color, #cba6f7);
-      }
-
-      .chip-name {
-        font-size: 12px;
-        color: var(--text-primary, #cdd6f4);
-        max-width: 200px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-
-      .chip-remove {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-        padding: 2px;
-        border: none;
-        border-radius: 3px;
-        background: transparent;
-        color: var(--text-muted, #6c7086);
-        cursor: pointer;
-        line-height: 1;
-      }
-
-      .chip-remove:hover {
-        background: rgba(255, 255, 255, 0.1);
-        color: #f38ba8;
-      }
-
       /* Datasource Picker */
       .ds-loading,
       .ds-empty {
@@ -1021,22 +1193,71 @@ import { FilePreview, FileType, UploadStatus } from '../../core/models/file.mode
       @keyframes spin {
         to { transform: rotate(360deg); }
       }
+
+      /* Narrow panel responsive overrides */
+      @container (max-width: 360px) {
+        .form-container {
+          padding: 10px;
+        }
+
+        .advanced-section {
+          padding: 10px;
+        }
+
+        .expert-card {
+          padding: 10px;
+        }
+
+        .tool-toggle {
+          padding: 6px 8px;
+        }
+
+        .tool-toggle-icon {
+          display: none;
+        }
+
+        .slider-row {
+          gap: 6px;
+        }
+
+        .form-actions {
+          flex-direction: column;
+        }
+
+        .form-actions .btn {
+          width: 100%;
+          justify-content: center;
+        }
+      }
     `,
   ],
 })
 export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
   readonly fileService = inject(FileHandlingService);
+  readonly artifacts = inject(JobArtifactService);
+
+  constructor() {
+    // Sync artifact signals → local form state (builder → form direction)
+    effect(() => {
+      const instructions = this.artifacts.instructions();
+      if (instructions !== null && instructions !== this.instructionsContent()) {
+        this.instructionsContent.set(instructions);
+      }
+    });
+    effect(() => {
+      const description = this.artifacts.description();
+      if (description !== null && description !== this.formData.description) {
+        this.formData.description = description;
+      }
+    });
+  }
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
-  @ViewChild('configInput') configInput!: ElementRef<HTMLInputElement>;
-  @ViewChild('instructionsInput') instructionsInput!: ElementRef<HTMLInputElement>;
 
   readonly isSubmitting = signal(false);
   readonly isUploading = signal(false);
   readonly isDragOver = signal(false);
-  readonly isConfigDragOver = signal(false);
-  readonly isInstructionsDragOver = signal(false);
   readonly successMessage = signal<string | null>(null);
   readonly errorMessage = signal<string | null>(null);
   readonly filePreviews = signal<FilePreview[]>([]);
@@ -1045,11 +1266,31 @@ export class JobCreateComponent implements OnInit {
   readonly experts = signal<Expert[]>([]);
   readonly selectedExpert = signal<Expert | null>(null);
   readonly isLoadingExperts = signal(false);
+  readonly expertDetail = signal<ExpertDetail | null>(null);
+  readonly isLoadingExpertDetail = signal(false);
+
+  // Instructions editor state
+  readonly instructionsContent = signal<string | null>(null);
+
+  // Config settings form state
+  readonly configModel = signal<string | null>(null);
+  readonly configTemperature = signal<number | null>(null);
+  readonly configReasoning = signal<string | null>(null);
+  readonly disabledToolCategories = signal<Set<string>>(new Set());
+
+  // Model list for combo-box (loaded from env.js at runtime)
+  readonly availableModels = environment.models;
+
+  // Tool category metadata for toggles
+  readonly toolCategories = [
+    { key: 'research', label: 'Research', icon: 'travel_explore', description: 'Web search, paper search, browsing' },
+    { key: 'citation', label: 'Citation', icon: 'format_quote', description: 'Citation and literature management' },
+    { key: 'document', label: 'Document', icon: 'article', description: 'Document processing and chunking' },
+    { key: 'coding', label: 'Coding', icon: 'code', description: 'Shell command execution' },
+  ];
 
   // Advanced section state
   readonly showAdvanced = signal(false);
-  readonly configFile = signal<FilePreview | null>(null);
-  readonly instructionsFile = signal<FilePreview | null>(null);
 
   // Datasource picker state
   readonly availableDatasources = signal<Datasource[]>([]);
@@ -1058,8 +1299,6 @@ export class JobCreateComponent implements OnInit {
 
   // Current upload_id after successful upload
   private uploadId: string | null = null;
-  private configUploadId: string | null = null;
-  private instructionsUploadId: string | null = null;
 
   formData: JobCreateRequest = {
     description: '',
@@ -1086,9 +1325,159 @@ export class JobCreateComponent implements OnInit {
   toggleExpert(expert: Expert): void {
     if (this.selectedExpert()?.id === expert.id) {
       this.selectedExpert.set(null);
+      this.expertDetail.set(null);
+      this.instructionsContent.set(null);
+      this.artifacts.instructions.set(null);
+      this.configModel.set(null);
+      this.configTemperature.set(null);
+      this.configReasoning.set(null);
+      this.disabledToolCategories.set(new Set());
     } else {
       this.selectedExpert.set(expert);
+      this.fetchExpertDetail(expert.id);
     }
+  }
+
+  private fetchExpertDetail(expertId: string): void {
+    this.isLoadingExpertDetail.set(true);
+    this.api.getExpertDetail(expertId).subscribe({
+      next: (detail) => {
+        this.expertDetail.set(detail);
+        if (detail?.instructions) {
+          this.instructionsContent.set(detail.instructions);
+          this.artifacts.instructions.set(detail.instructions);
+        }
+        this.prefillConfigFromExpert();
+        this.isLoadingExpertDetail.set(false);
+      },
+      error: () => {
+        this.isLoadingExpertDetail.set(false);
+      },
+    });
+  }
+
+  /** Sync instructions edits to artifact service (form → builder direction). */
+  onInstructionsEdit(value: string): void {
+    this.instructionsContent.set(value);
+    if (!this.artifacts.streaming()) {
+      this.artifacts.instructions.set(value || null);
+    }
+  }
+
+  /** Sync description edits to artifact service (form → builder direction). */
+  onDescriptionEdit(value: string): void {
+    if (!this.artifacts.streaming()) {
+      this.artifacts.description.set(value || null);
+    }
+  }
+
+  clearInstructions(): void {
+    this.instructionsContent.set(null);
+    this.artifacts.instructions.set(null);
+  }
+
+  resetInstructionsToExpert(): void {
+    const detail = this.expertDetail();
+    if (detail?.instructions) {
+      this.instructionsContent.set(detail.instructions);
+      this.artifacts.instructions.set(detail.instructions);
+    }
+  }
+
+  // ===== Config Settings Methods =====
+
+  /** Clamp temperature to valid 0–2 range. */
+  onTemperatureChange(value: number): void {
+    this.configTemperature.set(Math.round(Math.min(2, Math.max(0, value)) * 10) / 10);
+  }
+
+  getExpertDefault(path: string): unknown {
+    const detail = this.expertDetail();
+    if (!detail?.config) return null;
+    return path.split('.').reduce((obj: any, key) => obj?.[key], detail.config) ?? null;
+  }
+
+  isToolCategoryEnabled(category: string): boolean {
+    return !this.disabledToolCategories().has(category);
+  }
+
+  toggleToolCategory(category: string): void {
+    this.disabledToolCategories.update((current) => {
+      const next = new Set(current);
+      if (next.has(category)) {
+        next.delete(category);
+      } else {
+        next.add(category);
+      }
+      return next;
+    });
+  }
+
+  /** Build config_override by diffing form values against expert defaults. */
+  private buildConfigOverride(): Record<string, unknown> | undefined {
+    const override: Record<string, unknown> = {};
+    const llm: Record<string, unknown> = {};
+
+    const model = this.configModel();
+    if (model && model !== this.getExpertDefault('llm.model')) {
+      llm['model'] = model;
+    }
+
+    const temp = this.configTemperature();
+    if (temp !== null && temp !== this.getExpertDefault('llm.temperature')) {
+      llm['temperature'] = temp;
+    }
+
+    const reasoning = this.configReasoning();
+    if (reasoning !== null && reasoning !== this.getExpertDefault('llm.reasoning_level')) {
+      llm['reasoning_level'] = reasoning;
+    }
+
+    if (Object.keys(llm).length > 0) {
+      override['llm'] = llm;
+    }
+
+    // Tool overrides — only include disabled categories (set to empty array)
+    const disabled = this.disabledToolCategories();
+    if (disabled.size > 0) {
+      const tools: Record<string, unknown> = {};
+      disabled.forEach((cat) => {
+        tools[cat] = [];
+      });
+      override['tools'] = tools;
+    }
+
+    return Object.keys(override).length > 0 ? override : undefined;
+  }
+
+  private prefillConfigFromExpert(): void {
+    const detail = this.expertDetail();
+    if (!detail?.config) {
+      this.configModel.set(null);
+      this.configTemperature.set(null);
+      this.configReasoning.set(null);
+      this.disabledToolCategories.set(new Set());
+      return;
+    }
+
+    // Pre-fill from expert config (user can then change)
+    const llm = detail.config['llm'] as Record<string, unknown> | undefined;
+    this.configModel.set((llm?.['model'] as string) ?? null);
+    this.configTemperature.set((llm?.['temperature'] as number) ?? null);
+    this.configReasoning.set((llm?.['reasoning_level'] as string) ?? null);
+
+    // Detect which tool categories are empty (disabled)
+    const tools = detail.config['tools'] as Record<string, unknown[]> | undefined;
+    const disabled = new Set<string>();
+    if (tools) {
+      for (const cat of this.toolCategories) {
+        const val = tools[cat.key];
+        if (Array.isArray(val) && val.length === 0) {
+          disabled.add(cat.key);
+        }
+      }
+    }
+    this.disabledToolCategories.set(disabled);
   }
 
   // ===== Datasource Methods =====
@@ -1198,134 +1587,6 @@ export class JobCreateComponent implements OnInit {
     this.uploadId = null;
   }
 
-  // ===== Config/Instructions Upload Methods =====
-
-  triggerConfigInput(): void {
-    if (!this.isSubmitting()) {
-      this.configInput.nativeElement.click();
-    }
-  }
-
-  triggerInstructionsInput(): void {
-    if (!this.isSubmitting()) {
-      this.instructionsInput.nativeElement.click();
-    }
-  }
-
-  async onConfigFileSelected(event: Event): Promise<void> {
-    const input = event.target as HTMLInputElement;
-    if (input.files?.[0]) {
-      const file = input.files[0];
-      if (!file.name.toLowerCase().endsWith('.yaml') && !file.name.toLowerCase().endsWith('.yml')) {
-        this.errorMessage.set('Config must be a YAML file (.yaml or .yml)');
-        input.value = '';
-        return;
-      }
-      const previews = await this.fileService.createFilePreviews([file]);
-      this.configFile.set(previews[0] || null);
-      this.configUploadId = null; // Clear previous upload
-      input.value = '';
-    }
-  }
-
-  async onInstructionsFileSelected(event: Event): Promise<void> {
-    const input = event.target as HTMLInputElement;
-    if (input.files?.[0]) {
-      const file = input.files[0];
-      if (!file.name.toLowerCase().endsWith('.md') && !file.name.toLowerCase().endsWith('.txt')) {
-        this.errorMessage.set('Instructions must be a markdown or text file (.md or .txt)');
-        input.value = '';
-        return;
-      }
-      const previews = await this.fileService.createFilePreviews([file]);
-      this.instructionsFile.set(previews[0] || null);
-      this.instructionsUploadId = null; // Clear previous upload
-      input.value = '';
-    }
-  }
-
-  removeConfigFile(event: Event): void {
-    event.stopPropagation();
-    this.configFile.set(null);
-    this.configUploadId = null;
-  }
-
-  removeInstructionsFile(event: Event): void {
-    event.stopPropagation();
-    this.instructionsFile.set(null);
-    this.instructionsUploadId = null;
-  }
-
-  // ===== Config/Instructions Drag & Drop =====
-
-  onConfigDragOver(event: DragEvent): void {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!this.isSubmitting()) {
-      this.isConfigDragOver.set(true);
-    }
-  }
-
-  onConfigDragLeave(event: DragEvent): void {
-    event.preventDefault();
-    event.stopPropagation();
-    this.isConfigDragOver.set(false);
-  }
-
-  async onConfigDrop(event: DragEvent): Promise<void> {
-    event.preventDefault();
-    event.stopPropagation();
-    this.isConfigDragOver.set(false);
-
-    if (this.isSubmitting()) return;
-
-    const files = event.dataTransfer?.files;
-    if (files && files.length > 0) {
-      const file = files[0];
-      if (!file.name.toLowerCase().endsWith('.yaml') && !file.name.toLowerCase().endsWith('.yml')) {
-        this.errorMessage.set('Config must be a YAML file (.yaml or .yml)');
-        return;
-      }
-      const previews = await this.fileService.createFilePreviews([file]);
-      this.configFile.set(previews[0] || null);
-      this.configUploadId = null;
-    }
-  }
-
-  onInstructionsDragOver(event: DragEvent): void {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!this.isSubmitting()) {
-      this.isInstructionsDragOver.set(true);
-    }
-  }
-
-  onInstructionsDragLeave(event: DragEvent): void {
-    event.preventDefault();
-    event.stopPropagation();
-    this.isInstructionsDragOver.set(false);
-  }
-
-  async onInstructionsDrop(event: DragEvent): Promise<void> {
-    event.preventDefault();
-    event.stopPropagation();
-    this.isInstructionsDragOver.set(false);
-
-    if (this.isSubmitting()) return;
-
-    const files = event.dataTransfer?.files;
-    if (files && files.length > 0) {
-      const file = files[0];
-      if (!file.name.toLowerCase().endsWith('.md') && !file.name.toLowerCase().endsWith('.txt')) {
-        this.errorMessage.set('Instructions must be a markdown or text file (.md or .txt)');
-        return;
-      }
-      const previews = await this.fileService.createFilePreviews([file]);
-      this.instructionsFile.set(previews[0] || null);
-      this.instructionsUploadId = null;
-    }
-  }
-
   // ===== Form Submission =====
 
   async onSubmit(): Promise<void> {
@@ -1334,22 +1595,6 @@ export class JobCreateComponent implements OnInit {
     }
 
     this.clearMessages();
-
-    // Upload config file if provided
-    if (this.configFile() && !this.configUploadId) {
-      const configSuccess = await this.uploadConfigFile();
-      if (!configSuccess) {
-        return;
-      }
-    }
-
-    // Upload instructions file if provided
-    if (this.instructionsFile() && !this.instructionsUploadId) {
-      const instrSuccess = await this.uploadInstructionsFile();
-      if (!instrSuccess) {
-        return;
-      }
-    }
 
     // Upload document files if any
     const files = this.filePreviews();
@@ -1376,16 +1621,24 @@ export class JobCreateComponent implements OnInit {
     if (this.uploadId) {
       request.upload_id = this.uploadId;
     }
-    if (this.configUploadId) {
-      request.config_upload_id = this.configUploadId;
+    const configOverride = this.buildConfigOverride();
+    if (configOverride) {
+      request.config_override = configOverride;
     }
-    if (this.instructionsUploadId) {
-      request.instructions_upload_id = this.instructionsUploadId;
+    const instructions = this.instructionsContent();
+    if (instructions) {
+      request.instructions = instructions;
     }
 
     const dsIds = this.selectedDatasourceIds();
     if (dsIds.size > 0) {
       request.datasource_ids = Array.from(dsIds);
+    }
+
+    // Link builder session if one was started
+    const builderSessionId = this.artifacts.sessionId();
+    if (builderSessionId) {
+      request.builder_session_id = builderSessionId;
     }
 
     this.api.createJob(request).subscribe({
@@ -1466,62 +1719,6 @@ export class JobCreateComponent implements OnInit {
     }
   }
 
-  private async uploadConfigFile(): Promise<boolean> {
-    const config = this.configFile();
-    if (!config) return true;
-
-    this.isUploading.set(true);
-
-    try {
-      const response = await new Promise<{ upload_id: string } | null>((resolve, reject) => {
-        this.api.uploadConfig(config.file).subscribe({
-          next: (res) => resolve(res),
-          error: (err) => reject(err),
-        });
-      });
-
-      if (response) {
-        this.configUploadId = response.upload_id;
-        this.isUploading.set(false);
-        return true;
-      } else {
-        throw new Error('Config upload failed');
-      }
-    } catch (err) {
-      this.isUploading.set(false);
-      this.errorMessage.set('Failed to upload config file. Please try again.');
-      return false;
-    }
-  }
-
-  private async uploadInstructionsFile(): Promise<boolean> {
-    const instructions = this.instructionsFile();
-    if (!instructions) return true;
-
-    this.isUploading.set(true);
-
-    try {
-      const response = await new Promise<{ upload_id: string } | null>((resolve, reject) => {
-        this.api.uploadInstructions(instructions.file).subscribe({
-          next: (res) => resolve(res),
-          error: (err) => reject(err),
-        });
-      });
-
-      if (response) {
-        this.instructionsUploadId = response.upload_id;
-        this.isUploading.set(false);
-        return true;
-      } else {
-        throw new Error('Instructions upload failed');
-      }
-    } catch (err) {
-      this.isUploading.set(false);
-      this.errorMessage.set('Failed to upload instructions file. Please try again.');
-      return false;
-    }
-  }
-
   resetForm(): void {
     this.formData = {
       description: '',
@@ -1530,14 +1727,20 @@ export class JobCreateComponent implements OnInit {
     this.uploadId = null;
     // Reset expert selection
     this.selectedExpert.set(null);
+    this.expertDetail.set(null);
+    // Reset instructions editor
+    this.instructionsContent.set(null);
+    // Reset config settings
+    this.configModel.set(null);
+    this.configTemperature.set(null);
+    this.configReasoning.set(null);
+    this.disabledToolCategories.set(new Set());
     // Reset advanced options
     this.showAdvanced.set(false);
-    this.configFile.set(null);
-    this.instructionsFile.set(null);
-    this.configUploadId = null;
-    this.instructionsUploadId = null;
     // Reset datasource selections
     this.selectedDatasourceIds.set(new Set());
+    // Reset artifact service (clears builder session)
+    this.artifacts.reset();
   }
 
   clearSuccess(): void {

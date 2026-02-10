@@ -55,6 +55,15 @@ export interface Expert {
   tags: string[];
 }
 
+/**
+ * Full expert detail including merged config and instructions content.
+ * Returned by GET /api/experts/{expert_id}.
+ */
+export interface ExpertDetail extends Expert {
+  config: Record<string, unknown>;
+  instructions: string | null;
+}
+
 // =============================================================================
 // Datasource Models
 // =============================================================================
@@ -182,6 +191,7 @@ export interface JobCreateRequest {
   context?: Record<string, unknown>;
   instructions?: string;
   datasource_ids?: string[];
+  builder_session_id?: string;
 }
 
 /**

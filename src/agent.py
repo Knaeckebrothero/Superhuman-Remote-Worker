@@ -779,8 +779,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Initialize workspace (creates directories)
         self._workspace_manager.initialize()
 
-        # Copy instructions to workspace (from upload or template)
-        if metadata.get("instructions_upload_id"):
+        # Copy instructions to workspace (priority: inline > upload > template)
+        if metadata.get("instructions"):
+            # Use inline instructions (from job creation form or builder)
+            self._workspace_manager.write_file("instructions.md", metadata["instructions"])
+            logger.info("Using inline instructions from job metadata")
+        elif metadata.get("instructions_upload_id"):
             # Use uploaded instructions
             instr_upload_id = metadata["instructions_upload_id"]
             from .core.workspace import get_workspace_base_path

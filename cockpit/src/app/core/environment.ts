@@ -19,8 +19,16 @@ const getDozzleUrl = (): string | null => {
   return null;
 };
 
+const getModels = (): { group: string; models: string[] }[] => {
+  if (typeof window !== 'undefined') {
+    return (window as any)['env']?.['models'] || [];
+  }
+  return [];
+};
+
 export const environment = {
   apiUrl: getApiUrl(),
   giteaUrl: getGiteaUrl(),
   dozzleUrl: getDozzleUrl(),
+  models: getModels(),
 };
