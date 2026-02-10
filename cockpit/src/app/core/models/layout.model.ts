@@ -25,7 +25,8 @@ export type ComponentType =
   | 'agent-list'
   | 'job-list'
   | 'job-create'
-  | 'statistics';
+  | 'statistics'
+  | 'datasource-list';
 
 /**
  * Layout configuration for the tiling system.

@@ -16,6 +16,10 @@ import {
   AgentStatistics,
   StuckJob,
   WorkspaceOverview,
+  Datasource,
+  DatasourceCreateRequest,
+  DatasourceUpdateRequest,
+  DatasourceTestResult,
 } from '../models/api.model';
 import { UploadResponse, UploadInfo } from '../models/file.model';
 import {
@@ -407,6 +411,100 @@ export class ApiService {
       catchError((error) => {
         console.error(`Failed to delete agent ${agentId}:`, error);
         return of(null);
+      }),
+    );
+  }
+
+  // ===== Datasource Management Endpoints =====
+
+  /**
+   * Get list of datasources with optional filters.
+   */
+  getDatasources(jobId?: string, type?: string): Observable<Datasource[]> {
+    let params = new HttpParams();
+    if (jobId) {
+      params = params.set('job_id', jobId);
+    }
+    if (type) {
+      params = params.set('type', type);
+    }
+
+    return this.http.get<Datasource[]>(`${this.baseUrl}/datasources`, { params }).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch datasources:', error);
+        return of([]);
+      }),
+    );
+  }
+
+  /**
+   * Get a single datasource by ID.
+   */
+  getDatasource(id: string): Observable<Datasource | null> {
+    return this.http.get<Datasource>(`${this.baseUrl}/datasources/${id}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch datasource ${id}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Create a new datasource.
+   */
+  createDatasource(ds: DatasourceCreateRequest): Observable<Datasource | null> {
+    return this.http.post<Datasource>(`${this.baseUrl}/datasources`, ds).pipe(
+      catchError((error) => {
+        console.error('Failed to create datasource:', error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Update a datasource.
+   */
+  updateDatasource(id: string, ds: DatasourceUpdateRequest): Observable<{ status: string } | null> {
+    return this.http.put<{ status: string }>(`${this.baseUrl}/datasources/${id}`, ds).pipe(
+      catchError((error) => {
+        console.error(`Failed to update datasource ${id}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Delete a datasource.
+   */
+  deleteDatasource(id: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/datasources/${id}`).pipe(
+      catchError((error) => {
+        console.error(`Failed to delete datasource ${id}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Test connectivity to a datasource.
+   */
+  testDatasource(id: string): Observable<DatasourceTestResult | null> {
+    return this.http.post<DatasourceTestResult>(`${this.baseUrl}/datasources/${id}/test`, {}).pipe(
+      catchError((error) => {
+        console.error(`Failed to test datasource ${id}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get resolved datasources for a job.
+   */
+  getJobDatasources(jobId: string): Observable<Datasource[]> {
+    return this.http.get<Datasource[]>(`${this.baseUrl}/jobs/${jobId}/datasources`).pipe(
+      catchError((error) => {
+        console.error(`Failed to fetch datasources for job ${jobId}:`, error);
+        return of([]);
       }),
     );
   }

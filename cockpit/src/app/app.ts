@@ -16,6 +16,7 @@ import { AgentListComponent } from './components/agent-list/agent-list.component
 import { JobListComponent } from './components/job-list/job-list.component';
 import { JobCreateComponent } from './components/job-create/job-create.component';
 import { StatisticsComponent } from './components/statistics/statistics.component';
+import { DatasourceListComponent } from './components/datasource-list/datasource-list.component';
 
 @Component({
   selector: 'app-root',
@@ -137,6 +138,12 @@ export class App implements OnInit {
       type: 'statistics',
       displayName: 'Statistics',
       component: StatisticsComponent,
+    });
+
+    this.registry.register({
+      type: 'datasource-list',
+      displayName: 'Datasources',
+      component: DatasourceListComponent,
     });
   }
 }

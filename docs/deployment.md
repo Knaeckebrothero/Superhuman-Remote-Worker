@@ -96,7 +96,9 @@ ALTER TABLE jobs ADD COLUMN assigned_agent_id UUID REFERENCES agents(id);
 | `workspace` | read_file, write_file, edit_file, list_files, delete_file, search_files, move_file, copy_file | File operations in job workspace | - |
 | `todo` | next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete | Task management and phase control | - |
 | `citation` | cite_document, cite_web, list_sources, get_citation, list_citations | Source tracking and citations | PostgreSQL |
-| `neo4j` | execute_cypher_query, get_database_schema, validate_schema_compliance | Graph database operations | Neo4j |
+| `graph` | execute_cypher_query, get_database_schema | Neo4j graph operations | Neo4j datasource |
+| `sql` | sql_query, sql_schema, sql_execute | PostgreSQL operations | PostgreSQL datasource |
+| `mongodb` | mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update | MongoDB operations | MongoDB datasource |
 | `web` | web_search, fetch_url | Internet research | TAVILY_API_KEY |
 | `document` | extract_document_text, get_document_info | PDF/document processing | - |
 | `s3` | s3_upload, s3_download, s3_list, s3_delete | Cloud storage | S3 credentials |
@@ -156,20 +158,12 @@ src/tools/
 
 Each toolkit is a class:
 ```python
-class Neo4jToolkit(Toolkit):
-    name = "neo4j"
-    requires = ["NEO4J_URI"]  # Required env vars
-
-    def get_tools(self, context: ToolContext) -> list[Tool]:
-        return [
-            execute_cypher_query,
-            get_database_schema,
-            validate_schema_compliance
-        ]
-
-    def validate_config(self) -> bool:
-        """Check if required connections/credentials exist."""
-        return bool(os.getenv("NEO4J_URI"))
+# Database tools are now injected by the orchestrator based on attached datasources.
+# See docs/datasources.md for the multi-stage config pipeline.
+# Example: if a Neo4j datasource is attached, the orchestrator injects:
+#   graph: [execute_cypher_query, get_database_schema]
+# If a PostgreSQL datasource is attached:
+#   sql: [sql_query, sql_schema, sql_execute]
 ```
 
 ### Cockpit Expansion

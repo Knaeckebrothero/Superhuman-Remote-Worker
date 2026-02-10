@@ -22,6 +22,7 @@ from decimal import Decimal  # noqa: E402
 from typing import Any  # noqa: E402
 from uuid import UUID  # noqa: E402
 
+import asyncpg  # noqa: E402
 import yaml  # noqa: E402
 from fastapi import FastAPI, HTTPException, Query  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
@@ -84,6 +85,28 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
 # =============================================================================
 
 
+class DatasourceCreate(BaseModel):
+    """Request body for creating a datasource."""
+
+    name: str = Field(..., description="User-provided label")
+    type: str = Field(..., description="Datasource type: postgresql, neo4j, mongodb")
+    connection_url: str = Field(..., description="Full connection string")
+    description: str | None = Field(None, description="What this datasource contains")
+    credentials: dict[str, Any] | None = Field(None, description="Additional auth details")
+    read_only: bool = Field(True, description="Whether the agent is allowed to write")
+    job_id: str | None = Field(None, description="Job UUID (null for global)")
+
+
+class DatasourceUpdate(BaseModel):
+    """Request body for updating a datasource."""
+
+    name: str | None = Field(None, description="New label")
+    description: str | None = Field(None, description="New description")
+    connection_url: str | None = Field(None, description="New connection string")
+    credentials: dict[str, Any] | None = Field(None, description="New auth details")
+    read_only: bool | None = Field(None, description="New read_only flag")
+
+
 class AgentRegistration(BaseModel):
     """Request body for agent registration."""
 
@@ -134,6 +157,7 @@ class JobCreate(BaseModel):
     config_override: dict[str, Any] | None = Field(None, description="Per-job configuration overrides")
     context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
     instructions: str | None = Field(None, description="Additional inline instructions for the agent")
+    datasource_ids: list[str] | None = Field(None, description="Global datasource IDs to clone as job-scoped")
 
 
 class JobStartRequest(BaseModel):
@@ -151,6 +175,7 @@ class JobStartRequest(BaseModel):
     context: dict[str, Any] | None = None
     instructions: str | None = None
     git_remote_url: str | None = None
+    datasources: list[dict[str, Any]] | None = None
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -404,6 +429,38 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 ctx["git_remote_url"] = git_remote_url
                 await postgres_db.update_job_context(job_id_str, ctx)
 
+        # Clone selected global datasources as job-scoped
+        if job.datasource_ids:
+            new_job_id = str(result["id"])
+            for ds_id in job.datasource_ids:
+                try:
+                    ds = await postgres_db.get_datasource(ds_id)
+                    if ds and ds.get("job_id") is None:
+                        # Parse credentials if stored as string
+                        creds = ds.get("credentials") or {}
+                        if isinstance(creds, str):
+                            try:
+                                creds = json.loads(creds)
+                            except (json.JSONDecodeError, ValueError):
+                                creds = {}
+
+                        await postgres_db.create_datasource(
+                            name=ds["name"],
+                            ds_type=ds["type"],
+                            connection_url=ds["connection_url"],
+                            description=ds.get("description"),
+                            credentials=creds if creds else None,
+                            read_only=ds.get("read_only", True),
+                            job_id=new_job_id,
+                        )
+                    else:
+                        logger.warning(
+                            f"Skipping datasource {ds_id}: "
+                            f"{'not found' if not ds else 'not global (already job-scoped)'}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to clone datasource {ds_id} for job {new_job_id}: {e}")
+
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -548,11 +605,20 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             except json.JSONDecodeError:
                 config_override = None
 
+        # Resolve datasources for this job (job-specific > global fallback)
+        resolved_ds = await postgres_db.resolve_datasources_for_job(job_id)
+        datasources_payload = _build_datasources_payload(resolved_ds)
+
+        # Apply datasource-driven tool override (inject/strip db tool categories)
+        if resolved_ds:
+            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+
         resume_payload = {
             "job_id": job_id,
             "config_name": job_config_name,
             "config_upload_id": job_context.get("config_upload_id") if job_context else None,
             "config_override": config_override,
+            "datasources": datasources_payload,
         }
         if request and request.feedback:
             resume_payload["feedback"] = request.feedback
@@ -981,6 +1047,99 @@ async def get_job_version(job_id: str) -> dict[str, Any] | None:
 # =============================================================================
 
 
+def _build_datasource_tool_override(
+    datasources: list[dict[str, Any]], config_override: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Inject/strip database tool categories based on attached datasources.
+
+    For each known datasource type, if a datasource is attached, the corresponding
+    tool category is injected. If not attached, the category is set to an empty list.
+    This ensures the agent only has database tools for databases that are actually
+    connected.
+
+    Args:
+        datasources: List of resolved datasource dicts (from resolve_datasources_for_job)
+        config_override: Existing config override dict (may be None)
+
+    Returns:
+        Updated config override dict with tool categories adjusted
+    """
+    override = dict(config_override or {})
+    tools_override = dict(override.get("tools", {}))
+
+    # Datasource type -> tool category + tool names
+    DS_TOOL_MAP = {
+        "neo4j": {
+            "category": "graph",
+            "read": ["execute_cypher_query", "get_database_schema"],
+            "write": ["execute_cypher_query", "get_database_schema"],
+        },
+        "postgresql": {
+            "category": "sql",
+            "read": ["sql_query", "sql_schema"],
+            "write": ["sql_query", "sql_schema", "sql_execute"],
+        },
+        "mongodb": {
+            "category": "mongodb",
+            "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
+            "write": ["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"],
+        },
+    }
+
+    attached_types = {ds["type"] for ds in datasources}
+
+    for ds_type, tool_info in DS_TOOL_MAP.items():
+        category = tool_info["category"]
+        if ds_type in attached_types:
+            # Find the datasource to check read_only
+            ds = next(d for d in datasources if d["type"] == ds_type)
+            tools = tool_info["write"] if not ds.get("read_only", True) else tool_info["read"]
+            tools_override[category] = tools
+        else:
+            # No datasource attached — strip the category
+            tools_override[category] = []
+
+    override["tools"] = tools_override
+    return override
+
+
+def _build_datasources_payload(resolved_ds: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """Build the datasources payload for sending to the agent.
+
+    Strips internal fields (id, job_id, created_at, updated_at) that the
+    agent doesn't need.
+
+    Args:
+        resolved_ds: List of resolved datasource dicts from the database
+
+    Returns:
+        List of datasource dicts for the agent, or None if empty
+    """
+    if not resolved_ds:
+        return None
+
+    payload = []
+    for ds in resolved_ds:
+        creds = ds.get("credentials") or {}
+        if isinstance(creds, str):
+            import json as json_module
+            try:
+                creds = json_module.loads(creds)
+            except (json.JSONDecodeError, ValueError):
+                creds = {}
+
+        payload.append({
+            "type": ds["type"],
+            "name": ds["name"],
+            "description": ds.get("description"),
+            "connection_url": ds["connection_url"],
+            "credentials": creds,
+            "read_only": ds.get("read_only", True),
+        })
+
+    return payload or None
+
+
 @app.post("/api/jobs/{job_id}/assign/{agent_id}")
 async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
     """Assign a job to an agent.
@@ -1045,6 +1204,14 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
         extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "git_remote_url"}
         remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
 
+        # Resolve datasources for this job (job-specific > global fallback)
+        resolved_ds = await postgres_db.resolve_datasources_for_job(job_id)
+        datasources_payload = _build_datasources_payload(resolved_ds)
+
+        # Apply datasource-driven tool override (inject/strip db tool categories)
+        if resolved_ds:
+            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+
         # Build job start request - use job's config, not agent's
         job_start = JobStartRequest(
             job_id=job_id,
@@ -1057,6 +1224,7 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             config_override=config_override,
             git_remote_url=git_remote_url,
             context=remaining_context if remaining_context else None,
+            datasources=datasources_payload,
         )
 
         # Send request to agent pod
@@ -1098,6 +1266,178 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             status_code=502,
             detail=f"Failed to connect to agent: {str(e)}",
         ) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Datasource Endpoints
+# =============================================================================
+
+
+@app.get("/api/datasources")
+async def list_datasources(
+    job_id: str | None = Query(default=None, description="Filter by job ID (use 'global' for global-only)"),
+    type: str | None = Query(default=None, description="Filter by type (postgresql, neo4j, mongodb)"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """List datasources with optional filters."""
+    try:
+        return await postgres_db.list_datasources(job_id=job_id, ds_type=type, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/datasources/{datasource_id}")
+async def get_datasource(datasource_id: str) -> dict[str, Any]:
+    """Get a single datasource by ID."""
+    try:
+        ds = await postgres_db.get_datasource(datasource_id)
+        if not ds:
+            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+        return ds
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/datasources")
+async def create_datasource(body: DatasourceCreate) -> dict[str, Any]:
+    """Create a new datasource.
+
+    Use job_id=null for global datasources (available to all jobs).
+    """
+    valid_types = {"postgresql", "neo4j", "mongodb"}
+    if body.type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid type '{body.type}'. Must be one of: {', '.join(sorted(valid_types))}",
+        )
+
+    try:
+        return await postgres_db.create_datasource(
+            name=body.name,
+            ds_type=body.type,
+            connection_url=body.connection_url,
+            description=body.description,
+            credentials=body.credentials,
+            read_only=body.read_only,
+            job_id=body.job_id,
+        )
+    except Exception as e:
+        error_msg = str(e)
+        if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
+            scope = f"job '{body.job_id}'" if body.job_id else "global scope"
+            raise HTTPException(
+                status_code=409,
+                detail=f"A '{body.type}' datasource already exists for {scope}",
+            ) from e
+        raise HTTPException(status_code=500, detail=error_msg) from e
+
+
+@app.put("/api/datasources/{datasource_id}")
+async def update_datasource(datasource_id: str, body: DatasourceUpdate) -> dict[str, str]:
+    """Update a datasource."""
+    try:
+        success = await postgres_db.update_datasource(
+            datasource_id=datasource_id,
+            name=body.name,
+            description=body.description,
+            connection_url=body.connection_url,
+            credentials=body.credentials,
+            read_only=body.read_only,
+        )
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+        return {"status": "updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/datasources/{datasource_id}")
+async def delete_datasource(datasource_id: str) -> dict[str, str]:
+    """Delete a datasource."""
+    try:
+        success = await postgres_db.delete_datasource(datasource_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/datasources")
+async def get_job_datasources(job_id: str) -> list[dict[str, Any]]:
+    """Get resolved datasources for a job.
+
+    Returns one datasource per type, with job-specific taking precedence
+    over global datasources.
+    """
+    try:
+        return await postgres_db.resolve_datasources_for_job(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/datasources/{datasource_id}/test")
+async def test_datasource(datasource_id: str) -> dict[str, Any]:
+    """Test connectivity to a datasource.
+
+    Attempts to connect using the stored connection details and returns
+    the result. Does not modify any data.
+    """
+    try:
+        ds = await postgres_db.get_datasource(datasource_id)
+        if not ds:
+            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+
+        ds_type = ds["type"]
+        url = ds["connection_url"]
+        creds = ds.get("credentials") or {}
+        if isinstance(creds, str):
+            creds = json.loads(creds)
+
+        if ds_type == "postgresql":
+            try:
+                conn = await asyncpg.connect(url, timeout=10)
+                version = await conn.fetchval("SELECT version()")
+                await conn.close()
+                return {"status": "ok", "message": f"Connected: {version[:80]}"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif ds_type == "neo4j":
+            try:
+                from neo4j import GraphDatabase
+                username = creds.get("username", "neo4j")
+                password = creds.get("password", "")
+                driver = GraphDatabase.driver(url, auth=(username, password))
+                driver.verify_connectivity()
+                driver.close()
+                return {"status": "ok", "message": "Connected to Neo4j"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        elif ds_type == "mongodb":
+            try:
+                from pymongo import MongoClient
+                client = MongoClient(url, serverSelectionTimeoutMS=5000)
+                client.server_info()
+                client.close()
+                return {"status": "ok", "message": "Connected to MongoDB"}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+
+        else:
+            return {"status": "error", "message": f"Unknown datasource type: {ds_type}"}
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

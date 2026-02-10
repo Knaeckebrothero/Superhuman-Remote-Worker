@@ -27,6 +27,8 @@ from .document import create_document_tools, get_document_metadata
 from .research import create_research_tools, get_research_metadata
 from .citation import create_citation_tools, get_citation_metadata
 from .graph import create_graph_tools, get_graph_metadata
+from .sql import create_sql_tools, get_sql_metadata
+from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .git import create_git_tools, get_git_metadata
 from .coding import create_coding_tools, get_coding_metadata
 
@@ -51,6 +53,8 @@ TOOL_REGISTRY.update(get_document_metadata())
 TOOL_REGISTRY.update(get_research_metadata())
 TOOL_REGISTRY.update(get_citation_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
+TOOL_REGISTRY.update(get_sql_metadata())
+TOOL_REGISTRY.update(get_mongodb_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_coding_metadata())
 
@@ -310,8 +314,8 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
 
     # Graph tools
     if "graph" in tools_by_category:
-        if not context.has_neo4j():
-            logger.warning("Graph tools require neo4j_db in ToolContext")
+        if not context.has_datasource("neo4j"):
+            logger.warning("Graph tools require a neo4j datasource in ToolContext")
         else:
             try:
                 graph_tools = create_graph_tools(context)
@@ -322,6 +326,36 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded graph tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load graph tools: {e}")
+
+    # SQL tools
+    if "sql" in tools_by_category:
+        if not context.has_datasource("postgresql"):
+            logger.warning("SQL tools require a postgresql datasource in ToolContext")
+        else:
+            try:
+                sql_tools = create_sql_tools(context)
+                requested = set(tools_by_category["sql"])
+                for tool in sql_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded sql tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load sql tools: {e}")
+
+    # MongoDB tools
+    if "mongodb" in tools_by_category:
+        if not context.has_datasource("mongodb"):
+            logger.warning("MongoDB tools require a mongodb datasource in ToolContext")
+        else:
+            try:
+                mongo_tools = create_mongodb_tools(context)
+                requested = set(tools_by_category["mongodb"])
+                for tool in mongo_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded mongodb tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load mongodb tools: {e}")
 
     # Git tools
     if "git" in tools_by_category:
