@@ -314,17 +314,31 @@ export class MenuComponent {
         },
       ],
     },
-    ...(environment.dozzleUrl
+    ...(environment.giteaUrl || environment.dozzleUrl
       ? [
           {
-            title: 'Monitoring',
+            title: 'Tools',
             items: [
-              {
-                label: 'Dozzle',
-                url: environment.dozzleUrl,
-                icon: '📋',
-                description: 'Container log viewer',
-              },
+              ...(environment.giteaUrl
+                ? [
+                    {
+                      label: 'Gitea',
+                      url: environment.giteaUrl,
+                      icon: '🍵',
+                      description: 'Git repository browser',
+                    },
+                  ]
+                : []),
+              ...(environment.dozzleUrl
+                ? [
+                    {
+                      label: 'Dozzle',
+                      url: environment.dozzleUrl,
+                      icon: '📋',
+                      description: 'Container log viewer',
+                    },
+                  ]
+                : []),
             ],
           },
         ]

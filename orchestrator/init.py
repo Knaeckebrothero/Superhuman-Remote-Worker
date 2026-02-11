@@ -639,7 +639,7 @@ def restore_mongodb(backup_dir: Path) -> bool:
 # Uploads Directory Management
 # =============================================================================
 
-UPLOADS_DIR = Path("workspace/uploads")
+UPLOADS_DIR = Path(__file__).resolve().parent.parent / "workspace" / "uploads"
 
 
 def get_uploads_path() -> Path:
