@@ -491,6 +491,191 @@ class GiteaClient:
             logger.warning(f"Failed to read {file_path} from {repo_name}: {e}")
             return None
 
+    async def get_commits(
+        self,
+        repo_name: str,
+        sha: str = "main",
+        page: int = 1,
+        limit: int = 20,
+    ) -> list[dict] | None:
+        """List commits from a branch, tag, or SHA.
+
+        Args:
+            repo_name: Repository name
+            sha: Branch, tag, or commit SHA to list from
+            page: Page number (1-indexed)
+            limit: Max commits per page
+
+        Returns:
+            List of commit dicts with sha, message, author, date, or None on failure.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/git/commits",
+                params={"sha": sha, "page": page, "limit": limit},
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to list commits for {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            commits = resp.json()
+            return [
+                {
+                    "sha": c["sha"],
+                    "message": c.get("commit", {}).get("message", ""),
+                    "author": c.get("commit", {}).get("author", {}).get("name", ""),
+                    "date": c.get("commit", {}).get("author", {}).get("date", ""),
+                }
+                for c in commits
+            ]
+
+        except Exception as e:
+            logger.warning(f"Failed to list commits for {repo_name}: {e}")
+            return None
+
+    async def get_compare(
+        self, repo_name: str, base: str, head: str = "HEAD"
+    ) -> dict | None:
+        """Compare two refs and return commits between them.
+
+        Args:
+            repo_name: Repository name
+            base: Base ref (commit SHA, tag, or branch)
+            head: Head ref (default: HEAD)
+
+        Returns:
+            Dict with total_commits and commits list, or None on failure.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/compare/{base}...{head}",
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to compare {base}...{head} in {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            data = resp.json()
+            commits = [
+                {
+                    "sha": c["sha"],
+                    "message": c.get("commit", {}).get("message", ""),
+                    "author": c.get("commit", {}).get("author", {}).get("name", ""),
+                    "date": c.get("commit", {}).get("author", {}).get("date", ""),
+                }
+                for c in data.get("commits", [])
+            ]
+            return {
+                "total_commits": data.get("total_commits", len(commits)),
+                "commits": commits,
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to compare {base}...{head} in {repo_name}: {e}")
+            return None
+
+    async def get_diff(
+        self, repo_name: str, base: str, head: str = "HEAD"
+    ) -> str | None:
+        """Get raw unified diff between two refs.
+
+        Args:
+            repo_name: Repository name
+            base: Base ref (commit SHA, tag, or branch)
+            head: Head ref (default: HEAD)
+
+        Returns:
+            Unified diff as text, or None on failure.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/compare/{base}...{head}.diff",
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to get diff {base}...{head} in {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            return resp.text
+
+        except Exception as e:
+            logger.warning(f"Failed to get diff {base}...{head} in {repo_name}: {e}")
+            return None
+
+    async def get_tags(
+        self, repo_name: str, page: int = 1, limit: int = 50
+    ) -> list[dict] | None:
+        """List tags in a repository.
+
+        Args:
+            repo_name: Repository name
+            page: Page number (1-indexed)
+            limit: Max tags per page
+
+        Returns:
+            List of tag dicts with name, sha, and date, or None on failure.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/tags",
+                params={"page": page, "limit": limit},
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to list tags for {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            tags = resp.json()
+            return [
+                {
+                    "name": t["name"],
+                    "sha": t.get("id", t.get("commit", {}).get("sha", "")),
+                    "message": t.get("message", ""),
+                }
+                for t in tags
+            ]
+
+        except Exception as e:
+            logger.warning(f"Failed to list tags for {repo_name}: {e}")
+            return None
+
     async def close(self) -> None:
         """Close the httpx client."""
         if self._client and not self._client.is_closed:
