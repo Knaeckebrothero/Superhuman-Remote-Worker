@@ -572,10 +572,11 @@ def finalize_job(
             import asyncio
 
             async def update_status():
-                return await postgres_db.jobs.update(
+                await postgres_db.jobs.update_status(
                     job_id,
                     status="pending_review",
                 )
+                return True
 
             # Run the async operation
             loop = asyncio.get_event_loop()

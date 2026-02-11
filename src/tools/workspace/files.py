@@ -594,6 +594,16 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 f"Use git tools to commit and push your results for delivery."
             )
 
+        # Enforce word limit
+        max_write_words = context.get_config("max_write_words", 10_000)
+        word_count = len(content.split())
+        if word_count > max_write_words:
+            return (
+                f"Error: Content too large ({word_count:,} words, limit is {max_write_words:,}). "
+                f"Split into multiple write_file calls — for example, write each section or chapter "
+                f"separately using different file paths, then combine if needed."
+            )
+
         try:
             # Enforce read-before-write for existing files
             if workspace.exists(path) and not context.was_recently_read(path):
