@@ -29,7 +29,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +37,25 @@ logger = logging.getLogger(__name__)
 class ConversationSummary(BaseModel):
     """Structured summary — forces the model to stop after valid JSON."""
     summary: str = Field(description="General overview of the conversation and what happened")
-    tasks_completed: str = Field(description="Bullet-point list of completed tasks")
-    key_decisions: str = Field(description="Important decisions made")
+    tasks_completed: str | List[str] = Field(description="Bullet-point list of completed tasks")
+    key_decisions: str | List[str] = Field(description="Important decisions made")
     current_state: str = Field(description="Current progress and immediate next steps")
-    blockers: str = Field(default="", description="Errors or blockers encountered, empty if none")
-    state_changes: str = Field(default="", description="Files created, modified, or deleted during this period")
+    blockers: str | List[str] = Field(default="", description="Errors or blockers encountered, empty if none")
+    state_changes: str | List[str] = Field(default="", description="Files created, modified, or deleted during this period")
     pinned_instructions: str = Field(default="", description="Rules from instructions/config that must persist")
+
+    @field_validator("tasks_completed", "key_decisions", "blockers", "state_changes", mode="before")
+    @classmethod
+    def coerce_list_to_string(cls, v):
+        """Coerce list fields to strings.
+
+        Some models (e.g., Kimi K2 on Groq) return arrays instead of strings
+        for list-like fields. The JSON schema must accept both (Union type)
+        so provider-side validation passes, then we normalize to string here.
+        """
+        if isinstance(v, list):
+            return "\n".join(f"- {item}" for item in v)
+        return v
 
 
 def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int:

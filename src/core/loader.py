@@ -1636,3 +1636,44 @@ def get_transition_strategic_todos_from_config(
         }
         for t in raw_todos
     ]
+
+
+def get_resume_strategic_todos_from_config(
+    config: Optional["AgentConfig"] = None,
+) -> List[Dict[str, Any]]:
+    """Get strategic todos for resuming a frozen job with feedback.
+
+    Loads from strategic_todos_resume.yaml template with deployment override support.
+
+    Args:
+        config: Agent configuration (for deployment directory). If None, uses
+               framework defaults only.
+
+    Returns:
+        List of todo dicts ready for TodoManager.set_todos_from_list():
+        [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
+    """
+    deployment_dir = config._deployment_dir if config else None
+
+    try:
+        raw_todos = load_strategic_todos_template(
+            "strategic_todos_resume.yaml",
+            deployment_dir=deployment_dir,
+        )
+    except FileNotFoundError:
+        logger.warning(
+            "strategic_todos_resume.yaml not found, using empty list. "
+            "Create config/templates/strategic_todos_resume.yaml or deployment override."
+        )
+        return []
+
+    # Convert to TodoManager format
+    return [
+        {
+            "id": f"todo_{t['id']}",
+            "content": t["content"],
+            "status": "pending",
+            "priority": "medium",
+        }
+        for t in raw_todos
+    ]
