@@ -143,6 +143,118 @@ class TestEmbeddingService:
         )
         assert service.is_configured is True
 
+    # ----- Batching tests -----
+
+    def test_constructor_batch_params(self):
+        """Test custom and default batch parameters are stored."""
+        service = EmbeddingService(
+            model="test-model",
+            api_key="test",
+            max_tokens_per_batch=100_000,
+            max_texts_per_batch=512,
+            timeout=30.0,
+        )
+        assert service.max_tokens_per_batch == 100_000
+        assert service.max_texts_per_batch == 512
+        assert service.timeout == 30.0
+
+        # Defaults
+        default = EmbeddingService(model="test-model", api_key="test")
+        assert default.max_tokens_per_batch == 250_000
+        assert default.max_texts_per_batch == 2048
+        assert default.timeout == 60.0
+
+    def test_estimate_tokens(self):
+        """Test token estimation heuristic."""
+        assert EmbeddingService._estimate_tokens("") == 1  # min 1
+        assert EmbeddingService._estimate_tokens("hello world") == 3  # 11 // 3
+        assert EmbeddingService._estimate_tokens("a" * 3000) == 1000
+
+    def test_compute_batches_single(self):
+        """Small input fits in one batch."""
+        service = EmbeddingService(model="test-model", api_key="test")
+        batches = service._compute_batches(["hello", "world"])
+        assert len(batches) == 1
+        assert batches[0] == [0, 1]
+
+    def test_compute_batches_token_split(self):
+        """Low token limit forces multiple batches."""
+        service = EmbeddingService(
+            model="test-model", api_key="test", max_tokens_per_batch=10
+        )
+        # Each text is 30 chars -> ~10 tokens, so each needs its own batch
+        texts = ["a" * 30, "b" * 30, "c" * 30]
+        batches = service._compute_batches(texts)
+        assert len(batches) == 3
+        assert batches[0] == [0]
+        assert batches[1] == [1]
+        assert batches[2] == [2]
+
+    def test_compute_batches_count_split(self):
+        """Low count limit forces multiple batches."""
+        service = EmbeddingService(
+            model="test-model", api_key="test", max_texts_per_batch=2
+        )
+        texts = ["a", "b", "c", "d", "e"]
+        batches = service._compute_batches(texts)
+        assert len(batches) == 3
+        assert batches[0] == [0, 1]
+        assert batches[1] == [2, 3]
+        assert batches[2] == [4]
+
+    def test_compute_batches_preserves_indices(self):
+        """All indices appear exactly once across all batches."""
+        service = EmbeddingService(
+            model="test-model", api_key="test", max_texts_per_batch=3
+        )
+        texts = [f"text {i}" for i in range(10)]
+        batches = service._compute_batches(texts)
+        all_indices = [idx for batch in batches for idx in batch]
+        assert sorted(all_indices) == list(range(10))
+
+    def test_compute_batches_empty(self):
+        """Empty input returns empty batches."""
+        service = EmbeddingService(model="test-model", api_key="test")
+        assert service._compute_batches([]) == []
+
+    @patch("httpx.Client")
+    def test_embed_batch_multi_batch(self, MockClient):
+        """Multi-batch embedding makes multiple POST calls with correct result ordering."""
+        # Responses for batch 1 (indices 0,1) and batch 2 (index 2)
+        response1 = MagicMock()
+        response1.json.return_value = {
+            "data": [
+                {"embedding": [0.1, 0.2], "index": 0},
+                {"embedding": [0.3, 0.4], "index": 1},
+            ],
+        }
+        response1.raise_for_status = MagicMock()
+
+        response2 = MagicMock()
+        response2.json.return_value = {
+            "data": [
+                {"embedding": [0.5, 0.6], "index": 0},
+            ],
+        }
+        response2.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.side_effect = [response1, response2]
+        MockClient.return_value = mock_client
+
+        service = EmbeddingService(
+            model="test-model", api_key="test", max_texts_per_batch=2
+        )
+        results = service.embed_batch(["aaa", "bbb", "ccc"])
+
+        assert mock_client.post.call_count == 2
+        assert len(results) == 3
+        assert results[0] == [0.1, 0.2]
+        assert results[1] == [0.3, 0.4]
+        assert results[2] == [0.5, 0.6]
+
 
 # =============================================================================
 # SemanticChunker Tests
