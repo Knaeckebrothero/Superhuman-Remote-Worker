@@ -8,16 +8,17 @@
 # config/auth errors.
 # =============================================================================
 
-set -e
-
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 VPN_CONFIG="${VPN_CONFIG:-/etc/openfortivpn/config}"
 
 # ── Generate config from env vars (overrides default/example config) ────────
 if [ -n "$VPN_HOST" ]; then
     echo "[vpn] No config file found, generating from environment variables..."
-    mkdir -p "$(dirname "$VPN_CONFIG")"
-    cat > "$VPN_CONFIG" <<VPNEOF
+    if ! mkdir -p "$(dirname "$VPN_CONFIG")"; then
+        echo "[vpn] ERROR: Could not create config directory"
+        exit 1
+    fi
+    cat > "$VPN_CONFIG" <<VPNEOF || { echo "[vpn] ERROR: Could not write VPN config"; exit 1; }
 host = ${VPN_HOST}
 port = ${VPN_PORT:-443}
 username = ${VPN_USER}
@@ -63,20 +64,25 @@ cleanup() {
     exit 0
 }
 
-trap cleanup SIGTERM SIGINT
+trap cleanup SIGTERM SIGINT SIGHUP
 
 # ── Start microsocks ──────────────────────────────────────────────────────
-echo "[vpn] Starting microsocks on port ${SOCKS_PORT}..."
-microsocks -p "$SOCKS_PORT" &
-MICROSOCKS_PID=$!
+start_microsocks() {
+    echo "[vpn] Starting microsocks on port ${SOCKS_PORT}..."
+    microsocks -p "$SOCKS_PORT" &
+    MICROSOCKS_PID=$!
+    sleep 1
+    if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
+        echo "[vpn] ERROR: microsocks failed to start"
+        return 1
+    fi
+    echo "[vpn] microsocks running (PID ${MICROSOCKS_PID})"
+    return 0
+}
 
-# Verify microsocks started
-sleep 1
-if ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
-    echo "[vpn] ERROR: microsocks failed to start"
+if ! start_microsocks; then
     exit 1
 fi
-echo "[vpn] microsocks running (PID ${MICROSOCKS_PID})"
 
 # ── Start TCP forward (if configured) ────────────────────────────────────
 if [ -n "$FORWARD_PORT" ] && [ -n "$FORWARD_TARGET" ]; then
@@ -92,6 +98,12 @@ MAX_BACKOFF=60
 MIN_CONNECTED_SECS=60
 
 while true; do
+    # Ensure microsocks is still alive (may have died during VPN cycling)
+    if [ -n "$MICROSOCKS_PID" ] && ! kill -0 "$MICROSOCKS_PID" 2>/dev/null; then
+        echo "[vpn] microsocks died, restarting..."
+        start_microsocks || echo "[vpn] WARNING: microsocks restart failed, continuing anyway"
+    fi
+
     if [ ! -f "$VPN_CONFIG" ]; then
         echo "[vpn] ERROR: VPN config not found at ${VPN_CONFIG}"
         echo "[vpn] Copy config.example to config and fill in your credentials."

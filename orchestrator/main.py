@@ -1042,6 +1042,7 @@ async def get_job_chat_history(
 async def list_repo_contents(
     job_id: str,
     path: str = Query(default="", description="Directory path within the repo"),
+    ref: str | None = Query(default=None, description="Branch, tag, or commit SHA"),
 ) -> list[dict[str, Any]]:
     """List directory contents of a job's Gitea repository.
 
@@ -1057,7 +1058,7 @@ async def list_repo_contents(
         )
 
     repo_name = f"job-{job_id}"
-    contents = await gitea_client.list_contents(repo_name, path)
+    contents = await gitea_client.list_contents(repo_name, path, ref=ref)
 
     if contents is None:
         raise HTTPException(
@@ -1072,6 +1073,7 @@ async def list_repo_contents(
 async def get_repo_file(
     job_id: str,
     path: str = Query(..., description="File path within the repo"),
+    ref: str | None = Query(default=None, description="Branch, tag, or commit SHA"),
 ) -> dict[str, Any]:
     """Get file content from a job's Gitea repository.
 
@@ -1085,7 +1087,7 @@ async def get_repo_file(
         )
 
     repo_name = f"job-{job_id}"
-    content = await gitea_client.get_file_content(repo_name, path)
+    content = await gitea_client.get_file_content(repo_name, path, ref=ref)
 
     if content is None:
         raise HTTPException(
@@ -1098,6 +1100,94 @@ async def get_repo_file(
         "content": content,
         "size": len(content),
     }
+
+
+@app.get("/api/jobs/{job_id}/repo/commits")
+async def list_repo_commits(
+    job_id: str,
+    sha: str = Query(default="main", description="Branch, tag, or commit SHA to list from"),
+    since_ref: str | None = Query(default=None, description="Only show commits after this ref"),
+    page: int = Query(default=1, ge=1, description="Page number"),
+    limit: int = Query(default=20, ge=1, le=100, description="Max commits per page"),
+) -> dict[str, Any]:
+    """List git commits for a job's repository.
+
+    If since_ref is provided, returns only commits between since_ref and sha
+    using git compare. Otherwise lists commits from sha.
+
+    Returns:
+        Dict with commits list and total count
+    """
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available")
+
+    repo_name = f"job-{job_id}"
+
+    if since_ref:
+        # Use compare to get commits between two refs
+        compare = await gitea_client.get_compare(repo_name, since_ref, sha)
+        if compare is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Could not compare {since_ref}...{sha} in repo for job '{job_id}'",
+            )
+        return compare
+    else:
+        commits = await gitea_client.get_commits(repo_name, sha=sha, page=page, limit=limit)
+        if commits is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No commits found in repo for job '{job_id}'",
+            )
+        return {"total_commits": len(commits), "commits": commits}
+
+
+@app.get("/api/jobs/{job_id}/repo/diff")
+async def get_repo_diff(
+    job_id: str,
+    base: str = Query(..., description="Base ref (commit SHA, tag, or branch)"),
+    head: str = Query(default="HEAD", description="Head ref"),
+) -> dict[str, str]:
+    """Get unified diff between two refs in a job's repository.
+
+    Returns:
+        Dict with base, head, and diff text
+    """
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available")
+
+    repo_name = f"job-{job_id}"
+    diff_text = await gitea_client.get_diff(repo_name, base, head)
+
+    if diff_text is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Could not get diff {base}...{head} in repo for job '{job_id}'",
+        )
+
+    return {"base": base, "head": head, "diff": diff_text}
+
+
+@app.get("/api/jobs/{job_id}/repo/tags")
+async def list_repo_tags(job_id: str) -> list[dict[str, Any]]:
+    """List tags in a job's repository.
+
+    Returns:
+        List of tags with name, sha, and message
+    """
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available")
+
+    repo_name = f"job-{job_id}"
+    tags = await gitea_client.get_tags(repo_name)
+
+    if tags is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No tags found in repo for job '{job_id}'",
+        )
+
+    return tags
 
 
 # =============================================================================
@@ -1116,24 +1206,27 @@ async def get_job_workspace(job_id: str) -> dict[str, Any]:
     return workspace_service.get_workspace_overview(job_id)
 
 
-@app.get("/api/jobs/{job_id}/workspace/{filename}")
-async def get_workspace_file(job_id: str, filename: str) -> dict[str, str]:
-    """Get content of a specific workspace file.
+@app.get("/api/jobs/{job_id}/workspace/{path:path}")
+async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
+    """Get content of a workspace file by relative path.
+
+    Supports any file within the job workspace, including subdirectories
+    (e.g., "archive/phase_1_retrospective.md"). Path is sandboxed.
 
     Args:
         job_id: Job UUID
-        filename: File name (workspace.md, plan.md, or todos.yaml)
+        path: Relative path within the workspace
 
     Returns:
-        Dict with file content
+        Dict with path and file content
     """
-    content = workspace_service.get_workspace_file(job_id, filename)
+    content = workspace_service.get_workspace_file(job_id, path)
     if content is None:
         raise HTTPException(
             status_code=404,
-            detail=f"File '{filename}' not found in workspace for job '{job_id}'",
+            detail=f"File '{path}' not found in workspace for job '{job_id}'",
         )
-    return {"filename": filename, "content": content}
+    return {"path": path, "content": content}
 
 
 @app.get("/api/jobs/{job_id}/todos")
@@ -1791,6 +1884,402 @@ async def get_stuck_jobs(
     """
     try:
         return await postgres_db.detect_stuck_jobs(threshold_minutes=threshold_minutes)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Citation & Source Library Endpoints
+# =============================================================================
+
+
+@app.get("/api/sources")
+async def list_sources(
+    job_id: str | None = Query(default=None, description="Filter by job ID"),
+    type: str | None = Query(default=None, description="Filter by source type"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List sources, optionally filtered by job and/or type.
+
+    When job_id is provided, returns sources linked to that job via job_sources.
+    When omitted, returns all sources across jobs.
+    """
+    try:
+        async with postgres_db.acquire() as conn:
+            conditions = []
+            params: list[Any] = []
+            idx = 1
+
+            if job_id:
+                conditions.append(f"s.id IN (SELECT source_id FROM job_sources WHERE job_id = ${idx}::uuid)")
+                params.append(job_id)
+                idx += 1
+            if type:
+                conditions.append(f"s.type::text = ${idx}")
+                params.append(type)
+                idx += 1
+
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+            # Count total
+            count_row = await conn.fetchrow(
+                f"SELECT COUNT(*) as total FROM sources s {where}", *params
+            )
+            total = count_row["total"] if count_row else 0
+
+            # Fetch sources
+            params.append(limit)
+            params.append(offset)
+            rows = await conn.fetch(
+                f"""SELECT s.id, s.type::text as type, s.identifier, s.name,
+                       s.version, s.content_hash,
+                       LEFT(s.content, 200) as content_preview,
+                       s.metadata, s.created_at
+                FROM sources s {where}
+                ORDER BY s.created_at DESC
+                LIMIT ${idx} OFFSET ${idx + 1}""",
+                *params,
+            )
+
+            sources = [dict(r) for r in rows]
+
+            # If querying across jobs, include job IDs for each source
+            if not job_id:
+                for src in sources:
+                    job_rows = await conn.fetch(
+                        "SELECT job_id FROM job_sources WHERE source_id = $1",
+                        src["id"],
+                    )
+                    src["job_ids"] = [str(r["job_id"]) for r in job_rows]
+
+            return {"sources": sources, "total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/sources/{source_id}")
+async def get_source_detail(
+    source_id: int,
+    content_limit: int = Query(default=2000, ge=0, le=100000),
+) -> dict[str, Any]:
+    """Get full detail for a single source."""
+    try:
+        async with postgres_db.acquire() as conn:
+            if content_limit > 0:
+                row = await conn.fetchrow(
+                    """SELECT id, type::text as type, identifier, name, version,
+                          LEFT(content, $2) as content, content_hash, metadata, created_at,
+                          LENGTH(content) as full_content_length
+                    FROM sources WHERE id = $1""",
+                    source_id, content_limit,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """SELECT id, type::text as type, identifier, name, version,
+                          content, content_hash, metadata, created_at,
+                          LENGTH(content) as full_content_length
+                    FROM sources WHERE id = $1""",
+                    source_id,
+                )
+
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
+
+            result = dict(row)
+            result["content_truncated"] = (
+                content_limit > 0 and result.get("full_content_length", 0) > content_limit
+            )
+
+            # Include linked job IDs
+            job_rows = await conn.fetch(
+                "SELECT job_id FROM job_sources WHERE source_id = $1", source_id
+            )
+            result["job_ids"] = [str(r["job_id"]) for r in job_rows]
+
+            return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/citations")
+async def list_job_citations(
+    job_id: str,
+    source_id: int | None = Query(default=None),
+    status: str | None = Query(default=None, description="Filter by verification_status"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List citations for a job with optional filters."""
+    try:
+        async with postgres_db.acquire() as conn:
+            conditions = ["c.job_id = $1::uuid"]
+            params: list[Any] = [job_id]
+            idx = 2
+
+            if source_id is not None:
+                conditions.append(f"c.source_id = ${idx}")
+                params.append(source_id)
+                idx += 1
+            if status:
+                conditions.append(f"c.verification_status::text = ${idx}")
+                params.append(status)
+                idx += 1
+
+            where = "WHERE " + " AND ".join(conditions)
+
+            count_row = await conn.fetchrow(
+                f"SELECT COUNT(*) as total FROM citations c {where}", *params
+            )
+            total = count_row["total"] if count_row else 0
+
+            params.append(limit)
+            params.append(offset)
+            rows = await conn.fetch(
+                f"""SELECT c.id, LEFT(c.claim, 200) as claim, c.source_id,
+                       s.name as source_name, s.type::text as source_type,
+                       c.verification_status::text as verification_status,
+                       c.confidence::text as confidence,
+                       c.extraction_method::text as extraction_method,
+                       c.similarity_score, c.created_at
+                FROM citations c
+                JOIN sources s ON c.source_id = s.id
+                {where}
+                ORDER BY c.created_at DESC
+                LIMIT ${idx} OFFSET ${idx + 1}""",
+                *params,
+            )
+
+            return {"citations": [dict(r) for r in rows], "total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/citations/{citation_id}")
+async def get_citation_detail(citation_id: int) -> dict[str, Any]:
+    """Get full citation record with source info and verification details."""
+    try:
+        async with postgres_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT c.id, c.job_id, c.claim, c.verbatim_quote, c.quote_context,
+                      c.quote_language, c.relevance_reasoning,
+                      c.confidence::text as confidence,
+                      c.extraction_method::text as extraction_method,
+                      c.source_id, s.name as source_name, s.type::text as source_type,
+                      s.identifier as source_identifier,
+                      c.locator, c.verification_status::text as verification_status,
+                      c.verification_notes, c.similarity_score, c.matched_location,
+                      c.created_at, c.created_by
+                FROM citations c
+                JOIN sources s ON c.source_id = s.id
+                WHERE c.id = $1""",
+                citation_id,
+            )
+
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Citation {citation_id} not found")
+
+            return dict(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/sources/{source_id}/annotations")
+async def get_source_annotations(
+    job_id: str,
+    source_id: int,
+    type: str | None = Query(default=None, description="Filter by annotation_type"),
+) -> list[dict[str, Any]]:
+    """Get annotations for a source within a job."""
+    try:
+        async with postgres_db.acquire() as conn:
+            if type:
+                rows = await conn.fetch(
+                    """SELECT id, annotation_type, content, page_reference, created_at, created_by
+                    FROM source_annotations
+                    WHERE source_id = $1 AND job_id = $2::uuid AND annotation_type = $3
+                    ORDER BY created_at""",
+                    source_id, job_id, type,
+                )
+            else:
+                rows = await conn.fetch(
+                    """SELECT id, annotation_type, content, page_reference, created_at, created_by
+                    FROM source_annotations
+                    WHERE source_id = $1 AND job_id = $2::uuid
+                    ORDER BY created_at""",
+                    source_id, job_id,
+                )
+
+            return [dict(r) for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/sources/{source_id}/tags")
+async def get_source_tags(job_id: str, source_id: int) -> list[str]:
+    """Get tags for a source within a job."""
+    try:
+        async with postgres_db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT tag FROM source_tags WHERE source_id = $1 AND job_id = $2::uuid ORDER BY tag",
+                source_id, job_id,
+            )
+            return [r["tag"] for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/citations/stats")
+async def get_citation_stats(job_id: str) -> dict[str, Any]:
+    """Get citation statistics for a job."""
+    try:
+        async with postgres_db.acquire() as conn:
+            # Sources by type
+            source_rows = await conn.fetch(
+                """SELECT s.type::text as type, COUNT(*) as count
+                FROM sources s
+                JOIN job_sources js ON s.id = js.source_id
+                WHERE js.job_id = $1::uuid
+                GROUP BY s.type""",
+                job_id,
+            )
+            sources_by_type = {r["type"]: r["count"] for r in source_rows}
+            total_sources = sum(sources_by_type.values())
+
+            # Citations by verification status
+            status_rows = await conn.fetch(
+                """SELECT verification_status::text as status, COUNT(*) as count
+                FROM citations WHERE job_id = $1::uuid
+                GROUP BY verification_status""",
+                job_id,
+            )
+            by_status = {r["status"]: r["count"] for r in status_rows}
+
+            # Citations by confidence
+            conf_rows = await conn.fetch(
+                """SELECT confidence::text as confidence, COUNT(*) as count
+                FROM citations WHERE job_id = $1::uuid
+                GROUP BY confidence""",
+                job_id,
+            )
+            by_confidence = {r["confidence"]: r["count"] for r in conf_rows}
+
+            # Citations by extraction method
+            method_rows = await conn.fetch(
+                """SELECT extraction_method::text as method, COUNT(*) as count
+                FROM citations WHERE job_id = $1::uuid
+                GROUP BY extraction_method""",
+                job_id,
+            )
+            by_method = {r["method"]: r["count"] for r in method_rows}
+
+            total_citations = sum(by_status.values())
+
+            return {
+                "job_id": job_id,
+                "total_sources": total_sources,
+                "sources_by_type": sources_by_type,
+                "total_citations": total_citations,
+                "citations_by_verification_status": by_status,
+                "citations_by_confidence": by_confidence,
+                "citations_by_extraction_method": by_method,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/sources/search")
+async def search_job_sources(
+    job_id: str,
+    query: str = Query(..., description="Search query"),
+    mode: str = Query(default="keyword", description="Search mode: keyword, semantic, hybrid"),
+    source_type: str | None = Query(default=None),
+    tags: str | None = Query(default=None, description="Comma-separated tags (AND logic)"),
+    top_k: int = Query(default=10, ge=1, le=50),
+) -> dict[str, Any]:
+    """Search a job's source library using keyword search.
+
+    Falls back to SQL keyword search. Semantic/hybrid modes require
+    the CitationEngine with pgvector.
+    """
+    try:
+        async with postgres_db.acquire() as conn:
+            # Build conditions for source filtering
+            conditions = ["js.job_id = $1::uuid"]
+            params: list[Any] = [job_id]
+            idx = 2
+
+            if source_type:
+                conditions.append(f"s.type::text = ${idx}")
+                params.append(source_type)
+                idx += 1
+
+            # Tag filtering: find sources that have ALL specified tags
+            if tags:
+                tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+                for tag in tag_list:
+                    conditions.append(
+                        f"EXISTS (SELECT 1 FROM source_tags st "
+                        f"WHERE st.source_id = s.id AND st.job_id = $1::uuid AND st.tag = ${idx})"
+                    )
+                    params.append(tag)
+                    idx += 1
+
+            where = "WHERE " + " AND ".join(conditions)
+
+            # Keyword search using PostgreSQL full-text search
+            params.append(query)
+            query_param_idx = idx
+            idx += 1
+            params.append(top_k)
+
+            rows = await conn.fetch(
+                f"""SELECT s.id, s.name, s.type::text as type, s.identifier,
+                       ts_rank(to_tsvector('simple', s.content),
+                               plainto_tsquery('simple', ${query_param_idx})) as rank,
+                       ts_headline('simple', s.content,
+                                   plainto_tsquery('simple', ${query_param_idx}),
+                                   'MaxFragments=2,MaxWords=60,MinWords=20') as snippet
+                FROM sources s
+                JOIN job_sources js ON s.id = js.source_id
+                {where}
+                  AND to_tsvector('simple', s.content) @@ plainto_tsquery('simple', ${query_param_idx})
+                ORDER BY rank DESC
+                LIMIT ${idx}""",
+                *params,
+            )
+
+            results = []
+            for r in rows:
+                rank = float(r["rank"]) if r["rank"] else 0.0
+                if rank > 0.1:
+                    evidence = "HIGH"
+                elif rank > 0.01:
+                    evidence = "MEDIUM"
+                else:
+                    evidence = "LOW"
+
+                results.append({
+                    "source_id": r["id"],
+                    "source_name": r["name"],
+                    "source_type": r["type"],
+                    "identifier": r["identifier"],
+                    "evidence_label": evidence,
+                    "rank": rank,
+                    "snippet": r["snippet"],
+                })
+
+            return {
+                "job_id": job_id,
+                "query": query,
+                "mode": "keyword",
+                "results": results,
+                "total": len(results),
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

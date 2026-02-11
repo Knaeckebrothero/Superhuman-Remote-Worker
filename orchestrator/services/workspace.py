@@ -294,26 +294,33 @@ class WorkspaceService:
         }
 
     def get_workspace_file(self, job_id: str, filename: str) -> str | None:
-        """Get content of a workspace file.
+        """Get content of a workspace file by relative path.
+
+        Supports any file within the job workspace directory, including
+        subdirectories (e.g., "archive/phase_1_retrospective.md").
+        Path is sandboxed — directory traversal is blocked.
 
         Args:
             job_id: Job UUID
-            filename: File name (e.g., "workspace.md", "plan.md")
+            filename: Relative path within workspace (e.g., "workspace.md",
+                      "plan.md", "archive/todos_phase_2.yaml")
 
         Returns:
-            File content as string, or None if not found
+            File content as string, or None if not found or access denied
         """
         job_path = self._get_job_path(job_id)
         if not job_path:
             return None
 
-        # Security: only allow specific files
-        allowed_files = {"workspace.md", "plan.md", "todos.yaml"}
-        if filename not in allowed_files:
+        # Security: resolve the path and verify it stays within the workspace
+        try:
+            file_path = (job_path / filename).resolve()
+            if not str(file_path).startswith(str(job_path.resolve())):
+                return None  # Directory traversal attempt
+        except (ValueError, OSError):
             return None
 
-        file_path = job_path / filename
-        if not file_path.exists():
+        if not file_path.exists() or not file_path.is_file():
             return None
 
         try:
