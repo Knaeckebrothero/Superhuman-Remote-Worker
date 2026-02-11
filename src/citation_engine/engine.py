@@ -2235,6 +2235,12 @@ Respond in JSON format."""
 
             self._embed_source_content(source_id, content, job_id, service)
         except Exception as e:
+            # Rollback to clear PostgreSQL's aborted transaction state,
+            # otherwise all subsequent queries on this connection will fail.
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
             log.warning(f"Auto-embed failed for source [{source_id}], skipping: {e}")
 
     def _embed_source_content(
