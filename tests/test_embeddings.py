@@ -218,6 +218,41 @@ class TestEmbeddingService:
         assert service._compute_batches([]) == []
 
     @patch("httpx.Client")
+    def test_embed_batch_truncates_oversized_text(self, MockClient):
+        """Text exceeding max_tokens_per_text is truncated before sending to API."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "data": [
+                {"embedding": [0.1, 0.2], "index": 0},
+                {"embedding": [0.3, 0.4], "index": 1},
+            ],
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = mock_response
+        MockClient.return_value = mock_client
+
+        service = EmbeddingService(
+            model="test-model", api_key="test", max_tokens_per_text=100
+        )
+        # ~10000 tokens estimated (30000 chars / 3), well above limit of 100
+        oversized = "a" * 30_000
+        original_texts = [oversized, "short"]
+        results = service.embed_batch(original_texts)
+
+        # Verify the API received truncated text (100 tokens * 3 = 300 chars)
+        call_args = mock_client.post.call_args
+        sent_texts = call_args.kwargs.get("json", call_args[1].get("json", {}))["input"]
+        assert len(sent_texts[0]) == 300  # truncated to max_tokens * 3
+        assert sent_texts[1] == "short"   # short text unchanged
+
+        # Original list not mutated
+        assert len(original_texts[0]) == 30_000
+
+    @patch("httpx.Client")
     def test_embed_batch_multi_batch(self, MockClient):
         """Multi-batch embedding makes multiple POST calls with correct result ordering."""
         # Responses for batch 1 (indices 0,1) and batch 2 (index 2)

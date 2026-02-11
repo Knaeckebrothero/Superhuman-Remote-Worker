@@ -109,9 +109,39 @@ class SemanticChunker:
         # Fallback: fixed-size splitting
         return self._fixed_chunk(text)
 
+    def _split_long_sentences(self, sentences: list[str]) -> list[str]:
+        """
+        Sub-split sentences that are too long for embedding windows.
+
+        A window of `window_size` sentences must fit within the embedding model's
+        token limit. If any single sentence exceeds its fair share, split it using
+        fixed-size chunking to keep all windows embeddable.
+        """
+        if not self._embedding_service:
+            return sentences
+
+        max_tokens = getattr(self._embedding_service, "max_tokens_per_text", 8191)
+        # Each sentence gets an equal share of the window's token budget
+        max_chars_per_sentence = (max_tokens * 3) // self.window_size
+
+        result = []
+        for sentence in sentences:
+            if len(sentence) > max_chars_per_sentence:
+                # Split oversized sentence into smaller pieces
+                sub_chunks = self._fixed_chunk(
+                    sentence,
+                    chunk_size=max_chars_per_sentence,
+                    overlap=64,
+                )
+                result.extend(sub_chunks)
+            else:
+                result.append(sentence)
+        return result
+
     def _semantic_chunk(self, text: str) -> list[str]:
         """Chunk using embedding similarity between sentence windows."""
         sentences = _split_sentences(text)
+        sentences = self._split_long_sentences(sentences)
 
         if len(sentences) <= self.window_size:
             return self._fixed_chunk(text)
