@@ -2193,20 +2193,29 @@ Respond in JSON format."""
                 f"model '{service.model}' needs vector({expected_dim}). Auto-migrating..."
             )
 
-            # Drop HNSW index, clear stale embeddings, alter column, recreate index
+            # Drop HNSW index, clear stale embeddings, alter column
             self._cursor.execute("DROP INDEX IF EXISTS idx_source_embeddings_vector")
             self._cursor.execute("DELETE FROM source_embeddings WHERE embedding IS NOT NULL")
             self._cursor.execute(
                 f"ALTER TABLE source_embeddings "
                 f"ALTER COLUMN embedding TYPE vector({expected_dim})"
             )
-            self._cursor.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector "
-                f"ON source_embeddings USING hnsw (embedding vector_cosine_ops) "
-                f"WITH (m = 16, ef_construction = 64)"
-            )
             self._conn.commit()
-            log.info(f"Vector column migrated from {current_dim} to {expected_dim} dimensions")
+
+            # Recreate HNSW index only if within pgvector's 2000-dim limit
+            if expected_dim <= 2000:
+                self._cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector "
+                    "ON source_embeddings USING hnsw (embedding vector_cosine_ops) "
+                    "WITH (m = 16, ef_construction = 64)"
+                )
+                self._conn.commit()
+                log.info(f"Vector column migrated to {expected_dim} dimensions (with HNSW index)")
+            else:
+                log.info(
+                    f"Vector column migrated to {expected_dim} dimensions "
+                    f"(no HNSW index — exceeds 2000-dim limit, sequential scan will be used)"
+                )
 
         except Exception as e:
             self._conn.rollback()
