@@ -41,7 +41,7 @@ def _get_uploads_dir() -> Path:
     env_path = os.getenv("WORKSPACE_PATH")
     if env_path:
         return Path(env_path) / "uploads"
-    return Path(__file__).parent.parent / "workspace" / "uploads"
+    return Path(__file__).resolve().parent.parent / "workspace" / "uploads"
 
 
 UPLOADS_DIR = _get_uploads_dir()

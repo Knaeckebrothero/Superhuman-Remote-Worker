@@ -108,7 +108,7 @@ while true; do
     # Run openfortivpn in foreground; it exits when the tunnel drops
     openfortivpn -c "$VPN_CONFIG" &
     VPN_PID=$!
-    wait "$VPN_PID"
+    wait "$VPN_PID" || true
     VPN_EXIT=$?
     VPN_PID=""
 
