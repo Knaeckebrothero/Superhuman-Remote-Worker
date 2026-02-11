@@ -114,7 +114,7 @@ class SemanticChunker:
         sentences = _split_sentences(text)
 
         if len(sentences) <= self.window_size:
-            return [text.strip()]
+            return self._fixed_chunk(text)
 
         # Create overlapping windows
         windows = []
