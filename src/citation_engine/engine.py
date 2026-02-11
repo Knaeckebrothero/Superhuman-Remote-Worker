@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -146,6 +147,7 @@ class CitationEngine:
         # Embedding service (lazy init, optional)
         self._embedding_service = None
         self._chunker = None
+        self._vector_dimension_checked = False
 
         log.info(
             f"CitationEngine initialized: mode={mode}, "
@@ -2157,6 +2159,59 @@ Respond in JSON format."""
 
         return self._chunker
 
+    def _ensure_vector_dimension(self, service) -> None:
+        """Ensure pgvector column dimension matches the embedding model. Auto-migrates if needed."""
+        if self._vector_dimension_checked or self._db_type != "postgresql":
+            self._vector_dimension_checked = True
+            return
+
+        self._vector_dimension_checked = True
+        expected_dim = service.dimension
+
+        try:
+            self._cursor.execute(
+                "SELECT format_type(atttypid, atttypmod) "
+                "FROM pg_attribute "
+                "WHERE attrelid = 'source_embeddings'::regclass "
+                "AND attname = 'embedding'"
+            )
+            row = self._cursor.fetchone()
+            if not row:
+                return
+
+            col_type = row[0] if isinstance(row, (tuple, list)) else row.get("format_type", "")
+            match = re.search(r"vector\((\d+)\)", col_type)
+            if not match:
+                return  # Untyped vector column, no constraint to fix
+
+            current_dim = int(match.group(1))
+            if current_dim == expected_dim:
+                return
+
+            log.warning(
+                f"Vector column dimension mismatch: DB has vector({current_dim}), "
+                f"model '{service.model}' needs vector({expected_dim}). Auto-migrating..."
+            )
+
+            # Drop HNSW index, clear stale embeddings, alter column, recreate index
+            self._cursor.execute("DROP INDEX IF EXISTS idx_source_embeddings_vector")
+            self._cursor.execute("DELETE FROM source_embeddings WHERE embedding IS NOT NULL")
+            self._cursor.execute(
+                f"ALTER TABLE source_embeddings "
+                f"ALTER COLUMN embedding TYPE vector({expected_dim})"
+            )
+            self._cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector "
+                f"ON source_embeddings USING hnsw (embedding vector_cosine_ops) "
+                f"WITH (m = 16, ef_construction = 64)"
+            )
+            self._conn.commit()
+            log.info(f"Vector column migrated from {current_dim} to {expected_dim} dimensions")
+
+        except Exception as e:
+            self._conn.rollback()
+            log.warning(f"Failed to check/migrate vector dimension: {e}")
+
     def _auto_embed_source(self, source_id: int, content: str, job_id: str) -> None:
         """Auto-embed source content after registration. Silently skips on failure."""
         if self._db_type == "sqlite":
@@ -2205,6 +2260,9 @@ Respond in JSON format."""
             service = self._get_embedding_service()
             if not service:
                 raise RuntimeError("Embedding service not available")
+
+        # Ensure DB vector column matches the embedding model dimension
+        self._ensure_vector_dimension(service)
 
         chunker = self._get_chunker()
         chunks = chunker.chunk(content)
