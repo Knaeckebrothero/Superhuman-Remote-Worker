@@ -60,6 +60,9 @@ class EmbeddingService:
         model: str | None = None,
         api_url: str | None = None,
         api_key: str | None = None,
+        max_tokens_per_batch: int = 250_000,
+        max_texts_per_batch: int = 2048,
+        timeout: float = 60.0,
     ):
         self.model = model or os.getenv(
             "CITATION_EMBEDDING_MODEL", "text-embedding-3-small"
@@ -85,6 +88,10 @@ class EmbeddingService:
                 "Set CITATION_EMBEDDING_KEY or OPENAI_API_KEY, "
                 "or set CITATION_EMBEDDING_URL to a local endpoint."
             )
+
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.max_texts_per_batch = max_texts_per_batch
+        self.timeout = timeout
 
         self._dimension: int | None = _KNOWN_DIMENSIONS.get(self.model)
         log.info(
@@ -134,9 +141,91 @@ class EmbeddingService:
         results = self.embed_batch([text])
         return results[0]
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Estimate token count from text length (chars / 3, conservative)."""
+        return max(1, len(text) // 3)
+
+    def _compute_batches(self, texts: list[str]) -> list[list[int]]:
+        """
+        Partition text indices into sub-batches respecting token and count limits.
+
+        Returns:
+            List of index groups, e.g. [[0,1,2], [3,4]] for two batches.
+        """
+        if not texts:
+            return []
+
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_tokens = 0
+
+        for i, text in enumerate(texts):
+            tokens = self._estimate_tokens(text)
+
+            # Start new batch if adding this text would exceed limits
+            if current_batch and (
+                current_tokens + tokens > self.max_tokens_per_batch
+                or len(current_batch) >= self.max_texts_per_batch
+            ):
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+
+            current_batch.append(i)
+            current_tokens += tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
+
+    def _embed_single_batch(
+        self,
+        texts: list[str],
+        client: "httpx.Client",
+        url: str,
+        headers: dict[str, str],
+    ) -> list[list[float]]:
+        """
+        Send a single embedding API request for a batch of texts.
+
+        Returns:
+            List of embedding vectors in input order.
+        """
+        import httpx
+
+        payload = {
+            "model": self.model,
+            "input": texts,
+        }
+
+        try:
+            response = client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as e:
+            raise EmbeddingServiceError(
+                f"Embedding API returned {e.response.status_code}: {e.response.text[:500]}"
+            ) from e
+        except httpx.RequestError as e:
+            raise EmbeddingServiceError(
+                f"Embedding API request failed: {e}"
+            ) from e
+
+        embeddings_data = data.get("data", [])
+        if len(embeddings_data) != len(texts):
+            raise EmbeddingServiceError(
+                f"Expected {len(texts)} embeddings, got {len(embeddings_data)}"
+            )
+
+        # Sort by index to ensure correct order
+        embeddings_data.sort(key=lambda x: x.get("index", 0))
+        return [item["embedding"] for item in embeddings_data]
+
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """
-        Embed multiple text strings in a single API call.
+        Embed multiple text strings, automatically batching to stay within API limits.
 
         Args:
             texts: List of texts to embed
@@ -163,45 +252,28 @@ class EmbeddingService:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        payload = {
-            "model": self.model,
-            "input": texts,
-        }
+        batches = self._compute_batches(texts)
+        log.debug(
+            f"Embedding {len(texts)} text(s) in {len(batches)} batch(es) via {url}"
+        )
 
-        log.debug(f"Embedding {len(texts)} text(s) via {url}")
+        results: list[list[float] | None] = [None] * len(texts)
 
-        try:
-            with httpx.Client(timeout=60.0) as client:
-                response = client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise EmbeddingServiceError(
-                f"Embedding API returned {e.response.status_code}: {e.response.text[:500]}"
-            ) from e
-        except httpx.RequestError as e:
-            raise EmbeddingServiceError(
-                f"Embedding API request failed: {e}"
-            ) from e
-
-        # Parse OpenAI-compatible response format:
-        # {"data": [{"embedding": [...], "index": 0}, ...], "model": "...", "usage": {...}}
-        embeddings_data = data.get("data", [])
-        if len(embeddings_data) != len(texts):
-            raise EmbeddingServiceError(
-                f"Expected {len(texts)} embeddings, got {len(embeddings_data)}"
-            )
-
-        # Sort by index to ensure correct order
-        embeddings_data.sort(key=lambda x: x.get("index", 0))
-        results = [item["embedding"] for item in embeddings_data]
+        with httpx.Client(timeout=self.timeout) as client:
+            for batch_indices in batches:
+                batch_texts = [texts[i] for i in batch_indices]
+                batch_results = self._embed_single_batch(
+                    batch_texts, client, url, headers
+                )
+                for idx, embedding in zip(batch_indices, batch_results):
+                    results[idx] = embedding
 
         # Cache dimension from first result
         if self._dimension is None and results:
             self._dimension = len(results[0])
             log.debug(f"Learned embedding dimension: {self._dimension}")
 
-        return results
+        return results  # type: ignore[return-value]
 
     @property
     def is_configured(self) -> bool:
