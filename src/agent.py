@@ -326,17 +326,6 @@ class UniversalAgent:
                     frozen_path.unlink()
                     logger.info("Removed job_frozen.json to allow continuation")
 
-                    # Inject feedback if provided
-                    if feedback:
-                        feedback_section = (
-                            f"\n\n## Human Feedback on Resume\n\n"
-                            f"The job was previously frozen for review. "
-                            f"A human operator has provided the following feedback:\n\n"
-                            f"{feedback}\n"
-                        )
-                        self._workspace_manager.append_file("instructions.md", feedback_section)
-                        logger.info("Injected human feedback into instructions.md")
-
                     # Update database status back to processing
                     if self.postgres_conn:
                         try:
@@ -492,6 +481,21 @@ class UniversalAgent:
                     workspace_path=str(self._workspace_manager.path),
                     metadata=updated_metadata,
                 )
+
+            # Inject feedback into graph state via aupdate_state
+            # This sets resume_feedback so route_entry routes to restore_from_feedback
+            if resume and feedback and graph_input is None:
+                await self._graph.aupdate_state(
+                    thread_config,
+                    {
+                        "resume_feedback": feedback,
+                        "should_stop": False,
+                        "goal_achieved": False,
+                        "is_final_phase": False,
+                    },
+                    as_node="__start__",
+                )
+                logger.info("Injected feedback into graph state via aupdate_state")
 
             if stream:
                 # For streaming, cleanup happens inside the generator
@@ -775,6 +779,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 instructions = load_instructions(self.config)
                 self._workspace_manager.write_file("instructions.md", instructions)
                 logger.debug("Wrote missing instructions.md to workspace")
+
+            # Initialize git manager if git versioning is enabled (safe on existing repos)
+            if self._workspace_manager.config.git_versioning and self._workspace_manager.git_manager is None:
+                self._workspace_manager._initialize_git()
+                self._workspace_manager._initialized = True
 
             # Ensure git remote is configured for workspace delivery
             if metadata.get("git_remote_url") and self._workspace_manager.git_manager:

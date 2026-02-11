@@ -1,0 +1,101 @@
+# Strategic todos for resuming a frozen job with human feedback.
+# These todos guide the agent through processing feedback, evaluating
+# outputs, adapting the plan, and creating corrective todos.
+#
+# This template is used when a frozen job is resumed with --feedback.
+# The agent should NOT call job_complete during this phase — it must
+# first process the feedback and create corrective tactical todos.
+todos:
+  - id: 1
+    content: >-
+      PROCESS FEEDBACK: Read and categorize the human feedback.
+
+      Steps:
+      (1) Read the feedback message in this conversation (injected above as a HumanMessage).
+      (2) Read feedback.md for the persisted copy of the feedback.
+      (3) Re-read instructions.md for the original task requirements.
+      (4) Categorize each feedback item as: content issue, structural issue, missing
+          deliverable, quality concern, or factual error.
+
+      Update workspace.md with a "## Feedback Summary" section containing:
+      - Each categorized feedback item (one bullet per item)
+      - Severity assessment (critical / important / minor) for each
+      - Which output file(s) each item affects
+
+      COMPLETION CRITERIA: workspace.md updated with "## Feedback Summary" section
+      that categorizes all feedback items with severity and affected files.
+
+      ANTI-PATTERNS:
+      - Do NOT start modifying output files yet. This todo is analysis only.
+      - Do NOT dismiss or downplay feedback items — treat them all as actionable.
+
+  - id: 2
+    content: >-
+      EVALUATE OUTPUTS: Check existing output files against the feedback.
+
+      Steps:
+      (1) Use list_files on output/ to see all deliverables from the previous run.
+      (2) For each file mentioned in the feedback, use read_file to examine the
+          relevant sections.
+      (3) Assess the severity of each issue per file — how much rework is needed?
+
+      Update workspace.md "## Feedback Summary" with evaluation results:
+      - Which files need minor edits vs major rework vs complete rewrite
+      - Specific sections or content that must change
+      - Any feedback items that are already addressed (explain why)
+
+      COMPLETION CRITERIA: Each feedback item has been checked against actual
+      output files, with specific assessment of what needs to change.
+
+      ANTI-PATTERNS:
+      - Do NOT assume outputs match your memory — re-read the actual files.
+      - Do NOT skip files that seem fine — verify against the feedback.
+
+  - id: 3
+    content: >-
+      ADAPT PLAN: Rewrite plan.md with corrective phases.
+
+      Based on the feedback evaluation, create a new plan that:
+      (1) Lists completed phases from the previous run (for context).
+      (2) Creates corrective phases ordered by feedback severity (critical first).
+      (3) Each corrective phase targets specific feedback items and files.
+      (4) Estimates todo count per phase (target 5 todos per phase).
+
+      REWRITE plan.md — do not append. The old plan is no longer relevant.
+
+      COMPLETION CRITERIA: plan.md rewritten with corrective phases that
+      trace back to specific feedback items. Every feedback item must be
+      addressed by at least one phase.
+
+      ANTI-PATTERNS:
+      - Do NOT keep the old plan intact — rewrite it to focus on corrections.
+      - Do NOT add phases for tasks unrelated to the feedback.
+      - Do NOT plan "cleanup" or "packaging" phases — the system handles delivery.
+
+  - id: 4
+    content: >-
+      CREATE CORRECTIVE TODOS: Call next_phase_todos with the first corrective phase.
+
+      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+
+      Create todos that:
+      - Target specific feedback items from the "## Feedback Summary" in workspace.md
+      - Name exact files, sections, and changes needed
+      - Are completable in 1-3 tool calls each
+      - Include a verification todo that checks the corrected output against
+        the original feedback
+
+      Target 5 todos for the first corrective phase.
+
+      CRITICAL: Do NOT call job_complete in this phase. You have not yet made
+      the corrections — you are only planning them. job_complete should only be
+      called after all corrective phases have been executed and verified.
+
+      COMPLETION CRITERIA: next_phase_todos called with ~5 corrective todos
+      that trace to specific feedback items.
+
+      ANTI-PATTERNS:
+      - Do NOT call job_complete — corrections have not been made yet.
+      - Do NOT skip reading todo_guide.md — the tool enforces this.
+      - Do NOT create vague todos — each must reference specific feedback and files.
+      - Do NOT create todos for archiving, cleanup, or meta-tasks.

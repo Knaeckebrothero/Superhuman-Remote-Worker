@@ -134,7 +134,7 @@ type StatusFilter = 'all' | JobStatus;
                         Review
                       </button>
                     }
-                    @if (job.status !== 'completed' && job.status !== 'cancelled') {
+                    @if (job.status !== 'completed') {
                       <button
                         class="action-btn resume"
                         (click)="resumeJob(job.id); $event.stopPropagation()"

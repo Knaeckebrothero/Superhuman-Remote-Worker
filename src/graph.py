@@ -74,6 +74,7 @@ from .core.phase import (
     handle_phase_transition,
     get_initial_strategic_todos,
     get_transition_strategic_todos,
+    get_resume_strategic_todos,
 )
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .llm.exceptions import ContextOverflowError
@@ -1263,12 +1264,15 @@ def route_after_check_todos(state: UniversalAgentState) -> Literal["execute", "a
     return "execute"
 
 
-def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "restore_todo_state"]:
+def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "restore_todo_state", "restore_from_feedback"]:
     """Route at entry based on initialization state.
 
+    If resuming with feedback, route to feedback processing node.
     If already initialized (resume), restore todo state then go to execute.
     Otherwise, start initialization flow.
     """
+    if state.get("resume_feedback"):
+        return "restore_from_feedback"
     if state.get("initialized", False):
         return "restore_todo_state"
     return "init_workspace"
@@ -1319,6 +1323,143 @@ def create_restore_todo_state_node(
         return {}
 
     return restore_todo_state
+
+
+def create_restore_from_feedback_node(
+    workspace: WorkspaceManager,
+    todo_manager: TodoManager,
+    config: AgentConfig,
+    context_mgr: ContextManager,
+    summarization_llm: BaseChatModel,
+    summarization_prompt: str,
+) -> Callable[[UniversalAgentState], Dict[str, Any]]:
+    """Create node that handles resume-from-feedback flow.
+
+    This node is executed when a frozen job is resumed with --feedback.
+    It:
+    1. Force-compacts old conversation context
+    2. Writes feedback.md to workspace for persistence
+    3. Injects feedback as a HumanMessage
+    4. Loads resume-specific strategic todos
+    5. Clears is_final_phase / should_stop / goal_achieved flags
+
+    Args:
+        workspace: WorkspaceManager for file operations
+        todo_manager: TodoManager instance to load resume todos into
+        config: Agent configuration
+        context_mgr: ContextManager for force compaction
+        summarization_llm: LLM for context summarization
+        summarization_prompt: Prompt template for summarization
+
+    Returns:
+        Async node function for the feedback resume flow
+    """
+
+    async def restore_from_feedback(state: UniversalAgentState) -> Dict[str, Any]:
+        """Process feedback resume: compact context, inject feedback, load resume todos."""
+        job_id = state.get("job_id", "unknown")
+        feedback = state.get("resume_feedback", "")
+        messages = state.get("messages", [])
+
+        logger.info(f"[{job_id}] Restoring from feedback resume ({len(feedback)} chars)")
+
+        # Step 1: Force-compact old conversation context
+        # This gives the agent a "fresh start" with just a summary of prior work
+        oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+        compacted_messages = await context_mgr.ensure_within_limits(
+            messages,
+            summarization_llm,
+            summarization_prompt,
+            oss_reasoning_level=oss_reasoning_level,
+            max_summary_length=config.context_management.max_summary_length,
+            force=True,
+        )
+
+        # Separate RemoveMessage markers from actual messages
+        remove_markers = [m for m in compacted_messages if isinstance(m, RemoveMessage)]
+        actual_messages = [m for m in compacted_messages if not isinstance(m, RemoveMessage)]
+
+        if remove_markers:
+            logger.info(
+                f"[{job_id}] Compacted context for feedback resume: "
+                f"{len(messages)} -> {len(actual_messages)} messages "
+                f"(removing {len(remove_markers)} old messages)"
+            )
+
+        # Step 2: Write feedback.md to workspace for persistence across context compaction
+        feedback_content = (
+            f"# Human Feedback\n\n"
+            f"Received when resuming frozen job.\n\n"
+            f"## Feedback\n\n"
+            f"{feedback}\n"
+        )
+        workspace.write_file("feedback.md", feedback_content)
+        logger.info(f"[{job_id}] Wrote feedback.md to workspace")
+
+        # Step 3: Create HumanMessage with formatted feedback
+        feedback_message = HumanMessage(
+            content=(
+                f"[FEEDBACK_RESUME] This job was previously frozen for human review. "
+                f"The human operator has provided feedback and resumed the job.\n\n"
+                f"## Human Feedback\n\n{feedback}\n\n"
+                f"The feedback has been saved to feedback.md for reference. "
+                f"Process the feedback using the strategic todos below, then create "
+                f"corrective tactical todos to address each feedback item."
+            )
+        )
+
+        # Step 4: Load resume-specific strategic todos
+        resume_todos = get_resume_strategic_todos(config)
+        todo_list = [todo.to_dict() for todo in resume_todos]
+        todo_manager.set_todos_from_list(todo_list)
+        todo_manager.is_strategic_phase = True
+        todo_manager.phase_number = state.get("phase_number", 0)
+
+        # Export todo state for checkpointing
+        todo_state = todo_manager.export_state()
+
+        logger.info(
+            f"[{job_id}] Loaded {len(resume_todos)} resume strategic todos"
+        )
+
+        # Audit the feedback resume
+        auditor = get_archiver()
+        if auditor:
+            auditor.audit_step(
+                job_id=job_id,
+                agent_type=config.agent_id,
+                step_type="feedback_resume",
+                node_name="restore_from_feedback",
+                iteration=state.get("iteration", 0),
+                data={
+                    "feedback_length": len(feedback),
+                    "resume_todos": len(resume_todos),
+                    "messages_before": len(messages),
+                    "messages_after": len(actual_messages),
+                },
+                metadata=state.get("metadata"),
+                phase="strategic",
+                phase_number=state.get("phase_number", 0),
+            )
+
+        # Step 5: Return state updates
+        # Include remove markers + compacted messages + feedback message
+        result_messages = remove_markers + actual_messages + [feedback_message]
+
+        return {
+            "messages": result_messages,
+            "resume_feedback": None,  # Clear — consumed
+            "is_final_phase": False,
+            "should_stop": False,
+            "goal_achieved": False,
+            "is_strategic_phase": True,
+            "phase_complete": False,
+            "todos": todo_state["todos"],
+            "staged_todos": todo_state["staged_todos"],
+            "todo_next_id": todo_state["next_id"],
+        }
+
+    return restore_from_feedback
 
 
 def create_route_after_transition(
@@ -1555,6 +1696,10 @@ def build_phase_alternation_graph(
     init_workspace = create_init_workspace_node(memory_manager, workspace_template, config)
     init_strategic_todos = create_init_strategic_todos_node(workspace, todo_manager, config)
     restore_todo_state = create_restore_todo_state_node(todo_manager)
+    restore_from_feedback = create_restore_from_feedback_node(
+        workspace, todo_manager, config,
+        context_mgr, llm_for_summarization, summarization_prompt,
+    )
 
     execute = create_execute_node(
         strategic_llm_with_tools=strategic_llm_with_tools,
@@ -1590,6 +1735,7 @@ def build_phase_alternation_graph(
     workflow.add_node("init_workspace", init_workspace)
     workflow.add_node("init_strategic_todos", init_strategic_todos)
     workflow.add_node("restore_todo_state", restore_todo_state)
+    workflow.add_node("restore_from_feedback", restore_from_feedback)
     workflow.add_node("execute", execute)
     workflow.add_node("tools", tool_node)
     workflow.add_node("check_todos", check_todos)
@@ -1605,6 +1751,7 @@ def build_phase_alternation_graph(
         {
             "init_workspace": "init_workspace",
             "restore_todo_state": "restore_todo_state",
+            "restore_from_feedback": "restore_from_feedback",
         },
     )
 
@@ -1614,6 +1761,9 @@ def build_phase_alternation_graph(
 
     # Wire resume path: restore_todo_state -> execute
     workflow.add_edge("restore_todo_state", "execute")
+
+    # Wire feedback resume path: restore_from_feedback -> execute
+    workflow.add_edge("restore_from_feedback", "execute")
 
     # Wire ReAct loop
     workflow.add_conditional_edges(

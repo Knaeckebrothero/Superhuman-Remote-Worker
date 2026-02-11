@@ -116,6 +116,11 @@ class UniversalAgentState(TypedDict):
     staged_todos: Optional[List[Dict[str, Any]]]
     todo_next_id: Optional[int]
 
+    # Resume from feedback
+    # Set via aupdate_state when resuming a frozen job with --feedback
+    # Consumed by restore_from_feedback node, then cleared
+    resume_feedback: Optional[str]
+
 
 def create_initial_state(
     job_id: str,
@@ -187,4 +192,7 @@ def create_initial_state(
         todos=None,
         staged_todos=None,
         todo_next_id=1,
+
+        # Resume from feedback
+        resume_feedback=None,
     )

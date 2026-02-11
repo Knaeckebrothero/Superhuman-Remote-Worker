@@ -186,6 +186,74 @@ def get_transition_strategic_todos(
     ]
 
 
+def get_resume_strategic_todos(
+    config: Optional["AgentConfig"] = None,
+) -> List[PredefinedTodo]:
+    """Get todos for the resume-from-feedback strategic phase.
+
+    These todos guide the agent through processing human feedback,
+    evaluating outputs, adapting the plan, and creating corrective todos.
+
+    Loads from strategic_todos_resume.yaml template with deployment override support.
+    Falls back to hardcoded defaults if template not found.
+
+    Args:
+        config: Agent configuration for deployment directory. If None, uses
+               framework defaults only.
+
+    Returns:
+        List of PredefinedTodo items for feedback-driven resume
+    """
+    from ..core.loader import get_resume_strategic_todos_from_config
+
+    # Try to load from template
+    todo_list = get_resume_strategic_todos_from_config(config)
+
+    if todo_list:
+        # Convert from TodoManager format to PredefinedTodo
+        return [
+            PredefinedTodo(
+                id=int(t["id"].replace("todo_", "")),
+                content=t["content"],
+            )
+            for t in todo_list
+        ]
+
+    # Fallback to hardcoded defaults (for backward compatibility)
+    logger.warning("Using hardcoded resume strategic todos (template not found)")
+    return [
+        PredefinedTodo(
+            id=1,
+            content=(
+                "Process the human feedback: read the feedback message and feedback.md, "
+                "categorize each item, and update workspace.md with a feedback summary."
+            ),
+        ),
+        PredefinedTodo(
+            id=2,
+            content=(
+                "Evaluate existing output files against the feedback. "
+                "Check which files need minor edits, major rework, or rewrite."
+            ),
+        ),
+        PredefinedTodo(
+            id=3,
+            content=(
+                "Rewrite plan.md with corrective phases ordered by feedback severity. "
+                "Each phase must trace to specific feedback items."
+            ),
+        ),
+        PredefinedTodo(
+            id=4,
+            content=(
+                "Create corrective todos using next_phase_todos. Each todo must "
+                "reference specific feedback items and files. Do NOT call job_complete "
+                "— corrections have not been made yet."
+            ),
+        ),
+    ]
+
+
 # =============================================================================
 # todos.yaml Schema and Validation
 # =============================================================================

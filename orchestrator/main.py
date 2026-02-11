@@ -527,14 +527,35 @@ async def cancel_job(job_id: str) -> dict[str, str]:
     If the job is assigned to an agent, this will also send a cancel request
     to the agent pod.
     """
+    import httpx
+
     try:
         # First get the job to check if it's assigned to an agent
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        # TODO: If job is assigned to an agent, send cancel request to agent pod
-        # For now, just update the database status
+        # If job is assigned to an agent, send cancel request to agent pod
+        assigned_agent_id = job.get("assigned_agent_id")
+        if assigned_agent_id:
+            agent = await postgres_db.get_agent(str(assigned_agent_id))
+            if agent and agent.get("pod_ip") and agent["status"] not in ("offline",):
+                agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/cancel"
+                try:
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        response = await client.post(
+                            agent_url,
+                            json={"reason": "Cancelled via cockpit"},
+                        )
+                        if response.status_code == 200:
+                            logger.info(f"Agent confirmed cancel for job {job_id}")
+                        else:
+                            logger.warning(
+                                f"Agent cancel returned {response.status_code}: {response.text}"
+                            )
+                except Exception as e:
+                    # Agent might be unreachable — still cancel in DB
+                    logger.warning(f"Could not reach agent to cancel job {job_id}: {e}")
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
@@ -581,9 +602,10 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        # Allow resuming jobs in any status except completed/cancelled
-        # This handles cases where agents disappear without marking jobs as failed
-        if job["status"] in ("completed", "cancelled"):
+        # Allow resuming jobs in any status except completed
+        # This handles cancelled jobs (user wants to retry) and cases where
+        # agents disappear without marking jobs as failed
+        if job["status"] == "completed":
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be resumed (status: {job['status']}).",
