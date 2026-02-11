@@ -377,6 +377,7 @@ class UniversalAgent:
                 summarization_llm=self._summarization_llm,
                 snapshot_manager=snapshot_manager,
                 tool_context=self._tool_context,
+                postgres_db=self.postgres_conn,
             )
 
             # Execute graph

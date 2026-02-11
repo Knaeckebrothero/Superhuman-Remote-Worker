@@ -958,6 +958,7 @@ def create_handle_transition_node(
     config: AgentConfig,
     min_todos: int = 5,
     max_todos: int = 20,
+    postgres_db: Optional[Any] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the handle_transition node.
 
@@ -992,6 +993,7 @@ def create_handle_transition_node(
             min_todos=min_todos,
             max_todos=max_todos,
             config=config,
+            postgres_db=postgres_db,
         )
 
         # Audit transition attempt
@@ -1470,6 +1472,7 @@ def build_phase_alternation_graph(
     summarization_llm: Optional[BaseChatModel] = None,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     tool_context: Optional[ToolContext] = None,
+    postgres_db: Optional[Any] = None,
     # Backwards compatibility
     llm_with_tools: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
@@ -1577,6 +1580,7 @@ def build_phase_alternation_graph(
         workspace, todo_manager, config,
         min_todos=config.phase_settings.min_todos,
         max_todos=config.phase_settings.max_todos,
+        postgres_db=postgres_db,
     )
 
     check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)

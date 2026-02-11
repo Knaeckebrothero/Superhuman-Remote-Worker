@@ -97,6 +97,8 @@ def setup_logging():
         "httpcore.http11",
         "openai",
         "openai._base_client",
+        "groq",
+        "groq._base_client",
         "pymongo",
         "pymongo.command",
         "pymongo.connection",
