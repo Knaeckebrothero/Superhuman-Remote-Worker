@@ -62,6 +62,7 @@ class EmbeddingService:
         api_key: str | None = None,
         max_tokens_per_batch: int = 250_000,
         max_texts_per_batch: int = 2048,
+        max_tokens_per_text: int = 8191,
         timeout: float = 60.0,
     ):
         self.model = model or os.getenv(
@@ -91,6 +92,7 @@ class EmbeddingService:
 
         self.max_tokens_per_batch = max_tokens_per_batch
         self.max_texts_per_batch = max_texts_per_batch
+        self.max_tokens_per_text = max_tokens_per_text
         self.timeout = timeout
 
         self._dimension: int | None = _KNOWN_DIMENSIONS.get(self.model)
@@ -251,6 +253,21 @@ class EmbeddingService:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+
+        # Truncate texts that exceed per-text token limit
+        if self.max_tokens_per_text:
+            max_chars = self.max_tokens_per_text * 3  # inverse of _estimate_tokens
+            truncated = False
+            for i, text in enumerate(texts):
+                if self._estimate_tokens(text) > self.max_tokens_per_text:
+                    if not truncated:
+                        texts = list(texts)  # copy on first mutation
+                        truncated = True
+                    log.warning(
+                        f"Text {i} exceeds embedding token limit "
+                        f"(~{self._estimate_tokens(text)} > {self.max_tokens_per_text}), truncating"
+                    )
+                    texts[i] = text[:max_chars]
 
         batches = self._compute_batches(texts)
         log.debug(
