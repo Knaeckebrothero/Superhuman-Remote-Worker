@@ -22,9 +22,10 @@ export class RequestService {
 
   readonly tokenSummary = computed(() => {
     const req = this.request();
-    if (!req?.metrics?.token_usage) return null;
+    const usage = req?.metrics?.token_usage;
+    // Empty object {} from API means no token data was returned
+    if (!usage || Object.keys(usage).length === 0) return null;
 
-    const usage = req.metrics.token_usage;
     return {
       prompt: usage.prompt_tokens ?? 0,
       completion: usage.completion_tokens ?? 0,
