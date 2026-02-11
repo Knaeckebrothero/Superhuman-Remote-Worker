@@ -141,6 +141,12 @@
           "default": 25000,
           "description": "Maximum word count for workspace read operations. For non-PDF files, estimated from file size (bytes / 5.5). For PDFs, counted during page iteration."
         },
+        "max_write_words": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 10000,
+          "description": "Maximum word count for a single write_file call. Returns an error with guidance to split into multiple calls if exceeded."
+        },
         "max_read_size": {
           "type": "integer",
           "minimum": 1000,

@@ -22,6 +22,7 @@ workspace:
   initial_files:
     workspace.md: prompts/workspace_template.md
   max_read_words: 25000
+  max_write_words: 10000
   # Git versioning for workspace history
   git_versioning: true
   git_ignore_patterns:
