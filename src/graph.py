@@ -44,6 +44,7 @@ Phase Alternation:
 """
 
 import logging
+import re
 import time
 from typing import Any, Callable, Dict, List, Literal, Optional
 
@@ -86,6 +87,129 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
+
+
+def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
+    """Extract retry-after delay from rate limit errors.
+
+    Checks the exception and its chain for rate limit indicators (HTTP 429)
+    and extracts the retry-after value from headers or error messages.
+
+    Args:
+        error: The exception to inspect
+
+    Returns:
+        Delay in seconds if rate limit detected, None otherwise
+    """
+    error_str = str(error)
+
+    # Check if this is a rate limit error
+    is_rate_limit = (
+        "429" in error_str
+        or "rate limit" in error_str.lower()
+        or "too many requests" in error_str.lower()
+    )
+    if not is_rate_limit:
+        return None
+
+    # Try to extract retry-after from the exception chain
+    # Anthropic/OpenAI SDK exceptions may have response headers
+    current = error
+    while current is not None:
+        # Check for response attribute with headers (httpx/SDK exceptions)
+        response = getattr(current, "response", None)
+        if response is not None:
+            headers = getattr(response, "headers", {})
+            retry_after = headers.get("retry-after")
+            if retry_after:
+                try:
+                    return float(retry_after) + 5.0  # Add buffer
+                except (ValueError, TypeError):
+                    pass
+
+        current = current.__cause__ if current.__cause__ != current else None
+
+    # Fallback: try to extract retry-after from error message text
+    match = re.search(r"retry.?after['\"]?\s*[:=]\s*['\"]?(\d+)", error_str, re.IGNORECASE)
+    if match:
+        return float(match.group(1)) + 5.0
+
+    # Rate limit detected but no retry-after found — use conservative default
+    return 90.0
+
+
+def _extract_tool_use_failed(error: Exception) -> Optional[str]:
+    """Extract failed_generation from Groq's tool_use_failed error.
+
+    When a Groq model exceeds its max completion tokens, the output is truncated
+    mid-tool-call and Groq returns a 400 error with code 'tool_use_failed' instead
+    of a truncated response. This function detects that error and extracts the
+    truncated output so we can give the model actionable feedback.
+
+    Args:
+        error: The exception to inspect (walks __cause__ chain)
+
+    Returns:
+        The failed_generation text if this is a tool_use_failed error, None otherwise
+    """
+    # Walk the exception chain (LangChain may wrap the original error)
+    current: Optional[BaseException] = error
+    while current is not None:
+        # Primary: check structured body attribute on Groq's BadRequestError
+        body = getattr(current, "body", None)
+        if isinstance(body, dict):
+            inner_error = body.get("error", {})
+            if isinstance(inner_error, dict) and inner_error.get("code") == "tool_use_failed":
+                return inner_error.get("failed_generation", "")
+
+        # Move up the cause chain
+        cause = getattr(current, "__cause__", None)
+        current = cause if cause is not current else None
+
+    # Fallback: regex on string representation
+    error_str = str(error)
+    if "tool_use_failed" in error_str:
+        match = re.search(r'"failed_generation"\s*:\s*"(.*?)"', error_str, re.DOTALL)
+        if match:
+            return match.group(1)
+        # Error identified but can't extract generation text
+        return ""
+
+    return None
+
+
+def _build_tool_use_failed_feedback(failed_generation: str) -> str:
+    """Build a feedback message from a truncated tool call output.
+
+    Creates a message explaining what happened and showing a preview of the
+    truncated output so the model can retry with smaller chunks.
+
+    Args:
+        failed_generation: The truncated output from the failed tool call
+
+    Returns:
+        Formatted feedback message for the model
+    """
+    # Build preview: first 100 words + last 100 words
+    words = failed_generation.split()
+    if len(words) <= 200:
+        preview = failed_generation
+    else:
+        first_100 = " ".join(words[:100])
+        last_100 = " ".join(words[-100:])
+        preview = f"{first_100}\n\n[... {len(words) - 200} words truncated ...]\n\n{last_100}"
+
+    return (
+        "YOUR PREVIOUS TOOL CALL FAILED: Your output exceeded the maximum completion token "
+        "limit and was truncated mid-tool-call. The tool call was never executed — no file "
+        "was written and no action was taken.\n\n"
+        "PREVIEW OF TRUNCATED OUTPUT:\n"
+        f"```\n{preview}\n```\n\n"
+        "TO FIX THIS: Split your content into multiple smaller tool calls. For example, "
+        "use multiple `write_file` calls to write sections of a document separately, or "
+        "break large operations into smaller steps. Each individual tool call must produce "
+        "less output than the model's completion token limit."
+    )
 
 
 def _is_tool_error(content: str) -> bool:
@@ -336,6 +460,9 @@ def create_execute_node(
 
     model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
 
+    # Track consecutive tool_use_failed errors (mutable container for closure access)
+    _tool_use_failed_streak = [0]
+
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
         job_id = state.get("job_id", "unknown")
@@ -522,6 +649,9 @@ def create_execute_node(
                 response = llm_with_tools.invoke(prepared_messages)
                 latency_ms = int((time.time() - start_time) * 1000)
 
+                # Reset tool_use_failed streak on successful response
+                _tool_use_failed_streak[0] = 0
+
                 tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
                 logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
 
@@ -555,12 +685,22 @@ def create_execute_node(
 
                     # Update the LLM audit document with response data
                     if llm_audit_id:
+                        # Normalize content: Anthropic returns list of content blocks,
+                        # OpenAI returns a plain string
+                        content = response.content
+                        if isinstance(content, list):
+                            content = " ".join(
+                                block.get("text", "") if isinstance(block, dict) else str(block)
+                                for block in content
+                            ).strip()
+                        content_str = content if isinstance(content, str) else str(content or "")
+
                         auditor.update_llm_response(
                             audit_doc_id=llm_audit_id,
                             request_id=request_id,
-                            response_preview=response.content[:500] if response.content else "",
+                            response_preview=content_str[:500],
                             tool_calls=tool_calls_preview,
-                            output_chars=len(response.content) if response.content else 0,
+                            output_chars=len(content_str),
                             latency_ms=latency_ms,
                         )
 
@@ -698,14 +838,90 @@ def create_execute_node(
                 }
 
             except Exception as e:
+                # Check for Groq tool_use_failed before standard retry logic
+                failed_generation = _extract_tool_use_failed(e)
+                if failed_generation is not None:
+                    _tool_use_failed_streak[0] += 1
+                    streak = _tool_use_failed_streak[0]
+
+                    if streak <= 3:
+                        logger.warning(
+                            f"[{job_id}] Groq tool_use_failed (streak {streak}/3): "
+                            f"output exceeded max completion tokens, giving model feedback"
+                        )
+
+                        # Build feedback for the model
+                        feedback_text = _build_tool_use_failed_feedback(failed_generation)
+
+                        # Create AIMessage (model's failed turn summary) + HumanMessage (guidance)
+                        ai_summary = AIMessage(content=(
+                            "My previous attempt to call a tool failed because the output "
+                            "exceeded the maximum completion token limit. The tool call was "
+                            "truncated and never executed. I need to retry with smaller chunks."
+                        ))
+                        human_feedback = HumanMessage(content=feedback_text)
+
+                        # Audit as warning
+                        if auditor:
+                            preview = failed_generation[:500] if failed_generation else "(empty)"
+                            auditor.audit_step(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                step_type="warning",
+                                node_name="execute",
+                                iteration=iteration,
+                                data={
+                                    "error": {
+                                        "type": "tool_use_failed",
+                                        "message": "Groq output exceeded max completion tokens",
+                                        "streak": streak,
+                                        "failed_generation_preview": preview,
+                                        "failed_generation_length": len(failed_generation),
+                                    }
+                                },
+                                metadata=state.get("metadata"),
+                                phase=phase_str,
+                                phase_number=phase_number,
+                            )
+
+                        # Return feedback messages — graph continues normally
+                        # Route: execute → check_todos (no tool_calls) → pending todos → execute
+                        if context_was_compacted:
+                            result_messages = remove_markers + messages + [ai_summary, human_feedback]
+                        else:
+                            result_messages = [ai_summary, human_feedback]
+
+                        return {
+                            "messages": result_messages,
+                            "iteration": iteration + 1,
+                            "error": None,
+                        }
+
+                    # Streak > 3: fall through to standard retry exhaustion
+                    logger.error(
+                        f"[{job_id}] Groq tool_use_failed streak exceeded (streak {streak}): "
+                        f"model cannot produce output within token limits"
+                    )
+
                 retry_manager.record_failure("llm_invoke")
 
                 if retry_manager.should_retry("llm_invoke", attempt):
                     delay = retry_manager.get_retry_delay(attempt)
-                    logger.warning(
-                        f"[{job_id}] LLM error (attempt {attempt + 1}/{retry_manager.max_retries}), "
-                        f"retrying in {delay:.1f}s: {e}"
-                    )
+
+                    # For rate limit errors, respect the retry-after header
+                    rate_limit_delay = _extract_rate_limit_delay(e)
+                    if rate_limit_delay is not None:
+                        delay = max(delay, rate_limit_delay)
+                        logger.warning(
+                            f"[{job_id}] Rate limit hit (attempt {attempt + 1}/{retry_manager.max_retries}), "
+                            f"waiting {delay:.0f}s before retry: {e}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{job_id}] LLM error (attempt {attempt + 1}/{retry_manager.max_retries}), "
+                            f"retrying in {delay:.1f}s: {e}"
+                        )
+
                     retry_manager.record_retry()
                     time.sleep(delay)
                     attempt += 1
