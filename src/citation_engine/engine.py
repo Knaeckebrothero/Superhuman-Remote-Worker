@@ -44,6 +44,34 @@ from .schema import (
 # Set up logging
 log = logging.getLogger(__name__)
 
+# Groq auto-detection: model prefixes served by Groq's OpenAI-compatible API
+GROQ_MODEL_PREFIXES = (
+    "llama-", "meta-llama/", "mixtral-", "gemma-", "gemma2-",
+    "deepseek-", "qwen/", "moonshotai/", "openai/gpt-oss",
+    "groq/", "canopylabs/", "whisper-",
+)
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+
+
+def _resolve_llm_provider(model: str, llm_url: str | None) -> str:
+    """
+    Resolve which LLM provider to use.
+
+    Priority:
+        1. CITATION_LLM_PROVIDER env var (explicit override)
+        2. CITATION_LLM_URL is set → "custom"
+        3. Model name matches a Groq prefix → "groq"
+        4. Default → "openai"
+    """
+    explicit = os.getenv("CITATION_LLM_PROVIDER", "").strip().lower()
+    if explicit:
+        return explicit
+    if llm_url:
+        return "custom"
+    if any(model.lower().startswith(p) for p in GROQ_MODEL_PREFIXES):
+        return "groq"
+    return "openai"
+
 
 class CitationEngine:
     """
@@ -71,6 +99,7 @@ class CitationEngine:
 
     Environment Variables:
         CITATION_DB_URL: PostgreSQL connection string (multi-agent mode)
+        CITATION_LLM_PROVIDER: Force provider: openai | groq | custom (auto-detected if unset)
         CITATION_LLM_URL: Custom LLM endpoint (e.g., llama.cpp server)
         CITATION_LLM_MODEL: Model to use for verification (default: gpt-4o-mini)
         CITATION_REASONING_REQUIRED: none | low | medium | high (default: low)
@@ -126,7 +155,20 @@ class CitationEngine:
         # LLM configuration
         self.llm_url = os.getenv("CITATION_LLM_URL")
         self.llm_model = os.getenv("CITATION_LLM_MODEL", "gpt-4o-mini")
-        self.llm_api_key = os.getenv("OPENAI_API_KEY", "")
+        self.llm_provider = _resolve_llm_provider(self.llm_model, self.llm_url)
+
+        if self.llm_provider == "groq":
+            self.llm_api_key = os.getenv("GROQ_API_KEY", "")
+            if not self.llm_url:
+                self.llm_url = GROQ_BASE_URL
+            if not self.llm_api_key:
+                log.warning(
+                    "Groq provider detected but GROQ_API_KEY is not set. "
+                    "Set GROQ_API_KEY or use CITATION_LLM_PROVIDER to override."
+                )
+        else:
+            self.llm_api_key = os.getenv("OPENAI_API_KEY", "")
+
         self.reasoning_level = os.getenv("CITATION_REASONING_LEVEL", "high")
         self.skip_verification = os.getenv("CITATION_SKIP_VERIFICATION", "false").lower() == "true"
 
@@ -151,6 +193,7 @@ class CitationEngine:
 
         log.info(
             f"CitationEngine initialized: mode={mode}, "
+            f"llm_provider={self.llm_provider}, "
             f"reasoning_required={self.reasoning_required}, "
             f"reasoning_level={self.reasoning_level}, "
             f"skip_verification={self.skip_verification}"
@@ -1519,9 +1562,13 @@ class CitationEngine:
         try:
             from langchain_openai import ChatOpenAI
 
-            # Build model_kwargs for reasoning
+            # Build model_kwargs for reasoning (only for OpenAI — Groq rejects it)
             model_kwargs = {}
-            if self.reasoning_level and self.reasoning_level != "none":
+            if (
+                self.llm_provider == "openai"
+                and self.reasoning_level
+                and self.reasoning_level != "none"
+            ):
                 model_kwargs["reasoning_effort"] = self.reasoning_level
 
             # Build kwargs for ChatOpenAI
