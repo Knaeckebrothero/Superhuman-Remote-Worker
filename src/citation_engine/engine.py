@@ -1562,12 +1562,13 @@ class CitationEngine:
         try:
             from langchain_openai import ChatOpenAI
 
-            # Build model_kwargs for reasoning (only for OpenAI — Groq rejects it)
+            # Build model_kwargs for reasoning (only for o-series models)
             model_kwargs = {}
             if (
                 self.llm_provider == "openai"
                 and self.reasoning_level
                 and self.reasoning_level != "none"
+                and self.llm_model.startswith("o")
             ):
                 model_kwargs["reasoning_effort"] = self.reasoning_level
 
@@ -1577,7 +1578,7 @@ class CitationEngine:
                 "temperature": 0.0,  # Deterministic verification
                 "timeout": 120,  # 2 min - verification of 3 pages should be fast
                 "max_retries": 1,  # 1 retry only - avoid long waits on failures
-                "max_tokens": 4096,  # Verification response is small JSON
+                "max_completion_tokens": 4096,  # Verification response is small JSON
             }
 
             # Add model_kwargs if non-empty
