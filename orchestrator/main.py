@@ -2988,7 +2988,6 @@ async def _summarize_builder_session(
 
     Uses the same builder model for summarization.
     """
-    from services.builder_tools import build_summarization_prompt
 
     # Only summarize if we have enough messages
     if len(messages) < 6:
