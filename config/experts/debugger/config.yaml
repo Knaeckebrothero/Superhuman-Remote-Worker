@@ -1,0 +1,48 @@
+# yaml-language-server: $schema=../../schema.json
+# Job Debugger Expert - Post-mortem analysis and workflow issue detection
+$extends: defaults
+
+agent_id: debugger
+display_name: Job Debugger
+description: |
+  Performs post-mortem analysis of completed, failed, and frozen jobs.
+  Identifies workflow issues, tool errors, wasted phases, and citation
+  problems. Produces structured diagnostic reports.
+icon: bug_report
+color: "#f38ba8"
+tags:
+  - debugging
+  - analysis
+  - quality-assurance
+
+# Lean tool set — read-heavy, no research or citation creation needed
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - list_files
+    - search_files
+    - file_exists
+    - get_workspace_summary
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  document: []
+  research: []
+  citation: []
+  graph: []
+  # SQL tools are injected when system PostgreSQL datasource is attached
+  # This gives the debugger direct access to jobs, requirements, citations tables
+  sql: []
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  coding:
+    - run_command

@@ -1591,7 +1591,7 @@ def _format_created_job(result: dict[str, Any], config_name: str) -> str:
     """Format the result of creating a new job."""
     job_id = result.get("id", "unknown")
     lines = [
-        f"Job created successfully.",
+        "Job created successfully.",
         f"Job ID: {job_id}",
         f"Config: {config_name}",
         f"Status: {result.get('status', 'created')}",
@@ -2486,7 +2486,6 @@ def _format_annotations(
         atype = a.get("annotation_type", "note")
         content = a.get("content", "")
         page_ref = a.get("page_reference", "")
-        created = a.get("created_at", "")
 
         icon = {
             "note": "N",

@@ -24,8 +24,14 @@ CitationEngine is a [separate repository](https://github.com/Knaeckebrothero/Cit
 
 ### Database Management
 ```bash
-# Start databases (development)
+# Start databases (development) — see docker-compose.dev.yaml for all services
 podman-compose -f docker-compose.dev.yaml up -d
+
+# Start only databases
+podman-compose -f docker-compose.dev.yaml up -d postgres mongodb
+
+# Start databases + MCP for Claude Code
+podman-compose -f docker-compose.dev.yaml up -d postgres mongodb mcp
 
 # Initialize everything (databases + workspace) - RECOMMENDED
 python init.py
@@ -137,7 +143,7 @@ uvicorn main:app --reload --port 8085
 
 ### Universal Agent Pattern
 
-Single codebase configured for different roles via JSON configs in `config/`. See `config/README.md` for full documentation on creating custom agent configs.
+Single codebase configured for different roles via YAML configs in `config/`. See `config/README.md` for full documentation on creating custom agent configs.
 
 Config structure:
 - `config/defaults.yaml` - Framework defaults (all configs extend this)
@@ -146,6 +152,8 @@ Config structure:
 - `config/templates/` - File templates (workspace_template.md, phase_retrospective_template.md)
   - `strategic_todos_initial.yaml` - First strategic phase (job startup)
   - `strategic_todos_transition.yaml` - Subsequent strategic phases (phase transitions)
+  - `strategic_todos_resume.yaml` - Resumed jobs
+- `config/experts/` - Pre-built agent roles (coder, researcher, writer, debugger)
 - `config/my_agent.yaml` - Custom single-file config
 - `config/my_agent/config.yaml` - Custom directory config (with prompt overrides)
 
@@ -387,12 +395,16 @@ Required in `.env`:
 | Service | Port |
 |---------|------|
 | Agent API | 8001 |
+| MCP Server (Claude Code) | 8055 |
 | Orchestrator API | 8085 |
 | Cockpit Frontend (docker) | 4000 |
 | Cockpit Frontend (npm start) | 4200 |
 | Gitea | 3000 |
+| pgAdmin | 5050 |
 | PostgreSQL | 5432 |
+| Mongo Express | 8081 |
 | MongoDB | 27017 |
+| Dozzle (container logs) | 9999 |
 
 ## Debugging
 
@@ -422,17 +434,18 @@ python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid> --audit   # F
 ```
 
 **Orchestrator MCP Server** (for Claude Code integration):
-The project includes `.mcp.json` for MCP server configuration. Claude Code can use these tools for AI-assisted debugging:
+The project includes `.mcp.json` for MCP server configuration. The MCP server runs on port 8055 (HTTP transport) as a separate container (`srw-mcp`) and proxies to the orchestrator API on 8085. Health check: `http://localhost:8055/health`.
 
-| Tool | Description |
-|------|-------------|
-| `list_jobs` | List jobs with status filter |
-| `get_job` | Get job details by ID |
-| `get_audit_trail` | Get paginated audit entries |
-| `get_chat_history` | Get conversation turns |
-| `get_todos` | Get current and archived todos |
-| `get_graph_changes` | Get graph mutations timeline |
-| `get_llm_request` | Get full LLM request/response |
-| `search_audit` | Search audit entries by pattern |
+The server exposes 43 tools in 7 categories:
+
+| Category | Tools |
+|----------|-------|
+| Debug & Inspection | `list_jobs`, `get_job`, `get_audit_trail`, `get_chat_history`, `get_todos`, `get_graph_changes`, `get_llm_request`, `search_audit` |
+| Actions & Operations | `approve_job`, `resume_job_with_feedback`, `cancel_job`, `create_job`, `delete_job`, `assign_job`, `test_datasource` |
+| Git History | `list_job_commits`, `get_job_diff`, `get_job_file`, `list_job_files`, `list_job_tags` |
+| Workspace & Job Context | `get_frozen_job`, `get_workspace_file`, `get_workspace_overview`, `get_job_progress`, `get_job_requirements` |
+| System Monitoring | `get_job_stats`, `get_agent_stats`, `get_stuck_jobs`, `list_agents`, `list_experts`, `get_expert`, `list_datasources` |
+| Database Inspection | `list_tables`, `query_table`, `get_table_schema` |
+| Citation & Source Library | `list_job_sources`, `get_source_detail`, `list_job_citations`, `get_citation_detail`, `search_job_sources`, `get_source_annotations`, `get_source_tags`, `get_citation_stats` |
 
 The MCP server is located at `orchestrator/mcp/`.

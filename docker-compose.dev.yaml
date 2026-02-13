@@ -122,16 +122,13 @@ services:
   mcp:
     image: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:${IMAGE_TAG:-latest}
     container_name: srw-mcp
+    network_mode: host
     environment:
-      COCKPIT_API_URL: http://host.docker.internal:8085
+      COCKPIT_API_URL: http://localhost:8085
       MCP_TRANSPORT: http
-      MCP_PORT: 8055
-    ports:
-      - "${MCP_PORT:-8055}:8055"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      MCP_PORT: ${MCP_PORT:-8055}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8055/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${MCP_PORT:-8055}/health')"]
       interval: 10s
       timeout: 5s
       retries: 5
