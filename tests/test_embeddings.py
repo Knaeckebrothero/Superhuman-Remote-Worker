@@ -164,11 +164,31 @@ class TestEmbeddingService:
         assert default.max_texts_per_batch == 2048
         assert default.timeout == 60.0
 
-    def test_estimate_tokens(self):
-        """Test token estimation heuristic."""
-        assert EmbeddingService._estimate_tokens("") == 1  # min 1
-        assert EmbeddingService._estimate_tokens("hello world") == 3  # 11 // 3
-        assert EmbeddingService._estimate_tokens("a" * 3000) == 1000
+    def test_estimate_tokens_heuristic(self):
+        """Test token estimation with chars // 2 heuristic (no tiktoken)."""
+        service = EmbeddingService(
+            model="unknown-model-no-tiktoken",
+            api_url="http://localhost:11434/v1",
+            api_key="test",
+        )
+        assert service._encoding is None  # tiktoken doesn't know this model
+        assert service._estimate_tokens("") == 1  # min 1
+        assert service._estimate_tokens("hello world") == 5  # 11 // 2
+        assert service._estimate_tokens("a" * 3000) == 1500
+
+    def test_estimate_tokens_with_tiktoken(self):
+        """Test token estimation uses tiktoken when available."""
+        service = EmbeddingService(
+            model="text-embedding-3-small",
+            api_key="test",
+        )
+        assert service._encoding is not None
+        # tiktoken gives exact counts; "hello world" is 2 tokens
+        result = service._estimate_tokens("hello world")
+        assert result == 2
+        # Longer text should give a reasonable count
+        result = service._estimate_tokens("a" * 3000)
+        assert result > 0
 
     def test_compute_batches_single(self):
         """Small input fits in one batch."""
@@ -180,9 +200,12 @@ class TestEmbeddingService:
     def test_compute_batches_token_split(self):
         """Low token limit forces multiple batches."""
         service = EmbeddingService(
-            model="test-model", api_key="test", max_tokens_per_batch=10
+            model="unknown-model-no-tiktoken",
+            api_url="http://localhost:11434/v1",
+            api_key="test",
+            max_tokens_per_batch=10,
         )
-        # Each text is 30 chars -> ~10 tokens, so each needs its own batch
+        # Each text is 30 chars -> ~15 tokens (chars // 2), so each needs its own batch
         texts = ["a" * 30, "b" * 30, "c" * 30]
         batches = service._compute_batches(texts)
         assert len(batches) == 3
@@ -219,7 +242,7 @@ class TestEmbeddingService:
 
     @patch("httpx.Client")
     def test_embed_batch_truncates_oversized_text(self, MockClient):
-        """Text exceeding max_tokens_per_text is truncated before sending to API."""
+        """Text exceeding max_tokens_per_text is truncated before sending to API (heuristic path)."""
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "data": [
@@ -236,21 +259,61 @@ class TestEmbeddingService:
         MockClient.return_value = mock_client
 
         service = EmbeddingService(
-            model="test-model", api_key="test", max_tokens_per_text=100
+            model="unknown-model-no-tiktoken",
+            api_url="http://localhost:11434/v1",
+            api_key="test",
+            max_tokens_per_text=100,
         )
-        # ~10000 tokens estimated (30000 chars / 3), well above limit of 100
+        assert service._encoding is None  # heuristic path
+        # ~15000 tokens estimated (30000 chars / 2), well above limit of 100
         oversized = "a" * 30_000
         original_texts = [oversized, "short"]
         results = service.embed_batch(original_texts)
 
-        # Verify the API received truncated text (100 tokens * 3 = 300 chars)
+        # Verify the API received truncated text (100 tokens * 2 = 200 chars)
         call_args = mock_client.post.call_args
         sent_texts = call_args.kwargs.get("json", call_args[1].get("json", {}))["input"]
-        assert len(sent_texts[0]) == 300  # truncated to max_tokens * 3
+        assert len(sent_texts[0]) == 200  # truncated to max_tokens * 2
         assert sent_texts[1] == "short"   # short text unchanged
 
         # Original list not mutated
         assert len(original_texts[0]) == 30_000
+
+    @patch("httpx.Client")
+    def test_embed_batch_truncates_with_tiktoken(self, MockClient):
+        """Text exceeding max_tokens_per_text is truncated exactly via tiktoken."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "data": [
+                {"embedding": [0.1, 0.2], "index": 0},
+            ],
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        mock_client = MagicMock()
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client.post.return_value = mock_response
+        MockClient.return_value = mock_client
+
+        service = EmbeddingService(
+            model="text-embedding-3-small",
+            api_key="test",
+            max_tokens_per_text=10,
+        )
+        assert service._encoding is not None  # tiktoken path
+        # Long text that will exceed 10 tokens
+        oversized = "This is a longer sentence that should definitely exceed ten tokens by a wide margin."
+        original_texts = [oversized]
+        results = service.embed_batch(original_texts)
+
+        # Verify the API received truncated text
+        call_args = mock_client.post.call_args
+        sent_texts = call_args.kwargs.get("json", call_args[1].get("json", {}))["input"]
+        # Truncated text should be shorter than original
+        assert len(sent_texts[0]) < len(oversized)
+        # And the truncated text should tokenize to exactly max_tokens_per_text
+        assert len(service._encoding.encode(sent_texts[0])) == 10
 
     @patch("httpx.Client")
     def test_embed_batch_multi_batch(self, MockClient):
