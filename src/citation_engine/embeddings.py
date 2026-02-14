@@ -95,6 +95,15 @@ class EmbeddingService:
         self.max_tokens_per_text = max_tokens_per_text
         self.timeout = timeout
 
+        # Try to load tiktoken for accurate token counting
+        self._encoding = None
+        try:
+            import tiktoken
+            self._encoding = tiktoken.encoding_for_model(self.model)
+            log.debug(f"Using tiktoken encoding for model {self.model}")
+        except (ImportError, KeyError):
+            log.debug(f"tiktoken unavailable for model {self.model}, using heuristic")
+
         self._dimension: int | None = _KNOWN_DIMENSIONS.get(self.model)
         log.info(
             f"EmbeddingService configured: model={self.model}, "
@@ -143,10 +152,11 @@ class EmbeddingService:
         results = self.embed_batch([text])
         return results[0]
 
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        """Estimate token count from text length (chars / 3, conservative)."""
-        return max(1, len(text) // 3)
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count. Uses tiktoken if available, else chars // 2."""
+        if self._encoding is not None:
+            return max(1, len(self._encoding.encode(text)))
+        return max(1, len(text) // 2)
 
     def _compute_batches(self, texts: list[str]) -> list[list[int]]:
         """
@@ -256,7 +266,6 @@ class EmbeddingService:
 
         # Truncate texts that exceed per-text token limit
         if self.max_tokens_per_text:
-            max_chars = self.max_tokens_per_text * 3  # inverse of _estimate_tokens
             truncated = False
             for i, text in enumerate(texts):
                 if self._estimate_tokens(text) > self.max_tokens_per_text:
@@ -267,7 +276,11 @@ class EmbeddingService:
                         f"Text {i} exceeds embedding token limit "
                         f"(~{self._estimate_tokens(text)} > {self.max_tokens_per_text}), truncating"
                     )
-                    texts[i] = text[:max_chars]
+                    if self._encoding is not None:
+                        tokens = self._encoding.encode(text)
+                        texts[i] = self._encoding.decode(tokens[:self.max_tokens_per_text])
+                    else:
+                        texts[i] = text[:self.max_tokens_per_text * 2]
 
         batches = self._compute_batches(texts)
         log.debug(

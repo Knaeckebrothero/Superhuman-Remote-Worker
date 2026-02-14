@@ -43,6 +43,7 @@ full = [
     "langchain-openai>=0.0.5",
     "pgvector>=0.2.0",
     "httpx>=0.25.0",
+    "tiktoken>=0.7",
 ]
 # PDF extraction support
 pdf = [
@@ -66,6 +67,7 @@ postgresql = [
 vector = [
     "pgvector>=0.2.0",
     "httpx>=0.25.0",
+    "tiktoken>=0.7",
 ]
 # Development dependencies
 dev = [
