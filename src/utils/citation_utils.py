@@ -42,10 +42,15 @@ def get_citation_engine_config() -> Dict[str, Any]:
     Returns:
         Configuration dictionary for Citation Engine
     """
+    llm_model = os.getenv("CITATION_LLM_MODEL", "gpt-4")
+    llm_url = os.getenv("CITATION_LLM_URL")
+    if not llm_url and llm_model.lower().startswith("openai/"):
+        llm_url = os.getenv("LLM_BASE_URL")
+
     return {
         "db_url": os.getenv("CITATION_DB_URL", os.getenv("DATABASE_URL")),
-        "llm_url": os.getenv("CITATION_LLM_URL", os.getenv("LLM_BASE_URL")),
-        "llm_model": os.getenv("CITATION_LLM_MODEL", "gpt-4"),
+        "llm_url": llm_url,
+        "llm_model": llm_model,
         "reasoning_required": os.getenv("CITATION_REASONING_REQUIRED", "low"),
     }
 

@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=../../schema.json
+# Scholar - Continuous R&D exploration and idea generation
+$extends: defaults
+
+agent_id: scholar
+display_name: Scholar
+description: |
+  Continuous exploration agent. Scans the web, digs through codebases,
+  analyzes logs and test results, runs experiments. Generates a high volume
+  of idea artifacts — the Critic decides which survive.
+icon: lightbulb
+color: "#f9e2af"
+tags:
+  - research
+  - exploration
+  - ideas
+
+llm:
+  temperature: 0.3
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - output/ideas/
+    - output/experiments/
+    - notes/
+    - repo/
+  git_versioning: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - edit_file
+    - list_files
+    - delete_file
+    - search_files
+    - file_exists
+    - move_file
+    - copy_file
+    - get_workspace_summary
+    - get_document_info
+    - create_directory
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  research:
+    - web_search
+    - extract_webpage
+    - crawl_website
+    - map_website
+    - search_papers
+    - download_paper
+    - get_paper_info
+    - browse_website
+    - research_topic
+  coding:
+    - run_command
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # SQL injected when system datasource attached (for reading job data, test results)
+  sql: []
+  # Not needed
+  document: []
+  citation: []
+  graph: []
+  mongodb: []

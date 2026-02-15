@@ -2366,6 +2366,52 @@ async def get_agent(agent_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/agents/{agent_id}/system-info")
+async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
+    """Proxy system info request to an agent's /system/info endpoint.
+
+    Returns CPU, memory, disk, processes, listening ports, and network
+    connections from the agent's container.
+    """
+    import httpx
+
+    try:
+        agent = await postgres_db.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+        if agent["status"] == "offline":
+            raise HTTPException(status_code=400, detail="Agent is offline")
+
+        pod_ip = agent.get("pod_ip")
+        if not pod_ip:
+            raise HTTPException(status_code=400, detail="Agent has no pod IP configured")
+
+        pod_port = agent.get("pod_port", 8001)
+        agent_url = f"http://{pod_ip}:{pod_port}/system/info"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(agent_url)
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Agent returned {response.status_code}: {response.text}",
+            )
+
+        return response.json()
+
+    except HTTPException:
+        raise
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to connect to agent: {str(e)}",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.delete("/api/agents/{agent_id}")
 async def delete_agent(agent_id: str) -> dict[str, str]:
     """Deregister an agent.

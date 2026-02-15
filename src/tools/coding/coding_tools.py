@@ -105,6 +105,21 @@ def create_coding_tools(context: ToolContext) -> List[Any]:
     ws = context.workspace_manager
     max_output_chars = context.get_config("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
 
+    # Configurable blocklist: None → use default, [] → no restrictions
+    configured_blocked = context.get_config("run_command_blocked_commands", None)
+    if configured_blocked is None:
+        effective_blocked = BLOCKED_COMMANDS
+    else:
+        effective_blocked = frozenset(configured_blocked)
+
+    # Configurable sandbox: true → workspace-only paths, false → any path
+    sandbox_enabled = context.get_config("run_command_sandbox", True)
+
+    if not effective_blocked:
+        logger.warning("run_command: command blocklist is DISABLED — all commands allowed")
+    if not sandbox_enabled:
+        logger.warning("run_command: workspace sandbox is DISABLED — commands can run anywhere")
+
     @tool
     def run_command(
         command: str,
@@ -121,8 +136,8 @@ def create_coding_tools(context: ToolContext) -> List[Any]:
             command: Shell command to execute (e.g., "pytest tests/ -x",
                      "npm test", "python script.py", "git commit -m 'msg'")
             working_dir: Subdirectory within workspace to run in (optional).
-                         Relative to workspace root. Example: "repo" to run
-                         in the cloned repository directory.
+                         When sandbox is enabled, this is relative to workspace root.
+                         When sandbox is disabled, absolute paths are also accepted.
             timeout: Maximum execution time in seconds (default: 120).
                      Commands exceeding this are killed.
 
@@ -135,20 +150,27 @@ def create_coding_tools(context: ToolContext) -> List[Any]:
             run_command(command="git status", working_dir="repo")
             run_command(command="python -m py_compile src/main.py", working_dir="repo")
         """
-        # Safety check
-        blocked = _check_blocked(command)
-        if blocked:
-            return blocked
+        # Safety check (skip if blocklist empty)
+        if effective_blocked:
+            first_word = command.strip().split()[0] if command.strip() else ""
+            if first_word in effective_blocked:
+                return f"Command blocked: '{first_word}' is not allowed. Blocked commands: {', '.join(sorted(effective_blocked))}"
 
         # Resolve working directory
         if working_dir:
-            # Validate the path is within workspace (security)
-            try:
-                cwd = str(ws.get_path(working_dir))
-            except (ValueError, PermissionError) as e:
-                return f"Invalid working directory: {e}"
+            if sandbox_enabled:
+                # Validate the path is within workspace (security)
+                try:
+                    cwd = str(ws.get_path(working_dir))
+                except (ValueError, PermissionError) as e:
+                    return f"Invalid working directory: {e}"
+            else:
+                # Unrestricted: accept absolute paths, resolve relative to workspace
+                from pathlib import Path
+                p = Path(working_dir)
+                cwd = str(p if p.is_absolute() else ws.path / working_dir)
         else:
-            cwd = str(ws.workspace_path)
+            cwd = str(ws.path)
 
         # Cap timeout to reasonable maximum
         timeout_capped = min(timeout, 600)  # 10 minutes max

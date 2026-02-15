@@ -458,7 +458,8 @@ def create_execute_node(
                         kwargs[attr] = val
         return kwargs
 
-    model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
+    strategic_model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
+    tactical_model_kwargs = _extract_model_kwargs(tactical_llm_with_tools)
 
     # Track consecutive tool_use_failed errors (mutable container for closure access)
     _tool_use_failed_streak = [0]
@@ -501,6 +502,7 @@ def create_execute_node(
             todos_content=todos_content,
         )
         phase_name = "strategic" if is_strategic else "tactical"
+        context_mgr.set_current_phase(phase_name)
         logger.debug(
             f"[{job_id}] Using {phase_name} LLM and prompt for phase {phase_number}"
         )
@@ -627,12 +629,14 @@ def create_execute_node(
         auditor = get_archiver()
         llm_audit_id = None
         phase_str = "strategic" if is_strategic else "tactical"
+        phase_model = config.llm.get_phase_config(phase_str).model
+        model_kwargs = strategic_model_kwargs if is_strategic else tactical_model_kwargs
         if auditor:
             llm_audit_id = auditor.audit_llm_call(
                 job_id=job_id,
                 agent_type=config.agent_id,
                 iteration=iteration,
-                model=config.llm.model,
+                model=phase_model,
                 input_message_count=len(prepared_messages),
                 state_message_count=len(messages),
                 metadata=state.get("metadata"),
@@ -646,14 +650,20 @@ def create_execute_node(
         while True:
             try:
                 start_time = time.time()
-                response = llm_with_tools.invoke(prepared_messages)
+                response = await llm_with_tools.ainvoke(prepared_messages)
                 latency_ms = int((time.time() - start_time) * 1000)
 
                 # Reset tool_use_failed streak on successful response
                 _tool_use_failed_streak[0] = 0
 
                 tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
-                logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
+                content_str = response.content
+                if isinstance(content_str, list):
+                    content_str = " ".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b) for b in content_str
+                    ).strip()
+                content_len = len(content_str) if isinstance(content_str, str) else 0
+                logger.info(f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls")
 
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
@@ -664,7 +674,7 @@ def create_execute_node(
                         agent_type=config.agent_id,
                         messages=prepared_messages,
                         response=response,
-                        model=config.llm.model,
+                        model=phase_model,
                         latency_ms=latency_ms,
                         iteration=iteration,
                         metadata=state.get("metadata"),
@@ -711,20 +721,18 @@ def create_execute_node(
                 if not (hasattr(response, 'tool_calls') and response.tool_calls):
                     remaining = todo_manager.list_pending()
                     if remaining:
+                        first = remaining[0]
                         todo_lines = "\n".join(
-                            f"  - {t.id}: {t.content}"
+                            f"  - {t.id}: {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
                             for t in remaining
                         )
                         injected_reminder = HumanMessage(content=(
-                            f"You have {len(remaining)} incomplete todo(s):\n"
+                            f'Action required: call `todo_complete(todo_id="{first.id}")` to mark your current task done.\n\n'
+                            "If you already finished the work for this todo, that's perfectly fine — "
+                            "just call `todo_complete` now to record it. You don't need to redo anything.\n\n"
+                            f"Pending todos ({len(remaining)}):\n"
                             f"{todo_lines}\n\n"
-                            "IMPORTANT: Tasks are NOT considered complete until you explicitly call "
-                            "the `todo_complete` tool for each one. Performing the work alone is not "
-                            "enough — you MUST mark each task done using the tool.\n\n"
-                            "Use `todo_complete(todo_id=\"<id>\")` to mark a specific todo as done, "
-                            "or call `todo_complete()` with no arguments to complete the next pending item. "
-                            "If you have already done the work for a todo, call `todo_complete` now to "
-                            "record it. Use `todo_list()` to review the full list."
+                            "Do NOT respond with text. Your next action must be a tool call."
                         ))
 
                 # Return compacted messages + response if compaction occurred,
@@ -1191,7 +1199,7 @@ def create_handle_transition_node(
         max_todos: Maximum todos for strategic->tactical transition
     """
 
-    def handle_transition(state: UniversalAgentState) -> Dict[str, Any]:
+    async def handle_transition(state: UniversalAgentState) -> Dict[str, Any]:
         """Handle phase transition based on current mode."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
@@ -1210,8 +1218,24 @@ def create_handle_transition_node(
             min_todos=min_todos,
             max_todos=max_todos,
             config=config,
-            postgres_db=postgres_db,
         )
+
+        # If the job was finalized (frozen for review), update DB status.
+        # This must happen here in the async node where we can properly
+        # await the asyncpg pool on the correct event loop.
+        if (
+            result.success
+            and result.state_updates.get("should_stop")
+            and postgres_db
+        ):
+            try:
+                await postgres_db.jobs.update_status(
+                    job_id,
+                    status="pending_review",
+                )
+                logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to update job status to 'pending_review': {e}")
 
         # Audit transition attempt
         phase_number = state.get("phase_number", 0)
@@ -1891,7 +1915,14 @@ def build_phase_alternation_graph(
         summarization_safe_limit=config.limits.summarization_safe_limit,
         summarization_chunk_size=config.limits.summarization_chunk_size,
     )
-    context_mgr = ContextManager(config=context_config, model=config.llm.model)
+    strategic_config = config.llm.get_phase_config("strategic")
+    tactical_config = config.llm.get_phase_config("tactical")
+    context_mgr = ContextManager(
+        config=context_config,
+        model=config.llm.model,
+        strategic_model=strategic_config.model,
+        tactical_model=tactical_config.model,
+    )
 
     # Create retry manager for LLM call retries
     retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)

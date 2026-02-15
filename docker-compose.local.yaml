@@ -1,24 +1,20 @@
 # =============================================================================
-# Superhuman Remote Worker - Production Stack
+# Superhuman Remote Worker - Local Build Stack
 # =============================================================================
 #
-# Full-stack deployment: databases, VPN sidecars, orchestrator, agents, and cockpit.
-# All services run as containers with shared workspace volume.
-#
-# VPN sidecars route LLM and research traffic through the university network.
-# Agent containers reach VPN services over the Docker network (no host ports).
+# Same as docker-compose.yaml but builds all custom images locally instead of
+# pulling from GHCR. Use this for faster iteration on containerization.
 #
 # Usage:
-#   podman-compose up -d                   # Start all services
-#   podman-compose up -d --scale agent=3   # Start with 3 agent replicas
-#   podman-compose pull                    # Pull latest images
-#   podman-compose down                    # Stop services
-#   podman-compose down -v                 # Stop and remove all data
-#   podman-compose logs -f agent           # Follow agent logs
+#   podman-compose -f docker-compose.local.yaml build          # Build all images
+#   podman-compose -f docker-compose.local.yaml up -d          # Start all services
+#   podman-compose -f docker-compose.local.yaml up -d --scale agent=3
+#   podman-compose -f docker-compose.local.yaml down           # Stop services
+#   podman-compose -f docker-compose.local.yaml down -v        # Stop and remove all data
+#   podman-compose -f docker-compose.local.yaml logs -f agent  # Follow agent logs
 #
 # Prerequisites:
 #   - Copy .env.example to .env and configure API keys + VPN credentials
-#   - Ensure GHCR images are accessible (or build locally)
 #
 # Exposed ports:
 #   - 8085: Orchestrator API
@@ -124,7 +120,10 @@ services:
     restart: unless-stopped
 
   vpn-cluster:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
+    build:
+      context: docker/vpn/
+      dockerfile: Dockerfile
+    image: srw-vpn:local
     container_name: srw-vpn-cluster
     cap_add:
       - NET_ADMIN
@@ -152,7 +151,10 @@ services:
     restart: unless-stopped
 
   vpn-research:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
+    build:
+      context: docker/vpn/
+      dockerfile: Dockerfile
+    image: srw-vpn:local
     container_name: srw-vpn-research
     cap_add:
       - NET_ADMIN
@@ -178,7 +180,10 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    image: srw-orchestrator:local
     container_name: srw-orchestrator
     environment:
       PORT: 8085
@@ -207,7 +212,12 @@ services:
     restart: unless-stopped
 
   agent:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      args:
+        CITATION_ENGINE_PATH: CitationEngine
+    image: srw-agent:local
     environment:
       AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
       AGENT_PORT: 8001
@@ -254,7 +264,10 @@ services:
     restart: unless-stopped
 
   cockpit:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-cockpit:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cockpit
+    image: srw-cockpit:local
     container_name: srw-cockpit
     environment:
       PORT: 4000

@@ -1147,6 +1147,35 @@ async def get_citation_stats(job_id: str) -> str:
         return _format_citation_error("get citation stats", e, job_id=job_id)
 
 
+@mcp.tool
+async def get_agent_system_info(agent_id: str) -> str:
+    """Get system information from an agent's container.
+
+    Returns CPU, memory, disk usage, listening ports, top processes by memory,
+    established network connections, and current agent state. Useful for
+    monitoring what the agent is doing inside its container.
+
+    Args:
+        agent_id: Agent UUID
+
+    Returns:
+        Formatted system info with resource usage and process details
+    """
+    client = _get_client()
+    try:
+        data = await client.get_agent_system_info(agent_id)
+        return _format_system_info(agent_id, data)
+    except Exception as e:
+        error_msg = str(e)
+        if hasattr(e, "response"):
+            try:
+                detail = e.response.json().get("detail", error_msg)  # type: ignore[union-attr]
+                error_msg = detail
+            except Exception:
+                error_msg = f"HTTP {e.response.status_code}: {error_msg}"  # type: ignore[union-attr]
+        return f"Failed to get system info for agent {agent_id}:\n{error_msg}"
+
+
 # =============================================================================
 # Formatters - Convert API responses to readable text
 # =============================================================================
@@ -2573,3 +2602,60 @@ def _format_citation_error(
 
     scope = f" for job {job_id}" if job_id else ""
     return f"Failed to {operation}{scope}:\n{error_msg}"
+
+
+def _format_system_info(agent_id: str, data: dict[str, Any]) -> str:
+    """Format agent system info for display."""
+    lines = [f"System Info for agent {agent_id}\n"]
+
+    # Agent state
+    agent = data.get("agent", {})
+    lines.append(f"Agent ID: {agent.get('agent_id', 'N/A')}")
+    lines.append(f"Current job: {agent.get('current_job') or 'idle'}")
+
+    # CPU
+    cpu = data.get("cpu", {})
+    lines.append(f"\nCPU: {cpu.get('percent', 0)}% ({cpu.get('cores', '?')} cores)")
+
+    # Memory
+    mem = data.get("memory", {})
+    lines.append(f"Memory: {mem.get('used_mb', 0)} / {mem.get('total_mb', 0)} MB ({mem.get('percent', 0)}%)")
+
+    # Disk
+    disk = data.get("disk", {})
+    lines.append(f"Disk: {disk.get('used_gb', 0)} / {disk.get('total_gb', 0)} GB ({disk.get('percent', 0)}%)")
+
+    # Listening ports
+    ports = data.get("listening_ports", [])
+    if ports:
+        lines.append(f"\nListening ports ({len(ports)}):")
+        for p in ports:
+            lines.append(f"  :{p.get('port', '?')} ({p.get('address', '*')}) pid={p.get('pid', '?')}")
+    else:
+        lines.append("\nNo listening ports detected.")
+
+    # Top processes
+    procs = data.get("processes", [])
+    if procs:
+        lines.append(f"\nTop processes by memory ({len(procs)}):")
+        for proc in procs[:10]:
+            cmd = proc.get("cmd", "") or proc.get("name", "")
+            if len(cmd) > 60:
+                cmd = cmd[:57] + "..."
+            lines.append(
+                f"  PID {proc.get('pid', '?'):>6}  "
+                f"{proc.get('memory_mb', 0):>7.1f} MB  "
+                f"{proc.get('cpu_percent', 0):>5.1f}% CPU  "
+                f"{cmd}"
+            )
+
+    # Network connections
+    conns = data.get("network_connections", [])
+    if conns:
+        lines.append(f"\nEstablished connections ({len(conns)}):")
+        for c in conns[:10]:
+            lines.append(f"  {c.get('local', '?')} -> {c.get('remote', '?')} pid={c.get('pid', '?')}")
+        if len(conns) > 10:
+            lines.append(f"  ... and {len(conns) - 10} more")
+
+    return "\n".join(lines)

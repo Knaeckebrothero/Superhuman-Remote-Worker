@@ -12,13 +12,16 @@ Key Features:
 - Simplified 4-node LangGraph workflow
 """
 
+import asyncio
 import logging
 import os
 import shutil
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import aiosqlite
 from langchain_core.language_models import BaseChatModel
@@ -119,6 +122,9 @@ class UniversalAgent:
         self._job_metadata: Optional[Dict[str, Any]] = None
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[str, Any] = {}  # Parent clients for cleanup (e.g. MongoClient)
+
+        # Background document registration task
+        self._doc_registration_task: Optional[asyncio.Task] = None
 
         # Control flags
         self._initialized = False
@@ -665,6 +671,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         metadata = metadata or {}
 
+        # Handle expert config name - load the named config (tools, prompts, workspace settings)
+        # This must happen before config_upload_id and config_override so those can further override
+        if metadata.get("config_name"):
+            from .core.loader import load_and_merge_config, load_agent_config_from_dict, resolve_config_path
+
+            expert_name = metadata["config_name"]
+            try:
+                config_path, deployment_dir = resolve_config_path(expert_name)
+                logger.info(f"Loading expert config '{expert_name}' from {config_path}")
+                merged_config_data = load_and_merge_config(config_path)
+                self.config = load_agent_config_from_dict(merged_config_data, deployment_dir=deployment_dir)
+                logger.info(f"Applied expert config '{expert_name}' (tools: {list(self.config.tools.__dict__.keys())})")
+            except Exception as e:
+                logger.warning(f"Failed to load expert config '{expert_name}': {e}. Continuing with current config.")
+
         # Handle config upload - load and merge with defaults BEFORE workspace setup
         # This must happen first since config affects workspace settings
         if metadata.get("config_upload_id"):
@@ -740,7 +761,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info("Applied inline config overrides")
 
         # Recreate LLMs if config was modified for this job
-        if metadata.get("config_upload_id") or metadata.get("config_override"):
+        if metadata.get("config_name") or metadata.get("config_upload_id") or metadata.get("config_override"):
             logger.info("Config changed for this job — recreating LLMs")
             self._create_phase_llms()
 
@@ -1171,24 +1192,49 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Domain tools get short descriptions; agent reads full docs from workspace
         self._tools = apply_description_overrides(self._tools)
 
-        # Bind tools to phase-specific LLMs
-        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(self._tools)
-        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(self._tools)
+        # Configure parallel tool calls from config (defaults to False to prevent
+        # overwhelming the agent loop with 20+ simultaneous tool calls).
+        # OpenAI o-series reasoning models don't support this parameter.
+        bind_kwargs = {}
+        model_name = (self.config.llm.model or "").lower()
+        if not model_name.startswith(("o1", "o3", "o4")):
+            bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
+
+        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(self._tools, **bind_kwargs)
+        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(self._tools, **bind_kwargs)
 
         # Keep _llm_with_tools for backwards compatibility
         self._llm_with_tools = self._strategic_llm_with_tools
 
         logger.debug(f"Loaded {len(self._tools)} tools")
 
-        # Auto-register input documents as CitationEngine sources
-        self._register_initial_documents(context)
+        # Auto-register input documents as CitationEngine sources (background)
+        self._doc_registration_task = asyncio.create_task(
+            self._register_initial_documents_background(context)
+        )
+
+    async def _register_initial_documents_background(self, context: "ToolContext") -> None:
+        """Background async wrapper for parallel document registration.
+
+        Runs the synchronous _register_initial_documents in a thread executor
+        so the agent's ReAct loop can start immediately.
+
+        Args:
+            context: ToolContext with workspace and citation engine
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._register_initial_documents, context)
 
     def _register_initial_documents(self, context: "ToolContext") -> None:
         """Register input documents in documents/ as CitationEngine sources.
 
         Scans the documents/ directory for supported file types and registers
-        each as a source, enabling hybrid vector search via search_library.
+        each as a source in parallel using ThreadPoolExecutor, enabling hybrid
+        vector search via search_library.
         Skips documents/external/ (web content registered separately).
+
+        Each worker thread creates its own CitationEngine instance for thread
+        safety (the shared context.citation_engine uses a single DB connection).
 
         Non-fatal: failures are logged but do not block job execution.
 
@@ -1208,7 +1254,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             if not docs_path.exists():
                 return
 
-            registered_count = 0
+            # Collect eligible files
+            files: List[Tuple[Path, str]] = []
             for file_path in sorted(docs_path.rglob("*")):
                 if not file_path.is_file():
                     continue
@@ -1224,21 +1271,90 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                     continue
 
-                try:
-                    context.get_or_register_doc_source(
-                        str(file_path), name=file_path.name
-                    )
-                    registered_count += 1
-                except Exception as e:
-                    logger.debug(f"Could not register document {file_path.name}: {e}")
+                files.append((file_path, file_path.name))
 
+            if not files:
+                return
+
+            start_time = time.monotonic()
+            logger.info(f"Starting background registration of {len(files)} document(s)...")
+
+            # Process in parallel — each thread gets its own CitationEngine
+            max_workers = min(len(files), 4)
+            results: List[Optional[Tuple[str, int]]] = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._process_single_document,
+                        file_path,
+                        name,
+                        context,
+                    )
+                    for file_path, name in files
+                ]
+                for future in futures:
+                    results.append(future.result())
+
+            # Update source registry from results (single-threaded, no race)
+            registered_count = 0
+            for result in results:
+                if result is not None:
+                    file_path_str, source_id = result
+                    context._source_registry[file_path_str] = source_id
+                    registered_count += 1
+
+            elapsed = time.monotonic() - start_time
             if registered_count > 0:
                 logger.info(
-                    f"Auto-registered {registered_count} input document(s) as citation sources"
+                    f"Registered {registered_count} document(s) in {elapsed:.1f}s (parallel)"
                 )
 
         except Exception as e:
             logger.warning(f"Auto-registration of input documents failed (non-fatal): {e}")
+
+    def _process_single_document(
+        self,
+        file_path: Path,
+        name: str,
+        context: "ToolContext",
+    ) -> Optional[Tuple[str, int]]:
+        """Process a single document in a worker thread.
+
+        Creates an independent CitationEngine instance with its own DB
+        connection for thread safety.
+
+        Args:
+            file_path: Absolute path to the document file
+            name: Human-readable name for the source
+            context: ToolContext (used only for job_id and agent_id)
+
+        Returns:
+            Tuple of (file_path_str, source_id) on success, None on failure
+        """
+        engine = None
+        try:
+            from citation_engine import CitationEngine, CitationContext
+
+            ctx = CitationContext(
+                session_id=context.job_id or "unknown",
+                agent_id=context.config.get("agent_id", "unknown"),
+            )
+            engine = CitationEngine(mode="multi-agent", context=ctx)
+            engine._connect()
+
+            source = engine.add_doc_source(str(file_path), name=name)
+            return (str(file_path), source.id)
+
+        except Exception as e:
+            logger.debug(f"Could not register document {name}: {e}")
+            return None
+        finally:
+            if engine is not None:
+                try:
+                    engine.close()
+                except Exception:
+                    pass
 
     def _create_datasource_connection(self, ds: Dict[str, Any]) -> Any:
         """Create a connection to an external datasource.
