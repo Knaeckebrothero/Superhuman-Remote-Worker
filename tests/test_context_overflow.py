@@ -4,11 +4,13 @@ Tests the token counting and overflow detection in ReasoningCapturingClient.
 """
 
 import json
+import httpx
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.llm.exceptions import ContextOverflowError
 from src.llm.reasoning_chat import (
+    AsyncReasoningCapturingClient,
     ReasoningCapturingClient,
     count_request_tokens,
     DEFAULT_MAX_CONTEXT_TOKENS,
@@ -378,3 +380,65 @@ class TestIntegration:
 
         count = count_request_tokens(body)
         assert count > 100000  # Should be very large
+
+
+# =============================================================================
+# Tests for AsyncReasoningCapturingClient
+# =============================================================================
+
+
+class TestAsyncReasoningCapturingClient:
+    """Tests for the async HTTP client with context limit validation."""
+
+    @pytest.mark.asyncio
+    async def test_async_raises_on_overflow(self, large_request_body):
+        """Async client should raise ContextOverflowError when over limit."""
+        client = AsyncReasoningCapturingClient(max_context_tokens=100)
+
+        request = MagicMock()
+        request.url = "https://api.openai.com/v1/chat/completions"
+        request.content = json.dumps(large_request_body).encode()
+
+        with pytest.raises(ContextOverflowError) as exc_info:
+            await client.send(request)
+
+        assert exc_info.value.token_count > exc_info.value.limit
+        assert exc_info.value.limit == 100
+
+    @pytest.mark.asyncio
+    async def test_async_skips_non_chat_requests(self, large_request_body):
+        """Async client should not validate non-chat-completion requests."""
+        client = AsyncReasoningCapturingClient(max_context_tokens=100)
+
+        request = MagicMock()
+        request.url = "https://api.openai.com/v1/embeddings"
+        request.content = json.dumps(large_request_body).encode()
+
+        with patch.object(httpx.AsyncClient, "send", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = MagicMock(content=b"{}")
+            await client.send(request)
+            mock_send.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_async_key_injection(self):
+        """Async client should inject KeyRing key into request header."""
+        mock_ring = MagicMock()
+        mock_ring.current_key = "sk-injected-key"
+        mock_ring.has_alternatives = False
+
+        client = AsyncReasoningCapturingClient(
+            max_context_tokens=100_000,
+            key_ring=mock_ring,
+        )
+
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+        request = MagicMock()
+        request.url = "https://api.openai.com/v1/chat/completions"
+        request.content = json.dumps(body).encode()
+        request.headers = {}
+
+        with patch.object(httpx.AsyncClient, "send", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = MagicMock(content=b'{"choices":[{"message":{}}]}')
+            await client.send(request)
+
+        assert request.headers["authorization"] == "Bearer sk-injected-key"

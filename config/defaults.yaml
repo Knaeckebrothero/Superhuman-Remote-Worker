@@ -2,7 +2,7 @@
 # Framework defaults - agents extend this via $extends
 
 agent_id: default
-display_name: Remote Worker
+display_name: General Secretary
 
 llm:
   model: openai/gpt-oss-120b
@@ -13,6 +13,7 @@ llm:
   timeout: 600
   max_retries: 3
   multimodal: false  # Set to true if model can process images directly
+  parallel_tool_calls: false  # Set to true for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)
 
 workspace:
   structure:
@@ -96,6 +97,10 @@ tools:
   # MongoDB tools - MongoDB operations (src/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
+  # Coding tools - shell execution + Claude Code delegation (src/tools/coding/)
+  coding:
+    - run_command
+    # - claude_code  # Requires: Claude Code CLI installed + authenticated
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -136,4 +141,9 @@ browser:
   headless: true
   timeout: 60000  # Milliseconds
   use_vision: false  # DOM-based by default (works with any LLM)
+
+# Claude Code delegation settings (used when claude_code tool is enabled)
+# claude_code:
+#   model: claude-opus-4-6   # Model for Claude Code sessions
+#   effort_level: high        # Reasoning effort: low, medium, high
 

@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=../../schema.json
+# Critic - Proactive code review, quality gating, idea rejection
+$extends: defaults
+
+agent_id: critic
+display_name: Critic
+description: |
+  Quality gatekeeper. Reviews code diffs, evaluates Scholar proposals,
+  audits the codebase for tech debt, and runs tests. Nothing passes
+  without meeting the standard. Harsh, direct, evidence-based.
+icon: gavel
+color: "#f38ba8"
+tags:
+  - review
+  - quality
+  - gating
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - output/reviews/
+    - output/audits/
+    - notes/
+  git_versioning: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - list_files
+    - search_files
+    - file_exists
+    - get_workspace_summary
+    - get_document_info
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  coding:
+    - run_command
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # SQL injected when system datasource attached (for querying job data)
+  sql: []
+  # Not needed
+  document: []
+  research: []
+  citation: []
+  graph: []
+  mongodb: []

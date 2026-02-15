@@ -503,7 +503,6 @@ def finalize_job(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
     todo_manager: "TodoManager",
-    postgres_db: Optional[Any] = None,
 ) -> TransitionResult:
     """Finalize the job for human review.
 
@@ -513,14 +512,15 @@ def finalize_job(
 
     Actions:
     - Write output/job_frozen.json with summary/deliverables
-    - Update PostgreSQL job status to 'pending_review'
     - Return TransitionResult with should_stop=True
+
+    Note: The database status update to 'pending_review' is handled by
+    the async handle_transition node in graph.py.
 
     Args:
         state: Current agent state
         workspace: WorkspaceManager for file access
         todo_manager: TodoManager (for archiving)
-        postgres_db: Optional PostgreSQL database for status update
 
     Returns:
         TransitionResult with should_stop=True to end the agent loop
@@ -565,34 +565,9 @@ def finalize_job(
     logger.info(f"[{job_id}] JOB FROZEN for review: {freeze_data['summary']}")
     logger.info(f"[{job_id}] Deliverables: {freeze_data['deliverables']}")
 
-    # Update job status in PostgreSQL (async operation handled synchronously here)
-    db_updated = False
-    if postgres_db:
-        try:
-            import asyncio
-
-            async def update_status():
-                await postgres_db.jobs.update_status(
-                    job_id,
-                    status="pending_review",
-                )
-                return True
-
-            # Run the async operation
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # We're already in an async context, create a task
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, update_status())
-                    db_updated = future.result(timeout=10)
-            else:
-                db_updated = loop.run_until_complete(update_status())
-
-            if db_updated:
-                logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
-        except Exception as e:
-            logger.error(f"[{job_id}] Error updating job status in database: {e}")
+    # NOTE: Database status update to 'pending_review' is handled by the
+    # async handle_transition node in graph.py, which can properly await
+    # the asyncpg pool on the correct event loop.
 
     # Clear the final phase data
     clear_final_phase_data(job_id)
@@ -612,10 +587,9 @@ def finalize_job(
         todo_manager.archive("final")
 
     # Create completion message
-    db_status = " Database updated to 'pending_review'." if db_updated else ""
     completion_msg = HumanMessage(
         content=(
-            f"[JOB_FROZEN] Job frozen for human review.{db_status}\n"
+            f"[JOB_FROZEN] Job frozen for human review.\n"
             f"Wrote: {output_path}\n"
             f"Summary: {freeze_data['summary']}\n"
             f"Deliverables: {len(freeze_data['deliverables'])} files\n"
@@ -685,7 +659,6 @@ def on_strategic_phase_complete(
     todo_manager: "TodoManager",
     min_todos: int = 5,
     max_todos: int = 20,
-    postgres_db: Optional[Any] = None,
 ) -> TransitionResult:
     """Handle transition from strategic phase to tactical phase.
 
@@ -716,7 +689,6 @@ def on_strategic_phase_complete(
         todo_manager: TodoManager for loading todos
         min_todos: Minimum todos required (default: 5, used by staging)
         max_todos: Maximum todos allowed (default: 20, used by staging)
-        postgres_db: Optional PostgreSQL database for job status update
 
     Returns:
         TransitionResult indicating success/failure with state updates
@@ -732,7 +704,7 @@ def on_strategic_phase_complete(
 
     if is_final or final_data:
         logger.info(f"[{job_id}] Final phase detected, completing job")
-        return finalize_job(state, workspace, todo_manager, postgres_db)
+        return finalize_job(state, workspace, todo_manager)
 
     logger.info(f"[{job_id}] Strategic phase complete, checking for staged todos")
 
@@ -878,7 +850,6 @@ def handle_phase_transition(
     min_todos: int = 5,
     max_todos: int = 20,
     config: Optional["AgentConfig"] = None,
-    postgres_db: Optional[Any] = None,
 ) -> TransitionResult:
     """Route to the appropriate phase transition handler.
 
@@ -892,7 +863,6 @@ def handle_phase_transition(
         min_todos: Minimum todos for strategic->tactical transition
         max_todos: Maximum todos for strategic->tactical transition
         config: Agent configuration for loading strategic todos from template
-        postgres_db: Optional PostgreSQL database for job status update
 
     Returns:
         TransitionResult from the appropriate handler
@@ -901,7 +871,7 @@ def handle_phase_transition(
 
     if is_strategic:
         return on_strategic_phase_complete(
-            state, workspace, todo_manager, min_todos, max_todos, postgres_db
+            state, workspace, todo_manager, min_todos, max_todos
         )
     else:
         return on_tactical_phase_complete(state, workspace, todo_manager, config)

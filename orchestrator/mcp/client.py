@@ -1300,3 +1300,25 @@ class AsyncCockpitClient:
         resp = await self._client.get(f"/api/jobs/{job_id}/citations/stats")
         resp.raise_for_status()
         return resp.json()
+
+    # =========================================================================
+    # Agent System Monitoring
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def get_agent_system_info(self, agent_id: str) -> dict[str, Any]:
+        """Get system information from an agent's container.
+
+        Proxied through the orchestrator to the agent's /system/info endpoint.
+        Returns CPU, memory, disk, listening ports, processes, and network connections.
+
+        Args:
+            agent_id: Agent UUID
+
+        Returns:
+            Dict with cpu, memory, disk, listening_ports, processes,
+            network_connections, and agent info
+        """
+        resp = await self._client.get(f"/api/agents/{agent_id}/system-info")
+        resp.raise_for_status()
+        return resp.json()

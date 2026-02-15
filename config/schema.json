@@ -71,7 +71,7 @@
         },
         "reasoning_level": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "default": "high",
           "description": "Reasoning depth for models that support it"
         },
@@ -96,6 +96,17 @@
           "type": "boolean",
           "default": false,
           "description": "Whether the primary model can process images directly. When true, visual content (document screenshots, images) is sent as base64-encoded images. When false, visual content is converted to text descriptions via a separate vision model."
+        },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the model to make multiple tool calls per response. Enable for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)."
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "default": null,
+          "description": "Override max output tokens (auto-detected if null)"
         },
         "strategic": {
           "$ref": "#/$defs/llmPhaseOverride",
@@ -249,8 +260,8 @@
           "items": {
             "type": "string"
           },
-          "description": "Coding/execution tools for shell command execution (src/tools/coding/)",
-          "examples": [["run_command"]]
+          "description": "Coding/execution tools: shell commands and Claude Code delegation (src/tools/coding/)",
+          "examples": [["run_command", "claude_code"]]
         }
       }
     },
@@ -341,7 +352,7 @@
         },
         "reasoning_level": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "default": "high",
           "description": "Reasoning effort level hint for summarization (injected as {oss_reasoning_level})"
         },
@@ -404,6 +415,24 @@
           "description": "Use screenshot-based navigation instead of DOM/accessibility tree"
         }
       }
+    },
+    "claude_code": {
+      "type": "object",
+      "description": "Claude Code CLI delegation settings",
+      "properties": {
+        "model": {
+          "type": "string",
+          "default": "claude-opus-4-6",
+          "description": "Model for Claude Code sessions (--model flag)"
+        },
+        "effort_level": {
+          "type": "string",
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+          "default": "high",
+          "description": "Reasoning effort level (CLAUDE_CODE_EFFORT_LEVEL env var)"
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": true,
@@ -429,7 +458,7 @@
         },
         "reasoning_level": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "description": "Reasoning depth override"
         },
         "base_url": {
@@ -454,6 +483,15 @@
         "multimodal": {
           "type": "boolean",
           "description": "Override whether this phase's model can process images directly"
+        },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "description": "Override parallel tool calls for this phase"
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Override max output tokens for this phase"
         }
       },
       "additionalProperties": false
