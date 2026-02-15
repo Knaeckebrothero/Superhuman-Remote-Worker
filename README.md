@@ -297,7 +297,6 @@ pytest tests/ --cov=src                    # With coverage
 | **Scholar** | `config/experts/scholar/` | Continuous R&D exploration, idea generation, web research |
 | **Critic** | `config/experts/critic/` | Code review, proposal review, codebase audits, test execution |
 | **Developer** | `config/experts/developer/` | Claude Code delegation, PR factory, implementation |
-| **Unrestricted** | `config/experts/unrestricted/` | Full container access, no sandbox — escape hatch |
 
 All experts share the same universal agent codebase. Configs live in `config/` and use `$extends: defaults` for inheritance. See [config/README.md](config/README.md) for details.
 

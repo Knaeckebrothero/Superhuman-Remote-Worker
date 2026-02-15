@@ -2467,18 +2467,6 @@ def _scan_experts() -> list[ExpertInfo]:
     experts_dir = config_dir / "experts"
     experts: list[ExpertInfo] = []
 
-    # Add synthetic defaults entry
-    experts.append(
-        ExpertInfo(
-            id="defaults",
-            display_name="Generalist Agent",
-            description="General-purpose agent with balanced capabilities for requirement extraction, validation, and compliance checking.",
-            icon="psychology",
-            color="#cba6f7",
-            tags=["general", "requirements", "compliance"],
-        )
-    )
-
     if not experts_dir.is_dir():
         return experts
 
