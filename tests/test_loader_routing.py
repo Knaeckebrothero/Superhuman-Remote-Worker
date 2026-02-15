@@ -6,9 +6,11 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from src.core.loader import (
+    _detect_provider,
     _needs_custom_base_url,
     _should_use_reasoning_summary,
     _create_openai_llm,
+    _create_openrouter_llm,
 )
 
 
@@ -225,3 +227,117 @@ class TestReasoningSummaryRouting:
         call_kwargs = mock_chat.call_args[1]
         assert "reasoning" not in call_kwargs
         assert "model_kwargs" not in call_kwargs
+
+
+class TestDetectProviderOpenRouter:
+    """Unit tests for openrouter/ prefix detection in _detect_provider."""
+
+    def test_openrouter_prefix(self):
+        assert _detect_provider("openrouter/anthropic/claude-opus-4") == "openrouter"
+
+    def test_openrouter_prefix_case_insensitive(self):
+        assert _detect_provider("OpenRouter/openai/gpt-4o") == "openrouter"
+        assert _detect_provider("OPENROUTER/meta-llama/llama-3") == "openrouter"
+
+    def test_openrouter_various_models(self):
+        assert _detect_provider("openrouter/deepseek/deepseek-r1") == "openrouter"
+        assert _detect_provider("openrouter/openai/gpt-4o-mini") == "openrouter"
+        assert _detect_provider("openrouter/meta-llama/llama-3.3-70b-instruct") == "openrouter"
+
+    def test_explicit_provider_overrides_prefix(self):
+        """Explicit provider should always win over prefix detection."""
+        assert _detect_provider("openrouter/some-model", "openai") == "openai"
+
+    def test_other_providers_unchanged(self):
+        """Ensure openrouter detection doesn't break existing providers."""
+        assert _detect_provider("claude-sonnet-4-20250514") == "anthropic"
+        assert _detect_provider("gemini-2.0-flash") == "google"
+        assert _detect_provider("groq/llama-3") == "groq"
+        assert _detect_provider("gpt-4o") == "openai"
+
+
+class TestOpenRouterLLMCreation:
+    """Integration tests for _create_openrouter_llm."""
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_strips_prefix_and_sets_base_url(self, mock_chat):
+        """Should strip openrouter/ prefix and use OpenRouter base URL."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openrouter/anthropic/claude-opus-4")
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model"] == "anthropic/claude-opus-4"
+        assert call_kwargs["base_url"] == "https://openrouter.ai/api/v1"
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_explicit_base_url_overrides(self, mock_chat):
+        """Explicit config.base_url should override the default OpenRouter URL."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="openrouter/openai/gpt-4o",
+            base_url="https://custom-proxy.example.com/v1",
+        )
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["base_url"] == "https://custom-proxy.example.com/v1"
+
+    @patch.dict(os.environ, {
+        "OPENROUTER_API_KEY": "sk-or-test-key",
+        "OPENROUTER_REFERER": "https://my-app.com",
+        "OPENROUTER_TITLE": "My Agent",
+    }, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_custom_headers(self, mock_chat):
+        """Should pass HTTP-Referer and X-Title headers when env vars are set."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openrouter/openai/gpt-4o")
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["default_headers"] == {
+            "HTTP-Referer": "https://my-app.com",
+            "X-Title": "My Agent",
+        }
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_reasoning_in_model_kwargs(self, mock_chat):
+        """Reasoning should go in model_kwargs (no Responses API on OpenRouter)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openrouter/deepseek/deepseek-r1", reasoning_level="high")
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "reasoning" not in call_kwargs
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+
+    def test_missing_api_key_raises(self):
+        """Should raise ValueError when OPENROUTER_API_KEY is not set."""
+        env = os.environ.copy()
+        env.pop("OPENROUTER_API_KEY", None)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = _make_config(model="openrouter/openai/gpt-4o")
+            with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+                _create_openrouter_llm(config, limits=None)
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-key1,sk-or-key2"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_multiple_keys(self, mock_chat):
+        """Should support comma-separated keys for rotation."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openrouter/openai/gpt-4o")
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        # First key should be passed to SDK
+        assert call_kwargs["api_key"] == "sk-or-key1"

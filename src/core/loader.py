@@ -256,7 +256,7 @@ class LLMConfig:
     """
 
     model: str = "gpt-4o"
-    provider: Optional[str] = None  # "openai", "anthropic", "google", "groq" (auto-detect if None)
+    provider: Optional[str] = None  # "openai", "anthropic", "google", "groq", "openrouter" (auto-detect if None)
     temperature: float = 0.0
     reasoning_level: str = "high"
     base_url: Optional[str] = None
@@ -792,11 +792,13 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
     """Detect LLM provider from model name or explicit setting.
 
     Args:
-        model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o")
-        explicit_provider: Explicit provider override ("openai", "anthropic", "google", "groq")
+        model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o",
+               "openrouter/anthropic/claude-opus-4")
+        explicit_provider: Explicit provider override ("openai", "anthropic", "google",
+                          "groq", "openrouter")
 
     Returns:
-        Provider name: "openai", "anthropic", "google", or "groq"
+        Provider name: "openai", "anthropic", "google", "groq", or "openrouter"
 
     Note:
         Groq requires explicit provider setting since it hosts open models
@@ -806,6 +808,8 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
         return explicit_provider.lower()
 
     model_lower = model.lower()
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
     if model_lower.startswith("groq/"):
         return "groq"
     if model_lower.startswith("claude"):
@@ -851,6 +855,7 @@ def create_llm(
     - Anthropic (Claude models)
     - Google (Gemini models)
     - Groq (fast inference for open models)
+    - OpenRouter (300+ models via unified API)
 
     Provider is auto-detected from model name or can be explicitly set via config.provider.
 
@@ -869,6 +874,8 @@ def create_llm(
         return _create_google_llm(config, limits)
     elif provider == "groq":
         return _create_groq_llm(config, limits)
+    elif provider == "openrouter":
+        return _create_openrouter_llm(config, limits)
     else:
         return _create_openai_llm(config, limits)
 
@@ -1107,6 +1114,115 @@ def _create_groq_llm(
     logger.info(
         f"Created Groq LLM: model={model}, temp={config.temperature}, "
         f"timeout={config.timeout}s, max_retries={config.max_retries}"
+    )
+
+    return llm
+
+
+def _create_openrouter_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create OpenRouter LLM (300+ models via unified OpenAI-compatible API).
+
+    Requires OPENROUTER_API_KEY environment variable or config.api_key.
+    Routes through ReasoningChatOpenAI with the OpenRouter base URL.
+
+    Model names are specified as openrouter/<provider>/<model>, e.g.:
+    - openrouter/anthropic/claude-opus-4
+    - openrouter/openai/gpt-4o
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - openrouter/deepseek/deepseek-r1
+
+    The openrouter/ prefix is stripped before sending to the API.
+
+    Multiple API keys can be provided as a comma-separated string in
+    OPENROUTER_API_KEY for automatic fallback rotation.
+
+    Optional headers (for OpenRouter leaderboard):
+    - OPENROUTER_REFERER: Your site URL
+    - OPENROUTER_TITLE: Your app name
+    """
+    from src.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    # Parse API keys (supports comma-separated list for fallback)
+    raw_key = config.api_key or os.getenv("OPENROUTER_API_KEY")
+    if not raw_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY environment variable required for OpenRouter provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+    keys = parse_key_string(raw_key)
+    if not keys:
+        raise ValueError("OPENROUTER_API_KEY is empty after parsing.")
+    cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
+    key_ring = get_or_create_key_ring(keys, provider="openrouter", cooldown_seconds=cooldown)
+
+    # SDK gets the first key; KeyRing overrides the header in send()
+    api_key = keys[0]
+
+    # Strip openrouter/ prefix — OpenRouter expects provider/model format
+    model = config.model
+    if model.lower().startswith("openrouter/"):
+        model = model[len("openrouter/"):]
+
+    # Base URL: explicit config wins, otherwise always OpenRouter
+    base_url = config.base_url or "https://openrouter.ai/api/v1"
+
+    # Build model kwargs
+    model_kwargs = {}
+
+    # OpenRouter proxies Chat Completions only (no Responses API),
+    # so reasoning_effort goes in model_kwargs when set
+    if config.reasoning_level and config.reasoning_level != "none":
+        model_kwargs["reasoning_effort"] = config.reasoning_level
+
+    # Build kwargs for ReasoningChatOpenAI
+    llm_kwargs = {
+        "model": model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_retries": config.max_retries,
+    }
+
+    # Add optional OpenRouter headers for leaderboard identification
+    default_headers = {}
+    referer = os.getenv("OPENROUTER_REFERER")
+    title = os.getenv("OPENROUTER_TITLE")
+    if referer:
+        default_headers["HTTP-Referer"] = referer
+    if title:
+        default_headers["X-Title"] = title
+    if default_headers:
+        llm_kwargs["default_headers"] = default_headers
+
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+
+    if model_kwargs:
+        llm_kwargs["model_kwargs"] = model_kwargs
+
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
+
+    # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
+    max_context_tokens = limits.model_max_context_tokens if limits else None
+    if max_context_tokens:
+        llm_kwargs["max_context_tokens"] = max_context_tokens
+
+    # Pass KeyRing for automatic key rotation
+    llm_kwargs["key_ring"] = key_ring
+
+    llm = ReasoningChatOpenAI(**llm_kwargs)
+
+    key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
+    reasoning_mode = f"chat_completions(effort={config.reasoning_level})" if config.reasoning_level and config.reasoning_level != "none" else "none"
+    logger.info(
+        f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
+        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
+        f"reasoning={reasoning_mode}, keys={key_info}"
     )
 
     return llm
