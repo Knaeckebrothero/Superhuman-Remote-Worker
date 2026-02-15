@@ -380,6 +380,9 @@ Required in `.env`:
 - `ANTHROPIC_API_KEY` - For Claude models (claude-*)
 - `GOOGLE_API_KEY` - For Gemini models (gemini-*)
 - `GROQ_API_KEY` - For Groq fast inference
+- `OPENROUTER_API_KEY` - For OpenRouter (openrouter/* models, 300+ models via unified API)
+- `OPENROUTER_REFERER` - Optional: your site URL for OpenRouter leaderboard
+- `OPENROUTER_TITLE` - Optional: your app name for OpenRouter leaderboard
 - `TAVILY_API_KEY` - Web search
 - `MONGODB_URL` - LLM request archiving (audit trail)
 - `DEFAULT_DS_*` - Default datasources (see `docs/datasources.md`)

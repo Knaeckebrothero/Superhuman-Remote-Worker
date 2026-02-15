@@ -11,6 +11,7 @@
     { group: 'Anthropic', models: ['claude-sonnet-4-5-20250929', 'claude-opus-4-6'] },
     { group: 'Google', models: ['gemini-2.5-pro', 'gemini-2.5-flash'] },
     { group: 'Groq', models: ['groq/moonshotai/kimi-k2-instruct-0905', 'groq/gpt-oss-120b'] },
+    { group: 'OpenRouter', models: ['openrouter/minimax/minimax-m2.5'] },
   ];
 
   // Quick-select presets for strategic + tactical model combinations.
