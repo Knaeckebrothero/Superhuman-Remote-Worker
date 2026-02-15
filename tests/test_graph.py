@@ -742,7 +742,8 @@ todos:
 class TestHandleTransitionNode:
     """Tests for handle_transition node."""
 
-    def test_strategic_to_tactical_success(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_strategic_to_tactical_success(self, managers, mock_config):
         """Test successful strategic -> tactical transition."""
         # Write valid todos.yaml
         content = """
@@ -778,7 +779,7 @@ todos:
             "phase_number": 0,
             "iteration": 10,
         }
-        result = node(state)
+        result = await node(state)
 
         # Should inject phase boundary marker
         assert len(result.get("messages", [])) == 1
@@ -792,7 +793,8 @@ todos:
         todos = managers["todo"].list_all()
         assert len(todos) == 5
 
-    def test_strategic_to_tactical_rejection(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_strategic_to_tactical_rejection(self, managers, mock_config):
         """Test rejected strategic -> tactical transition (no todos.yaml)."""
         # Add phase_settings to mock config
         phase_settings = MagicMock()
@@ -811,14 +813,15 @@ todos:
             "phase_number": 0,
             "iteration": 10,
         }
-        result = node(state)
+        result = await node(state)
 
         # Should have error message
         assert "messages" in result
         assert len(result["messages"]) == 1
         assert "[TRANSITION_REJECTED]" in result["messages"][0].content
 
-    def test_tactical_to_strategic_transition(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_tactical_to_strategic_transition(self, managers, mock_config):
         """Test tactical -> strategic transition (archives and loads strategic todos)."""
         # Add some completed todos
         managers["todo"].add("Task 1")
@@ -841,7 +844,7 @@ todos:
             "phase_number": 1,
             "iteration": 20,
         }
-        result = node(state)
+        result = await node(state)
 
         # Should inject phase boundary marker
         assert len(result.get("messages", [])) == 1
@@ -864,7 +867,8 @@ todos:
 class TestPhaseAlternationCycle:
     """Integration tests for the full phase alternation cycle."""
 
-    def test_full_strategic_tactical_strategic_cycle(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_full_strategic_tactical_strategic_cycle(self, managers, mock_config):
         """Test a complete cycle: init → strategic → tactical → strategic."""
         # Configure mock
         phase_settings = MagicMock()
@@ -914,7 +918,7 @@ todos:
         )
 
         state["iteration"] = 10
-        result = transition_node(state)
+        result = await transition_node(state)
         state.update(result)
 
         # Verify transition to tactical
@@ -929,7 +933,7 @@ todos:
 
         # Step 5: Transition tactical → strategic
         state["iteration"] = 20
-        result = transition_node(state)
+        result = await transition_node(state)
         state.update(result)
 
         # Verify transition back to strategic
@@ -961,7 +965,8 @@ todos:
         assert result.get("goal_achieved") is True
         assert result.get("should_stop") is True
 
-    def test_transition_rejection_retryable(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_transition_rejection_retryable(self, managers, mock_config):
         """Test that transition rejection allows retry."""
         phase_settings = MagicMock()
         phase_settings.min_todos = 5
@@ -983,7 +988,7 @@ todos:
             "phase_number": 0,
             "iteration": 10,
         }
-        result = transition_node(state)
+        result = await transition_node(state)
 
         # Should be rejected
         assert "[TRANSITION_REJECTED]" in result["messages"][0].content
@@ -1012,7 +1017,7 @@ todos:
 
         # Try transition again
         state["iteration"] = 15
-        result = transition_node(state)
+        result = await transition_node(state)
 
         # Should succeed now
         assert len(result.get("messages", [])) == 1
@@ -1023,7 +1028,8 @@ todos:
         # route_after_transition should proceed to check_goal
         assert route_after_transition({"messages": result["messages"]}) == "check_goal"
 
-    def test_workspace_memory_persists_across_phases(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_workspace_memory_persists_across_phases(self, managers, mock_config):
         """Test that workspace.md content persists across phase transitions."""
         phase_settings = MagicMock()
         phase_settings.min_todos = 5
@@ -1070,7 +1076,7 @@ todos:
         state["is_strategic_phase"] = True
         state["phase_number"] = 0
         state["iteration"] = 10
-        transition_node(state)
+        await transition_node(state)
 
         # Verify memory still exists after transition
         memory_content = managers["memory"].read()
@@ -1086,7 +1092,7 @@ todos:
         state["is_strategic_phase"] = False
         state["phase_number"] = 1
         state["iteration"] = 20
-        transition_node(state)
+        await transition_node(state)
 
         # Verify both facts persist
         memory_content = managers["memory"].read()

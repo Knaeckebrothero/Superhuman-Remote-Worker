@@ -1,18 +1,27 @@
 # yaml-language-server: $schema=../../schema.json
-# Coding Agent - implements features, fixes bugs, runs tests, submits PRs
+# Developer - Claude Code delegation, PR factory
 $extends: defaults
 
-agent_id: coder
-display_name: Coding Agent
+agent_id: developer
+display_name: Developer
 description: |
-  Implements features, fixes bugs, runs tests, and submits pull requests.
-  Needs a git repository URL (--git-url) to clone into the workspace.
+  Implementation engine. Receives approved ideas and implementation tasks,
+  delegates to Claude Code sessions, manages PRs. Throughput-focused and
+  systematic. One todo = one delegation = one focused change.
 icon: code
-color: "#a6e3a1"
+color: "#89b4fa"
 tags:
   - coding
   - development
-  - automation
+  - delegation
+
+llm:
+  model: gpt-5.2
+  reasoning_level: high
+
+claude_code:
+  model: claude-opus-4-6
+  effort_level: high
 
 workspace:
   structure:
@@ -26,17 +35,13 @@ tools:
   workspace:
     - read_file
     - write_file
-    - edit_file
     - list_files
     - search_files
     - file_exists
-    - move_file
-    - copy_file
-    - delete_file
-    - create_directory
-    - delete_directory
+    - get_workspace_summary
+    - get_document_info
   coding:
-    - run_command
+    - claude_code
   core:
     - next_phase_todos
     - todo_complete
@@ -46,7 +51,6 @@ tools:
   git:
     - git_log
     - git_diff
-    - git_show
     - git_status
     - git_tags
   # Disable unused tool categories

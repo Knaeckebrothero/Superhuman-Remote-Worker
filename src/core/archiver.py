@@ -69,11 +69,26 @@ def _serialize_for_mongo(obj: Any) -> Any:
     return obj
 
 
+def _normalize_content(content) -> str:
+    """Normalize message content to string, handling Responses API list content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and "text" in block:
+                parts.append(block["text"])
+        return " ".join(parts).strip()
+    return str(content) if content else ""
+
+
 def _message_to_dict(msg: BaseMessage) -> Dict[str, Any]:
     """Convert a LangChain message to a serializable dict."""
     result = {
         "type": msg.__class__.__name__,
-        "content": msg.content if isinstance(msg.content, str) else str(msg.content),
+        "content": _normalize_content(msg.content),
     }
 
     # Add role for clarity
@@ -329,10 +344,10 @@ class LLMArchiver:
 
             # Count tokens approximately
             total_input_chars = sum(
-                len(m.content) if isinstance(m.content, str) else 0
+                len(_normalize_content(m.content))
                 for m in messages
             )
-            response_chars = len(response.content) if isinstance(response.content, str) else 0
+            response_chars = len(_normalize_content(response.content))
 
             doc["metrics"] = {
                 "input_chars": total_input_chars,
@@ -497,7 +512,7 @@ class LLMArchiver:
                 if isinstance(msg, SystemMessage):
                     continue
 
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                content = _normalize_content(msg.content)
 
                 input_entry: Dict[str, Any] = {
                     "type": "human" if isinstance(msg, HumanMessage) else "tool",
@@ -513,7 +528,7 @@ class LLMArchiver:
                 new_inputs.append(input_entry)
 
             # Extract response
-            resp_content = response.content if isinstance(response.content, str) else str(response.content)
+            resp_content = _normalize_content(response.content)
             response_data: Dict[str, Any] = {
                 "content": resp_content,
                 "content_preview": self._truncate_string(resp_content, 500),

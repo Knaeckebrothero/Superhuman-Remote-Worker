@@ -365,16 +365,36 @@ class ContextManager:
         self,
         config: Optional[ContextConfig] = None,
         model: str = "gpt-4",
+        strategic_model: Optional[str] = None,
+        tactical_model: Optional[str] = None,
     ):
         """Initialize context manager.
 
         Args:
             config: Context management configuration
-            model: Model name for token counting
+            model: Model name for token counting (default/fallback)
+            strategic_model: Model name for strategic phase token counting
+            tactical_model: Model name for tactical phase token counting
         """
         self.config = config or ContextConfig()
-        self.token_counter = get_token_counter(model)
+        self._default_counter = get_token_counter(model)
+        self._phase_counters: Dict[str, Callable[[List[BaseMessage]], int]] = {}
+        if strategic_model:
+            self._phase_counters["strategic"] = get_token_counter(strategic_model)
+        if tactical_model:
+            self._phase_counters["tactical"] = get_token_counter(tactical_model)
+        self.token_counter = self._default_counter
         self._state = ContextManagementState()
+
+    def set_current_phase(self, phase: str) -> None:
+        """Switch token counter to the appropriate phase-specific model.
+
+        Falls back to the default counter if no phase-specific one exists.
+
+        Args:
+            phase: Phase name ("strategic" or "tactical")
+        """
+        self.token_counter = self._phase_counters.get(phase, self._default_counter)
 
     @property
     def state(self) -> ContextManagementState:

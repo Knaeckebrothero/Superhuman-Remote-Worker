@@ -230,6 +230,8 @@ class PhaseLLMOverride:
     timeout: Optional[float] = None
     max_retries: Optional[int] = None
     multimodal: Optional[bool] = None
+    parallel_tool_calls: Optional[bool] = None
+    max_output_tokens: Optional[int] = None
 
 
 @dataclass
@@ -262,6 +264,8 @@ class LLMConfig:
     timeout: Optional[float] = 600.0  # 10 minutes default
     max_retries: int = 3
     multimodal: bool = False  # Whether model can process images directly
+    parallel_tool_calls: bool = False  # Allow multiple tool calls per response
+    max_output_tokens: Optional[int] = None  # Override max output tokens (auto-detected if None)
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -296,6 +300,8 @@ class LLMConfig:
             timeout=override.timeout if override.timeout is not None else self.timeout,
             max_retries=override.max_retries if override.max_retries is not None else self.max_retries,
             multimodal=override.multimodal if override.multimodal is not None else self.multimodal,
+            parallel_tool_calls=override.parallel_tool_calls if override.parallel_tool_calls is not None else self.parallel_tool_calls,
+            max_output_tokens=override.max_output_tokens if override.max_output_tokens is not None else self.max_output_tokens,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -429,6 +435,8 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         timeout=data.get("timeout"),
         max_retries=data.get("max_retries"),
         multimodal=data.get("multimodal"),
+        parallel_tool_calls=data.get("parallel_tool_calls"),
+        max_output_tokens=data.get("max_output_tokens"),
     )
 
 
@@ -451,6 +459,8 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         timeout=llm_data.get("timeout", 600.0),
         max_retries=llm_data.get("max_retries", 3),
         multimodal=llm_data.get("multimodal", False),
+        parallel_tool_calls=llm_data.get("parallel_tool_calls", False),
+        max_output_tokens=llm_data.get("max_output_tokens"),
         # Phase-specific overrides
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
@@ -806,6 +816,30 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
     return "openai"
 
 
+def _needs_custom_base_url(model: str) -> bool:
+    """Check if model requires a custom base URL (OpenAI-compatible endpoint).
+
+    Models with 'openai/' prefix are served via OpenAI-compatible endpoints
+    (vLLM, llama.cpp, sglang) and need LLM_BASE_URL. Native OpenAI models
+    (gpt-*, o1-*, o3-*, o4-*) go directly to api.openai.com.
+    """
+    return model.lower().startswith("openai/")
+
+
+def _should_use_reasoning_summary(model: str) -> bool:
+    """Check if model supports readable reasoning summaries via the Responses API.
+
+    Native OpenAI reasoning models return reasoning content through the
+    Responses API when the reasoning.summary parameter is set.
+    Models with a '/' prefix (openai/*, groq/*) are proxy models and excluded.
+    """
+    model_lower = model.lower()
+    if "/" in model_lower:
+        return False
+    reasoning_prefixes = ("o1", "o3", "o4", "gpt-5")
+    return any(model_lower.startswith(p) for p in reasoning_prefixes)
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -848,22 +882,36 @@ def _create_openai_llm(
     Uses ReasoningChatOpenAI which provides:
     - reasoning_content capture for DeepSeek-style models
     - HTTP-layer context overflow protection
+    - Automatic API key rotation via KeyRing (when multiple keys configured)
 
     The base_url can point to any OpenAI-compatible endpoint (vLLM, Ollama, etc.)
-    """
-    # Get API key from config or environment
-    api_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
 
-    # Get base URL from config or environment
-    base_url = config.base_url or os.getenv("LLM_BASE_URL")
+    Multiple API keys can be provided as a comma-separated string in
+    OPENAI_API_KEY (e.g. "sk-key1,sk-key2,sk-key3"). The KeyRing will
+    rotate through them on auth/quota failures.
+    """
+    from src.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    # Parse API keys (supports comma-separated list for fallback)
+    raw_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
+    keys = parse_key_string(raw_key) or ["not-needed"]
+    cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
+    key_ring = get_or_create_key_ring(keys, provider="openai", cooldown_seconds=cooldown)
+
+    # SDK gets the first key; KeyRing overrides the header in send()
+    api_key = keys[0]
+
+    # Get base URL: explicit config wins, then LLM_BASE_URL for openai/ models only.
+    # Native OpenAI models (gpt-*, o1-*, etc.) go directly to api.openai.com.
+    if config.base_url:
+        base_url = config.base_url
+    elif _needs_custom_base_url(config.model):
+        base_url = os.getenv("LLM_BASE_URL")
+    else:
+        base_url = None
 
     # Build model kwargs
     model_kwargs = {}
-
-    # Add reasoning level if model supports it
-    if config.reasoning_level and config.reasoning_level != "none":
-        # Some models support reasoning_effort parameter
-        model_kwargs["reasoning_effort"] = config.reasoning_level
 
     # Build kwargs for ChatOpenAI
     llm_kwargs = {
@@ -872,6 +920,22 @@ def _create_openai_llm(
         "api_key": api_key,
         "max_retries": config.max_retries,
     }
+
+    # Add reasoning parameters
+    reasoning_mode = "none"
+    if config.reasoning_level and config.reasoning_level != "none":
+        if _should_use_reasoning_summary(config.model):
+            # Native OpenAI reasoning models: use Responses API with readable summaries.
+            # Passing reasoning={} triggers LangChain's automatic Responses API routing.
+            llm_kwargs["reasoning"] = {
+                "effort": config.reasoning_level,
+                "summary": "auto",
+            }
+            reasoning_mode = f"responses_api(effort={config.reasoning_level})"
+        else:
+            # Other models (DeepSeek, vLLM-hosted, etc.): use Chat Completions API.
+            model_kwargs["reasoning_effort"] = config.reasoning_level
+            reasoning_mode = f"chat_completions(effort={config.reasoning_level})"
 
     # Add timeout if specified
     if config.timeout is not None:
@@ -885,17 +949,25 @@ def _create_openai_llm(
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
 
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
+
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     max_context_tokens = limits.model_max_context_tokens if limits else None
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
+    # Pass KeyRing for automatic key rotation
+    llm_kwargs["key_ring"] = key_ring
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
+    key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
-        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}"
+        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
+        f"reasoning={reasoning_mode}, keys={key_info}"
     )
 
     return llm
@@ -929,13 +1001,19 @@ def _create_anthropic_llm(
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
 
-    # Anthropic requires max_tokens - set a reasonable default
-    # Use limits if available, otherwise default to 4096
-    if limits and limits.model_max_context_tokens:
-        # Reserve reasonable space for output (up to 8192 tokens)
-        llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
+    # Anthropic requires max_tokens - use config override or model-aware defaults
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
     else:
-        llm_kwargs["max_tokens"] = 4096
+        model_lower = config.model.lower()
+        if any(x in model_lower for x in ("opus-4-6", "opus-4-5", "opus-4-1", "opus-4-0")):
+            llm_kwargs["max_tokens"] = 32000
+        elif any(x in model_lower for x in ("sonnet-4-5", "sonnet-4-0")):
+            llm_kwargs["max_tokens"] = 16384
+        elif limits and limits.model_max_context_tokens:
+            llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
+        else:
+            llm_kwargs["max_tokens"] = 4096
 
     llm = ChatAnthropic(**llm_kwargs)
 
