@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- Job configuration (which agent config to use)
     config_name VARCHAR(100) DEFAULT 'default',
     config_override JSONB DEFAULT NULL,
+    resolved_config JSONB DEFAULT NULL,
     assigned_agent_id UUID,  -- FK added after agents table creation
 
     CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review')),
@@ -76,6 +77,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_creator_status ON jobs(creator_status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_config_name ON jobs(config_name);
 CREATE INDEX IF NOT EXISTS idx_jobs_assigned_agent ON jobs(assigned_agent_id);
+
+-- Migration: Add resolved_config column to existing databases
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN resolved_config JSONB DEFAULT NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
 
 -- ============================================================================
 -- 2. AGENTS TABLE

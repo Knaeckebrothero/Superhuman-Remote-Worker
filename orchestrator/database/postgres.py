@@ -477,7 +477,8 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, status, creator_status, validator_status,
-                       config_name, config_override, assigned_agent_id,
+                       config_name, config_override, resolved_config,
+                       assigned_agent_id,
                        created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1

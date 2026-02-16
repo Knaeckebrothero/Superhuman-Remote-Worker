@@ -1,0 +1,4 @@
+# Scholar expert prompt matrix
+# Only list entries that differ from the base matrix.
+
+default: {}
