@@ -28,35 +28,55 @@ The agent receives prompts assembled from multiple layered sources:
 
 ### Prompt File Locations
 
-**Shared** (`config/prompts/`):
+**Shared** (`config/`):
 
 | File | Purpose |
 |------|---------|
-| `systemprompt.txt` | Base template. Memory model, instruction hierarchy, working principles, meta-cognitive guardrails. Placeholders: `{oss_reasoning_level}`, `{agent_display_name}`, `{prompt_content}`, `{todos_content}` |
-| `strategic.txt` | Generic strategic phase directive. Review-reflect-adapt cycle, phase sizing, workspace compaction. |
-| `tactical.txt` | Generic tactical phase directive. Tunnel vision, per-todo workflow, atomicity. |
-| `instructions.md` | Generalist "Remote Worker" identity. Phase alternation model, tool usage, working principles, citation guidance. |
-| `summarization_prompt.txt` | Context compaction prompt for summarizing conversation history. |
+| `prompt_matrix.yaml` | Base prompt matrix mapping `(model_family, prompt_type)` → filename. Consulted as levels 3-4 of the resolution chain. |
+| `prompts/systemprompt.txt` | Base template. Memory model, instruction hierarchy, working principles, meta-cognitive guardrails. Placeholders: `{oss_reasoning_level}`, `{agent_display_name}`, `{prompt_content}`, `{todos_content}` |
+| `prompts/strategic.txt` | Generic strategic phase directive. Review-reflect-adapt cycle, phase sizing, workspace compaction. |
+| `prompts/tactical.txt` | Generic tactical phase directive. Tunnel vision, per-todo workflow, atomicity. |
+| `prompts/instructions.md` | Generalist "Remote Worker" identity. Phase alternation model, tool usage, working principles, citation guidance. |
+| `prompts/summarization_prompt.txt` | Context compaction prompt for summarizing conversation history. |
 
 **Per-expert** (`config/experts/<name>/`):
 
-| Expert | `config.yaml` | `instructions.md` | `strategic.txt` | `tactical.txt` |
-|--------|:-:|:-:|:-:|:-:|
-| Critic | custom | custom | **shared** | **shared** |
-| Developer | custom | custom | **custom** | **custom** |
-| Scholar | custom | custom | **shared** | **shared** |
+| Expert | `config.yaml` | `prompt_matrix.yaml` | `instruction_matrix.yaml` | `instructions.md` | `strategic.txt` | `tactical.txt` |
+|--------|:-:|:-:|:-:|:-:|:-:|:-:|
+| Critic | custom | custom | custom | custom | **shared** | **shared** |
+| Developer | custom | custom | custom | custom | **custom** | **custom** |
+| Scholar | custom | custom | custom | custom | **shared** | **shared** |
 
-The `PromptResolver` (`src/core/loader.py`) checks the expert directory first, then falls back to `config/prompts/`. This means any expert can override any prompt file by placing a same-named file in its directory.
+The system uses two parallel matrix resolvers, both inheriting from `MatrixResolver` (`src/core/loader.py`):
+
+**`PromptMatrixResolver`** — resolves prompt types (`systemprompt`, `strategic`, `tactical`, `summarization`) to filenames via `prompt_matrix.yaml`. File search: expert directory → `config/prompts/`.
+
+**`InstructionMatrixResolver`** — resolves instruction types (`instructions`, `strategic_todos_initial`, `strategic_todos_transition`, `strategic_todos_resume`, `workspace_template`, `todo_guide`) to filenames via `instruction_matrix.yaml`. File search: expert directory → `config/templates/`.
+
+Both use the same 4-level resolution chain:
+
+1. Expert matrix → model-specific key → type
+2. Expert matrix → `"default"` key → type
+3. Base matrix → model-specific key → type
+4. Base matrix → `"default"` key → type
+
+Once the filename is determined, `FileResolver` (base class, aliased as `PromptResolver`) locates the actual file — checking the expert directory first, then falling back to the framework directory. This means any expert can override any file by placing a same-named file in its directory, and model-specific variants can be configured via matrix YAML files without code changes.
+
+**Resolved Config JSONB**: On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
 
 ### How System Prompt Is Assembled
 
-`get_phase_system_prompt()` in `loader.py`:
+`get_phase_system_prompt(config, is_strategic, phase_number, todos_content, model)` in `loader.py`:
 
-1. Load `systemprompt.txt` (base template)
-2. Load `strategic.txt` or `tactical.txt` (phase component)
-3. Render `{phase_number}` in the phase component
-4. Inject rendered phase component into `{prompt_content}` in base template
-5. Render remaining placeholders (`{todos_content}`, `{agent_display_name}`, `{oss_reasoning_level}`)
+1. Detect model family from `model` via `detect_model_family()` (defaults to `"default"`)
+2. Create `PromptMatrixResolver` with the config's deployment dir and model family
+3. Load base template via `load_base_system_prompt(resolver)` → resolves `"systemprompt"` type
+4. Load phase component via `load_phase_component(is_strategic, resolver)` → resolves `"strategic"` or `"tactical"` type
+5. Render `{phase_number}` in the phase component
+6. Inject rendered phase component into `{prompt_content}` in base template
+7. Render remaining placeholders (`{todos_content}`, `{agent_display_name}`, `{oss_reasoning_level}`)
+
+Similarly, `load_summarization_prompt(config, model)` creates its own `PromptMatrixResolver` internally. `load_instructions(config, model)` uses `InstructionMatrixResolver` instead, resolving via `instruction_matrix.yaml` and `config/templates/`.
 
 ### How instructions.md Is Used
 
@@ -119,9 +139,11 @@ These sections describe phase-specific behavior, but they're delivered via `inst
 
 ### Issue F: No Model-Aware Prompting
 
+> **Status: Infrastructure implemented.** The `PromptMatrixResolver` and `detect_model_family()` are now the sole prompt resolution mechanism. All loading functions (`get_phase_system_prompt`, `load_instructions`, `load_summarization_prompt`) create a matrix resolver internally from the model name. The 4-level fallback chain (expert model-specific → expert default → base model-specific → base default) is fully operational. What remains is authoring model-specific prompt variants in `prompt_matrix.yaml` files and the corresponding prompt files.
+
 **Problem**: Prompts are written assuming a specific model behavior (currently: reasoning-capable OSS models via vLLM), but experts can be configured to use any model via YAML. Swapping an expert's model to a different family changes how it interprets the same prompt — and the prompt system has no way to adapt.
 
-The only model-specific element in the current prompt system is `{oss_reasoning_level}` rendered as `Reasoning: high` at the top of `systemprompt.txt`. Everything else is model-agnostic.
+Beyond `{oss_reasoning_level}` rendered as `Reasoning: high` at the top of `systemprompt.txt`, the prompt matrix system now provides the infrastructure to serve different prompt files per model family — but no model-specific variants have been authored yet. All families currently resolve to the same default filenames.
 
 **Current model assignments:**
 
@@ -143,15 +165,23 @@ The only model-specific element in the current prompt system is `{oss_reasoning_
 
 **Impact**: When an expert is swapped to a significantly different model (e.g., Scholar on Claude Sonnet instead of gpt-oss-120b), the prompt style may be suboptimal — too verbose for strong reasoners, too complex for weak models, or structured in a way the model doesn't handle well.
 
-**Potential approaches:**
+**Implemented approach — Prompt Matrix (combines Options 1 & 2 from original analysis):**
 
-1. **Model class property + conditional logic in `get_phase_system_prompt()`** — Add a `model_class` field to `LLMConfig` (auto-detected or explicit, e.g. `"reasoning"`, `"chat"`, `"compact"`). The Python code conditionally adjusts prompt sections based on class. Prompts stay as single files.
+The `PromptMatrixResolver` maps `(model_family, prompt_type)` to filenames via `prompt_matrix.yaml`. `detect_model_family()` auto-detects the family from the model name (e.g., `"claude-opus"`, `"deepseek"`, `"gpt-4o"`, `"default"`). This enables model-specific prompt files without code changes — just add entries to the matrix and create the corresponding files.
 
-2. **Model variant files via PromptResolver** — Extend the fallback chain: `expert/strategic.reasoning.txt` → `expert/strategic.txt` → `shared/strategic.reasoning.txt` → `shared/strategic.txt`. Creates many files (3 experts × 2 phases × N model classes).
+Example `config/prompt_matrix.yaml`:
+```yaml
+default:
+  systemprompt: systemprompt.txt
+  strategic: strategic.txt
+  tactical: tactical.txt
+claude-opus:
+  systemprompt: systemprompt_claude.txt  # shorter, less hand-holding
+deepseek:
+  strategic: strategic_reasoning.txt     # no CoT instructions
+```
 
-3. **Keep prompts model-agnostic** — Prompts describe *what* to do; the code handles *how* via `LLMConfig`, `create_llm()`, and runtime parameters. Accept that prompts are tuned for the default model class and document this assumption.
-
-**Recommendation**: Option 1 (model class property) is the best balance. It avoids file proliferation while allowing the code to adapt prompt delivery based on model capabilities. The class can be auto-detected from the model name (like `_detect_provider()` already does) with an explicit override in config. Start with two classes: `reasoning` (default) and `chat`.
+**Remaining work**: Author model-specific prompt variants for key families (claude, deepseek, gpt-4o) and populate the matrix files. The infrastructure is ready.
 
 ### Issue G: Tool Descriptions Are Model-Agnostic
 
@@ -337,21 +367,21 @@ Option 3 is the least invasive. The instructions.md files are already much short
 
 ## 4. Implementation Priority
 
-| Priority | Change | Effort | Impact |
-|----------|--------|--------|--------|
-| 1 | Create Critic `strategic.txt` + `tactical.txt` | Medium | Fixes expert workflow mismatch |
-| 2 | Create Scholar `strategic.txt` + `tactical.txt` | Medium | Fixes expert workflow mismatch |
-| 3 | Trim phase-overlap sections from Critic + Scholar `instructions.md` | Low | Removes hierarchy conflict |
-| 4 | Trim tool listings from all `instructions.md` files | Low | Reduces token waste |
-| 5 | Fix `strategic_todos_initial.yaml` todo #1 | Low | Prevents workspace.md duplication |
-| 6 | Trim shared `instructions.md` (generalist) | Low | Token savings |
-| 7 | Decompose instructions.md into context layers (Section 5) | High | Eliminates Issues C-E, reduces tokens ~60% |
-| 8 | Add auto-seeded Pinned Instructions from config | Medium | Constraints survive compaction without manual pinning |
-| 9 | Structured rejection feedback (Section 5.5) | Medium | Agents get actionable fix targets instead of freeform text |
-| 10 | Add model class detection + prompt adaptation | High | Enables model-agnostic expert configs, defer |
-| 11 | Add model-class-aware tool description tiers | High | Optimizes tool selection accuracy per model, defer |
+| Priority | Change | Effort | Impact | Status |
+|----------|--------|--------|--------|--------|
+| 1 | Create Critic `strategic.txt` + `tactical.txt` | Medium | Fixes expert workflow mismatch | |
+| 2 | Create Scholar `strategic.txt` + `tactical.txt` | Medium | Fixes expert workflow mismatch | |
+| 3 | Trim phase-overlap sections from Critic + Scholar `instructions.md` | Low | Removes hierarchy conflict | |
+| 4 | Trim tool listings from all `instructions.md` files | Low | Reduces token waste | |
+| 5 | Fix `strategic_todos_initial.yaml` todo #1 | Low | Prevents workspace.md duplication | |
+| 6 | Trim shared `instructions.md` (generalist) | Low | Token savings | |
+| 7 | Decompose instructions.md into context layers (Section 5) | High | Eliminates Issues C-E, reduces tokens ~60% | |
+| 8 | Add auto-seeded Pinned Instructions from config | Medium | Constraints survive compaction without manual pinning | |
+| 9 | Structured rejection feedback (Section 5.5) | Medium | Agents get actionable fix targets instead of freeform text | |
+| 10 | Add model class detection + prompt adaptation | High | Enables model-agnostic expert configs | **Infrastructure done** — `PromptMatrixResolver` + `detect_model_family()` implemented; needs prompt variants |
+| 11 | Add model-class-aware tool description tiers | High | Optimizes tool selection accuracy per model, defer | |
 
-Priorities 1-6 can be done independently as quick wins. Priority 7 is the big architectural shift described in Section 5 — decomposing instructions.md into the five context layers. Priority 8 makes constraint pinning automatic. Priority 9 improves the feedback loop for rejected jobs. Priorities 10-11 are model-awareness dimensions that apply on top of the layered architecture.
+Priorities 1-6 can be done independently as quick wins. Priority 7 is the big architectural shift described in Section 5 — decomposing instructions.md into the five context layers. Priority 8 makes constraint pinning automatic. Priority 9 improves the feedback loop for rejected jobs. Priority 10's infrastructure (`PromptMatrixResolver`, `detect_model_family()`, matrix-only resolution in all loading functions) is complete — what remains is authoring model-specific prompt variants and populating `prompt_matrix.yaml` files. Priority 11 (model-class-aware tool description tiers) applies on top of the layered architecture.
 
 ---
 

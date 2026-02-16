@@ -495,13 +495,15 @@ def create_execute_node(
 
         # Get phase-aware system prompt (workspace.md is now injected as fake tool call below)
         phase_number = state.get("phase_number", 0)
+        phase_name = "strategic" if is_strategic else "tactical"
+        phase_llm_config = config.llm.get_phase_config(phase_name)
         full_system = get_phase_system_prompt(
             config=config,
             is_strategic=is_strategic,
             phase_number=phase_number,
             todos_content=todos_content,
+            model=phase_llm_config.model,
         )
-        phase_name = "strategic" if is_strategic else "tactical"
         context_mgr.set_current_phase(phase_name)
         logger.debug(
             f"[{job_id}] Using {phase_name} LLM and prompt for phase {phase_number}"
@@ -1927,8 +1929,9 @@ def build_phase_alternation_graph(
     # Create retry manager for LLM call retries
     retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)
 
-    # Load summarization prompt
-    summarization_prompt = load_summarization_prompt(config)
+    # Load summarization prompt (use summarization model for matrix resolution)
+    summarization_config = config.llm.get_phase_config("summarization")
+    summarization_prompt = load_summarization_prompt(config, model=summarization_config.model)
 
     if not workspace_template:
         raise ValueError("workspace_template is required")

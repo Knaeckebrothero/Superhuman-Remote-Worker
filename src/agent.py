@@ -579,16 +579,21 @@ class UniversalAgent:
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
 
+        Uses InstructionMatrixResolver for model-aware resolution.
+
         Returns:
             Template content for workspace.md
         """
-        # Template is at config/templates/workspace_template.md
-        templates_dir = get_project_root() / "config" / "templates"
-        template_path = templates_dir / "workspace_template.md"
+        from .core.loader import InstructionMatrixResolver, detect_model_family
 
-        if not template_path.exists():
-            raise FileNotFoundError(f"Workspace template not found: {template_path}")
-        return template_path.read_text(encoding="utf-8")
+        # Check for pre-resolved content
+        resolved = self.config.extra.get("_resolved_instructions", {})
+        if resolved.get("workspace_template"):
+            return resolved["workspace_template"]
+
+        model_family = detect_model_family(self.config.llm.model)
+        resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
+        return resolver.load("workspace_template")
 
     def _inject_repo_context_to_workspace(
         self, git_url: str, git_branch: str
@@ -671,9 +676,24 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         metadata = metadata or {}
 
+        # On resume: try to load frozen config from JSONB (prevents config drift)
+        _config_from_db = False
+        if resume and self.postgres_conn:
+            try:
+                from .core.loader import load_config_from_resolved
+                import uuid as _uuid
+                resolved = await self.postgres_conn.jobs.get_resolved_config(_uuid.UUID(job_id))
+                if resolved:
+                    self.config = load_config_from_resolved(resolved)
+                    self._create_phase_llms()
+                    _config_from_db = True
+                    logger.info(f"Loaded frozen config for resumed job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to load frozen config, falling back to disk: {e}")
+
         # Handle expert config name - load the named config (tools, prompts, workspace settings)
         # This must happen before config_upload_id and config_override so those can further override
-        if metadata.get("config_name"):
+        if not _config_from_db and metadata.get("config_name"):
             from .core.loader import load_and_merge_config, load_agent_config_from_dict, resolve_config_path
 
             expert_name = metadata["config_name"]
@@ -688,7 +708,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Handle config upload - load and merge with defaults BEFORE workspace setup
         # This must happen first since config affects workspace settings
-        if metadata.get("config_upload_id"):
+        if not _config_from_db and metadata.get("config_upload_id"):
             config_upload_id = metadata["config_upload_id"]
             from .core.workspace import get_workspace_base_path
             from .core.loader import load_uploaded_config, load_agent_config_from_dict
@@ -747,7 +767,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     logger.warning(f"Config upload directory not found: {config_uploads_dir}")
 
         # Handle inline config override - merge on top of current config
-        if metadata.get("config_override"):
+        if not _config_from_db and metadata.get("config_override"):
             from .core.loader import deep_merge, load_agent_config_from_dict
             import dataclasses
 
@@ -760,10 +780,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self.config = load_agent_config_from_dict(merged_config_data)
             logger.info("Applied inline config overrides")
 
-        # Recreate LLMs if config was modified for this job
-        if metadata.get("config_name") or metadata.get("config_upload_id") or metadata.get("config_override"):
+        # Recreate LLMs if config was modified for this job (skip if already loaded from DB)
+        if not _config_from_db and (metadata.get("config_name") or metadata.get("config_upload_id") or metadata.get("config_override")):
             logger.info("Config changed for this job — recreating LLMs")
             self._create_phase_llms()
+
+        # Freeze resolved config on first run (not resume)
+        if self.postgres_conn and not resume and not _config_from_db:
+            try:
+                from .core.loader import serialize_resolved_config
+                import uuid as _uuid
+                resolved = serialize_resolved_config(self.config, model=self.config.llm.model)
+                await self.postgres_conn.jobs.store_resolved_config(_uuid.UUID(job_id), resolved)
+                logger.info(f"Froze resolved config for job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to freeze resolved config: {e}")
 
         # Create workspace manager
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
@@ -797,7 +828,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             instructions_path = self._workspace_manager.path / "instructions.md"
             if not instructions_path.exists():
                 # Only write instructions if missing
-                instructions = load_instructions(self.config)
+                instructions = load_instructions(self.config, model=self.config.llm.model)
                 self._workspace_manager.write_file("instructions.md", instructions)
                 logger.debug("Wrote missing instructions.md to workspace")
 
@@ -877,11 +908,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             # Fall back to template if upload failed
             if not instructions_written:
-                instructions = load_instructions(self.config)
+                instructions = load_instructions(self.config, model=self.config.llm.model)
                 self._workspace_manager.write_file("instructions.md", instructions)
         else:
             # Use template-based instructions
-            instructions = load_instructions(self.config)
+            instructions = load_instructions(self.config, model=self.config.llm.model)
             self._workspace_manager.write_file("instructions.md", instructions)
 
         # Process initial_files from config (e.g., workspace.md template)
@@ -1116,13 +1147,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         tools_dir = self._workspace_manager.get_path("tools")
         generate_workspace_tool_docs(tool_names, tools_dir)
 
-        # Copy todo crafting guide to workspace
-        todo_guide_src = get_project_root() / "config" / "templates" / "todo_guide.md"
-        if todo_guide_src.exists():
-            self._workspace_manager.write_file(
-                "todo_guide.md", todo_guide_src.read_text(encoding="utf-8")
-            )
+        # Copy todo crafting guide to workspace via instruction matrix
+        from .core.loader import InstructionMatrixResolver, detect_model_family
+        model_family = detect_model_family(self.config.llm.model)
+        instr_resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
+        try:
+            # Check for pre-resolved content first
+            resolved = self.config.extra.get("_resolved_instructions", {})
+            todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
+            self._workspace_manager.write_file("todo_guide.md", todo_guide)
             logger.debug("Copied todo_guide.md to workspace")
+        except FileNotFoundError:
+            logger.warning("todo_guide.md not found via instruction matrix")
 
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
