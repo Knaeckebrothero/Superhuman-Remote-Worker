@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     total_tokens_used INTEGER DEFAULT 0,
     total_requests INTEGER DEFAULT 0,
 
+    -- Resolved config snapshot (frozen at job start for reproducibility)
+    resolved_config JSONB DEFAULT NULL,
+
     CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
@@ -62,6 +65,12 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_creator_status ON jobs(creator_status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
+
+-- Migration: Add resolved_config column to existing databases
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN resolved_config JSONB DEFAULT NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
 
 -- ============================================================================
 -- 2. AGENTS TABLE

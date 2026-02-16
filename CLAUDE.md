@@ -148,14 +148,16 @@ Single codebase configured for different roles via YAML configs in `config/`. Se
 Config structure:
 - `config/defaults.yaml` - Framework defaults (all configs extend this)
 - `config/schema.json` - JSON Schema for config validation
-- `config/prompts/` - System prompts (strategic.txt, tactical.txt, systemprompt.txt)
-- `config/templates/` - File templates (workspace_template.md, phase_retrospective_template.md)
+- `config/prompt_matrix.yaml` - Base prompt matrix (model family → prompt filename)
+- `config/instruction_matrix.yaml` - Base instruction matrix (model family → template filename)
+- `config/prompts/` - System prompts (strategic.txt, tactical.txt, systemprompt.txt, summarization_prompt.txt)
+- `config/templates/` - Instruction templates (instructions.md, workspace_template.md, todo_guide.md)
   - `strategic_todos_initial.yaml` - First strategic phase (job startup)
   - `strategic_todos_transition.yaml` - Subsequent strategic phases (phase transitions)
   - `strategic_todos_resume.yaml` - Resumed jobs
-- `config/experts/` - Pre-built agent roles (coder, researcher, writer, debugger)
+- `config/experts/` - Pre-built agent roles (developer, scholar, critic)
 - `config/my_agent.yaml` - Custom single-file config
-- `config/my_agent/config.yaml` - Custom directory config (with prompt overrides)
+- `config/my_agent/config.yaml` - Custom directory config (with prompt/instruction overrides)
 
 ### Phase Alternation Model
 
@@ -215,6 +217,26 @@ tools:
   citation:
     - cite_web
 ```
+
+### Two Matrix Systems
+
+The agent uses two parallel matrix systems to resolve prompt and template files, both inheriting from `MatrixResolver` (`src/core/loader.py`):
+
+**Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts (`systemprompt`, `strategic`, `tactical`, `summarization`) to filenames. File search: expert directory → `config/prompts/`.
+
+**Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates (`instructions`, `strategic_todos_initial`, `strategic_todos_transition`, `strategic_todos_resume`, `workspace_template`, `todo_guide`) to filenames. File search: expert directory → `config/templates/`.
+
+Both use the same 4-level resolution chain:
+1. Expert matrix → model-specific key → type
+2. Expert matrix → `"default"` key → type
+3. Base matrix → model-specific key → type
+4. Base matrix → `"default"` key → type
+
+Once the filename is determined, `FileResolver` locates the actual file — checking the expert directory first, then falling back to the framework directory. See `config/README.md` for full documentation.
+
+### Resolved Config JSONB
+
+On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
 
 Tool categories in config:
 - `workspace`: File operations (read_file, write_file, list_files, etc.)
@@ -298,7 +320,7 @@ This separation means workspace.md survives context compaction while the convers
 - `src/core/` - State management, workspace, context, phase transitions
   - `state.py` - UniversalAgentState TypedDict
   - `workspace.py` - WorkspaceManager for job directories
-  - `loader.py` - Config loading, LLM creation, tool registry
+  - `loader.py` - Config loading, LLM creation, tool registry, matrix resolvers (`FileResolver`, `MatrixResolver`, `PromptMatrixResolver`, `InstructionMatrixResolver`), resolved config serialization
   - `context.py` - ContextManager for token counting/compaction (three-layer safety)
   - `phase.py` - Phase transition logic (strategic ↔ tactical)
   - `phase_snapshot.py` - Phase boundary snapshots for recovery

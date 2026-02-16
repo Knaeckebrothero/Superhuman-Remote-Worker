@@ -127,16 +127,16 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
     return config_data
 
 
-class PromptResolver:
-    """Resolves prompt templates with deployment override support.
+class FileResolver:
+    """Resolves template files with deployment override support.
 
-    Checks deployment directory first, then falls back to framework prompts.
-    This allows deployments to override specific prompts while using
+    Checks deployment directory first, then falls back to a framework directory.
+    This allows deployments to override specific files while using
     framework defaults for others.
 
     Example:
         ```python
-        resolver = PromptResolver(deployment_dir="/project/config/my_agent")
+        resolver = FileResolver(deployment_dir="/project/config/my_agent")
 
         # Will check: /project/config/my_agent/instructions.md
         # Falls back to: config/prompts/instructions.md
@@ -144,18 +144,23 @@ class PromptResolver:
         ```
     """
 
-    def __init__(self, deployment_dir: Optional[str] = None):
-        """Initialize prompt resolver.
+    def __init__(
+        self,
+        deployment_dir: Optional[str] = None,
+        framework_dir: Optional[Path] = None,
+    ):
+        """Initialize file resolver.
 
         Args:
             deployment_dir: Path to deployment directory (e.g., config/my_agent)
-                          If None, only framework prompts are used.
+                          If None, only framework files are used.
+            framework_dir: Path to framework directory. Defaults to config/prompts/.
         """
         self.deployment_dir = Path(deployment_dir) if deployment_dir else None
-        self.framework_dir = get_project_root() / "config" / "prompts"
+        self.framework_dir = framework_dir or (get_project_root() / "config" / "prompts")
 
     def resolve(self, template_name: str) -> Path:
-        """Find prompt template, checking deployment dir first.
+        """Find template file, checking deployment dir first.
 
         Args:
             template_name: Name of the template file (e.g., "instructions.md")
@@ -178,12 +183,12 @@ class PromptResolver:
             return framework_path
 
         raise FileNotFoundError(
-            f"Prompt template not found: {template_name} "
+            f"Template not found: {template_name} "
             f"(checked: {self.deployment_dir}, {self.framework_dir})"
         )
 
     def load(self, template_name: str) -> str:
-        """Load prompt template content.
+        """Load template content.
 
         Args:
             template_name: Name of the template file
@@ -211,6 +216,169 @@ class PromptResolver:
             return True
         except FileNotFoundError:
             return False
+
+
+# Backward compatibility alias
+PromptResolver = FileResolver
+
+
+class MatrixResolver:
+    """Base class for matrix-based file resolution.
+
+    Resolves logical names to filenames through a 2D matrix: (type, model_family).
+    Resolution chain (4 levels):
+    1. Expert matrix → model-specific key → type
+    2. Expert matrix → "default" key → type
+    3. Base matrix → model-specific key → type
+    4. Base matrix → "default" key → type
+
+    Once the filename is determined, FileResolver locates the actual file
+    (expert directory → framework directory).
+
+    Subclasses define MATRIX_FILENAME, FRAMEWORK_DIR, and HARDCODED_DEFAULTS.
+    """
+
+    MATRIX_FILENAME: str = "matrix.yaml"
+    FRAMEWORK_DIR: str = "config/prompts"
+    HARDCODED_DEFAULTS: Dict[str, str] = {}
+
+    def __init__(
+        self,
+        deployment_dir: Optional[str] = None,
+        model_family: str = "default",
+    ):
+        self.deployment_dir = Path(deployment_dir) if deployment_dir else None
+        self.model_family = model_family
+        self._file_resolver = FileResolver(
+            deployment_dir=deployment_dir,
+            framework_dir=get_project_root() / self.FRAMEWORK_DIR,
+        )
+
+        # Load matrices
+        self._expert_matrix = self._load_matrix(self.deployment_dir)
+        base_matrix_path = get_project_root() / "config" / self.MATRIX_FILENAME
+        self._base_matrix = self._load_matrix_from_path(base_matrix_path)
+
+    @staticmethod
+    def _load_matrix_from_path(path: Path) -> Dict[str, Dict[str, str]]:
+        """Load a matrix YAML file. Returns empty dict if not found."""
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                return {}
+            # Validate structure: each key maps to a dict of type → filename
+            result = {}
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    result[key] = {k: str(v) for k, v in value.items() if v is not None}
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to load matrix {path}: {e}")
+            return {}
+
+    def _load_matrix(self, directory: Optional[Path]) -> Dict[str, Dict[str, str]]:
+        """Load matrix YAML from a directory. Returns empty dict if not found."""
+        if not directory:
+            return {}
+        return self._load_matrix_from_path(directory / self.MATRIX_FILENAME)
+
+    def resolve_filename(self, entry_type: str) -> str:
+        """Resolve a type to a filename through the 4-level fallback chain.
+
+        Args:
+            entry_type: Logical name (e.g., "systemprompt", "instructions")
+
+        Returns:
+            Filename string (e.g., "systemprompt.txt")
+        """
+        family = self.model_family
+
+        # Level 1: Expert matrix, model-specific
+        if family != "default" and family in self._expert_matrix:
+            if entry_type in self._expert_matrix[family]:
+                return self._expert_matrix[family][entry_type]
+
+        # Level 2: Expert matrix, default
+        if "default" in self._expert_matrix:
+            if entry_type in self._expert_matrix["default"]:
+                return self._expert_matrix["default"][entry_type]
+
+        # Level 3: Base matrix, model-specific
+        if family != "default" and family in self._base_matrix:
+            if entry_type in self._base_matrix[family]:
+                return self._base_matrix[family][entry_type]
+
+        # Level 4: Base matrix, default
+        if "default" in self._base_matrix:
+            if entry_type in self._base_matrix["default"]:
+                return self._base_matrix["default"][entry_type]
+
+        # Final fallback: hardcoded defaults
+        return self.HARDCODED_DEFAULTS.get(entry_type, f"{entry_type}.txt")
+
+    def load(self, entry_type: str) -> str:
+        """Resolve filename and load the content.
+
+        Args:
+            entry_type: Type to resolve and load
+
+        Returns:
+            File content as string
+        """
+        filename = self.resolve_filename(entry_type)
+        return self._file_resolver.load(filename)
+
+    def exists(self, entry_type: str) -> bool:
+        """Check if a type can be resolved and the file exists."""
+        filename = self.resolve_filename(entry_type)
+        return self._file_resolver.exists(filename)
+
+
+class PromptMatrixResolver(MatrixResolver):
+    """Resolves prompt filenames through a 2D matrix: (prompt_type, model_family).
+
+    Thin subclass of MatrixResolver for prompt files (config/prompts/).
+    """
+
+    MATRIX_FILENAME = "prompt_matrix.yaml"
+    FRAMEWORK_DIR = "config/prompts"
+    HARDCODED_DEFAULTS = {
+        "systemprompt": "systemprompt.txt",
+        "strategic": "strategic.txt",
+        "tactical": "tactical.txt",
+        "summarization": "summarization_prompt.txt",
+    }
+
+    # Backward compatibility: expose _prompt_resolver as alias for _file_resolver
+    @property
+    def _prompt_resolver(self):
+        return self._file_resolver
+
+    @_prompt_resolver.setter
+    def _prompt_resolver(self, value):
+        self._file_resolver = value
+
+
+class InstructionMatrixResolver(MatrixResolver):
+    """Resolves instruction filenames through a 2D matrix: (instruction_type, model_family).
+
+    Handles non-prompt template files: instructions, strategic todos templates,
+    workspace template, and todo guide.
+    """
+
+    MATRIX_FILENAME = "instruction_matrix.yaml"
+    FRAMEWORK_DIR = "config/templates"
+    HARDCODED_DEFAULTS = {
+        "instructions": "instructions.md",
+        "strategic_todos_initial": "strategic_todos_initial.yaml",
+        "strategic_todos_transition": "strategic_todos_transition.yaml",
+        "strategic_todos_resume": "strategic_todos_resume.yaml",
+        "workspace_template": "workspace_template.md",
+        "todo_guide": "todo_guide.md",
+    }
 
 
 @dataclass
@@ -820,6 +988,60 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
     return "openai"
 
 
+def detect_model_family(model: str) -> str:
+    """Detect model family from model name for prompt matrix resolution.
+
+    Strips provider prefixes (openrouter/, groq/, openai/) and pattern-matches
+    the model name to a family string. Returns "default" as fallback.
+
+    Args:
+        model: Model name (e.g., "claude-opus-4-6", "openrouter/deepseek/deepseek-r1")
+
+    Returns:
+        Family string (e.g., "claude-opus", "deepseek", "default")
+    """
+    name = model.lower()
+
+    # Strip provider prefixes to get the actual model name
+    for prefix in ("openrouter/", "groq/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            # Strip second-level provider prefix (e.g., "anthropic/" in "openrouter/anthropic/claude-opus-4")
+            if "/" in name:
+                name = name.split("/", 1)[1]
+            break
+
+    # Strip openai/ prefix for self-hosted models
+    if name.startswith("openai/"):
+        name = name[len("openai/"):]
+
+    # Pattern match model name to family
+    if name.startswith("claude-opus"):
+        return "claude-opus"
+    if name.startswith("claude-sonnet"):
+        return "claude-sonnet"
+    if name.startswith("claude-haiku"):
+        return "claude-haiku"
+    if name.startswith("gpt-5"):
+        return "gpt-5"
+    if name.startswith("gpt-4o"):
+        return "gpt-4o"
+    if name.startswith(("o1", "o3", "o4")):
+        return "o-series"
+    if "deepseek" in name:
+        return "deepseek"
+    if "qwen" in name or "qwq" in name:
+        return "qwen"
+    if "llama" in name:
+        return "llama"
+    if name.startswith("gemini"):
+        return "gemini"
+    if name.startswith("gpt-oss"):
+        return "gpt-oss"
+
+    return "default"
+
+
 def _needs_custom_base_url(model: str) -> bool:
     """Check if model requires a custom base URL (OpenAI-compatible endpoint).
 
@@ -1233,51 +1455,39 @@ def _create_openrouter_llm(
 # =============================================================================
 
 
-def load_base_system_prompt(
-    deployment_dir: Optional[str] = None,
-) -> str:
-    """Load the base system prompt template (systemprompt.txt).
-
-    Uses PromptResolver to check deployment directory first if available,
-    allowing deployments to override the base template.
+def load_base_system_prompt(matrix_resolver: PromptMatrixResolver) -> str:
+    """Load the base system prompt template via prompt matrix resolution.
 
     Args:
-        deployment_dir: Path to deployment directory (e.g., config/my_agent).
-                       If None, only framework templates are used.
+        matrix_resolver: PromptMatrixResolver for model-aware filename resolution.
 
     Returns:
         Raw template string with placeholders ({prompt_content}, {todos_content}, etc.)
 
     Raises:
-        FileNotFoundError: If template not found in either location
+        FileNotFoundError: If template not found
     """
-    resolver = PromptResolver(deployment_dir)
-    return resolver.load("systemprompt.txt")
+    return matrix_resolver.load("systemprompt")
 
 
 def load_phase_component(
     is_strategic: bool,
-    deployment_dir: Optional[str] = None,
+    matrix_resolver: PromptMatrixResolver,
 ) -> str:
     """Load the phase-specific component (strategic.txt or tactical.txt).
 
-    Uses PromptResolver to check deployment directory first if available,
-    allowing deployments to override phase components.
-
     Args:
         is_strategic: True for strategic phase, False for tactical
-        deployment_dir: Path to deployment directory (e.g., config/my_agent).
-                       If None, only framework templates are used.
+        matrix_resolver: PromptMatrixResolver for model-aware filename resolution.
 
     Returns:
         Raw template string with {phase_number} placeholder
 
     Raises:
-        FileNotFoundError: If template not found in either location
+        FileNotFoundError: If template not found
     """
-    resolver = PromptResolver(deployment_dir)
-    template_name = "strategic.txt" if is_strategic else "tactical.txt"
-    return resolver.load(template_name)
+    prompt_type = "strategic" if is_strategic else "tactical"
+    return matrix_resolver.load(prompt_type)
 
 
 def get_phase_system_prompt(
@@ -1285,7 +1495,7 @@ def get_phase_system_prompt(
     is_strategic: bool,
     phase_number: int = 0,
     todos_content: str = "",
-    config_dir: Optional[str] = None,
+    model: str = "",
 ) -> str:
     """Get the complete system prompt for the current phase.
 
@@ -1305,7 +1515,7 @@ def get_phase_system_prompt(
         is_strategic: True for strategic phase, False for tactical
         phase_number: Current phase number
         todos_content: Formatted todo list string
-        config_dir: Base directory for config files (deprecated, uses deployment_dir)
+        model: Model name for prompt matrix resolution.
 
     Returns:
         Fully rendered system prompt string
@@ -1317,16 +1527,22 @@ def get_phase_system_prompt(
             is_strategic=True,
             phase_number=1,
             todos_content="- Explore workspace\\n- Create plan",
+            model="claude-opus-4-6",
         )
         ```
     """
-    deployment_dir = config._deployment_dir
+    # Check for pre-resolved prompt content (from resolved_config JSONB)
+    resolved_prompts = config.extra.get("_resolved_prompts", {})
+
+    model_family = detect_model_family(model) if model else "default"
+    resolver = PromptMatrixResolver(config._deployment_dir, model_family)
 
     # 1. Load base template
-    base_template = load_base_system_prompt(deployment_dir)
+    base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(resolver)
 
     # 2. Load phase component
-    phase_component = load_phase_component(is_strategic, deployment_dir)
+    prompt_type = "strategic" if is_strategic else "tactical"
+    phase_component = resolved_prompts.get(prompt_type) or load_phase_component(is_strategic, resolver)
 
     # 3. Render phase component's {phase_number} placeholder
     rendered_component = phase_component.format(phase_number=phase_number)
@@ -1342,51 +1558,30 @@ def get_phase_system_prompt(
     )
 
 
-def load_instructions(
-    config: AgentConfig,
-    config_dir: Optional[str] = None,
-    prompt_resolver: Optional[PromptResolver] = None,
-) -> str:
+def load_instructions(config: AgentConfig, model: str = "") -> str:
     """Load the instructions template for the agent.
 
-    Uses PromptResolver to check deployment directory first if available,
-    allowing deployments to override framework prompts.
+    Uses InstructionMatrixResolver for model-aware instruction resolution.
 
     Args:
         config: Agent configuration
-        config_dir: Base directory for config files (deprecated, use prompt_resolver)
-        prompt_resolver: Optional resolver for finding prompts (preferred)
+        model: Model name for instruction matrix resolution.
 
     Returns:
         Instructions content to be placed in workspace
     """
-    template_name = config.workspace.instructions_template
+    # Check for pre-resolved content (from resolved_config JSONB)
+    resolved = config.extra.get("_resolved_instructions", {})
+    if resolved.get("instructions"):
+        return resolved["instructions"]
 
-    # Try PromptResolver first (new style)
-    if prompt_resolver is None and config._deployment_dir:
-        prompt_resolver = PromptResolver(config._deployment_dir)
-
-    if prompt_resolver:
-        try:
-            return prompt_resolver.load(template_name)
-        except FileNotFoundError:
-            pass  # Fall through to legacy handling
-
-    # Legacy path resolution (backward compatibility)
-    if config_dir is None:
-        config_dir = get_project_root() / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    instructions_path = config_dir / "prompts" / template_name
-
-    if instructions_path.exists():
-        with open(instructions_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
+    model_family = detect_model_family(model) if model else "default"
+    resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
+    try:
+        return resolver.load("instructions")
+    except FileNotFoundError:
         logger.warning(
-            f"Instructions template not found: {template_name}. "
-            "Using minimal instructions."
+            "Instructions template not found. Using minimal instructions."
         )
         # Build tool list from all categories
         all_tools = []
@@ -1418,53 +1613,30 @@ See `tools/README.md` for detailed documentation of each tool.
 """
 
 
-def load_summarization_prompt(
-    config: Optional["AgentConfig"] = None,
-    config_dir: Optional[str] = None,
-    prompt_resolver: Optional[PromptResolver] = None,
-) -> str:
+def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
     """Load the summarization prompt template.
 
-    Uses PromptResolver to check deployment directory first if available.
+    Uses PromptMatrixResolver for model-aware prompt resolution.
 
     Args:
-        config: Agent configuration (to get agent-specific template)
-        config_dir: Base directory for config files (deprecated, use prompt_resolver)
-        prompt_resolver: Optional resolver for finding prompts (preferred)
+        config: Agent configuration
+        model: Model name for prompt matrix resolution.
 
     Returns:
         Summarization prompt content
     """
-    # Determine template name
-    template_name = "summarization_prompt.txt"
-    if config and config.context_management.summarization_template:
-        template_name = config.context_management.summarization_template
+    # Check for pre-resolved content (from resolved_config JSONB)
+    resolved = config.extra.get("_resolved_prompts", {})
+    if resolved.get("summarization"):
+        return resolved["summarization"]
 
-    # Try PromptResolver first (new style)
-    if prompt_resolver is None and config and config._deployment_dir:
-        prompt_resolver = PromptResolver(config._deployment_dir)
-
-    if prompt_resolver:
-        try:
-            return prompt_resolver.load(template_name)
-        except FileNotFoundError:
-            pass  # Fall through to legacy handling
-
-    # Legacy path resolution (backward compatibility)
-    if config_dir is None:
-        config_dir = get_project_root() / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / template_name
-
-    if prompt_path.exists():
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
+    model_family = detect_model_family(model) if model else "default"
+    resolver = PromptMatrixResolver(config._deployment_dir, model_family)
+    try:
+        return resolver.load("summarization")
+    except FileNotFoundError:
         logger.warning(
-            f"Summarization prompt not found: {prompt_path}. "
-            "Using default prompt."
+            "Summarization prompt not found. Using default prompt."
         )
         return """Summarize this agent conversation concisely.
 Focus on:
@@ -1687,19 +1859,90 @@ def _parse_strategic_todos_yaml(path: Path) -> List[Dict[str, Any]]:
     return validated_todos
 
 
+def _parse_strategic_todos_yaml_from_string(content: str) -> List[Dict[str, Any]]:
+    """Parse and validate strategic todos from a YAML string.
+
+    Same validation as _parse_strategic_todos_yaml but works on string content
+    instead of a file path. Used when loading from resolved_config JSONB.
+
+    Args:
+        content: YAML string with todos schema
+
+    Returns:
+        List of todo dicts with 'id' and 'content' keys
+    """
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        raise StrategicTodosValidationError(
+            f"Invalid YAML syntax in strategic todos: {e}",
+            [f"YAML parse error: {e}"],
+        )
+
+    if data is None or not isinstance(data, dict) or "todos" not in data:
+        raise StrategicTodosValidationError(
+            "Strategic todos content must be a YAML mapping with 'todos' key",
+            ["Missing or invalid 'todos' structure"],
+        )
+
+    todos_raw = data["todos"]
+    if not isinstance(todos_raw, list):
+        raise StrategicTodosValidationError(
+            "'todos' must be a list",
+            [f"Expected list for 'todos', got {type(todos_raw).__name__}"],
+        )
+
+    validated_todos: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen_ids: set = set()
+
+    for i, item in enumerate(todos_raw):
+        if not isinstance(item, dict):
+            errors.append(f"Todo #{i + 1}: Expected mapping, got {type(item).__name__}")
+            continue
+        todo_id = item.get("id")
+        content_val = item.get("content")
+        if todo_id is None:
+            errors.append(f"Todo #{i + 1}: Missing required 'id' field")
+        elif not isinstance(todo_id, int):
+            errors.append(f"Todo #{i + 1}: 'id' must be an integer")
+        elif todo_id in seen_ids:
+            errors.append(f"Todo #{i + 1}: Duplicate id '{todo_id}'")
+        else:
+            seen_ids.add(todo_id)
+        if content_val is None:
+            errors.append(f"Todo #{i + 1}: Missing required 'content' field")
+        elif not isinstance(content_val, str):
+            errors.append(f"Todo #{i + 1}: 'content' must be a string")
+        elif len(content_val.strip()) < 10:
+            errors.append(f"Todo #{i + 1}: 'content' too short")
+        if todo_id is not None and content_val is not None and not errors:
+            validated_todos.append({"id": todo_id, "content": content_val.strip()})
+
+    if errors:
+        raise StrategicTodosValidationError(
+            f"Strategic todos validation failed with {len(errors)} error(s)", errors,
+        )
+    return validated_todos
+
+
 def load_strategic_todos_template(
     template_name: str,
     deployment_dir: Optional[str] = None,
+    model: str = "",
+    resolved_content: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Load a strategic todos template with deployment override support.
 
-    Checks deployment directory first, then falls back to framework templates.
-    This allows deployments to override strategic todos for customization.
+    Uses InstructionMatrixResolver for model-aware resolution. Checks
+    deployment directory first, then falls back to framework templates.
 
     Args:
         template_name: Name of the template file (e.g., "strategic_todos_initial.yaml")
         deployment_dir: Path to deployment directory (e.g., config/my_agent).
                        If None, only framework templates are used.
+        model: Model name for instruction matrix resolution.
+        resolved_content: Pre-resolved YAML content (from resolved_config JSONB).
 
     Returns:
         List of todo dicts with 'id' and 'content' keys
@@ -1707,35 +1950,28 @@ def load_strategic_todos_template(
     Raises:
         FileNotFoundError: If template not found in either location
         StrategicTodosValidationError: If template is invalid
-
-    Example:
-        ```python
-        todos = load_strategic_todos_template(
-            "strategic_todos_initial.yaml",
-            deployment_dir="config/my_agent"
-        )
-        # Returns: [{"id": 1, "content": "..."}, {"id": 2, "content": "..."}, ...]
-        ```
     """
-    # Check deployment directory first
-    if deployment_dir:
-        deployment_path = Path(deployment_dir) / template_name
-        if deployment_path.exists():
-            logger.debug(f"Loading strategic todos from deployment: {deployment_path}")
-            return _parse_strategic_todos_yaml(deployment_path)
+    # Check for pre-resolved content first
+    if resolved_content:
+        logger.debug("Loading strategic todos from resolved content")
+        return _parse_strategic_todos_yaml_from_string(resolved_content)
 
-    # Fall back to framework templates directory
-    templates_dir = get_project_root() / "config" / "templates"
-    framework_path = templates_dir / template_name
+    # Use InstructionMatrixResolver for 4-level fallback
+    model_family = detect_model_family(model) if model else "default"
+    resolver = InstructionMatrixResolver(deployment_dir, model_family)
 
-    if framework_path.exists():
-        logger.debug(f"Loading strategic todos from framework: {framework_path}")
-        return _parse_strategic_todos_yaml(framework_path)
+    # Strip .yaml extension for instruction type key
+    instruction_type = template_name.replace(".yaml", "")
 
-    raise FileNotFoundError(
-        f"Strategic todos template not found: {template_name} "
-        f"(checked: {deployment_dir}, {templates_dir})"
-    )
+    try:
+        path = resolver._file_resolver.resolve(resolver.resolve_filename(instruction_type))
+        logger.debug(f"Loading strategic todos from: {path}")
+        return _parse_strategic_todos_yaml(path)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Strategic todos template not found: {template_name} "
+            f"(checked: {deployment_dir}, config/templates/)"
+        )
 
 
 def get_initial_strategic_todos_from_config(
@@ -1752,19 +1988,22 @@ def get_initial_strategic_todos_from_config(
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
         [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
-
-    Example:
-        ```python
-        todos = get_initial_strategic_todos_from_config(config)
-        todo_manager.set_todos_from_list(todos)
-        ```
     """
     deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+
+    # Check for pre-resolved content
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {})
+        resolved_content = resolved.get("strategic_todos_initial")
 
     try:
         raw_todos = load_strategic_todos_template(
             "strategic_todos_initial.yaml",
             deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
         )
     except FileNotFoundError:
         logger.warning(
@@ -1799,19 +2038,22 @@ def get_transition_strategic_todos_from_config(
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
         [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
-
-    Example:
-        ```python
-        todos = get_transition_strategic_todos_from_config(config)
-        todo_manager.set_todos_from_list(todos)
-        ```
     """
     deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+
+    # Check for pre-resolved content
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {})
+        resolved_content = resolved.get("strategic_todos_transition")
 
     try:
         raw_todos = load_strategic_todos_template(
             "strategic_todos_transition.yaml",
             deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
         )
     except FileNotFoundError:
         logger.warning(
@@ -1848,11 +2090,20 @@ def get_resume_strategic_todos_from_config(
         [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
     """
     deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+
+    # Check for pre-resolved content
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {})
+        resolved_content = resolved.get("strategic_todos_resume")
 
     try:
         raw_todos = load_strategic_todos_template(
             "strategic_todos_resume.yaml",
             deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
         )
     except FileNotFoundError:
         logger.warning(
@@ -1871,3 +2122,83 @@ def get_resume_strategic_todos_from_config(
         }
         for t in raw_todos
     ]
+
+
+# =============================================================================
+# Resolved Config Serialization
+# =============================================================================
+
+
+def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
+    """Serialize the fully resolved config (agent config + all prompt/instruction content).
+
+    Captures everything needed to reproduce a job's config without disk access.
+    Used to freeze config into the resolved_config JSONB column at job start.
+
+    Args:
+        config: Fully resolved AgentConfig
+        model: Model name for matrix resolution
+
+    Returns:
+        Dict suitable for JSON serialization and storage in JSONB
+    """
+    import dataclasses
+    from datetime import datetime, timezone
+
+    model_family = detect_model_family(model) if model else "default"
+
+    # Agent config as dict (strip internal fields and secrets)
+    agent_dict = dataclasses.asdict(config)
+    agent_dict.pop("_deployment_dir", None)
+    # Strip API keys from LLM configs
+    for key in ["api_key"]:
+        agent_dict.get("llm", {}).pop(key, None)
+        for phase in ["strategic", "tactical", "summarization"]:
+            override = agent_dict.get("llm", {}).get(phase)
+            if isinstance(override, dict):
+                override.pop(key, None)
+
+    # Resolve all prompts to full text
+    prompt_resolver = PromptMatrixResolver(config._deployment_dir, model_family)
+    prompts = {}
+    for pt in ["systemprompt", "strategic", "tactical", "summarization"]:
+        try:
+            prompts[pt] = prompt_resolver.load(pt)
+        except FileNotFoundError:
+            prompts[pt] = None
+
+    # Resolve all instructions to full text
+    instr_resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
+    instructions = {}
+    for it in InstructionMatrixResolver.HARDCODED_DEFAULTS:
+        try:
+            instructions[it] = instr_resolver.load(it)
+        except FileNotFoundError:
+            instructions[it] = None
+
+    return {
+        "agent": agent_dict,
+        "prompts": prompts,
+        "instructions": instructions,
+        "model_family": model_family,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def load_config_from_resolved(resolved: dict) -> AgentConfig:
+    """Reconstruct an AgentConfig from a resolved_config JSONB snapshot.
+
+    The returned config has pre-resolved prompt and instruction content
+    stored in config.extra, so loading functions can bypass disk access.
+
+    Args:
+        resolved: Dict from resolved_config JSONB column
+
+    Returns:
+        AgentConfig with pre-resolved content in config.extra
+    """
+    config = load_agent_config_from_dict(resolved["agent"])
+    # Store pre-resolved content for runtime use
+    config.extra["_resolved_prompts"] = resolved.get("prompts", {})
+    config.extra["_resolved_instructions"] = resolved.get("instructions", {})
+    return config
