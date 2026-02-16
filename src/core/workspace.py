@@ -581,8 +581,13 @@ class WorkspaceManager:
         if not case_sensitive:
             query = query.lower()
 
-        # Recursively search text files
-        for file_path in search_path.rglob("*"):
+        # If search_path is a file, search it directly; otherwise recurse
+        if search_path.is_file():
+            files_to_search = [search_path]
+        else:
+            files_to_search = search_path.rglob("*")
+
+        for file_path in files_to_search:
             if not file_path.is_file():
                 continue
 
