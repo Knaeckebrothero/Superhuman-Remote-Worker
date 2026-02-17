@@ -10,7 +10,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Deque, Dict, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 from urllib.parse import urlparse
 
 from ..core.workspace import WorkspaceManager
@@ -67,6 +67,7 @@ class ToolContext:
     _recent_reads: Deque[str] = field(default_factory=lambda: deque(maxlen=10))  # Recently read file paths
     _current_phase: Optional[str] = None
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
+    _instruction_files: List[Any] = field(default_factory=list)  # List[InstructionFileEntry]
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -361,6 +362,62 @@ class ToolContext:
             Number of recent reads to track (default 10)
         """
         return self.get_config("read_tracking_limit", 10)
+
+    def get_enforcement_files(self, tool_name: str) -> List[str]:
+        """Get instruction files that must be read before using a tool.
+
+        Checks instruction_files config for entries with trigger type
+        'before_tool' matching the given tool name and enforce=True.
+
+        Args:
+            tool_name: Name of the tool being called
+
+        Returns:
+            List of workspace-relative file paths that must be read first
+        """
+        required = []
+        for entry in self._instruction_files:
+            if entry.enforce and entry.trigger_type == "before_tool" and entry.trigger_target == tool_name:
+                required.append(entry.file)
+        return required
+
+    def check_tool_enforcement(self, tool_name: str) -> Optional[str]:
+        """Check if a tool's instruction file enforcement requirements are met.
+
+        Returns an error message if any required instruction files have not
+        been recently read. Returns None if all requirements are met.
+
+        Args:
+            tool_name: Name of the tool being called
+
+        Returns:
+            Error message string if enforcement fails, None if OK
+        """
+        required_files = self.get_enforcement_files(tool_name)
+        for file_path in required_files:
+            if not self.was_recently_read(file_path):
+                return (
+                    f"Error: You must read_file('{file_path}') before using {tool_name}. "
+                    f"It contains critical instructions for this operation. "
+                    f"Read it first, then call {tool_name} again."
+                )
+        return None
+
+    def get_phase_instruction_files(self, phase: str) -> List[Any]:
+        """Get instruction files triggered by a phase transition.
+
+        Returns entries with trigger type 'phase' matching the given phase.
+
+        Args:
+            phase: Phase name ('strategic' or 'tactical')
+
+        Returns:
+            List of InstructionFileEntry objects for this phase
+        """
+        return [
+            entry for entry in self._instruction_files
+            if entry.trigger_type == "phase" and entry.trigger_target == phase
+        ]
 
     def set_current_phase(self, phase: str) -> None:
         """Set the current execution phase for phase-aware behavior.

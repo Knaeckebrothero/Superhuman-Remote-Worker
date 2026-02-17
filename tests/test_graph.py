@@ -630,9 +630,9 @@ class TestInitStrategicTodosNode:
         state = {"job_id": "test-123"}
         result = node(state)
 
-        # Should still work with fallback message
+        # Should still work with strategic mode message
         assert "messages" in result
-        assert "No instructions.md found" in result["messages"][0].content
+        assert "strategic mode" in result["messages"][0].content
 
         # Should still load strategic todos
         todos = managers["todo"].list_all()

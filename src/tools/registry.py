@@ -14,8 +14,9 @@ Usage:
     tools = load_tools_by_category("workspace", context)
 """
 
+import functools
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .context import ToolContext
 
@@ -464,3 +465,72 @@ def unregister_tool(name: str) -> bool:
         logger.info(f"Unregistered tool: {name}")
         return True
     return False
+
+
+def apply_instruction_enforcement(
+    tools: List[Any],
+    context: ToolContext,
+) -> List[Any]:
+    """Apply instruction file enforcement wrappers to tools.
+
+    For each tool that has a 'before_tool' trigger with enforce=True,
+    wraps the tool's func to check was_recently_read() before executing.
+    The agent must read the instruction file before the tool will work.
+
+    This generalizes the pattern from todo.py's hardcoded todo_guide.md
+    check into a config-driven system.
+
+    Args:
+        tools: List of loaded LangChain tool objects
+        context: ToolContext with instruction_files configured
+
+    Returns:
+        Same list of tools (modified in-place with enforcement wrappers)
+    """
+    if not context._instruction_files:
+        return tools
+
+    # Build lookup: tool_name -> list of enforced file paths
+    enforcement_map: Dict[str, List[str]] = {}
+    for entry in context._instruction_files:
+        if entry.trigger_type == "before_tool" and entry.enforce:
+            enforcement_map.setdefault(entry.trigger_target, []).append(entry.file)
+
+    if not enforcement_map:
+        return tools
+
+    for tool in tools:
+        if tool.name not in enforcement_map:
+            continue
+
+        required_files = enforcement_map[tool.name]
+        original_func = tool.func
+        tool_name = tool.name
+
+        @functools.wraps(original_func)
+        def make_wrapper(orig, name, files):
+            """Create enforcement wrapper closure."""
+            def wrapper(*args, **kwargs):
+                for file_path in files:
+                    if not context.was_recently_read(file_path):
+                        return (
+                            f"Error: You must read_file('{file_path}') before using "
+                            f"{name}. It contains critical instructions for this "
+                            f"operation. Read it first, then call {name} again."
+                        )
+                return orig(*args, **kwargs)
+            return wrapper
+
+        tool.func = make_wrapper(original_func, tool_name, required_files)
+        logger.debug(
+            f"Applied instruction enforcement to {tool_name}: "
+            f"requires {required_files}"
+        )
+
+    wrapped_count = sum(1 for t in tools if t.name in enforcement_map)
+    if wrapped_count:
+        logger.info(
+            f"Applied instruction enforcement to {wrapped_count} tools"
+        )
+
+    return tools

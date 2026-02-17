@@ -10,9 +10,11 @@ todos:
       EXPLORE: Thoroughly understand the task before doing anything else.
 
       Steps:
-      (1) Use read_file to read instructions.md in full. Do NOT skim — read every line.
-      (2) Use list_files on the tools/ directory to understand your available capabilities.
-      (3) Use list_files on documents/ to inventory all input materials.
+      (1) Use read_file to read task_brief.md — this is the task description and opening message.
+      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
+      (3) Use list_files on the tools/ directory to understand your available capabilities.
+      (4) Use list_files on documents/ to inventory all input materials.
+      (5) Use list_files on reference/ to check for domain-specific reference material.
 
       Then PIN critical rules to workspace.md under a "## Pinned Instructions" section.
       Extract and write down:
@@ -22,10 +24,10 @@ todos:
       - Delivery expectations (what "done" looks like)
 
       These pinned instructions survive context compaction; the original instructions.md
-      content will NOT. If you don't pin it now, you may forget it later.
+      and task_brief.md content will NOT. If you don't pin it now, you may forget it later.
 
       COMPLETION CRITERIA: workspace.md exists and contains a "## Pinned Instructions"
-      section with the four categories above populated from instructions.md.
+      section with the four categories above populated from instructions.md and task_brief.md.
 
       ANTI-PATTERNS:
       - Do NOT start writing output files yet. This phase is read-only exploration.
@@ -35,10 +37,15 @@ todos:
     content: >-
       PLAN: Create plan.md with a phased execution strategy.
 
-      Structure the plan as a phase table where each phase has:
+      Start with a "## Deliverables" section listing every required output:
+      - Exact output path (always in output/, e.g., output/report.md)
+      - Format and structure requirements
+      - Quality criteria (what "good" looks like)
+
+      Then structure the rest of the plan as a phase table where each phase has:
       - Phase name and description
       - Phase type: research, elaboration, execution, integration, or verification
-      - Expected output: the specific deliverable(s) this phase produces
+      - Expected output: which deliverable(s) this phase advances
 
       PHASE SIZING: Target 5 todos per tactical phase. Prefer many short phases
       over few long ones. Each phase should be one coherent unit of work (e.g.,
@@ -72,11 +79,14 @@ todos:
       workspace.md is injected into EVERY LLM call as your persistent memory.
       It must be compact and high-value. Structure it with these sections:
       - "## Pinned Instructions" (already populated from todo 1)
+      - "## Deliverables" — table tracking each expected output from plan.md
+        with columns: Deliverable | Path | Status (pending/in-progress/done)
       - "## Key Decisions" — record significant choices with brief reasoning
       - "## Entities" — only if you already identified key entities to track
       - "## Critical Context" — anything else that must survive context compaction
 
       COMPLETION CRITERIA: workspace.md has the sections above and is under 50 lines.
+      The Deliverables table matches the deliverables defined in plan.md.
 
       ANTI-PATTERNS:
       - Do NOT dump full document inventories or file listings here.

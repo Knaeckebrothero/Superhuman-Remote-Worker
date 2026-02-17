@@ -57,6 +57,21 @@ import { environment } from '../../core/environment';
             <span class="field-hint">Describe what you want the agent to do</span>
           </div>
 
+          <!-- Kickoff Message (optional opening prompt) -->
+          <div class="form-group">
+            <label for="kickoff" class="form-label">Opening Message</label>
+            <textarea
+              id="kickoff"
+              name="kickoff"
+              class="form-textarea"
+              [(ngModel)]="kickoffMessage"
+              rows="3"
+              placeholder="Say something to the AI... (e.g., 'Start by reviewing the document structure')"
+              [disabled]="isSubmitting() || artifacts.streaming()"
+            ></textarea>
+            <span class="field-hint">Optional opening prompt — gives the agent initial direction</span>
+          </div>
+
           <!-- Expert Selector -->
           <div class="form-group">
             <label class="form-label">Agent Expert</label>
@@ -1510,6 +1525,8 @@ export class JobCreateComponent implements OnInit {
   // Current upload_id after successful upload
   private uploadId: string | null = null;
 
+  kickoffMessage = '';
+
   formData: JobCreateRequest = {
     description: '',
   };
@@ -1902,6 +1919,9 @@ export class JobCreateComponent implements OnInit {
     if (instructions) {
       request.instructions = instructions;
     }
+    if (this.kickoffMessage.trim()) {
+      request.kickoff_message = this.kickoffMessage.trim();
+    }
 
     const dsIds = this.selectedDatasourceIds();
     if (dsIds.size > 0) {
@@ -1996,6 +2016,7 @@ export class JobCreateComponent implements OnInit {
     this.formData = {
       description: '',
     };
+    this.kickoffMessage = '';
     this.filePreviews.set([]);
     this.uploadId = null;
     // Reset expert selection

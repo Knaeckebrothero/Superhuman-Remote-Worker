@@ -336,11 +336,17 @@ def create_init_strategic_todos_node(
         job_id = state.get("job_id", "unknown")
         logger.info(f"[{job_id}] Initializing strategic todos for phase alternation")
 
-        # Read instructions for context
+        # Read task brief for context
+        try:
+            task_brief = workspace.read_file("task_brief.md")
+        except FileNotFoundError:
+            task_brief = ""
+
+        # Read instructions for context (backward compat — removed in Phase 0)
         try:
             instructions = workspace.read_file("instructions.md")
         except FileNotFoundError:
-            instructions = "No instructions.md found. Please create a plan based on job metadata."
+            instructions = ""
             logger.warning(f"[{job_id}] instructions.md not found")
 
         # Load predefined strategic todos from config template
@@ -368,6 +374,7 @@ def create_init_strategic_todos_node(
                 data={
                     "phase_alternation": True,
                     "strategic_todos": len(strategic_todos),
+                    "task_brief_length": len(task_brief),
                     "instructions_length": len(instructions),
                 },
                 metadata=state.get("metadata"),
@@ -375,12 +382,18 @@ def create_init_strategic_todos_node(
                 phase_number=0,
             )
 
-        # Add instructions as initial context for the strategic agent
-        message = HumanMessage(
-            content=f"## Task Instructions\n\n{instructions}\n\n"
+        # Compose initial HumanMessage: task brief + instructions
+        content_parts = []
+        if task_brief:
+            content_parts.append(task_brief)
+        if instructions:
+            content_parts.append(f"## Task Instructions\n\n{instructions}")
+        content_parts.append(
             "You are starting in strategic mode. Work through the predefined todos "
-            "to understand the task, create a plan, and prepare todos for execution."
+            "to understand the task, create a plan, and prepare todos for execution.\n\n"
+            "Your task brief is saved to `task_brief.md` in your workspace for reference."
         )
+        message = HumanMessage(content="\n\n".join(content_parts))
 
         return {
             "messages": [message],
@@ -560,6 +573,30 @@ def create_execute_node(
             ws_ai_msg, ws_tool_msg = create_workspace_tool_messages(workspace_content)
             prepared_messages.append(ws_ai_msg)
             prepared_messages.append(ws_tool_msg)
+
+        # Step 2b: Inject phase-triggered instruction files (active injection)
+        # Files with enforce=false and phase triggers are auto-injected as
+        # transient messages so the agent doesn't need to remember to read them.
+        if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
+            phase_name = "strategic" if is_strategic else "tactical"
+            phase_entries = tool_context.get_phase_instruction_files(phase_name)
+            if phase_entries:
+                from src.core.workspace_injection import create_instruction_tool_messages
+                for entry in phase_entries:
+                    try:
+                        instr_content = workspace_manager.read_file(entry.file)
+                        instr_ai, instr_tool = create_instruction_tool_messages(
+                            entry.file, instr_content
+                        )
+                        prepared_messages.append(instr_ai)
+                        prepared_messages.append(instr_tool)
+                        logger.debug(
+                            f"[{job_id}] Injected instruction file: {entry.file}"
+                        )
+                    except FileNotFoundError:
+                        logger.warning(
+                            f"[{job_id}] Phase instruction file not found: {entry.file}"
+                        )
 
         # Step 3: Add rest of conversation (excluding all SystemMessages)
         for msg in messages:

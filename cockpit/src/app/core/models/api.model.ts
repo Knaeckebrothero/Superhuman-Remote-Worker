@@ -190,6 +190,7 @@ export interface JobCreateRequest {
   config_override?: Record<string, unknown>;
   context?: Record<string, unknown>;
   instructions?: string;
+  kickoff_message?: string;
   datasource_ids?: string[];
   builder_session_id?: string;
 }
