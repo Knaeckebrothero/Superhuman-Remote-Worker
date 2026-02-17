@@ -22,8 +22,8 @@ todos:
       2. **Incomplete**: What was attempted but didn't fully succeed, and why.
       3. **Discoveries**: Unexpected findings or blockers encountered.
       4. **Todo Stats**: How many todos were completed vs planned (e.g., "8/10 completed").
-      5. **Deliverable Status**: Which deliverables from instructions.md are now done
-         vs still remaining. List them explicitly.
+      5. **Deliverable Status**: Which deliverables from plan.md's "## Deliverables" section
+         are now done vs still remaining. Use list_files('output/') to verify. List them explicitly.
 
       COMPLETION CRITERIA: archive/phase_N_retrospective.md written with all 5 sections,
       backed by git evidence (commit hashes, file paths from git_diff).
@@ -42,6 +42,8 @@ todos:
       tokens and confuses future decisions. After rewriting, it should contain ONLY:
       - "## Pinned Instructions" — the rules from instructions.md (re-read instructions.md
         if you're unsure these are still accurate and complete)
+      - "## Deliverables" — update the status table based on the retrospective's
+        Deliverable Status section. Mark completed items as "done".
       - "## Key Decisions" — significant choices made so far, with brief reasoning
       - "## Entities" — key entities being tracked (if applicable)
       - "## Critical Context" — current blockers, important discoveries, anything
@@ -73,8 +75,8 @@ todos:
       (3) If the phase was incomplete, create a continuation phase (e.g., "Phase 2.5:
           Complete remaining extraction") rather than overloading the next phase.
       (4) Remove phases that are no longer needed based on what you've learned.
-      (5) Cross-check remaining phases against instructions.md — are all required
-          deliverables still covered by at least one upcoming phase?
+      (5) Cross-check remaining phases against the "## Deliverables" section in plan.md —
+          are all required deliverables still covered by at least one upcoming phase?
 
       COMPLETION CRITERIA: plan.md updated with outcomes on completed phases,
       phase sizing adjusted, upcoming phases verified against instructions.md.
@@ -92,10 +94,10 @@ todos:
 
       === STOP CONDITION (check this FIRST) ===
 
-      Re-read your "## Pinned Instructions" in workspace.md (or re-read instructions.md
-      directly). List every required deliverable. Then check which ones actually exist
-      in output/ using list_files. If ALL required deliverables exist AND the REVIEW
-      phase (todo 1) confirmed their quality, then the job is DONE.
+      Check the "## Deliverables" table in workspace.md (or re-read plan.md's
+      Deliverables section). Then verify which outputs actually exist in output/
+      using list_files. If ALL required deliverables exist AND the REVIEW phase
+      (todo 1) confirmed their quality, then the job is DONE.
 
       Call job_complete with:
       - summary: What was accomplished across all phases

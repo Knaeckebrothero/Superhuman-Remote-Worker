@@ -13,7 +13,7 @@ todos:
       Steps:
       (1) Read the feedback message in this conversation (injected above as a HumanMessage).
       (2) Read feedback.md for the persisted copy of the feedback.
-      (3) Re-read instructions.md for the original task requirements.
+      (3) Re-read task_brief.md and instructions.md for the original task requirements.
       (4) Categorize each feedback item as: content issue, structural issue, missing
           deliverable, quality concern, or factual error.
 

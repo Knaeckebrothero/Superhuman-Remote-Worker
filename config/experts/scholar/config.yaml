@@ -25,8 +25,18 @@ workspace:
     - output/ideas/
     - output/experiments/
     - notes/
+    - reference/
     - repo/
   git_versioning: true
+
+# Scholar-specific instruction files (extends defaults' todo_guide.md)
+instruction_files:
+  - file: todo_guide.md
+    trigger: before_tool:next_phase_todos
+    enforce: true
+  - file: research_guide.md
+    trigger: phase:tactical
+    enforce: false  # Active: injected automatically at tactical phase start
 
 tools:
   workspace:

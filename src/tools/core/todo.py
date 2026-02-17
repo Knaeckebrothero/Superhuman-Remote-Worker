@@ -112,8 +112,10 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             )
         """
         try:
-            # Enforce read-before-create: AI must read todo_guide.md first
-            if not context.was_recently_read("todo_guide.md"):
+            # Enforcement of todo_guide.md read is now config-driven via
+            # instruction_files triggers (apply_instruction_enforcement wrapper).
+            # Fallback check for backward compat when no instruction_files configured:
+            if not context._instruction_files and not context.was_recently_read("todo_guide.md"):
                 return (
                     "Error: You must read_file('todo_guide.md') before creating todos. "
                     "The guide contains critical instructions on how to craft effective, "

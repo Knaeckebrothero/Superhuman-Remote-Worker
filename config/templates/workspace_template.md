@@ -31,7 +31,15 @@ Information that MUST survive context compaction. Use sparingly.
 
 (Example: "API rate limit: 100/min - batch accordingly")
 
+## Deliverables
+
+Track expected outputs (from plan.md) and their status:
+
+| Deliverable | Path | Status |
+|---|---|---|
+| (from plan.md) | output/... | pending |
+
 ## Pinned Instructions
 
-Rules from instructions.md that must persist across context compaction.
+Rules from instructions.md and task_brief.md that must persist across context compaction.
 Extract and place here during the first strategic phase.

@@ -4,6 +4,7 @@
 
 default:
   systemprompt: systemprompt.txt
+  persona: persona.txt
   strategic: strategic.txt
   tactical: tactical.txt
   summarization: summarization_prompt.txt
