@@ -347,6 +347,7 @@ class PromptMatrixResolver(MatrixResolver):
     FRAMEWORK_DIR = "config/prompts"
     HARDCODED_DEFAULTS = {
         "systemprompt": "systemprompt.txt",
+        "persona": "persona.txt",
         "strategic": "strategic.txt",
         "tactical": "tactical.txt",
         "summarization": "summarization_prompt.txt",
@@ -379,6 +380,37 @@ class InstructionMatrixResolver(MatrixResolver):
         "workspace_template": "workspace_template.md",
         "todo_guide": "todo_guide.md",
     }
+
+
+@dataclass
+class InstructionFileEntry:
+    """An instruction file with trigger conditions for auto-injection.
+
+    Defines when and how an instruction file is delivered to the agent.
+
+    Attributes:
+        file: Workspace-relative path (e.g., "todo_guide.md")
+        trigger: Trigger condition string:
+            - "before_tool:<tool_name>" — fires when the named tool is called
+            - "phase:strategic" / "phase:tactical" — fires on phase transition
+        enforce: If True, tool rejects until agent reads the file (passive).
+                 If False, system injects content automatically (active).
+    """
+
+    file: str
+    trigger: str
+    enforce: bool = True
+
+    @property
+    def trigger_type(self) -> str:
+        """Extract trigger type: 'before_tool' or 'phase'."""
+        return self.trigger.split(":")[0]
+
+    @property
+    def trigger_target(self) -> str:
+        """Extract trigger target: tool name or phase name."""
+        parts = self.trigger.split(":", 1)
+        return parts[1] if len(parts) > 1 else ""
 
 
 @dataclass
@@ -572,6 +604,7 @@ class AgentConfig:
         default_factory=ContextManagementConfig
     )
     phase_settings: PhaseSettings = field(default_factory=PhaseSettings)
+    instruction_files: List[InstructionFileEntry] = field(default_factory=list)
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -762,11 +795,22 @@ def load_agent_config(
         max_todos=phase_data.get("max_todos", 20),
     )
 
+    # Parse instruction_files entries
+    instruction_files_data = data.get("instruction_files", [])
+    instruction_files = [
+        InstructionFileEntry(
+            file=entry["file"],
+            trigger=entry["trigger"],
+            enforce=entry.get("enforce", True),
+        )
+        for entry in instruction_files_data
+    ]
+
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings"
+        "phase_settings", "instruction_files"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -781,6 +825,7 @@ def load_agent_config(
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,
+        instruction_files=instruction_files,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -882,11 +927,22 @@ def load_agent_config_from_dict(
         max_todos=phase_data.get("max_todos", 20),
     )
 
+    # Parse instruction_files entries
+    instruction_files_data = data.get("instruction_files", [])
+    instruction_files = [
+        InstructionFileEntry(
+            file=entry["file"],
+            trigger=entry["trigger"],
+            enforce=entry.get("enforce", True),
+        )
+        for entry in instruction_files_data
+    ]
+
     # Collect extra fields
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings"
+        "phase_settings", "instruction_files"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -901,6 +957,7 @@ def load_agent_config_from_dict(
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,
+        instruction_files=instruction_files,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -1540,19 +1597,28 @@ def get_phase_system_prompt(
     # 1. Load base template
     base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(resolver)
 
-    # 2. Load phase component
+    # 2. Load expert persona (empty string if no persona file exists)
+    expert_identity = resolved_prompts.get("persona") or ""
+    if not expert_identity:
+        try:
+            expert_identity = resolver.load("persona")
+        except FileNotFoundError:
+            expert_identity = ""
+
+    # 3. Load phase component
     prompt_type = "strategic" if is_strategic else "tactical"
     phase_component = resolved_prompts.get(prompt_type) or load_phase_component(is_strategic, resolver)
 
-    # 3. Render phase component's {phase_number} placeholder
+    # 4. Render phase component's {phase_number} placeholder
     rendered_component = phase_component.format(phase_number=phase_number)
 
-    # 4. & 5. Inject component and render remaining placeholders
+    # 5. Inject all components and render remaining placeholders
     oss_reasoning_level = config.llm.reasoning_level or "high"
 
     return base_template.format(
         oss_reasoning_level=oss_reasoning_level,
         agent_display_name=config.display_name,
+        expert_identity=expert_identity,
         prompt_content=rendered_component,
         todos_content=todos_content,
     )
@@ -2161,7 +2227,7 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     # Resolve all prompts to full text
     prompt_resolver = PromptMatrixResolver(config._deployment_dir, model_family)
     prompts = {}
-    for pt in ["systemprompt", "strategic", "tactical", "summarization"]:
+    for pt in ["systemprompt", "persona", "strategic", "tactical", "summarization"]:
         try:
             prompts[pt] = prompt_resolver.load(pt)
         except FileNotFoundError:

@@ -31,7 +31,7 @@ from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkp
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.loader import get_project_root
 from .managers import TodoManager
-from .tools import ToolContext, load_tools
+from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .core.state import UniversalAgentState, create_initial_state
 from .core.loader import (
     AgentConfig,
@@ -915,6 +915,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             instructions = load_instructions(self.config, model=self.config.llm.model)
             self._workspace_manager.write_file("instructions.md", instructions)
 
+        # Write task brief to workspace (description + optional kickoff message)
+        description = metadata.get("description", "")
+        kickoff_message = metadata.get("kickoff_message", "")
+        brief_parts = [f"# Task Brief\n\n## Description\n\n{description}"]
+        if kickoff_message:
+            brief_parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
+        self._workspace_manager.write_file("task_brief.md", "".join(brief_parts))
+        logger.debug("Wrote task_brief.md to workspace")
+
         # Process initial_files from config (e.g., workspace.md template)
         if self.config.workspace.initial_files:
             config_dir = Path(__file__).parent.parent / "config" / "agents"
@@ -1148,7 +1157,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         generate_workspace_tool_docs(tool_names, tools_dir)
 
         # Copy todo crafting guide to workspace via instruction matrix
-        from .core.loader import InstructionMatrixResolver, detect_model_family
+        from .core.loader import InstructionMatrixResolver, FileResolver, detect_model_family
         model_family = detect_model_family(self.config.llm.model)
         instr_resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
         try:
@@ -1159,6 +1168,33 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.debug("Copied todo_guide.md to workspace")
         except FileNotFoundError:
             logger.warning("todo_guide.md not found via instruction matrix")
+
+        # Copy instruction files to workspace (config-driven)
+        if self.config.instruction_files:
+            templates_dir = get_project_root() / "config" / "templates"
+            file_resolver = FileResolver(
+                deployment_dir=self.config._deployment_dir,
+                framework_dir=templates_dir,
+            )
+            resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            for entry in self.config.instruction_files:
+                try:
+                    # Skip todo_guide.md — already handled above via matrix
+                    if entry.file == "todo_guide.md":
+                        continue
+                    # Check resolved config first (resumed jobs)
+                    basename = Path(entry.file).stem
+                    content = resolved_instructions.get(basename)
+                    if not content:
+                        # Resolve from filesystem
+                        content = file_resolver.load(Path(entry.file).name)
+                    # Ensure parent directory exists
+                    target_path = self._workspace_manager.get_path(entry.file)
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._workspace_manager.write_file(entry.file, content)
+                    logger.debug(f"Copied instruction file to workspace: {entry.file}")
+                except FileNotFoundError:
+                    logger.warning(f"Instruction file not found: {entry.file}")
 
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
@@ -1203,6 +1239,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             config=tool_config,
             _job_id=self._current_job_id,
             _llm_config=self.config.llm,
+            _instruction_files=self.config.instruction_files,
         )
         self._tool_context = context
 
@@ -1227,6 +1264,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Apply description overrides for deferred tools
         # Domain tools get short descriptions; agent reads full docs from workspace
         self._tools = apply_description_overrides(self._tools)
+
+        # Apply instruction file enforcement wrappers (before_tool triggers)
+        self._tools = apply_instruction_enforcement(self._tools, context)
 
         # Configure parallel tool calls from config (defaults to False to prevent
         # overwhelming the agent loop with 20+ simultaneous tool calls).

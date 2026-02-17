@@ -169,6 +169,7 @@ class JobCreate(BaseModel):
     config_override: dict[str, Any] | None = Field(None, description="Per-job configuration overrides")
     context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
     instructions: str | None = Field(None, description="Additional inline instructions for the agent")
+    kickoff_message: str | None = Field(None, description="Opening message to the agent (task brief)")
     datasource_ids: list[str] | None = Field(None, description="Global datasource IDs to clone as job-scoped")
     builder_session_id: str | None = Field(None, description="Builder session ID to link to this job")
 
@@ -440,6 +441,8 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             context["instructions_upload_id"] = job.instructions_upload_id
         if job.instructions:
             context["instructions"] = job.instructions
+        if job.kickoff_message:
+            context["kickoff_message"] = job.kickoff_message
 
         result = await postgres_db.create_job(
             description=job.description,

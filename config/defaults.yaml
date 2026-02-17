@@ -18,6 +18,8 @@ llm:
 workspace:
   structure:
     - archive/
+    - output/
+    - reference/
     - tools/
   instructions_template: instructions.md
   initial_files:
@@ -108,6 +110,15 @@ tools:
     - git_diff
     - git_status
     - git_tags
+
+# Instruction files — config-driven auto-injection of guidance documents.
+# Each entry copies a file to the workspace and triggers injection based on conditions.
+# enforce: true = passive (tool rejects until agent reads file)
+# enforce: false = active (system injects content as transient message)
+instruction_files:
+  - file: todo_guide.md
+    trigger: before_tool:next_phase_todos
+    enforce: true
 
 connections:
   postgres: true

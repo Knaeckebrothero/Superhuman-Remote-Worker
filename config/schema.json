@@ -132,8 +132,8 @@
           "items": {
             "type": "string"
           },
-          "description": "Directories to create in the workspace",
-          "examples": [["archive/", "output/", "tools/"]]
+          "description": "Directories to create in the workspace. Standard: archive/ (phase history), output/ (deliverables), reference/ (domain material), tools/ (auto-generated tool docs)",
+          "examples": [["archive/", "output/", "reference/", "tools/"]]
         },
         "instructions_template": {
           "type": "string",
@@ -264,6 +264,37 @@
           "examples": [["run_command", "claude_code"]]
         }
       }
+    },
+    "instruction_files": {
+      "type": "array",
+      "description": "Instruction files with config-driven trigger conditions for auto-injection. Each entry copies a file to the workspace and triggers delivery based on conditions.",
+      "items": {
+        "type": "object",
+        "required": ["file", "trigger"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Workspace-relative target path for the instruction file (e.g., 'todo_guide.md' or 'instructions/review_guide.md')"
+          },
+          "trigger": {
+            "type": "string",
+            "description": "Trigger condition. Format: 'before_tool:<tool_name>' (fires before tool execution) or 'phase:<phase_name>' (fires on phase transition). Examples: 'before_tool:next_phase_todos', 'phase:strategic'",
+            "pattern": "^(before_tool|phase):.+$"
+          },
+          "enforce": {
+            "type": "boolean",
+            "default": true,
+            "description": "If true (passive), the tool rejects until the agent reads the file. If false (active), the system auto-injects the content as a transient message."
+          }
+        },
+        "additionalProperties": false
+      },
+      "examples": [
+        [
+          {"file": "todo_guide.md", "trigger": "before_tool:next_phase_todos", "enforce": true},
+          {"file": "instructions/review_guide.md", "trigger": "phase:strategic", "enforce": false}
+        ]
+      ]
     },
     "connections": {
       "type": "object",
