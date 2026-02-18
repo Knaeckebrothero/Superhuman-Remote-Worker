@@ -75,6 +75,12 @@
           "default": "high",
           "description": "Reasoning depth for models that support it"
         },
+        "reasoning_method": {
+          "type": ["string", "null"],
+          "enum": ["prompt", "api", "none", null],
+          "default": null,
+          "description": "How reasoning level is delivered. 'prompt' injects in system prompt (gpt-oss). 'api' passes as API parameter (OpenAI, OpenRouter). 'none' disables (Anthropic, Google, Groq). null auto-detects from model name."
+        },
         "base_url": {
           "type": ["string", "null"],
           "description": "Custom API base URL (null for default)"
@@ -107,6 +113,12 @@
           "minimum": 1,
           "default": null,
           "description": "Override max output tokens (auto-detected if null)"
+        },
+        "model_max_context_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1000,
+          "default": null,
+          "description": "Hard limit for this model's context window. Used for pre-request safety checks (Layer 1) and HTTP-layer validation (Layer 0). Falls back to limits.model_max_context_tokens if null."
         },
         "strategic": {
           "$ref": "#/$defs/llmPhaseOverride",
@@ -326,7 +338,7 @@
         "message_count_min_tokens": {
           "type": "integer",
           "minimum": 1000,
-          "default": 30000,
+          "default": 40000,
           "description": "Minimum token count required when using message count threshold"
         },
         "tool_retry_count": {
@@ -338,14 +350,14 @@
         "model_max_context_tokens": {
           "type": "integer",
           "minimum": 1000,
-          "default": 128000,
-          "description": "Hard limit for model context window. Pre-request safety check will force summarization if exceeded."
+          "default": 100000,
+          "description": "Global fallback for model context window. Used when llm.model_max_context_tokens is not set. Pre-request safety check (Layer 1) will force summarization if exceeded."
         },
         "summarization_safe_limit": {
           "type": "integer",
           "minimum": 1000,
-          "default": 100000,
-          "description": "Maximum input tokens for summarization LLM. Larger inputs trigger recursive chunked summarization."
+          "default": 90000,
+          "description": "Maximum input tokens for summarization LLM. Must be less than model_max_context_tokens to leave room for prompt overhead. Larger inputs trigger recursive chunked summarization."
         },
         "summarization_chunk_size": {
           "type": "integer",
@@ -367,8 +379,8 @@
         "keep_recent_tool_results": {
           "type": "integer",
           "minimum": 0,
-          "default": 10,
-          "description": "Number of recent tool results to keep in full"
+          "default": 15,
+          "description": "Number of recent tool results to preserve in full during context compaction. Higher values retain more context but slow compaction."
         },
         "keep_recent_messages": {
           "type": "integer",
@@ -385,7 +397,7 @@
           "type": "string",
           "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "default": "high",
-          "description": "Reasoning effort level hint for summarization (injected as {oss_reasoning_level})"
+          "description": "Reasoning effort level for summarization. Only injected in prompt when reasoning_method is 'prompt'."
         },
         "max_summary_length": {
           "type": "integer",
@@ -492,6 +504,11 @@
           "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "description": "Reasoning depth override"
         },
+        "reasoning_method": {
+          "type": ["string", "null"],
+          "enum": ["prompt", "api", "none", null],
+          "description": "Override how reasoning level is delivered for this phase"
+        },
         "base_url": {
           "type": ["string", "null"],
           "description": "Custom API base URL override"
@@ -523,6 +540,11 @@
           "type": ["integer", "null"],
           "minimum": 1,
           "description": "Override max output tokens for this phase"
+        },
+        "model_max_context_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1000,
+          "description": "Hard limit for this phase model's context window. Overrides the base llm.model_max_context_tokens for this phase."
         }
       },
       "additionalProperties": false
