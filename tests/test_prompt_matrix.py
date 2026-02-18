@@ -11,10 +11,13 @@ from src.core.loader import (
     AgentConfig,
     FileResolver,
     InstructionMatrixResolver,
+    LLMConfig,
     MatrixResolver,
+    PhaseLLMOverride,
     PromptMatrixResolver,
     PromptResolver,
     detect_model_family,
+    detect_reasoning_method,
     get_phase_system_prompt,
     load_base_system_prompt,
     load_instructions,
@@ -91,6 +94,47 @@ class TestDetectModelFamily:
     def test_case_insensitive(self):
         assert detect_model_family("Claude-Opus-4-6") == "claude-opus"
         assert detect_model_family("GPT-4o") == "gpt-4o"
+
+
+# =============================================================================
+# detect_reasoning_method tests
+# =============================================================================
+
+
+class TestDetectReasoningMethod:
+    """Tests for detect_reasoning_method() auto-detection and explicit override."""
+
+    def test_gpt_oss_returns_prompt(self):
+        assert detect_reasoning_method("gpt-oss-120b") == "prompt"
+        assert detect_reasoning_method("openai/gpt-oss-120b") == "prompt"
+
+    def test_claude_returns_none(self):
+        assert detect_reasoning_method("claude-opus-4-6") == "none"
+        assert detect_reasoning_method("claude-sonnet-4-20250514") == "none"
+        assert detect_reasoning_method("claude-haiku-4-5-20251001") == "none"
+
+    def test_gemini_returns_none(self):
+        assert detect_reasoning_method("gemini-2.0-flash") == "none"
+
+    def test_gpt5_returns_api(self):
+        assert detect_reasoning_method("gpt-5") == "api"
+
+    def test_gpt4o_returns_api(self):
+        assert detect_reasoning_method("gpt-4o") == "api"
+
+    def test_o_series_returns_api(self):
+        assert detect_reasoning_method("o3-mini") == "api"
+
+    def test_deepseek_returns_api(self):
+        assert detect_reasoning_method("deepseek-r1") == "api"
+
+    def test_unknown_returns_api(self):
+        assert detect_reasoning_method("some-unknown-model") == "api"
+
+    def test_explicit_override(self):
+        assert detect_reasoning_method("gpt-oss-120b", explicit_method="none") == "none"
+        assert detect_reasoning_method("claude-opus-4-6", explicit_method="prompt") == "prompt"
+        assert detect_reasoning_method("gpt-4o", explicit_method="api") == "api"
 
 
 # =============================================================================
@@ -322,7 +366,7 @@ class TestDefaultResolution:
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name} {oss_reasoning_level} {prompt_content} {todos_content}"
+                "{agent_display_name} {prompt_content}"
             )
             (config_prompts / "strategic.txt").write_text("phase {phase_number}")
 
@@ -330,11 +374,9 @@ class TestDefaultResolution:
                 config=config,
                 is_strategic=True,
                 phase_number=1,
-                todos_content="todos here",
             )
             assert "Test Agent" in result
             assert "phase 1" in result
-            assert "todos here" in result
 
     def test_get_phase_system_prompt_with_model(self, tmp_path):
         """With model param, model family is detected and used."""
@@ -347,7 +389,7 @@ class TestDefaultResolution:
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
             (config_prompts / "systemprompt.txt").write_text(
-                "{agent_display_name} {oss_reasoning_level} {prompt_content} {todos_content}"
+                "{agent_display_name} {prompt_content}"
             )
             (config_prompts / "strategic.txt").write_text("phase {phase_number}")
 
@@ -355,11 +397,12 @@ class TestDefaultResolution:
                 config=config,
                 is_strategic=True,
                 phase_number=1,
-                todos_content="todos here",
                 model="claude-opus-4-6",
             )
             assert "Test Agent" in result
             assert "phase 1" in result
+            # Claude models should not have reasoning directive injected
+            assert "Reasoning:" not in result
 
 
 # =============================================================================
@@ -431,3 +474,116 @@ class TestPromptMatrixResolverLoad:
 
             resolver = PromptMatrixResolver(model_family="default")
             assert resolver.exists("nonexistent_type") is False
+
+
+# =============================================================================
+# LLMConfig.get_phase_config() — model_max_context_tokens merge tests
+# =============================================================================
+
+
+class TestPhaseConfigContextTokens:
+    """Tests for model_max_context_tokens merge in get_phase_config()."""
+
+    def test_base_value_inherited_when_no_override(self):
+        """Phase config inherits base model_max_context_tokens when override omits it."""
+        config = LLMConfig(model="gpt-4o", model_max_context_tokens=128000)
+        phase = config.get_phase_config("strategic")
+        assert phase.model_max_context_tokens == 128000
+
+    def test_override_replaces_base(self):
+        """Phase override's model_max_context_tokens replaces base value."""
+        config = LLMConfig(
+            model="gpt-4o",
+            model_max_context_tokens=128000,
+            tactical=PhaseLLMOverride(model="gpt-4o-mini", model_max_context_tokens=32000),
+        )
+        phase = config.get_phase_config("tactical")
+        assert phase.model_max_context_tokens == 32000
+        assert phase.model == "gpt-4o-mini"
+
+    def test_override_none_keeps_base(self):
+        """When override has model_max_context_tokens=None, base is kept."""
+        config = LLMConfig(
+            model="gpt-4o",
+            model_max_context_tokens=128000,
+            strategic=PhaseLLMOverride(temperature=0.5),
+        )
+        phase = config.get_phase_config("strategic")
+        assert phase.model_max_context_tokens == 128000
+        assert phase.temperature == 0.5
+
+    def test_base_none_override_sets(self):
+        """When base has no model_max_context_tokens, override can set it."""
+        config = LLMConfig(
+            model="gpt-4o",
+            tactical=PhaseLLMOverride(model_max_context_tokens=32000),
+        )
+        assert config.model_max_context_tokens is None
+        phase = config.get_phase_config("tactical")
+        assert phase.model_max_context_tokens == 32000
+
+    def test_no_override_returns_self(self):
+        """Phase without override returns self (identity)."""
+        config = LLMConfig(model="gpt-4o", model_max_context_tokens=128000)
+        phase = config.get_phase_config("tactical")
+        assert phase is config
+
+    def test_resolved_config_has_no_phase_fields(self):
+        """Resolved phase config has strategic/tactical/summarization=None."""
+        config = LLMConfig(
+            model="gpt-4o",
+            model_max_context_tokens=128000,
+            strategic=PhaseLLMOverride(model_max_context_tokens=200000),
+        )
+        phase = config.get_phase_config("strategic")
+        assert phase.strategic is None
+        assert phase.tactical is None
+        assert phase.summarization is None
+
+
+# =============================================================================
+# LLM reuse — full config equality tests
+# =============================================================================
+
+
+class TestLLMReuseEquality:
+    """Tests that LLM reuse compares full config, not just model name."""
+
+    def test_same_model_same_settings_are_equal(self):
+        """Identical configs should be equal (enabling reuse)."""
+        config = LLMConfig(model="gpt-4o", temperature=0.3, model_max_context_tokens=128000)
+        strategic = config.get_phase_config("strategic")
+        tactical = config.get_phase_config("tactical")
+        assert strategic == tactical
+
+    def test_same_model_different_context_tokens_not_equal(self):
+        """Same model but different context tokens should NOT be equal."""
+        config = LLMConfig(
+            model="gpt-4o",
+            model_max_context_tokens=128000,
+            tactical=PhaseLLMOverride(model_max_context_tokens=32000),
+        )
+        strategic = config.get_phase_config("strategic")
+        tactical = config.get_phase_config("tactical")
+        assert strategic != tactical
+
+    def test_same_model_different_temperature_not_equal(self):
+        """Same model but different temperature should NOT be equal."""
+        config = LLMConfig(
+            model="gpt-4o",
+            temperature=0.3,
+            tactical=PhaseLLMOverride(temperature=0.0),
+        )
+        strategic = config.get_phase_config("strategic")
+        tactical = config.get_phase_config("tactical")
+        assert strategic != tactical
+
+    def test_different_models_not_equal(self):
+        """Different models are obviously not equal."""
+        config = LLMConfig(
+            model="gpt-4o",
+            tactical=PhaseLLMOverride(model="gpt-4o-mini"),
+        )
+        strategic = config.get_phase_config("strategic")
+        tactical = config.get_phase_config("tactical")
+        assert strategic != tactical

@@ -425,6 +425,7 @@ class PhaseLLMOverride:
     provider: Optional[str] = None
     temperature: Optional[float] = None
     reasoning_level: Optional[str] = None
+    reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect)
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     timeout: Optional[float] = None
@@ -432,6 +433,7 @@ class PhaseLLMOverride:
     multimodal: Optional[bool] = None
     parallel_tool_calls: Optional[bool] = None
     max_output_tokens: Optional[int] = None
+    model_max_context_tokens: Optional[int] = None
 
 
 @dataclass
@@ -459,6 +461,7 @@ class LLMConfig:
     provider: Optional[str] = None  # "openai", "anthropic", "google", "groq", "openrouter" (auto-detect if None)
     temperature: float = 0.0
     reasoning_level: str = "high"
+    reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect from model)
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     timeout: Optional[float] = 600.0  # 10 minutes default
@@ -466,6 +469,7 @@ class LLMConfig:
     multimodal: bool = False  # Whether model can process images directly
     parallel_tool_calls: bool = False  # Allow multiple tool calls per response
     max_output_tokens: Optional[int] = None  # Override max output tokens (auto-detected if None)
+    model_max_context_tokens: Optional[int] = None  # Per-model context window limit (falls back to limits.model_max_context_tokens)
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -495,6 +499,7 @@ class LLMConfig:
             provider=override.provider if override.provider is not None else self.provider,
             temperature=override.temperature if override.temperature is not None else self.temperature,
             reasoning_level=override.reasoning_level if override.reasoning_level is not None else self.reasoning_level,
+            reasoning_method=override.reasoning_method if override.reasoning_method is not None else self.reasoning_method,
             base_url=override.base_url if override.base_url is not None else self.base_url,
             api_key=override.api_key if override.api_key is not None else self.api_key,
             timeout=override.timeout if override.timeout is not None else self.timeout,
@@ -502,6 +507,7 @@ class LLMConfig:
             multimodal=override.multimodal if override.multimodal is not None else self.multimodal,
             parallel_tool_calls=override.parallel_tool_calls if override.parallel_tool_calls is not None else self.parallel_tool_calls,
             max_output_tokens=override.max_output_tokens if override.max_output_tokens is not None else self.max_output_tokens,
+            model_max_context_tokens=override.model_max_context_tokens if override.model_max_context_tokens is not None else self.model_max_context_tokens,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -554,11 +560,11 @@ class LimitsConfig:
 
     context_threshold_tokens: int = 80000
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 30000
+    message_count_min_tokens: int = 40000
     tool_retry_count: int = 3
     # Safety layer constants for preventing context overflow
-    model_max_context_tokens: int = 128000  # Hard limit for model context window
-    summarization_safe_limit: int = 100000  # Max input tokens for summarization LLM
+    model_max_context_tokens: int = 100000  # Global fallback for model context window
+    summarization_safe_limit: int = 90000  # Max input tokens for summarization LLM (< model_max for prompt overhead)
     summarization_chunk_size: int = 80000   # Chunk size for recursive summarization
 
 
@@ -567,7 +573,7 @@ class ContextManagementConfig:
     """Context management configuration."""
 
     compact_on_archive: bool = True
-    keep_recent_tool_results: int = 10
+    keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     summarization_template: str = "summarization_prompt.txt"
     reasoning_level: str = "high"
@@ -631,6 +637,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         provider=data.get("provider"),
         temperature=data.get("temperature"),
         reasoning_level=data.get("reasoning_level"),
+        reasoning_method=data.get("reasoning_method"),
         base_url=data.get("base_url"),
         api_key=data.get("api_key"),
         timeout=data.get("timeout"),
@@ -638,6 +645,7 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         multimodal=data.get("multimodal"),
         parallel_tool_calls=data.get("parallel_tool_calls"),
         max_output_tokens=data.get("max_output_tokens"),
+        model_max_context_tokens=data.get("model_max_context_tokens"),
     )
 
 
@@ -655,6 +663,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         provider=llm_data.get("provider"),
         temperature=llm_data.get("temperature", 0.0),
         reasoning_level=llm_data.get("reasoning_level", "high"),
+        reasoning_method=llm_data.get("reasoning_method"),
         base_url=llm_data.get("base_url"),
         api_key=llm_data.get("api_key"),
         timeout=llm_data.get("timeout", 600.0),
@@ -662,6 +671,7 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         multimodal=llm_data.get("multimodal", False),
         parallel_tool_calls=llm_data.get("parallel_tool_calls", False),
         max_output_tokens=llm_data.get("max_output_tokens"),
+        model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         # Phase-specific overrides
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
@@ -769,17 +779,17 @@ def load_agent_config(
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
-        model_max_context_tokens=limits_data.get("model_max_context_tokens", 128000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 100000),
+        model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
+        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
     )
 
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 10),
+        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
             "summarization_template",
@@ -901,17 +911,17 @@ def load_agent_config_from_dict(
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
-        model_max_context_tokens=limits_data.get("model_max_context_tokens", 128000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 100000),
+        model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
+        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
     )
 
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 10),
+        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
             "summarization_template",
@@ -1099,6 +1109,33 @@ def detect_model_family(model: str) -> str:
     return "default"
 
 
+def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -> str:
+    """Determine how reasoning level is delivered to the model.
+
+    - "prompt": Inject `Reasoning: {level}` in system prompt (gpt-oss via vLLM)
+    - "api": Pass as API parameter (OpenAI, OpenRouter native models)
+    - "none": Model doesn't support reasoning level control (Anthropic, Google, Groq)
+
+    Args:
+        model: Model name for family detection
+        explicit_method: Explicit override from config (skips auto-detection)
+
+    Returns:
+        One of "prompt", "api", or "none"
+    """
+    if explicit_method:
+        return explicit_method
+
+    family = detect_model_family(model)
+
+    if family == "gpt-oss":
+        return "prompt"
+    if family in ("claude-opus", "claude-sonnet", "claude-haiku", "gemini"):
+        return "none"
+    # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
+    return "api"
+
+
 def _needs_custom_base_url(model: str) -> bool:
     """Check if model requires a custom base URL (OpenAI-compatible endpoint).
 
@@ -1239,7 +1276,8 @@ def _create_openai_llm(
         llm_kwargs["max_tokens"] = config.max_output_tokens
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
-    max_context_tokens = limits.model_max_context_tokens if limits else None
+    # Prefer per-model config value, fall back to global limits
+    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
@@ -1296,6 +1334,8 @@ def _create_anthropic_llm(
             llm_kwargs["max_tokens"] = 32000
         elif any(x in model_lower for x in ("sonnet-4-5", "sonnet-4-0")):
             llm_kwargs["max_tokens"] = 16384
+        elif config.model_max_context_tokens:
+            llm_kwargs["max_tokens"] = min(8192, config.model_max_context_tokens // 4)
         elif limits and limits.model_max_context_tokens:
             llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
         else:
@@ -1486,7 +1526,8 @@ def _create_openrouter_llm(
         llm_kwargs["max_tokens"] = config.max_output_tokens
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
-    max_context_tokens = limits.model_max_context_tokens if limits else None
+    # Prefer per-model config value, fall back to global limits
+    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
@@ -1519,7 +1560,7 @@ def load_base_system_prompt(matrix_resolver: PromptMatrixResolver) -> str:
         matrix_resolver: PromptMatrixResolver for model-aware filename resolution.
 
     Returns:
-        Raw template string with placeholders ({prompt_content}, {todos_content}, etc.)
+        Raw template string with placeholders ({prompt_content}, etc.)
 
     Raises:
         FileNotFoundError: If template not found
@@ -1551,7 +1592,6 @@ def get_phase_system_prompt(
     config: AgentConfig,
     is_strategic: bool,
     phase_number: int = 0,
-    todos_content: str = "",
     model: str = "",
 ) -> str:
     """Get the complete system prompt for the current phase.
@@ -1562,16 +1602,15 @@ def get_phase_system_prompt(
     2. Load phase component (strategic.txt or tactical.txt)
     3. Render phase component's {phase_number} placeholder
     4. Inject rendered component into base template's {prompt_content}
-    5. Render remaining placeholders ({todos_content}, etc.)
+    5. Render remaining placeholders ({agent_display_name}, etc.)
 
-    Note: workspace.md content is now injected as a synthetic tool call result
+    Note: workspace.md and todos are injected as transient messages
     in graph.py, not included in the system prompt.
 
     Args:
         config: Agent configuration
         is_strategic: True for strategic phase, False for tactical
         phase_number: Current phase number
-        todos_content: Formatted todo list string
         model: Model name for prompt matrix resolution.
 
     Returns:
@@ -1583,7 +1622,6 @@ def get_phase_system_prompt(
             config=config,
             is_strategic=True,
             phase_number=1,
-            todos_content="- Explore workspace\\n- Create plan",
             model="claude-opus-4-6",
         )
         ```
@@ -1613,15 +1651,19 @@ def get_phase_system_prompt(
     rendered_component = phase_component.format(phase_number=phase_number)
 
     # 5. Inject all components and render remaining placeholders
-    oss_reasoning_level = config.llm.reasoning_level or "high"
-
-    return base_template.format(
-        oss_reasoning_level=oss_reasoning_level,
+    rendered = base_template.format(
         agent_display_name=config.display_name,
         expert_identity=expert_identity,
         prompt_content=rendered_component,
-        todos_content=todos_content,
     )
+
+    # Prepend reasoning directive only for OSS models that need it as prompt text
+    method = detect_reasoning_method(model or config.llm.model, config.llm.reasoning_method)
+    if method == "prompt":
+        level = config.llm.reasoning_level or "high"
+        rendered = f"Reasoning: {level}\n\n{rendered}"
+
+    return rendered
 
 
 def load_instructions(config: AgentConfig, model: str = "") -> str:
@@ -1683,28 +1725,29 @@ def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
     """Load the summarization prompt template.
 
     Uses PromptMatrixResolver for model-aware prompt resolution.
+    Prepends a reasoning directive for OSS models that need it as prompt text.
 
     Args:
         config: Agent configuration
         model: Model name for prompt matrix resolution.
 
     Returns:
-        Summarization prompt content
+        Summarization prompt content ready for use
     """
     # Check for pre-resolved content (from resolved_config JSONB)
     resolved = config.extra.get("_resolved_prompts", {})
-    if resolved.get("summarization"):
-        return resolved["summarization"]
+    template = resolved.get("summarization") or ""
 
-    model_family = detect_model_family(model) if model else "default"
-    resolver = PromptMatrixResolver(config._deployment_dir, model_family)
-    try:
-        return resolver.load("summarization")
-    except FileNotFoundError:
-        logger.warning(
-            "Summarization prompt not found. Using default prompt."
-        )
-        return """Summarize this agent conversation concisely.
+    if not template:
+        model_family = detect_model_family(model) if model else "default"
+        resolver = PromptMatrixResolver(config._deployment_dir, model_family)
+        try:
+            template = resolver.load("summarization")
+        except FileNotFoundError:
+            logger.warning(
+                "Summarization prompt not found. Using default prompt."
+            )
+            template = """Summarize this agent conversation concisely.
 Focus on:
 1. What tasks were completed
 2. Key decisions made
@@ -1717,6 +1760,18 @@ Keep the summary under 500 words. Use bullet points.
 Conversation:
 {conversation}
 """
+
+    # Prepend reasoning directive only for OSS models that need it as prompt text
+    summarization_config = config.llm.get_phase_config("summarization")
+    method = detect_reasoning_method(
+        model or summarization_config.model,
+        summarization_config.reasoning_method,
+    )
+    if method == "prompt":
+        level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+        template = f"Reasoning: {level}\n\n{template}"
+
+    return template
 
 
 def get_all_tool_names(config: AgentConfig) -> List[str]:
@@ -2018,7 +2073,7 @@ def load_strategic_todos_template(
         StrategicTodosValidationError: If template is invalid
     """
     # Check for pre-resolved content first
-    if resolved_content:
+    if resolved_content and isinstance(resolved_content, str):
         logger.debug("Loading strategic todos from resolved content")
         return _parse_strategic_todos_yaml_from_string(resolved_content)
 

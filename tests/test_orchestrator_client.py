@@ -195,12 +195,13 @@ class TestOrchestratorClient:
 class TestCreateOrchestratorClientFromEnv:
     """Tests for create_orchestrator_client_from_env function."""
 
-    def test_returns_none_without_url(self):
-        """Test returns None when ORCHESTRATOR_URL not set."""
+    def test_returns_client_with_default_url(self):
+        """Test returns client with default URL when ORCHESTRATOR_URL not set."""
         with patch.dict(os.environ, {}, clear=True):
             os.environ.pop("ORCHESTRATOR_URL", None)
             client = create_orchestrator_client_from_env("creator")
-            assert client is None
+            assert client is not None
+            assert client.orchestrator_url == "http://localhost:8085"
 
     def test_creates_client_with_url(self):
         """Test creates client when ORCHESTRATOR_URL is set."""

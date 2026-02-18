@@ -2,18 +2,22 @@
 # Framework defaults - agents extend this via $extends
 
 agent_id: default
-display_name: General Secretary
+display_name: The General Secretary
 
 llm:
   model: openai/gpt-oss-120b
   provider: null  # Auto-detect from model name (claude-* → anthropic, gemini-* → google)
   temperature: 0.0
   reasoning_level: high
-  base_url: null
+  reasoning_method: null  # Auto-detect from model name (prompt/api/none)
+  base_url: null  # Set LLM_BASE_URL env var for local vLLM endpoint
   timeout: 600
   max_retries: 3
+  max_output_tokens: null  # Auto-detected per provider; override for local models if needed
   multimodal: false  # Set to true if model can process images directly
   parallel_tool_calls: false  # Set to true for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)
+  model_max_context_tokens: 100000  # gpt-oss-120b effective context limit (vLLM); Layer 0/1 safety
+  # No phase overrides — strategic, tactical, and summarization all use gpt-oss-120b
 
 workspace:
   structure:
@@ -88,6 +92,7 @@ tools:
     - get_annotations
     - tag_source
     - search_library
+    - generate_bibliography
   # Graph tools - Neo4j operations (src/tools/graph/)
   # NOTE: Graph tools are no longer listed in defaults. They are injected
   # automatically when a Neo4j datasource is attached to the job.
@@ -125,19 +130,20 @@ connections:
 
 limits:
   context_threshold_tokens: 80000
-  message_count_threshold: 200
-  message_count_min_tokens: 40000
+  message_count_threshold: 300
+  message_count_min_tokens: 50000
   tool_retry_count: 3
-  model_max_context_tokens: 100000
-  summarization_safe_limit: 100000
+  model_max_context_tokens: 80000
+  summarization_safe_limit: 100000  # Must be < model_max to leave room for summarization prompt overhead
   summarization_chunk_size: 80000
 
 context_management:
   compact_on_archive: true
-  # TODO: This is somewhat "bad practice" and should be reworked
-  keep_recent_tool_results: 200
+  keep_recent_tool_results: 15
   keep_recent_messages: 10
   summarization_template: summarization_prompt.txt
+  reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
+  max_summary_length: 10000
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)

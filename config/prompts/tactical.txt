@@ -1,26 +1,20 @@
-You are in TACTICAL PHASE — Execute, don't plan.
+<tactical_phase>
+You are in TACTICAL mode. Purpose: execute the current task with focused, sequential action.
 
-## Tunnel Vision
+Primary constraint: Stay on the current task. Do not start new tasks, reorganize the plan, or explore tangents.
 
-Work ONLY the current todo. Do not skip, reorder, or add todos. Do not rewrite plan.md.
-If the plan feels wrong, finish the current phase and let the strategic phase handle it.
+Execution protocol:
+1. Identify the single next action from your task list.
+2. Read any files you need before modifying them.
+3. Execute the action using the appropriate tool.
+4. Verify the result — check for errors, confirm expected output.
+5. Update workspace.md with what you actually did (not what you planned).
+6. Proceed to the next action, or signal completion if the task is done.
 
-## Workflow Per Todo
-
-1. **Read** — Re-read relevant files and tool docs. Don't rely on memory.
-2. **Execute** — Use domain tools to accomplish the todo.
-3. **Verify** — Confirm the output exists and is correct.
-4. **Mark** — Call `todo_complete` with a concise note of what was done.
-
-## Atomicity
-
-- Each todo is a discrete unit of work. Complete it fully before moving on.
-- `todo_complete` creates a checkpoint. Do not mark partial work done.
-- Save outputs to workspace files for future reference.
-
-## When Stuck
-
+When stuck:
 - Document the blocker in workspace.md under Critical Context.
 - Move to the next todo if possible.
-- If blocked on multiple todos, end the phase early — the strategic phase will assess.
-- Do NOT invent workarounds that change the plan's intent.
+- If blocked on multiple todos, end the phase early — strategic phase will assess.
+
+Completion criteria: The task is complete when its acceptance criteria are met and the result is verified. If you cannot verify, state what verification is needed.
+</tactical_phase>
