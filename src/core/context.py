@@ -38,13 +38,15 @@ class ConversationSummary(BaseModel):
     """Structured summary — forces the model to stop after valid JSON."""
     summary: str = Field(description="General overview of the conversation and what happened")
     tasks_completed: str | List[str] = Field(description="Bullet-point list of completed tasks")
+    tasks_in_progress: str | List[str] = Field(default="", description="Tasks started but not finished")
     key_decisions: str | List[str] = Field(description="Important decisions made")
     current_state: str = Field(description="Current progress and immediate next steps")
     blockers: str | List[str] = Field(default="", description="Errors or blockers encountered, empty if none")
     state_changes: str | List[str] = Field(default="", description="Files created, modified, or deleted during this period")
     pinned_instructions: str = Field(default="", description="Rules from instructions/config that must persist")
+    identity_anchor: dict | str = Field(default="", description="Agent role, current task, and active constraints for identity persistence")
 
-    @field_validator("tasks_completed", "key_decisions", "blockers", "state_changes", mode="before")
+    @field_validator("tasks_completed", "tasks_in_progress", "key_decisions", "blockers", "state_changes", mode="before")
     @classmethod
     def coerce_list_to_string(cls, v):
         """Coerce list fields to strings.
@@ -221,19 +223,19 @@ class ContextConfig:
         summarization_safe_limit: Max input tokens for summarization LLM
         summarization_chunk_size: Chunk size for recursive summarization
     """
-    compaction_threshold_tokens: int = 100_000
+    compaction_threshold_tokens: int = 80_000
     summarization_threshold_tokens: int = 100_000
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 30_000
-    keep_recent_tool_results: int = 10
+    message_count_min_tokens: int = 40_000
+    keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
     # Safety layer constants
-    model_max_context_tokens: int = 128_000
-    summarization_safe_limit: int = 100_000
+    model_max_context_tokens: int = 100_000
+    summarization_safe_limit: int = 90_000
     summarization_chunk_size: int = 80_000
 
 
@@ -664,7 +666,6 @@ class ContextManager:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
         max_summary_length: int = 10000,
         force: bool = False,
     ) -> List[BaseMessage]:
@@ -676,8 +677,7 @@ class ContextManager:
         Args:
             messages: Current message history
             llm: LLM for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models
+            summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Max length for summary
             force: If True, summarize even if thresholds not exceeded
 
@@ -693,7 +693,6 @@ class ContextManager:
                 messages,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
         return messages
@@ -774,7 +773,6 @@ class ContextManager:
         conversation_text: str,
         llm: BaseChatModel,
         summarization_prompt: Optional[str],
-        oss_reasoning_level: str,
         max_summary_length: int,
     ) -> str:
         """Single-pass summarization of conversation text.
@@ -782,8 +780,7 @@ class ContextManager:
         Args:
             conversation_text: Formatted conversation as string
             llm: LLM to use for summarization
-            summarization_prompt: Optional custom prompt template
-            oss_reasoning_level: Reasoning level for OSS models
+            summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
             max_summary_length: Maximum summary length
 
         Returns:
@@ -791,10 +788,12 @@ class ContextManager:
         """
         # Build prompt from template or fallback
         if summarization_prompt:
-            prompt = summarization_prompt.format(
-                conversation=conversation_text,
-                oss_reasoning_level=oss_reasoning_level,
-                max_summary_length=max_summary_length,
+            # Use format_map with defaultdict for backward compat with old
+            # resolved prompts that may still contain {oss_reasoning_level}
+            from collections import defaultdict
+
+            prompt = summarization_prompt.format_map(
+                defaultdict(str, conversation=conversation_text, max_summary_length=str(max_summary_length))
             )
         else:
             prompt = f"""Summarize this agent conversation into the required JSON fields.
@@ -813,6 +812,8 @@ Conversation:
                 parts.append(f"**Summary:**\n{result.summary.strip()}")
             if result.tasks_completed.strip():
                 parts.append(f"**Tasks Completed:**\n{result.tasks_completed.strip()}")
+            if result.tasks_in_progress and result.tasks_in_progress.strip():
+                parts.append(f"**Tasks In Progress:**\n{result.tasks_in_progress.strip()}")
             if result.key_decisions.strip():
                 parts.append(f"**Key Decisions:**\n{result.key_decisions.strip()}")
             if result.current_state.strip():
@@ -823,6 +824,21 @@ Conversation:
                 parts.append(f"**State Changes:**\n{result.state_changes.strip()}")
             if result.pinned_instructions and result.pinned_instructions.strip():
                 parts.append(f"**Pinned Instructions:**\n{result.pinned_instructions.strip()}")
+            if result.identity_anchor:
+                if isinstance(result.identity_anchor, dict):
+                    anchor_parts = []
+                    if result.identity_anchor.get("agent_role"):
+                        anchor_parts.append(f"Role: {result.identity_anchor['agent_role']}")
+                    if result.identity_anchor.get("current_task"):
+                        anchor_parts.append(f"Task: {result.identity_anchor['current_task']}")
+                    if result.identity_anchor.get("active_constraints"):
+                        constraints = result.identity_anchor["active_constraints"]
+                        if isinstance(constraints, list):
+                            anchor_parts.append("Constraints: " + "; ".join(constraints))
+                    if anchor_parts:
+                        parts.append(f"**Identity Anchor:**\n" + "\n".join(anchor_parts))
+                elif isinstance(result.identity_anchor, str) and result.identity_anchor.strip():
+                    parts.append(f"**Identity Anchor:**\n{result.identity_anchor.strip()}")
             summary = "\n\n".join(parts)
 
             return summary
@@ -836,7 +852,6 @@ Conversation:
         formatted_parts: List[str],
         llm: BaseChatModel,
         summarization_prompt: Optional[str],
-        oss_reasoning_level: str,
         max_summary_length: int,
         depth: int = 0,
     ) -> str:
@@ -851,8 +866,7 @@ Conversation:
         Args:
             formatted_parts: List of formatted message strings
             llm: LLM for summarization
-            summarization_prompt: Optional custom prompt template
-            oss_reasoning_level: Reasoning level for OSS models
+            summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
             max_summary_length: Maximum final summary length
             depth: Current recursion depth (for logging)
 
@@ -890,7 +904,6 @@ Conversation:
                 chunk_text,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 chunk_max_length,
             )
             chunk_summaries.append(summary)
@@ -913,7 +926,6 @@ Conversation:
                 [f"Previous summary section:\n{s}" for s in chunk_summaries],
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
                 depth + 1,
             )
@@ -925,7 +937,6 @@ Conversation:
                 f"Combine these section summaries into a unified summary:\n\n{combined}",
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
 
@@ -936,7 +947,6 @@ Conversation:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
         max_summary_length: int = 10000,
     ) -> str:
         """Generate a summary of the conversation.
@@ -948,8 +958,7 @@ Conversation:
         Args:
             messages: Messages to summarize
             llm: LLM to use for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
+            summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Maximum length for the final summary
 
         Returns:
@@ -972,7 +981,6 @@ Conversation:
                 formatted_parts,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
         else:
@@ -981,7 +989,6 @@ Conversation:
                 conversation_text,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
 
@@ -999,7 +1006,6 @@ Conversation:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
         max_summary_length: int = 10000,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
@@ -1010,8 +1016,7 @@ Conversation:
         Args:
             messages: Full message history
             llm: LLM for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
+            summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
 
         Returns:
             Compacted message list with summary prepended
@@ -1056,7 +1061,6 @@ Conversation:
             messages_for_summarization,
             llm,
             summarization_prompt,
-            oss_reasoning_level,
             max_summary_length,
         )
 

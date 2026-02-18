@@ -15,12 +15,15 @@ Also handles injection of instruction files triggered by phase transitions
 import uuid
 from typing import List, Tuple
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 # Prefix for identifying synthetic workspace tool calls
 # Used to exclude these messages from summarization
 WORKSPACE_TOOL_CALL_ID_PREFIX = "workspace_init_"
 INSTRUCTION_TOOL_CALL_ID_PREFIX = "instruction_inject_"
+
+# Prefix for identifying transient todo injection messages
+TODOS_INJECTION_CONTENT_PREFIX = "<active_tasks>\n"
 
 
 def create_workspace_tool_messages(workspace_content: str) -> Tuple[AIMessage, ToolMessage]:
@@ -57,6 +60,22 @@ def create_workspace_tool_messages(workspace_content: str) -> Tuple[AIMessage, T
     )
 
     return ai_message, tool_message
+
+
+def create_todos_human_message(todos_content: str) -> HumanMessage:
+    """Create a transient HumanMessage for todo list injection.
+
+    The message is placed after summary SystemMessages and before the
+    workspace.md fake tool call, giving the agent an up-to-date view of
+    all todos (including completed items) every turn.
+
+    Args:
+        todos_content: Formatted todo list from TodoManager.format_for_injection()
+
+    Returns:
+        HumanMessage with content prefixed by TODOS_INJECTION_CONTENT_PREFIX
+    """
+    return HumanMessage(content=f"{TODOS_INJECTION_CONTENT_PREFIX}{todos_content}\n</active_tasks>")
 
 
 def create_instruction_tool_messages(
@@ -100,8 +119,8 @@ def create_instruction_tool_messages(
 def is_workspace_injection_message(message: BaseMessage) -> bool:
     """Check if a message is part of a transient injection pair.
 
-    Used to identify and exclude workspace/instruction injection messages from
-    summarization, since they will be re-injected fresh after summarization.
+    Used to identify and exclude workspace/instruction/todo injection messages
+    from summarization, since they will be re-injected fresh after summarization.
 
     Args:
         message: A LangChain message object
@@ -109,6 +128,12 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
     Returns:
         True if this message is a synthetic injection message
     """
+    # Detect transient todo HumanMessage
+    if isinstance(message, HumanMessage):
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
+            return True
+
     prefixes = (WORKSPACE_TOOL_CALL_ID_PREFIX, INSTRUCTION_TOOL_CALL_ID_PREFIX)
 
     if isinstance(message, ToolMessage):

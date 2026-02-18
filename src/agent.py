@@ -218,8 +218,8 @@ class UniversalAgent:
             self._strategic_llm = create_llm(strategic_config, limits=limits)
             logger.info(f"Created strategic LLM: {strategic_config.model}")
 
-            # Optimization: reuse LLM if same config
-            if tactical_config.model == strategic_config.model:
+            # Optimization: reuse LLM if fully identical config (not just model name)
+            if tactical_config == strategic_config:
                 self._tactical_llm = self._strategic_llm
                 logger.info(f"Tactical LLM: reusing strategic ({tactical_config.model})")
             else:
@@ -231,10 +231,10 @@ class UniversalAgent:
                 # (avoids creating a separate LLM with potentially unreachable base config)
                 self._summarization_llm = self._strategic_llm
                 logger.info(f"Summarization LLM: reusing strategic ({strategic_config.model}) (no override)")
-            elif summarization_config.model == strategic_config.model:
+            elif summarization_config == strategic_config:
                 self._summarization_llm = self._strategic_llm
                 logger.info(f"Summarization LLM: reusing strategic ({summarization_config.model})")
-            elif summarization_config.model == tactical_config.model:
+            elif summarization_config == tactical_config:
                 self._summarization_llm = self._tactical_llm
                 logger.info(f"Summarization LLM: reusing tactical ({summarization_config.model})")
             else:
@@ -1151,11 +1151,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
-        # Generate tool documentation in workspace
-        tool_names = get_all_tool_names(self.config)
-        tools_dir = self._workspace_manager.get_path("tools")
-        generate_workspace_tool_docs(tool_names, tools_dir)
-
         # Copy todo crafting guide to workspace via instruction matrix
         from .core.loader import InstructionMatrixResolver, FileResolver, detect_model_family
         model_family = detect_model_family(self.config.llm.model)
@@ -1260,6 +1255,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     logger.debug(f"Tool not implemented: {name}")
 
             self._tools = implemented_tools
+
+        # Generate tool documentation in workspace (before overrides so full docstrings are captured)
+        tools_dir = self._workspace_manager.get_path("tools")
+        generate_workspace_tool_docs(tool_names, tools_dir, tools=self._tools)
 
         # Apply description overrides for deferred tools
         # Domain tools get short descriptions; agent reads full docs from workspace

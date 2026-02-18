@@ -503,10 +503,7 @@ def create_execute_node(
         # Build messages for LLM
         prepared_messages = []
 
-        # Get current dynamic content for system prompt
-        todos_content = todo_manager.format_for_display()
-
-        # Get phase-aware system prompt (workspace.md is now injected as fake tool call below)
+        # Get phase-aware system prompt (workspace.md and todos are injected as transient messages below)
         phase_number = state.get("phase_number", 0)
         phase_name = "strategic" if is_strategic else "tactical"
         phase_llm_config = config.llm.get_phase_config(phase_name)
@@ -514,7 +511,6 @@ def create_execute_node(
             config=config,
             is_strategic=is_strategic,
             phase_number=phase_number,
-            todos_content=todos_content,
             model=phase_llm_config.model,
         )
         context_mgr.set_current_phase(phase_name)
@@ -525,12 +521,10 @@ def create_execute_node(
 
         # Ensure context is within limits before LLM call
         original_message_count = len(messages)
-        oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
         messages = await context_mgr.ensure_within_limits(
             messages,
             summarization_llm,
             summarization_prompt,
-            oss_reasoning_level=oss_reasoning_level,
             max_summary_length=config.context_management.max_summary_length,
         )
         # Separate RemoveMessage markers from actual messages
@@ -553,6 +547,7 @@ def create_execute_node(
 
         # Add full conversation history in specific order:
         # 1. Summary SystemMessages first (context from before compaction)
+        # 1.5. Todo injection (full todo list as transient HumanMessage)
         # 2. Workspace injection (fake tool call - current workspace state)
         # 3. Rest of conversation (excluding regular SystemMessages)
 
@@ -561,6 +556,14 @@ def create_execute_node(
             if isinstance(msg, SystemMessage):
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
+
+        # Step 1.5: Inject full todo list as transient HumanMessage
+        # This gives the agent visibility into completed + pending work every turn,
+        # surviving context compaction (re-injected fresh, not stored in state)
+        from src.core.workspace_injection import create_todos_human_message
+
+        todos_injection_content = todo_manager.format_for_injection()
+        prepared_messages.append(create_todos_human_message(todos_injection_content))
 
         # Step 2: Inject workspace.md as fake tool call result
         # This makes it appear as if the agent already read workspace.md
@@ -609,7 +612,7 @@ def create_execute_node(
         # LAYER 1 SAFETY CHECK: Ensure we don't exceed model context limit
         # This catches bad configs and edge cases that slip through normal compaction
         total_tokens = context_mgr.get_token_count(prepared_messages)
-        model_max = config.limits.model_max_context_tokens
+        model_max = phase_llm_config.model_max_context_tokens or config.limits.model_max_context_tokens
 
         if total_tokens > model_max:
             logger.warning(
@@ -622,7 +625,6 @@ def create_execute_node(
                 messages,
                 summarization_llm,
                 summarization_prompt,
-                oss_reasoning_level=oss_reasoning_level,
                 max_summary_length=config.context_management.max_summary_length,
                 force=True,
             )
@@ -632,7 +634,7 @@ def create_execute_node(
             messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
             # Rebuild prepared_messages with compacted history
-            # Keep system prompt, replace conversation history
+            # Keep system prompt, re-inject transient todo message, replace conversation
             system_msg = prepared_messages[0] if prepared_messages else None
             prepared_messages = []
             if system_msg and isinstance(system_msg, SystemMessage):
@@ -643,7 +645,12 @@ def create_execute_node(
                 if isinstance(msg, SystemMessage):
                     if "[Summary of prior work]" in msg.content:
                         prepared_messages.append(msg)
-                else:
+
+            # Re-inject transient todo message
+            prepared_messages.append(create_todos_human_message(todos_injection_content))
+
+            for msg in messages:
+                if not isinstance(msg, SystemMessage):
                     prepared_messages.append(msg)
 
             # Merge remove markers if compaction occurred
@@ -811,7 +818,6 @@ def create_execute_node(
                         messages,
                         summarization_llm,
                         summarization_prompt,
-                        oss_reasoning_level=oss_reasoning_level,
                         max_summary_length=config.context_management.max_summary_length,
                         force=True,
                     )
@@ -1166,8 +1172,6 @@ def create_archive_phase_node(
         compacted_messages = None
 
         if config.context_management.compact_on_archive:
-            oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
-
             # Force summarization when transitioning from strategic to tactical
             # This gives tactical phases a "fresh conversation" with just the plan summary
             force_summarize = is_strategic  # True when completing strategic phase
@@ -1176,7 +1180,6 @@ def create_archive_phase_node(
                 messages,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level=oss_reasoning_level,
                 max_summary_length=config.context_management.max_summary_length,
                 force=force_summarize,
             )
@@ -1644,12 +1647,10 @@ def create_restore_from_feedback_node(
 
         # Step 1: Force-compact old conversation context
         # This gives the agent a "fresh start" with just a summary of prior work
-        oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
         compacted_messages = await context_mgr.ensure_within_limits(
             messages,
             summarization_llm,
             summarization_prompt,
-            oss_reasoning_level=oss_reasoning_level,
             max_summary_length=config.context_management.max_summary_length,
             force=True,
         )

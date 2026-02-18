@@ -33,7 +33,7 @@ The agent receives prompts assembled from multiple layered sources:
 | File | Purpose |
 |------|---------|
 | `prompt_matrix.yaml` | Base prompt matrix mapping `(model_family, prompt_type)` → filename. Consulted as levels 3-4 of the resolution chain. |
-| `prompts/systemprompt.txt` | Base template. Memory model, instruction hierarchy, working principles, meta-cognitive guardrails. Placeholders: `{oss_reasoning_level}`, `{agent_display_name}`, `{prompt_content}`, `{todos_content}` |
+| `prompts/systemprompt.txt` | Base template. Memory model, instruction hierarchy, working principles, meta-cognitive guardrails. Placeholders: `{oss_reasoning_level}` (auto-resolved via `reasoning_method`), `{agent_display_name}`, `{prompt_content}`, `{todos_content}` |
 | `prompts/strategic.txt` | Generic strategic phase directive. Review-reflect-adapt cycle, phase sizing, workspace compaction. |
 | `prompts/tactical.txt` | Generic tactical phase directive. Tunnel vision, per-todo workflow, atomicity. |
 | `prompts/instructions.md` | Generalist "Remote Worker" identity. Phase alternation model, tool usage, working principles, citation guidance. |
@@ -74,7 +74,7 @@ Once the filename is determined, `FileResolver` (base class, aliased as `PromptR
 4. Load phase component via `load_phase_component(is_strategic, resolver)` → resolves `"strategic"` or `"tactical"` type
 5. Render `{phase_number}` in the phase component
 6. Inject rendered phase component into `{prompt_content}` in base template
-7. Render remaining placeholders (`{todos_content}`, `{agent_display_name}`, `{oss_reasoning_level}`)
+7. Render remaining placeholders (`{todos_content}`, `{agent_display_name}`, `{oss_reasoning_level}` — only populated when `reasoning_method == "prompt"`, otherwise stripped)
 
 Similarly, `load_summarization_prompt(config, model)` creates its own `PromptMatrixResolver` internally. `load_instructions(config, model)` uses `InstructionMatrixResolver` instead, resolving via `instruction_matrix.yaml` and `config/templates/`.
 
@@ -143,7 +143,7 @@ These sections describe phase-specific behavior, but they're delivered via `inst
 
 **Problem**: Prompts are written assuming a specific model behavior (currently: reasoning-capable OSS models via vLLM), but experts can be configured to use any model via YAML. Swapping an expert's model to a different family changes how it interprets the same prompt — and the prompt system has no way to adapt.
 
-Beyond `{oss_reasoning_level}` rendered as `Reasoning: high` at the top of `systemprompt.txt`, the prompt matrix system now provides the infrastructure to serve different prompt files per model family — but no model-specific variants have been authored yet. All families currently resolve to the same default filenames.
+The `{oss_reasoning_level}` placeholder in `systemprompt.txt` and `summarization_prompt.txt` is now conditionally rendered via `detect_reasoning_method()`. It is only populated when `reasoning_method == "prompt"` (auto-detected for `gpt-oss` models); for all other model families (Claude, Gemini, GPT-4o, o-series, etc.) the `Reasoning:` line is stripped entirely. The `reasoning_method` config field (`"prompt"`, `"api"`, `"none"`, or `null` for auto-detect) can be set in `llm:` or per-phase overrides. Beyond this, the prompt matrix system provides infrastructure to serve different prompt files per model family — but no model-specific variants have been authored yet. All families currently resolve to the same default filenames.
 
 **Current model assignments:**
 
@@ -711,7 +711,7 @@ Key findings that affect our plan:
 - **Vendor-specific tool count limits**: Claude 50+ with Tool Search / 10-15 without; GPT-5/o-series <100 in-distribution / 20-40 with clear descriptions; Gemini 10-20 recommended / 128 hard limit; small models (<70B) fewer than 10 per call.
 - **Four model-family adaptations capture 80% of gains** without maintaining separate prompt variants: (1) format tags — XML for Claude, Markdown for OpenAI; (2) reasoning model detection — remove CoT instructions for o-series, R1, QwQ; (3) parallel tool calling guidance — explicit prompt block; (4) tool set sizing per model class.
 - **Proposed `model_class` YAML schema** with four categories: `frontier_reasoning` (claude-opus, o3, o4, gpt-5), `standard` (claude-sonnet, claude-haiku, gpt-4o, gemini), `oss_reasoning` (deepseek-r1, qwq, qwen-thinking), `compact` (llama-8b, qwen-7b/14b). Each category sets tool_limit, parallel_tools, format, cot_instructions, and constrained_decoding.
-- **DeepSeek R1 ignores system prompts** — all instructions must go in the user role. R1 also doesn't natively support function calling; requires ReAct-style prompting or routing to V3/Chat for tool execution. Our existing `{oss_reasoning_level}` tag concept is on the right track but needs to extend to these removals.
+- **DeepSeek R1 ignores system prompts** — all instructions must go in the user role. R1 also doesn't natively support function calling; requires ReAct-style prompting or routing to V3/Chat for tool execution. The `reasoning_method` config field now controls whether the `Reasoning:` directive is injected (`"prompt"` for gpt-oss), passed as an API parameter (`"api"`), or omitted (`"none"` for Claude/Gemini).
 - **Universal prompts with runtime tool management outperform model-specific prompt variants** for most practical purposes. Invest engineering effort in dynamic tool loading first, format adaptation second, full prompt variants only for highest-stakes configs.
 - **Comparison matrix** across Claude 4.x, GPT-5/o-series, Gemini 3/2.5, Qwen3/QwQ, DeepSeek R1, and Llama 70B covering description style, tool count tolerance, parallel calling, prompt format, system prompt adherence, reasoning control, temperature, context window, and BFCL ranking.
 

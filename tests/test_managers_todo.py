@@ -288,8 +288,8 @@ class TestTodoManagerStatus:
     """Tests for todo status checks."""
 
     def test_all_complete_empty(self, todo_manager):
-        """Test all_complete with no todos."""
-        assert todo_manager.all_complete() is True
+        """Test all_complete with no todos returns False (empty != complete)."""
+        assert todo_manager.all_complete() is False
 
     def test_all_complete_none_done(self, todo_manager):
         """Test all_complete when no todos are done."""
@@ -388,7 +388,7 @@ class TestTodoManagerDisplay:
         todo_manager.add("Urgent task", priority="high")
 
         result = todo_manager.format_for_display()
-        assert "[!]Urgent task" in result
+        assert "[!] Urgent task" in result
 
 
 class TestTodoManagerArchive:

@@ -389,7 +389,7 @@ class TestResolvedConfigSerialization:
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
-            (config_prompts / "systemprompt.txt").write_text("base {prompt_content} {todos_content}")
+            (config_prompts / "systemprompt.txt").write_text("base {prompt_content}")
             (config_prompts / "strategic.txt").write_text("strategic {phase_number}")
             (config_prompts / "tactical.txt").write_text("tactical {phase_number}")
             (config_prompts / "summarization_prompt.txt").write_text("summarize")
