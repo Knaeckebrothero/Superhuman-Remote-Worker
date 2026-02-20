@@ -1,3 +1,19 @@
+---
+tags:
+  - tool-development
+  - agent-architecture
+  - debugging
+aliases:
+  - tool phase filtering
+  - dynamic tool binding
+  - phase enforcement
+related:
+  - "[[tools_description]]"
+  - "[[prompts]]"
+  - "[[phase_number_issues]]"
+  - "[[config_issues]]"
+---
+
 # Tool Phase Filtering Issue
 
 ## Summary
@@ -122,3 +138,10 @@ Enhance prompts with explicit tool lists and stronger warnings.
 - `src/core/loader.py:589-649` - Phase system prompt loading
 - `src/config/prompts/strategic.txt` - Strategic phase prompt
 - `src/config/prompts/tactical.txt` - Tactical phase prompt
+
+## Related
+
+- [[tools_description]] - Agent tools and their metamodel validation capabilities
+- [[prompts]] - Prompt architecture including phase-specific tool guidance
+- [[phase_number_issues]] - Phase management and transition issues
+- [[config_issues]] - Configuration issues affecting tool loading

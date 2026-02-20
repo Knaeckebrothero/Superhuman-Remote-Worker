@@ -9,6 +9,8 @@ from src.core.loader import (
     _detect_provider,
     _needs_custom_base_url,
     _should_use_reasoning_summary,
+    _clamp_reasoning_level,
+    _OPENAI_REASONING_LEVELS,
     _create_openai_llm,
     _create_openrouter_llm,
 )
@@ -309,15 +311,15 @@ class TestOpenRouterLLMCreation:
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_reasoning_in_model_kwargs(self, mock_chat):
-        """Reasoning should go in model_kwargs (no Responses API on OpenRouter)."""
+        """Reasoning should use nested reasoning object for OpenRouter."""
         mock_chat.return_value = MagicMock()
         config = _make_config(model="openrouter/deepseek/deepseek-r1", reasoning_level="high")
 
         _create_openrouter_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert "reasoning" not in call_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+        assert "reasoning" not in call_kwargs  # not in top-level llm_kwargs
+        assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "high"}
 
     def test_missing_api_key_raises(self):
         """Should raise ValueError when OPENROUTER_API_KEY is not set."""
@@ -341,3 +343,78 @@ class TestOpenRouterLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         # First key should be passed to SDK
         assert call_kwargs["api_key"] == "sk-or-key1"
+
+
+class TestReasoningLevelClamping:
+    """Tests for _clamp_reasoning_level."""
+
+    def test_supported_levels_unchanged(self):
+        """low/medium/high pass through for OpenAI."""
+        for level in ("low", "medium", "high"):
+            assert _clamp_reasoning_level(level, _OPENAI_REASONING_LEVELS) == level
+
+    def test_xhigh_clamped_to_high(self):
+        """xhigh -> high for OpenAI."""
+        assert _clamp_reasoning_level("xhigh", _OPENAI_REASONING_LEVELS) == "high"
+
+    def test_minimal_clamped_to_low(self):
+        """minimal -> low for OpenAI."""
+        assert _clamp_reasoning_level("minimal", _OPENAI_REASONING_LEVELS) == "low"
+
+    def test_unknown_level_falls_back_to_high(self):
+        """Unknown levels should fall back to high."""
+        assert _clamp_reasoning_level("turbo", _OPENAI_REASONING_LEVELS) == "high"
+
+
+class TestOpenAIReasoningClamping:
+    """Integration tests verifying clamping reaches ReasoningChatOpenAI for OpenAI."""
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_clamped_to_high(self, mock_chat):
+        """xhigh should be clamped to high for OpenAI Chat Completions."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openai/gpt-oss-120b", reasoning_level="xhigh")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_minimal_clamped_to_low_responses_api(self, mock_chat):
+        """minimal should be clamped to low for Responses API models."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="o3-mini", reasoning_level="minimal")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["reasoning"] == {"effort": "low", "summary": "auto"}
+
+
+class TestOpenRouterReasoningFormat:
+    """Verify OpenRouter gets nested reasoning object without clamping."""
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_xhigh_not_clamped(self, mock_chat):
+        """OpenRouter should pass xhigh through without clamping."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openrouter/deepseek/deepseek-r1", reasoning_level="xhigh")
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "xhigh"}
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_minimal_not_clamped(self, mock_chat):
+        """OpenRouter should pass minimal through without clamping."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="openrouter/minimax/minimax-m2.5", reasoning_level="minimal")
+
+        _create_openrouter_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "minimal"}

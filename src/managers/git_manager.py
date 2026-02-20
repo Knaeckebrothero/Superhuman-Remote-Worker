@@ -72,18 +72,23 @@ class GitManager:
         """Get the workspace path."""
         return self._workspace_path
 
-    def init_repository(self, ignore_patterns: Optional[List[str]] = None) -> bool:
+    # Default .gitignore patterns for workspace repositories
+    DEFAULT_IGNORE_PATTERNS = [
+        "*.db",
+        "*.log",
+        "__pycache__/",
+        ".DS_Store",
+        "*.pyc",
+    ]
+
+    def init_repository(self) -> bool:
         """Initialize git repository with .gitignore.
 
         Creates a new git repository in the workspace directory, configures
-        a local git user, creates .gitignore from patterns, and makes an
-        initial commit.
+        a local git user, creates .gitignore with sensible defaults, and
+        makes an initial commit.
 
         If a .git directory already exists, this is a no-op and returns True.
-
-        Args:
-            ignore_patterns: List of patterns for .gitignore
-                            (e.g., ["*.db", "*.log", "__pycache__/"])
 
         Returns:
             True if successful or already initialized, False on error
@@ -108,11 +113,10 @@ class GitManager:
             self._run_git(["config", "user.email", "agent@workspace.local"])
             self._run_git(["config", "user.name", "Agent"])
 
-            # Create .gitignore
-            if ignore_patterns:
-                gitignore_path = self._workspace_path / ".gitignore"
-                gitignore_content = "\n".join(ignore_patterns) + "\n"
-                gitignore_path.write_text(gitignore_content)
+            # Create .gitignore with sensible defaults
+            gitignore_path = self._workspace_path / ".gitignore"
+            gitignore_content = "\n".join(self.DEFAULT_IGNORE_PATTERNS) + "\n"
+            gitignore_path.write_text(gitignore_content)
 
             # Stage all files
             result = self._run_git(["add", "-A"])

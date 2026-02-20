@@ -36,7 +36,7 @@ def git_manager(temp_workspace):
 def initialized_git(temp_workspace):
     """Create a GitManager with an initialized repository."""
     gm = GitManager(temp_workspace)
-    gm.init_repository(ignore_patterns=["*.log", "*.tmp"])
+    gm.init_repository()
     return gm
 
 
@@ -84,15 +84,14 @@ class TestGitManagerInitRepository:
         assert (temp_workspace / ".git").exists()
 
     def test_init_creates_gitignore(self, git_manager, temp_workspace):
-        """Test that init creates .gitignore with patterns."""
-        patterns = ["*.log", "*.tmp", "__pycache__/"]
-        git_manager.init_repository(ignore_patterns=patterns)
+        """Test that init creates .gitignore with default patterns."""
+        git_manager.init_repository()
 
         gitignore = temp_workspace / ".gitignore"
         assert gitignore.exists()
 
         content = gitignore.read_text()
-        for pattern in patterns:
+        for pattern in GitManager.DEFAULT_IGNORE_PATTERNS:
             assert pattern in content
 
     def test_init_makes_initial_commit(self, initialized_git):

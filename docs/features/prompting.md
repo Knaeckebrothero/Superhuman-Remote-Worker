@@ -1,3 +1,12 @@
+---
+tags:
+  - agent-architecture
+  - llm-configuration
+  - context-management
+  - tool-development
+  - planning
+---
+
 # Prompt & Instruction System Rework
 
 This document captures the design problem, current state, and the chosen direction for reworking the agent's prompt and instruction architecture.
@@ -376,3 +385,12 @@ Phase 6 (testing)
        ▼
 Merge autonomy-focus → main
 ```
+
+## Related
+
+- [[context_management]]
+- [[citation_engine_roadmap]]
+- [[cloud_workspace]]
+- [[advanced_job_configuration]]
+- [[tool_issues]]
+- [[obsidian]]

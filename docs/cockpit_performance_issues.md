@@ -1,3 +1,19 @@
+---
+tags:
+  - user-interface
+  - bug-fix
+  - debugging
+  - orchestrator
+aliases:
+  - Performance Audit
+  - Cockpit Optimization
+related:
+  - "[[cockpit_ds]]"
+  - "[[01_issues]]"
+  - "[[advanced_job_configuration]]"
+  - "[[config_issues]]"
+---
+
 # Cockpit Performance Issues
 
 Performance audit of the cockpit Angular frontend and its orchestrator backend, focused on large jobs (5k+ audit entries).
@@ -633,3 +649,10 @@ Use for audit/chat counts that don't need to be real-time accurate.
 | 5 | Backend only | #11, #12 | Low — additive caching layer |
 
 Phases 1 and 2 can be done in parallel. Phase 3 depends on phase 2 (indexes needed for incremental queries to be fast). Phase 4 is independent. Phase 5 is independent.
+
+## Related
+
+- [[cockpit_ds]] — Data service architecture that these issues build upon
+- [[01_issues]] — MCP overhaul issues in the same orchestrator stack
+- [[advanced_job_configuration]] — Job creation component in the same frontend
+- [[config_issues]] — Backend configuration affecting performance

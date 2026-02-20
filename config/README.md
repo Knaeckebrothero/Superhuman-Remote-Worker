@@ -101,6 +101,30 @@ On first run, the fully resolved config (agent config + all prompt/instruction c
 | `agent_id` | string | Unique identifier (lowercase, underscores allowed) |
 | `display_name` | string | Human-readable name |
 
+### Autonomy Level
+
+Controls when the agent pauses for human review at phase boundaries and after job completion.
+
+```yaml
+autonomy: partial  # full | review | partial | guided | dependent
+```
+
+| Level | After 1st Strategic | After Nth Strategic | After Tactical | After job_complete |
+|-------|:---:|:---:|:---:|:---:|
+| `full` | - | - | - | auto-complete |
+| `review` | - | - | - | freeze |
+| `partial` | freeze | - | - | freeze |
+| `guided` | freeze | freeze | - | freeze |
+| `dependent` | freeze | freeze | freeze | freeze |
+
+- **`full`** — Fully autonomous. Never freezes. On `job_complete`, writes `job_completion.json` directly and sets DB status to `completed`.
+- **`review`** — Runs freely through all phases but freezes after `job_complete` for human review before marking as completed.
+- **`partial`** (default) — Freezes after the first strategic phase boundary for early feedback, then runs freely. Freezes again at `job_complete`.
+- **`guided`** — Freezes at every strategic phase boundary for review. Tactical phases run freely. Freezes at `job_complete`.
+- **`dependent`** — Freezes at every phase boundary (strategic and tactical). Maximum human oversight.
+
+When frozen at a phase boundary (`freeze_type: "phase_boundary"`), approving the job sets its status back to `processing` and the agent continues. When frozen at job completion (`freeze_type: "job_complete"`), approving writes `job_completion.json` and sets status to `completed`.
+
 ### LLM Configuration
 
 ```yaml

@@ -1,9 +1,21 @@
+---
+tags:
+  - user-interface
+  - orchestrator
+  - agent-architecture
+  - data-management
+  - cloud-infrastructure
+  - configuration
+aliases:
+  - ["Angular Migration", "Cockpit Migration"]
+---
+
 # Angular Cockpit Migration Plan
 
 > **Status**: Phases 1-5 complete ✅ | Migration complete!
 >
 > **Completed in Phase 5**:
-> - ✅ Removed Streamlit dashboard (`dashboard/` directory deleted)
+> - ✅ Removed Streamlit dashboard (`dashboard/` directory deleted, see [[cleanup]])
 > - ✅ Updated README.md with new architecture
 > - ✅ Cleaned up deprecated code comments
 > - ⏳ Job Details Component - deferred (optional enhancement)
@@ -221,7 +233,7 @@ The Fessi app uses a clean architecture that could inform cockpit improvements:
 
 ## Agent Orchestration Architecture
 
-The cockpit backend will act as the **orchestration server** for agents. This provides a foundation for k3s deployment with horizontal scaling.
+The cockpit backend will act as the **orchestration server** for agents (see [[hive_implementation]] for the stateless worker architecture). This provides a foundation for k3s deployment with horizontal scaling.
 
 ### Agent Registration Flow
 
@@ -426,7 +438,7 @@ The agent currently imports database classes but may not need them for the unive
 2. **Job State**: Agent reads job config from workspace, writes results to workspace
 3. **Cockpit Polls**: Cockpit API reads workspace files (todos, workspace.md) for display
 
-**Decision**: Agent operates on filesystem only. Cockpit API handles all database operations.
+**Decision**: Agent operates on filesystem only. Cockpit API handles all database operations (see [[db_refactor]] for database architecture details).
 
 ### Workspace as Source of Truth
 
@@ -905,3 +917,11 @@ Consistent status badge styling:
 - [CLAUDE.md](../CLAUDE.md)
 - [Advanced-LLM-Chat README](../Advanced-LLM-Chat/README.md) - Fessi chatbot with auth, file handling, streaming
 - [Advanced-LLM-Chat CLAUDE.md](../Advanced-LLM-Chat/CLAUDE.md) - Architecture and patterns documentation
+
+## Related
+
+- [[hive_implementation]]
+- [[db_refactor]]
+- [[cleanup]]
+- [[graph_visualization]]
+- [[masterplan]]

@@ -1,3 +1,18 @@
+---
+tags:
+  - user-interface
+  - data-management
+  - debugging
+aliases:
+  - Graph Timeline
+  - Cytoscape Visualization
+  - Neo4j Change Viewer
+related:
+  - "[[debug_cockpit]]"
+  - "[[datasources]]"
+  - "[[deployment]]"
+  - "[[agent_improvements]]"
+---
 # Graph Change Detection & Timeline Visualization
 
 ## Overview
@@ -1418,3 +1433,10 @@ When user clicks a tool call in the Agent Activity panel:
 - [Okabe-Ito Colorblind-Safe Palette](https://jfly.uni-koeln.de/color/)
 - [AeonG: Temporal Graph Database (VLDB 2024)](https://www.vldb.org/pvldb/vol17/p1-aeong.pdf)
 - [Git Packfile Format](https://git-scm.com/book/en/v2/Git-Internals-Packfiles)
+
+## Related
+
+- [[debug_cockpit]] - Graph timeline is a pluggable panel in the cockpit dashboard
+- [[datasources]] - Neo4j datasource provides the graph data being visualized
+- [[deployment]] - Visualization backend runs as part of the cockpit API
+- [[agent_improvements]] - Graph visualization helps debug agent graph operations

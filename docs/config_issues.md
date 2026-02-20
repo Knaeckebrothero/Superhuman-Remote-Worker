@@ -1,3 +1,19 @@
+---
+tags:
+  - configuration
+  - bug-fix
+  - debugging
+  - agent-architecture
+aliases:
+  - Config Audit
+  - Dead Config Cleanup
+related:
+  - "[[advanced_job_configuration]]"
+  - "[[auxiliary_tasks]]"
+  - "[[01_issues]]"
+  - "[[cockpit_performance_issues]]"
+---
+
 # Config Audit: defaults.yaml Value Usage
 
 Audit of all config values in `config/defaults.yaml` to determine whether each is actually parsed and used at runtime.
@@ -43,3 +59,10 @@ All other config values are properly parsed and used at runtime:
 - **research**: `proxy.*` (via extra)
 - **browser**: `headless`, `timeout`, `use_vision` (via extra)
 - **Expert UI**: `icon`, `color`, `tags` (via extra, consumed by orchestrator)
+
+## Related
+
+- [[advanced_job_configuration]] — Job configuration UI that uses these config values
+- [[auxiliary_tasks]] — Phase alternation model configured via defaults.yaml
+- [[01_issues]] — MCP issues caused by configuration problems
+- [[cockpit_performance_issues]] — Performance issues in the same system

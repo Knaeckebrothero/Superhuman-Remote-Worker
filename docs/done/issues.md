@@ -1,3 +1,18 @@
+---
+tags:
+  - bug-fix
+  - debugging
+  - context-management
+  - agent-architecture
+  - data-management
+  - tool-development
+  - model-issues
+aliases:
+  - "Agent Issues"
+  - "Bug Tracker"
+  - "Universal Agent Issues"
+---
+
 # Universal Agent Issues
 
 Investigation date: 2026-01-08, updated 2026-01-09
@@ -6,7 +21,7 @@ Investigation date: 2026-01-08, updated 2026-01-09
 
 **Phase 1 (2026-01-08):** Initial issues stemmed from a **partial implementation** of the workspace-centric architecture. The context efficiency pattern was half-implemented: tools returned concise summaries but didn't persist full data to workspace files. Issues #1-8 resolved.
 
-**Phase 2 (2026-01-09):** Testing revealed critical runtime issues. Job `19c4de92` ran for 53 minutes and produced zero requirements before hitting LangGraph's recursion limit. New issues discovered: context overflow loop (#10), agent reading full documents instead of chunks (#11), insufficient logging (#12), candidate extractor returning zero (#13), and MongoDB archiver missing data (#14).
+**Phase 2 (2026-01-09):** Testing revealed critical runtime issues. Job `19c4de92` ran for 53 minutes and produced zero requirements before hitting LangGraph's recursion limit. New issues discovered: context overflow loop (#10, see also [[compact_chat]]), agent reading full documents instead of chunks (#11), insufficient logging (#12), candidate extractor returning zero (#13), and MongoDB archiver missing data (#14).
 
 **Phase 3 (2026-01-09 - deep dive):** Issue #10 investigated in depth. Server-side root cause (llama.cpp `--parallel` config dividing context window) **RESOLVED** by user. Code-side issues remain: 6 sub-issues identified (10.1-10.6) covering error classification, consecutive error tracking, context compaction, and summarization.
 
@@ -66,7 +81,7 @@ Investigation date: 2026-01-08, updated 2026-01-09
 
 ### ~~9. PostgreSQL Tables: Dead Code and Deprecated Tables~~ RESOLVED
 
-**Investigation date:** 2026-01-09
+**Investigation date:** 2026-01-09 (see also [[db_refactor]] and [[postgres_migration_deep_dive]])
 
 **Problem:** The PostgreSQL database has 5 tables and 2 views, but most are empty or unused.
 
@@ -88,8 +103,8 @@ The Universal Agent architecture moved away from PostgreSQL for most state manag
 | Function | Old Agents | Universal Agent |
 |----------|-----------|-----------------|
 | Workspaces | `candidate_workspace` table | Filesystem (`./workspace/job_<uuid>/`) |
-| Checkpointing | `agent_checkpoints` table | LangGraph's `AsyncPostgresSaver` |
-| LLM Logging | `llm_requests` table (never used) | MongoDB via `llm_archiver.py` |
+| Checkpointing | `agent_checkpoints` table | LangGraph's `AsyncPostgresSaver` (see [[langgraph_checkpointing_assessment]]) |
+| LLM Logging | `llm_requests` table (never used) | MongoDB via `llm_archiver.py` (see [[mongodb_migration_deep_dive]]) |
 
 Only `jobs` and `requirement_cache` are actively used by the new architecture.
 
@@ -1701,3 +1716,11 @@ Files modified for resolved issues:
 - `creator_instructions.md`: #13 (rewrote Phase 2 for LLM-based extraction, updated tool listing)
 - `creator_identification.txt`: #13 (rewrote phase prompt for LLM-based analysis)
 - Deleted: `schema_vector.sql`, `checkpoint.py`, `workspace.py`, `vector.py`: #9
+
+## Related
+- [[old_agent_issues]]
+- [[db_refactor]]
+- [[compact_chat]]
+- [[langgraph_checkpointing_assessment]]
+- [[mongodb_migration_deep_dive]]
+- [[cleanup]]

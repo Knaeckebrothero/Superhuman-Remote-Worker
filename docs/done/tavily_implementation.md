@@ -1,6 +1,16 @@
+---
+tags:
+  - web-search
+  - tool-development
+  - agent-architecture
+  - configuration
+aliases:
+  - ["Tavily Implementation", "Web Tools Implementation"]
+---
+
 # Tavily Web Tools Implementation Plan
 
-Implementation plan for enhancing `web_search` and adding `extract_webpage`, `crawl_website`, and `map_website` tools using the `langchain-tavily` package (already in `requirements.txt`).
+Implementation plan for enhancing `web_search` and adding `extract_webpage`, `crawl_website`, and `map_website` tools using the `langchain-tavily` package (already in `requirements.txt`). See also [[internet_usage_and_research]] for broader research strategy and [[tool_implementation]] for the tool description system.
 
 ## Overview
 
@@ -691,3 +701,10 @@ pytest tests/ -v
 | Crawl | with instructions | 2 credits per 10 pages |
 | Map | without instructions | 1 credit per 10 pages |
 | Map | with instructions | 2 credits per 10 pages |
+
+## Related
+
+- [[internet_usage_and_research]]
+- [[tool_implementation]]
+- [[agent]]
+- [[overview]]

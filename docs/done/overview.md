@@ -1,8 +1,18 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - knowledge-management
+  - tool-development
+aliases:
+  - ["Agent Overview", "How the Agent Works"]
+---
+
 # How the Agent Works - A Guide for Non-Technical Team Members
 
 ## The Big Picture
 
-The agent is like an **autonomous worker** that processes documents to extract requirements. Think of it as a very methodical assistant that:
+The [[agent]] is like an **autonomous worker** that processes documents to extract requirements. Think of it as a very methodical assistant that:
 
 1. Receives a task (a document to analyze)
 2. Creates a plan for how to do the work
@@ -91,7 +101,7 @@ The agent operates with a **nested loop** structure - a "big loop" for strategy 
 - **Statuses**: Pending → In Progress → Completed
 
 ### 4. Memory (The Notepad)
-- **What it is**: A file called `workspace.md` where the agent keeps notes
+- **What it is**: A file called `workspace.md` where the agent keeps notes (see [[workspace_implementation]] for the architecture)
 - **Purpose**: Helps the agent remember important things across phases
 - **Updated when**: After each phase completes
 
@@ -201,3 +211,10 @@ These control specific agent behaviors:
 | **Memory** | The agent's notes that persist across phases |
 | **Archive** | Where completed to-dos are saved |
 | **Citation** | A reference to where information came from |
+
+## Related
+
+- [[agent]]
+- [[workspace_implementation]]
+- [[masterplan]]
+- [[tool_implementation]]

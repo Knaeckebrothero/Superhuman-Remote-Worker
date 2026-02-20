@@ -447,6 +447,122 @@ def load_todos_from_yaml(
 
 
 
+def should_freeze_at_boundary(config: "AgentConfig", is_strategic: bool, phase_number: int) -> bool:
+    """Determine whether the agent should freeze at a phase boundary.
+
+    Checks the autonomy level from config and the current phase context
+    to decide if the agent should pause for human review.
+
+    Args:
+        config: Agent configuration with autonomy level
+        is_strategic: True if the completing phase is strategic
+        phase_number: Current phase number (1-based after first strategic)
+
+    Returns:
+        True if the agent should freeze at this boundary
+    """
+    autonomy = getattr(config, "autonomy", "partial")
+    if autonomy == "full":
+        return False
+    if autonomy == "review":
+        return False
+    if autonomy == "partial":
+        return is_strategic and phase_number <= 1
+    if autonomy == "guided":
+        return is_strategic
+    if autonomy == "dependent":
+        return True
+    return False
+
+
+def freeze_for_review(
+    state: "UniversalAgentState",
+    workspace: "WorkspaceManager",
+    todo_manager: "TodoManager",
+    phase_type: str,
+    phase_number: int,
+) -> "TransitionResult":
+    """Freeze the job at a phase boundary for human review.
+
+    This is a lighter version of finalize_job() — it pauses execution
+    without requiring job_complete data (summary/deliverables/confidence).
+
+    Actions:
+    - Write output/job_frozen.json with freeze_type="phase_boundary"
+    - Git commit + push
+    - Return TransitionResult with should_stop=True but NOT goal_achieved=True
+
+    Args:
+        state: Current agent state
+        workspace: WorkspaceManager for file access
+        todo_manager: TodoManager (for archiving)
+        phase_type: "strategic" or "tactical"
+        phase_number: Current phase number
+
+    Returns:
+        TransitionResult with should_stop=True to pause the agent loop
+    """
+    job_id = state.get("job_id", "unknown")
+
+    freeze_data = {
+        "status": "pending_review",
+        "freeze_type": "phase_boundary",
+        "timestamp": datetime.now().isoformat(),
+        "phase_type": phase_type,
+        "phase_number": phase_number,
+        "job_id": job_id,
+    }
+
+    # Write to output/job_frozen.json
+    output_path = "output/job_frozen.json"
+    workspace.write_file(
+        output_path,
+        json.dumps(freeze_data, indent=2, ensure_ascii=False)
+    )
+
+    logger.info(
+        f"[{job_id}] JOB FROZEN at phase boundary: "
+        f"{phase_type} phase {phase_number}"
+    )
+
+    # Git commit and push
+    git_mgr = workspace.git_manager
+    if git_mgr and git_mgr.is_active:
+        try:
+            git_mgr.commit(
+                f"Frozen at {phase_type} phase {phase_number} boundary",
+                allow_empty=True,
+            )
+            git_mgr.push()
+        except Exception as e:
+            logger.warning(f"[{job_id}] Git push failed at freeze: {e}")
+
+    # Archive todos if any remain
+    if todo_manager:
+        todo_manager.archive(f"phase_{phase_number}_{phase_type}")
+
+    # Create freeze message
+    freeze_msg = HumanMessage(
+        content=(
+            f"[JOB_FROZEN] Job paused for human review at {phase_type} phase "
+            f"{phase_number} boundary.\n"
+            f"Wrote: {output_path}\n\n"
+            f"The job has been paused for human review. A human operator can:\n"
+            f"  - Approve: python agent.py --config <config> --job-id {job_id} --approve\n"
+            f"  - Resume:  python agent.py --config <config> --job-id {job_id} --resume --feedback '...'"
+        )
+    )
+
+    return TransitionResult(
+        success=True,
+        state_updates={
+            "messages": [freeze_msg],
+            "goal_achieved": False,
+            "should_stop": True,
+        },
+    )
+
+
 @dataclass
 class TransitionResult:
     """Result of a phase transition attempt.
@@ -503,24 +619,26 @@ def finalize_job(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
     todo_manager: "TodoManager",
+    config: Optional["AgentConfig"] = None,
 ) -> TransitionResult:
-    """Finalize the job for human review.
+    """Finalize the job after job_complete is called.
 
-    This function is called when all strategic todos are complete and the
-    phase has been marked as final via job_complete. It freezes the job
-    for human review.
+    Behavior depends on autonomy level:
+    - full: Write job_completion.json directly, auto-complete (no freeze)
+    - All others: Write job_frozen.json with freeze_type="job_complete"
 
     Actions:
-    - Write output/job_frozen.json with summary/deliverables
+    - Write output file (job_completion.json or job_frozen.json)
     - Return TransitionResult with should_stop=True
 
-    Note: The database status update to 'pending_review' is handled by
-    the async handle_transition node in graph.py.
+    Note: The database status update is handled by the async
+    handle_transition node in graph.py.
 
     Args:
         state: Current agent state
         workspace: WorkspaceManager for file access
         todo_manager: TodoManager (for archiving)
+        config: Agent configuration (for autonomy level)
 
     Returns:
         TransitionResult with should_stop=True to end the agent loop
@@ -528,6 +646,7 @@ def finalize_job(
     from ..tools.core.job import get_final_phase_data, clear_final_phase_data
 
     job_id = state.get("job_id", "unknown")
+    autonomy = getattr(config, "autonomy", "partial") if config else "partial"
 
     # Get the final phase data (set by job_complete tool)
     final_data = get_final_phase_data(job_id)
@@ -542,9 +661,69 @@ def finalize_job(
             "job_id": job_id,
         }
 
-    # Build freeze report
+    # Clear the final phase data
+    clear_final_phase_data(job_id)
+
+    if autonomy == "full":
+        # Full autonomy: auto-complete without freezing
+        completion_data = {
+            "status": "job_completed",
+            "timestamp": datetime.now().isoformat(),
+            "summary": final_data.get("summary", "Job completed"),
+            "deliverables": final_data.get("deliverables", []),
+            "confidence": final_data.get("confidence", 1.0),
+            "job_id": job_id,
+        }
+        if "notes" in final_data:
+            completion_data["notes"] = final_data["notes"]
+
+        output_path = "output/job_completion.json"
+        workspace.write_file(
+            output_path,
+            json.dumps(completion_data, indent=2, ensure_ascii=False)
+        )
+
+        logger.info(f"[{job_id}] JOB AUTO-COMPLETED (autonomy=full): {completion_data['summary']}")
+        logger.info(f"[{job_id}] Deliverables: {completion_data['deliverables']}")
+
+        # Final git commit and push
+        git_mgr = workspace.git_manager
+        if git_mgr and git_mgr.is_active:
+            try:
+                git_mgr.commit("Job completed (autonomy=full)", allow_empty=True)
+                git_mgr.tag("job-completed", "Job auto-completed (full autonomy)")
+                git_mgr.push()
+            except Exception as e:
+                logger.warning(f"[{job_id}] Final git push failed: {e}")
+
+        # Archive todos
+        if todo_manager:
+            todo_manager.archive("final")
+
+        completion_msg = HumanMessage(
+            content=(
+                f"[JOB_COMPLETED] Job auto-completed (autonomy=full).\n"
+                f"Wrote: {output_path}\n"
+                f"Summary: {completion_data['summary']}\n"
+                f"Deliverables: {len(completion_data['deliverables'])} files\n"
+                f"Confidence: {completion_data['confidence']:.0%}"
+            )
+        )
+
+        return TransitionResult(
+            success=True,
+            state_updates={
+                "messages": [completion_msg],
+                "goal_achieved": True,
+                "should_stop": True,
+                "is_final_phase": False,
+            },
+        )
+
+    # All other autonomy levels: freeze for human review
     freeze_data = {
         "status": "pending_review",
+        "freeze_type": "job_complete",
         "timestamp": datetime.now().isoformat(),
         "summary": final_data.get("summary", "Job completed"),
         "deliverables": final_data.get("deliverables", []),
@@ -568,9 +747,6 @@ def finalize_job(
     # NOTE: Database status update to 'pending_review' is handled by the
     # async handle_transition node in graph.py, which can properly await
     # the asyncpg pool on the correct event loop.
-
-    # Clear the final phase data
-    clear_final_phase_data(job_id)
 
     # Final git commit and push for workspace delivery
     git_mgr = workspace.git_manager
@@ -604,7 +780,7 @@ def finalize_job(
         success=True,
         state_updates={
             "messages": [completion_msg],
-            "goal_achieved": True,
+            "goal_achieved": False,  # False = DB gets pending_review, not completed
             "should_stop": True,
             "is_final_phase": False,  # Reset for cleanliness
         },
@@ -659,6 +835,7 @@ def on_strategic_phase_complete(
     todo_manager: "TodoManager",
     min_todos: int = 5,
     max_todos: int = 20,
+    config: Optional["AgentConfig"] = None,
 ) -> TransitionResult:
     """Handle transition from strategic phase to tactical phase.
 
@@ -704,7 +881,12 @@ def on_strategic_phase_complete(
 
     if is_final or final_data:
         logger.info(f"[{job_id}] Final phase detected, completing job")
-        return finalize_job(state, workspace, todo_manager)
+        return finalize_job(state, workspace, todo_manager, config=config)
+
+    # Check autonomy level for phase boundary freeze
+    if config and should_freeze_at_boundary(config, is_strategic=True, phase_number=phase_number):
+        logger.info(f"[{job_id}] Autonomy freeze at strategic phase {phase_number} boundary")
+        return freeze_for_review(state, workspace, todo_manager, "strategic", phase_number)
 
     logger.info(f"[{job_id}] Strategic phase complete, checking for staged todos")
 
@@ -799,14 +981,6 @@ def on_tactical_phase_complete(
     # Get count of completed todos before loading new ones
     completed_todos = len([t for t in todo_manager.list_all() if t.status.value == "completed"])
 
-    # Load predefined strategic todos (from config template or defaults)
-    strategic_todos = get_transition_strategic_todos(config)
-    todo_list = [todo.to_dict() for todo in strategic_todos]
-    todo_manager.set_todos_from_list(todo_list)
-
-    # Export todo state for checkpointing
-    todo_state = todo_manager.export_state()
-
     # Git operations: tag completed phase, commit
     _complete_phase_with_git(
         workspace=workspace,
@@ -814,6 +988,19 @@ def on_tactical_phase_complete(
         phase_type="tactical",
         todos_archived=completed_todos,
     )
+
+    # Check autonomy level for phase boundary freeze (before loading new todos)
+    if config and should_freeze_at_boundary(config, is_strategic=False, phase_number=phase_number):
+        logger.info(f"[{job_id}] Autonomy freeze at tactical phase {phase_number} boundary")
+        return freeze_for_review(state, workspace, todo_manager, "tactical", phase_number)
+
+    # Load predefined strategic todos (from config template or defaults)
+    strategic_todos = get_transition_strategic_todos(config)
+    todo_list = [todo.to_dict() for todo in strategic_todos]
+    todo_manager.set_todos_from_list(todo_list)
+
+    # Export todo state for checkpointing
+    todo_state = todo_manager.export_state()
 
     logger.info(
         f"[{job_id}] Transitioning to strategic phase "
@@ -871,7 +1058,7 @@ def handle_phase_transition(
 
     if is_strategic:
         return on_strategic_phase_complete(
-            state, workspace, todo_manager, min_todos, max_todos
+            state, workspace, todo_manager, min_todos, max_todos, config=config
         )
     else:
         return on_tactical_phase_complete(state, workspace, todo_manager, config)

@@ -163,9 +163,12 @@ def create_claude_code_tools(context: ToolContext) -> List[Any]:
             f"prompt_len={len(prompt)})"
         )
 
-        # Environment: strip CLAUDECODE to avoid nesting guard, set effort level
+        # Environment: strip CLAUDECODE to avoid nesting guard, set effort level.
+        # Strip ANTHROPIC_API_KEY so the CLI uses OAuth/Max plan auth
+        # instead of API key billing from the agent's .env.
         env_override = {
             "CLAUDECODE": "",
+            "ANTHROPIC_API_KEY": "",
             "CLAUDE_CODE_EFFORT_LEVEL": effort_level,
         }
 

@@ -1,3 +1,18 @@
+---
+tags:
+  - email
+  - user-interface
+  - orchestrator
+aliases:
+  - Notifications
+  - Mobile Cockpit
+  - Agent-User Communication
+related:
+  - "[[deployment]]"
+  - "[[debug_cockpit]]"
+  - "[[interactive_planning]]"
+  - "[[deliverables]]"
+---
 # Autonomous Operation: Email, Mobile & User-Agent Communication
 
 ## Motivation
@@ -289,3 +304,10 @@ feedback:
   interval_phases: 3
   timeout_minutes: 60
 ```
+
+## Related
+
+- [[deployment]] - Notification service runs within the deployed orchestrator
+- [[debug_cockpit]] - Mobile-optimized cockpit for monitoring from phone
+- [[interactive_planning]] - Scheduled feedback phases and autonomy levels
+- [[deliverables]] - Notifications on job completion and pending review status

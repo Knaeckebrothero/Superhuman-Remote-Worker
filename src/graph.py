@@ -1262,7 +1262,7 @@ def create_handle_transition_node(
             config=config,
         )
 
-        # If the job was finalized (frozen for review), update DB status.
+        # If the job was stopped, update DB status.
         # This must happen here in the async node where we can properly
         # await the asyncpg pool on the correct event loop.
         if (
@@ -1270,14 +1270,32 @@ def create_handle_transition_node(
             and result.state_updates.get("should_stop")
             and postgres_db
         ):
+            goal_achieved = result.state_updates.get("goal_achieved", False)
             try:
-                await postgres_db.jobs.update_status(
-                    job_id,
-                    status="pending_review",
-                )
-                logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
+                if goal_achieved:
+                    # Full autonomy auto-complete: mark as completed
+                    await postgres_db.jobs.update_status(
+                        job_id,
+                        status="completed",
+                    )
+                    # Also set completed_at timestamp
+                    try:
+                        await postgres_db.execute(
+                            "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
+                            job_id,
+                        )
+                    except Exception:
+                        pass  # Non-critical
+                    logger.info(f"[{job_id}] Updated job status to 'completed' in database")
+                else:
+                    # Freeze for review (phase boundary or job_complete)
+                    await postgres_db.jobs.update_status(
+                        job_id,
+                        status="pending_review",
+                    )
+                    logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
             except Exception as e:
-                logger.error(f"[{job_id}] Failed to update job status to 'pending_review': {e}")
+                logger.error(f"[{job_id}] Failed to update job status: {e}")
 
         # Audit transition attempt
         phase_number = state.get("phase_number", 0)

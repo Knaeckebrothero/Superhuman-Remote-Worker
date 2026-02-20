@@ -497,8 +497,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             uptime_seconds=status["uptime_seconds"],
             checks={
                 "initialized": status["initialized"],
-                "postgres": status["connections"]["postgres"],
-                "neo4j": status["connections"]["neo4j"],
+                "postgres": status["connections"].get("postgres", False),
             },
         )
 

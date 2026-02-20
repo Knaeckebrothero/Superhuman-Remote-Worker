@@ -1,3 +1,20 @@
+---
+tags:
+  - user-interface
+  - data-management
+  - debugging
+  - orchestrator
+aliases:
+  - Data Service Refactor
+  - IndexedDB Caching
+  - Cockpit Data Layer
+related:
+  - "[[cockpit_performance_issues]]"
+  - "[[advanced_job_configuration]]"
+  - "[[01_issues]]"
+  - "[[config_issues]]"
+---
+
 # Cockpit Data Service Refactor
 
 This document describes the architectural refactor of the Debug Cockpit's data layer to improve timeline navigation performance and component reactivity.
@@ -426,3 +443,10 @@ GET /api/jobs/{job_id}/audit/page-for-timestamp  (remove after migration)
 - [IndexedDB API](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API)
 - [Angular Signals](https://angular.dev/guide/signals)
 - Current implementation: `docs/debug_cockpit.md`
+
+## Related
+
+- [[cockpit_performance_issues]] — Performance audit building on this data layer
+- [[advanced_job_configuration]] — Job creation UI in the same cockpit frontend
+- [[01_issues]] — MCP issues affecting the same orchestrator backend
+- [[config_issues]] — Configuration patterns used by the data service

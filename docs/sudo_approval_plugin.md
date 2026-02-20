@@ -1,3 +1,19 @@
+---
+tags:
+  - security
+  - agent-architecture
+  - orchestrator
+aliases:
+  - sudo gate
+  - approval daemon
+  - privilege escalation control
+related:
+  - "[[security_checklist]]"
+  - "[[tool_issues]]"
+  - "[[cockpit_ds]]"
+  - "[[deployment]]"
+---
+
 # Sudo Approval Plugin: Human-in-the-Loop Privilege Escalation for LLM Agents
 
 ## Concept
@@ -260,3 +276,10 @@ For development, Option C is simplest. For production, Option A (Kata) integrate
 - **Approval delegation**: Allow the LLM orchestrator itself to auto-approve low-risk commands based on a policy engine, escalating only high-risk ones to the human
 - **Audit integration**: All sudo requests and decisions flow into the MongoDB audit trail alongside the agent's regular tool calls
 - **Multi-agent coordination**: In a multi-agent setup, one agent's approval could be contingent on another agent's state (e.g., "only allow network changes if the monitoring agent confirms health")
+
+## Related
+
+- [[security_checklist]] - Container security hardening checklist for agents
+- [[deployment]] - Deployment infrastructure and VM configuration
+- [[cockpit_ds]] - Cockpit UI for monitoring and managing agents
+- [[tool_issues]] - Tool phase filtering and execution control

@@ -1,3 +1,19 @@
+---
+tags:
+  - orchestrator
+  - bug-fix
+  - debugging
+  - tool-development
+aliases:
+  - MCP Issues
+  - MCP Overhaul Issues
+related:
+  - "[[cockpit_performance_issues]]"
+  - "[[config_issues]]"
+  - "[[coding_agent]]"
+  - "[[cockpit_ds]]"
+---
+
 # MCP Overhaul — Issues Found During Testing
 
 Tested by debugging job `6298b72e` ("Refine documentation") — the multi-feedback-round job with 4 `job_complete` calls, 24 phases, 1614 audit entries.
@@ -259,3 +275,11 @@ This works only because the proxy at `:8080` happens to route `gpt-5.2-pro` to t
 - **Deliverables**: 11 German academic chapters + editorial report in `output/`
 - **Citations**: 347 sources (111 web, 236 documents), 10 citations (4 verified, 6 failed)
 - **Phases**: 24 phases (0-23), 4 `job_complete` attempts at audit steps 679, 711, 1143, 1609
+
+## Related
+
+- [[cockpit_performance_issues]] — Performance audit of the same cockpit/orchestrator stack
+- [[config_issues]] — Config value audit and dead code cleanup
+- [[coding_agent]] — The coding agent that exercises MCP tools
+- [[cockpit_ds]] — Data service refactor that depends on working MCP endpoints
+- [[advanced_job_configuration]] — Job creation UI that uses orchestrator APIs

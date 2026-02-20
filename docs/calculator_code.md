@@ -1,3 +1,19 @@
+---
+tags:
+  - coding-tools
+  - tool-development
+  - security
+aliases:
+  - Code Execution
+  - Calculator Tool
+  - Python Sandbox
+related:
+  - "[[coding_agent]]"
+  - "[[cloud_workspace]]"
+  - "[[auxiliary_tasks]]"
+  - "[[cli_wrapper]]"
+---
+
 # Calculator & Code Execution Tools
 
 Ideas for adding computational tools to the agent.
@@ -437,3 +453,10 @@ print(summary.to_string())
 - [Claude Code Sandboxing](https://www.anthropic.com/engineering/claude-code-sandboxing) - OS-level isolation approach
 - [sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) - Open source lightweight sandboxing
 - [E2B Code Interpreter](https://e2b.dev/) - Third-party hosted sandbox option
+
+## Related
+
+- [[coding_agent]] — Coding agent that uses run_command for shell execution
+- [[cloud_workspace]] — Container sandbox where code execution runs securely
+- [[auxiliary_tasks]] — Phase alternation model that orchestrates tool usage
+- [[cli_wrapper]] — Claude Code SDK with built-in code execution capabilities
