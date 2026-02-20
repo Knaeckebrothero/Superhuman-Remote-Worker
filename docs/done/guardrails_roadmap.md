@@ -1,6 +1,16 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - context-management
+  - tool-development
+aliases:
+  - ["Guardrails Roadmap", "Guardrails Implementation Plan"]
+---
+
 # Guardrails Implementation Roadmap
 
-This document outlines the implementation plan for the nested loop graph architecture described in `guardrails.md`. The goal is to refactor the agent from a simple ReAct loop with bolted-on features to a structurally-enforced nested loop workflow with proper manager abstractions.
+This document outlines the implementation plan for the nested loop graph architecture described in [[guardrails]]. The goal is to refactor the agent from a simple ReAct loop with bolted-on features to a structurally-enforced nested loop workflow with proper manager abstractions.
 
 ## Current State Analysis
 
@@ -29,7 +39,7 @@ src/agent/
 
 | Component | Current Approach | Problem |
 |-----------|------------------|---------|
-| Plan checking | `ProtectedContextProvider` injects plan | Hidden magic, no structural revisit |
+| Plan checking | `ProtectedContextProvider` injects plan | Hidden magic, no structural revisit (see [[compact_chat]]) |
 | Todo display | Layer 2 injection via hook | Bolted on, not part of workflow |
 | Phase transitions | Global `_last_transition_result` | Hacky side-channel communication |
 | Memory | Hopes agent writes to files | No enforcement |
@@ -121,7 +131,7 @@ Three focused managers built on WorkspaceManager:
 
 | File | Purpose | Injection |
 |------|---------|-----------|
-| `workspace.md` | Long-term memory (like CLAUDE.md) | Always in system prompt |
+| `workspace.md` | Long-term memory (like CLAUDE.md, see [[agent]]) | Always in system prompt |
 | `plan.md` | Strategic direction | Read only at phase transitions |
 | `instructions.md` | Task instructions | Read once at initialization |
 | `archive/` | Completed todos by phase | Written on phase completion |
@@ -529,3 +539,11 @@ Phases are ordered by dependency:
 5. **Phase 5** (Testing) should run throughout but complete after Phase 4
 
 Each phase has clear checkpoints. Commit after each completed task to enable easy rollback if issues arise.
+
+## Related
+
+- [[guardrails]]
+- [[agent]]
+- [[cleanup]]
+- [[compact_chat]]
+- [[workspace_implementation]]

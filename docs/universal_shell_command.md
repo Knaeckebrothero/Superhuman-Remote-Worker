@@ -1,3 +1,21 @@
+---
+tags:
+  - tool-development
+  - security
+  - agent-architecture
+  - coding-tools
+aliases:
+  - run_command
+  - shell access
+  - coding tools
+related:
+  - "[[coding_agent]]"
+  - "[[security_checklist]]"
+  - "[[deployment]]"
+  - "[[config_issues]]"
+  - "[[cloud_workspace]]"
+---
+
 # Universal Shell Command Access
 
 ## Problem
@@ -141,3 +159,12 @@ The `unrestricted` expert (`config/experts/unrestricted/config.yaml`) serves as 
 - **Per-agent allowlists**: If finer control is needed, add an `allow` list that acts as a whitelist (only listed command prefixes are permitted). Not implemented yet since the current blocklist + container isolation is sufficient.
 - **Per-agent timeout overrides**: A writer compiling a large LaTeX document might need more than 120s default. Could add a `run_command_timeout` config key.
 - **Rename `coding` to `shell`**: The tool category is still called `coding` for backwards compatibility. Could rename to `shell` to be more role-neutral and keep `coding` as an alias.
+
+## Related
+
+- [[coding_agent]] — Coding agent configuration that uses run_command
+- [[security_checklist]] — Security considerations for the agent system
+- [[deployment]] — Container deployment and infrastructure
+- [[config_issues]] — Configuration issues including tool access
+- [[cloud_workspace]] — Cloud workspace and container architecture
+- [[sudo_approval_plugin]] — Sudo approval mechanism for elevated commands

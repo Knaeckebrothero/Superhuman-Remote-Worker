@@ -1,8 +1,10 @@
-"""ChatOpenAI wrapper that captures reasoning_content from DeepSeek-style models.
+"""ChatOpenAI wrapper that captures reasoning content from reasoning models.
 
-LangChain's ChatOpenAI doesn't capture the `reasoning_content` field that DeepSeek R1
-and similar reasoning models return. This module provides a custom wrapper that
-intercepts the raw HTTP response to capture and preserve this field.
+LangChain's ChatOpenAI doesn't capture reasoning fields that DeepSeek R1,
+OpenRouter, and similar reasoning models return. This module provides a custom
+wrapper that intercepts the raw HTTP response to capture and preserve reasoning
+content across multiple provider formats (reasoning_content, reasoning,
+reasoning_details).
 
 Also implements Layer 0 context overflow protection by counting tokens in the
 actual HTTP request body before sending.
@@ -170,6 +172,40 @@ def _extract_responses_api_reasoning(message) -> None:
     message.content = " ".join(cleaned).strip() if all(isinstance(c, str) for c in cleaned) else cleaned or ""
 
 
+def _extract_reasoning_from_response(data: dict) -> Optional[str]:
+    """Extract reasoning text from a chat completion response.
+
+    Supports multiple provider formats:
+    1. DeepSeek: message.reasoning_content (string)
+    2. OpenRouter: message.reasoning (string)
+    3. OpenRouter: message.reasoning_details (array of {type, text} objects)
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    msg = choices[0].get("message", {})
+
+    # 1. DeepSeek format
+    if msg.get("reasoning_content"):
+        return msg["reasoning_content"]
+
+    # 2. OpenRouter plain string
+    if msg.get("reasoning"):
+        return msg["reasoning"]
+
+    # 3. OpenRouter reasoning_details array
+    details = msg.get("reasoning_details")
+    if details and isinstance(details, list):
+        parts = []
+        for item in details:
+            if isinstance(item, dict) and item.get("text"):
+                parts.append(item["text"])
+        if parts:
+            return "\n".join(parts)
+
+    return None
+
+
 class ReasoningCapturingClient(httpx.Client):
     """HTTP client that captures reasoning_content and validates context limits.
 
@@ -275,12 +311,11 @@ class ReasoningCapturingClient(httpx.Client):
             if rotated_response is not None:
                 response = rotated_response
 
-        # Capture reasoning_content from response (existing behavior)
+        # Capture reasoning_content from response
         if is_chat:
             try:
                 data = json.loads(response.content)
-                msg = data.get("choices", [{}])[0].get("message", {})
-                self._last_reasoning_content = msg.get("reasoning_content")
+                self._last_reasoning_content = _extract_reasoning_from_response(data)
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
 
@@ -454,8 +489,7 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         if is_chat:
             try:
                 data = json.loads(response.content)
-                msg = data.get("choices", [{}])[0].get("message", {})
-                self._last_reasoning_content = msg.get("reasoning_content")
+                self._last_reasoning_content = _extract_reasoning_from_response(data)
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
 

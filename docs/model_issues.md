@@ -1,3 +1,19 @@
+---
+tags:
+  - model-issues
+  - debugging
+  - agent-architecture
+aliases:
+  - model failures
+  - gpt-oss issues
+  - documentation agent failures
+related:
+  - "[[llamacpp_optimization]]"
+  - "[[prompts]]"
+  - "[[phase_number_issues]]"
+  - "[[sprints]]"
+---
+
 # Model Issues: Documentation Agent Failures
 
 ## Overview
@@ -193,3 +209,11 @@ Reduce instruction complexity for weaker models:
 - Output files: `workspace/job_3fd40883-3408-498f-a62a-cd787a60cd00/output/`
 - Instructions used: `project_documentation/new_instructions.md`
 - Job logs: `workspace/logs/job_3fd40883-3408-498f-a62a-cd787a60cd00.log`
+
+## Related
+
+- [[llamacpp_optimization]] - Optimizing llama.cpp for gpt-oss models on datacenter GPUs
+- [[prompts]] - Prompt architecture analysis and model-aware prompting
+- [[phase_number_issues]] - Phase numbering confusion and planning issues
+- [[sprints]] - Sprint limits to force reflection in tactical phases
+- [[writing_instructions]] - Document writing instructions for agents

@@ -1,6 +1,16 @@
+---
+tags:
+  - user-interface
+  - data-management
+  - debugging
+  - agent-architecture
+aliases:
+  - ["Graph Visualization", "Graph Timeline", "Cytoscape Angular"]
+---
+
 # Building a graph change timeline in Angular 21
 
-**Cytoscape.js with the cytoscape-angular wrapper emerges as the clear choice for your Neo4j debug cockpit**, offering native Angular 21 signals support, a new WebGL renderer (January 2025) that handles 1,200+ nodes at 100+ FPS, and proven incremental layout algorithms. The key to achieving smooth 60fps scrubbing lies in combining an anchor+delta snapshot architecture with fCoSE layouts that preserve layout stability, Canvas rendering with Web Workers for computation, and a three-tier caching strategy borrowed from video editing systems.
+**Cytoscape.js with the cytoscape-angular wrapper emerges as the clear choice for your [[angular_migration_plan|Neo4j debug cockpit]]**, offering native Angular 21 signals support, a new WebGL renderer (January 2025) that handles 1,200+ nodes at 100+ FPS, and proven incremental layout algorithms. The key to achieving smooth 60fps scrubbing lies in combining an anchor+delta snapshot architecture with fCoSE layouts that preserve layout stability, Canvas rendering with Web Workers for computation, and a three-tier caching strategy borrowed from video editing systems.
 
 ---
 
@@ -52,7 +62,7 @@ L2: Anchor Cache (IndexedDB)
 ├── ~30 anchors for 3000 ops
 └── LRU eviction for inactive regions
 
-L3: Full Event Store (FastAPI backend)
+L3: Full Event Store (FastAPI backend, see [[db_refactor]])
 ├── Complete delta log
 ├── All anchors (compressed)
 └── MongoDB for audit trail persistence
@@ -392,3 +402,10 @@ onTimelineChange(position: number) {
 5. **Week 9+:** Performance testing at scale, accessibility audit, edge case handling for 5+ hour job histories
 
 The combination of Cytoscape.js's proven ecosystem, the modern cytoscape-angular wrapper, anchor+delta architecture, and fCoSE layout stability creates a solid foundation for visualizing your 3000+ operation knowledge graph modifications with smooth 60fps scrubbing.
+
+## Related
+
+- [[angular_migration_plan]]
+- [[db_refactor]]
+- [[neo4j_migration_deep_dive]]
+- [[overview]]

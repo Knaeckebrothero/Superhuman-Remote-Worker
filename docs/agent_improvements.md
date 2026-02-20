@@ -1,3 +1,19 @@
+---
+tags:
+  - agent-architecture
+  - context-management
+  - planning
+  - debugging
+aliases:
+  - Architecture Improvements
+  - Long-Running Agent Improvements
+related:
+  - "[[auxiliary_tasks]]"
+  - "[[advanced_websearch]]"
+  - "[[coding_agent]]"
+  - "[[citation_engine_rework]]"
+---
+
 # Agent Architecture Improvements
 
 Improvements derived from the research report:
@@ -112,3 +128,11 @@ Add structured tracing where every LLM call, tool invocation, and outcome is lin
 **Report ref: Section 5.2 — Agent2Agent Protocol**
 
 If the system evolves to multi-framework orchestration (e.g., LangGraph agents delegating to specialized agents from other frameworks), Google's A2A protocol provides capability discovery via "Agent Cards" and cross-vendor task delegation. Not needed for the current single-framework setup.
+
+## Related
+
+- [[auxiliary_tasks]] — The phase alternation refactor that implemented many of these ideas
+- [[advanced_websearch]] — Deep research capabilities for improved web search
+- [[coding_agent]] — Coding agent that benefits from verification gates
+- [[citation_engine_rework]] — Cross-job learning applies to citation management
+- [[cli_wrapper]] — Alternative execution model for the same agent architecture

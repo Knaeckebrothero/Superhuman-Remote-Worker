@@ -1,3 +1,18 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - orchestrator
+aliases:
+  - Job Completion
+  - Human-in-the-Loop Review
+  - Delivery Pipeline
+related:
+  - "[[deployment]]"
+  - "[[git]]"
+  - "[[interactive_planning]]"
+  - "[[debug_cockpit]]"
+---
 # Agent Deliverables
 
 ## Problem
@@ -225,3 +240,11 @@ Once the review loop is battle-tested and we have data on what humans actually r
 - Add a delivery manifest (`output/manifest.yaml`) extracted during the initial strategic phase
 - Use the `confidence` parameter as a gate (low confidence → require extra verification before freezing)
 - Programmatic checks in `job_complete` tool (verify declared deliverables exist and are non-empty)
+
+## Related
+
+- [[deployment]] - Delivery pipeline runs within the deployed agent infrastructure
+- [[git]] - Git versioning underpins the workspace delivery mechanism
+- [[interactive_planning]] - Autonomy levels control the review freeze behavior
+- [[debug_cockpit]] - Cockpit hosts the job review and workspace browser components
+- [[email_and_mobile]] - Notifications when a job enters pending_review status

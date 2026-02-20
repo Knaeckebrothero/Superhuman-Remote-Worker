@@ -20,7 +20,6 @@ interface CachedAuditEntry {
 interface CachedChatEntry {
   id: string;
   jobId: string;
-  sequenceNumber: number;
   timestamp: string;
   data: ChatEntry;
 }
@@ -55,7 +54,7 @@ class TestDatabase extends Dexie {
     super(name);
     this.version(1).stores({
       auditEntries: 'id, jobId, [jobId+index], [jobId+stepType+index]',
-      chatEntries: 'id, jobId, [jobId+sequenceNumber]',
+      chatEntries: 'id, jobId, [jobId+timestamp]',
       graphDeltas: 'id, jobId, [jobId+index]',
       jobMetadata: 'jobId',
     });
@@ -94,7 +93,6 @@ function createMockChatEntry(overrides: Partial<ChatEntry> = {}): ChatEntry {
     _id: `chat_${Math.random().toString(36).slice(2)}`,
     job_id: 'test-job-1',
     agent_type: 'creator',
-    sequence_number: 1,
     timestamp: new Date().toISOString(),
     iteration: 1,
     model: 'gpt-4',
@@ -264,43 +262,51 @@ describe('IndexedDB Schema', () => {
     const jobId = 'test-job-1';
 
     it('should store and retrieve chat entries', async () => {
-      const entry = createMockChatEntry({ job_id: jobId, sequence_number: 1 });
+      const entry = createMockChatEntry({ job_id: jobId });
       const cached: CachedChatEntry = {
-        id: `${jobId}_1`,
+        id: entry._id,
         jobId,
-        sequenceNumber: 1,
         timestamp: entry.timestamp,
         data: entry,
       };
 
       await db.chatEntries.put(cached);
 
-      const retrieved = await db.chatEntries.get(`${jobId}_1`);
+      const retrieved = await db.chatEntries.get(entry._id);
       expect(retrieved).toBeDefined();
-      expect(retrieved!.data.sequence_number).toBe(1);
+      expect(retrieved!.data.job_id).toBe(jobId);
     });
 
-    it('should query chat entries by sequence range', async () => {
+    it('should query chat entries by timestamp range', async () => {
+      const baseTime = Date.now();
       const entries = Array.from({ length: 10 }, (_, i) =>
-        createMockChatEntry({ job_id: jobId, sequence_number: i })
+        createMockChatEntry({
+          job_id: jobId,
+          _id: `chat_${i}`,
+          timestamp: new Date(baseTime + i * 1000).toISOString(),
+        })
       );
       const cached: CachedChatEntry[] = entries.map((entry) => ({
-        id: `${jobId}_${entry.sequence_number}`,
+        id: entry._id,
         jobId,
-        sequenceNumber: entry.sequence_number,
         timestamp: entry.timestamp,
         data: entry,
       }));
       await db.chatEntries.bulkPut(cached);
 
+      // Query entries between timestamp[2] and timestamp[5]
       const results = await db.chatEntries
-        .where('[jobId+sequenceNumber]')
-        .between([jobId, 2], [jobId, 5], true, true)
+        .where('[jobId+timestamp]')
+        .between(
+          [jobId, entries[2].timestamp],
+          [jobId, entries[5].timestamp],
+          true, true,
+        )
         .toArray();
 
       expect(results.length).toBe(4);
-      expect(results[0].sequenceNumber).toBe(2);
-      expect(results[3].sequenceNumber).toBe(5);
+      expect(results[0].timestamp).toBe(entries[2].timestamp);
+      expect(results[3].timestamp).toBe(entries[5].timestamp);
     });
   });
 
@@ -426,8 +432,8 @@ describe('IndexedDB Schema', () => {
         { id: `${jobId2}_0`, jobId: jobId2, index: 0, timestamp: '', stepType: 'llm', data: createMockAuditEntry({ job_id: jobId2 }) },
       ]);
       await db.chatEntries.bulkPut([
-        { id: `${jobId1}_0`, jobId: jobId1, sequenceNumber: 0, timestamp: '', data: createMockChatEntry({ job_id: jobId1 }) },
-        { id: `${jobId2}_0`, jobId: jobId2, sequenceNumber: 0, timestamp: '', data: createMockChatEntry({ job_id: jobId2 }) },
+        { id: `${jobId1}_chat_0`, jobId: jobId1, timestamp: '2024-01-01T00:00:00Z', data: createMockChatEntry({ job_id: jobId1 }) },
+        { id: `${jobId2}_chat_0`, jobId: jobId2, timestamp: '2024-01-01T00:00:00Z', data: createMockChatEntry({ job_id: jobId2 }) },
       ]);
       await db.jobMetadata.bulkPut([
         { jobId: jobId1, auditEntryCount: 2, chatEntryCount: 1, graphDeltaCount: 0, firstTimestamp: null, lastTimestamp: null, cachedAt: '', version: 1 },

@@ -12,7 +12,7 @@ import {
 } from '../models/cache.model';
 
 /** Current cache schema version */
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 
 /**
  * Dexie database class for cockpit cache.
@@ -27,10 +27,16 @@ class CockpitDatabase extends Dexie {
   constructor() {
     super('cockpit-cache');
     this.version(1).stores({
+      auditEntries: 'id, jobId, [jobId+index], [jobId+stepType+index]',
+      chatEntries: 'id, jobId, [jobId+sequenceNumber]',
+      graphDeltas: 'id, jobId, [jobId+index]',
+      jobMetadata: 'jobId',
+    });
+    this.version(2).stores({
       // Primary key: id, indexes: jobId, compound [jobId+index], compound [jobId+stepType+index]
       auditEntries: 'id, jobId, [jobId+index], [jobId+stepType+index]',
-      // Primary key: id, indexes: jobId, compound [jobId+sequenceNumber]
-      chatEntries: 'id, jobId, [jobId+sequenceNumber]',
+      // Primary key: id (MongoDB _id), indexes: jobId, compound [jobId+timestamp]
+      chatEntries: 'id, jobId, [jobId+timestamp]',
       // Primary key: id, indexes: jobId, compound [jobId+index]
       graphDeltas: 'id, jobId, [jobId+index]',
       // Primary key: jobId
@@ -218,9 +224,8 @@ export class IndexedDbService {
   async cacheChatEntries(jobId: string, entries: ChatEntry[]): Promise<void> {
     if (!this.db) return;
     const cached: CachedChatEntry[] = entries.map((entry) => ({
-      id: `${jobId}_${entry.sequence_number}`,
+      id: entry._id,
       jobId,
-      sequenceNumber: entry.sequence_number,
       timestamp: entry.timestamp,
       data: entry,
     }));
@@ -232,17 +237,13 @@ export class IndexedDbService {
   }
 
   /**
-   * Get chat entries by sequence number range (inclusive).
+   * Get all chat entries for a job, ordered by timestamp.
    */
-  async getChatEntries(
-    jobId: string,
-    startSeq: number,
-    endSeq: number,
-  ): Promise<ChatEntry[]> {
+  async getChatEntries(jobId: string): Promise<ChatEntry[]> {
     if (!this.db) return [];
     const entries = await this.db.chatEntries
-      .where('[jobId+sequenceNumber]')
-      .between([jobId, startSeq], [jobId, endSeq], true, true)
+      .where('[jobId+timestamp]')
+      .between([jobId, Dexie.minKey], [jobId, Dexie.maxKey], true, true)
       .toArray();
 
     return entries.map((e) => e.data);

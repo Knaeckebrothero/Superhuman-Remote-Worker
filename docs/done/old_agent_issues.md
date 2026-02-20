@@ -1,6 +1,18 @@
+---
+tags:
+  - agent-architecture
+  - bug-fix
+  - debugging
+  - llm-configuration
+  - tool-development
+  - model-issues
+aliases:
+  - ["Creator Agent Issues", "Agent Issues Assessment"]
+---
+
 # Creator Agent Issues Assessment
 
-This document summarizes the issues identified causing the Creator Agent to get stuck in the preprocessing phase, looping 250+ iterations without making progress.
+This document summarizes the issues identified causing the Creator Agent to get stuck in the preprocessing phase, looping 250+ iterations without making progress. These issues were key motivators for the [[workspace_implementation]] architecture redesign.
 
 ## Summary
 
@@ -218,3 +230,11 @@ After implementing fixes:
    podman-compose exec postgres psql -U graphrag -d graphrag \
      -c "SELECT COUNT(*) FROM requirement_cache WHERE job_id = '<job-uuid>';"
    ```
+
+## Related
+
+- [[workspace_implementation]]
+- [[validator_issues]]
+- [[issues]]
+- [[agent]]
+- [[tool_implementation]]

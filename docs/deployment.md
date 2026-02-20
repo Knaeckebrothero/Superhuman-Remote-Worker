@@ -1,3 +1,19 @@
+---
+tags:
+  - cloud-infrastructure
+  - configuration
+  - orchestrator
+aliases:
+  - Containerization
+  - Docker Compose
+  - Kubernetes Deployment
+related:
+  - "[[datasources]]"
+  - "[[debug_cockpit]]"
+  - "[[deliverables]]"
+  - "[[security_checklist]]"
+  - "[[email_and_mobile]]"
+---
 # Deployment: General-Purpose Agent Workforce
 
 ## Vision
@@ -408,3 +424,11 @@ Based on the docker-compose, you'll create:
 - **Secrets**: Database passwords, API keys
 
 The docker-compose serves as the source of truth for what containers need.
+
+## Related
+
+- [[datasources]] - Datasource connector system for external databases
+- [[debug_cockpit]] - Angular frontend deployed as part of the stack
+- [[deliverables]] - Job delivery pipeline within the deployed infrastructure
+- [[security_checklist]] - Security considerations for production deployment
+- [[email_and_mobile]] - Notification system for autonomous operation

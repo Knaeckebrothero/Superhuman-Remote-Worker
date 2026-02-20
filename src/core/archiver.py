@@ -162,7 +162,6 @@ class LLMArchiver:
         self._connected = False
         self._connection_attempted = False
         self._step_counters: Dict[str, int] = {}  # Per-job step counters
-        self._chat_sequence_counters: Dict[str, int] = {}  # Per-job chat sequence
 
     @classmethod
     def from_env(cls) -> Optional["LLMArchiver"]:
@@ -253,20 +252,6 @@ class LLMArchiver:
                 self._step_counters[job_id] = 0
         self._step_counters[job_id] += 1
         return self._step_counters[job_id]
-
-    def _get_next_chat_sequence(self, job_id: str) -> int:
-        """Get the next chat sequence number for a job.
-
-        Args:
-            job_id: Job identifier
-
-        Returns:
-            Next sequential chat sequence number for this job.
-        """
-        if job_id not in self._chat_sequence_counters:
-            self._chat_sequence_counters[job_id] = 0
-        self._chat_sequence_counters[job_id] += 1
-        return self._chat_sequence_counters[job_id]
 
     def _truncate_string(self, s: str, max_length: int = 500) -> str:
         """Truncate a string to max_length with ellipsis indicator."""
@@ -560,7 +545,6 @@ class LLMArchiver:
             doc: Dict[str, Any] = {
                 "job_id": job_id,
                 "agent_type": agent_type,
-                "sequence_number": self._get_next_chat_sequence(job_id),
                 "timestamp": datetime.now(timezone.utc),
                 "iteration": iteration,
                 "model": model,

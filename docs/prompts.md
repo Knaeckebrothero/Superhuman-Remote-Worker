@@ -1,3 +1,21 @@
+---
+tags:
+  - agent-architecture
+  - llm-configuration
+  - context-management
+  - configuration
+aliases:
+  - prompt engineering
+  - context engineering
+  - prompt refactoring
+related:
+  - "[[model_issues]]"
+  - "[[phase_number_issues]]"
+  - "[[tool_issues]]"
+  - "[[context_management]]"
+  - "[[config_issues]]"
+---
+
 # Prompt Architecture: Analysis and Refactoring Plan
 
 This document analyzes the current prompt assembly system, identifies issues, and proposes a refactoring plan.
@@ -744,3 +762,11 @@ Key findings that affect our plan:
 - **Structured workspace.md formats resist bloat** — section headers with per-section token budgets + priority tags ([HIGH]/[MED]/[LOW]) enable automated pruning. Programmatic enforcement: count tokens after each rewrite, trigger a correction LLM call if budget exceeded.
 - **Cost model**: current architecture (no optimization) = **$19.44/job** on Claude Sonnet 4 (200 calls). Optimized architecture (caching + tool compression + workspace budget + aggressive compaction) = **$10.87/job** — a **44.1% net savings**. On Claude Opus, the optimized architecture saves ~$42/job.
 - **Practical implementation roadmap**: Week 1 (high impact, low effort) — reorder prompt components + enable caching, ~23% savings on input costs. Week 2 (medium impact, low effort) — compress tool descriptions + workspace.md budget, ~3-5% additional. Week 3 (high impact, medium effort) — tiered compaction starting at 50% capacity, ~15-25% additional. Month 2 — dynamic tool loading + model routing.
+
+## Related
+
+- [[model_issues]] - Model failures demonstrating prompt architecture weaknesses
+- [[phase_number_issues]] - Phase numbering issues related to prompt design
+- [[tool_issues]] - Tool phase filtering and description management
+- [[context_management]] - Context window management and compaction strategies
+- [[config_issues]] - Configuration system for expert and model settings

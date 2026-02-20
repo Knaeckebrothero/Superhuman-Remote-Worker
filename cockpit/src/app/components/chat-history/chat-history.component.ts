@@ -66,7 +66,7 @@ import { ChatEntry } from '../../core/models/chat.model';
             <div class="chat-turn">
               <!-- Turn Header -->
               <div class="turn-header">
-                <span class="turn-number">#{{ entry.sequence_number }}</span>
+                <span class="turn-number">#{{ idx + 1 }}</span>
                 <span class="phase-badge" [class.strategic]="entry.phase === 'strategic'" [class.tactical]="entry.phase === 'tactical'">
                   {{ entry.phase || 'unknown' }}
                 </span>

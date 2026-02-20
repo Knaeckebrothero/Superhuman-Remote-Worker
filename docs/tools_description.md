@@ -1,3 +1,19 @@
+---
+tags:
+  - tool-development
+  - agent-architecture
+  - data-management
+aliases:
+  - agent tools
+  - Neo4j tools
+  - metamodel validator tool
+related:
+  - "[[metamodel-compliance-architecture]]"
+  - "[[tool_issues]]"
+  - "[[patch_tool]]"
+  - "[[datasources]]"
+---
+
 # Agent Tools Description
 
 This document describes the tools available to the LangGraph requirement analysis agent.
@@ -181,3 +197,10 @@ execute_cypher_query(query="""
 | `Requirement` | `IMPACTS_MESSAGE` | `Message` |
 | `Message` | `USES_OBJECT` | `BusinessObject` |
 | `Message` | `PRODUCES_OBJECT` | `BusinessObject` |
+
+## Related
+
+- [[metamodel-compliance-architecture]] - Full metamodel compliance verification architecture
+- [[tool_issues]] - Tool phase filtering and dynamic binding proposals
+- [[patch_tool]] - Multi-file content operation tool research
+- [[datasources]] - External datasource connectors for Neo4j, PostgreSQL, MongoDB

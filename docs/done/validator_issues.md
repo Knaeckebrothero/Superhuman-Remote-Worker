@@ -1,6 +1,17 @@
+---
+tags:
+  - agent-architecture
+  - bug-fix
+  - debugging
+  - tool-development
+  - configuration
+aliases:
+  - ["Validator Issues", "Validator Agent Issues"]
+---
+
 # Validator Agent Issues
 
-This document describes the issues discovered when first running the validator agent.
+This document describes the issues discovered when first running the validator [[agent]]. See also [[old_agent_issues]] for similar problems with the Creator Agent.
 
 **Status:** ✅ ALL ISSUES RESOLVED
 
@@ -143,3 +154,11 @@ The following 9 tools were removed from the codebase:
    - ✅ Both: Agent calls `job_complete` and writes `output/integration_result.json`
    - CLI reads the output file and updates PostgreSQL requirement record
    - Updates: `neo4j_id`, `status`, `validated_at`
+
+## Related
+
+- [[old_agent_issues]]
+- [[agent]]
+- [[issues]]
+- [[tool_implementation]]
+- [[workspace_implementation]]

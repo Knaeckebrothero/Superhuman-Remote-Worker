@@ -1,3 +1,19 @@
+---
+tags:
+  - data-management
+  - tool-development
+  - agent-architecture
+aliases:
+  - vector search
+  - semantic search
+  - workspace embeddings
+related:
+  - "[[context_management]]"
+  - "[[working_memory]]"
+  - "[[datasources]]"
+  - "[[tools_description]]"
+---
+
 # Workspace Vector Search - Future Feature
 
 **Status:** Not implemented (infrastructure pending)
@@ -202,3 +218,11 @@ The following files contained partial/stub implementation and were removed durin
 - [pgvector GitHub](https://github.com/pgvector/pgvector)
 - [sentence-transformers](https://www.sbert.net/)
 - [LangChain vector stores](https://python.langchain.com/docs/modules/data_connection/vectorstores/)
+
+## Related
+
+- [[context_management]] — Current context and memory management approach
+- [[working_memory]] — Workspace memory mechanisms the agent uses today
+- [[datasources]] — Database datasource architecture (PostgreSQL, Neo4j, MongoDB)
+- [[tools_description]] — Tool documentation and registry
+- [[memories_mechanism]] — Agent memory and state persistence patterns

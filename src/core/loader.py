@@ -18,6 +18,8 @@ from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 logger = logging.getLogger(__name__)
 
+VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
+
 
 # =============================================================================
 # Config Merging Utilities
@@ -528,9 +530,6 @@ class WorkspaceConfig:
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
-    git_ignore_patterns: List[str] = field(
-        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-    )
 
 
 @dataclass
@@ -611,6 +610,7 @@ class AgentConfig:
     )
     phase_settings: PhaseSettings = field(default_factory=PhaseSettings)
     instruction_files: List[InstructionFileEntry] = field(default_factory=list)
+    autonomy: str = "partial"
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -752,10 +752,6 @@ def load_agent_config(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        git_ignore_patterns=workspace_data.get(
-            "git_ignore_patterns",
-            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-        ),
     )
 
     tools_data = data.get("tools", {})
@@ -816,11 +812,17 @@ def load_agent_config(
         for entry in instruction_files_data
     ]
 
+    # Parse autonomy level
+    autonomy = data.get("autonomy", "partial")
+    if autonomy not in VALID_AUTONOMY_LEVELS:
+        logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
+        autonomy = "partial"
+
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "instruction_files"
+        "phase_settings", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -836,6 +838,7 @@ def load_agent_config(
         context_management=context_config,
         phase_settings=phase_config,
         instruction_files=instruction_files,
+        autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -884,10 +887,6 @@ def load_agent_config_from_dict(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        git_ignore_patterns=workspace_data.get(
-            "git_ignore_patterns",
-            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-        ),
     )
 
     tools_data = data.get("tools", {})
@@ -948,11 +947,17 @@ def load_agent_config_from_dict(
         for entry in instruction_files_data
     ]
 
+    # Parse autonomy level
+    autonomy = data.get("autonomy", "partial")
+    if autonomy not in VALID_AUTONOMY_LEVELS:
+        logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
+        autonomy = "partial"
+
     # Collect extra fields
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "instruction_files"
+        "phase_settings", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -968,6 +973,7 @@ def load_agent_config_from_dict(
         context_management=context_config,
         phase_settings=phase_config,
         instruction_files=instruction_files,
+        autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -1160,6 +1166,27 @@ def _should_use_reasoning_summary(model: str) -> bool:
     return any(model_lower.startswith(p) for p in reasoning_prefixes)
 
 
+# Reasoning levels supported by each provider API
+_OPENAI_REASONING_LEVELS = {"low", "medium", "high"}
+
+
+def _clamp_reasoning_level(level: str, supported: set[str]) -> str:
+    """Clamp a reasoning level to the nearest supported value.
+
+    Maps unsupported levels to the closest supported equivalent:
+    - 'minimal' -> 'low'
+    - 'xhigh' -> 'high'
+    """
+    if level in supported:
+        return level
+    mapping = {"minimal": "low", "xhigh": "high"}
+    clamped = mapping.get(level, level)
+    if clamped not in supported:
+        return "high"  # safe fallback
+    logger.debug(f"Clamped reasoning level '{level}' -> '{clamped}' for provider")
+    return clamped
+
+
 def create_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -1247,18 +1274,19 @@ def _create_openai_llm(
     # Add reasoning parameters
     reasoning_mode = "none"
     if config.reasoning_level and config.reasoning_level != "none":
+        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
         if _should_use_reasoning_summary(config.model):
             # Native OpenAI reasoning models: use Responses API with readable summaries.
             # Passing reasoning={} triggers LangChain's automatic Responses API routing.
             llm_kwargs["reasoning"] = {
-                "effort": config.reasoning_level,
+                "effort": level,
                 "summary": "auto",
             }
-            reasoning_mode = f"responses_api(effort={config.reasoning_level})"
+            reasoning_mode = f"responses_api(effort={level})"
         else:
             # Other models (DeepSeek, vLLM-hosted, etc.): use Chat Completions API.
-            model_kwargs["reasoning_effort"] = config.reasoning_level
-            reasoning_mode = f"chat_completions(effort={config.reasoning_level})"
+            model_kwargs["reasoning_effort"] = level
+            reasoning_mode = f"chat_completions(effort={level})"
 
     # Add timeout if specified
     if config.timeout is not None:
@@ -1491,10 +1519,10 @@ def _create_openrouter_llm(
     # Build model kwargs
     model_kwargs = {}
 
-    # OpenRouter proxies Chat Completions only (no Responses API),
-    # so reasoning_effort goes in model_kwargs when set
+    # OpenRouter uses nested reasoning object format.
+    # OpenRouter supports all levels (none, minimal, low, medium, high, xhigh) — no clamping needed.
     if config.reasoning_level and config.reasoning_level != "none":
-        model_kwargs["reasoning_effort"] = config.reasoning_level
+        model_kwargs["reasoning"] = {"effort": config.reasoning_level}
 
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {

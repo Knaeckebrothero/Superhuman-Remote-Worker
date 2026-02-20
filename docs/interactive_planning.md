@@ -1,3 +1,20 @@
+---
+tags:
+  - planning
+  - agent-architecture
+  - orchestrator
+  - user-interface
+aliases:
+  - Autonomy Levels
+  - Human-in-the-Loop
+  - Plan Review
+related:
+  - "[[deliverables]]"
+  - "[[git]]"
+  - "[[email_and_mobile]]"
+  - "[[debug_cockpit]]"
+  - "[[continuous_improvement_loop]]"
+---
 # Autonomy Levels & Human-in-the-Loop Review
 
 Design document for the autonomy level system — a configurable human-in-the-loop mechanism that controls when the agent pauses for human review during job execution.
@@ -467,3 +484,11 @@ Same chat UI, same session continuity, but with context-appropriate tools activa
 - **Gitea API integration depth:** How much of the Gitea PR API do we need to wrap? Minimal (create PR, check status, read comments, merge) vs. full (labels, reviewers, CI checks). Start minimal.
 - **PR comment format for agent consumption:** PR comments are human-written. Should we structure them for agent parsing (e.g., prefixed with action tags like `[FIX]`, `[QUESTION]`, `[APPROVE]`) or let the agent interpret free-form text? Free-form is more natural but less reliable.
 - **MCP authentication for builder chat:** The builder chat backend needs access to the orchestrator MCP and the workspace. Since both run server-side this is straightforward, but tool calls need to be scoped to the current job. Will figure this out during implementation.
+
+## Related
+
+- [[deliverables]] - Human-in-the-loop review and job completion gates
+- [[git]] - Phase branches and PR-based review model
+- [[email_and_mobile]] - Notifications when agent freezes for review
+- [[debug_cockpit]] - Cockpit UI for plan review and workspace browsing
+- [[continuous_improvement_loop]] - Evaluator assesses planning quality across autonomy levels

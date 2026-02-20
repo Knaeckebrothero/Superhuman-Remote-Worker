@@ -1,3 +1,18 @@
+---
+tags:
+  - agent-architecture
+  - context-management
+  - knowledge-management
+aliases:
+  - associative memory
+  - observer memory system
+related:
+  - "[[obsidian]]"
+  - "[[context_management]]"
+  - "[[working_memory]]"
+  - "[[agent_improvements]]"
+---
+
 # Associative Memory Mechanism
 
 ## Concept
@@ -104,3 +119,11 @@ Relevant memories are surfaced into the agent's context based on its current act
 - **Memory lifecycle:** Do memories decay over time? Can they be consolidated/merged? Is there a cap?
 - **Cross-job memory:** Should memories from one job be available to other jobs? Scoped by agent config/expert type?
 - **Feedback loop:** If a surfaced memory leads to better outcomes, should it be reinforced? If ignored repeatedly, should it decay?
+
+## Related
+
+- [[obsidian]] - Obsidian-style knowledge workspace with Zettelkasten note-taking
+- [[context_management]] - Context window management and compaction strategies
+- [[working_memory]] - Working memory implementation for the agent
+- [[vectorization]] - Vector embedding approaches for semantic search
+- [[agent_improvements]] - General agent improvement proposals

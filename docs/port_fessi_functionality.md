@@ -1,3 +1,20 @@
+---
+tags:
+  - tool-development
+  - agent-architecture
+  - configuration
+aliases:
+  - vision helper
+  - document renderer
+  - multimodal support
+  - Fessi port
+related:
+  - "[[podcast_generation]]"
+  - "[[tools_description]]"
+  - "[[config_issues]]"
+  - "[[agent_improvements]]"
+---
+
 # Porting Fessi Vision/Audio Functionality to Graph-RAG Workspace
 
 This document outlines the plan for adding vision and audio capabilities to the Graph-RAG workspace agent, based on the patterns implemented in the Advanced-LLM-Chat (Fessi) backend.
@@ -1479,3 +1496,10 @@ The Fessi implementation can be adapted with these changes:
 - Fessi source: `Advanced-LLM-Chat/backend/services/file_retrieval_service.py`
 - Fessi source: `Advanced-LLM-Chat/backend/services/cache/description_cache.py`
 - Fessi source: `Advanced-LLM-Chat/backend/services/audio_handler.py`
+
+## Related
+
+- [[podcast_generation]] - Podcast generation from documents using TTS pipelines
+- [[tools_description]] - Agent tools and their descriptions
+- [[config_issues]] - Configuration issues and improvements
+- [[agent_improvements]] - General agent improvement proposals

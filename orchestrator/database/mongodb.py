@@ -411,8 +411,8 @@ class MongoDB:
         skip = (page - 1) * page_size
         has_more = (skip + page_size) < total
 
-        # Fetch paginated entries, sorted by sequence_number
-        cursor = collection.find(query).sort("sequence_number", 1).skip(skip).limit(page_size)
+        # Fetch paginated entries, sorted by timestamp
+        cursor = collection.find(query).sort("timestamp", 1).skip(skip).limit(page_size)
 
         entries = []
         async for doc in cursor:
@@ -541,8 +541,8 @@ class MongoDB:
         # Check if there are more entries
         has_more = (offset + limit) < total
 
-        # Fetch entries sorted by sequence_number
-        cursor = collection.find(query).sort("sequence_number", 1).skip(offset).limit(limit)
+        # Fetch entries sorted by timestamp
+        cursor = collection.find(query).sort("timestamp", 1).skip(offset).limit(limit)
 
         entries = []
         async for doc in cursor:

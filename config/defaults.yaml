@@ -32,13 +32,6 @@ workspace:
   max_write_words: 10000
   # Git versioning for workspace history
   git_versioning: true
-  git_ignore_patterns:
-    - "*.db"
-    - "*.log"
-    - "__pycache__/"
-    - ".DS_Store"
-    - "*.pyc"
-    - "documents/"
 
 tools:
   # Workspace tools - file operations (src/tools/workspace/)
@@ -107,7 +100,7 @@ tools:
   # Coding tools - shell execution + Claude Code delegation (src/tools/coding/)
   coding:
     - run_command
-    # - claude_code  # Requires: Claude Code CLI installed + authenticated
+    - claude_code  # Requires: Claude Code CLI installed + authenticated
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -153,6 +146,10 @@ research:
     host: null
     port: null
 
+# Autonomy level — controls when the agent pauses for human review
+# full | review | partial | guided | dependent
+autonomy: partial
+
 # Browser automation settings (browser-use + Playwright)
 browser:
   headless: true
@@ -160,7 +157,7 @@ browser:
   use_vision: false  # DOM-based by default (works with any LLM)
 
 # Claude Code delegation settings (used when claude_code tool is enabled)
-# claude_code:
-#   model: claude-opus-4-6   # Model for Claude Code sessions
-#   effort_level: high        # Reasoning effort: low, medium, high
+claude_code:
+  model: claude-opus-4-6   # Model for Claude Code sessions
+  effort_level: high        # Reasoning effort: low, medium, high
 

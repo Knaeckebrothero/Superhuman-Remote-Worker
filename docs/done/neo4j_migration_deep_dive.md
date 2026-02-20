@@ -1,16 +1,29 @@
+---
+tags:
+  - data-management
+  - agent-architecture
+  - configuration
+  - tool-development
+  - debugging
+aliases:
+  - "Neo4j Migration Deep Dive"
+  - "Neo4j Migration"
+  - "Neo4j Refactor"
+---
+
 # Neo4j Migration Deep Dive
 
 **Date:** 2026-01-14
 **Status:** ✅ **COMPLETE** (Phase 1/2 implemented)
-**Related:** `docs/db_refactor.md`, `docs/phase1_complete.md`
+**Related:** [[db_refactor]], [[phase1_complete]]
 
 ## Executive Summary
 
-This document provides a comprehensive analysis of the Neo4j migration from the old `neo4j_utils.py` module-level functions to a clean `Neo4jDB` class-based architecture with **dependency injection**. Unlike PostgreSQL which is async-first, Neo4j uses the official **synchronous** Python driver and remains synchronous in the new architecture.
+This document provides a comprehensive analysis of the Neo4j migration from the old `neo4j_utils.py` module-level functions to a clean `Neo4jDB` class-based architecture with **dependency injection**. Unlike [[postgres_migration_deep_dive|PostgreSQL]] which is async-first, Neo4j uses the official **synchronous** Python driver and remains synchronous in the new architecture.
 
 **Migration Status:** ✅ **COMPLETE**
 - ✅ Phase 1: `Neo4jDB` class created with namespace pattern
-- ✅ Phase 2: UniversalAgent and tools (graph_tools) migrated to use Neo4jDB
+- ✅ Phase 2: UniversalAgent and tools ([[graph_visualization|graph_tools]]) migrated to use Neo4jDB
 - ✅ No critical bugs found (implementation was already correctly using sync driver)
 
 **Key Design Decision:** No singleton pattern. Each component creates its own `Neo4jDB` instance and passes it via dependency injection. This approach works because the official Neo4j driver has built-in connection pooling that handles concurrency correctly. Singletons were only needed for SQLite to avoid write conflicts.
@@ -2598,3 +2611,10 @@ with neo4j_db.transaction() as tx:
 ---
 
 ## End of Neo4j Migration Deep Dive
+
+## Related
+- [[db_refactor]]
+- [[postgres_migration_deep_dive]]
+- [[mongodb_migration_deep_dive]]
+- [[phase1_complete]]
+- [[graph_visualization]]

@@ -1,3 +1,18 @@
+---
+tags:
+  - bug-fix
+  - llm-configuration
+  - model-issues
+aliases:
+  - KeyRing Bug
+  - API Key Rotation
+  - Async Client Issue
+related:
+  - "[[model_issues]]"
+  - "[[agent_improvements]]"
+  - "[[context_management]]"
+  - "[[01_issues]]"
+---
 # KeyRing Rotation Issues
 
 Investigation date: 2026-02-14
@@ -146,3 +161,10 @@ async_client = AsyncReasoningCapturingClient(...)  # NEW
 kwargs["http_client"] = sync_client
 kwargs["http_async_client"] = async_client  # NEW
 ```
+
+## Related
+
+- [[model_issues]] - Broader model-related issues including provider-specific bugs
+- [[agent_improvements]] - Agent reliability improvements that depend on fixing key rotation
+- [[context_management]] - Layer 0 context overflow protection is part of the broken code path
+- [[01_issues]] - Master issues list tracking this and other bugs

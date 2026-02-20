@@ -1,3 +1,12 @@
+---
+tags:
+  - agent-architecture
+  - tool-development
+  - context-management
+  - performance
+  - research
+---
+
 # VM-Based Agent Isolation (KubeVirt + Harvester)
 
 Design document for running each agent job in a dedicated virtual machine instead of a container, providing full OS-level isolation with enterprise-style management and browser-based remote access.
@@ -292,3 +301,12 @@ Layer 4: Orchestrator — human-in-the-loop for sensitive operations
 - [Security Checklist](../security_checklist.md) — container hardening checklist (partially superseded by VM approach)
 - [Deployment](../deployment.md) — current containerized deployment
 - [Datasources](../datasources.md) — external database/repo connections
+
+## Related
+
+- [[cloud_workspace]]
+- [[security_checklist]]
+- [[deployment]]
+- [[datasources]]
+- [[advanced_job_configuration]]
+- [[tool_issues]]

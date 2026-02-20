@@ -23,13 +23,12 @@ export interface CachedAuditEntry {
 }
 
 /**
- * Cached chat entry with job context and sequence number.
+ * Cached chat entry with job context and timestamp ordering.
  */
 export interface CachedChatEntry {
-  /** Composite key: `${jobId}_${sequenceNumber}` */
+  /** MongoDB _id (unique per entry) */
   id: string;
   jobId: string;
-  sequenceNumber: number;
   timestamp: string;
   /** The original chat entry data */
   data: ChatEntry;

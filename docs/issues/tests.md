@@ -1,3 +1,12 @@
+---
+tags:
+  - testing
+  - quality-assurance
+  - tool-development
+  - research
+  - documentation
+---
+
 # Test Coverage Gaps
 
 Current state: **746 tests** across **24 test files**, covering ~45 of ~86 source modules.
@@ -2085,3 +2094,10 @@ Prioritized by risk, value, and ease of testing:
 8. **LLMArchiver** (Cat. 6) — Audit trail reliability
 9. **Todo/Job tool wrappers** (Cat. 3b) — Tool layer between LLM and managers
 10. **Citation sources** (Cat. 3c) — Full citation workflow
+
+## Related
+
+- [[tool_issues]]
+- [[job_debug]]
+- [[agent_architecture]]
+- [[context_management]]
