@@ -1,3 +1,13 @@
+---
+tags:
+  - context-management
+  - agent-architecture
+  - tool-development
+aliases:
+  - ["workspace initialization"]
+  - ["memory system"]
+---
+
 # Working Memory (workspace.md) Initialization Issue
 
 ## Overview
@@ -23,7 +33,7 @@ The workspace.md gets written immediately without the agent checking what files 
 
 **Location**: `src/graph.py:142-184`
 
-The initialization is performed by `create_init_workspace_node()`, which creates a node that:
+The initialization is performed by `create_init_workspace_node()` in [[agent_improvements]], which creates a node that:
 
 ```python
 def init_workspace(state: UniversalAgentState) -> Dict[str, Any]:
@@ -43,7 +53,7 @@ def init_workspace(state: UniversalAgentState) -> Dict[str, Any]:
     ...
 ```
 
-This node is part of the **INITIALIZATION sequence**:
+This node is part of the **INITIALIZATION sequence** (see [[continuous_improvement_loop]]):
 ```
 init_workspace → read_instructions → create_plan → init_todos
 ```
@@ -509,3 +519,10 @@ Instead of including workspace.md content directly in the system prompt, we inje
 2. **Identifiable via prefix** - Tool call IDs use `workspace_init_` prefix for easy identification during summarization exclusion.
 
 3. **No special resume handling** - Since injection happens in `execute()` each time, resume naturally gets fresh workspace content
+
+## Related
+
+- [[context_management]] - Context handling, summarization, memory management
+- [[memories_mechanism]] - Agent memory and state persistence patterns
+- [[agent_improvements]] - Agent design, loop patterns, phase management
+- [[patch_tool]] - Tool creation and patching

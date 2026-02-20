@@ -1,3 +1,12 @@
+---
+tags:
+  - debugging
+  - agent-architecture
+  - job-management
+  - user-feedback
+  - planning
+---
+
 # Issue: Agent Abandons Solvable Tasks via job_complete Escape Hatch
 
 **Observed in:** Job `aab9a1a2-bfc1-4748-987d-edb6f8e648ed` ("Organize docs (oss 120b)")
@@ -212,3 +221,11 @@ The template doesn't account for the "stuck in a loop with no progress" scenario
 **Problem:** Once the agent wrote "core topic is undefined" to workspace.md Critical Context, this was injected into every subsequent LLM call, reinforcing the false belief. The strategic REFLECT step rewrites workspace.md but preserves Critical Context because it's "important."
 
 **Fix:** Critical Context items should have a TTL or be automatically challenged after N phases. Alternatively, the REFLECT template should include: "Re-evaluate all items in Critical Context. If a blocker has persisted for 2+ phases without resolution, consider whether the premise is wrong."
+
+## Related
+
+- [[job_debug]]
+- [[context_management]]
+- [[advanced_job_configuration]]
+- [[tool_issues]]
+- [[agent_architecture]]

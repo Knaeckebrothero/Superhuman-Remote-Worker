@@ -1,3 +1,18 @@
+---
+tags:
+  - security
+  - cloud-infrastructure
+  - configuration
+aliases:
+  - container hardening
+  - Docker security
+  - agent security
+related:
+  - "[[sudo_approval_plugin]]"
+  - "[[deployment]]"
+  - "[[cloud_workspace]]"
+---
+
 # Container Security Checklist for Autonomous LLM Agents
 
 Based on: *Security Architecture for Autonomous LLM Agents: A Comprehensive Analysis of Container Hardening*
@@ -342,3 +357,9 @@ Key references:
 - [Render: Security Best Practices for AI Agents](https://render.com/articles/security-best-practices-when-building-ai-agents)
 - [Snyk: ToxicSkills Study](https://snyk.io/blog/toxicskills-malicious-ai-agent-skills-clawhub/)
 - [syscall2seccomp (Auto-generate seccomp profiles)](https://github.com/antitree/syscall2seccomp)
+
+## Related
+
+- [[sudo_approval_plugin]] - Human-in-the-loop privilege escalation for agents
+- [[deployment]] - Deployment configuration and infrastructure
+- [[cloud_workspace]] - Cloud infrastructure and workspace setup

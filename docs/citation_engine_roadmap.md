@@ -1,3 +1,19 @@
+---
+tags:
+  - citation-engine
+  - data-management
+  - planning
+  - tool-development
+aliases:
+  - Citation Roadmap
+  - CitationEngine Implementation Plan
+related:
+  - "[[citation_engine_rework]]"
+  - "[[citation_issues]]"
+  - "[[config_issues]]"
+  - "[[agent_improvements]]"
+---
+
 # CitationEngine Rework — Implementation Roadmap
 
 **Parent doc:** [citation_engine_rework.md](citation_engine_rework.md)
@@ -504,3 +520,11 @@ Phase 4 ── depends on all above
 | `src/tools/registry.py` | 1, 3 | Register new tools |
 | `config/defaults.yaml` | 1, 3 | Add new tools to default config |
 | `docker-compose.dev.yaml` | 2 | pgvector-enabled PostgreSQL image |
+
+## Related
+
+- [[citation_engine_rework]] — Parent design document with full architecture
+- [[citation_issues]] — Citation workflow issues and research findings
+- [[config_issues]] — Config patterns for tool registration
+- [[agent_improvements]] — Architecture improvements that inform the roadmap
+- [[advanced_websearch]] — Web search tools that feed into citations

@@ -1,3 +1,21 @@
+---
+tags:
+  - writing
+  - agent-architecture
+  - context-management
+  - planning
+aliases:
+  - writing methodology
+  - citation discipline
+  - prompt architecture
+related:
+  - "[[citation_engine_roadmap]]"
+  - "[[citation_engine_rework]]"
+  - "[[prompts]]"
+  - "[[context_management]]"
+  - "[[citation_issues]]"
+---
+
 # Agent Instruction Design: Research Findings & Design Rationale
 
 This document captures research and reasoning behind the agent instruction design. It covers
@@ -353,3 +371,12 @@ These recommendations are primarily for gpt-oss-120b but provide useful baseline
 - [FACTUM - Citation Hallucination Detection (arXiv:2601.05866)](https://arxiv.org/abs/2601.05866)
 - [Anthropic - Reduce Hallucinations](https://platform.claude.com/docs/en/test-and-evaluate/strengthen-guardrails/reduce-hallucinations)
 - [Agent Prompt Optimization Report](docs/Agent%20Prompt%20Optimization%20Report.pdf) — Internal report on optimizing phase-alternating agent prompts for gpt-oss-120b (42 references)
+
+## Related
+
+- [[citation_engine_roadmap]] — CitationEngine development roadmap
+- [[citation_engine_rework]] — CitationEngine architecture rework
+- [[prompts]] — Agent prompt design and configuration
+- [[context_management]] — Context window management and compaction
+- [[citation_issues]] — Known citation-related issues
+- [[latex]] — LaTeX output format used in academic writing

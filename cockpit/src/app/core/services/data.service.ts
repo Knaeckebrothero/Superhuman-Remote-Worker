@@ -577,13 +577,12 @@ export class DataService {
     const auditEntries = await this.db.getAuditEntries(jobId, start, end);
 
     // Load ALL chat entries and graph deltas (they use different indexing)
-    // Chat entries are indexed by sequence_number (1-N), not audit index
+    // Chat entries are ordered by timestamp, not audit index
     // Graph deltas are indexed by toolCallIndex, not audit index
-    const chatCount = await this.db.getChatEntryCount(jobId);
     const graphCount = await this.db.getGraphDeltaCount(jobId);
 
     const [chatEntries, graphDeltas] = await Promise.all([
-      this.db.getChatEntries(jobId, 0, chatCount),
+      this.db.getChatEntries(jobId),
       this.db.getGraphDeltas(jobId, 0, graphCount),
     ]);
 

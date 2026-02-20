@@ -1,3 +1,12 @@
+---
+tags:
+  - context-management
+  - tool-development
+  - llm-configuration
+  - performance
+  - research
+---
+
 # Context Management Evolution: Summarization Tool & Async Context Assembly
 
 > Feature proposal for agent-controlled context compaction, tiered summarization, and async phase preparation.
@@ -385,3 +394,12 @@ Manus's approach of storing both full and compact versions is more explicit than
 ### 6. Sub-Agent for Context Assembly
 
 The RLM and multi-agent patterns suggest Feature 3 (async context assembly) should use a dedicated sub-LLM rather than the main agent. A cheaper, faster model (Haiku, Flash) can analyze the phase archive and produce a context package without consuming the main agent's context or budget.
+
+## Related
+
+- [[context_management]]
+- [[advanced_job_configuration]]
+- [[citation_engine_roadmap]]
+- [[prompting]]
+- [[obsidian]]
+- [[tool_issues]]

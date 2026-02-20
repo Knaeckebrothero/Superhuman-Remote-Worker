@@ -179,14 +179,6 @@
           "type": "boolean",
           "default": true,
           "description": "Enable git versioning for workspace history. Creates a git repository in the workspace for automatic change tracking."
-        },
-        "git_ignore_patterns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"],
-          "description": "Patterns for .gitignore when git versioning is enabled"
         }
       }
     },
@@ -476,6 +468,12 @@
         }
       },
       "additionalProperties": false
+    },
+    "autonomy": {
+      "type": "string",
+      "enum": ["full", "review", "partial", "guided", "dependent"],
+      "default": "partial",
+      "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
     }
   },
   "additionalProperties": true,

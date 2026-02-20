@@ -1,3 +1,18 @@
+---
+tags:
+  - finetuning
+  - llm-configuration
+  - agent-architecture
+aliases:
+  - QLoRA Training
+  - Tool Use Finetuning
+  - Synthetic Data Generation
+related:
+  - "[[continuous_improvement_loop]]"
+  - "[[context_management]]"
+  - "[[model_issues]]"
+  - "[[prompts]]"
+---
 # Finetuning Guide for Agent Improvement
 
 This document outlines strategies for finetuning open-source LLMs (e.g., 120B parameter models) to improve agent behavior, tool use, and task completion reliability.
@@ -348,3 +363,11 @@ Using Claude Opus for synthetic data generation:
 - [LlamaFactory GitHub](https://github.com/hiyouga/LLaMA-Factory)
 - [Hugging Face PEFT](https://github.com/huggingface/peft)
 - [Tool Use & Function Calling - RLHF Book](https://rlhfbook.com/c/14.5-tools)
+
+## Related
+
+- [[continuous_improvement_loop]] - CI loop generates training data from job evaluations
+- [[context_management]] - Finetuning for better token efficiency and context handling
+- [[model_issues]] - Model-specific behaviors that finetuning can address
+- [[prompts]] - Prompt engineering complements finetuning for agent behavior
+- [[financing]] - Revenue to fund GPU hardware for training

@@ -51,9 +51,6 @@ class WorkspaceManagerConfig:
 
     # Git versioning settings
     git_versioning: bool = True  # Enable git versioning for workspace history
-    git_ignore_patterns: List[str] = field(
-        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-    )
 
     # Git remote URL for workspace delivery (set by orchestrator via Gitea)
     git_remote_url: Optional[str] = None
@@ -65,10 +62,6 @@ class WorkspaceManagerConfig:
             base_path=data.get("base_path"),
             structure=data.get("structure", cls.__dataclass_fields__["structure"].default_factory()),
             git_versioning=data.get("git_versioning", True),
-            git_ignore_patterns=data.get(
-                "git_ignore_patterns",
-                cls.__dataclass_fields__["git_ignore_patterns"].default_factory()
-            ),
             git_remote_url=data.get("git_remote_url"),
         )
 
@@ -250,9 +243,7 @@ class WorkspaceManager:
         self._git_manager = GitManager(self._workspace_path)
 
         # Initialize repository (no-op if already exists)
-        success = self._git_manager.init_repository(
-            ignore_patterns=self.config.git_ignore_patterns
-        )
+        success = self._git_manager.init_repository()
 
         if success:
             logger.info("Git versioning enabled for workspace")

@@ -1,3 +1,19 @@
+---
+tags:
+  - configuration
+  - user-interface
+  - orchestrator
+  - llm-configuration
+aliases:
+  - Job Configuration
+  - Instruction Builder
+related:
+  - "[[cockpit_ds]]"
+  - "[[cockpit_performance_issues]]"
+  - "[[config_issues]]"
+  - "[[coding_agent]]"
+---
+
 # Advanced Job Configuration
 
 ## Problem Statement
@@ -588,3 +604,11 @@ These are lightweight, well-maintained libraries with no security concerns.
 - **Builder session resume**: Allow users to resume a builder chat when editing an existing job's configuration (load session by job_id).
 - **Artifact diff view**: Show what the AI changed in the instructions (inline diff highlighting) after each `edit_instructions` / `insert_instructions` tool call.
 - **Orphaned session cleanup**: Automated cleanup of builder sessions with no linked job (e.g., sessions older than 24h with `job_id IS NULL`). Not needed for v1 — manual cleanup is sufficient.
+
+## Related
+
+- [[cockpit_ds]] — Data service architecture for the same cockpit frontend
+- [[cockpit_performance_issues]] — Performance issues in cockpit components
+- [[config_issues]] — Config schema and validation patterns
+- [[coding_agent]] — Expert agent that uses the config system
+- [[cli_wrapper]] — Alternative backend that needs compatible job configuration

@@ -1,3 +1,19 @@
+---
+tags:
+  - orchestrator
+  - tool-development
+  - coding-tools
+  - agent-architecture
+  - debugging
+  - citation-engine
+  - git-integration
+  - configuration
+aliases:
+  - "MCP Overhaul"
+  - "MCP Server Overhaul"
+  - "Model Context Protocol Overhaul"
+---
+
 # MCP Overhaul: Full Feature Parity & Action Tools
 
 ## Motivation
@@ -8,9 +24,9 @@ The MCP currently exposes **8 out of 70** orchestrator API endpoints — all rea
 - Resume jobs with feedback
 - See what the agent actually produced (git history, workspace files)
 - Monitor system health (stats, stuck jobs, agent status)
-- Manage datasources or view expert configs
+- Manage [[db_refactor|datasources]] or view expert configs
 
-This overhaul brings the MCP to feature parity with the cockpit UI and adds action tools that let the AI actively manage jobs — the single biggest capability unlock.
+This overhaul brings the MCP to feature parity with the [[angular_migration_plan|cockpit UI]] and adds action tools that let the AI actively manage jobs — the single biggest capability unlock.
 
 ## Current State
 
@@ -23,7 +39,7 @@ This overhaul brings the MCP to feature parity with the cockpit UI and adds acti
 | `get_audit_trail` | MongoDB | Paginated audit entries (LLM messages, tool calls, errors) |
 | `get_chat_history` | MongoDB | Clean conversation turns |
 | `get_todos` | Filesystem | Current + archived todos |
-| `get_graph_changes` | MongoDB | Neo4j mutation timeline |
+| `get_graph_changes` | MongoDB | [[neo4j_migration_deep_dive|Neo4j]] mutation timeline |
 | `get_llm_request` | MongoDB | Full LLM request/response by doc ID |
 | `search_audit` | MongoDB | Text search across audit entries |
 
@@ -471,7 +487,7 @@ Get column definitions for a table.
 
 ### Category F: Citation & Source Library Tools
 
-These expose the CitationEngine's data — sources, citations, annotations, tags, and hybrid search — for verifying agent work and exploring the knowledge base a job built up.
+These expose the [[tool_implementation|CitationEngine]]'s data — sources, citations, annotations, tags, and hybrid search — for verifying agent work and exploring the knowledge base a job built up.
 
 **Background:** The CitationEngine stores data in PostgreSQL tables (`sources`, `citations`, `job_sources`, `source_annotations`, `source_tags`, `source_embeddings`). Agents use 11 citation tools during execution. But the orchestrator currently has **zero citation API endpoints**, so none of this is accessible via MCP. New orchestrator endpoints are required.
 
@@ -860,3 +876,10 @@ Every new tool must handle backend unavailability gracefully:
 ## Open Questions
 
 1. **[Phase 5a] Source content in MCP responses:** Source content can be very large (full documents). The `get_source_detail` tool truncates by default (2000 chars), but should `search_job_sources` chunk results also be truncatable via a parameter? Current default is 500 chars per chunk in the engine's `to_dict()`.
+
+## Related
+- [[tool_implementation]]
+- [[angular_migration_plan]]
+- [[graph_visualization]]
+- [[db_refactor]]
+- [[guardrails]]

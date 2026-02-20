@@ -1,3 +1,20 @@
+---
+tags:
+  - llm-configuration
+  - agent-architecture
+  - coding-tools
+  - tool-development
+aliases:
+  - Claude Code SDK
+  - CLI Wrapper
+  - Claude Code Integration
+related:
+  - "[[coding_agent]]"
+  - "[[cloud_workspace]]"
+  - "[[agent_improvements]]"
+  - "[[auxiliary_tasks]]"
+---
+
 # Claude Code SDK as Alternative LLM Backend
 
 ## Context
@@ -312,3 +329,11 @@ llm:
 - **Context management fully delegated** — Claude Code's auto-compact handles everything
 - **One model per phase** — can't switch models mid-phase
 - **Claude Code CLI required** — Node.js runtime + `claude auth` setup needed
+
+## Related
+
+- [[coding_agent]] — Coding agent that could delegate work via Claude Code
+- [[cloud_workspace]] — Container architecture for production deployment
+- [[agent_improvements]] — Architecture improvements for the same agent system
+- [[auxiliary_tasks]] — Phase alternation model that Claude Code would replace
+- [[calculator_code]] — Code execution tools that Claude Code handles natively

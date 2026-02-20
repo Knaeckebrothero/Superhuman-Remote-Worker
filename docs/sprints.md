@@ -1,3 +1,19 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - configuration
+aliases:
+  - sprint limit
+  - tactical phase limit
+  - forced reflection
+related:
+  - "[[phase_number_issues]]"
+  - "[[model_issues]]"
+  - "[[prompts]]"
+  - "[[agent_improvements]]"
+---
+
 # Sprint Limit for Tactical Phases
 
 ## Problem
@@ -67,3 +83,10 @@ phase_settings:
 | `src/graph.py` | Sprint limit check in `check_todos` node |
 | `src/core/phase.py` | Set `phase_start_iteration` on entering tactical; sprint-aware message on leaving |
 | `tests/test_sprint_limit.py` | Unit tests |
+
+## Related
+
+- [[phase_number_issues]] - Phase numbering and planning confusion
+- [[model_issues]] - Model failures demonstrating need for forced reflection
+- [[prompts]] - Prompt architecture and phase prompt design
+- [[agent_improvements]] - General agent improvement proposals

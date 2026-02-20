@@ -1,3 +1,18 @@
+---
+tags:
+  - latex
+  - writing
+  - tool-development
+aliases:
+  - LaTeX MCP
+  - TexMCP
+  - Academic Paper Tools
+related:
+  - "[[finetuning]]"
+  - "[[coding_agent]]"
+  - "[[deployment]]"
+  - "[[writing_instructions]]"
+---
 # LaTeX Integration for the Writer Agent
 
 Research into available options for enabling the writer agent to produce LaTeX papers.
@@ -65,3 +80,10 @@ For integrating with the LangGraph agent system, ranked by preference:
 
 - Simpler syntax = fewer LLM errors, faster compilation, tiny binary
 - But less LaTeX training data in LLMs, and if the university requires `.tex` submission, it's a non-starter
+
+## Related
+
+- [[finetuning]] - Training models for better LaTeX generation accuracy
+- [[coding_agent]] - Coding agent could integrate LaTeX compilation tools
+- [[deployment]] - LaTeX MCP server as a Docker sidecar service
+- [[writing_instructions]] - Writing guidelines applicable to academic paper output

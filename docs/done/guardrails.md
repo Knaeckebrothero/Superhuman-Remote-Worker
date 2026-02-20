@@ -1,6 +1,17 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - context-management
+  - tool-development
+  - debugging
+aliases:
+  - ["Guardrails", "Agent Guardrails", "Nested Loop Architecture"]
+---
+
 # Agent Guardrails System
 
-This document describes the guardrails system designed to keep agents focused and on-track during long-running tasks. The system addresses context window limitations and agent drift by enforcing structured checkpoints and phase-based execution.
+This document describes the guardrails system designed to keep agents focused and on-track during long-running tasks. The [[guardrails_roadmap|system]] addresses [[compact_chat|context window limitations]] and agent drift by enforcing structured checkpoints and phase-based execution.
 
 ## Problem Statement
 
@@ -175,7 +186,7 @@ This is similar to how humans work:
 
 ### workspace.md (Long-Term Memory)
 
-The `workspace.md` file serves the same role as `CLAUDE.md` in Claude Code - it's the agent's persistent memory that survives context resets.
+The `workspace.md` file serves the same role as `CLAUDE.md` in Claude Code - it's the [[agent|agent's]] persistent memory that survives context resets.
 
 **Always in system prompt:** The agent always has access to workspace.md content.
 
@@ -806,3 +817,11 @@ The following are deprecated and will be removed in a future version:
 | `ProtectedContextProvider` in `context.py` | Replaced by MemoryManager |
 
 The old ReAct-only graph has been removed. The nested loop graph in `graph.py` is the only implementation.
+
+## Related
+
+- [[guardrails_roadmap]]
+- [[agent]]
+- [[compact_chat]]
+- [[cleanup]]
+- [[workspace_implementation]]

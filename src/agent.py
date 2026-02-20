@@ -803,7 +803,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
                 git_versioning=self.config.workspace.git_versioning,
-                git_ignore_patterns=self.config.workspace.git_ignore_patterns,
                 git_remote_url=metadata.get("git_remote_url"),
             )
         )
@@ -1788,7 +1787,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
                 git_versioning=self.config.workspace.git_versioning,
-                git_ignore_patterns=self.config.workspace.git_ignore_patterns,
             )
         )
 
@@ -1804,7 +1802,34 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Read frozen data
         frozen_data = json.loads(frozen_path.read_text())
 
-        # Convert to completion data
+        # Determine freeze type (backward compat: missing = job_complete)
+        freeze_type = frozen_data.get("freeze_type", "job_complete")
+
+        if freeze_type == "phase_boundary":
+            # Phase boundary freeze: resume execution, don't complete
+            frozen_path.unlink()
+            logger.info(f"Removed job_frozen.json for phase boundary approval on job {job_id}")
+
+            # Update database status back to processing
+            if self.postgres_conn:
+                try:
+                    await self.postgres_conn.execute(
+                        "UPDATE jobs SET status = 'processing' WHERE id = $1::uuid",
+                        job_id
+                    )
+                    logger.info(f"Updated job {job_id} status to 'processing' in database")
+                except Exception as e:
+                    logger.warning(f"Failed to update job status in database: {e}")
+
+            return {
+                "job_id": job_id,
+                "status": "approved_continue",
+                "freeze_type": freeze_type,
+                "phase_type": frozen_data.get("phase_type"),
+                "phase_number": frozen_data.get("phase_number"),
+            }
+
+        # job_complete freeze (or backward compat): mark as truly completed
         completion_data = {
             **frozen_data,
             "status": "job_completed",

@@ -1,8 +1,18 @@
+---
+tags:
+  - data-management
+  - agent-architecture
+  - bug-fix
+  - debugging
+aliases:
+  - ["PostgreSQL Migration", "Postgres Migration Deep Dive"]
+---
+
 # PostgreSQL Migration Deep Dive
 
 **Document Status:** ✅ **COMPLETE** (Phase 1/2 implemented)
 **Last Updated:** 2026-01-14
-**Related:** `docs/db_refactor.md`, `docs/phase1_complete.md`
+**Related:** [[db_refactor]], [[phase1_complete]]
 
 ## Executive Summary
 
@@ -1466,3 +1476,11 @@ open htmlcov/index.html
 ---
 
 **Document End**
+
+## Related
+
+- [[db_refactor]]
+- [[phase1_complete]]
+- [[neo4j_migration_deep_dive]]
+- [[mongodb_migration_deep_dive]]
+- [[agent]]

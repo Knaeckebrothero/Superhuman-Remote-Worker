@@ -1,3 +1,12 @@
+---
+tags:
+  - data-management
+  - git-integration
+  - cloud-infrastructure
+  - tool-development
+  - knowledge-management
+---
+
 # Repository Datasource
 
 Design document for adding git repository support as a datasource type, enabling persistent agent memory (e.g. Obsidian vaults) and multi-repo workflows (e.g. coding agents contributing to external projects).
@@ -257,3 +266,12 @@ Connection test: attempt clone to a temp directory, verify access, clean up.
 - **Large repos**: Should we support shallow clones (`--depth 1`) for large repos where history isn't needed? Probably yes, as a config option.
 - **Submodules**: Ignore for now, add `--recurse-submodules` as a config flag later if needed.
 - **.gitignore on workspace**: When a repo is cloned into the workspace, the workspace's own `.gitignore` should exclude the cloned repo directory to avoid the workspace git tracking external repo files.
+
+## Related
+
+- [[datasources]]
+- [[cloud_workspace]]
+- [[obsidian]]
+- [[security_checklist]]
+- [[deployment]]
+- [[tool_issues]]

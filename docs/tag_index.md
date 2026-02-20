@@ -1,0 +1,430 @@
+# Tag Index
+
+Index of all tags used across documents in the knowledge base, with mappings to documents that use each tag.
+
+## Statistics
+
+- **Total unique tags:** 32
+- **Total document-tag pairs:** 345
+
+---
+
+## Tag-to-Document Mapping
+
+### agent-architecture (60 documents)
+- [[advanced_websearch]]
+- [[agent]]
+- [[agent_improvements]]
+- [[angular_migration_plan]]
+- [[auxiliary_tasks]]
+- [[cleanup]]
+- [[cli_wrapper]]
+- [[cloud_workspace]]
+- [[coding_agent]]
+- [[compact_chat]]
+- [[config_issues]]
+- [[context_management]]
+- [[continuous_improvement_loop]]
+- [[datasources]]
+- [[db_refactor]]
+- [[deliverables]]
+- [[finetuning]]
+- [[git]]
+- [[graph_visualization]]
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[hive_implementation]]
+- [[interactive_planning]]
+- [[internet_usage_and_research]]
+- [[issues]]
+- [[langgraph_checkpointing_assessment]]
+- [[masterplan]]
+- [[masterplan_roadmap]]
+- [[mcp_overhaul]]
+- [[memories_mechanism]]
+- [[metamodel-compliance-architecture]]
+- [[model_issues]]
+- [[mongodb_migration_deep_dive]]
+- [[multi_agent]]
+- [[neo4j_migration_deep_dive]]
+- [[obsidian]]
+- [[old_agent_issues]]
+- [[overview]]
+- [[patch_tool]]
+- [[phase1_complete]]
+- [[phase_number_issues]]
+- [[port_fessi_functionality]]
+- [[postgres_migration_deep_dive]]
+- [[prompting]]
+- [[prompts]]
+- [[sprints]]
+- [[sudo_approval_plugin]]
+- [[task_clearance_user_feedback]]
+- [[tavily_implementation]]
+- [[tool_implementation]]
+- [[tool_issues]]
+- [[tools_description]]
+- [[universal_shell_command]]
+- [[validator_issues]]
+- [[vectorization]]
+- [[vm]]
+- [[working_memory]]
+- [[workspace_implementation]]
+- [[write_vs_edit_tool]]
+- [[writing_instructions]]
+
+### tool-development (44 documents)
+- [[01_issues]]
+- [[advanced_websearch]]
+- [[agent]]
+- [[auxiliary_tasks]]
+- [[calculator_code]]
+- [[citation_engine_rework]]
+- [[citation_engine_roadmap]]
+- [[cleanup]]
+- [[cli_wrapper]]
+- [[coding_agent]]
+- [[datasources]]
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[internet_usage_and_research]]
+- [[issues]]
+- [[job_debug]]
+- [[latex]]
+- [[masterplan_roadmap]]
+- [[mcp_overhaul]]
+- [[metamodel-compliance-architecture]]
+- [[mongodb_migration_deep_dive]]
+- [[multi_agent]]
+- [[neo4j_migration_deep_dive]]
+- [[old_agent_issues]]
+- [[overview]]
+- [[patch_tool]]
+- [[podcast_generation]]
+- [[port_fessi_functionality]]
+- [[prompting]]
+- [[repo_datasource]]
+- [[summary_tool]]
+- [[tavily_implementation]]
+- [[tests]]
+- [[tldr_concept]]
+- [[tool_implementation]]
+- [[tool_issues]]
+- [[tools_description]]
+- [[universal_shell_command]]
+- [[validator_issues]]
+- [[vectorization]]
+- [[vm]]
+- [[working_memory]]
+- [[workspace_implementation]]
+- [[write_vs_edit_tool]]
+
+### debugging (27 documents)
+- [[01_issues]]
+- [[agent_improvements]]
+- [[cleanup]]
+- [[cockpit_ds]]
+- [[cockpit_performance_issues]]
+- [[compact_chat]]
+- [[config_issues]]
+- [[continuous_improvement_loop]]
+- [[db_refactor]]
+- [[debug_cockpit]]
+- [[graph_change_detection]]
+- [[graph_visualization]]
+- [[guardrails]]
+- [[issues]]
+- [[job_debug]]
+- [[langgraph_checkpointing_assessment]]
+- [[mcp_overhaul]]
+- [[model_issues]]
+- [[mongodb_migration_deep_dive]]
+- [[neo4j_migration_deep_dive]]
+- [[old_agent_issues]]
+- [[phase1_complete]]
+- [[phase_number_issues]]
+- [[postgres_migration_deep_dive]]
+- [[task_clearance_user_feedback]]
+- [[tool_issues]]
+- [[validator_issues]]
+
+### configuration (23 documents)
+- [[advanced_job_configuration]]
+- [[agent]]
+- [[angular_migration_plan]]
+- [[cleanup]]
+- [[cloud_workspace]]
+- [[config_issues]]
+- [[datasources]]
+- [[db_refactor]]
+- [[deployment]]
+- [[hive_implementation]]
+- [[internet_usage_and_research]]
+- [[langgraph_checkpointing_assessment]]
+- [[mcp_overhaul]]
+- [[mongodb_migration_deep_dive]]
+- [[multi_agent]]
+- [[neo4j_migration_deep_dive]]
+- [[podcast_generation]]
+- [[port_fessi_functionality]]
+- [[prompts]]
+- [[security_checklist]]
+- [[sprints]]
+- [[tavily_implementation]]
+- [[validator_issues]]
+
+### planning (23 documents)
+- [[agent]]
+- [[agent_improvements]]
+- [[auxiliary_tasks]]
+- [[citation_engine_roadmap]]
+- [[continuous_improvement_loop]]
+- [[deliverables]]
+- [[git]]
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[interactive_planning]]
+- [[inventory]]
+- [[langgraph_checkpointing_assessment]]
+- [[masterplan]]
+- [[masterplan_roadmap]]
+- [[multi_agent]]
+- [[obsidian]]
+- [[overview]]
+- [[phase_number_issues]]
+- [[prompting]]
+- [[sprints]]
+- [[task_clearance_user_feedback]]
+- [[workspace_implementation]]
+- [[writing_instructions]]
+
+### data-management (22 documents)
+- [[angular_migration_plan]]
+- [[citation_engine_rework]]
+- [[citation_engine_roadmap]]
+- [[cockpit_ds]]
+- [[datasources]]
+- [[db_refactor]]
+- [[graph_change_detection]]
+- [[graph_visualization]]
+- [[issues]]
+- [[langgraph_checkpointing_assessment]]
+- [[masterplan]]
+- [[masterplan_roadmap]]
+- [[metamodel-compliance-architecture]]
+- [[mongodb_migration_deep_dive]]
+- [[multi_agent]]
+- [[neo4j_migration_deep_dive]]
+- [[phase1_complete]]
+- [[postgres_migration_deep_dive]]
+- [[repo_datasource]]
+- [[tools_description]]
+- [[vectorization]]
+- [[workspace_implementation]]
+
+### context-management (21 documents)
+- [[agent]]
+- [[agent_improvements]]
+- [[auxiliary_tasks]]
+- [[compact_chat]]
+- [[context_management]]
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[issues]]
+- [[job_debug]]
+- [[masterplan]]
+- [[memories_mechanism]]
+- [[prompting]]
+- [[prompts]]
+- [[summary_tool]]
+- [[tldr_concept]]
+- [[tool_implementation]]
+- [[vm]]
+- [[working_memory]]
+- [[workspace_implementation]]
+- [[write_vs_edit_tool]]
+- [[writing_instructions]]
+
+### orchestrator (15 documents)
+- [[01_issues]]
+- [[advanced_job_configuration]]
+- [[angular_migration_plan]]
+- [[cockpit_ds]]
+- [[cockpit_performance_issues]]
+- [[debug_cockpit]]
+- [[deliverables]]
+- [[deployment]]
+- [[email_and_mobile]]
+- [[hive_implementation]]
+- [[interactive_planning]]
+- [[masterplan]]
+- [[masterplan_roadmap]]
+- [[mcp_overhaul]]
+- [[sudo_approval_plugin]]
+
+### llm-configuration (14 documents)
+- [[advanced_job_configuration]]
+- [[cli_wrapper]]
+- [[compact_chat]]
+- [[context_management]]
+- [[finetuning]]
+- [[gpu_comparison]]
+- [[key_issues]]
+- [[llamacpp_optimization]]
+- [[old_agent_issues]]
+- [[prompting]]
+- [[prompts]]
+- [[summary_tool]]
+- [[tldr_concept]]
+- [[tool_implementation]]
+
+### cloud-infrastructure (10 documents)
+- [[angular_migration_plan]]
+- [[cloud_workspace]]
+- [[deployment]]
+- [[gpu_comparison]]
+- [[hive_implementation]]
+- [[llamacpp_optimization]]
+- [[masterplan]]
+- [[masterplan_roadmap]]
+- [[repo_datasource]]
+- [[security_checklist]]
+
+### knowledge-management (10 documents)
+- [[citation_engine_rework]]
+- [[citation_issues]]
+- [[inventory]]
+- [[masterplan]]
+- [[memories_mechanism]]
+- [[multi_agent]]
+- [[obsidian]]
+- [[overview]]
+- [[repo_datasource]]
+- [[workspace_implementation]]
+
+### user-interface (10 documents)
+- [[advanced_job_configuration]]
+- [[angular_migration_plan]]
+- [[cockpit_ds]]
+- [[cockpit_performance_issues]]
+- [[debug_cockpit]]
+- [[email_and_mobile]]
+- [[graph_change_detection]]
+- [[graph_visualization]]
+- [[hive_implementation]]
+- [[interactive_planning]]
+
+### bug-fix (9 documents)
+- [[01_issues]]
+- [[citation_issues]]
+- [[cockpit_performance_issues]]
+- [[config_issues]]
+- [[issues]]
+- [[key_issues]]
+- [[old_agent_issues]]
+- [[postgres_migration_deep_dive]]
+- [[validator_issues]]
+
+### citation-engine (7 documents)
+- [[citation_engine_rework]]
+- [[citation_engine_roadmap]]
+- [[citation_issues]]
+- [[internet_usage_and_research]]
+- [[masterplan]]
+- [[masterplan_roadmap]]
+- [[mcp_overhaul]]
+
+### coding-tools (7 documents)
+- [[calculator_code]]
+- [[cli_wrapper]]
+- [[coding_agent]]
+- [[mcp_overhaul]]
+- [[patch_tool]]
+- [[universal_shell_command]]
+- [[write_vs_edit_tool]]
+
+### security (6 documents)
+- [[calculator_code]]
+- [[cloud_workspace]]
+- [[internet_usage_and_research]]
+- [[security_checklist]]
+- [[sudo_approval_plugin]]
+- [[universal_shell_command]]
+
+### research (5 documents)
+- [[job_debug]]
+- [[summary_tool]]
+- [[tests]]
+- [[tldr_concept]]
+- [[vm]]
+
+### finetuning (4 documents)
+- [[continuous_improvement_loop]]
+- [[finetuning]]
+- [[gpu_comparison]]
+- [[llamacpp_optimization]]
+
+### git-integration (4 documents)
+- [[coding_agent]]
+- [[git]]
+- [[mcp_overhaul]]
+- [[repo_datasource]]
+
+### model-issues (4 documents)
+- [[issues]]
+- [[key_issues]]
+- [[model_issues]]
+- [[old_agent_issues]]
+
+### performance (4 documents)
+- [[job_debug]]
+- [[summary_tool]]
+- [[tldr_concept]]
+- [[vm]]
+
+### writing (4 documents)
+- [[citation_issues]]
+- [[financing]]
+- [[latex]]
+- [[writing_instructions]]
+
+### web-search (3 documents)
+- [[advanced_websearch]]
+- [[internet_usage_and_research]]
+- [[tavily_implementation]]
+
+### business (1 document)
+- [[financing]]
+
+### documentation (1 document)
+- [[tests]]
+
+### email (1 document)
+- [[email_and_mobile]]
+
+### job-management (1 document)
+- [[task_clearance_user_feedback]]
+
+### latex (1 document)
+- [[latex]]
+
+### media (1 document)
+- [[podcast_generation]]
+
+### quality-assurance (1 document)
+- [[tests]]
+
+### testing (1 document)
+- [[tests]]
+
+### user-feedback (1 document)
+- [[task_clearance_user_feedback]]
+
+---
+
+## Notes
+
+- Tags follow the pattern: lowercase, hyphenated (e.g., `context-management`)
+- Each document can have multiple tags defined in YAML frontmatter
+- Related documents are linked via wiki-links in the `related:` field
+- This index is auto-generated from document frontmatter

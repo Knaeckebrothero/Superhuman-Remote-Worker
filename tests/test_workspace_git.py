@@ -1,7 +1,8 @@
 """Unit tests for workspace git initialization.
 
 Tests that WorkspaceManager correctly initializes git repositories
-when git_versioning is enabled.
+when git_versioning is enabled, and that GitManager writes sensible
+default .gitignore patterns without relying on config.
 """
 
 import pytest
@@ -16,6 +17,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from src.core.workspace import WorkspaceManager, WorkspaceManagerConfig  # noqa: E402
+from src.managers.git_manager import GitManager  # noqa: E402
 
 
 def git_available():
@@ -85,14 +87,12 @@ class TestWorkspaceGitInitialization:
         assert git_dir.exists()
 
     def test_gitignore_created(self, temp_base):
-        """Test that .gitignore is created with configured patterns."""
-        patterns = ["*.log", "*.tmp", "secret/"]
+        """Test that .gitignore is created with sensible defaults."""
         ws = WorkspaceManager(
             job_id="test-job",
             config=WorkspaceManagerConfig(
                 structure=["archive/"],
                 git_versioning=True,
-                git_ignore_patterns=patterns,
             ),
             base_path=temp_base,
         )
@@ -102,8 +102,12 @@ class TestWorkspaceGitInitialization:
         assert gitignore.exists()
 
         content = gitignore.read_text()
-        for pattern in patterns:
+        # Check GitManager's default patterns are present
+        for pattern in GitManager.DEFAULT_IGNORE_PATTERNS:
             assert pattern in content
+
+        # documents/ should NOT be ignored by default
+        assert "documents/" not in content
 
     def test_initial_commit_created(self, temp_base):
         """Test that initial commit is created."""
@@ -151,25 +155,38 @@ class TestWorkspaceGitConfig:
         config = WorkspaceManagerConfig()
         assert config.git_versioning is True
 
-    def test_default_ignore_patterns(self, temp_base):
-        """Test default git ignore patterns."""
-        config = WorkspaceManagerConfig()
-        assert "*.db" in config.git_ignore_patterns
-        assert "*.log" in config.git_ignore_patterns
-        assert "__pycache__/" in config.git_ignore_patterns
+    def test_default_ignore_patterns_on_git_manager(self, temp_base):
+        """Test that GitManager has sensible default ignore patterns."""
+        assert "*.db" in GitManager.DEFAULT_IGNORE_PATTERNS
+        assert "*.log" in GitManager.DEFAULT_IGNORE_PATTERNS
+        assert "__pycache__/" in GitManager.DEFAULT_IGNORE_PATTERNS
+        # documents/ should NOT be in defaults
+        assert "documents/" not in GitManager.DEFAULT_IGNORE_PATTERNS
+
+    def test_git_manager_creates_gitignore_with_defaults(self, temp_base):
+        """Test that GitManager.init_repository() writes default .gitignore."""
+        workspace_path = temp_base / "job_test"
+        workspace_path.mkdir()
+
+        gm = GitManager(workspace_path)
+        result = gm.init_repository()
+        assert result is True
+
+        gitignore = workspace_path / ".gitignore"
+        assert gitignore.exists()
+        content = gitignore.read_text()
+        for pattern in GitManager.DEFAULT_IGNORE_PATTERNS:
+            assert pattern in content
 
     def test_from_dict_with_git_config(self, temp_base):
         """Test creating config from dict with git settings."""
         data = {
             "structure": ["archive/"],
             "git_versioning": True,
-            "git_ignore_patterns": ["*.custom", "build/"],
         }
         config = WorkspaceManagerConfig.from_dict(data)
 
         assert config.git_versioning is True
-        assert "*.custom" in config.git_ignore_patterns
-        assert "build/" in config.git_ignore_patterns
 
     def test_from_dict_git_disabled(self, temp_base):
         """Test creating config from dict with git disabled."""

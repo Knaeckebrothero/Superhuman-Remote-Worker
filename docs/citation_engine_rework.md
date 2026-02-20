@@ -1,3 +1,20 @@
+---
+tags:
+  - citation-engine
+  - knowledge-management
+  - data-management
+  - tool-development
+aliases:
+  - Literature Management
+  - Citation Engine v2
+  - Semantic Search
+related:
+  - "[[citation_engine_roadmap]]"
+  - "[[citation_issues]]"
+  - "[[advanced_websearch]]"
+  - "[[agent_improvements]]"
+---
+
 # CitationEngine Rework: Literature Management & Semantic Search
 
 **Status:** Planning
@@ -443,3 +460,10 @@ Minor implementation details to figure out during development:
 - [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL vector similarity search extension
 - [sentence-transformers](https://www.sbert.net/) — local embedding models
 - [Graphlit Agent Memory Survey](https://www.graphlit.com/blog/survey-of-ai-agent-memory-frameworks) — comprehensive comparison of memory frameworks
+
+## Related
+
+- [[citation_engine_roadmap]] — Detailed implementation roadmap for this rework
+- [[citation_issues]] — Citation workflow problems that motivated the rework
+- [[advanced_websearch]] — Web search integration with citation management
+- [[agent_improvements]] — Cross-job learning that applies to the source library

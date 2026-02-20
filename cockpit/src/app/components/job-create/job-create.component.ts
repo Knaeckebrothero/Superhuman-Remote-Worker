@@ -1,4 +1,4 @@
-import { Component, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
+import { Component, computed, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import { FileHandlingService } from '../../core/services/file-handling.service';
@@ -261,11 +261,13 @@ import { environment } from '../../core/environment';
                       name="strategicReasoning"
                       [disabled]="isSubmitting()"
                     >
-                      <option [ngValue]="null">Default</option>
-                      <option value="none">None</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high">High</option>
+                      @for (opt of strategicReasoningOptions(); track opt.value) {
+                        @if (opt.value === null) {
+                          <option [ngValue]="null">{{ opt.label }}</option>
+                        } @else {
+                          <option [value]="opt.value">{{ opt.label }}</option>
+                        }
+                      }
                     </select>
                     <span class="field-hint">
                       @if (getExpertPhaseDefault('strategic', 'reasoning_level'); as defaultLevel) {
@@ -346,11 +348,13 @@ import { environment } from '../../core/environment';
                       name="tacticalReasoning"
                       [disabled]="isSubmitting()"
                     >
-                      <option [ngValue]="null">Default</option>
-                      <option value="none">None</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high">High</option>
+                      @for (opt of tacticalReasoningOptions(); track opt.value) {
+                        @if (opt.value === null) {
+                          <option [ngValue]="null">{{ opt.label }}</option>
+                        } @else {
+                          <option [value]="opt.value">{{ opt.label }}</option>
+                        }
+                      }
                     </select>
                     <span class="field-hint">
                       @if (getExpertPhaseDefault('tactical', 'reasoning_level'); as defaultLevel) {
@@ -1468,6 +1472,22 @@ export class JobCreateComponent implements OnInit {
         this.formData.description = description;
       }
     });
+
+    // Reset reasoning level when model changes to one that doesn't support it
+    effect(() => {
+      const options = this.strategicReasoningOptions();
+      const current = this.strategicReasoning();
+      if (current !== null && !options.some(o => o.value === current)) {
+        this.strategicReasoning.set(null);
+      }
+    });
+    effect(() => {
+      const options = this.tacticalReasoningOptions();
+      const current = this.tacticalReasoning();
+      if (current !== null && !options.some(o => o.value === current)) {
+        this.tacticalReasoning.set(null);
+      }
+    });
   }
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
@@ -1499,6 +1519,13 @@ export class JobCreateComponent implements OnInit {
   readonly tacticalReasoning = signal<string | null>(null);
   readonly tacticalTemperature = signal<number | null>(null);
   readonly tacticalMultimodal = signal<boolean | null>(null);
+
+  readonly strategicReasoningOptions = computed(() =>
+    this.getReasoningOptions(this.strategicModel())
+  );
+  readonly tacticalReasoningOptions = computed(() =>
+    this.getReasoningOptions(this.tacticalModel())
+  );
 
   readonly disabledToolCategories = signal<Set<string>>(new Set());
 
@@ -1646,6 +1673,72 @@ export class JobCreateComponent implements OnInit {
   getExpertPhaseDefault(phase: string, field: string): unknown {
     return this.getExpertDefault(`llm.${phase}.${field}`)
       ?? this.getExpertDefault(`llm.${field}`);
+  }
+
+  /**
+   * Determine available reasoning levels based on the model's provider and family.
+   * Mirrors backend logic in src/core/loader.py (detect_model_family + detect_reasoning_method).
+   */
+  getReasoningOptions(model: string | null): { value: string | null; label: string }[] {
+    const base = [{ value: null, label: 'Default' }];
+    if (!model) {
+      // No model selected → show standard set (OpenAI-like: low/medium/high)
+      return [...base,
+        { value: 'none', label: 'None' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+      ];
+    }
+
+    const lower = model.toLowerCase();
+
+    // Provider-level: OpenRouter supports all 6 levels natively
+    if (lower.startsWith('openrouter/')) {
+      return [...base,
+        { value: 'none', label: 'None' },
+        { value: 'minimal', label: 'Minimal' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+        { value: 'xhigh', label: 'X-High' },
+      ];
+    }
+
+    // Provider-level: Groq doesn't pass reasoning through
+    if (lower.startsWith('groq/')) return base;
+
+    // Strip provider prefix for model family detection
+    let name = lower;
+    for (const prefix of ['openai/']) {
+      if (name.startsWith(prefix)) {
+        name = name.slice(prefix.length);
+        break;
+      }
+    }
+
+    // Model families that don't support reasoning control
+    if (name.startsWith('claude') || name.startsWith('gemini')) return base;
+
+    // gpt-oss (vLLM prompt injection) supports all levels
+    if (name.startsWith('gpt-oss')) {
+      return [...base,
+        { value: 'none', label: 'None' },
+        { value: 'minimal', label: 'Minimal' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+        { value: 'xhigh', label: 'X-High' },
+      ];
+    }
+
+    // OpenAI, DeepSeek, Qwen, Llama, default → low/medium/high
+    return [...base,
+      { value: 'none', label: 'None' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High' },
+    ];
   }
 
   isToolCategoryEnabled(category: string): boolean {

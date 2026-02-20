@@ -1,3 +1,16 @@
+---
+tags:
+  - agent-architecture
+  - data-management
+  - debugging
+  - planning
+  - configuration
+aliases:
+  - "Checkpointing Assessment"
+  - "LangGraph Checkpointing"
+  - "Resume Capability"
+---
+
 # LangGraph Checkpointing Integration Assessment
 
 **Date:** 2026-01-15
@@ -8,7 +21,7 @@
 
 ## Problem Statement
 
-Currently when the Universal Agent crashes after hours of execution:
+Currently when the Universal Agent (see [[agent]]) crashes after hours of execution:
 - ✅ Job record exists in PostgreSQL (via `jobs` table)
 - ✅ Partial results may exist (via `requirements` table)
 - ❌ **Graph execution state is lost** (no LangGraph checkpointing)
@@ -82,7 +95,7 @@ PostgresSaver creates its own tables:
 - `checkpoint_writes` - Pending writes
 - `checkpoint_migrations` - Schema version tracking
 
-These are **separate from** your `jobs` and `requirements` tables.
+These are **separate from** your `jobs` and `requirements` tables (see [[db_refactor]]).
 
 ### Resume Behavior
 
@@ -365,7 +378,7 @@ await checkpointer.delete_thread(thread_id="creator_job-123")
    ```
 
 2. **State compaction:**
-   - Already doing this with `archive_phase` context compaction
+   - Already doing this with `archive_phase` context compaction (see [[compact_chat]])
    - Keeps checkpoint size manageable
 
 3. **Periodic cleanup:**
@@ -530,3 +543,11 @@ Use **both** debugging and checkpointing:
 **Risk:** Low (isolated change, well-tested library)
 
 The agent will automatically create checkpoints during execution. After a crash, simply run with the same `--job-id` and it resumes from the last successful checkpoint.
+
+## Related
+- [[agent]]
+- [[db_refactor]]
+- [[postgres_migration_deep_dive]]
+- [[issues]]
+- [[compact_chat]]
+- [[masterplan]]
