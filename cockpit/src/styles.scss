@@ -97,3 +97,17 @@ body {
   background: var(--accent-color);
   color: var(--timeline-bg);
 }
+
+/* Mobile touch adjustments */
+@media (max-width: 768px) {
+  .app-frame {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  button,
+  .btn {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}

@@ -33,10 +33,22 @@ const getModelPresets = (): { label: string; strategic: string; tactical: string
   return [];
 };
 
+const getBuilderModels = (): { label: string; id: string }[] => {
+  if (typeof window !== 'undefined') {
+    const models = (window as any)['env']?.['builderModels'];
+    if (Array.isArray(models) && models.length > 0) return models;
+  }
+  return [
+    { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
+    { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
+  ];
+};
+
 export const environment = {
   apiUrl: getApiUrl(),
   giteaUrl: getGiteaUrl(),
   dozzleUrl: getDozzleUrl(),
   models: getModels(),
   modelPresets: getModelPresets(),
+  builderModels: getBuilderModels(),
 };

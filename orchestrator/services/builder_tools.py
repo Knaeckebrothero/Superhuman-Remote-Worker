@@ -17,7 +17,20 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Tools that are executed server-side (not forwarded to the frontend as artifact mutations)
-SERVER_SIDE_TOOLS = {"web_search"}
+SERVER_SIDE_TOOLS = {
+    "web_search",
+    "list_jobs",
+    "get_job",
+    "get_job_progress",
+    "get_workspace_file",
+    "get_workspace_overview",
+    "get_frozen_job",
+    "get_todos",
+    "get_chat_history",
+    "approve_job",
+    "resume_job_with_feedback",
+    "create_follow_up_job",
+}
 
 BUILDER_TOOLS = [
     {
@@ -184,6 +197,262 @@ BUILDER_TOOLS = [
             },
         },
     },
+    # -----------------------------------------------------------------
+    # Job Inspection & Action Tools (server-side, loopback to orchestrator API)
+    # -----------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "list_jobs",
+            "description": (
+                "List recent jobs. Use this when the user asks about their jobs, "
+                "recent work, or wants to find a specific job."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["created", "queued", "running", "completed", "failed", "cancelled", "pending_review"],
+                        "description": "Filter by job status",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max jobs to return (default 10)",
+                        "default": 10,
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job",
+            "description": (
+                "Get detailed information about a specific job including its status, "
+                "config, description, and timestamps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_progress",
+            "description": (
+                "Get detailed progress for a job including phase, todo completion, "
+                "and timing information."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_workspace_file",
+            "description": (
+                "Read a file from a job's workspace. Common files: workspace.md (agent memory), "
+                "plan.md (strategic plan), todos.yaml (current tasks), "
+                "archive/phase_N_retrospective.md (phase reviews)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path (e.g. 'workspace.md', 'plan.md', 'archive/phase_1_retrospective.md')",
+                    },
+                },
+                "required": ["job_id", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_workspace_overview",
+            "description": (
+                "Get a high-level overview of a job's workspace including file listing, "
+                "truncated workspace.md/plan.md content, current todos, and archive count."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_frozen_job",
+            "description": (
+                "Get the frozen job data (summary, deliverables, confidence) for a job "
+                "that is pending review. Use this to understand what the agent produced."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_todos",
+            "description": (
+                "Get all todos for a job including current active todos and archived phases. "
+                "Shows task planning and execution progress."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_history",
+            "description": (
+                "Get the agent's conversation history for a job. Shows LLM input/response pairs. "
+                "Use page=-1 to get the most recent messages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Page number (1-indexed, -1 for last page)",
+                        "default": -1,
+                    },
+                    "page_size": {
+                        "type": "integer",
+                        "description": "Entries per page (default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_job",
+            "description": (
+                "Approve a frozen job that is pending review. This marks the job as completed. "
+                "Only works on jobs with status 'pending_review'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID to approve",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_job_with_feedback",
+            "description": (
+                "Resume a failed or frozen job, optionally with feedback for the agent. "
+                "The feedback is injected into the agent's context before resuming."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID to resume",
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "Optional feedback or instructions for the agent",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_follow_up_job",
+            "description": (
+                "Create a new job. Use this to start follow-up work or create jobs based on "
+                "the user's request. Returns the new job ID."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "What the agent should accomplish",
+                    },
+                    "config_name": {
+                        "type": "string",
+                        "description": "Agent config to use (e.g. 'default', 'scholar', 'developer')",
+                        "default": "default",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Additional instructions for the agent",
+                    },
+                },
+                "required": ["description"],
+            },
+        },
+    },
 ]
 
 
@@ -298,7 +567,7 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
 
 def get_builder_model() -> str:
     """Get the model name for the builder LLM."""
-    return os.getenv("BUILDER_MODEL", "gpt-4o-mini")
+    return os.getenv("BUILDER_MODEL", "gpt-5.2-pro")
 
 
 def get_builder_api_key() -> str | None:

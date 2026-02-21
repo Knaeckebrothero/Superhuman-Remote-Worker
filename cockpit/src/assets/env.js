@@ -22,4 +22,10 @@
     { label: 'K2 + OSS 120B (Groq)', strategic: 'groq/moonshotai/kimi-k2-instruct-0905', tactical: 'groq/gpt-oss-120b' },
     { label: 'OSS 120B Local (both)', strategic: 'openai/gpt-oss-120b', tactical: 'openai/gpt-oss-120b' },
   ];
+
+  // Models available in the instruction builder chat.
+  window['env']['builderModels'] = [
+    { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
+    { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
+  ];
 })(this);
