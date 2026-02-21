@@ -17,6 +17,8 @@ llm:
   multimodal: false  # Set to true if model can process images directly
   parallel_tool_calls: false  # Set to true for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)
   model_max_context_tokens: 100000  # gpt-oss-120b effective context limit (vLLM); Layer 0/1 safety
+  # IMPORTANT: Override this per-model in expert configs. Wrong values cause crashes
+  # (too high → token limit errors) or wasted context (too low → premature compaction).
   # No phase overrides — strategic, tactical, and summarization all use gpt-oss-120b
 
 workspace:
@@ -148,7 +150,7 @@ research:
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent
-autonomy: partial
+autonomy: review
 
 # Browser automation settings (browser-use + Playwright)
 browser:

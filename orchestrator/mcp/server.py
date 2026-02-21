@@ -59,7 +59,7 @@ async def health_check(request):
 
 @mcp.tool
 async def list_jobs(
-    status: Literal["pending", "running", "completed", "failed"] | None = None,
+    status: Literal["created", "processing", "completed", "failed", "cancelled", "pending_review"] | None = None,
     limit: int = 20,
 ) -> str:
     """List agent jobs with optional status filter.
@@ -68,7 +68,7 @@ async def list_jobs(
     Use this to find jobs to investigate.
 
     Args:
-        status: Filter by status (pending, running, completed, failed)
+        status: Filter by status (created, processing, completed, failed, cancelled, pending_review)
         limit: Maximum jobs to return (1-100, default 20)
 
     Returns:

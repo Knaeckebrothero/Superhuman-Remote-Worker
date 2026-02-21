@@ -519,14 +519,40 @@ def create_execute_node(
         )
         prepared_messages.append(SystemMessage(content=full_system))
 
+        # Estimate transient injection overhead (system prompt + workspace.md + todos)
+        # so compaction thresholds account for messages that will be added AFTER compaction
+        injection_overhead_tokens = context_mgr.get_token_count([prepared_messages[0]])  # system prompt
+        if workspace_manager.exists("workspace.md"):
+            ws_text = workspace_manager.read_file("workspace.md")
+            injection_overhead_tokens += len(ws_text) // 4  # approximate
+        injection_overhead_tokens += len(todo_manager.format_for_injection()) // 4  # approximate
+
+        # Temporarily lower compaction thresholds to account for injection overhead
+        # Floor at 50% of original to avoid over-triggering
+        original_compaction_threshold = context_mgr.config.compaction_threshold_tokens
+        original_summarization_threshold = context_mgr.config.summarization_threshold_tokens
+        context_mgr.config.compaction_threshold_tokens = max(
+            original_compaction_threshold // 2,
+            original_compaction_threshold - injection_overhead_tokens,
+        )
+        context_mgr.config.summarization_threshold_tokens = max(
+            original_summarization_threshold // 2,
+            original_summarization_threshold - injection_overhead_tokens,
+        )
+
         # Ensure context is within limits before LLM call
         original_message_count = len(messages)
-        messages = await context_mgr.ensure_within_limits(
-            messages,
-            summarization_llm,
-            summarization_prompt,
-            max_summary_length=config.context_management.max_summary_length,
-        )
+        try:
+            messages = await context_mgr.ensure_within_limits(
+                messages,
+                summarization_llm,
+                summarization_prompt,
+                max_summary_length=config.context_management.max_summary_length,
+            )
+        finally:
+            # Restore original thresholds
+            context_mgr.config.compaction_threshold_tokens = original_compaction_threshold
+            context_mgr.config.summarization_threshold_tokens = original_summarization_threshold
         # Separate RemoveMessage markers from actual messages
         # RemoveMessage markers must NOT be sent to LLM - they're only for state update
         remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
@@ -557,49 +583,51 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Step 1.5: Inject full todo list as transient HumanMessage
-        # This gives the agent visibility into completed + pending work every turn,
-        # surviving context compaction (re-injected fresh, not stored in state)
-        from src.core.workspace_injection import create_todos_human_message
+        # Helper: inject all transient messages (todos, workspace.md, instruction files)
+        # Used both in normal path and safety rebuild to avoid code duplication
+        from src.core.workspace_injection import (
+            create_todos_human_message,
+            create_workspace_tool_messages,
+            create_instruction_tool_messages,
+        )
 
         todos_injection_content = todo_manager.format_for_injection()
-        prepared_messages.append(create_todos_human_message(todos_injection_content))
 
-        # Step 2: Inject workspace.md as fake tool call result
-        # This makes it appear as if the agent already read workspace.md
-        # Note: workspace injection is transient (not stored in state), so it's
-        # re-injected fresh each turn and won't be included in summarization
-        if workspace_manager.exists("workspace.md"):
-            from src.core.workspace_injection import create_workspace_tool_messages
+        def _inject_transient_messages(target_messages: list) -> None:
+            """Append transient injection messages (todos, workspace.md, instruction files)."""
+            # Todo list as transient HumanMessage
+            target_messages.append(create_todos_human_message(todos_injection_content))
 
-            workspace_content = workspace_manager.read_file("workspace.md")
-            ws_ai_msg, ws_tool_msg = create_workspace_tool_messages(workspace_content)
-            prepared_messages.append(ws_ai_msg)
-            prepared_messages.append(ws_tool_msg)
+            # Workspace.md as fake tool call result
+            if workspace_manager.exists("workspace.md"):
+                ws_content = workspace_manager.read_file("workspace.md")
+                ws_ai, ws_tool = create_workspace_tool_messages(ws_content)
+                target_messages.append(ws_ai)
+                target_messages.append(ws_tool)
 
-        # Step 2b: Inject phase-triggered instruction files (active injection)
-        # Files with enforce=false and phase triggers are auto-injected as
-        # transient messages so the agent doesn't need to remember to read them.
-        if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
-            phase_name = "strategic" if is_strategic else "tactical"
-            phase_entries = tool_context.get_phase_instruction_files(phase_name)
-            if phase_entries:
-                from src.core.workspace_injection import create_instruction_tool_messages
-                for entry in phase_entries:
-                    try:
-                        instr_content = workspace_manager.read_file(entry.file)
-                        instr_ai, instr_tool = create_instruction_tool_messages(
-                            entry.file, instr_content
-                        )
-                        prepared_messages.append(instr_ai)
-                        prepared_messages.append(instr_tool)
-                        logger.debug(
-                            f"[{job_id}] Injected instruction file: {entry.file}"
-                        )
-                    except FileNotFoundError:
-                        logger.warning(
-                            f"[{job_id}] Phase instruction file not found: {entry.file}"
-                        )
+            # Phase-triggered instruction files (active injection)
+            if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
+                _phase_name = "strategic" if is_strategic else "tactical"
+                phase_entries = tool_context.get_phase_instruction_files(_phase_name)
+                if phase_entries:
+                    for entry in phase_entries:
+                        try:
+                            instr_content = workspace_manager.read_file(entry.file)
+                            instr_ai, instr_tool = create_instruction_tool_messages(
+                                entry.file, instr_content
+                            )
+                            target_messages.append(instr_ai)
+                            target_messages.append(instr_tool)
+                            logger.debug(
+                                f"[{job_id}] Injected instruction file: {entry.file}"
+                            )
+                        except FileNotFoundError:
+                            logger.warning(
+                                f"[{job_id}] Phase instruction file not found: {entry.file}"
+                            )
+
+        # Inject transient messages (todos, workspace.md, instruction files)
+        _inject_transient_messages(prepared_messages)
 
         # Step 3: Add rest of conversation (excluding all SystemMessages)
         for msg in messages:
@@ -634,7 +662,7 @@ def create_execute_node(
             messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
             # Rebuild prepared_messages with compacted history
-            # Keep system prompt, re-inject transient todo message, replace conversation
+            # Keep system prompt, re-inject ALL transient messages, replace conversation
             system_msg = prepared_messages[0] if prepared_messages else None
             prepared_messages = []
             if system_msg and isinstance(system_msg, SystemMessage):
@@ -646,8 +674,11 @@ def create_execute_node(
                     if "[Summary of prior work]" in msg.content:
                         prepared_messages.append(msg)
 
-            # Re-inject transient todo message
-            prepared_messages.append(create_todos_human_message(todos_injection_content))
+            # Re-inject ALL transient messages (todos + workspace.md + instruction files)
+            _inject_transient_messages(prepared_messages)
+            logger.debug(
+                f"[{job_id}] Re-injected transient messages after safety compaction"
+            )
 
             for msg in messages:
                 if not isinstance(msg, SystemMessage):
