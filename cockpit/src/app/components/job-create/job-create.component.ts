@@ -1,4 +1,4 @@
-import { Component, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
+import { Component, computed, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ApiService } from '../../core/services/api.service';
 import { FileHandlingService } from '../../core/services/file-handling.service';
@@ -55,6 +55,21 @@ import { environment } from '../../core/environment';
               [disabled]="isSubmitting() || artifacts.streaming()"
             ></textarea>
             <span class="field-hint">Describe what you want the agent to do</span>
+          </div>
+
+          <!-- Kickoff Message (optional opening prompt) -->
+          <div class="form-group">
+            <label for="kickoff" class="form-label">Opening Message</label>
+            <textarea
+              id="kickoff"
+              name="kickoff"
+              class="form-textarea"
+              [(ngModel)]="kickoffMessage"
+              rows="3"
+              placeholder="Say something to the AI... (e.g., 'Start by reviewing the document structure')"
+              [disabled]="isSubmitting() || artifacts.streaming()"
+            ></textarea>
+            <span class="field-hint">Optional opening prompt — gives the agent initial direction</span>
           </div>
 
           <!-- Expert Selector -->
@@ -215,26 +230,18 @@ import { environment } from '../../core/environment';
 
                   <div class="form-group compact">
                     <label class="form-label">Model</label>
-                    <div class="model-combo">
-                      <input
-                        type="text"
-                        class="form-input"
-                        [ngModel]="strategicModel()"
-                        (ngModelChange)="strategicModel.set($event)"
-                        name="strategicModel"
-                        placeholder="Select or type a model..."
-                        list="strategicModelList"
-                        [disabled]="isSubmitting()"
-                        autocomplete="off"
-                      >
-                      <datalist id="strategicModelList">
-                        @for (group of availableModels; track group.group) {
+                    <select class="form-input"
+                      [ngModel]="strategicModel()" (ngModelChange)="strategicModel.set($event)"
+                      name="strategicModel" [disabled]="isSubmitting()">
+                      <option [ngValue]="null">Default</option>
+                      @for (group of availableModels; track group.group) {
+                        <optgroup [label]="group.group">
                           @for (model of group.models; track model) {
-                            <option [value]="model">{{ group.group }}</option>
+                            <option [value]="model">{{ model }}</option>
                           }
-                        }
-                      </datalist>
-                    </div>
+                        </optgroup>
+                      }
+                    </select>
                   </div>
 
                   <div class="form-group compact">
@@ -246,11 +253,13 @@ import { environment } from '../../core/environment';
                       name="strategicReasoning"
                       [disabled]="isSubmitting()"
                     >
-                      <option [ngValue]="null">Default</option>
-                      <option value="none">None</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high">High</option>
+                      @for (opt of strategicReasoningOptions(); track opt.value) {
+                        @if (opt.value === null) {
+                          <option [ngValue]="null">{{ opt.label }}</option>
+                        } @else {
+                          <option [value]="opt.value">{{ opt.label }}</option>
+                        }
+                      }
                     </select>
                     <span class="field-hint">
                       @if (getExpertPhaseDefault('strategic', 'reasoning_level'); as defaultLevel) {
@@ -300,26 +309,18 @@ import { environment } from '../../core/environment';
 
                   <div class="form-group compact">
                     <label class="form-label">Model</label>
-                    <div class="model-combo">
-                      <input
-                        type="text"
-                        class="form-input"
-                        [ngModel]="tacticalModel()"
-                        (ngModelChange)="tacticalModel.set($event)"
-                        name="tacticalModel"
-                        placeholder="Select or type a model..."
-                        list="tacticalModelList"
-                        [disabled]="isSubmitting()"
-                        autocomplete="off"
-                      >
-                      <datalist id="tacticalModelList">
-                        @for (group of availableModels; track group.group) {
+                    <select class="form-input"
+                      [ngModel]="tacticalModel()" (ngModelChange)="tacticalModel.set($event)"
+                      name="tacticalModel" [disabled]="isSubmitting()">
+                      <option [ngValue]="null">Default</option>
+                      @for (group of availableModels; track group.group) {
+                        <optgroup [label]="group.group">
                           @for (model of group.models; track model) {
-                            <option [value]="model">{{ group.group }}</option>
+                            <option [value]="model">{{ model }}</option>
                           }
-                        }
-                      </datalist>
-                    </div>
+                        </optgroup>
+                      }
+                    </select>
                   </div>
 
                   <div class="form-group compact">
@@ -331,11 +332,13 @@ import { environment } from '../../core/environment';
                       name="tacticalReasoning"
                       [disabled]="isSubmitting()"
                     >
-                      <option [ngValue]="null">Default</option>
-                      <option value="none">None</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high">High</option>
+                      @for (opt of tacticalReasoningOptions(); track opt.value) {
+                        @if (opt.value === null) {
+                          <option [ngValue]="null">{{ opt.label }}</option>
+                        } @else {
+                          <option [value]="opt.value">{{ opt.label }}</option>
+                        }
+                      }
                     </select>
                     <span class="field-hint">
                       @if (getExpertPhaseDefault('tactical', 'reasoning_level'); as defaultLevel) {
@@ -683,11 +686,6 @@ import { environment } from '../../core/environment';
         display: inline-block;
         vertical-align: middle;
         margin-left: 6px;
-      }
-
-      /* Model combo-box */
-      .model-combo {
-        position: relative;
       }
 
       /* Model preset chips */
@@ -1453,6 +1451,22 @@ export class JobCreateComponent implements OnInit {
         this.formData.description = description;
       }
     });
+
+    // Reset reasoning level when model changes to one that doesn't support it
+    effect(() => {
+      const options = this.strategicReasoningOptions();
+      const current = this.strategicReasoning();
+      if (current !== null && !options.some(o => o.value === current)) {
+        this.strategicReasoning.set(null);
+      }
+    });
+    effect(() => {
+      const options = this.tacticalReasoningOptions();
+      const current = this.tacticalReasoning();
+      if (current !== null && !options.some(o => o.value === current)) {
+        this.tacticalReasoning.set(null);
+      }
+    });
   }
 
   @ViewChild('fileInput') fileInput!: ElementRef<HTMLInputElement>;
@@ -1485,6 +1499,13 @@ export class JobCreateComponent implements OnInit {
   readonly tacticalTemperature = signal<number | null>(null);
   readonly tacticalMultimodal = signal<boolean | null>(null);
 
+  readonly strategicReasoningOptions = computed(() =>
+    this.getReasoningOptions(this.strategicModel())
+  );
+  readonly tacticalReasoningOptions = computed(() =>
+    this.getReasoningOptions(this.tacticalModel())
+  );
+
   readonly disabledToolCategories = signal<Set<string>>(new Set());
 
   // Model list for combo-box (loaded from env.js at runtime)
@@ -1509,6 +1530,8 @@ export class JobCreateComponent implements OnInit {
 
   // Current upload_id after successful upload
   private uploadId: string | null = null;
+
+  kickoffMessage = '';
 
   formData: JobCreateRequest = {
     description: '',
@@ -1629,6 +1652,72 @@ export class JobCreateComponent implements OnInit {
   getExpertPhaseDefault(phase: string, field: string): unknown {
     return this.getExpertDefault(`llm.${phase}.${field}`)
       ?? this.getExpertDefault(`llm.${field}`);
+  }
+
+  /**
+   * Determine available reasoning levels based on the model's provider and family.
+   * Mirrors backend logic in src/core/loader.py (detect_model_family + detect_reasoning_method).
+   */
+  getReasoningOptions(model: string | null): { value: string | null; label: string }[] {
+    const base = [{ value: null, label: 'Default' }];
+    if (!model) {
+      // No model selected → show standard set (OpenAI-like: low/medium/high)
+      return [...base,
+        { value: 'none', label: 'None' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+      ];
+    }
+
+    const lower = model.toLowerCase();
+
+    // Provider-level: OpenRouter supports all 6 levels natively
+    if (lower.startsWith('openrouter/')) {
+      return [...base,
+        { value: 'none', label: 'None' },
+        { value: 'minimal', label: 'Minimal' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+        { value: 'xhigh', label: 'X-High' },
+      ];
+    }
+
+    // Provider-level: Groq doesn't pass reasoning through
+    if (lower.startsWith('groq/')) return base;
+
+    // Strip provider prefix for model family detection
+    let name = lower;
+    for (const prefix of ['openai/']) {
+      if (name.startsWith(prefix)) {
+        name = name.slice(prefix.length);
+        break;
+      }
+    }
+
+    // Model families that don't support reasoning control
+    if (name.startsWith('claude') || name.startsWith('gemini')) return base;
+
+    // gpt-oss (vLLM prompt injection) supports all levels
+    if (name.startsWith('gpt-oss')) {
+      return [...base,
+        { value: 'none', label: 'None' },
+        { value: 'minimal', label: 'Minimal' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+        { value: 'xhigh', label: 'X-High' },
+      ];
+    }
+
+    // OpenAI, DeepSeek, Qwen, Llama, default → low/medium/high
+    return [...base,
+      { value: 'none', label: 'None' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High' },
+    ];
   }
 
   isToolCategoryEnabled(category: string): boolean {
@@ -1902,6 +1991,9 @@ export class JobCreateComponent implements OnInit {
     if (instructions) {
       request.instructions = instructions;
     }
+    if (this.kickoffMessage.trim()) {
+      request.kickoff_message = this.kickoffMessage.trim();
+    }
 
     const dsIds = this.selectedDatasourceIds();
     if (dsIds.size > 0) {
@@ -1996,6 +2088,7 @@ export class JobCreateComponent implements OnInit {
     this.formData = {
       description: '',
     };
+    this.kickoffMessage = '';
     this.filePreviews.set([]);
     this.uploadId = null;
     // Reset expert selection

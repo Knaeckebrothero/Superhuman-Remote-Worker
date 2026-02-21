@@ -541,6 +541,53 @@ class JobsNamespace:
             )
         return [self.db._row_to_dict(row) for row in rows]
 
+    async def store_resolved_config(
+        self,
+        job_id: uuid.UUID,
+        resolved_config: Dict[str, Any],
+    ) -> bool:
+        """Store the fully resolved config snapshot for a job.
+
+        Only writes if resolved_config is currently NULL (first run only).
+
+        Args:
+            job_id: Job UUID
+            resolved_config: Fully resolved config dict (agent config + prompts + instructions)
+
+        Returns:
+            True if the config was stored, False if already set
+        """
+        result = await self.db.execute(
+            "UPDATE jobs SET resolved_config = $1::jsonb WHERE id = $2 AND resolved_config IS NULL",
+            json.dumps(resolved_config),
+            job_id,
+        )
+        stored = result == "UPDATE 1"
+        if stored:
+            logger.debug(f"Stored resolved config for job {job_id}")
+        return stored
+
+    async def get_resolved_config(
+        self,
+        job_id: uuid.UUID,
+    ) -> Optional[Dict[str, Any]]:
+        """Get the resolved config snapshot for a job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Resolved config dict or None if not set
+        """
+        row = await self.db.fetchrow(
+            "SELECT resolved_config FROM jobs WHERE id = $1",
+            job_id,
+        )
+        if row and row["resolved_config"]:
+            rc = row["resolved_config"]
+            return rc if isinstance(rc, dict) else json.loads(rc)
+        return None
+
     # Sync wrappers for scripts
     def create_sync(
         self,

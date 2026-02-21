@@ -537,8 +537,27 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             result = "\n".join(output_lines)
 
-            # Add continuation hint if there are more lines
-            if end_line < total_lines:
+            # Word count cap: dense files (e.g., JSONL) can exceed context budgets
+            # even within the 2000-line limit. Truncate to max_read_words if exceeded.
+            word_count = len(result.split())
+            if word_count > max_read_words:
+                words = result.split()
+                truncated_text = " ".join(words[:max_read_words])
+                # Trim to last complete line to avoid mid-line truncation
+                last_newline = truncated_text.rfind("\n")
+                if last_newline > 0:
+                    truncated_text = truncated_text[:last_newline]
+                # Count how many lines we actually kept
+                kept_lines = truncated_text.count("\n") + 1
+                actual_end = start_line + kept_lines - 1
+                result = truncated_text
+                result += (
+                    f"\n\n[TRUNCATED at word limit ({max_read_words:,} words). "
+                    f"Showing lines {start_line}-{actual_end} of {total_lines}. "
+                    f"Use offset={actual_end + 1} to continue.]"
+                )
+            elif end_line < total_lines:
+                # Add continuation hint if there are more lines (and no word truncation)
                 result += f"\n\n[Lines {start_line}-{end_line} of {total_lines}. "
                 result += f"Use offset={end_line + 1} to continue.]"
 

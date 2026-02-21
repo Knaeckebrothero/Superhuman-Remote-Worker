@@ -1,3 +1,20 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - context-management
+  - tool-development
+aliases:
+  - Phase Alternation
+  - Single ReAct Loop
+  - Strategic Agent Refactor
+related:
+  - "[[agent_improvements]]"
+  - "[[coding_agent]]"
+  - "[[config_issues]]"
+  - "[[cli_wrapper]]"
+---
+
 # Strategic Agent Architecture Refactor
 
 ## Critical Issue: Blind Planning LLM
@@ -616,3 +633,11 @@ Most phases should complete before hitting 80k tokens. Compaction is insurance f
 | Configuration | Two LLM instances | One LLM, phase-specific tools |
 | Todo creation | Hardcoded node extracts from LLM output | Agent writes todos.yaml |
 | Validation | None | 5-20 todos required for transition |
+
+## Related
+
+- [[agent_improvements]] — Architecture improvements derived from research
+- [[coding_agent]] — Coding agent built on the phase alternation model
+- [[config_issues]] — Config audit for the tool and phase settings
+- [[cli_wrapper]] — Claude Code SDK as alternative to the ReAct loop
+- [[cloud_workspace]] — Production deployment of the agent architecture

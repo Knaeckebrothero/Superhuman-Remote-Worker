@@ -81,6 +81,23 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  neo4j:
+    image: docker.io/library/neo4j:5
+    container_name: srw-neo4j
+    environment:
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-neo4j_password}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_dev_data:/data
+    ports:
+      - "${NEO4J_HTTP_PORT:-7474}:7474"
+      - "${NEO4J_BOLT_PORT:-7687}:7687"
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USERNAME:-neo4j}", "-p", "${NEO4J_PASSWORD:-neo4j_password}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   mongo-express:
     image: docker.io/library/mongo-express:latest
     container_name: srw-mongo-express
@@ -216,5 +233,7 @@ volumes:
     name: srw_postgres_dev_data
   mongodb_dev_data:
     name: srw_mongodb_dev_data
+  neo4j_dev_data:
+    name: srw_neo4j_dev_data
   gitea_dev_data:
     name: srw_gitea_dev_data

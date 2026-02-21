@@ -1,3 +1,18 @@
+---
+tags:
+  - media
+  - tool-development
+  - configuration
+aliases:
+  - PDF to podcast
+  - audio generation
+  - NotebookLM alternative
+related:
+  - "[[port_fessi_functionality]]"
+  - "[[writing_instructions]]"
+  - "[[agent_improvements]]"
+---
+
 # Podcast Generation from Documents
 
 **Status**: Idea / Research phase
@@ -155,3 +170,9 @@ Use a multimodal model to **listen** to generated audio and critique:
 ## Related Links
 - [Mercity Step-by-Step Guide](https://www.mercity.ai/blog-post/step-by-step-guide-to-generate-podcasts-using-tts-and-llms-ai-elevenlabs)
 - [Descript NotebookLM Review](https://www.descript.com/blog/article/testing-notebook-for-podcasters)
+
+## Related
+
+- [[port_fessi_functionality]] - Porting vision and audio capabilities from the Fessi backend
+- [[writing_instructions]] - Document writing and generation instructions
+- [[agent_improvements]] - General agent improvement proposals

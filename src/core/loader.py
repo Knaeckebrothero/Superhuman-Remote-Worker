@@ -18,6 +18,8 @@ from src.llm.reasoning_chat import ReasoningChatOpenAI
 
 logger = logging.getLogger(__name__)
 
+VALID_AUTONOMY_LEVELS = {"full", "review", "partial", "guided", "dependent"}
+
 
 # =============================================================================
 # Config Merging Utilities
@@ -127,16 +129,16 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
     return config_data
 
 
-class PromptResolver:
-    """Resolves prompt templates with deployment override support.
+class FileResolver:
+    """Resolves template files with deployment override support.
 
-    Checks deployment directory first, then falls back to framework prompts.
-    This allows deployments to override specific prompts while using
+    Checks deployment directory first, then falls back to a framework directory.
+    This allows deployments to override specific files while using
     framework defaults for others.
 
     Example:
         ```python
-        resolver = PromptResolver(deployment_dir="/project/config/my_agent")
+        resolver = FileResolver(deployment_dir="/project/config/my_agent")
 
         # Will check: /project/config/my_agent/instructions.md
         # Falls back to: config/prompts/instructions.md
@@ -144,18 +146,23 @@ class PromptResolver:
         ```
     """
 
-    def __init__(self, deployment_dir: Optional[str] = None):
-        """Initialize prompt resolver.
+    def __init__(
+        self,
+        deployment_dir: Optional[str] = None,
+        framework_dir: Optional[Path] = None,
+    ):
+        """Initialize file resolver.
 
         Args:
             deployment_dir: Path to deployment directory (e.g., config/my_agent)
-                          If None, only framework prompts are used.
+                          If None, only framework files are used.
+            framework_dir: Path to framework directory. Defaults to config/prompts/.
         """
         self.deployment_dir = Path(deployment_dir) if deployment_dir else None
-        self.framework_dir = get_project_root() / "config" / "prompts"
+        self.framework_dir = framework_dir or (get_project_root() / "config" / "prompts")
 
     def resolve(self, template_name: str) -> Path:
-        """Find prompt template, checking deployment dir first.
+        """Find template file, checking deployment dir first.
 
         Args:
             template_name: Name of the template file (e.g., "instructions.md")
@@ -178,12 +185,12 @@ class PromptResolver:
             return framework_path
 
         raise FileNotFoundError(
-            f"Prompt template not found: {template_name} "
+            f"Template not found: {template_name} "
             f"(checked: {self.deployment_dir}, {self.framework_dir})"
         )
 
     def load(self, template_name: str) -> str:
-        """Load prompt template content.
+        """Load template content.
 
         Args:
             template_name: Name of the template file
@@ -213,6 +220,201 @@ class PromptResolver:
             return False
 
 
+# Backward compatibility alias
+PromptResolver = FileResolver
+
+
+class MatrixResolver:
+    """Base class for matrix-based file resolution.
+
+    Resolves logical names to filenames through a 2D matrix: (type, model_family).
+    Resolution chain (4 levels):
+    1. Expert matrix → model-specific key → type
+    2. Expert matrix → "default" key → type
+    3. Base matrix → model-specific key → type
+    4. Base matrix → "default" key → type
+
+    Once the filename is determined, FileResolver locates the actual file
+    (expert directory → framework directory).
+
+    Subclasses define MATRIX_FILENAME, FRAMEWORK_DIR, and HARDCODED_DEFAULTS.
+    """
+
+    MATRIX_FILENAME: str = "matrix.yaml"
+    FRAMEWORK_DIR: str = "config/prompts"
+    HARDCODED_DEFAULTS: Dict[str, str] = {}
+
+    def __init__(
+        self,
+        deployment_dir: Optional[str] = None,
+        model_family: str = "default",
+    ):
+        self.deployment_dir = Path(deployment_dir) if deployment_dir else None
+        self.model_family = model_family
+        self._file_resolver = FileResolver(
+            deployment_dir=deployment_dir,
+            framework_dir=get_project_root() / self.FRAMEWORK_DIR,
+        )
+
+        # Load matrices
+        self._expert_matrix = self._load_matrix(self.deployment_dir)
+        base_matrix_path = get_project_root() / "config" / self.MATRIX_FILENAME
+        self._base_matrix = self._load_matrix_from_path(base_matrix_path)
+
+    @staticmethod
+    def _load_matrix_from_path(path: Path) -> Dict[str, Dict[str, str]]:
+        """Load a matrix YAML file. Returns empty dict if not found."""
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                return {}
+            # Validate structure: each key maps to a dict of type → filename
+            result = {}
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    result[key] = {k: str(v) for k, v in value.items() if v is not None}
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to load matrix {path}: {e}")
+            return {}
+
+    def _load_matrix(self, directory: Optional[Path]) -> Dict[str, Dict[str, str]]:
+        """Load matrix YAML from a directory. Returns empty dict if not found."""
+        if not directory:
+            return {}
+        return self._load_matrix_from_path(directory / self.MATRIX_FILENAME)
+
+    def resolve_filename(self, entry_type: str) -> str:
+        """Resolve a type to a filename through the 4-level fallback chain.
+
+        Args:
+            entry_type: Logical name (e.g., "systemprompt", "instructions")
+
+        Returns:
+            Filename string (e.g., "systemprompt.txt")
+        """
+        family = self.model_family
+
+        # Level 1: Expert matrix, model-specific
+        if family != "default" and family in self._expert_matrix:
+            if entry_type in self._expert_matrix[family]:
+                return self._expert_matrix[family][entry_type]
+
+        # Level 2: Expert matrix, default
+        if "default" in self._expert_matrix:
+            if entry_type in self._expert_matrix["default"]:
+                return self._expert_matrix["default"][entry_type]
+
+        # Level 3: Base matrix, model-specific
+        if family != "default" and family in self._base_matrix:
+            if entry_type in self._base_matrix[family]:
+                return self._base_matrix[family][entry_type]
+
+        # Level 4: Base matrix, default
+        if "default" in self._base_matrix:
+            if entry_type in self._base_matrix["default"]:
+                return self._base_matrix["default"][entry_type]
+
+        # Final fallback: hardcoded defaults
+        return self.HARDCODED_DEFAULTS.get(entry_type, f"{entry_type}.txt")
+
+    def load(self, entry_type: str) -> str:
+        """Resolve filename and load the content.
+
+        Args:
+            entry_type: Type to resolve and load
+
+        Returns:
+            File content as string
+        """
+        filename = self.resolve_filename(entry_type)
+        return self._file_resolver.load(filename)
+
+    def exists(self, entry_type: str) -> bool:
+        """Check if a type can be resolved and the file exists."""
+        filename = self.resolve_filename(entry_type)
+        return self._file_resolver.exists(filename)
+
+
+class PromptMatrixResolver(MatrixResolver):
+    """Resolves prompt filenames through a 2D matrix: (prompt_type, model_family).
+
+    Thin subclass of MatrixResolver for prompt files (config/prompts/).
+    """
+
+    MATRIX_FILENAME = "prompt_matrix.yaml"
+    FRAMEWORK_DIR = "config/prompts"
+    HARDCODED_DEFAULTS = {
+        "systemprompt": "systemprompt.txt",
+        "persona": "persona.txt",
+        "strategic": "strategic.txt",
+        "tactical": "tactical.txt",
+        "summarization": "summarization_prompt.txt",
+    }
+
+    # Backward compatibility: expose _prompt_resolver as alias for _file_resolver
+    @property
+    def _prompt_resolver(self):
+        return self._file_resolver
+
+    @_prompt_resolver.setter
+    def _prompt_resolver(self, value):
+        self._file_resolver = value
+
+
+class InstructionMatrixResolver(MatrixResolver):
+    """Resolves instruction filenames through a 2D matrix: (instruction_type, model_family).
+
+    Handles non-prompt template files: instructions, strategic todos templates,
+    workspace template, and todo guide.
+    """
+
+    MATRIX_FILENAME = "instruction_matrix.yaml"
+    FRAMEWORK_DIR = "config/templates"
+    HARDCODED_DEFAULTS = {
+        "instructions": "instructions.md",
+        "strategic_todos_initial": "strategic_todos_initial.yaml",
+        "strategic_todos_transition": "strategic_todos_transition.yaml",
+        "strategic_todos_resume": "strategic_todos_resume.yaml",
+        "workspace_template": "workspace_template.md",
+        "todo_guide": "todo_guide.md",
+    }
+
+
+@dataclass
+class InstructionFileEntry:
+    """An instruction file with trigger conditions for auto-injection.
+
+    Defines when and how an instruction file is delivered to the agent.
+
+    Attributes:
+        file: Workspace-relative path (e.g., "todo_guide.md")
+        trigger: Trigger condition string:
+            - "before_tool:<tool_name>" — fires when the named tool is called
+            - "phase:strategic" / "phase:tactical" — fires on phase transition
+        enforce: If True, tool rejects until agent reads the file (passive).
+                 If False, system injects content automatically (active).
+    """
+
+    file: str
+    trigger: str
+    enforce: bool = True
+
+    @property
+    def trigger_type(self) -> str:
+        """Extract trigger type: 'before_tool' or 'phase'."""
+        return self.trigger.split(":")[0]
+
+    @property
+    def trigger_target(self) -> str:
+        """Extract trigger target: tool name or phase name."""
+        parts = self.trigger.split(":", 1)
+        return parts[1] if len(parts) > 1 else ""
+
+
 @dataclass
 class PhaseLLMOverride:
     """Phase-specific LLM overrides.
@@ -225,11 +427,15 @@ class PhaseLLMOverride:
     provider: Optional[str] = None
     temperature: Optional[float] = None
     reasoning_level: Optional[str] = None
+    reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect)
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     timeout: Optional[float] = None
     max_retries: Optional[int] = None
     multimodal: Optional[bool] = None
+    parallel_tool_calls: Optional[bool] = None
+    max_output_tokens: Optional[int] = None
+    model_max_context_tokens: Optional[int] = None
 
 
 @dataclass
@@ -254,14 +460,18 @@ class LLMConfig:
     """
 
     model: str = "gpt-4o"
-    provider: Optional[str] = None  # "openai", "anthropic", "google", "groq" (auto-detect if None)
+    provider: Optional[str] = None  # "openai", "anthropic", "google", "groq", "openrouter" (auto-detect if None)
     temperature: float = 0.0
     reasoning_level: str = "high"
+    reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect from model)
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     timeout: Optional[float] = 600.0  # 10 minutes default
     max_retries: int = 3
     multimodal: bool = False  # Whether model can process images directly
+    parallel_tool_calls: bool = False  # Allow multiple tool calls per response
+    max_output_tokens: Optional[int] = None  # Override max output tokens (auto-detected if None)
+    model_max_context_tokens: Optional[int] = None  # Per-model context window limit (falls back to limits.model_max_context_tokens)
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -291,11 +501,15 @@ class LLMConfig:
             provider=override.provider if override.provider is not None else self.provider,
             temperature=override.temperature if override.temperature is not None else self.temperature,
             reasoning_level=override.reasoning_level if override.reasoning_level is not None else self.reasoning_level,
+            reasoning_method=override.reasoning_method if override.reasoning_method is not None else self.reasoning_method,
             base_url=override.base_url if override.base_url is not None else self.base_url,
             api_key=override.api_key if override.api_key is not None else self.api_key,
             timeout=override.timeout if override.timeout is not None else self.timeout,
             max_retries=override.max_retries if override.max_retries is not None else self.max_retries,
             multimodal=override.multimodal if override.multimodal is not None else self.multimodal,
+            parallel_tool_calls=override.parallel_tool_calls if override.parallel_tool_calls is not None else self.parallel_tool_calls,
+            max_output_tokens=override.max_output_tokens if override.max_output_tokens is not None else self.max_output_tokens,
+            model_max_context_tokens=override.model_max_context_tokens if override.model_max_context_tokens is not None else self.model_max_context_tokens,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -316,9 +530,6 @@ class WorkspaceConfig:
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
-    git_ignore_patterns: List[str] = field(
-        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-    )
 
 
 @dataclass
@@ -348,11 +559,11 @@ class LimitsConfig:
 
     context_threshold_tokens: int = 80000
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 30000
+    message_count_min_tokens: int = 40000
     tool_retry_count: int = 3
     # Safety layer constants for preventing context overflow
-    model_max_context_tokens: int = 128000  # Hard limit for model context window
-    summarization_safe_limit: int = 100000  # Max input tokens for summarization LLM
+    model_max_context_tokens: int = 100000  # Global fallback for model context window
+    summarization_safe_limit: int = 90000  # Max input tokens for summarization LLM (< model_max for prompt overhead)
     summarization_chunk_size: int = 80000   # Chunk size for recursive summarization
 
 
@@ -361,7 +572,7 @@ class ContextManagementConfig:
     """Context management configuration."""
 
     compact_on_archive: bool = True
-    keep_recent_tool_results: int = 10
+    keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     summarization_template: str = "summarization_prompt.txt"
     reasoning_level: str = "high"
@@ -398,6 +609,8 @@ class AgentConfig:
         default_factory=ContextManagementConfig
     )
     phase_settings: PhaseSettings = field(default_factory=PhaseSettings)
+    instruction_files: List[InstructionFileEntry] = field(default_factory=list)
+    autonomy: str = "partial"
 
     # Additional agent-specific config (preserved from JSON)
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -424,11 +637,15 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         provider=data.get("provider"),
         temperature=data.get("temperature"),
         reasoning_level=data.get("reasoning_level"),
+        reasoning_method=data.get("reasoning_method"),
         base_url=data.get("base_url"),
         api_key=data.get("api_key"),
         timeout=data.get("timeout"),
         max_retries=data.get("max_retries"),
         multimodal=data.get("multimodal"),
+        parallel_tool_calls=data.get("parallel_tool_calls"),
+        max_output_tokens=data.get("max_output_tokens"),
+        model_max_context_tokens=data.get("model_max_context_tokens"),
     )
 
 
@@ -446,11 +663,15 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         provider=llm_data.get("provider"),
         temperature=llm_data.get("temperature", 0.0),
         reasoning_level=llm_data.get("reasoning_level", "high"),
+        reasoning_method=llm_data.get("reasoning_method"),
         base_url=llm_data.get("base_url"),
         api_key=llm_data.get("api_key"),
         timeout=llm_data.get("timeout", 600.0),
         max_retries=llm_data.get("max_retries", 3),
         multimodal=llm_data.get("multimodal", False),
+        parallel_tool_calls=llm_data.get("parallel_tool_calls", False),
+        max_output_tokens=llm_data.get("max_output_tokens"),
+        model_max_context_tokens=llm_data.get("model_max_context_tokens"),
         # Phase-specific overrides
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
@@ -531,10 +752,6 @@ def load_agent_config(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        git_ignore_patterns=workspace_data.get(
-            "git_ignore_patterns",
-            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-        ),
     )
 
     tools_data = data.get("tools", {})
@@ -558,17 +775,17 @@ def load_agent_config(
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
-        model_max_context_tokens=limits_data.get("model_max_context_tokens", 128000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 100000),
+        model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
+        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
     )
 
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 10),
+        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
             "summarization_template",
@@ -584,11 +801,28 @@ def load_agent_config(
         max_todos=phase_data.get("max_todos", 20),
     )
 
+    # Parse instruction_files entries
+    instruction_files_data = data.get("instruction_files", [])
+    instruction_files = [
+        InstructionFileEntry(
+            file=entry["file"],
+            trigger=entry["trigger"],
+            enforce=entry.get("enforce", True),
+        )
+        for entry in instruction_files_data
+    ]
+
+    # Parse autonomy level
+    autonomy = data.get("autonomy", "partial")
+    if autonomy not in VALID_AUTONOMY_LEVELS:
+        logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
+        autonomy = "partial"
+
     # Collect extra fields (agent-specific config)
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings"
+        "phase_settings", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -603,6 +837,8 @@ def load_agent_config(
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,
+        instruction_files=instruction_files,
+        autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -651,10 +887,6 @@ def load_agent_config_from_dict(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
-        git_ignore_patterns=workspace_data.get(
-            "git_ignore_patterns",
-            ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-        ),
     )
 
     tools_data = data.get("tools", {})
@@ -678,17 +910,17 @@ def load_agent_config_from_dict(
     limits_config = LimitsConfig(
         context_threshold_tokens=limits_data.get("context_threshold_tokens", 80000),
         message_count_threshold=limits_data.get("message_count_threshold", 200),
-        message_count_min_tokens=limits_data.get("message_count_min_tokens", 30000),
+        message_count_min_tokens=limits_data.get("message_count_min_tokens", 40000),
         tool_retry_count=limits_data.get("tool_retry_count", 3),
-        model_max_context_tokens=limits_data.get("model_max_context_tokens", 128000),
-        summarization_safe_limit=limits_data.get("summarization_safe_limit", 100000),
+        model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
+        summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
     )
 
     context_data = data.get("context_management", {})
     context_config = ContextManagementConfig(
         compact_on_archive=context_data.get("compact_on_archive", True),
-        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 10),
+        keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
             "summarization_template",
@@ -704,11 +936,28 @@ def load_agent_config_from_dict(
         max_todos=phase_data.get("max_todos", 20),
     )
 
+    # Parse instruction_files entries
+    instruction_files_data = data.get("instruction_files", [])
+    instruction_files = [
+        InstructionFileEntry(
+            file=entry["file"],
+            trigger=entry["trigger"],
+            enforce=entry.get("enforce", True),
+        )
+        for entry in instruction_files_data
+    ]
+
+    # Parse autonomy level
+    autonomy = data.get("autonomy", "partial")
+    if autonomy not in VALID_AUTONOMY_LEVELS:
+        logger.warning(f"Invalid autonomy level '{autonomy}', defaulting to 'partial'")
+        autonomy = "partial"
+
     # Collect extra fields
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings"
+        "phase_settings", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -723,6 +972,8 @@ def load_agent_config_from_dict(
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,
+        instruction_files=instruction_files,
+        autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
     )
@@ -782,11 +1033,13 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
     """Detect LLM provider from model name or explicit setting.
 
     Args:
-        model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o")
-        explicit_provider: Explicit provider override ("openai", "anthropic", "google", "groq")
+        model: Model name (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash", "gpt-4o",
+               "openrouter/anthropic/claude-opus-4")
+        explicit_provider: Explicit provider override ("openai", "anthropic", "google",
+                          "groq", "openrouter")
 
     Returns:
-        Provider name: "openai", "anthropic", "google", or "groq"
+        Provider name: "openai", "anthropic", "google", "groq", or "openrouter"
 
     Note:
         Groq requires explicit provider setting since it hosts open models
@@ -796,6 +1049,8 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
         return explicit_provider.lower()
 
     model_lower = model.lower()
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
     if model_lower.startswith("groq/"):
         return "groq"
     if model_lower.startswith("claude"):
@@ -804,6 +1059,132 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
         return "google"
     # Default to openai (covers gpt-*, openai/*, local models)
     return "openai"
+
+
+def detect_model_family(model: str) -> str:
+    """Detect model family from model name for prompt matrix resolution.
+
+    Strips provider prefixes (openrouter/, groq/, openai/) and pattern-matches
+    the model name to a family string. Returns "default" as fallback.
+
+    Args:
+        model: Model name (e.g., "claude-opus-4-6", "openrouter/deepseek/deepseek-r1")
+
+    Returns:
+        Family string (e.g., "claude-opus", "deepseek", "default")
+    """
+    name = model.lower()
+
+    # Strip provider prefixes to get the actual model name
+    for prefix in ("openrouter/", "groq/"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            # Strip second-level provider prefix (e.g., "anthropic/" in "openrouter/anthropic/claude-opus-4")
+            if "/" in name:
+                name = name.split("/", 1)[1]
+            break
+
+    # Strip openai/ prefix for self-hosted models
+    if name.startswith("openai/"):
+        name = name[len("openai/"):]
+
+    # Pattern match model name to family
+    if name.startswith("claude-opus"):
+        return "claude-opus"
+    if name.startswith("claude-sonnet"):
+        return "claude-sonnet"
+    if name.startswith("claude-haiku"):
+        return "claude-haiku"
+    if name.startswith("gpt-5"):
+        return "gpt-5"
+    if name.startswith("gpt-4o"):
+        return "gpt-4o"
+    if name.startswith(("o1", "o3", "o4")):
+        return "o-series"
+    if "deepseek" in name:
+        return "deepseek"
+    if "qwen" in name or "qwq" in name:
+        return "qwen"
+    if "llama" in name:
+        return "llama"
+    if name.startswith("gemini"):
+        return "gemini"
+    if name.startswith("gpt-oss"):
+        return "gpt-oss"
+
+    return "default"
+
+
+def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -> str:
+    """Determine how reasoning level is delivered to the model.
+
+    - "prompt": Inject `Reasoning: {level}` in system prompt (gpt-oss via vLLM)
+    - "api": Pass as API parameter (OpenAI, OpenRouter native models)
+    - "none": Model doesn't support reasoning level control (Anthropic, Google, Groq)
+
+    Args:
+        model: Model name for family detection
+        explicit_method: Explicit override from config (skips auto-detection)
+
+    Returns:
+        One of "prompt", "api", or "none"
+    """
+    if explicit_method:
+        return explicit_method
+
+    family = detect_model_family(model)
+
+    if family == "gpt-oss":
+        return "prompt"
+    if family in ("claude-opus", "claude-sonnet", "claude-haiku", "gemini"):
+        return "none"
+    # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
+    return "api"
+
+
+def _needs_custom_base_url(model: str) -> bool:
+    """Check if model requires a custom base URL (OpenAI-compatible endpoint).
+
+    Models with 'openai/' prefix are served via OpenAI-compatible endpoints
+    (vLLM, llama.cpp, sglang) and need LLM_BASE_URL. Native OpenAI models
+    (gpt-*, o1-*, o3-*, o4-*) go directly to api.openai.com.
+    """
+    return model.lower().startswith("openai/")
+
+
+def _should_use_reasoning_summary(model: str) -> bool:
+    """Check if model supports readable reasoning summaries via the Responses API.
+
+    Native OpenAI reasoning models return reasoning content through the
+    Responses API when the reasoning.summary parameter is set.
+    Models with a '/' prefix (openai/*, groq/*) are proxy models and excluded.
+    """
+    model_lower = model.lower()
+    if "/" in model_lower:
+        return False
+    reasoning_prefixes = ("o1", "o3", "o4", "gpt-5")
+    return any(model_lower.startswith(p) for p in reasoning_prefixes)
+
+
+# Reasoning levels supported by each provider API
+_OPENAI_REASONING_LEVELS = {"low", "medium", "high"}
+
+
+def _clamp_reasoning_level(level: str, supported: set[str]) -> str:
+    """Clamp a reasoning level to the nearest supported value.
+
+    Maps unsupported levels to the closest supported equivalent:
+    - 'minimal' -> 'low'
+    - 'xhigh' -> 'high'
+    """
+    if level in supported:
+        return level
+    mapping = {"minimal": "low", "xhigh": "high"}
+    clamped = mapping.get(level, level)
+    if clamped not in supported:
+        return "high"  # safe fallback
+    logger.debug(f"Clamped reasoning level '{level}' -> '{clamped}' for provider")
+    return clamped
 
 
 def create_llm(
@@ -817,6 +1198,7 @@ def create_llm(
     - Anthropic (Claude models)
     - Google (Gemini models)
     - Groq (fast inference for open models)
+    - OpenRouter (300+ models via unified API)
 
     Provider is auto-detected from model name or can be explicitly set via config.provider.
 
@@ -835,6 +1217,8 @@ def create_llm(
         return _create_google_llm(config, limits)
     elif provider == "groq":
         return _create_groq_llm(config, limits)
+    elif provider == "openrouter":
+        return _create_openrouter_llm(config, limits)
     else:
         return _create_openai_llm(config, limits)
 
@@ -848,22 +1232,36 @@ def _create_openai_llm(
     Uses ReasoningChatOpenAI which provides:
     - reasoning_content capture for DeepSeek-style models
     - HTTP-layer context overflow protection
+    - Automatic API key rotation via KeyRing (when multiple keys configured)
 
     The base_url can point to any OpenAI-compatible endpoint (vLLM, Ollama, etc.)
-    """
-    # Get API key from config or environment
-    api_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
 
-    # Get base URL from config or environment
-    base_url = config.base_url or os.getenv("LLM_BASE_URL")
+    Multiple API keys can be provided as a comma-separated string in
+    OPENAI_API_KEY (e.g. "sk-key1,sk-key2,sk-key3"). The KeyRing will
+    rotate through them on auth/quota failures.
+    """
+    from src.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    # Parse API keys (supports comma-separated list for fallback)
+    raw_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
+    keys = parse_key_string(raw_key) or ["not-needed"]
+    cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
+    key_ring = get_or_create_key_ring(keys, provider="openai", cooldown_seconds=cooldown)
+
+    # SDK gets the first key; KeyRing overrides the header in send()
+    api_key = keys[0]
+
+    # Get base URL: explicit config wins, then LLM_BASE_URL for openai/ models only.
+    # Native OpenAI models (gpt-*, o1-*, etc.) go directly to api.openai.com.
+    if config.base_url:
+        base_url = config.base_url
+    elif _needs_custom_base_url(config.model):
+        base_url = os.getenv("LLM_BASE_URL")
+    else:
+        base_url = None
 
     # Build model kwargs
     model_kwargs = {}
-
-    # Add reasoning level if model supports it
-    if config.reasoning_level and config.reasoning_level != "none":
-        # Some models support reasoning_effort parameter
-        model_kwargs["reasoning_effort"] = config.reasoning_level
 
     # Build kwargs for ChatOpenAI
     llm_kwargs = {
@@ -872,6 +1270,23 @@ def _create_openai_llm(
         "api_key": api_key,
         "max_retries": config.max_retries,
     }
+
+    # Add reasoning parameters
+    reasoning_mode = "none"
+    if config.reasoning_level and config.reasoning_level != "none":
+        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
+        if _should_use_reasoning_summary(config.model):
+            # Native OpenAI reasoning models: use Responses API with readable summaries.
+            # Passing reasoning={} triggers LangChain's automatic Responses API routing.
+            llm_kwargs["reasoning"] = {
+                "effort": level,
+                "summary": "auto",
+            }
+            reasoning_mode = f"responses_api(effort={level})"
+        else:
+            # Other models (DeepSeek, vLLM-hosted, etc.): use Chat Completions API.
+            model_kwargs["reasoning_effort"] = level
+            reasoning_mode = f"chat_completions(effort={level})"
 
     # Add timeout if specified
     if config.timeout is not None:
@@ -885,17 +1300,26 @@ def _create_openai_llm(
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
 
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
+
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
-    max_context_tokens = limits.model_max_context_tokens if limits else None
+    # Prefer per-model config value, fall back to global limits
+    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
+    # Pass KeyRing for automatic key rotation
+    llm_kwargs["key_ring"] = key_ring
+
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
+    key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     logger.info(
         f"Created OpenAI LLM: model={config.model}, temp={config.temperature}, "
         f"base_url={base_url or 'default'}, timeout={config.timeout}s, "
-        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}"
+        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
+        f"reasoning={reasoning_mode}, keys={key_info}"
     )
 
     return llm
@@ -929,13 +1353,21 @@ def _create_anthropic_llm(
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
 
-    # Anthropic requires max_tokens - set a reasonable default
-    # Use limits if available, otherwise default to 4096
-    if limits and limits.model_max_context_tokens:
-        # Reserve reasonable space for output (up to 8192 tokens)
-        llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
+    # Anthropic requires max_tokens - use config override or model-aware defaults
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
     else:
-        llm_kwargs["max_tokens"] = 4096
+        model_lower = config.model.lower()
+        if any(x in model_lower for x in ("opus-4-6", "opus-4-5", "opus-4-1", "opus-4-0")):
+            llm_kwargs["max_tokens"] = 32000
+        elif any(x in model_lower for x in ("sonnet-4-5", "sonnet-4-0")):
+            llm_kwargs["max_tokens"] = 16384
+        elif config.model_max_context_tokens:
+            llm_kwargs["max_tokens"] = min(8192, config.model_max_context_tokens // 4)
+        elif limits and limits.model_max_context_tokens:
+            llm_kwargs["max_tokens"] = min(8192, limits.model_max_context_tokens // 4)
+        else:
+            llm_kwargs["max_tokens"] = 4096
 
     llm = ChatAnthropic(**llm_kwargs)
 
@@ -1034,64 +1466,161 @@ def _create_groq_llm(
     return llm
 
 
+def _create_openrouter_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create OpenRouter LLM (300+ models via unified OpenAI-compatible API).
+
+    Requires OPENROUTER_API_KEY environment variable or config.api_key.
+    Routes through ReasoningChatOpenAI with the OpenRouter base URL.
+
+    Model names are specified as openrouter/<provider>/<model>, e.g.:
+    - openrouter/anthropic/claude-opus-4
+    - openrouter/openai/gpt-4o
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - openrouter/deepseek/deepseek-r1
+
+    The openrouter/ prefix is stripped before sending to the API.
+
+    Multiple API keys can be provided as a comma-separated string in
+    OPENROUTER_API_KEY for automatic fallback rotation.
+
+    Optional headers (for OpenRouter leaderboard):
+    - OPENROUTER_REFERER: Your site URL
+    - OPENROUTER_TITLE: Your app name
+    """
+    from src.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    # Parse API keys (supports comma-separated list for fallback)
+    raw_key = config.api_key or os.getenv("OPENROUTER_API_KEY")
+    if not raw_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY environment variable required for OpenRouter provider. "
+            "Set it in your environment or provide api_key in config."
+        )
+    keys = parse_key_string(raw_key)
+    if not keys:
+        raise ValueError("OPENROUTER_API_KEY is empty after parsing.")
+    cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
+    key_ring = get_or_create_key_ring(keys, provider="openrouter", cooldown_seconds=cooldown)
+
+    # SDK gets the first key; KeyRing overrides the header in send()
+    api_key = keys[0]
+
+    # Strip openrouter/ prefix — OpenRouter expects provider/model format
+    model = config.model
+    if model.lower().startswith("openrouter/"):
+        model = model[len("openrouter/"):]
+
+    # Base URL: explicit config wins, otherwise always OpenRouter
+    base_url = config.base_url or "https://openrouter.ai/api/v1"
+
+    # Build model kwargs
+    model_kwargs = {}
+
+    # OpenRouter uses nested reasoning object format.
+    # OpenRouter supports all levels (none, minimal, low, medium, high, xhigh) — no clamping needed.
+    if config.reasoning_level and config.reasoning_level != "none":
+        model_kwargs["reasoning"] = {"effort": config.reasoning_level}
+
+    # Build kwargs for ReasoningChatOpenAI
+    llm_kwargs = {
+        "model": model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_retries": config.max_retries,
+    }
+
+    # Add optional OpenRouter headers for leaderboard identification
+    default_headers = {}
+    referer = os.getenv("OPENROUTER_REFERER")
+    title = os.getenv("OPENROUTER_TITLE")
+    if referer:
+        default_headers["HTTP-Referer"] = referer
+    if title:
+        default_headers["X-Title"] = title
+    if default_headers:
+        llm_kwargs["default_headers"] = default_headers
+
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+
+    if model_kwargs:
+        llm_kwargs["model_kwargs"] = model_kwargs
+
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
+
+    # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
+    # Prefer per-model config value, fall back to global limits
+    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
+    if max_context_tokens:
+        llm_kwargs["max_context_tokens"] = max_context_tokens
+
+    # Pass KeyRing for automatic key rotation
+    llm_kwargs["key_ring"] = key_ring
+
+    llm = ReasoningChatOpenAI(**llm_kwargs)
+
+    key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
+    reasoning_mode = f"chat_completions(effort={config.reasoning_level})" if config.reasoning_level and config.reasoning_level != "none" else "none"
+    logger.info(
+        f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
+        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
+        f"reasoning={reasoning_mode}, keys={key_info}"
+    )
+
+    return llm
+
+
 # =============================================================================
 # Phase-Aware System Prompts
 # =============================================================================
 
 
-def load_base_system_prompt(
-    deployment_dir: Optional[str] = None,
-) -> str:
-    """Load the base system prompt template (systemprompt.txt).
-
-    Uses PromptResolver to check deployment directory first if available,
-    allowing deployments to override the base template.
+def load_base_system_prompt(matrix_resolver: PromptMatrixResolver) -> str:
+    """Load the base system prompt template via prompt matrix resolution.
 
     Args:
-        deployment_dir: Path to deployment directory (e.g., config/my_agent).
-                       If None, only framework templates are used.
+        matrix_resolver: PromptMatrixResolver for model-aware filename resolution.
 
     Returns:
-        Raw template string with placeholders ({prompt_content}, {todos_content}, etc.)
+        Raw template string with placeholders ({prompt_content}, etc.)
 
     Raises:
-        FileNotFoundError: If template not found in either location
+        FileNotFoundError: If template not found
     """
-    resolver = PromptResolver(deployment_dir)
-    return resolver.load("systemprompt.txt")
+    return matrix_resolver.load("systemprompt")
 
 
 def load_phase_component(
     is_strategic: bool,
-    deployment_dir: Optional[str] = None,
+    matrix_resolver: PromptMatrixResolver,
 ) -> str:
     """Load the phase-specific component (strategic.txt or tactical.txt).
 
-    Uses PromptResolver to check deployment directory first if available,
-    allowing deployments to override phase components.
-
     Args:
         is_strategic: True for strategic phase, False for tactical
-        deployment_dir: Path to deployment directory (e.g., config/my_agent).
-                       If None, only framework templates are used.
+        matrix_resolver: PromptMatrixResolver for model-aware filename resolution.
 
     Returns:
         Raw template string with {phase_number} placeholder
 
     Raises:
-        FileNotFoundError: If template not found in either location
+        FileNotFoundError: If template not found
     """
-    resolver = PromptResolver(deployment_dir)
-    template_name = "strategic.txt" if is_strategic else "tactical.txt"
-    return resolver.load(template_name)
+    prompt_type = "strategic" if is_strategic else "tactical"
+    return matrix_resolver.load(prompt_type)
 
 
 def get_phase_system_prompt(
     config: AgentConfig,
     is_strategic: bool,
     phase_number: int = 0,
-    todos_content: str = "",
-    config_dir: Optional[str] = None,
+    model: str = "",
 ) -> str:
     """Get the complete system prompt for the current phase.
 
@@ -1101,17 +1630,16 @@ def get_phase_system_prompt(
     2. Load phase component (strategic.txt or tactical.txt)
     3. Render phase component's {phase_number} placeholder
     4. Inject rendered component into base template's {prompt_content}
-    5. Render remaining placeholders ({todos_content}, etc.)
+    5. Render remaining placeholders ({agent_display_name}, etc.)
 
-    Note: workspace.md content is now injected as a synthetic tool call result
+    Note: workspace.md and todos are injected as transient messages
     in graph.py, not included in the system prompt.
 
     Args:
         config: Agent configuration
         is_strategic: True for strategic phase, False for tactical
         phase_number: Current phase number
-        todos_content: Formatted todo list string
-        config_dir: Base directory for config files (deprecated, uses deployment_dir)
+        model: Model name for prompt matrix resolution.
 
     Returns:
         Fully rendered system prompt string
@@ -1122,77 +1650,74 @@ def get_phase_system_prompt(
             config=config,
             is_strategic=True,
             phase_number=1,
-            todos_content="- Explore workspace\\n- Create plan",
+            model="claude-opus-4-6",
         )
         ```
     """
-    deployment_dir = config._deployment_dir
+    # Check for pre-resolved prompt content (from resolved_config JSONB)
+    resolved_prompts = config.extra.get("_resolved_prompts", {})
+
+    model_family = detect_model_family(model) if model else "default"
+    resolver = PromptMatrixResolver(config._deployment_dir, model_family)
 
     # 1. Load base template
-    base_template = load_base_system_prompt(deployment_dir)
+    base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(resolver)
 
-    # 2. Load phase component
-    phase_component = load_phase_component(is_strategic, deployment_dir)
+    # 2. Load expert persona (empty string if no persona file exists)
+    expert_identity = resolved_prompts.get("persona") or ""
+    if not expert_identity:
+        try:
+            expert_identity = resolver.load("persona")
+        except FileNotFoundError:
+            expert_identity = ""
 
-    # 3. Render phase component's {phase_number} placeholder
+    # 3. Load phase component
+    prompt_type = "strategic" if is_strategic else "tactical"
+    phase_component = resolved_prompts.get(prompt_type) or load_phase_component(is_strategic, resolver)
+
+    # 4. Render phase component's {phase_number} placeholder
     rendered_component = phase_component.format(phase_number=phase_number)
 
-    # 4. & 5. Inject component and render remaining placeholders
-    oss_reasoning_level = config.llm.reasoning_level or "high"
-
-    return base_template.format(
-        oss_reasoning_level=oss_reasoning_level,
+    # 5. Inject all components and render remaining placeholders
+    rendered = base_template.format(
         agent_display_name=config.display_name,
+        expert_identity=expert_identity,
         prompt_content=rendered_component,
-        todos_content=todos_content,
     )
 
+    # Prepend reasoning directive only for OSS models that need it as prompt text
+    method = detect_reasoning_method(model or config.llm.model, config.llm.reasoning_method)
+    if method == "prompt":
+        level = config.llm.reasoning_level or "high"
+        rendered = f"Reasoning: {level}\n\n{rendered}"
 
-def load_instructions(
-    config: AgentConfig,
-    config_dir: Optional[str] = None,
-    prompt_resolver: Optional[PromptResolver] = None,
-) -> str:
+    return rendered
+
+
+def load_instructions(config: AgentConfig, model: str = "") -> str:
     """Load the instructions template for the agent.
 
-    Uses PromptResolver to check deployment directory first if available,
-    allowing deployments to override framework prompts.
+    Uses InstructionMatrixResolver for model-aware instruction resolution.
 
     Args:
         config: Agent configuration
-        config_dir: Base directory for config files (deprecated, use prompt_resolver)
-        prompt_resolver: Optional resolver for finding prompts (preferred)
+        model: Model name for instruction matrix resolution.
 
     Returns:
         Instructions content to be placed in workspace
     """
-    template_name = config.workspace.instructions_template
+    # Check for pre-resolved content (from resolved_config JSONB)
+    resolved = config.extra.get("_resolved_instructions", {})
+    if resolved.get("instructions"):
+        return resolved["instructions"]
 
-    # Try PromptResolver first (new style)
-    if prompt_resolver is None and config._deployment_dir:
-        prompt_resolver = PromptResolver(config._deployment_dir)
-
-    if prompt_resolver:
-        try:
-            return prompt_resolver.load(template_name)
-        except FileNotFoundError:
-            pass  # Fall through to legacy handling
-
-    # Legacy path resolution (backward compatibility)
-    if config_dir is None:
-        config_dir = get_project_root() / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    instructions_path = config_dir / "prompts" / template_name
-
-    if instructions_path.exists():
-        with open(instructions_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
+    model_family = detect_model_family(model) if model else "default"
+    resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
+    try:
+        return resolver.load("instructions")
+    except FileNotFoundError:
         logger.warning(
-            f"Instructions template not found: {template_name}. "
-            "Using minimal instructions."
+            "Instructions template not found. Using minimal instructions."
         )
         # Build tool list from all categories
         all_tools = []
@@ -1224,55 +1749,33 @@ See `tools/README.md` for detailed documentation of each tool.
 """
 
 
-def load_summarization_prompt(
-    config: Optional["AgentConfig"] = None,
-    config_dir: Optional[str] = None,
-    prompt_resolver: Optional[PromptResolver] = None,
-) -> str:
+def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
     """Load the summarization prompt template.
 
-    Uses PromptResolver to check deployment directory first if available.
+    Uses PromptMatrixResolver for model-aware prompt resolution.
+    Prepends a reasoning directive for OSS models that need it as prompt text.
 
     Args:
-        config: Agent configuration (to get agent-specific template)
-        config_dir: Base directory for config files (deprecated, use prompt_resolver)
-        prompt_resolver: Optional resolver for finding prompts (preferred)
+        config: Agent configuration
+        model: Model name for prompt matrix resolution.
 
     Returns:
-        Summarization prompt content
+        Summarization prompt content ready for use
     """
-    # Determine template name
-    template_name = "summarization_prompt.txt"
-    if config and config.context_management.summarization_template:
-        template_name = config.context_management.summarization_template
+    # Check for pre-resolved content (from resolved_config JSONB)
+    resolved = config.extra.get("_resolved_prompts", {})
+    template = resolved.get("summarization") or ""
 
-    # Try PromptResolver first (new style)
-    if prompt_resolver is None and config and config._deployment_dir:
-        prompt_resolver = PromptResolver(config._deployment_dir)
-
-    if prompt_resolver:
+    if not template:
+        model_family = detect_model_family(model) if model else "default"
+        resolver = PromptMatrixResolver(config._deployment_dir, model_family)
         try:
-            return prompt_resolver.load(template_name)
+            template = resolver.load("summarization")
         except FileNotFoundError:
-            pass  # Fall through to legacy handling
-
-    # Legacy path resolution (backward compatibility)
-    if config_dir is None:
-        config_dir = get_project_root() / "config"
-    else:
-        config_dir = Path(config_dir)
-
-    prompt_path = config_dir / "prompts" / template_name
-
-    if prompt_path.exists():
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            return f.read()
-    else:
-        logger.warning(
-            f"Summarization prompt not found: {prompt_path}. "
-            "Using default prompt."
-        )
-        return """Summarize this agent conversation concisely.
+            logger.warning(
+                "Summarization prompt not found. Using default prompt."
+            )
+            template = """Summarize this agent conversation concisely.
 Focus on:
 1. What tasks were completed
 2. Key decisions made
@@ -1285,6 +1788,18 @@ Keep the summary under 500 words. Use bullet points.
 Conversation:
 {conversation}
 """
+
+    # Prepend reasoning directive only for OSS models that need it as prompt text
+    summarization_config = config.llm.get_phase_config("summarization")
+    method = detect_reasoning_method(
+        model or summarization_config.model,
+        summarization_config.reasoning_method,
+    )
+    if method == "prompt":
+        level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+        template = f"Reasoning: {level}\n\n{template}"
+
+    return template
 
 
 def get_all_tool_names(config: AgentConfig) -> List[str]:
@@ -1493,19 +2008,90 @@ def _parse_strategic_todos_yaml(path: Path) -> List[Dict[str, Any]]:
     return validated_todos
 
 
+def _parse_strategic_todos_yaml_from_string(content: str) -> List[Dict[str, Any]]:
+    """Parse and validate strategic todos from a YAML string.
+
+    Same validation as _parse_strategic_todos_yaml but works on string content
+    instead of a file path. Used when loading from resolved_config JSONB.
+
+    Args:
+        content: YAML string with todos schema
+
+    Returns:
+        List of todo dicts with 'id' and 'content' keys
+    """
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        raise StrategicTodosValidationError(
+            f"Invalid YAML syntax in strategic todos: {e}",
+            [f"YAML parse error: {e}"],
+        )
+
+    if data is None or not isinstance(data, dict) or "todos" not in data:
+        raise StrategicTodosValidationError(
+            "Strategic todos content must be a YAML mapping with 'todos' key",
+            ["Missing or invalid 'todos' structure"],
+        )
+
+    todos_raw = data["todos"]
+    if not isinstance(todos_raw, list):
+        raise StrategicTodosValidationError(
+            "'todos' must be a list",
+            [f"Expected list for 'todos', got {type(todos_raw).__name__}"],
+        )
+
+    validated_todos: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen_ids: set = set()
+
+    for i, item in enumerate(todos_raw):
+        if not isinstance(item, dict):
+            errors.append(f"Todo #{i + 1}: Expected mapping, got {type(item).__name__}")
+            continue
+        todo_id = item.get("id")
+        content_val = item.get("content")
+        if todo_id is None:
+            errors.append(f"Todo #{i + 1}: Missing required 'id' field")
+        elif not isinstance(todo_id, int):
+            errors.append(f"Todo #{i + 1}: 'id' must be an integer")
+        elif todo_id in seen_ids:
+            errors.append(f"Todo #{i + 1}: Duplicate id '{todo_id}'")
+        else:
+            seen_ids.add(todo_id)
+        if content_val is None:
+            errors.append(f"Todo #{i + 1}: Missing required 'content' field")
+        elif not isinstance(content_val, str):
+            errors.append(f"Todo #{i + 1}: 'content' must be a string")
+        elif len(content_val.strip()) < 10:
+            errors.append(f"Todo #{i + 1}: 'content' too short")
+        if todo_id is not None and content_val is not None and not errors:
+            validated_todos.append({"id": todo_id, "content": content_val.strip()})
+
+    if errors:
+        raise StrategicTodosValidationError(
+            f"Strategic todos validation failed with {len(errors)} error(s)", errors,
+        )
+    return validated_todos
+
+
 def load_strategic_todos_template(
     template_name: str,
     deployment_dir: Optional[str] = None,
+    model: str = "",
+    resolved_content: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Load a strategic todos template with deployment override support.
 
-    Checks deployment directory first, then falls back to framework templates.
-    This allows deployments to override strategic todos for customization.
+    Uses InstructionMatrixResolver for model-aware resolution. Checks
+    deployment directory first, then falls back to framework templates.
 
     Args:
         template_name: Name of the template file (e.g., "strategic_todos_initial.yaml")
         deployment_dir: Path to deployment directory (e.g., config/my_agent).
                        If None, only framework templates are used.
+        model: Model name for instruction matrix resolution.
+        resolved_content: Pre-resolved YAML content (from resolved_config JSONB).
 
     Returns:
         List of todo dicts with 'id' and 'content' keys
@@ -1513,35 +2099,28 @@ def load_strategic_todos_template(
     Raises:
         FileNotFoundError: If template not found in either location
         StrategicTodosValidationError: If template is invalid
-
-    Example:
-        ```python
-        todos = load_strategic_todos_template(
-            "strategic_todos_initial.yaml",
-            deployment_dir="config/my_agent"
-        )
-        # Returns: [{"id": 1, "content": "..."}, {"id": 2, "content": "..."}, ...]
-        ```
     """
-    # Check deployment directory first
-    if deployment_dir:
-        deployment_path = Path(deployment_dir) / template_name
-        if deployment_path.exists():
-            logger.debug(f"Loading strategic todos from deployment: {deployment_path}")
-            return _parse_strategic_todos_yaml(deployment_path)
+    # Check for pre-resolved content first
+    if resolved_content and isinstance(resolved_content, str):
+        logger.debug("Loading strategic todos from resolved content")
+        return _parse_strategic_todos_yaml_from_string(resolved_content)
 
-    # Fall back to framework templates directory
-    templates_dir = get_project_root() / "config" / "templates"
-    framework_path = templates_dir / template_name
+    # Use InstructionMatrixResolver for 4-level fallback
+    model_family = detect_model_family(model) if model else "default"
+    resolver = InstructionMatrixResolver(deployment_dir, model_family)
 
-    if framework_path.exists():
-        logger.debug(f"Loading strategic todos from framework: {framework_path}")
-        return _parse_strategic_todos_yaml(framework_path)
+    # Strip .yaml extension for instruction type key
+    instruction_type = template_name.replace(".yaml", "")
 
-    raise FileNotFoundError(
-        f"Strategic todos template not found: {template_name} "
-        f"(checked: {deployment_dir}, {templates_dir})"
-    )
+    try:
+        path = resolver._file_resolver.resolve(resolver.resolve_filename(instruction_type))
+        logger.debug(f"Loading strategic todos from: {path}")
+        return _parse_strategic_todos_yaml(path)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Strategic todos template not found: {template_name} "
+            f"(checked: {deployment_dir}, config/templates/)"
+        )
 
 
 def get_initial_strategic_todos_from_config(
@@ -1558,19 +2137,22 @@ def get_initial_strategic_todos_from_config(
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
         [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
-
-    Example:
-        ```python
-        todos = get_initial_strategic_todos_from_config(config)
-        todo_manager.set_todos_from_list(todos)
-        ```
     """
     deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+
+    # Check for pre-resolved content
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {})
+        resolved_content = resolved.get("strategic_todos_initial")
 
     try:
         raw_todos = load_strategic_todos_template(
             "strategic_todos_initial.yaml",
             deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
         )
     except FileNotFoundError:
         logger.warning(
@@ -1605,19 +2187,22 @@ def get_transition_strategic_todos_from_config(
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
         [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
-
-    Example:
-        ```python
-        todos = get_transition_strategic_todos_from_config(config)
-        todo_manager.set_todos_from_list(todos)
-        ```
     """
     deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+
+    # Check for pre-resolved content
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {})
+        resolved_content = resolved.get("strategic_todos_transition")
 
     try:
         raw_todos = load_strategic_todos_template(
             "strategic_todos_transition.yaml",
             deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
         )
     except FileNotFoundError:
         logger.warning(
@@ -1654,11 +2239,20 @@ def get_resume_strategic_todos_from_config(
         [{"id": "todo_1", "content": "...", "status": "pending", "priority": "medium"}, ...]
     """
     deployment_dir = config._deployment_dir if config else None
+    model = config.llm.model if config else ""
+
+    # Check for pre-resolved content
+    resolved_content = None
+    if config:
+        resolved = config.extra.get("_resolved_instructions", {})
+        resolved_content = resolved.get("strategic_todos_resume")
 
     try:
         raw_todos = load_strategic_todos_template(
             "strategic_todos_resume.yaml",
             deployment_dir=deployment_dir,
+            model=model,
+            resolved_content=resolved_content,
         )
     except FileNotFoundError:
         logger.warning(
@@ -1677,3 +2271,83 @@ def get_resume_strategic_todos_from_config(
         }
         for t in raw_todos
     ]
+
+
+# =============================================================================
+# Resolved Config Serialization
+# =============================================================================
+
+
+def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
+    """Serialize the fully resolved config (agent config + all prompt/instruction content).
+
+    Captures everything needed to reproduce a job's config without disk access.
+    Used to freeze config into the resolved_config JSONB column at job start.
+
+    Args:
+        config: Fully resolved AgentConfig
+        model: Model name for matrix resolution
+
+    Returns:
+        Dict suitable for JSON serialization and storage in JSONB
+    """
+    import dataclasses
+    from datetime import datetime, timezone
+
+    model_family = detect_model_family(model) if model else "default"
+
+    # Agent config as dict (strip internal fields and secrets)
+    agent_dict = dataclasses.asdict(config)
+    agent_dict.pop("_deployment_dir", None)
+    # Strip API keys from LLM configs
+    for key in ["api_key"]:
+        agent_dict.get("llm", {}).pop(key, None)
+        for phase in ["strategic", "tactical", "summarization"]:
+            override = agent_dict.get("llm", {}).get(phase)
+            if isinstance(override, dict):
+                override.pop(key, None)
+
+    # Resolve all prompts to full text
+    prompt_resolver = PromptMatrixResolver(config._deployment_dir, model_family)
+    prompts = {}
+    for pt in ["systemprompt", "persona", "strategic", "tactical", "summarization"]:
+        try:
+            prompts[pt] = prompt_resolver.load(pt)
+        except FileNotFoundError:
+            prompts[pt] = None
+
+    # Resolve all instructions to full text
+    instr_resolver = InstructionMatrixResolver(config._deployment_dir, model_family)
+    instructions = {}
+    for it in InstructionMatrixResolver.HARDCODED_DEFAULTS:
+        try:
+            instructions[it] = instr_resolver.load(it)
+        except FileNotFoundError:
+            instructions[it] = None
+
+    return {
+        "agent": agent_dict,
+        "prompts": prompts,
+        "instructions": instructions,
+        "model_family": model_family,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def load_config_from_resolved(resolved: dict) -> AgentConfig:
+    """Reconstruct an AgentConfig from a resolved_config JSONB snapshot.
+
+    The returned config has pre-resolved prompt and instruction content
+    stored in config.extra, so loading functions can bypass disk access.
+
+    Args:
+        resolved: Dict from resolved_config JSONB column
+
+    Returns:
+        AgentConfig with pre-resolved content in config.extra
+    """
+    config = load_agent_config_from_dict(resolved["agent"])
+    # Store pre-resolved content for runtime use
+    config.extra["_resolved_prompts"] = resolved.get("prompts", {})
+    config.extra["_resolved_instructions"] = resolved.get("instructions", {})
+    return config

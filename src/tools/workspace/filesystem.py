@@ -214,6 +214,20 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         # Cap depth at 3 to prevent excessive output
         depth = max(0, min(3, depth))
 
+        def _strip_prefix(item_path: str, base_path: str) -> str:
+            """Strip parent directory prefix from workspace-relative path.
+
+            workspace.list_files() returns paths relative to the workspace root
+            (e.g., "output/data/"), but for display we want paths relative to
+            the queried directory (e.g., "data/").
+            """
+            if not base_path:
+                return item_path
+            prefix = base_path.rstrip("/") + "/"
+            if item_path.startswith(prefix):
+                return item_path[len(prefix):]
+            return item_path
+
         def list_recursive(dir_path: str, current_depth: int, indent: str) -> list[str]:
             """Recursively list directory contents up to specified depth."""
             lines = []
@@ -225,16 +239,16 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             dirs = sorted([i for i in items if i.endswith("/")])
             files = sorted([i for i in items if not i.endswith("/")])
 
-            # Add files at this level
+            # Add files at this level (strip prefix for display)
             for f in files:
-                lines.append(f"{indent}{f}")
+                lines.append(f"{indent}{_strip_prefix(f, dir_path)}")
 
             # Add directories and optionally their contents
             for d in dirs:
-                lines.append(f"{indent}{d}")
+                lines.append(f"{indent}{_strip_prefix(d, dir_path)}")
                 if current_depth < depth:
-                    subdir_path = f"{dir_path}/{d.rstrip('/')}" if dir_path else d.rstrip("/")
-                    sub_lines = list_recursive(subdir_path, current_depth + 1, indent + "  ")
+                    # d is already workspace-relative, use directly
+                    sub_lines = list_recursive(d.rstrip("/"), current_depth + 1, indent + "  ")
                     lines.extend(sub_lines)
 
             return lines
@@ -261,10 +275,10 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             if dirs:
                 lines.append("Directories:")
                 for d in dirs:
-                    lines.append(f"  {d}")
+                    lines.append(f"  {_strip_prefix(d, path)}")
                     if depth > 0:
-                        subdir_path = f"{path}/{d.rstrip('/')}" if path else d.rstrip("/")
-                        sub_lines = list_recursive(subdir_path, 1, "    ")
+                        # d is already workspace-relative, use directly
+                        sub_lines = list_recursive(d.rstrip("/"), 1, "    ")
                         lines.extend(sub_lines)
 
             if files:
@@ -272,7 +286,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     lines.append("")
                 lines.append("Files:")
                 for f in files:
-                    lines.append(f"  {f}")
+                    lines.append(f"  {_strip_prefix(f, path)}")
 
             return "\n".join(lines)
 

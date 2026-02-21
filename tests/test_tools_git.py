@@ -69,7 +69,7 @@ def temp_workspace():
 def git_manager(temp_workspace):
     """Create an initialized GitManager."""
     gm = GitManager(temp_workspace)
-    gm.init_repository(ignore_patterns=["*.log", "*.tmp"])
+    gm.init_repository()
     return gm
 
 

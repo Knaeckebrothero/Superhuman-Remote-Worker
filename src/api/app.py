@@ -159,9 +159,15 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
         import psutil
 
         process = psutil.Process()
+        listening = [
+            c for c in psutil.net_connections(kind="inet")
+            if c.status == "LISTEN"
+        ]
         return {
             "memory_mb": process.memory_info().rss / (1024 * 1024),
             "cpu_percent": process.cpu_percent(),
+            "listening_ports": len(listening),
+            "process_count": len(psutil.pids()),
         }
     except ImportError:
         # psutil not installed
@@ -169,6 +175,96 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug(f"Failed to collect metrics: {e}")
         return None
+
+
+def _collect_system_info() -> Dict[str, Any]:
+    """Collect comprehensive system information for the /system/info endpoint."""
+    import psutil
+
+    # CPU
+    cpu_info = {
+        "percent": psutil.cpu_percent(interval=0.1),
+        "cores": psutil.cpu_count(),
+    }
+
+    # Memory
+    mem = psutil.virtual_memory()
+    memory_info = {
+        "total_mb": round(mem.total / (1024 * 1024)),
+        "used_mb": round(mem.used / (1024 * 1024)),
+        "percent": mem.percent,
+    }
+
+    # Disk
+    disk = psutil.disk_usage("/")
+    disk_info = {
+        "total_gb": round(disk.total / (1024 ** 3), 1),
+        "used_gb": round(disk.used / (1024 ** 3), 1),
+        "percent": disk.percent,
+    }
+
+    # Listening ports
+    listening_ports = []
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.status == "LISTEN":
+                listening_ports.append({
+                    "port": c.laddr.port,
+                    "address": c.laddr.ip,
+                    "pid": c.pid,
+                })
+    except (psutil.AccessDenied, PermissionError):
+        pass
+
+    # Top 20 processes by memory
+    processes = []
+    try:
+        for proc in sorted(
+            psutil.process_iter(["pid", "name", "cmdline", "memory_info", "cpu_percent"]),
+            key=lambda p: (p.info.get("memory_info") or type("", (), {"rss": 0})).rss,
+            reverse=True,
+        )[:20]:
+            info = proc.info
+            mem_info = info.get("memory_info")
+            cmdline = info.get("cmdline") or []
+            processes.append({
+                "pid": info["pid"],
+                "name": info.get("name", ""),
+                "cmd": " ".join(cmdline[:5]) if cmdline else "",
+                "memory_mb": round(mem_info.rss / (1024 * 1024), 1) if mem_info else 0,
+                "cpu_percent": info.get("cpu_percent", 0),
+            })
+    except (psutil.AccessDenied, PermissionError):
+        pass
+
+    # Established TCP connections (limit 50)
+    network_connections = []
+    try:
+        for c in psutil.net_connections(kind="inet"):
+            if c.status == "ESTABLISHED" and len(network_connections) < 50:
+                network_connections.append({
+                    "local": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "",
+                    "remote": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else "",
+                    "pid": c.pid,
+                })
+    except (psutil.AccessDenied, PermissionError):
+        pass
+
+    # Agent info
+    agent_info: Dict[str, Any] = {"agent_id": None, "current_job": None}
+    if _agent:
+        agent_info["agent_id"] = _agent.config.agent_id
+    agent_info["current_job"] = _current_job_id
+
+    return {
+        "cpu": cpu_info,
+        "memory": memory_info,
+        "disk": disk_info,
+        "listening_ports": listening_ports,
+        "processes": processes,
+        "network_connections": network_connections,
+        "agent": agent_info,
+    }
 
 
 class _FlushingFileHandler(logging.FileHandler):
@@ -229,6 +325,44 @@ def _cleanup_job_file_handler(job_id: str) -> None:
                 root.removeHandler(handler)
 
 
+async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) -> None:
+    """Update job status in PostgreSQL based on graph execution result.
+
+    Determines the appropriate status from the final state:
+    - error present → 'failed'
+    - should_stop=True → 'pending_review' (frozen for human review)
+      This covers both goal_achieved=True (agent called job_complete)
+      and goal_achieved=False (iteration limit or other stop condition).
+    - Otherwise → leave as 'processing' (only explicit approval sets 'completed')
+    """
+    if _agent is None or _agent.postgres_conn is None:
+        logger.warning(f"Cannot update job {job_id} status: no database connection")
+        return
+
+    try:
+        error = result.get("error")
+        should_stop = result.get("should_stop", False)
+
+        if error:
+            error_msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
+            await _agent.postgres_conn.jobs.update_status(
+                job_id, status="failed", error_message=error_msg
+            )
+            logger.info(f"Updated job {job_id} status to 'failed'")
+        elif should_stop:
+            await _agent.postgres_conn.jobs.update_status(
+                job_id, status="pending_review"
+            )
+            logger.info(f"Updated job {job_id} status to 'pending_review'")
+        else:
+            logger.warning(
+                f"Job {job_id} ended without should_stop or error — "
+                f"leaving status unchanged (goal_achieved={result.get('goal_achieved')})"
+            )
+    except Exception as e:
+        logger.error(f"Failed to update job {job_id} status: {e}")
+
+
 async def _process_orchestrator_job(
     job_id: str,
     description: str,
@@ -239,6 +373,7 @@ async def _process_orchestrator_job(
     document_dir: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
     instructions: Optional[str] = None,
+    config_name: Optional[str] = None,
     config_override: Optional[Dict[str, Any]] = None,
     git_remote_url: Optional[str] = None,
     datasources: Optional[list] = None,
@@ -276,6 +411,8 @@ async def _process_orchestrator_job(
             metadata.update(context)
         if instructions:
             metadata["instructions"] = instructions
+        if config_name and config_name != "default":
+            metadata["config_name"] = config_name
         if config_override:
             metadata["config_override"] = config_override
         if git_remote_url:
@@ -296,11 +433,16 @@ async def _process_orchestrator_job(
         result = final_state or {}
         logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
 
+        # Update job status in database based on final state
+        await _update_job_status_from_result(job_id, result)
+
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")
         raise
     except Exception as e:
         logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
+        # Mark job as failed in database
+        await _update_job_status_from_result(job_id, {"error": {"message": str(e)}})
     finally:
         _current_job_id = None
         _cleanup_job_file_handler(job_id)
@@ -355,8 +497,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             uptime_seconds=status["uptime_seconds"],
             checks={
                 "initialized": status["initialized"],
-                "postgres": status["connections"]["postgres"],
-                "neo4j": status["connections"]["neo4j"],
+                "postgres": status["connections"].get("postgres", False),
             },
         )
 
@@ -432,6 +573,27 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         )
 
     # =========================================================================
+    # System Monitoring
+    # =========================================================================
+
+    @app.get("/system/info", tags=["Monitoring"])
+    async def system_info() -> Dict[str, Any]:
+        """Get comprehensive system information for container monitoring.
+
+        Returns CPU, memory, disk usage, listening ports, top processes,
+        established network connections, and agent state.
+        """
+        try:
+            return _collect_system_info()
+        except ImportError:
+            raise HTTPException(
+                status_code=501,
+                detail="psutil not installed — system monitoring unavailable",
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # =========================================================================
     # Orchestrator Integration Endpoints
     # =========================================================================
 
@@ -482,6 +644,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 document_dir=request.document_dir,
                 context=request.context,
                 instructions=request.instructions,
+                config_name=request.config_name,
                 config_override=request.config_override,
                 git_remote_url=request.git_remote_url,
                 datasources=request.datasources,
@@ -598,6 +761,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         # Start processing in background
         async def _resume_job():
             global _current_job_id
+            _setup_job_file_logging(request.job_id)
             try:
                 result = await _agent.process_job(
                     request.job_id,
@@ -607,13 +771,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     original_config_name=config_name,
                 )
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
+                # Update job status in database based on final state
+                await _update_job_status_from_result(request.job_id, result or {})
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
                 raise
             except Exception as e:
                 logger.error(f"Resumed job {request.job_id} failed: {e}", exc_info=True)
+                await _update_job_status_from_result(request.job_id, {"error": {"message": str(e)}})
             finally:
                 _current_job_id = None
+                _cleanup_job_file_handler(request.job_id)
 
         _current_job_task = asyncio.create_task(_resume_job())
 

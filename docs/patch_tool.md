@@ -1,3 +1,20 @@
+---
+tags:
+  - tool-development
+  - coding-tools
+  - agent-architecture
+aliases:
+  - patch tool
+  - multi-file edit
+  - transfer_content
+  - apply_patch
+related:
+  - "[[tool_issues]]"
+  - "[[tools_description]]"
+  - "[[coding_agent]]"
+  - "[[agent_improvements]]"
+---
+
 # Patch Tool Research: Multi-File Content Operations
 
 ## Problem
@@ -198,3 +215,10 @@ def extracted_function():
 - [Windsurf Cascade](https://docs.windsurf.com/windsurf/cascade/cascade)
 - [Amazon Q Developer built-in tools](https://docs.aws.amazon.com/amazonq/latest/qdeveloper-ug/command-line-built-in-tools.html)
 - [Google Jules](https://blog.google/technology/google-labs/jules/)
+
+## Related
+
+- [[tool_issues]] - Tool phase filtering and enforcement concerns
+- [[tools_description]] - Agent tools including Neo4j and workspace tools
+- [[coding_agent]] - Coding agent configuration and capabilities
+- [[agent_improvements]] - General agent improvement proposals

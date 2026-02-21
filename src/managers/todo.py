@@ -349,6 +349,65 @@ class TodoManager:
             return False
         return all(t.status == TodoStatus.COMPLETED for t in self._todos)
 
+    def format_for_injection(self) -> str:
+        """Format the full todo list for transient HumanMessage injection.
+
+        Returns all todos grouped by status (completed, in progress, pending)
+        with a brief tool usage guide. Completed items are shown as crossed
+        off so the agent retains awareness of finished work after context
+        compaction.
+
+        Returns:
+            Formatted string for injection into prepared_messages
+        """
+        if not self._todos:
+            return "No active todos."
+
+        phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
+        phase_name = self._current_phase_name or self._staged_phase_name
+        if phase_name:
+            lines = [f"Current Tasks — Phase {self._phase_number} ({phase_type}): {phase_name}"]
+        else:
+            lines = [f"Current Tasks — Phase {self._phase_number} ({phase_type})"]
+
+        # Completed
+        completed = [t for t in self._todos if t.status == TodoStatus.COMPLETED]
+        if completed:
+            lines.append("")
+            lines.append("Completed:")
+            for todo in completed:
+                lines.append(f"  - [x] {todo.id}: {todo.content}")
+
+        # In progress
+        in_progress = [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        if in_progress:
+            lines.append("")
+            lines.append("In Progress:")
+            for todo in in_progress:
+                lines.append(f"  - [>] {todo.id}: {todo.content}")
+
+        # Pending
+        pending = [t for t in self._todos if t.status == TodoStatus.PENDING]
+        if pending:
+            lines.append("")
+            lines.append("Pending:")
+            priority_order = {"high": 0, "medium": 1, "low": 2}
+            pending_sorted = sorted(
+                pending, key=lambda t: priority_order.get(t.priority, 1)
+            )
+            for todo in pending_sorted:
+                lines.append(f"  - [ ] {todo.id}: {todo.content}")
+
+        # Tool usage guide
+        lines.append("")
+        lines.append(
+            "Tools: Use `todo_complete(todo_id=\"<id>\")` when a task is finished. "
+            "Use `todo_rewind(todo_id=\"<id>\")` to revisit a completed task. "
+            "Use `mark_complete` to signal the current phase is done."
+        )
+
+        return "\n".join(lines)
+
     def format_for_display(self) -> str:
         """Format todos for Layer 2 injection.
 

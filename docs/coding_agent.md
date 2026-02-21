@@ -1,3 +1,19 @@
+---
+tags:
+  - coding-tools
+  - agent-architecture
+  - tool-development
+  - git-integration
+aliases:
+  - Coder Agent
+  - Coding Expert
+related:
+  - "[[cloud_workspace]]"
+  - "[[cli_wrapper]]"
+  - "[[calculator_code]]"
+  - "[[auxiliary_tasks]]"
+---
+
 # Coding Agent
 
 Design document for a coding-capable agent configuration that can implement features, fix bugs, run tests, and submit PRs — tested on this project.
@@ -386,3 +402,11 @@ cat workspace/job_<job_id>/workspace.md
 2. **Long-running processes**: Dev servers (`npm start`) block. Need background process support or just document "don't do that"?
 3. **Auth for git push/PR**: How to provide git credentials inside the sandbox without exposing them to the agent's LLM context? Token mounted as file + gitconfig.
 4. **Self-improvement**: Can the coding agent modify its own codebase? (The singularity question. For now: yes, on a feature branch, reviewed by a human.)
+
+## Related
+
+- [[cloud_workspace]] — Production container architecture for the coding agent
+- [[cli_wrapper]] — Claude Code SDK as alternative execution backend
+- [[calculator_code]] — Code execution and calculator tools
+- [[auxiliary_tasks]] — Phase alternation model that the agent uses
+- [[agent_improvements]] — Architecture improvements for long-running agents

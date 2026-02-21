@@ -40,7 +40,6 @@ function createMockChatEntries(count: number): ChatEntry[] {
     _id: `chat_${i}`,
     job_id: 'test-job-1',
     agent_type: 'creator',
-    sequence_number: i,
     timestamp: new Date(Date.now() + i * 1000).toISOString(),
     iteration: 1,
     model: 'gpt-4',

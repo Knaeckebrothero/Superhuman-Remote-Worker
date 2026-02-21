@@ -1,12 +1,68 @@
 # Superhuman Remote Worker
 
-An AI agent you can treat like a remote employee. Message it a task — research, data analysis, document processing, database work, coding — and it gets it done autonomously. Built on LangGraph with a config-driven architecture that adapts to any role.
+A self-improving AI agent system. Three specialized agents form a continuous innovation cycle: one explores ideas, one tears them apart, one builds the survivors. The system gets better on its own.
 
-## How It Works
+Built on LangGraph with a config-driven architecture. Same codebase, different YAML configs, different roles.
 
-You describe a job in plain language. The agent breaks it down into phases, plans its approach, executes using the tools it needs, and delivers results — just like a remote worker on your team. It self-manages through strategic planning and tactical execution cycles, maintaining its own workspace, notes, and progress tracking across arbitrarily long tasks.
+## The Innovation Cycle
 
-**What it can do:**
+The typical human-AI workflow looks like this: you have an idea, you dump it on the AI, the AI builds it, then you spend forever refactoring because your inner perfectionist won't let you merge something that works but isn't elegant. Repeat.
+
+This system replaces that loop with three agents that run it continuously:
+
+```
+         ┌──────────────────────────────────────────────────┐
+         │                                                  │
+         ▼                                                  │
+   ┌──────────┐     writes ideas     ┌──────────┐          │
+   │  SCHOLAR │ ──────────────────► │  CRITIC  │          │
+   │          │                      │          │          │
+   │ Explores │     reviews &        │ Reviews  │          │
+   │ the web, │     rates them       │ rejects  │          │
+   │ codebase,│ ◄────────────────── │ or       │          │
+   │ papers,  │  feedback/issues     │ approves │          │
+   │ logs     │                      └────┬─────┘          │
+   └──────────┘                           │                │
+                              approved ideas               │
+                              & issue fixes                │
+                                          │                │
+                                          ▼                │
+                                   ┌──────────┐            │
+                                   │DEVELOPER │            │
+                                   │          │            │
+                                   │ Builds,  │ ───────────┘
+                                   │ tests,   │  code changes feed
+                                   │ ships    │  back into the cycle
+                                   │ PRs      │
+                                   └──────────┘
+```
+
+**Scholar** — The idea factory. Continuously scans the web, digs through the codebase, analyzes past agent runs, and runs experiments. Produces a high volume of idea artifacts. Doesn't self-filter — that's the Critic's job. Also takes inspiration from issues and feedback the Critic raises about the existing codebase.
+
+**Critic** — The quality gate. Reads Scholar's proposals, reviews code diffs, audits the codebase for tech debt, runs tests. Everything gets a verdict: APPROVED, REJECTED, or NEEDS INVESTIGATION. Harsh, direct, evidence-based. Every claim cites file:line. No approval with failing tests.
+
+**Developer** — The PR factory. Picks up approved ideas and Critic-identified issues, delegates implementation to Claude Code sessions, verifies results via git, and ships focused PRs. One feature per PR, one bug fix per PR. Throughput over perfection.
+
+The cycle repeats. Scholar sees the new code and finds more to explore. Critic reviews what Developer shipped. Developer picks up the next batch. The system improves because the loop never stops.
+
+### Why This Works
+
+The problem with human-in-the-loop AI development isn't the AI — it's the human bottleneck. You can only review so fast, you get attached to your ideas, and your perfectionism stalls shipping.
+
+This system applies evolutionary pressure:
+- **Random mutation** — Scholar generates volume, most of it mediocre, some of it brilliant
+- **Selection pressure** — Critic filters ruthlessly, only the good stuff survives
+- **Implementation** — Developer builds the survivors, fast and focused
+
+No human bottleneck in the loop. You set the direction, the system iterates.
+
+### The General Secretary
+
+The default config (`config/defaults.yaml`) is the **General Secretary** — a jack-of-all-trades with all tools enabled and no specialization. This is the agent you talk to directly for ad-hoc tasks, the one that doesn't fit neatly into the innovation cycle. It's the escape hatch for "just do this thing."
+
+## What It Can Do
+
+Beyond the innovation cycle, each agent is a general-purpose LangGraph worker that can:
 - Research topics on the web and synthesize findings
 - Process and analyze documents (PDF, DOCX, PPTX, images)
 - Query and manipulate databases (PostgreSQL, Neo4j, MongoDB)
@@ -215,22 +271,34 @@ pytest tests/ --cov=src                    # With coverage
                  │  Statistics & API         │
                  └─────────────┬─────────────┘
                                │
-             ┌─────────────────┼─────────────────┐
-             │                 │                 │
-             ▼                 ▼                 ▼
-┌────────────────────┐  ┌───────────┐  ┌─────────────────┐
-│  UNIVERSAL AGENT   │  │ PostgreSQL│  │  Datasources    │
-│                    │  │ (system)  │  │  (per-job)      │
-│ Config-driven      │  └───────────┘  │                 │
-│ Phase planning     │                 │ PostgreSQL      │
-│ Tool execution     │                 │ Neo4j           │
-│ Crash recovery     │                 │ MongoDB         │
-└────────────────────┘                 └─────────────────┘
+         ┌─────────────┬───────┴───────┬─────────────┐
+         │             │               │             │
+         ▼             ▼               ▼             ▼
+   ┌──────────┐ ┌──────────┐  ┌───────────┐ ┌────────────┐
+   │ SCHOLAR  │ │  CRITIC  │  │ DEVELOPER │ │ GENERAL    │
+   │          │ │          │  │           │ │ SECRETARY  │
+   │ R&D,     │ │ Review,  │  │ Claude    │ │            │
+   │ ideas,   │ │ quality  │  │ Code PRs  │ │ All tools, │
+   │ research │ │ gating   │  │           │ │ ad-hoc     │
+   └──────────┘ └──────────┘  └───────────┘ └────────────┘
+         │             │               │
+         ▼             ▼               ▼
+   ┌───────────┐  ┌───────────┐  ┌─────────────────┐
+   │ PostgreSQL│  │  MongoDB  │  │  Datasources    │
+   │ (system)  │  │ (logging) │  │  (per-job)      │
+   └───────────┘  └───────────┘  └─────────────────┘
 ```
 
-### Universal Agent
+### Expert Lineup
 
-A single agent codebase configured for different roles via YAML. Configs live in `config/` and use `$extends: defaults` for inheritance. See [config/README.md](config/README.md) for details.
+| Expert | Config | Role |
+|--------|--------|------|
+| **General Secretary** | `config/defaults.yaml` | Default — all tools, no specialization, direct human interaction |
+| **Scholar** | `config/experts/scholar/` | Continuous R&D exploration, idea generation, web research |
+| **Critic** | `config/experts/critic/` | Code review, proposal review, codebase audits, test execution |
+| **Developer** | `config/experts/developer/` | Claude Code delegation, PR factory, implementation |
+
+All experts share the same universal agent codebase. Configs live in `config/` and use `$extends: defaults` for inheritance. See [config/README.md](config/README.md) for details.
 
 ### Phase Alternation
 

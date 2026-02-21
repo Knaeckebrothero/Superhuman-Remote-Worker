@@ -1,3 +1,14 @@
+---
+tags:
+  - agent-architecture
+  - tool-development
+  - context-management
+  - planning
+  - configuration
+aliases:
+  - ["Universal Agent", "Agent Overview"]
+---
+
 # Universal Agent Overview
 
 This document provides a high-level overview of the Universal Agent system for team members who want to understand how it works.
@@ -169,7 +180,7 @@ On every generation, the LLM receives this information in order:
 
 ### Context Management
 
-The agent has an 80,000 token context window. When approaching this limit:
+The agent has an 80,000 token context window (see [[compact_chat]]). When approaching this limit:
 1. Older messages are summarized
 2. Recent 5 tool results are kept intact
 3. Protected context (plan + todos) is re-injected
@@ -203,6 +214,15 @@ The same Universal Agent code runs as two different agent types based on configu
 
 The Universal Agent is a **config-driven, workspace-centric autonomous system** that:
 - Loops through thinking → tool use → checking until done
-- Uses a workspace folder for persistent storage and memory
+- Uses a workspace folder for persistent storage and memory (see [[guardrails]])
 - Receives refreshed context (plan + todos) on every iteration
-- Can be configured as Creator or Validator with different tools and behaviors
+- Can be configured as Creator or Validator with different tools and behaviors (see [[hive_implementation]])
+
+## Related
+
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[compact_chat]]
+- [[cleanup]]
+- [[hive_implementation]]
+- [[tool_implementation]]

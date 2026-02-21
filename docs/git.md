@@ -1,3 +1,19 @@
+---
+tags:
+  - git-integration
+  - agent-architecture
+  - planning
+aliases:
+  - Workspace Git
+  - GitManager
+  - Phase Tracking
+related:
+  - "[[deliverables]]"
+  - "[[phase_number_issues]]"
+  - "[[deployment]]"
+  - "[[debug_cockpit]]"
+  - "[[interactive_planning]]"
+---
 # Git Versioning for Agent Workspaces
 
 ## Problem Statement
@@ -778,3 +794,11 @@ If multiple agents work on the same workspace:
 - [x] Update `config/prompts/strategic.txt` with git review instructions
 - [x] Add instructions for reading `phase_state.yaml` on context recovery
 - [ ] Test agent behavior with new prompts (manual testing)
+
+## Related
+
+- [[deliverables]] - Git-based delivery mechanism pushes workspace to Gitea
+- [[phase_number_issues]] - Git tags and phase_state.yaml solve phase numbering bugs
+- [[deployment]] - Git infrastructure within the containerized stack
+- [[debug_cockpit]] - Workspace browser component browses git repo contents
+- [[interactive_planning]] - Phase branches and PR-based review model

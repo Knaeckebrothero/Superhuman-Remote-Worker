@@ -1,15 +1,29 @@
+---
+tags:
+  - agent-architecture
+  - tool-development
+  - data-management
+  - knowledge-management
+  - planning
+  - configuration
+aliases:
+  - "Multi-Agent Document Ingestion"
+  - "Document Ingestion Pipeline"
+  - "Multi-Agent Pipeline"
+---
+
 # Multi-Agent Document Ingestion Pipeline
 
 ## Executive Summary
 
-This document describes a multi-agent system for processing large documents (e.g., 100-page legal/compliance texts) and extracting, validating, and integrating requirement candidates into the existing Neo4j knowledge graph.
+This document describes a multi-agent system for processing large documents (e.g., 100-page legal/compliance texts) and extracting, validating, and integrating requirement candidates into the existing [[neo4j_migration_deep_dive|Neo4j]] knowledge graph.
 
 **The Problem:** Users want to upload large documents and have the system automatically:
 1. Extract potential requirements from unstructured text
 2. Validate each candidate against the existing knowledge graph
 3. Integrate verified requirements into the FINIUS metamodel
 
-**The Solution:** A four-stage pipeline using specialized LangGraph agents:
+**The Solution:** A four-stage pipeline using specialized [[langgraph_checkpointing_assessment|LangGraph]] agents:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -527,7 +541,7 @@ class RejectedCandidate:
 | `resolve_message` | Match mentioned entity to existing Message |
 | `check_metamodel_compatibility` | Pre-validate against FINIUS constraints |
 | `generate_requirement_id` | Create unique RID following conventions |
-| `web_search` | Look up regulatory context (existing tool) |
+| `web_search` | Look up regulatory context (existing tool, see [[tavily_implementation]]) |
 
 **Validation Logic:**
 
@@ -1276,7 +1290,7 @@ src/
 
 ### 9.2 Checkpointing
 
-Use LangGraph's built-in checkpointing:
+Use [[langgraph_checkpointing_assessment|LangGraph's built-in checkpointing]]:
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
@@ -1345,3 +1359,11 @@ def handle_extraction_failure(chunk: DocumentChunk, error: Exception) -> List:
 - [Chunking Strategies for LLM Applications](https://www.pinecone.io/learn/chunking-strategies/)
 - [Legal Chunking Research](https://www.researchgate.net/publication/386472016_Legal_Chunking_Evaluating_Methods_for_Effective_Legal_Text_Retrieval)
 - [AWS Multi-Agent with LangGraph](https://aws.amazon.com/blogs/machine-learning/build-multi-agent-systems-with-langgraph-and-amazon-bedrock/)
+
+## Related
+- [[neo4j_migration_deep_dive]]
+- [[langgraph_checkpointing_assessment]]
+- [[tavily_implementation]]
+- [[graph_visualization]]
+- [[my_vision]]
+- [[hive_implementation]]

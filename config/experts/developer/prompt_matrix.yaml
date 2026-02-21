@@ -1,0 +1,7 @@
+# Developer expert prompt matrix
+# Only list entries that differ from the base matrix.
+# These files exist in config/experts/developer/ and are found by file search.
+
+default:
+  strategic: strategic.txt
+  tactical: tactical.txt
