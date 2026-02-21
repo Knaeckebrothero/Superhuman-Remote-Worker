@@ -234,6 +234,44 @@ Both use the same 4-level resolution chain:
 
 Once the filename is determined, `FileResolver` locates the actual file — checking the expert directory first, then falling back to the framework directory. See `config/README.md` for full documentation.
 
+### Autonomy Levels
+
+Controls when the agent pauses for human review (`autonomy` key in config):
+
+| Level | Behavior |
+|-------|----------|
+| `full` | Never freezes, runs to completion autonomously |
+| `review` | Freezes at job completion for human review (default) |
+| `partial` | Freezes at phase boundaries and job completion |
+| `guided` | Freezes after every tactical phase |
+| `dependent` | Freezes after every phase (strategic and tactical) |
+
+### Instruction Files System
+
+Config-driven auto-injection of guidance documents before specific tool calls:
+
+```yaml
+instruction_files:
+  - file: todo_guide.md
+    trigger: before_tool:next_phase_todos
+    enforce: true   # passive: tool rejects until agent reads file
+    # enforce: false  # active: system injects content as transient message
+```
+
+### Claude Code Delegation
+
+The `claude_code` tool spawns Claude Code CLI sessions in print mode (`-p`) to delegate heavy work. Supports multi-turn sessions via `session_id`. Requires Claude Code CLI installed and authenticated (`claude auth login`).
+
+```yaml
+claude_code:
+  model: claude-opus-4-6
+  effort_level: high  # low, medium, high
+```
+
+### KeyRing (API Key Rotation)
+
+`src/llm/key_ring.py` provides tiered API key fallback with cooldown-based rotation. Comma-separated keys in environment variables (e.g., `OPENAI_API_KEY=key1,key2,key3`) are automatically rotated on auth/quota failures. Thread-safe, with masked key logging.
+
 ### Resolved Config JSONB
 
 On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
@@ -242,13 +280,13 @@ Tool categories in config:
 - `workspace`: File operations (read_file, write_file, list_files, etc.)
 - `core`: Task management + completion (next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete)
 - `document`: Document processing (chunk_document)
-- `research`: Web search (web_search)
-- `citation`: Citation & literature management (cite_document, cite_web, list_sources, search_library, annotate_source, get_annotations, tag_source, etc.)
+- `research`: Web search, academic papers, browser automation (web_search, extract_webpage, crawl_website, map_website, search_papers, download_paper, get_paper_info, browse_website, download_from_website, research_topic)
+- `citation`: Citation & literature management (cite_document, cite_web, list_sources, get_citation, list_citations, edit_citation, annotate_source, get_annotations, tag_source, search_library, generate_bibliography)
 - `graph`: Neo4j operations (execute_cypher_query, get_database_schema) — injected by orchestrator when Neo4j datasource attached
 - `sql`: PostgreSQL operations (sql_query, sql_schema, sql_execute) — injected by orchestrator when PostgreSQL datasource attached
 - `mongodb`: MongoDB operations (mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update) — injected by orchestrator when MongoDB datasource attached
 - `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
-- `coding`: Shell command execution (run_command)
+- `coding`: Shell execution + Claude Code delegation (run_command, claude_code)
 
 **Phase-specific tool filtering**: Tools declare their phase availability via `phases` metadata in `TOOL_REGISTRY` (`src/tools/registry.py`). Each tool entry specifies `phases: ["strategic", "tactical"]` or a subset. `filter_tools_by_phase()` removes tools not available in the current phase before binding to the LLM. `job_complete` is strategic-only; tactical phases cannot signal job completion directly.
 
@@ -298,8 +336,9 @@ Compaction preserves the 10 most recent tool results and sanitizes orphaned `Too
 
 Config keys:
 - `limits.context_threshold_tokens`: 80000 (default)
-- `limits.message_count_threshold`: 200 messages
-- `context_management.keep_recent_tool_results`: 10
+- `limits.message_count_threshold`: 300 messages (with `message_count_min_tokens: 50000`)
+- `limits.summarization_chunk_size`: 80000
+- `context_management.keep_recent_tool_results`: 15
 
 ### Workspace-Centric Memory Model
 
@@ -333,6 +372,7 @@ This separation means workspace.md survives context compaction while the convers
   - `description_cache.py` - DescriptionCache for caching vision outputs
 - `src/llm/` - LLM wrappers
   - `reasoning_chat.py` - ReasoningChatOpenAI: captures `reasoning_content` from DeepSeek R1-style models, Layer 0 context overflow protection
+  - `key_ring.py` - KeyRing: tiered API key fallback with cooldown-based rotation
 - `src/tools/` - Tool implementations and registry
   - `registry.py` - Tool metadata registry with phase filtering
   - `context.py` - ToolContext dependency injection
@@ -340,6 +380,7 @@ This separation means workspace.md survives context compaction while the convers
 - `src/tools/graph/` - Neo4j datasource tools (execute_cypher_query, get_database_schema)
 - `src/tools/sql/` - PostgreSQL datasource tools (sql_query, sql_schema, sql_execute)
 - `src/tools/mongodb/` - MongoDB datasource tools (mongo_query, mongo_aggregate, etc.)
+- `src/tools/coding/claude_code.py` - Claude Code delegation tool
 - `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
   - `postgres_db.py` - Async PostgreSQL with namespaces
   - `neo4j_db.py` - Neo4j graph client (used via datasource connector)
@@ -373,6 +414,8 @@ llm:
   multimodal: true   # Model can process images directly
   # OR
   multimodal: false  # Model is text-only, uses VisionHelper for descriptions
+  parallel_tool_calls: false  # Set to true for models that handle parallel calls well
+  reasoning_level: high       # For DeepSeek R1-style models: high, medium, low
 ```
 
 **How it works:**

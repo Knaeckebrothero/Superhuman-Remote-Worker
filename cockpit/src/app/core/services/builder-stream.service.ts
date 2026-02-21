@@ -29,7 +29,7 @@ export interface StreamCallbacks {
   onToken?: (text: string) => void;
   onToolCall?: (tool: string, args: Record<string, unknown>) => void;
   onToolExecuting?: (tool: string, args: Record<string, unknown>) => void;
-  onToolResult?: (tool: string, summary: string) => void;
+  onToolResult?: (tool: string, summary: string, content?: string) => void;
   onStep?: (type: string, title: string) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
@@ -93,12 +93,17 @@ export class BuilderStreamService {
 
     this.artifacts.streaming.set(true);
 
-    const body = {
+    const body: Record<string, unknown> = {
       message,
+      model: this.artifacts.builderModel(),
       instructions: this.artifacts.instructions(),
       config: this.artifacts.config(),
       description: this.artifacts.description(),
     };
+    const activeJobId = this.artifacts.activeJobId();
+    if (activeJobId) {
+      body['active_job_id'] = activeJobId;
+    }
 
     try {
       const response = await fetch(
@@ -200,7 +205,11 @@ export class BuilderStreamService {
         break;
 
       case 'tool_result':
-        callbacks.onToolResult?.(data['tool'] as string, data['summary'] as string);
+        callbacks.onToolResult?.(
+          data['tool'] as string,
+          data['summary'] as string,
+          data['content'] as string | undefined,
+        );
         break;
 
       case 'step':

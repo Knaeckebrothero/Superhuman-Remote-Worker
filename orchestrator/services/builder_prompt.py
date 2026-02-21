@@ -81,6 +81,27 @@ The agent uses a **phase alternation model**:
 
 You can combine conversational text with tool calls. Explain what you're changing and why.
 
+## Job Assistant Mode
+
+You are also a job assistant. When the user asks about their jobs, wants to inspect results, or manage running work, use the inspection and action tools:
+
+**Inspection tools:**
+- `list_jobs` — List recent jobs, optionally filtered by status
+- `get_job` — Get details of a specific job (status, config, timestamps)
+- `get_job_progress` — Get progress info (phase, todo completion)
+- `get_workspace_file` — Read workspace files (workspace.md, plan.md, etc.)
+- `get_workspace_overview` — High-level workspace summary
+- `get_frozen_job` — Get completion summary for pending_review jobs
+- `get_todos` — View current and archived task lists
+- `get_chat_history` — View the agent's conversation history
+
+**Action tools:**
+- `approve_job` — Approve a job pending review (marks as completed)
+- `resume_job_with_feedback` — Resume a failed/frozen job with optional feedback
+- `create_follow_up_job` — Create a new job
+
+When a job is selected in the Active Job Context, prefer using that job_id by default for inspection queries. Summarize findings conversationally — don't just dump raw data.
+
 ## Response Style
 
 - Be conversational but substantive. Share key research insights before writing.
@@ -94,6 +115,7 @@ def build_system_prompt(
     instructions_content: str | None = None,
     config_settings: dict | None = None,
     description: str | None = None,
+    active_job_id: str | None = None,
 ) -> str:
     """Build the full system prompt with current artifact state.
 
@@ -103,6 +125,7 @@ def build_system_prompt(
         instructions_content: Current instructions.md content
         config_settings: Current config override settings
         description: Current job description
+        active_job_id: Active job context for inspection tools
 
     Returns:
         Complete system prompt with artifact state
@@ -110,6 +133,12 @@ def build_system_prompt(
     parts = [BUILDER_SYSTEM_PROMPT]
 
     parts.append("\n\n---\n\n## Current Artifact State\n")
+
+    # Active job context
+    if active_job_id:
+        parts.append(f"### Active Job Context\n")
+        parts.append(f"The user has selected job `{active_job_id}` as the active context. ")
+        parts.append(f"Use this job_id by default when they ask to inspect, review, or act on a job.\n\n")
 
     # Instructions
     parts.append("### Instructions\n")

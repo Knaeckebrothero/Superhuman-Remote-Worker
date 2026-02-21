@@ -500,6 +500,21 @@ type StatusFilter = 'all' | JobStatus;
         font-size: 11px;
         color: var(--text-muted, #6c7086);
       }
+
+      @media (max-width: 768px) {
+        .col-progress,
+        .col-created {
+          display: none;
+        }
+
+        .job-table tr {
+          min-height: 44px;
+        }
+
+        .col-actions {
+          width: 80px;
+        }
+      }
     `,
   ],
 })
