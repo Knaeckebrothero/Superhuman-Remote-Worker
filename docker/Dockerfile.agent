@@ -35,8 +35,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional: path to local CitationEngine source (for local builds)
+ARG CITATION_ENGINE_PATH=""
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# When CITATION_ENGINE_PATH is set, exclude citation-engine from requirements
+# (it will be installed separately from local source below)
+RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
+      sed '/citation-engine/d' requirements.txt > /tmp/reqs.txt && \
+      pip install --no-cache-dir -r /tmp/reqs.txt; \
+    else \
+      pip install --no-cache-dir -r requirements.txt; \
+    fi
+
+# Copy local CitationEngine when building locally; falls back to copying
+# requirements.txt (harmless no-op) so the COPY never fails in CI/CD builds
+COPY ${CITATION_ENGINE_PATH:-requirements.txt} /tmp/citation_engine_src/
+RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
+      pip install --no-cache-dir "/tmp/citation_engine_src[full]"; \
+    fi
 
 # Production image
 FROM python:3.11-slim
@@ -57,8 +75,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install runtime dependencies
-# Note: ripgrep and jq support the coding agent's run_command tool
+# Install curl first (needed for NodeSource setup), then add Node.js 22 repo
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install runtime + dev dependencies
+# The container IS the agent's computer — full toolset available.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
@@ -66,7 +89,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     ripgrep \
     jq \
+    nodejs \
+    build-essential \
+    cmake \
+    python3-dev \
+    libffi-dev \
+    vim-tiny \
+    less \
+    tree \
+    htop \
+    procps \
+    net-tools \
+    iproute2 \
+    dnsutils \
+    openssh-client \
+    zip \
+    unzip \
+    sudo \
     && rm -rf /var/lib/apt/lists/*
+
+# Allow graphrag to sudo without password (private project, no security concern)
+RUN echo "graphrag ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/graphrag \
+    && chmod 0440 /etc/sudoers.d/graphrag
 
 # Copy installed packages from builder (system-owned, read-only is fine)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages

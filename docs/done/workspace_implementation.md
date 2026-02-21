@@ -1,8 +1,20 @@
+---
+tags:
+  - agent-architecture
+  - context-management
+  - planning
+  - tool-development
+  - knowledge-management
+  - data-management
+aliases:
+  - ["Workspace Implementation", "Workspace Architecture"]
+---
+
 # Workspace-Centric Agent Architecture
 
 ## Executive Summary
 
-This document proposes replacing the rigid phase-based state machine in the Creator Agent with a **workspace-centric autonomous architecture**. Instead of hardcoded phase transitions, the agent uses a filesystem-like workspace to manage its own context, write intermediate results, and self-direct through complex tasks.
+This document proposes replacing the rigid phase-based state machine in the Creator Agent (see [[old_agent_issues]] for the problems identified) with a **workspace-centric autonomous architecture**. Instead of hardcoded phase transitions, the agent uses a filesystem-like workspace to manage its own context, write intermediate results, and self-direct through complex tasks.
 
 This approach is validated by recent industry research showing that file-based memory outperforms specialized tools, and aligns with LangChain's "Deep Agents" architecture released in December 2025.
 
@@ -1893,6 +1905,8 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 
 ### Risk Assessment
 
+See also [[masterplan]] and [[masterplan_roadmap]] for broader project planning context.
+
 | Risk | Mitigation |
 |------|------------|
 | Universal Agent doesn't match old agent quality | Test extensively in Phase 9 before migration, keep old code until validated |
@@ -1906,3 +1920,12 @@ The existing `todo_manager.py` is refactored and the tool wrappers moved to `tod
 | Tool registry becomes complex | Start simple, add sophistication only when needed |
 | Migration breaks orchestrator | Keep requirement_cache and job table interfaces unchanged |
 | Dashboard integration issues | Test hot-swapping configs early in Phase 9 |
+
+## Related
+
+- [[overview]]
+- [[old_agent_issues]]
+- [[tool_implementation]]
+- [[compact_chat]]
+- [[masterplan]]
+- [[write_vs_edit_tool]]

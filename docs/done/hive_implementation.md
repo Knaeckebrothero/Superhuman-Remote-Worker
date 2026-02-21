@@ -1,3 +1,14 @@
+---
+tags:
+  - agent-architecture
+  - orchestrator
+  - configuration
+  - cloud-infrastructure
+  - user-interface
+aliases:
+  - ["Hive Architecture", "Hive Implementation", "Stateless Workers"]
+---
+
 # Hive Architecture: Stateless Agent Workers
 
 ## Problem
@@ -12,7 +23,7 @@ Problems:
 
 ## Architecture Overview
 
-Agents become **stateless workers**. They have no fixed identity or configuration. They register with the orchestrator, send health pings, and execute whatever job the orchestrator assigns — with whatever config the orchestrator provides.
+Agents become **stateless workers**. They have no fixed identity or configuration. They register with the [[angular_migration_plan|orchestrator]], send health pings, and execute whatever job the orchestrator assigns — with whatever config the orchestrator provides.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -231,7 +242,7 @@ config/experts/
         instructions.md      # Migrated from config/prompts/doc_writer_instructions.md
 ```
 
-Each `config.yaml` uses `$extends: defaults` for inheritance. The directory format bundles custom prompts alongside the config (existing `PromptResolver` already supports this via `_deployment_dir`).
+Each `config.yaml` uses `$extends: defaults` for inheritance (see [[agent]] for config details). The directory format bundles custom prompts alongside the config (existing `PromptResolver` already supports this via `_deployment_dir`).
 
 **How experts work with the new architecture:**
 - Expert configs live in `config/experts/` on the **orchestrator** (shared volume or bundled in container)
@@ -480,3 +491,11 @@ Potential experts:
 - **Compliance Checker** — Validate requirement coverage against regulatory frameworks
 - **Technical Writer** — Write technical documentation from code/architecture
 - **Code Reviewer** — Review code for quality, security, and best practices
+
+## Related
+
+- [[angular_migration_plan]]
+- [[agent]]
+- [[guardrails]]
+- [[masterplan]]
+- [[overview]]

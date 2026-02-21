@@ -1,3 +1,20 @@
+---
+tags:
+  - citation-engine
+  - bug-fix
+  - knowledge-management
+  - writing
+aliases:
+  - Citation Workflow
+  - Citation Problems
+  - Post-hoc Grounding
+related:
+  - "[[citation_engine_rework]]"
+  - "[[citation_engine_roadmap]]"
+  - "[[advanced_websearch]]"
+  - "[[agent_improvements]]"
+---
+
 # Citation Workflow Issues & Research Findings
 
 ## The Problem
@@ -703,3 +720,10 @@ SELECT * FROM citations WHERE job_id = 'your-job-uuid';
 19. [Chaining the Evidence: Citation-Aware Rubric Rewards (CaRR)](https://arxiv.org/abs/2601.06021) - arXiv
 20. [AISAC: Integrated Multi-Agent System for Retrieval-Grounded Scientific Assistance](https://arxiv.org/html/2511.14043v1) - arXiv
 21. [Audit-Trail Fabrication in Tool-Using LLM Agents (OLIF)](https://www.researchgate.net/publication/400395675) - ResearchGate
+
+## Related
+
+- [[citation_engine_rework]] — Literature management system that addresses these issues
+- [[citation_engine_roadmap]] — Implementation plan for citation improvements
+- [[advanced_websearch]] — Web search capabilities that feed the citation pipeline
+- [[agent_improvements]] — Verification gates relevant to citation accuracy

@@ -58,7 +58,7 @@
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", "groq", null],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
           "default": null,
           "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai). Groq requires explicit setting."
         },
@@ -71,9 +71,15 @@
         },
         "reasoning_level": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "default": "high",
           "description": "Reasoning depth for models that support it"
+        },
+        "reasoning_method": {
+          "type": ["string", "null"],
+          "enum": ["prompt", "api", "none", null],
+          "default": null,
+          "description": "How reasoning level is delivered. 'prompt' injects in system prompt (gpt-oss). 'api' passes as API parameter (OpenAI, OpenRouter). 'none' disables (Anthropic, Google, Groq). null auto-detects from model name."
         },
         "base_url": {
           "type": ["string", "null"],
@@ -96,6 +102,23 @@
           "type": "boolean",
           "default": false,
           "description": "Whether the primary model can process images directly. When true, visual content (document screenshots, images) is sent as base64-encoded images. When false, visual content is converted to text descriptions via a separate vision model."
+        },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the model to make multiple tool calls per response. Enable for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)."
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "default": null,
+          "description": "Override max output tokens (auto-detected if null)"
+        },
+        "model_max_context_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1000,
+          "default": null,
+          "description": "Hard limit for this model's context window. Used for pre-request safety checks (Layer 1) and HTTP-layer validation (Layer 0). Falls back to limits.model_max_context_tokens if null."
         },
         "strategic": {
           "$ref": "#/$defs/llmPhaseOverride",
@@ -121,8 +144,8 @@
           "items": {
             "type": "string"
           },
-          "description": "Directories to create in the workspace",
-          "examples": [["archive/", "output/", "tools/"]]
+          "description": "Directories to create in the workspace. Standard: archive/ (phase history), output/ (deliverables), reference/ (domain material), tools/ (auto-generated tool docs)",
+          "examples": [["archive/", "output/", "reference/", "tools/"]]
         },
         "instructions_template": {
           "type": "string",
@@ -156,14 +179,6 @@
           "type": "boolean",
           "default": true,
           "description": "Enable git versioning for workspace history. Creates a git repository in the workspace for automatic change tracking."
-        },
-        "git_ignore_patterns": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc"],
-          "description": "Patterns for .gitignore when git versioning is enabled"
         }
       }
     },
@@ -249,10 +264,41 @@
           "items": {
             "type": "string"
           },
-          "description": "Coding/execution tools for shell command execution (src/tools/coding/)",
-          "examples": [["run_command"]]
+          "description": "Coding/execution tools: shell commands and Claude Code delegation (src/tools/coding/)",
+          "examples": [["run_command", "claude_code"]]
         }
       }
+    },
+    "instruction_files": {
+      "type": "array",
+      "description": "Instruction files with config-driven trigger conditions for auto-injection. Each entry copies a file to the workspace and triggers delivery based on conditions.",
+      "items": {
+        "type": "object",
+        "required": ["file", "trigger"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Workspace-relative target path for the instruction file (e.g., 'todo_guide.md' or 'instructions/review_guide.md')"
+          },
+          "trigger": {
+            "type": "string",
+            "description": "Trigger condition. Format: 'before_tool:<tool_name>' (fires before tool execution) or 'phase:<phase_name>' (fires on phase transition). Examples: 'before_tool:next_phase_todos', 'phase:strategic'",
+            "pattern": "^(before_tool|phase):.+$"
+          },
+          "enforce": {
+            "type": "boolean",
+            "default": true,
+            "description": "If true (passive), the tool rejects until the agent reads the file. If false (active), the system auto-injects the content as a transient message."
+          }
+        },
+        "additionalProperties": false
+      },
+      "examples": [
+        [
+          {"file": "todo_guide.md", "trigger": "before_tool:next_phase_todos", "enforce": true},
+          {"file": "instructions/review_guide.md", "trigger": "phase:strategic", "enforce": false}
+        ]
+      ]
     },
     "connections": {
       "type": "object",
@@ -284,7 +330,7 @@
         "message_count_min_tokens": {
           "type": "integer",
           "minimum": 1000,
-          "default": 30000,
+          "default": 40000,
           "description": "Minimum token count required when using message count threshold"
         },
         "tool_retry_count": {
@@ -296,14 +342,14 @@
         "model_max_context_tokens": {
           "type": "integer",
           "minimum": 1000,
-          "default": 128000,
-          "description": "Hard limit for model context window. Pre-request safety check will force summarization if exceeded."
+          "default": 100000,
+          "description": "Global fallback for model context window. Used when llm.model_max_context_tokens is not set. Pre-request safety check (Layer 1) will force summarization if exceeded."
         },
         "summarization_safe_limit": {
           "type": "integer",
           "minimum": 1000,
-          "default": 100000,
-          "description": "Maximum input tokens for summarization LLM. Larger inputs trigger recursive chunked summarization."
+          "default": 90000,
+          "description": "Maximum input tokens for summarization LLM. Must be less than model_max_context_tokens to leave room for prompt overhead. Larger inputs trigger recursive chunked summarization."
         },
         "summarization_chunk_size": {
           "type": "integer",
@@ -325,8 +371,8 @@
         "keep_recent_tool_results": {
           "type": "integer",
           "minimum": 0,
-          "default": 10,
-          "description": "Number of recent tool results to keep in full"
+          "default": 15,
+          "description": "Number of recent tool results to preserve in full during context compaction. Higher values retain more context but slow compaction."
         },
         "keep_recent_messages": {
           "type": "integer",
@@ -341,9 +387,9 @@
         },
         "reasoning_level": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "default": "high",
-          "description": "Reasoning effort level hint for summarization (injected as {oss_reasoning_level})"
+          "description": "Reasoning effort level for summarization. Only injected in prompt when reasoning_method is 'prompt'."
         },
         "max_summary_length": {
           "type": "integer",
@@ -404,6 +450,30 @@
           "description": "Use screenshot-based navigation instead of DOM/accessibility tree"
         }
       }
+    },
+    "claude_code": {
+      "type": "object",
+      "description": "Claude Code CLI delegation settings",
+      "properties": {
+        "model": {
+          "type": "string",
+          "default": "claude-opus-4-6",
+          "description": "Model for Claude Code sessions (--model flag)"
+        },
+        "effort_level": {
+          "type": "string",
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+          "default": "high",
+          "description": "Reasoning effort level (CLAUDE_CODE_EFFORT_LEVEL env var)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "autonomy": {
+      "type": "string",
+      "enum": ["full", "review", "partial", "guided", "dependent"],
+      "default": "partial",
+      "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
     }
   },
   "additionalProperties": true,
@@ -418,7 +488,7 @@
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", "groq", null],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
           "description": "LLM provider override"
         },
         "temperature": {
@@ -429,8 +499,13 @@
         },
         "reasoning_level": {
           "type": "string",
-          "enum": ["low", "medium", "high"],
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "description": "Reasoning depth override"
+        },
+        "reasoning_method": {
+          "type": ["string", "null"],
+          "enum": ["prompt", "api", "none", null],
+          "description": "Override how reasoning level is delivered for this phase"
         },
         "base_url": {
           "type": ["string", "null"],
@@ -454,6 +529,20 @@
         "multimodal": {
           "type": "boolean",
           "description": "Override whether this phase's model can process images directly"
+        },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "description": "Override parallel tool calls for this phase"
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Override max output tokens for this phase"
+        },
+        "model_max_context_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1000,
+          "description": "Hard limit for this phase model's context window. Overrides the base llm.model_max_context_tokens for this phase."
         }
       },
       "additionalProperties": false

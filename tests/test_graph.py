@@ -71,10 +71,17 @@ def managers(workspace_manager):
 
 @pytest.fixture
 def mock_config():
-    """Create a mock AgentConfig for testing."""
+    """Create a mock AgentConfig for testing.
+
+    Note: config.extra must be a real dict, not a MagicMock.
+    MagicMock().get() returns a truthy MagicMock, which can cause
+    yaml.safe_load(MagicMock()) — an infinite read loop that OOMs.
+    """
     config = MagicMock()
     config.agent_id = "test-agent"
     config.llm.model = "test-model"
+    config.extra = {}
+    config._deployment_dir = None
     return config
 
 
@@ -630,9 +637,9 @@ class TestInitStrategicTodosNode:
         state = {"job_id": "test-123"}
         result = node(state)
 
-        # Should still work with fallback message
+        # Should still work with strategic mode message
         assert "messages" in result
-        assert "No instructions.md found" in result["messages"][0].content
+        assert "strategic mode" in result["messages"][0].content
 
         # Should still load strategic todos
         todos = managers["todo"].list_all()
@@ -651,7 +658,7 @@ class TestPredefinedTodos:
         contents = [t.content for t in todos]
         assert any("workspace" in c.lower() for c in contents)
         assert any("plan" in c.lower() for c in contents)
-        assert any("todos.yaml" in c.lower() for c in contents)
+        assert any("next_phase_todos" in c.lower() for c in contents)
 
     def test_transition_strategic_todos(self):
         """Test get_transition_strategic_todos returns correct todos."""
@@ -742,24 +749,20 @@ todos:
 class TestHandleTransitionNode:
     """Tests for handle_transition node."""
 
-    def test_strategic_to_tactical_success(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_strategic_to_tactical_success(self, managers, mock_config):
         """Test successful strategic -> tactical transition."""
-        # Write valid todos.yaml
-        content = """
-phase: "Phase 1"
-todos:
-  - id: 1
-    content: "First task"
-  - id: 2
-    content: "Second task"
-  - id: 3
-    content: "Third task"
-  - id: 4
-    content: "Fourth task"
-  - id: 5
-    content: "Fifth task"
-"""
-        managers["workspace"].write_file("todos.yaml", content)
+        # Stage todos (simulating next_phase_todos tool call)
+        managers["todo"].stage_tactical_todos(
+            [
+                "First task with enough detail",
+                "Second task with enough detail",
+                "Third task with enough detail",
+                "Fourth task with enough detail",
+                "Fifth task with enough detail",
+            ],
+            phase_name="Phase 1",
+        )
 
         # Add phase_settings to mock config
         phase_settings = MagicMock()
@@ -778,7 +781,7 @@ todos:
             "phase_number": 0,
             "iteration": 10,
         }
-        result = node(state)
+        result = await node(state)
 
         # Should inject phase boundary marker
         assert len(result.get("messages", [])) == 1
@@ -792,7 +795,8 @@ todos:
         todos = managers["todo"].list_all()
         assert len(todos) == 5
 
-    def test_strategic_to_tactical_rejection(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_strategic_to_tactical_rejection(self, managers, mock_config):
         """Test rejected strategic -> tactical transition (no todos.yaml)."""
         # Add phase_settings to mock config
         phase_settings = MagicMock()
@@ -811,14 +815,15 @@ todos:
             "phase_number": 0,
             "iteration": 10,
         }
-        result = node(state)
+        result = await node(state)
 
         # Should have error message
         assert "messages" in result
         assert len(result["messages"]) == 1
         assert "[TRANSITION_REJECTED]" in result["messages"][0].content
 
-    def test_tactical_to_strategic_transition(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_tactical_to_strategic_transition(self, managers, mock_config):
         """Test tactical -> strategic transition (archives and loads strategic todos)."""
         # Add some completed todos
         managers["todo"].add("Task 1")
@@ -841,7 +846,7 @@ todos:
             "phase_number": 1,
             "iteration": 20,
         }
-        result = node(state)
+        result = await node(state)
 
         # Should inject phase boundary marker
         assert len(result.get("messages", [])) == 1
@@ -864,7 +869,8 @@ todos:
 class TestPhaseAlternationCycle:
     """Integration tests for the full phase alternation cycle."""
 
-    def test_full_strategic_tactical_strategic_cycle(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_full_strategic_tactical_strategic_cycle(self, managers, mock_config):
         """Test a complete cycle: init → strategic → tactical → strategic."""
         # Configure mock
         phase_settings = MagicMock()
@@ -890,22 +896,17 @@ class TestPhaseAlternationCycle:
         for todo in managers["todo"].list_all():
             managers["todo"].complete(todo.id)
 
-        # Write todos.yaml (simulating strategic agent's output)
-        todos_yaml = """
-phase: "Phase 1: Execute extraction"
-todos:
-  - id: 1
-    content: "Read document"
-  - id: 2
-    content: "Extract section 1"
-  - id: 3
-    content: "Extract section 2"
-  - id: 4
-    content: "Validate extractions"
-  - id: 5
-    content: "Write to database"
-"""
-        managers["workspace"].write_file("todos.yaml", todos_yaml)
+        # Stage todos (simulating strategic agent calling next_phase_todos)
+        managers["todo"].stage_tactical_todos(
+            [
+                "Read the source document carefully",
+                "Extract data from section one",
+                "Extract data from section two",
+                "Validate all extractions against source",
+                "Write validated data to database",
+            ],
+            phase_name="Phase 1: Execute extraction",
+        )
 
         # Step 3: Transition strategic → tactical
         transition_node = create_handle_transition_node(
@@ -914,7 +915,7 @@ todos:
         )
 
         state["iteration"] = 10
-        result = transition_node(state)
+        result = await transition_node(state)
         state.update(result)
 
         # Verify transition to tactical
@@ -929,7 +930,7 @@ todos:
 
         # Step 5: Transition tactical → strategic
         state["iteration"] = 20
-        result = transition_node(state)
+        result = await transition_node(state)
         state.update(result)
 
         # Verify transition back to strategic
@@ -961,7 +962,8 @@ todos:
         assert result.get("goal_achieved") is True
         assert result.get("should_stop") is True
 
-    def test_transition_rejection_retryable(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_transition_rejection_retryable(self, managers, mock_config):
         """Test that transition rejection allows retry."""
         phase_settings = MagicMock()
         phase_settings.min_todos = 5
@@ -983,7 +985,7 @@ todos:
             "phase_number": 0,
             "iteration": 10,
         }
-        result = transition_node(state)
+        result = await transition_node(state)
 
         # Should be rejected
         assert "[TRANSITION_REJECTED]" in result["messages"][0].content
@@ -993,26 +995,21 @@ todos:
         # After rejection, route_after_transition sends back to execute
         assert route_after_transition({"messages": result["messages"]}) == "execute"
 
-        # Second attempt: write valid todos.yaml (content must be 10+ chars)
-        todos_yaml = """
-phase: "Phase 1"
-todos:
-  - id: 1
-    content: "Read the source document and identify structure"
-  - id: 2
-    content: "Extract requirements from section one"
-  - id: 3
-    content: "Extract requirements from section two"
-  - id: 4
-    content: "Validate all extracted requirements"
-  - id: 5
-    content: "Write validated requirements to database"
-"""
-        managers["workspace"].write_file("todos.yaml", todos_yaml)
+        # Second attempt: stage todos properly (content must be 10+ chars)
+        managers["todo"].stage_tactical_todos(
+            [
+                "Read the source document and identify structure",
+                "Extract requirements from section one",
+                "Extract requirements from section two",
+                "Validate all extracted requirements",
+                "Write validated requirements to database",
+            ],
+            phase_name="Phase 1",
+        )
 
         # Try transition again
         state["iteration"] = 15
-        result = transition_node(state)
+        result = await transition_node(state)
 
         # Should succeed now
         assert len(result.get("messages", [])) == 1
@@ -1023,7 +1020,8 @@ todos:
         # route_after_transition should proceed to check_goal
         assert route_after_transition({"messages": result["messages"]}) == "check_goal"
 
-    def test_workspace_memory_persists_across_phases(self, managers, mock_config):
+    @pytest.mark.asyncio
+    async def test_workspace_memory_persists_across_phases(self, managers, mock_config):
         """Test that workspace.md content persists across phase transitions."""
         phase_settings = MagicMock()
         phase_settings.min_todos = 5
@@ -1046,21 +1044,16 @@ todos:
         for todo in managers["todo"].list_all():
             managers["todo"].complete(todo.id)
 
-        todos_yaml = """
-phase: "Phase 1"
-todos:
-  - id: 1
-    content: "Read the source document carefully"
-  - id: 2
-    content: "Extract key information from document"
-  - id: 3
-    content: "Validate extracted information"
-  - id: 4
-    content: "Transform data into required format"
-  - id: 5
-    content: "Write results to output file"
-"""
-        managers["workspace"].write_file("todos.yaml", todos_yaml)
+        managers["todo"].stage_tactical_todos(
+            [
+                "Read the source document carefully",
+                "Extract key information from document",
+                "Validate extracted information against source",
+                "Transform data into the required format",
+                "Write results to the output file",
+            ],
+            phase_name="Phase 1",
+        )
 
         # Transition to tactical
         transition_node = create_handle_transition_node(
@@ -1070,7 +1063,7 @@ todos:
         state["is_strategic_phase"] = True
         state["phase_number"] = 0
         state["iteration"] = 10
-        transition_node(state)
+        await transition_node(state)
 
         # Verify memory still exists after transition
         memory_content = managers["memory"].read()
@@ -1086,7 +1079,7 @@ todos:
         state["is_strategic_phase"] = False
         state["phase_number"] = 1
         state["iteration"] = 20
-        transition_node(state)
+        await transition_node(state)
 
         # Verify both facts persist
         memory_content = managers["memory"].read()

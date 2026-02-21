@@ -1,9 +1,22 @@
+---
+tags:
+  - data-management
+  - agent-architecture
+  - debugging
+  - configuration
+  - tool-development
+aliases:
+  - "MongoDB Migration Deep Dive"
+  - "MongoDB Migration"
+  - "MongoDB Refactor"
+---
+
 # MongoDB Migration Deep Dive
 
 **Status**: ✅ **COMPLETE** (Uses dependency injection like PostgreSQL and Neo4j)
 **Created**: 2026-01-14
-**Part of**: Database Refactoring Initiative
-**Related**: [db_refactor.md](db_refactor.md), [postgres_migration_deep_dive.md](postgres_migration_deep_dive.md), [neo4j_migration_deep_dive.md](neo4j_migration_deep_dive.md)
+**Part of**: [[db_refactor|Database Refactoring Initiative]]
+**Related**: [[db_refactor]], [[postgres_migration_deep_dive]], [[neo4j_migration_deep_dive]]
 
 ---
 
@@ -11,7 +24,7 @@
 
 ### Purpose
 
-This document describes the MongoDB implementation using **dependency injection**, following the same patterns as PostgreSQL and Neo4j. MongoDB is used exclusively for **LLM request archiving and agent audit trails** - an optional observability component for debugging, cost tracking, and compliance.
+This document describes the MongoDB implementation using **dependency injection**, following the same patterns as [[postgres_migration_deep_dive|PostgreSQL]] and [[neo4j_migration_deep_dive|Neo4j]]. MongoDB is used exclusively for **LLM request archiving and agent audit trails** - an optional observability component for debugging, cost tracking, and compliance.
 
 ### Current State: Dependency Injection ✅
 
@@ -368,7 +381,7 @@ def create_collections_and_indexes(client, db_name: str, logger):
 
 ### 1.4 Usage in Agent: `src/graph.py`
 
-**Current Pattern**: Audit points throughout the nested loop graph using dependency injection. The archiver instance is passed to the graph at construction time.
+**Current Pattern**: Audit points throughout the nested loop [[langgraph_checkpointing_assessment|LangGraph]] graph using dependency injection. The archiver instance is passed to the graph at construction time.
 
 ```python
 from .core.archiver import get_archiver
@@ -2468,3 +2481,10 @@ MONGODB_URL=mongodb://admin:password@localhost:27017/graphrag_logs?authSource=ad
 ---
 
 **End of MongoDB Migration Deep Dive**
+
+## Related
+- [[db_refactor]]
+- [[postgres_migration_deep_dive]]
+- [[neo4j_migration_deep_dive]]
+- [[langgraph_checkpointing_assessment]]
+- [[cleanup]]

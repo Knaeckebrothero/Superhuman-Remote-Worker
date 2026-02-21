@@ -1,3 +1,19 @@
+---
+tags:
+  - data-management
+  - agent-architecture
+  - configuration
+  - tool-development
+aliases:
+  - Datasource Connectors
+  - External Databases
+  - Database Tools
+related:
+  - "[[deployment]]"
+  - "[[debug_cockpit]]"
+  - "[[tool_issues]]"
+  - "[[coding_agent]]"
+---
 # External Datasources
 
 ## Motivation
@@ -570,3 +586,11 @@ The exact API surface for datasource CRUD and job attachment will be determined 
 ## Open Questions
 
 None at this time. Decisions above capture all resolved items.
+
+## Related
+
+- [[deployment]] - Datasource connectors are part of the containerized stack
+- [[debug_cockpit]] - Cockpit UI for managing and attaching datasources to jobs
+- [[tool_issues]] - Tool implementation details for SQL, MongoDB, and Neo4j tools
+- [[coding_agent]] - Coding agent may use SQL/MongoDB datasources for analysis
+- [[graph_change_detection]] - Neo4j datasource powers the graph timeline visualization

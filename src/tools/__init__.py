@@ -61,6 +61,7 @@ from .registry import (
     filter_tools_by_phase,
     get_tools_for_phase,
     get_phase_tool_summary,
+    apply_instruction_enforcement,
 )
 from .description_manager import (
     DescriptionManager,
@@ -113,6 +114,7 @@ __all__ = [
     "filter_tools_by_phase",
     "get_tools_for_phase",
     "get_phase_tool_summary",
+    "apply_instruction_enforcement",
     # Description manager
     "DescriptionManager",
     "generate_workspace_tool_docs",

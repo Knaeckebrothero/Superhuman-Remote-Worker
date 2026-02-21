@@ -53,7 +53,9 @@ def _get_browser_llm():
 
     model = os.getenv("BROWSER_LLM_MODEL", "gpt-4o-mini")
     api_key = os.getenv("BROWSER_LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("BROWSER_LLM_BASE_URL") or os.getenv("LLM_BASE_URL")
+    base_url = os.getenv("BROWSER_LLM_BASE_URL")
+    if not base_url and model.lower().startswith("openai/"):
+        base_url = os.getenv("LLM_BASE_URL")
 
     kwargs = {
         "model": model,

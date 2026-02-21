@@ -2,21 +2,30 @@
 # Framework defaults - agents extend this via $extends
 
 agent_id: default
-display_name: Remote Worker
+display_name: The General Secretary
 
 llm:
   model: openai/gpt-oss-120b
   provider: null  # Auto-detect from model name (claude-* → anthropic, gemini-* → google)
   temperature: 0.0
   reasoning_level: high
-  base_url: null
+  reasoning_method: null  # Auto-detect from model name (prompt/api/none)
+  base_url: null  # Set LLM_BASE_URL env var for local vLLM endpoint
   timeout: 600
   max_retries: 3
+  max_output_tokens: null  # Auto-detected per provider; override for local models if needed
   multimodal: false  # Set to true if model can process images directly
+  parallel_tool_calls: false  # Set to true for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)
+  model_max_context_tokens: 100000  # gpt-oss-120b effective context limit (vLLM); Layer 0/1 safety
+  # IMPORTANT: Override this per-model in expert configs. Wrong values cause crashes
+  # (too high → token limit errors) or wasted context (too low → premature compaction).
+  # No phase overrides — strategic, tactical, and summarization all use gpt-oss-120b
 
 workspace:
   structure:
     - archive/
+    - output/
+    - reference/
     - tools/
   instructions_template: instructions.md
   initial_files:
@@ -25,13 +34,6 @@ workspace:
   max_write_words: 10000
   # Git versioning for workspace history
   git_versioning: true
-  git_ignore_patterns:
-    - "*.db"
-    - "*.log"
-    - "__pycache__/"
-    - ".DS_Store"
-    - "*.pyc"
-    - "documents/"
 
 tools:
   # Workspace tools - file operations (src/tools/workspace/)
@@ -85,6 +87,7 @@ tools:
     - get_annotations
     - tag_source
     - search_library
+    - generate_bibliography
   # Graph tools - Neo4j operations (src/tools/graph/)
   # NOTE: Graph tools are no longer listed in defaults. They are injected
   # automatically when a Neo4j datasource is attached to the job.
@@ -96,6 +99,10 @@ tools:
   # MongoDB tools - MongoDB operations (src/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
+  # Coding tools - shell execution + Claude Code delegation (src/tools/coding/)
+  coding:
+    - run_command
+    - claude_code  # Requires: Claude Code CLI installed + authenticated
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -104,24 +111,34 @@ tools:
     - git_status
     - git_tags
 
+# Instruction files — config-driven auto-injection of guidance documents.
+# Each entry copies a file to the workspace and triggers injection based on conditions.
+# enforce: true = passive (tool rejects until agent reads file)
+# enforce: false = active (system injects content as transient message)
+instruction_files:
+  - file: todo_guide.md
+    trigger: before_tool:next_phase_todos
+    enforce: true
+
 connections:
   postgres: true
 
 limits:
   context_threshold_tokens: 80000
-  message_count_threshold: 200
-  message_count_min_tokens: 40000
+  message_count_threshold: 300
+  message_count_min_tokens: 50000
   tool_retry_count: 3
-  model_max_context_tokens: 100000
-  summarization_safe_limit: 100000
+  model_max_context_tokens: 80000
+  summarization_safe_limit: 100000  # Must be < model_max to leave room for summarization prompt overhead
   summarization_chunk_size: 80000
 
 context_management:
   compact_on_archive: true
-  # TODO: This is somewhat "bad practice" and should be reworked
-  keep_recent_tool_results: 200
+  keep_recent_tool_results: 15
   keep_recent_messages: 10
   summarization_template: summarization_prompt.txt
+  reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
+  max_summary_length: 10000
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
@@ -131,9 +148,18 @@ research:
     host: null
     port: null
 
+# Autonomy level — controls when the agent pauses for human review
+# full | review | partial | guided | dependent
+autonomy: review
+
 # Browser automation settings (browser-use + Playwright)
 browser:
   headless: true
   timeout: 60000  # Milliseconds
   use_vision: false  # DOM-based by default (works with any LLM)
+
+# Claude Code delegation settings (used when claude_code tool is enabled)
+claude_code:
+  model: claude-opus-4-6   # Model for Claude Code sessions
+  effort_level: high        # Reasoning effort: low, medium, high
 

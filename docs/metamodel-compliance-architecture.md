@@ -1,3 +1,19 @@
+---
+tags:
+  - agent-architecture
+  - data-management
+  - tool-development
+aliases:
+  - metamodel validator
+  - schema compliance
+  - GraphRAG compliance
+related:
+  - "[[tools_description]]"
+  - "[[tool_issues]]"
+  - "[[datasources]]"
+  - "[[graph_change_detection]]"
+---
+
 # Metamodel Compliance Verification Architecture
 
 ## Two-Phase Hybrid Pipeline for GraphRAG Domain Model Validation
@@ -1028,3 +1044,11 @@ RETURN
 ---
 
 *Document generated for the GraphRAG in Practice project, December 2025*
+
+## Related
+
+- [[tools_description]] - Agent tools including the validate_schema_compliance tool
+- [[tool_issues]] - Tool phase filtering and enforcement issues
+- [[datasources]] - External datasource connectors (Neo4j, PostgreSQL, MongoDB)
+- [[graph_change_detection]] - Detecting and tracking graph mutations
+- [[key_issues]] - Key open issues across the project

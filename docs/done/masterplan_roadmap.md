@@ -1,3 +1,18 @@
+---
+tags:
+  - planning
+  - agent-architecture
+  - orchestrator
+  - data-management
+  - citation-engine
+  - cloud-infrastructure
+  - tool-development
+aliases:
+  - "Implementation Roadmap"
+  - "Masterplan Roadmap"
+  - "Graph-RAG Roadmap"
+---
+
 # Graph-RAG Implementation Roadmap
 
 **Version:** 1.5
@@ -10,7 +25,7 @@
 
 ## Overview
 
-This document provides a structured implementation roadmap for the Graph-RAG Autonomous Agent System as described in `masterplan.md`. The roadmap is divided into six phases, each building upon the previous one.
+This document provides a structured implementation roadmap for the Graph-RAG Autonomous Agent System as described in [[masterplan]]. The roadmap is divided into six phases, each building upon the previous one.
 
 ### Phase Summary
 
@@ -123,7 +138,7 @@ src/
 
 ### 1.2 PostgreSQL Schema Implementation
 
-**Objective:** Create the PostgreSQL database schema for job tracking, requirement caching, and LLM logging.
+**Objective:** Create the PostgreSQL database schema for job tracking, requirement caching, and LLM logging (see also [[postgres_migration_deep_dive]]).
 
 **Tasks:**
 
@@ -204,7 +219,7 @@ def create_postgres_connection(connection_string: Optional[str] = None) -> Postg
 
 ### 1.3 Extended Neo4j Metamodel
 
-**Objective:** Update the Neo4j schema and `MetamodelValidator` with new fulfillment relationship types.
+**Objective:** Update the Neo4j schema (see [[neo4j_migration_deep_dive]]) and `MetamodelValidator` with new fulfillment relationship types.
 
 **Tasks:**
 
@@ -246,7 +261,7 @@ def create_postgres_connection(connection_string: Optional[str] = None) -> Postg
 
 ### 1.4 Shared Agent Utilities
 
-**Objective:** Implement shared utilities for context management, checkpointing, and workspace handling.
+**Objective:** Implement shared utilities for context management (see [[compact_chat]]), checkpointing (see [[langgraph_checkpointing_assessment]]), and workspace handling.
 
 **Tasks:**
 
@@ -388,7 +403,7 @@ CITATION_REASONING_REQUIRED=low
 
 ### Phase 1 Implementation Notes
 
-**Completed: January 2026**
+**Completed: January 2026** (see [[phase1_complete]])
 
 **Files Created:**
 - `src/agents/creator/__init__.py` - Creator Agent package stub
@@ -1332,3 +1347,11 @@ Steps to migrate from the current four-stage pipeline to the new two-agent syste
 *Document Version: 1.0*
 *Based on: masterplan.md v1.1*
 *Created: January 2026*
+
+## Related
+- [[masterplan]]
+- [[phase1_complete]]
+- [[agent]]
+- [[overview]]
+- [[db_refactor]]
+- [[guardrails_roadmap]]

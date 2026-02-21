@@ -493,6 +493,27 @@ def _create_mongodb_indexes(db) -> None:
             else:
                 logger.warning(f"    Failed to create index {options['name']}: {e}")
 
+    # chat_history collection
+    chat_history = db["chat_history"]
+    chat_indexes = [
+        ("job_id", {"name": "idx_chat_job_id"}),
+        ([("job_id", 1), ("timestamp", 1)], {"name": "idx_chat_job_timestamp"}),
+    ]
+
+    logger.info("  Configuring chat_history collection...")
+    for index_spec, options in chat_indexes:
+        try:
+            if isinstance(index_spec, list):
+                chat_history.create_index(index_spec, **options)
+            else:
+                chat_history.create_index(index_spec, **options)
+            logger.info(f"    Created index: {options['name']}")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info(f"    Index exists: {options['name']}")
+            else:
+                logger.warning(f"    Failed to create index {options['name']}: {e}")
+
 
 async def verify_mongodb() -> dict:
     """Verify MongoDB connectivity.

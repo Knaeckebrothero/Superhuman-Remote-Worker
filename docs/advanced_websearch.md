@@ -1,3 +1,18 @@
+---
+tags:
+  - web-search
+  - tool-development
+  - agent-architecture
+aliases:
+  - Deep Research
+  - Web Search Enhancement
+related:
+  - "[[citation_issues]]"
+  - "[[citation_engine_rework]]"
+  - "[[agent_improvements]]"
+  - "[[auxiliary_tasks]]"
+---
+
 # Advanced Web Search & Deep Research
 
 Research into how major AI providers (OpenAI, Google, Anthropic, Perplexity) implement deep research capabilities, and what techniques we can adopt to improve our agent's web search.
@@ -771,3 +786,11 @@ async def verify_report(report: str, sources: list[Finding]) -> VerificationResu
 - [RAG citation architecture](https://www.tensorlake.ai/blog/rag-citations)
 - [RAG hallucination detection (AWS)](https://aws.amazon.com/blogs/machine-learning/detect-hallucinations-for-rag-based-systems/)
 - [Reranker comparison](https://www.analyticsvidhya.com/blog/2025/06/top-rerankers-for-rag/)
+
+## Related
+
+- [[citation_issues]] — Citation workflow that consumes web search results
+- [[citation_engine_rework]] — Literature management with semantic search
+- [[agent_improvements]] — Agent architecture improvements including search patterns
+- [[auxiliary_tasks]] — Phase alternation model that orchestrates research tasks
+- [[coding_agent]] — Agent that could use web search for documentation lookup

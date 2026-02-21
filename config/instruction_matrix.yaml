@@ -1,0 +1,17 @@
+# Instruction Matrix — maps (instruction_type, model_family) → filename
+# Resolution: expert matrix → base matrix, model-specific → default
+# File search: expert directory → config/templates/
+
+default:
+  instructions: instructions.md
+  strategic_todos_initial: strategic_todos_initial.yaml
+  strategic_todos_transition: strategic_todos_transition.yaml
+  strategic_todos_resume: strategic_todos_resume.yaml
+  workspace_template: workspace_template.md
+  todo_guide: todo_guide.md
+
+# Model-specific overrides — add as needed:
+# claude-opus:
+#   instructions: instructions_claude_opus.md
+# deepseek:
+#   strategic_todos_initial: strategic_todos_initial_deepseek.yaml

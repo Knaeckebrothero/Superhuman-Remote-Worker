@@ -1,10 +1,20 @@
+---
+tags:
+  - tool-development
+  - agent-architecture
+  - context-management
+  - llm-configuration
+aliases:
+  - ["Tool Implementation", "Tool Description System"]
+---
+
 # Tool Description System
 
 This document describes how tool descriptions are managed and provided to agents in the Universal Agent system.
 
 ## Overview
 
-Agents have access to 20-40 tools depending on their configuration. Each tool has documentation that helps the agent understand how to use it. The system supports two mechanisms for providing tool descriptions:
+Agents have access to 20-40 tools depending on their configuration (see [[overview]] for a non-technical introduction). Each tool has documentation that helps the [[agent]] understand how to use it. The system supports two mechanisms for providing tool descriptions:
 
 1. **LangChain Binding** - Tool docstrings are automatically included in every LLM request via `bind_tools()`
 2. **Workspace Documentation** - Detailed markdown files generated in the agent's workspace for on-demand reference
@@ -594,3 +604,11 @@ Job completion signaling.
 | Tool | Description |
 |------|-------------|
 | `mark_complete` | Signal task completion |
+
+## Related
+
+- [[workspace_implementation]]
+- [[agent]]
+- [[overview]]
+- [[write_vs_edit_tool]]
+- [[tavily_implementation]]

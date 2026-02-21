@@ -1,0 +1,319 @@
+# =============================================================================
+# Superhuman Remote Worker - Local Build Stack
+# =============================================================================
+#
+# Same as docker-compose.yaml but builds all custom images locally instead of
+# pulling from GHCR. Use this for faster iteration on containerization.
+#
+# Usage:
+#   podman-compose -f docker-compose.local.yaml build          # Build all images
+#   podman-compose -f docker-compose.local.yaml up -d          # Start all services
+#   podman-compose -f docker-compose.local.yaml up -d --scale agent=3
+#   podman-compose -f docker-compose.local.yaml down           # Stop services
+#   podman-compose -f docker-compose.local.yaml down -v        # Stop and remove all data
+#   podman-compose -f docker-compose.local.yaml logs -f agent  # Follow agent logs
+#
+# Prerequisites:
+#   - Copy .env.example to .env and configure API keys + VPN credentials
+#
+# Exposed ports:
+#   - 8085: Orchestrator API
+#   - 4000: Cockpit Frontend
+#
+# =============================================================================
+
+name: superhuman-remote-worker
+
+services:
+  postgres:
+    image: docker.io/pgvector/pgvector:pg15
+    container_name: srw-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-graphrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-graphrag_password}
+      POSTGRES_DB: ${POSTGRES_DB:-graphrag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-graphrag}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongodb:
+    image: docker.io/library/mongo:7
+    container_name: srw-mongodb
+    environment:
+      MONGO_INITDB_DATABASE: graphrag_logs
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:latest
+    container_name: srw-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@srw.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/misc/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongo-express:
+    image: docker.io/library/mongo-express:latest
+    container_name: srw-mongo-express
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_BASICAUTH: "false"
+    ports:
+      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  gitea:
+    image: docker.io/gitea/gitea:1.22-rootless
+    container_name: srw-gitea
+    environment:
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__database__PATH: /var/lib/gitea/data/gitea.db
+      GITEA__server__ROOT_URL: http://gitea:3000
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__service__DISABLE_REGISTRATION: "false"
+      GITEA__service__REQUIRE_SIGNIN_VIEW: "false"
+      GITEA__service__ENABLE_CAPTCHA: "false"
+      GITEA__repository__DEFAULT_PRIVATE: private
+      GITEA__repository__ENABLE_PUSH_CREATE_USER: "true"
+    volumes:
+      - gitea_data:/var/lib/gitea
+    ports:
+      - "${GITEA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/v1/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  vpn-cluster:
+    build:
+      context: docker/vpn/
+      dockerfile: Dockerfile
+    image: srw-vpn:local
+    container_name: srw-vpn-cluster
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
+    environment:
+      SOCKS_PORT: 1080
+      FORWARD_PORT: 8080
+      FORWARD_TARGET: ${VPN_CLUSTER_LLM_ENDPOINT:-}
+      VPN_HOST: ${VPN_CLUSTER_HOST:-}
+      VPN_PORT: ${VPN_CLUSTER_PORT:-443}
+      VPN_REALM: ${VPN_CLUSTER_REALM:-}
+      VPN_USER: ${VPN_CLUSTER_USER:-}
+      VPN_PASS: ${VPN_CLUSTER_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_CLUSTER_TRUSTED_CERT:-}
+    healthcheck:
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  vpn-research:
+    build:
+      context: docker/vpn/
+      dockerfile: Dockerfile
+    image: srw-vpn:local
+    container_name: srw-vpn-research
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
+    environment:
+      SOCKS_PORT: 1080
+      VPN_HOST: ${VPN_RESEARCH_HOST:-}
+      VPN_PORT: ${VPN_RESEARCH_PORT:-443}
+      VPN_REALM: ${VPN_RESEARCH_REALM:-}
+      VPN_USER: ${VPN_RESEARCH_USER:-}
+      VPN_PASS: ${VPN_RESEARCH_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_RESEARCH_TRUSTED_CERT:-}
+    healthcheck:
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.orchestrator
+    image: srw-orchestrator:local
+    container_name: srw-orchestrator
+    environment:
+      PORT: 8085
+      DATABASE_URL: postgresql://${POSTGRES_USER:-graphrag}:${POSTGRES_PASSWORD:-graphrag_password}@postgres:5432/${POSTGRES_DB:-graphrag}
+      MONGODB_URL: mongodb://mongodb:27017/graphrag_logs
+      WORKSPACE_PATH: /workspace
+      GITEA_URL: http://gitea:3000
+      GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-graphrag}
+      GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-graphrag_gitea}
+    volumes:
+      - workspace_data:/workspace:z
+    ports:
+      - "${ORCHESTRATOR_PORT:-8085}:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      gitea:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      args:
+        CITATION_ENGINE_PATH: CitationEngine
+    image: srw-agent:local
+    environment:
+      AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
+      AGENT_PORT: 8001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-graphrag}:${POSTGRES_PASSWORD:-graphrag_password}@postgres:5432/${POSTGRES_DB:-graphrag}
+      MONGODB_URL: mongodb://mongodb:27017/graphrag_logs
+      ORCHESTRATOR_URL: http://orchestrator:8085
+      WORKSPACE_PATH: /workspace
+      # LLM provider keys — set in .env
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      # VPN routing — agent containers reach VPN sidecars over Docker network
+      LLM_BASE_URL: http://vpn-cluster:8080/v1
+      BROWSER_LLM_BASE_URL: http://vpn-cluster:8080/v1
+      CITATION_LLM_URL: http://vpn-cluster:8080/v1
+      RESEARCH_PROXY_TYPE: socks5
+      RESEARCH_PROXY_HOST: vpn-research
+      RESEARCH_PROXY_PORT: 1080
+      # Vision model (for text-only agents)
+      VISION_API_KEY: ${VISION_API_KEY:-}
+      VISION_BASE_URL: ${VISION_BASE_URL:-}
+      VISION_MODEL: ${VISION_MODEL:-}
+      # Claude Code CLI auth (for coder-cc expert, uses Max/Pro plan)
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+    volumes:
+      - workspace_data:/workspace:z
+    deploy:
+      replicas: ${AGENT_REPLICAS:-2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy
+      vpn-cluster:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+
+  cockpit:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cockpit
+    image: srw-cockpit:local
+    container_name: srw-cockpit
+    environment:
+      PORT: 4000
+    ports:
+      - "${COCKPIT_PORT:-4000}:4000"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Container log viewer (Dozzle)
+  # ---------------------------------------------------------------------------
+  # Socket path varies by runtime:
+  #   Rootless Podman: /run/user/<UID>/podman/podman.sock  (default below)
+  #   Rootful Podman:  /run/podman/podman.sock
+  #   Docker:          /var/run/docker.sock
+  dozzle:
+    image: docker.io/amir20/dozzle:latest
+    container_name: srw-dozzle
+    security_opt:
+      - label:disable
+    environment:
+      - DOZZLE_NO_ANALYTICS=true
+    volumes:
+      - /run/user/${HOST_UID:-1000}/podman/podman.sock:/var/run/docker.sock:ro
+    ports:
+      - "${DOZZLE_PORT:-9999}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: srw_postgres_data
+  mongodb_data:
+    name: srw_mongodb_data
+  gitea_data:
+    name: srw_gitea_data
+  workspace_data:
+    name: srw_workspace_data

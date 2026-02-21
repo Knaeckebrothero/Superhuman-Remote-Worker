@@ -1,3 +1,17 @@
+---
+tags:
+  - business
+  - writing
+aliases:
+  - Revenue Generation
+  - Freelance Writing
+  - GPU Funding
+related:
+  - "[[deployment]]"
+  - "[[finetuning]]"
+  - "[[writing_instructions]]"
+  - "[[email_and_mobile]]"
+---
 # Financing: Revenue Generation with the Agent
 
 **Goal:** Generate ~$10-12k to fund a Blackwell GPU workstation.
@@ -289,3 +303,10 @@ Key sections for quick lookup:
 - Ranked comparison table: pp. 13-15
 - Strategic action plan: pp. 15-16
 - Works cited: pp. 16-19
+
+## Related
+
+- [[deployment]] - Agent infrastructure that enables remote freelance work
+- [[finetuning]] - Improving agent quality for higher-value deliverables
+- [[writing_instructions]] - Writing style and formatting guidance for content jobs
+- [[email_and_mobile]] - Client communication and job monitoring on the go

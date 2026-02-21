@@ -1,3 +1,19 @@
+---
+tags:
+  - user-interface
+  - debugging
+  - orchestrator
+aliases:
+  - Cockpit Dashboard
+  - Debug UI
+  - Agent Monitor
+related:
+  - "[[graph_change_detection]]"
+  - "[[datasources]]"
+  - "[[deployment]]"
+  - "[[deliverables]]"
+  - "[[continuous_improvement_loop]]"
+---
 # Debug Cockpit - Implementation Plan
 
 ## Overview
@@ -887,3 +903,11 @@ Then add the filename (without `.json`) to the `presetFiles` array in `layout.se
 1. **Authentication**: Should the debug cockpit require auth, or is it dev-only?
 2. **Real-time updates**: Should the cockpit poll for updates on running jobs, or is historical replay enough?
 3. **Caching**: Should the FastAPI backend cache recent queries, or always hit the databases?
+
+## Related
+
+- [[graph_change_detection]] - Graph timeline component architecture and Cytoscape integration
+- [[datasources]] - Datasource management UI in the cockpit
+- [[deployment]] - Cockpit containerization and Docker compose setup
+- [[deliverables]] - Job review component and workspace browser in the cockpit
+- [[continuous_improvement_loop]] - Cockpit provides audit trail inspection for the evaluator

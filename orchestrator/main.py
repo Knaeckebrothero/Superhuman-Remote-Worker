@@ -169,6 +169,7 @@ class JobCreate(BaseModel):
     config_override: dict[str, Any] | None = Field(None, description="Per-job configuration overrides")
     context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
     instructions: str | None = Field(None, description="Additional inline instructions for the agent")
+    kickoff_message: str | None = Field(None, description="Opening message to the agent (task brief)")
     datasource_ids: list[str] | None = Field(None, description="Global datasource IDs to clone as job-scoped")
     builder_session_id: str | None = Field(None, description="Builder session ID to link to this job")
 
@@ -440,6 +441,8 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             context["instructions_upload_id"] = job.instructions_upload_id
         if job.instructions:
             context["instructions"] = job.instructions
+        if job.kickoff_message:
+            context["kickoff_message"] = job.kickoff_message
 
         result = await postgres_db.create_job(
             description=job.description,
@@ -783,7 +786,42 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
                            f"(checked Gitea repo and local workspace)",
                 )
 
-        # 3. Build completion data
+        # 3. Determine freeze type (backward compat: missing = job_complete)
+        freeze_type = frozen_data.get("freeze_type", "job_complete")
+
+        if freeze_type == "phase_boundary":
+            # Phase boundary freeze: approve to continue execution (not complete)
+            # Remove job_frozen.json from Gitea and local
+            if gitea_client.is_initialized:
+                await gitea_client.delete_file(
+                    repo_name,
+                    "output/job_frozen.json",
+                    "Approve phase boundary: remove job_frozen.json",
+                )
+
+            local_frozen = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+            if local_frozen.exists():
+                local_frozen.unlink()
+
+            # Update DB: status → processing (not completed)
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET status = 'processing', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                    job_id,
+                )
+
+            logger.info(f"Job {job_id} phase boundary approved (resume execution)")
+
+            return {
+                "status": "approved_continue",
+                "job_id": job_id,
+                "freeze_type": freeze_type,
+                "phase_type": frozen_data.get("phase_type"),
+                "phase_number": frozen_data.get("phase_number"),
+            }
+
+        # job_complete freeze (or backward compat): mark as truly completed
         completion_data = {
             **frozen_data,
             "status": "job_completed",
@@ -2366,6 +2404,52 @@ async def get_agent(agent_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/agents/{agent_id}/system-info")
+async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
+    """Proxy system info request to an agent's /system/info endpoint.
+
+    Returns CPU, memory, disk, processes, listening ports, and network
+    connections from the agent's container.
+    """
+    import httpx
+
+    try:
+        agent = await postgres_db.get_agent(agent_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+        if agent["status"] == "offline":
+            raise HTTPException(status_code=400, detail="Agent is offline")
+
+        pod_ip = agent.get("pod_ip")
+        if not pod_ip:
+            raise HTTPException(status_code=400, detail="Agent has no pod IP configured")
+
+        pod_port = agent.get("pod_port", 8001)
+        agent_url = f"http://{pod_ip}:{pod_port}/system/info"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(agent_url)
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Agent returned {response.status_code}: {response.text}",
+            )
+
+        return response.json()
+
+    except HTTPException:
+        raise
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to connect to agent: {str(e)}",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.delete("/api/agents/{agent_id}")
 async def delete_agent(agent_id: str) -> dict[str, str]:
     """Deregister an agent.
@@ -2420,18 +2504,6 @@ def _scan_experts() -> list[ExpertInfo]:
     config_dir = _get_config_dir()
     experts_dir = config_dir / "experts"
     experts: list[ExpertInfo] = []
-
-    # Add synthetic defaults entry
-    experts.append(
-        ExpertInfo(
-            id="defaults",
-            display_name="Generalist Agent",
-            description="General-purpose agent with balanced capabilities for requirement extraction, validation, and compliance checking.",
-            icon="psychology",
-            color="#cba6f7",
-            tags=["general", "requirements", "compliance"],
-        )
-    )
 
     if not experts_dir.is_dir():
         return experts
