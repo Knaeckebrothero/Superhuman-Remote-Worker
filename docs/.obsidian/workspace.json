@@ -11,10 +11,14 @@
             "id": "286db0584aa55bd0",
             "type": "leaf",
             "state": {
-              "type": "graph",
-              "state": {},
-              "icon": "lucide-git-fork",
-              "title": "Graph view"
+              "type": "markdown",
+              "state": {
+                "file": "01_issues.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "01_issues"
             }
           }
         ]
@@ -37,7 +41,7 @@
               "type": "file-explorer",
               "state": {
                 "sortOrder": "alphabetical",
-                "autoReveal": false
+                "autoReveal": true
               },
               "icon": "lucide-folder-closed",
               "title": "Files"
@@ -90,6 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
+                "file": "citation_engine_roadmap.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -99,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks"
+              "title": "Backlinks for citation_engine_roadmap"
             }
           },
           {
@@ -108,11 +113,12 @@
             "state": {
               "type": "outgoing-link",
               "state": {
+                "file": "citation_engine_roadmap.md",
                 "linksCollapsed": false,
                 "unlinkedCollapsed": true
               },
               "icon": "links-going-out",
-              "title": "Outgoing links"
+              "title": "Outgoing links from citation_engine_roadmap"
             }
           },
           {
@@ -150,12 +156,13 @@
             "state": {
               "type": "outline",
               "state": {
+                "file": "citation_engine_roadmap.md",
                 "followCursor": false,
                 "showSearch": false,
                 "searchQuery": ""
               },
               "icon": "lucide-list",
-              "title": "Outline"
+              "title": "Outline of citation_engine_roadmap"
             }
           }
         ]
@@ -177,5 +184,17 @@
     }
   },
   "active": "286db0584aa55bd0",
-  "lastOpenFiles": []
+  "lastOpenFiles": [
+    "citation_engine_roadmap.md",
+    "Untitled.canvas",
+    "issues/phases.md",
+    "issues/phases.md.tmp.283287.1771595809186",
+    "continuous_improvement_loop.md",
+    "citation_issues.md",
+    "cli_wrapper.md",
+    "advanced_job_configuration.md",
+    "drafts/dictionary_graph_instructions.md.tmp.8359.1771591141437",
+    "drafts/dictionary_graph_instructions.md",
+    "drafts/dictionary_graph_instructions.md.tmp.8359.1771590348674"
+  ]
 }

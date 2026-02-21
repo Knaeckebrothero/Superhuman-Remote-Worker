@@ -230,26 +230,18 @@ import { environment } from '../../core/environment';
 
                   <div class="form-group compact">
                     <label class="form-label">Model</label>
-                    <div class="model-combo">
-                      <input
-                        type="text"
-                        class="form-input"
-                        [ngModel]="strategicModel()"
-                        (ngModelChange)="strategicModel.set($event)"
-                        name="strategicModel"
-                        placeholder="Select or type a model..."
-                        list="strategicModelList"
-                        [disabled]="isSubmitting()"
-                        autocomplete="off"
-                      >
-                      <datalist id="strategicModelList">
-                        @for (group of availableModels; track group.group) {
+                    <select class="form-input"
+                      [ngModel]="strategicModel()" (ngModelChange)="strategicModel.set($event)"
+                      name="strategicModel" [disabled]="isSubmitting()">
+                      <option [ngValue]="null">Default</option>
+                      @for (group of availableModels; track group.group) {
+                        <optgroup [label]="group.group">
                           @for (model of group.models; track model) {
-                            <option [value]="model">{{ group.group }}</option>
+                            <option [value]="model">{{ model }}</option>
                           }
-                        }
-                      </datalist>
-                    </div>
+                        </optgroup>
+                      }
+                    </select>
                   </div>
 
                   <div class="form-group compact">
@@ -317,26 +309,18 @@ import { environment } from '../../core/environment';
 
                   <div class="form-group compact">
                     <label class="form-label">Model</label>
-                    <div class="model-combo">
-                      <input
-                        type="text"
-                        class="form-input"
-                        [ngModel]="tacticalModel()"
-                        (ngModelChange)="tacticalModel.set($event)"
-                        name="tacticalModel"
-                        placeholder="Select or type a model..."
-                        list="tacticalModelList"
-                        [disabled]="isSubmitting()"
-                        autocomplete="off"
-                      >
-                      <datalist id="tacticalModelList">
-                        @for (group of availableModels; track group.group) {
+                    <select class="form-input"
+                      [ngModel]="tacticalModel()" (ngModelChange)="tacticalModel.set($event)"
+                      name="tacticalModel" [disabled]="isSubmitting()">
+                      <option [ngValue]="null">Default</option>
+                      @for (group of availableModels; track group.group) {
+                        <optgroup [label]="group.group">
                           @for (model of group.models; track model) {
-                            <option [value]="model">{{ group.group }}</option>
+                            <option [value]="model">{{ model }}</option>
                           }
-                        }
-                      </datalist>
-                    </div>
+                        </optgroup>
+                      }
+                    </select>
                   </div>
 
                   <div class="form-group compact">
@@ -702,11 +686,6 @@ import { environment } from '../../core/environment';
         display: inline-block;
         vertical-align: middle;
         margin-left: 6px;
-      }
-
-      /* Model combo-box */
-      .model-combo {
-        position: relative;
       }
 
       /* Model preset chips */
