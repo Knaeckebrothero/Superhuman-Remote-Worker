@@ -77,7 +77,7 @@ class CockpitClient:
         """List jobs with optional status filter.
 
         Args:
-            status: Filter by status (pending, running, completed, failed)
+            status: Filter by status (created, processing, completed, failed, cancelled, pending_review)
             limit: Maximum number of jobs to return (1-500)
 
         Returns:
@@ -439,7 +439,7 @@ class AsyncCockpitClient:
         """List jobs with optional status filter.
 
         Args:
-            status: Filter by status (pending, running, completed, failed)
+            status: Filter by status (created, processing, completed, failed, cancelled, pending_review)
             limit: Maximum number of jobs to return (1-500)
 
         Returns:

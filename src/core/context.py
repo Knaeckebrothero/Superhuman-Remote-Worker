@@ -262,7 +262,10 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
         except KeyError:
             # Fall back to cl100k_base (used by GPT-4)
             enc = tiktoken.get_encoding("cl100k_base")
-            logger.debug(f"Model {model_name} not found in tiktoken, using cl100k_base")
+            logger.debug(
+                f"Model {model_name} not found in tiktoken, using cl100k_base. "
+                "Token counts may over/undercount for non-OpenAI models."
+            )
 
         total = 0
         debug_details = []
@@ -689,12 +692,134 @@ class ContextManager:
                 f"Context compaction triggered: {len(messages)} messages, "
                 f"{self.get_token_count(messages)} tokens"
             )
-            return await self.summarize_and_compact(
+            result = await self.summarize_and_compact(
                 messages,
                 llm,
                 summarization_prompt,
                 max_summary_length,
             )
+
+            # Progressive compaction: if force=True and still too many messages,
+            # retry with progressively smaller keep_recent windows
+            if force:
+                keep_recent = self.config.keep_recent_messages
+                # Count conversation messages (non-system, non-RemoveMessage)
+                prev_conv_count = sum(
+                    1 for m in messages
+                    if not isinstance(m, (SystemMessage, RemoveMessage))
+                )
+                conv_count = sum(
+                    1 for m in result
+                    if not isinstance(m, (SystemMessage, RemoveMessage))
+                )
+                # If first compaction didn't reduce, skip progressive loop
+                # (e.g., summary was larger than original — further retries won't help)
+                if conv_count >= prev_conv_count:
+                    logger.debug(
+                        f"Compaction did not reduce messages ({prev_conv_count} -> {conv_count}), "
+                        "skipping progressive loop"
+                    )
+                else:
+                    # Try progressively smaller windows: half → quarter → 2 → 1
+                    for divisor in [2, 4, None, None]:
+                        if conv_count <= keep_recent:
+                            break
+                        if divisor:
+                            next_keep = max(2, keep_recent // divisor)
+                        else:
+                            # Final attempts with absolute minimums
+                            next_keep = 2 if conv_count > 2 else 1
+                        if next_keep >= keep_recent:
+                            break  # No further reduction possible
+                        prev_conv_count = conv_count
+                        logger.warning(
+                            f"Progressive compaction: still {conv_count} conversation messages, "
+                            f"retrying with keep_recent={next_keep}"
+                        )
+                        # Re-compact from ORIGINAL messages to avoid RemoveMessage accumulation
+                        result = await self.summarize_and_compact(
+                            messages,
+                            llm,
+                            summarization_prompt,
+                            max_summary_length,
+                            keep_recent_override=next_keep,
+                        )
+                        conv_count = sum(
+                            1 for m in result
+                            if not isinstance(m, (SystemMessage, RemoveMessage))
+                        )
+                        keep_recent = next_keep
+                        # Break if compaction didn't reduce messages further
+                        if conv_count >= prev_conv_count:
+                            logger.debug(
+                                "Progressive compaction stalled, stopping retries"
+                            )
+                            break
+
+                # Emergency: if token count still exceeds model max, truncate tool results
+                non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+                token_count = self.get_token_count(non_remove)
+                if token_count > self.config.model_max_context_tokens:
+                    logger.warning(
+                        f"Emergency truncation: {token_count} tokens still exceeds "
+                        f"model max {self.config.model_max_context_tokens}"
+                    )
+                    result = self._emergency_truncate_tool_results(result)
+
+            return result
+        return messages
+
+    def _emergency_truncate_tool_results(
+        self,
+        messages: List[BaseMessage],
+        initial_limit: int = 2000,
+        final_limit: int = 500,
+    ) -> List[BaseMessage]:
+        """Truncate ALL tool results as a last resort when context is still too large.
+
+        This handles the case where individual tool results (e.g., a 875KB read_file)
+        are larger than the entire context budget.
+
+        Args:
+            messages: Message list (may contain RemoveMessage markers)
+            initial_limit: First truncation pass limit in chars
+            final_limit: Second truncation pass limit if still over
+
+        Returns:
+            Messages with truncated tool results
+        """
+        for limit in [initial_limit, final_limit]:
+            # Build list of (index, content_length) for ToolMessages, sorted largest first
+            tool_sizes = []
+            for i, msg in enumerate(messages):
+                if isinstance(msg, ToolMessage) and len(msg.content) > limit:
+                    tool_sizes.append((i, len(msg.content)))
+            tool_sizes.sort(key=lambda x: x[1], reverse=True)
+
+            if not tool_sizes:
+                break
+
+            truncated_count = 0
+            result = list(messages)
+            for idx, orig_len in tool_sizes:
+                msg = result[idx]
+                result[idx] = ToolMessage(
+                    content=msg.content[:limit] + f"\n\n[EMERGENCY TRUNCATED - {orig_len - limit} chars removed]",
+                    tool_call_id=msg.tool_call_id,
+                )
+                truncated_count += 1
+
+            logger.warning(
+                f"Emergency truncated {truncated_count} tool results to {limit} chars"
+            )
+            messages = result
+
+            # Check if we're under the limit now
+            non_remove = [m for m in messages if not isinstance(m, RemoveMessage)]
+            token_count = self.get_token_count(non_remove)
+            if token_count <= self.config.model_max_context_tokens:
+                break
+
         return messages
 
     def _format_messages_for_summary(self, messages: List[BaseMessage]) -> List[str]:
@@ -1007,6 +1132,7 @@ Conversation:
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
+        keep_recent_override: Optional[int] = None,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -1017,6 +1143,8 @@ Conversation:
             messages: Full message history
             llm: LLM for summarization
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
+            max_summary_length: Max length for summary
+            keep_recent_override: Override keep_recent_messages (for progressive compaction)
 
         Returns:
             Compacted message list with summary prepended
@@ -1026,6 +1154,13 @@ Conversation:
         # Filter out workspace injection messages BEFORE processing
         # They are transient and will be re-injected fresh after summarization
         messages = [m for m in messages if not is_workspace_injection_message(m)]
+
+        # Determine effective keep_recent value
+        effective_keep_recent = (
+            keep_recent_override
+            if keep_recent_override is not None
+            else self.config.keep_recent_messages
+        )
 
         # Separate system messages into:
         # 1. Regular system messages (keep in output)
@@ -1041,11 +1176,11 @@ Conversation:
         ]
         conversation = [m for m in messages if not isinstance(m, SystemMessage)]
 
-        if len(conversation) <= self.config.keep_recent_messages:
+        if len(conversation) <= effective_keep_recent:
             return messages
 
         # Find safe slice point that doesn't orphan ToolMessages
-        target_start = len(conversation) - self.config.keep_recent_messages
+        target_start = len(conversation) - effective_keep_recent
         safe_start = find_safe_slice_start(conversation, target_start)
 
         # Messages to summarize (older ones) and recent messages to keep
