@@ -1,3 +1,18 @@
+---
+tags:
+  - web-search
+  - tool-development
+  - citation-engine
+  - agent-architecture
+  - configuration
+  - security
+aliases:
+  - "Internet Usage"
+  - "Research Capabilities"
+  - "Academic Paper APIs"
+  - "Browser Automation"
+---
+
 # Internet Usage and Research Capabilities
 
 This document explores solutions for enabling the agent to perform academic research, download papers, and interact with websites. It covers the technical landscape, limitations, and recommended implementation strategies.
@@ -20,7 +35,7 @@ This document explores solutions for enabling the agent to perform academic rese
 
 ## Problem Statement
 
-The agent currently cannot properly download PDFs from academic sources. When using `cite_web` on arXiv links, it only fetches the abstract page metadata, not the full paper content. This limits the agent's ability to:
+The agent currently cannot properly download PDFs from academic sources. When using `cite_web` (see [[tool_implementation]]) on arXiv links, it only fetches the abstract page metadata, not the full paper content. This limits the agent's ability to:
 
 - Verify quotes against source material
 - Extract specific information from papers
@@ -588,7 +603,7 @@ src/tools/research/
 └── web.py               # web_search (Tavily)
 ```
 
-**Existing tool**: `web_search` - Tavily-based web search with citation source registration
+**Existing tool**: `web_search` - Tavily-based web search with citation source registration (see [[tavily_implementation]])
 
 ### Target State
 
@@ -1295,7 +1310,7 @@ async def research_topic(
 
 #### 3.3 Citation Integration
 
-Connect paper tools with existing citation system:
+Connect paper tools with existing [[overview|citation system]]:
 
 ```python
 # In download_paper, after successful download:
@@ -1569,3 +1584,10 @@ export INSTITUTIONAL_ACCESS=false
 ### Background Reading
 - [Green vs Gold Open Access - Penn State](https://guides.libraries.psu.edu/open-access/green)
 - [Unpaywall Explained - California Digital Library](https://cdlib.org/cdlinfo/2018/07/24/so-what-is-unpaywall-anyway/)
+
+## Related
+- [[tavily_implementation]]
+- [[tool_implementation]]
+- [[masterplan]]
+- [[overview]]
+- [[mcp_overhaul]]

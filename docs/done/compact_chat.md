@@ -1,8 +1,18 @@
+---
+tags:
+  - context-management
+  - agent-architecture
+  - llm-configuration
+  - debugging
+aliases:
+  - ["Context Management", "Compact Chat", "Context Overflow"]
+---
+
 # Agent Context Management - Research & Implementation Plan
 
 ## Problem Statement
 
-The LangGraph agent crashed after 29 steps with `ValueError: No generations found in stream`. This occurred because the conversation context grew too large, causing the LLM to return an empty response.
+The [[agent|LangGraph agent]] crashed after 29 steps with `ValueError: No generations found in stream`. This occurred because the conversation context grew too large, causing the LLM to return an empty response.
 
 **Error log:**
 ```
@@ -167,7 +177,7 @@ async for event in self.graph.astream_events(initial_state, config=config, versi
 ## Proposed Implementation Plan
 
 ### Phase 1: Quick Wins (Immediate)
-1. Add recursion limit (25 steps) as safety net
+1. Add recursion limit (25 steps) as safety net (see [[guardrails]])
 2. Implement tool result clearing for messages older than N turns
 
 ### Phase 2: Summarization (Next)
@@ -212,3 +222,10 @@ tiktoken>=0.5.0
 - [Anthropic Context Engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
 - [LangGraph Memory Documentation](https://docs.langchain.com/oss/python/langgraph/add-memory)
 - [Mem0 - Universal Memory Layer](https://github.com/mem0ai/mem0)
+
+## Related
+
+- [[agent]]
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[overview]]

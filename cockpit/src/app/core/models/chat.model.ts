@@ -50,7 +50,6 @@ export interface ChatEntry {
   _id: string;
   job_id: string;
   agent_type: string;
-  sequence_number: number;
   timestamp: string;
   iteration: number;
   phase?: string;

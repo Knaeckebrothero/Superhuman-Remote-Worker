@@ -1,3 +1,19 @@
+---
+tags:
+  - knowledge-management
+  - agent-architecture
+  - planning
+aliases:
+  - Zettelkasten workspace
+  - knowledge graph workspace
+  - Obsidian integration
+related:
+  - "[[memories_mechanism]]"
+  - "[[context_management]]"
+  - "[[working_memory]]"
+  - "[[vectorization]]"
+---
+
 # Obsidian-Style Knowledge Workspace
 
 This document captures the design discussion for integrating Obsidian-compatible, Zettelkasten-style note-taking into the agent's workspace.
@@ -241,3 +257,10 @@ Recommendation: **Files as source of truth** for simplicity and Obsidian compati
 - [Obsidian Help](https://help.obsidian.md/)
 - [A-MEM Paper](https://arxiv.org/abs/2502.12110)
 - [Obsidian-Assist](https://github.com/ya0002/obsidian-assist)
+
+## Related
+
+- [[memories_mechanism]] - Associative memory system with observer and vector storage
+- [[context_management]] - Context window management and compaction strategies
+- [[working_memory]] - Working memory implementation for the agent
+- [[vectorization]] - Vector embedding approaches for semantic retrieval

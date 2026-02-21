@@ -208,7 +208,7 @@ class TestSinglePassSummarize:
             conversation_text="User: Hello\nAssistant: Hi",
             llm=mock_llm,
             summarization_prompt=None,
-            oss_reasoning_level="high",
+
             max_summary_length=10000,
         )
 
@@ -225,7 +225,7 @@ class TestSinglePassSummarize:
             conversation_text="test",
             llm=mock_llm,
             summarization_prompt=custom_prompt,
-            oss_reasoning_level="high",
+
             max_summary_length=10000,
         )
 
@@ -244,7 +244,7 @@ class TestSinglePassSummarize:
             conversation_text="test",
             llm=error_llm,
             summarization_prompt=None,
-            oss_reasoning_level="high",
+
             max_summary_length=10000,
         )
 
@@ -269,7 +269,7 @@ class TestRecursiveSummarize:
             formatted_parts=parts,
             llm=mock_llm,
             summarization_prompt=None,
-            oss_reasoning_level="high",
+
             max_summary_length=5000,
         )
 
@@ -288,7 +288,7 @@ class TestRecursiveSummarize:
             formatted_parts=parts,
             llm=mock_llm,
             summarization_prompt=None,
-            oss_reasoning_level="high",
+
             max_summary_length=1000,
         )
 
@@ -303,7 +303,7 @@ class TestRecursiveSummarize:
             formatted_parts=parts,
             llm=mock_llm,
             summarization_prompt=None,
-            oss_reasoning_level="high",
+
             max_summary_length=10000,
         )
 
@@ -448,11 +448,11 @@ class TestContextSafetyIntegration:
         assert "[Summarization failed:" not in result
 
     def test_config_defaults_are_safe(self):
-        """Default config values should be safe for 128k context models."""
+        """Default config values should be safe for 100k effective context."""
         config = ContextConfig()
 
-        assert config.model_max_context_tokens == 128_000
-        assert config.summarization_safe_limit == 100_000
+        assert config.model_max_context_tokens == 100_000
+        assert config.summarization_safe_limit == 90_000
         assert config.summarization_chunk_size == 80_000
         # Safe limit should leave room for prompt overhead
         assert config.summarization_safe_limit < config.model_max_context_tokens

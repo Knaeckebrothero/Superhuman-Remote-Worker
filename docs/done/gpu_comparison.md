@@ -1,6 +1,15 @@
+---
+tags:
+  - llm-configuration
+  - cloud-infrastructure
+  - finetuning
+aliases:
+  - ["GPU Comparison", "GPU Benchmarks", "H100 vs H200"]
+---
+
 # GPU Performance Comparison
 
-Benchmark comparison of NVIDIA H100 and H200 GPUs running the `gpt-oss-120b` model with vLLM and llama.cpp inference frameworks.
+Benchmark comparison of NVIDIA H100 and H200 GPUs running the `gpt-oss-120b` model with vLLM and llama.cpp inference frameworks. These benchmarks inform [[hive_implementation|agent infrastructure]] decisions for GPU-backed LLM serving.
 
 ## Test Configuration
 
@@ -95,3 +104,9 @@ The script parses vLLM and llama.cpp log files and extracts:
 - Generation throughput (tokens/second)
 - Cache hit rates (vLLM)
 - Total tokens processed and timing statistics
+
+## Related
+
+- [[hive_implementation]]
+- [[agent]]
+- [[overview]]

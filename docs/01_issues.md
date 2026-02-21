@@ -1,3 +1,19 @@
+---
+tags:
+  - orchestrator
+  - bug-fix
+  - debugging
+  - tool-development
+aliases:
+  - MCP Issues
+  - MCP Overhaul Issues
+related:
+  - "[[cockpit_performance_issues]]"
+  - "[[config_issues]]"
+  - "[[coding_agent]]"
+  - "[[cockpit_ds]]"
+---
+
 # MCP Overhaul — Issues Found During Testing
 
 Tested by debugging job `6298b72e` ("Refine documentation") — the multi-feedback-round job with 4 `job_complete` calls, 24 phases, 1614 audit entries.
@@ -109,6 +125,125 @@ status: Literal["created", "processing", "pending_review", "completed", "failed"
 
 ---
 
+## Issue 6: Job status never updates from `processing` — broken async DB update
+
+**Severity**: Critical — every job stays `processing` forever, breaking the cockpit UI and `list_jobs` filters.
+
+**Symptom**: When an agent calls `job_complete` and the job freezes (writes `job_frozen.json`), the PostgreSQL job status remains `processing` instead of transitioning to `pending_review`. Reproduced on jobs `6298b72e`, `251f6723`, `63fe5596`.
+
+**Root cause (two layers)**:
+
+### Layer 1: `finalize_job()` used broken async pattern (`src/core/phase.py`)
+
+The original `finalize_job()` attempted to update the database using `ThreadPoolExecutor` + `asyncio.run()`:
+
+```python
+# BROKEN — creates a new event loop in a worker thread,
+# but asyncpg pool is bound to the main event loop
+with ThreadPoolExecutor() as pool:
+    pool.submit(asyncio.run, postgres_db.jobs.update_status(job_id, status="pending_review"))
+```
+
+This fails silently because asyncpg connection pools are bound to the event loop they were created on. The `asyncio.run()` creates a new loop, and the cross-loop usage raises an exception caught by a blanket `except Exception` that only logs at debug level.
+
+**Fix applied**: Removed the broken async code from `finalize_job()`. Made the `handle_transition` graph node `async def` so it can properly `await` the asyncpg call on the correct event loop. Added defense-in-depth DB update in `graph.py` after `handle_phase_transition()` returns with `should_stop=True`.
+
+### Layer 2: `_process_orchestrator_job()` never updated job status (`src/api/app.py`)
+
+After the graph finishes execution, `_process_orchestrator_job()` logged the result but never wrote the final status back to PostgreSQL. The `should_stop` and `goal_achieved` flags in the final graph state were ignored.
+
+**Fix applied**: Added `_update_job_status_from_result()` function that maps the final state to DB status:
+- `error` present → `failed`
+- `should_stop=True` → `pending_review` (frozen for human review)
+- Otherwise → leave as `processing` (only explicit approval sets `completed`)
+
+Called after both normal completion and in the exception handler. Also fixed the `_resume_job()` function which had the same missing status update.
+
+**Files modified**: `src/core/phase.py`, `src/graph.py`, `src/api/app.py`
+
+---
+
+## Issue 7: Context summarization hangs — `with_structured_output()` incompatible with LLM proxy
+
+**Severity**: Critical — blocks every job at the first phase transition, causing indefinite hangs.
+
+**Symptom**: After the initial strategic phase completes all todos, the graph moves to the `archive_phase` node for context compaction. The LLM summarization call hangs indefinitely. The agent keeps sending heartbeat as `working` but no progress is made. Reproduced on jobs `251f6723` (hung 70+ min) and `63fe5596` (hung 15+ min).
+
+**Evidence** (from job logs):
+```
+09:54:40 - Archiving phase: Phase 1 – Research & Taxonomy Design (Strategic)
+09:54:40 - Context compaction triggered: 33 messages, 26661 tokens
+09:54:40 - Starting single-pass summarization (298 tokens)
+[... no more graph events, only heartbeats ...]
+10:25:13 - Heartbeat sent: status=working
+```
+
+**Root cause**: The `_single_pass_summarize()` method in `src/core/context.py:786-788` uses:
+
+```python
+structured_llm = llm.with_structured_output(ConversationSummary)
+result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+```
+
+`with_structured_output()` (default method) sends the request with `response_format: { type: "json_schema", json_schema: {...} }`. This parameter is not properly handled by the LLM proxy at `localhost:8080`, causing the request to hang instead of returning or erroring.
+
+Regular tool/function calling works fine through the same proxy (the strategic phase completed 16 successful LLM iterations with tool calls). Only the `response_format`-based structured output fails.
+
+**Additional factor**: The `ReasoningChatOpenAI` wrapper sets a custom sync `httpx.Client` (`http_client`) for key ring integration, but does NOT set `http_async_client`. When `ainvoke()` is called, LangChain's `ChatOpenAI` uses a default async client that may not inherit the same timeout or connection settings.
+
+**Impact**: No job can ever complete a phase transition. The graph hangs at `archive_phase` and the job stays `processing` forever.
+
+**Proposed fix**: Change `with_structured_output()` to use `method="function_calling"` (same mechanism that works for tool calls), and add an `asyncio.wait_for()` timeout as a safety net:
+
+```python
+structured_llm = llm.with_structured_output(ConversationSummary, method="function_calling")
+result = await asyncio.wait_for(
+    structured_llm.ainvoke([HumanMessage(content=prompt)]),
+    timeout=120,
+)
+```
+
+**File**: `src/core/context.py:786-788`
+
+---
+
+## ~~Issue 8: Both phase LLMs routed through local proxy instead of respective providers~~ RESOLVED
+
+**Status**: Resolved — phase-aware model routing and audit trail now correctly reflect per-phase LLM configuration.
+
+**Fix applied** (`src/graph.py`, `src/llm/reasoning_chat.py`, `src/core/archiver.py`):
+- Split single `model_kwargs` into `strategic_model_kwargs` / `tactical_model_kwargs`
+- Resolve `phase_model` via `config.llm.get_phase_config(phase_str).model` inside `execute()`
+- Audit trail (`audit_llm_call`, `archive`) now logs the phase-specific model name instead of `config.llm.model`
+- Added `_agenerate()` override so async LLM calls (used by the graph) also capture reasoning
+- Added `_extract_responses_api_reasoning()` for GPT-5.2-pro's Responses API content block format
+- Added `_normalize_content()` in archiver to flatten list content blocks to clean strings
+
+**Tests**: 18 new unit tests in `tests/test_responses_api.py`, no regressions in existing suite.
+
+<details>
+<summary>Original issue description</summary>
+
+**Severity**: Medium — misconfiguration, works by accident but fragile.
+
+**Symptom**: Both the strategic model (`gpt-5.2-pro`, intended for OpenAI API) and the tactical model (`openai/gpt-oss-120b`, intended for local llama.cpp) are configured with `base_url=http://localhost:8080/v1`.
+
+**Evidence** (from job log):
+```
+Created OpenAI LLM: model=gpt-5.2-pro, base_url=http://localhost:8080/v1, keys=2 key(s)
+Created OpenAI LLM: model=openai/gpt-oss-120b, base_url=http://localhost:8080/v1, keys=2 key(s)
+```
+
+**Problem**: The `base_url` is set globally (via `LLM_BASE_URL` env var or the base `llm.base_url` config field) and applies to all phase LLMs. Phase-specific overrides (`llm.strategic.base_url`, `llm.tactical.base_url`) exist in the config schema but are apparently not set, so both models inherit the same base URL.
+
+This works only because the proxy at `:8080` happens to route `gpt-5.2-pro` to the OpenAI API and `openai/gpt-oss-120b` to the local llama.cpp server. But the proxy's `/v1/models` endpoint only lists the local model (`ggml-org/gpt-oss-120b-GGUF`), so `gpt-5.2-pro` is invisible and can't be verified directly.
+
+**Risk**: If the proxy doesn't handle certain request parameters (like `response_format` for structured output — see Issue 7), requests silently hang instead of being forwarded correctly. The proxy becomes a single point of failure for all LLM calls.
+
+</details>
+
+---
+
 ## Testing Summary
 
 ### Tools verified working (via REST API fallback)
@@ -140,3 +275,11 @@ status: Literal["created", "processing", "pending_review", "completed", "failed"
 - **Deliverables**: 11 German academic chapters + editorial report in `output/`
 - **Citations**: 347 sources (111 web, 236 documents), 10 citations (4 verified, 6 failed)
 - **Phases**: 24 phases (0-23), 4 `job_complete` attempts at audit steps 679, 711, 1143, 1609
+
+## Related
+
+- [[cockpit_performance_issues]] — Performance audit of the same cockpit/orchestrator stack
+- [[config_issues]] — Config value audit and dead code cleanup
+- [[coding_agent]] — The coding agent that exercises MCP tools
+- [[cockpit_ds]] — Data service refactor that depends on working MCP endpoints
+- [[advanced_job_configuration]] — Job creation UI that uses orchestrator APIs

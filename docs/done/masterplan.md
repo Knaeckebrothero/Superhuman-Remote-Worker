@@ -1,3 +1,20 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - data-management
+  - orchestrator
+  - citation-engine
+  - context-management
+  - cloud-infrastructure
+  - knowledge-management
+aliases:
+  - "Masterplan"
+  - "Graph-RAG Masterplan"
+  - "Two-Agent System"
+  - "Comprehensive Masterplan"
+---
+
 # Graph-RAG Autonomous Agent System
 ## Comprehensive Masterplan
 
@@ -65,7 +82,7 @@ This system is built on several key principles:
 - Metamodel compliance validation
 - Citation Engine (fully implemented as separate pip package in `citation_tool/`)
 
-**Target State:**
+**Target State (see [[masterplan_roadmap]]):**
 - Two autonomous agents running as separate containers
 - Asynchronous producer-consumer pattern via shared PostgreSQL cache
 - Long-running background processing (hours/days/weeks)
@@ -1119,6 +1136,8 @@ src/
 
 ## 9. Database Architecture
 
+See [[postgres_migration_deep_dive]] and [[db_refactor]] for implementation details.
+
 ### 9.1 PostgreSQL Schema
 
 PostgreSQL serves as the shared state between agents:
@@ -1390,6 +1409,8 @@ This is optional but valuable for:
 ---
 
 ## 10. Context Window Management
+
+See also [[compact_chat]] for implementation details of context compaction.
 
 ### 10.1 The Challenge
 
@@ -2011,6 +2032,8 @@ Source Document (GDPR Article 32)
 ---
 
 ## 13. Neo4j Schema & Metamodel
+
+See [[neo4j_migration_deep_dive]] for detailed migration analysis and [[graph_visualization]] for visualization approaches.
 
 ### 13.1 Current FINIUS Metamodel
 
@@ -2739,6 +2762,14 @@ class AgentPool:
 - [LangChain vs LangGraph 1.0 Comparison 2026](https://www.clickittech.com/ai/langchain-1-0-vs-langgraph-1-0/) - ClickIT
 
 ---
+
+## Related
+- [[masterplan_roadmap]]
+- [[my_vision]]
+- [[overview]]
+- [[multi_agent]]
+- [[hive_implementation]]
+- [[agent]]
 
 ## Conclusion
 

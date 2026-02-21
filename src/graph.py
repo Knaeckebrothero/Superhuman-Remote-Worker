@@ -336,11 +336,17 @@ def create_init_strategic_todos_node(
         job_id = state.get("job_id", "unknown")
         logger.info(f"[{job_id}] Initializing strategic todos for phase alternation")
 
-        # Read instructions for context
+        # Read task brief for context
+        try:
+            task_brief = workspace.read_file("task_brief.md")
+        except FileNotFoundError:
+            task_brief = ""
+
+        # Read instructions for context (backward compat — removed in Phase 0)
         try:
             instructions = workspace.read_file("instructions.md")
         except FileNotFoundError:
-            instructions = "No instructions.md found. Please create a plan based on job metadata."
+            instructions = ""
             logger.warning(f"[{job_id}] instructions.md not found")
 
         # Load predefined strategic todos from config template
@@ -368,6 +374,7 @@ def create_init_strategic_todos_node(
                 data={
                     "phase_alternation": True,
                     "strategic_todos": len(strategic_todos),
+                    "task_brief_length": len(task_brief),
                     "instructions_length": len(instructions),
                 },
                 metadata=state.get("metadata"),
@@ -375,12 +382,18 @@ def create_init_strategic_todos_node(
                 phase_number=0,
             )
 
-        # Add instructions as initial context for the strategic agent
-        message = HumanMessage(
-            content=f"## Task Instructions\n\n{instructions}\n\n"
+        # Compose initial HumanMessage: task brief + instructions
+        content_parts = []
+        if task_brief:
+            content_parts.append(task_brief)
+        if instructions:
+            content_parts.append(f"## Task Instructions\n\n{instructions}")
+        content_parts.append(
             "You are starting in strategic mode. Work through the predefined todos "
-            "to understand the task, create a plan, and prepare todos for execution."
+            "to understand the task, create a plan, and prepare todos for execution.\n\n"
+            "Your task brief is saved to `task_brief.md` in your workspace for reference."
         )
+        message = HumanMessage(content="\n\n".join(content_parts))
 
         return {
             "messages": [message],
@@ -458,7 +471,8 @@ def create_execute_node(
                         kwargs[attr] = val
         return kwargs
 
-    model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
+    strategic_model_kwargs = _extract_model_kwargs(strategic_llm_with_tools)
+    tactical_model_kwargs = _extract_model_kwargs(tactical_llm_with_tools)
 
     # Track consecutive tool_use_failed errors (mutable container for closure access)
     _tool_use_failed_streak = [0]
@@ -489,33 +503,56 @@ def create_execute_node(
         # Build messages for LLM
         prepared_messages = []
 
-        # Get current dynamic content for system prompt
-        todos_content = todo_manager.format_for_display()
-
-        # Get phase-aware system prompt (workspace.md is now injected as fake tool call below)
+        # Get phase-aware system prompt (workspace.md and todos are injected as transient messages below)
         phase_number = state.get("phase_number", 0)
+        phase_name = "strategic" if is_strategic else "tactical"
+        phase_llm_config = config.llm.get_phase_config(phase_name)
         full_system = get_phase_system_prompt(
             config=config,
             is_strategic=is_strategic,
             phase_number=phase_number,
-            todos_content=todos_content,
+            model=phase_llm_config.model,
         )
-        phase_name = "strategic" if is_strategic else "tactical"
+        context_mgr.set_current_phase(phase_name)
         logger.debug(
             f"[{job_id}] Using {phase_name} LLM and prompt for phase {phase_number}"
         )
         prepared_messages.append(SystemMessage(content=full_system))
 
+        # Estimate transient injection overhead (system prompt + workspace.md + todos)
+        # so compaction thresholds account for messages that will be added AFTER compaction
+        injection_overhead_tokens = context_mgr.get_token_count([prepared_messages[0]])  # system prompt
+        if workspace_manager.exists("workspace.md"):
+            ws_text = workspace_manager.read_file("workspace.md")
+            injection_overhead_tokens += len(ws_text) // 4  # approximate
+        injection_overhead_tokens += len(todo_manager.format_for_injection()) // 4  # approximate
+
+        # Temporarily lower compaction thresholds to account for injection overhead
+        # Floor at 50% of original to avoid over-triggering
+        original_compaction_threshold = context_mgr.config.compaction_threshold_tokens
+        original_summarization_threshold = context_mgr.config.summarization_threshold_tokens
+        context_mgr.config.compaction_threshold_tokens = max(
+            original_compaction_threshold // 2,
+            original_compaction_threshold - injection_overhead_tokens,
+        )
+        context_mgr.config.summarization_threshold_tokens = max(
+            original_summarization_threshold // 2,
+            original_summarization_threshold - injection_overhead_tokens,
+        )
+
         # Ensure context is within limits before LLM call
         original_message_count = len(messages)
-        oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
-        messages = await context_mgr.ensure_within_limits(
-            messages,
-            summarization_llm,
-            summarization_prompt,
-            oss_reasoning_level=oss_reasoning_level,
-            max_summary_length=config.context_management.max_summary_length,
-        )
+        try:
+            messages = await context_mgr.ensure_within_limits(
+                messages,
+                summarization_llm,
+                summarization_prompt,
+                max_summary_length=config.context_management.max_summary_length,
+            )
+        finally:
+            # Restore original thresholds
+            context_mgr.config.compaction_threshold_tokens = original_compaction_threshold
+            context_mgr.config.summarization_threshold_tokens = original_summarization_threshold
         # Separate RemoveMessage markers from actual messages
         # RemoveMessage markers must NOT be sent to LLM - they're only for state update
         remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
@@ -536,6 +573,7 @@ def create_execute_node(
 
         # Add full conversation history in specific order:
         # 1. Summary SystemMessages first (context from before compaction)
+        # 1.5. Todo injection (full todo list as transient HumanMessage)
         # 2. Workspace injection (fake tool call - current workspace state)
         # 3. Rest of conversation (excluding regular SystemMessages)
 
@@ -545,17 +583,51 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Step 2: Inject workspace.md as fake tool call result
-        # This makes it appear as if the agent already read workspace.md
-        # Note: workspace injection is transient (not stored in state), so it's
-        # re-injected fresh each turn and won't be included in summarization
-        if workspace_manager.exists("workspace.md"):
-            from src.core.workspace_injection import create_workspace_tool_messages
+        # Helper: inject all transient messages (todos, workspace.md, instruction files)
+        # Used both in normal path and safety rebuild to avoid code duplication
+        from src.core.workspace_injection import (
+            create_todos_human_message,
+            create_workspace_tool_messages,
+            create_instruction_tool_messages,
+        )
 
-            workspace_content = workspace_manager.read_file("workspace.md")
-            ws_ai_msg, ws_tool_msg = create_workspace_tool_messages(workspace_content)
-            prepared_messages.append(ws_ai_msg)
-            prepared_messages.append(ws_tool_msg)
+        todos_injection_content = todo_manager.format_for_injection()
+
+        def _inject_transient_messages(target_messages: list) -> None:
+            """Append transient injection messages (todos, workspace.md, instruction files)."""
+            # Todo list as transient HumanMessage
+            target_messages.append(create_todos_human_message(todos_injection_content))
+
+            # Workspace.md as fake tool call result
+            if workspace_manager.exists("workspace.md"):
+                ws_content = workspace_manager.read_file("workspace.md")
+                ws_ai, ws_tool = create_workspace_tool_messages(ws_content)
+                target_messages.append(ws_ai)
+                target_messages.append(ws_tool)
+
+            # Phase-triggered instruction files (active injection)
+            if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
+                _phase_name = "strategic" if is_strategic else "tactical"
+                phase_entries = tool_context.get_phase_instruction_files(_phase_name)
+                if phase_entries:
+                    for entry in phase_entries:
+                        try:
+                            instr_content = workspace_manager.read_file(entry.file)
+                            instr_ai, instr_tool = create_instruction_tool_messages(
+                                entry.file, instr_content
+                            )
+                            target_messages.append(instr_ai)
+                            target_messages.append(instr_tool)
+                            logger.debug(
+                                f"[{job_id}] Injected instruction file: {entry.file}"
+                            )
+                        except FileNotFoundError:
+                            logger.warning(
+                                f"[{job_id}] Phase instruction file not found: {entry.file}"
+                            )
+
+        # Inject transient messages (todos, workspace.md, instruction files)
+        _inject_transient_messages(prepared_messages)
 
         # Step 3: Add rest of conversation (excluding all SystemMessages)
         for msg in messages:
@@ -568,7 +640,7 @@ def create_execute_node(
         # LAYER 1 SAFETY CHECK: Ensure we don't exceed model context limit
         # This catches bad configs and edge cases that slip through normal compaction
         total_tokens = context_mgr.get_token_count(prepared_messages)
-        model_max = config.limits.model_max_context_tokens
+        model_max = phase_llm_config.model_max_context_tokens or config.limits.model_max_context_tokens
 
         if total_tokens > model_max:
             logger.warning(
@@ -581,7 +653,6 @@ def create_execute_node(
                 messages,
                 summarization_llm,
                 summarization_prompt,
-                oss_reasoning_level=oss_reasoning_level,
                 max_summary_length=config.context_management.max_summary_length,
                 force=True,
             )
@@ -591,7 +662,7 @@ def create_execute_node(
             messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
             # Rebuild prepared_messages with compacted history
-            # Keep system prompt, replace conversation history
+            # Keep system prompt, re-inject ALL transient messages, replace conversation
             system_msg = prepared_messages[0] if prepared_messages else None
             prepared_messages = []
             if system_msg and isinstance(system_msg, SystemMessage):
@@ -602,7 +673,15 @@ def create_execute_node(
                 if isinstance(msg, SystemMessage):
                     if "[Summary of prior work]" in msg.content:
                         prepared_messages.append(msg)
-                else:
+
+            # Re-inject ALL transient messages (todos + workspace.md + instruction files)
+            _inject_transient_messages(prepared_messages)
+            logger.debug(
+                f"[{job_id}] Re-injected transient messages after safety compaction"
+            )
+
+            for msg in messages:
+                if not isinstance(msg, SystemMessage):
                     prepared_messages.append(msg)
 
             # Merge remove markers if compaction occurred
@@ -627,12 +706,14 @@ def create_execute_node(
         auditor = get_archiver()
         llm_audit_id = None
         phase_str = "strategic" if is_strategic else "tactical"
+        phase_model = config.llm.get_phase_config(phase_str).model
+        model_kwargs = strategic_model_kwargs if is_strategic else tactical_model_kwargs
         if auditor:
             llm_audit_id = auditor.audit_llm_call(
                 job_id=job_id,
                 agent_type=config.agent_id,
                 iteration=iteration,
-                model=config.llm.model,
+                model=phase_model,
                 input_message_count=len(prepared_messages),
                 state_message_count=len(messages),
                 metadata=state.get("metadata"),
@@ -646,14 +727,20 @@ def create_execute_node(
         while True:
             try:
                 start_time = time.time()
-                response = llm_with_tools.invoke(prepared_messages)
+                response = await llm_with_tools.ainvoke(prepared_messages)
                 latency_ms = int((time.time() - start_time) * 1000)
 
                 # Reset tool_use_failed streak on successful response
                 _tool_use_failed_streak[0] = 0
 
                 tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
-                logger.info(f"[{job_id}] LLM response: {len(response.content)} chars, {tool_calls_count} tool calls")
+                content_str = response.content
+                if isinstance(content_str, list):
+                    content_str = " ".join(
+                        b.get("text", "") if isinstance(b, dict) else str(b) for b in content_str
+                    ).strip()
+                content_len = len(content_str) if isinstance(content_str, str) else 0
+                logger.info(f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls")
 
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
@@ -664,7 +751,7 @@ def create_execute_node(
                         agent_type=config.agent_id,
                         messages=prepared_messages,
                         response=response,
-                        model=config.llm.model,
+                        model=phase_model,
                         latency_ms=latency_ms,
                         iteration=iteration,
                         metadata=state.get("metadata"),
@@ -711,20 +798,18 @@ def create_execute_node(
                 if not (hasattr(response, 'tool_calls') and response.tool_calls):
                     remaining = todo_manager.list_pending()
                     if remaining:
+                        first = remaining[0]
                         todo_lines = "\n".join(
-                            f"  - {t.id}: {t.content}"
+                            f"  - {t.id}: {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
                             for t in remaining
                         )
                         injected_reminder = HumanMessage(content=(
-                            f"You have {len(remaining)} incomplete todo(s):\n"
+                            f'Action required: call `todo_complete(todo_id="{first.id}")` to mark your current task done.\n\n'
+                            "If you already finished the work for this todo, that's perfectly fine — "
+                            "just call `todo_complete` now to record it. You don't need to redo anything.\n\n"
+                            f"Pending todos ({len(remaining)}):\n"
                             f"{todo_lines}\n\n"
-                            "IMPORTANT: Tasks are NOT considered complete until you explicitly call "
-                            "the `todo_complete` tool for each one. Performing the work alone is not "
-                            "enough — you MUST mark each task done using the tool.\n\n"
-                            "Use `todo_complete(todo_id=\"<id>\")` to mark a specific todo as done, "
-                            "or call `todo_complete()` with no arguments to complete the next pending item. "
-                            "If you have already done the work for a todo, call `todo_complete` now to "
-                            "record it. Use `todo_list()` to review the full list."
+                            "Do NOT respond with text. Your next action must be a tool call."
                         ))
 
                 # Return compacted messages + response if compaction occurred,
@@ -764,7 +849,6 @@ def create_execute_node(
                         messages,
                         summarization_llm,
                         summarization_prompt,
-                        oss_reasoning_level=oss_reasoning_level,
                         max_summary_length=config.context_management.max_summary_length,
                         force=True,
                     )
@@ -1119,8 +1203,6 @@ def create_archive_phase_node(
         compacted_messages = None
 
         if config.context_management.compact_on_archive:
-            oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
-
             # Force summarization when transitioning from strategic to tactical
             # This gives tactical phases a "fresh conversation" with just the plan summary
             force_summarize = is_strategic  # True when completing strategic phase
@@ -1129,7 +1211,6 @@ def create_archive_phase_node(
                 messages,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level=oss_reasoning_level,
                 max_summary_length=config.context_management.max_summary_length,
                 force=force_summarize,
             )
@@ -1191,7 +1272,7 @@ def create_handle_transition_node(
         max_todos: Maximum todos for strategic->tactical transition
     """
 
-    def handle_transition(state: UniversalAgentState) -> Dict[str, Any]:
+    async def handle_transition(state: UniversalAgentState) -> Dict[str, Any]:
         """Handle phase transition based on current mode."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
@@ -1210,8 +1291,42 @@ def create_handle_transition_node(
             min_todos=min_todos,
             max_todos=max_todos,
             config=config,
-            postgres_db=postgres_db,
         )
+
+        # If the job was stopped, update DB status.
+        # This must happen here in the async node where we can properly
+        # await the asyncpg pool on the correct event loop.
+        if (
+            result.success
+            and result.state_updates.get("should_stop")
+            and postgres_db
+        ):
+            goal_achieved = result.state_updates.get("goal_achieved", False)
+            try:
+                if goal_achieved:
+                    # Full autonomy auto-complete: mark as completed
+                    await postgres_db.jobs.update_status(
+                        job_id,
+                        status="completed",
+                    )
+                    # Also set completed_at timestamp
+                    try:
+                        await postgres_db.execute(
+                            "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
+                            job_id,
+                        )
+                    except Exception:
+                        pass  # Non-critical
+                    logger.info(f"[{job_id}] Updated job status to 'completed' in database")
+                else:
+                    # Freeze for review (phase boundary or job_complete)
+                    await postgres_db.jobs.update_status(
+                        job_id,
+                        status="pending_review",
+                    )
+                    logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
+            except Exception as e:
+                logger.error(f"[{job_id}] Failed to update job status: {e}")
 
         # Audit transition attempt
         phase_number = state.get("phase_number", 0)
@@ -1581,12 +1696,10 @@ def create_restore_from_feedback_node(
 
         # Step 1: Force-compact old conversation context
         # This gives the agent a "fresh start" with just a summary of prior work
-        oss_reasoning_level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
         compacted_messages = await context_mgr.ensure_within_limits(
             messages,
             summarization_llm,
             summarization_prompt,
-            oss_reasoning_level=oss_reasoning_level,
             max_summary_length=config.context_management.max_summary_length,
             force=True,
         )
@@ -1891,13 +2004,21 @@ def build_phase_alternation_graph(
         summarization_safe_limit=config.limits.summarization_safe_limit,
         summarization_chunk_size=config.limits.summarization_chunk_size,
     )
-    context_mgr = ContextManager(config=context_config, model=config.llm.model)
+    strategic_config = config.llm.get_phase_config("strategic")
+    tactical_config = config.llm.get_phase_config("tactical")
+    context_mgr = ContextManager(
+        config=context_config,
+        model=config.llm.model,
+        strategic_model=strategic_config.model,
+        tactical_model=tactical_config.model,
+    )
 
     # Create retry manager for LLM call retries
     retry_manager = ToolRetryManager(max_retries=config.limits.tool_retry_count)
 
-    # Load summarization prompt
-    summarization_prompt = load_summarization_prompt(config)
+    # Load summarization prompt (use summarization model for matrix resolution)
+    summarization_config = config.llm.get_phase_config("summarization")
+    summarization_prompt = load_summarization_prompt(config, model=summarization_config.model)
 
     if not workspace_template:
         raise ValueError("workspace_template is required")

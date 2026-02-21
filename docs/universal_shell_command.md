@@ -1,3 +1,21 @@
+---
+tags:
+  - tool-development
+  - security
+  - agent-architecture
+  - coding-tools
+aliases:
+  - run_command
+  - shell access
+  - coding tools
+related:
+  - "[[coding_agent]]"
+  - "[[security_checklist]]"
+  - "[[deployment]]"
+  - "[[config_issues]]"
+  - "[[cloud_workspace]]"
+---
+
 # Universal Shell Command Access
 
 ## Problem
@@ -12,9 +30,11 @@ Real examples where this hurts:
 
 Building dedicated tools for every possible action is impractical. A shell tool is the universal escape hatch.
 
-## Current State
+## Security Model
 
-`run_command` already exists in `src/tools/coding/coding_tools.py` with solid security:
+### Default Mode (sandbox enabled)
+
+Every agent using `run_command` gets these protections by default:
 
 | Layer | Protection |
 |-------|-----------|
@@ -22,130 +42,129 @@ Building dedicated tools for every possible action is impractical. A shell tool 
 | **Workspace sandbox** | `WorkspaceManager.get_path()` prevents path traversal outside `workspace/job_<uuid>/` |
 | **Timeout cap** | Hard limit of 600s (10 minutes), default 120s |
 | **Output truncation** | 50,000 chars per stream (stdout/stderr), keeps tail |
-| **Container isolation** | In production (k3s), the container itself is the sandbox |
+| **Container isolation** | In production, the container itself is the sandbox |
 
-The tool is registered under the `coding` category and enabled only in `coder` and `debugger` expert configs.
+### Unrestricted Mode (sandbox disabled)
 
-## Proposal
-
-### Phase 1: Add to defaults (minimal change)
-
-Add `run_command` to `config/defaults.yaml` so every agent inherits it. Move it from the `coding` category into a new `shell` category to make it role-neutral.
+For containerized deployments where the agent needs full computer access, both the blocklist and sandbox can be disabled via config:
 
 ```yaml
-# config/defaults.yaml
-tools:
-  # Shell tools - command execution (src/tools/shell/)
-  shell:
-    - run_command
+# config/experts/unrestricted/config.yaml
+run_command_blocked_commands: []   # Empty list = no restrictions
+run_command_sandbox: false          # Allow commands anywhere in the container
 ```
 
-Expand the blocked commands list to cover more destructive operations:
+This is safe because the container IS the sandbox. The agent runs as non-root user `graphrag` with optional `sudo` access (NOPASSWD). There is no host access.
 
-```python
-BLOCKED_COMMANDS = frozenset([
-    # System control
-    "sudo", "su",
-    "reboot", "shutdown", "poweroff", "halt", "init", "systemctl",
-    # Destructive filesystem ops
-    "mkfs", "dd", "fdisk", "parted", "mount", "umount",
-    # Permission/ownership changes
-    "chmod", "chown", "chgrp",
-    # Network reconfiguration
-    "iptables", "ip6tables", "nft", "ifconfig", "ip",
-    # Package managers (prevent system modification)
-    "dnf", "yum", "apt", "apt-get", "pacman", "zypper", "snap", "flatpak",
-    # Process/service manipulation
-    "kill", "killall", "pkill",
-])
+## Implementation
+
+### Configurable `run_command` (`src/tools/coding/coding_tools.py`)
+
+Two config keys control the security posture, read via `ToolContext.get_config()` at tool creation time:
+
+| Config Key | Default | Effect |
+|-----------|---------|--------|
+| `run_command_blocked_commands` | `None` (use hardcoded blocklist) | List of blocked command prefixes. Set to `[]` to disable. |
+| `run_command_sandbox` | `true` | When `true`, `working_dir` must resolve within workspace. When `false`, absolute paths are accepted. |
+
+These use the existing extra-key collection mechanism: YAML root keys flow into the `extra` dict, which becomes `tool_config` on `ToolContext`, accessible via `context.get_config()`. No changes to `loader.py`, `schema.json`, or `defaults.yaml` are required.
+
+At tool creation time, the effective blocklist and sandbox flag are captured in closure variables. Startup warnings are logged when restrictions are disabled:
+
+```
+WARNING - run_command: command blocklist is DISABLED — all commands allowed
+WARNING - run_command: workspace sandbox is DISABLED — commands can run anywhere
 ```
 
-This is safe because:
-1. Agents already run in workspace-sandboxed directories — they can't touch system files
-2. Production runs in containers — the container is the real sandbox
-3. The blocklist prevents the most dangerous operations
-4. Timeout + output truncation prevent resource exhaustion
+### Fat Container (`docker/Dockerfile.agent`)
 
-### Phase 2: Per-agent command policies (future, if needed)
+The agent container includes a full dev environment so agents can actually use their shell access:
 
-If finer control is needed later, add optional per-config allow/deny lists:
+**Runtime tools**: curl, git, poppler-utils, ripgrep, jq, vim-tiny, less, tree, htop, zip/unzip, openssh-client
+**Dev tools**: build-essential, cmake, python3-dev, libffi-dev
+**Networking**: net-tools, iproute2, dnsutils
+**Process visibility**: procps (provides `ps`), iproute2 (provides `ss`)
+**Runtime**: Node.js 22 (LTS via NodeSource)
+**Escalation**: `sudo` with NOPASSWD for `graphrag` user
 
-```yaml
-# config/experts/writer/config.yaml
-tools:
-  shell:
-    - run_command
+The container still runs as `USER graphrag` (non-root) by default. Sudo is available when the agent explicitly needs it (e.g., installing a system package).
 
-shell:
-  # Only these commands are allowed (if set, acts as whitelist)
-  allow:
-    - pdflatex
-    - biber
-    - latexmk
-    - pandoc
-    - wc
-    - sort
-    - head
-    - tail
-    - grep
-    - find
-    - ls
-    - cat
-  # These are always blocked (merged with global blocklist)
-  deny: []
+### Container Monitoring (`GET /system/info`)
+
+A monitoring endpoint on the agent API provides visibility into what the agent is doing inside its container:
+
+```bash
+curl http://localhost:8001/system/info | python -m json.tool
 ```
 
-Implementation sketch for the whitelist check:
+Returns:
 
-```python
-def _check_allowed(command: str, allow_list: Optional[List[str]] = None) -> Optional[str]:
-    """If an allow list is configured, only permit commands on it."""
-    if allow_list is None:
-        return None  # No whitelist = all non-blocked commands allowed
+| Field | Content |
+|-------|---------|
+| `cpu` | percent, core count |
+| `memory` | total/used MB, percent |
+| `disk` | total/used GB, percent |
+| `listening_ports` | list of `{port, address, pid}` |
+| `processes` | top 20 by memory: `{pid, name, cmd, memory_mb, cpu_percent}` |
+| `network_connections` | established TCP connections (limit 50) |
+| `agent` | agent_id, current_job |
 
-    first_word = command.strip().split()[0] if command.strip() else ""
-    if first_word not in allow_list:
-        return f"Command not allowed: '{first_word}'. Allowed: {', '.join(sorted(allow_list))}"
-    return None
+This data is also available through the orchestrator proxy and MCP:
+
+```bash
+# Via orchestrator
+curl http://localhost:8085/api/agents/<agent_id>/system-info
+
+# Via MCP (Claude Code)
+get_agent_system_info(agent_id="<agent_id>")
 ```
 
-This keeps the default behavior permissive (blocklist only) while letting specific configs opt into a stricter whitelist model.
+The heartbeat now includes `listening_ports` count and `process_count` in agent metrics, flowing into the agents table `metadata` JSONB automatically.
 
-## Implementation Steps
+### Expert Configs
 
-1. **Rename module**: Move `src/tools/coding/` to `src/tools/shell/` (or create `src/tools/shell/` alongside, keeping `coding/` for backwards compat)
-2. **Update registry**: Register under `shell` category in `TOOL_REGISTRY`
-3. **Expand blocklist**: Add the extended set of blocked commands
-4. **Update defaults.yaml**: Add `shell: [run_command]` to the tools section
-5. **Update expert configs**: Remove `coding: [run_command]` from `coder` and `debugger` configs (they inherit from defaults now)
-6. **Update CLAUDE.md**: Add `shell` to the tool categories documentation
-7. **Tests**: Verify blocked commands, whitelist logic (if Phase 2), and that all expert configs load correctly
+| Config | Blocklist | Sandbox | Use Case |
+|--------|-----------|---------|----------|
+| `coder` | Default (7 commands) | Enabled | Standard coding tasks in workspace |
+| `debugger` | Default | Enabled | Debugging within workspace |
+| `unrestricted` | Disabled (`[]`) | Disabled | Full computer access in container |
+
+The `unrestricted` expert (`config/experts/unrestricted/config.yaml`) serves as the template for "full computer" mode with coding, workspace, git, and research tools.
 
 ## Security Considerations
 
-**What the workspace sandbox already prevents:**
+**What the workspace sandbox prevents (when enabled):**
 - Reading/writing files outside `workspace/job_<uuid>/`
 - The `working_dir` parameter is validated through `WorkspaceManager.get_path()` which uses `Path.resolve()` + `Path.relative_to()` to block traversal
 
-**What the blocklist prevents:**
-- Privilege escalation (`sudo`, `su`)
-- System-level damage (`reboot`, `shutdown`, `mkfs`, `dd`)
-- Permission changes (`chmod`, `chown`)
-- Package installation (`apt`, `dnf`, etc.)
+**What the blocklist prevents (when enabled):**
+- Privilege escalation (`sudo`)
+- System-level damage (`reboot`, `shutdown`, `poweroff`, `halt`)
+- Service manipulation (`init`, `systemctl`)
 
-**What the container provides (production):**
+**What the container provides (always):**
 - Filesystem isolation — agent only sees its own container
-- Network policies — no lateral movement
-- Resource limits — CPU/memory caps via k3s
-- No root access inside the container
+- Network policies — no lateral movement (when configured)
+- Resource limits — CPU/memory caps via container runtime
+- Non-root default — `graphrag` user, sudo available but must be explicit
 
 **Remaining risks (acceptable):**
 - Agent could run a fork bomb or CPU-intensive loop — mitigated by timeout cap (600s) and container resource limits
 - Agent could fill disk with output — mitigated by output truncation and workspace quotas (if configured)
 - Agent could make network requests via `curl`/`wget` — same risk as existing `web_search` tool, acceptable
+- In unrestricted mode, agent could `sudo` to install packages or modify system state — acceptable because the container is ephemeral and isolated
 
-## Open Questions
+## Future Considerations
 
-- **Should `shell` replace `coding` entirely, or coexist?** Simplest to just rename/relocate and keep the old `coding` key as an alias for backwards compatibility.
-- **Should the tool description change?** Current description is coding-focused ("run tests, linters, build commands"). For a universal tool, the description should be broader ("execute shell commands for file processing, compilation, data transformation, or any other task").
-- **Do we need per-agent timeout overrides?** A writer compiling a large LaTeX document might need more than 120s default. Could add `shell.default_timeout` to config.
+- **Per-agent allowlists**: If finer control is needed, add an `allow` list that acts as a whitelist (only listed command prefixes are permitted). Not implemented yet since the current blocklist + container isolation is sufficient.
+- **Per-agent timeout overrides**: A writer compiling a large LaTeX document might need more than 120s default. Could add a `run_command_timeout` config key.
+- **Rename `coding` to `shell`**: The tool category is still called `coding` for backwards compatibility. Could rename to `shell` to be more role-neutral and keep `coding` as an alias.
+
+## Related
+
+- [[coding_agent]] — Coding agent configuration that uses run_command
+- [[security_checklist]] — Security considerations for the agent system
+- [[deployment]] — Container deployment and infrastructure
+- [[config_issues]] — Configuration issues including tool access
+- [[cloud_workspace]] — Cloud workspace and container architecture
+- [[sudo_approval_plugin]] — Sudo approval mechanism for elevated commands

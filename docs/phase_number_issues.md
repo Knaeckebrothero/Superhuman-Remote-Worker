@@ -1,3 +1,19 @@
+---
+tags:
+  - agent-architecture
+  - planning
+  - debugging
+aliases:
+  - phase numbering
+  - phase confusion
+  - phase tracking
+related:
+  - "[[sprints]]"
+  - "[[model_issues]]"
+  - "[[prompts]]"
+  - "[[key_issues]]"
+---
+
 # Phase Numbering and Planning Issues
 
 ## Problem Statement
@@ -141,3 +157,11 @@ Files likely involved in phase counting:
 ## Status
 
 Discussion in progress. No implementation changes made yet.
+
+## Related
+
+- [[sprints]] - Sprint limits for forced reflection in tactical phases
+- [[model_issues]] - Model failures related to phase management problems
+- [[prompts]] - Prompt architecture including phase prompt design
+- [[key_issues]] - Broader collection of open issues
+- [[01_issues]] - Initial issue tracking

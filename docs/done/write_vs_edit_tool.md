@@ -1,8 +1,18 @@
+---
+tags:
+  - tool-development
+  - context-management
+  - agent-architecture
+  - coding-tools
+aliases:
+  - ["Write vs Edit Tool", "File Edit Safety"]
+---
+
 # Agent Memory and File Write Safety
 
 ## Problem: Blind Overwrites
 
-The current `write_file()` tool simply overwrites files without any safety checks:
+The current `write_file()` tool (part of the [[tool_implementation]] system) simply overwrites files without any safety checks:
 
 ```python
 def write_file(path: str, content: str) -> str:
@@ -13,7 +23,7 @@ def write_file(path: str, content: str) -> str:
     return f"Written: {path} ({size:,} bytes)"
 ```
 
-This is dangerous for persistent files like `workspace.md` because the agent can accidentally overwrite all previous content.
+This is dangerous for persistent files like `workspace.md` (see [[workspace_implementation]]) because the agent can accidentally overwrite all previous content.
 
 ## Why "Read Before Write" Doesn't Work Here
 
@@ -250,7 +260,7 @@ The compaction generates a structured summary with:
 
 ## What We Already Implemented
 
-Our `context.py` already implements most of Claude Code's approach:
+Our `context.py` already implements most of Claude Code's approach (see also [[compact_chat]] for context management details):
 
 ### 1. Keep Recent Tool Results (Priority: High)
 
@@ -496,3 +506,11 @@ Based on this research:
 - [How Claude Code Got Better by Protecting More Context](https://hyperdev.matsuoka.com/p/how-claude-code-got-better-by-protecting)
 - `src/agent/context.py` - Context compaction logic (ContextManager class)
 - `src/agent/tools/workspace_tools.py` - Current tool implementations
+
+## Related
+
+- [[workspace_implementation]]
+- [[tool_implementation]]
+- [[compact_chat]]
+- [[agent]]
+- [[overview]]

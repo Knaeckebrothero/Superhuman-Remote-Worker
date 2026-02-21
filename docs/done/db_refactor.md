@@ -1,3 +1,13 @@
+---
+tags:
+  - data-management
+  - agent-architecture
+  - configuration
+  - debugging
+aliases:
+  - ["Database Refactor", "DB Architecture"]
+---
+
 # Database Architecture Refactoring Guide
 
 This document describes the database architecture refactoring for the **Graph-RAG** project (FINIUS requirement traceability system). The goal is to consolidate PostgreSQL, Neo4j, and MongoDB access into a unified `src/database/` module with clean separation of concerns and consistent patterns.
@@ -2530,7 +2540,7 @@ This refactored database architecture for Graph-RAG provides:
 - `neo4j/seed_data.cypher` - Neo4j seed data
 
 **Usage in Application:**
-- `src/agent.py` - UniversalAgent creates database instances and injects them
+- `src/agent.py` - [[agent|UniversalAgent]] creates database instances and injects them
 - `src/tools/context.py` - ToolContext receives injected database connections
 - `src/tools/cache_tools.py` - Requirement CRUD using injected PostgresDB instance
 - `src/tools/graph_tools.py` - Graph operations using injected Neo4jDB instance
@@ -2585,3 +2595,12 @@ This architecture is adapted from the Advanced-LLM-Chat backend (`/home/ghost/Re
 - See exploration report from Task agent ID: `a632da0`
 - Current files: `src/database/postgres_utils.py` (496 lines), `neo4j_utils.py` (161 lines)
 - MongoDB logic in: `src/core/archiver.py` (720 lines)
+
+## Related
+
+- [[agent]]
+- [[angular_migration_plan]]
+- [[cleanup]]
+- [[postgres_migration_deep_dive]]
+- [[neo4j_migration_deep_dive]]
+- [[mongodb_migration_deep_dive]]

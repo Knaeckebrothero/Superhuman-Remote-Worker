@@ -1,0 +1,20 @@
+# Prompt Matrix — maps (prompt_type, model_family) → filename
+# Resolution: expert matrix → base matrix, model-specific → default
+# File search: expert directory → config/prompts/
+
+default:
+  systemprompt: systemprompt.txt
+  persona: persona.txt
+  strategic: strategic.txt
+  tactical: tactical.txt
+  summarization: summarization_prompt.txt
+
+# Model-specific overrides — add as needed:
+# claude-opus:
+#   systemprompt: systemprompt_claude_opus.txt
+# claude-sonnet:
+#   strategic: strategic_claude_sonnet.txt
+# gpt-oss:
+#   strategic: strategic_gpt_oss.txt
+# deepseek:
+#   systemprompt: systemprompt_deepseek.txt

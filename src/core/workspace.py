@@ -49,14 +49,8 @@ class WorkspaceManagerConfig:
         "output",
     ])
 
-    # Template file to copy as instructions.md (optional)
-    instructions_template: Optional[str] = None
-
     # Git versioning settings
     git_versioning: bool = True  # Enable git versioning for workspace history
-    git_ignore_patterns: List[str] = field(
-        default_factory=lambda: ["*.db", "*.log", "__pycache__/", ".DS_Store", "*.pyc", "documents/"]
-    )
 
     # Git remote URL for workspace delivery (set by orchestrator via Gitea)
     git_remote_url: Optional[str] = None
@@ -67,12 +61,7 @@ class WorkspaceManagerConfig:
         return cls(
             base_path=data.get("base_path"),
             structure=data.get("structure", cls.__dataclass_fields__["structure"].default_factory()),
-            instructions_template=data.get("instructions_template"),
             git_versioning=data.get("git_versioning", True),
-            git_ignore_patterns=data.get(
-                "git_ignore_patterns",
-                cls.__dataclass_fields__["git_ignore_patterns"].default_factory()
-            ),
             git_remote_url=data.get("git_remote_url"),
         )
 
@@ -233,10 +222,6 @@ class WorkspaceManager:
             dir_path.mkdir(parents=True, exist_ok=True)
             logger.debug(f"Created directory: {subdir}")
 
-        # Copy instructions template if configured
-        if self.config.instructions_template:
-            self._copy_instructions_template()
-
         # Initialize git versioning if enabled
         if self.config.git_versioning:
             self._initialize_git()
@@ -258,9 +243,7 @@ class WorkspaceManager:
         self._git_manager = GitManager(self._workspace_path)
 
         # Initialize repository (no-op if already exists)
-        success = self._git_manager.init_repository(
-            ignore_patterns=self.config.git_ignore_patterns
-        )
+        success = self._git_manager.init_repository()
 
         if success:
             logger.info("Git versioning enabled for workspace")
@@ -270,19 +253,6 @@ class WorkspaceManager:
         else:
             logger.warning("Failed to initialize git repository")
             self._git_manager = None
-
-    def _copy_instructions_template(self) -> None:
-        """Copy instructions template to workspace."""
-        from src.utils.config import get_project_root
-
-        template_path = get_project_root() / "config" / "prompts" / self.config.instructions_template
-        dest_path = self._workspace_path / "instructions.md"
-
-        if template_path.exists() and not dest_path.exists():
-            shutil.copy(template_path, dest_path)
-            logger.debug(f"Copied instructions template to {dest_path}")
-        elif not template_path.exists():
-            logger.warning(f"Instructions template not found: {template_path}")
 
     def get_path(self, relative_path: str = "") -> Path:
         """Get absolute path within workspace.
@@ -581,8 +551,13 @@ class WorkspaceManager:
         if not case_sensitive:
             query = query.lower()
 
-        # Recursively search text files
-        for file_path in search_path.rglob("*"):
+        # If search_path is a file, search it directly; otherwise recurse
+        if search_path.is_file():
+            files_to_search = [search_path]
+        else:
+            files_to_search = search_path.rglob("*")
+
+        for file_path in files_to_search:
             if not file_path.is_file():
                 continue
 

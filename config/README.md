@@ -6,18 +6,23 @@ This directory contains agent configuration files and templates.
 
 ```
 config/
-├── defaults.yaml              # Framework defaults (all configs extend this)
-├── schema.json                # JSON Schema for config validation
-├── README.md                  # This file
-├── prompts/                   # Prompt templates
-│   ├── strategic.txt          # Strategic phase system prompt
-│   ├── tactical.txt           # Tactical phase system prompt
-│   ├── systemprompt.txt       # Main system prompt
-│   └── summarization_prompt.txt
-└── templates/                 # File templates
-    ├── strategic_todos_initial.yaml    # Initial todos for job start
-    ├── strategic_todos_transition.yaml # Todos for phase transitions
-    └── workspace_template.md           # Template for workspace.md
+├── defaults.yaml                # Framework defaults (all configs extend this)
+├── schema.json                  # JSON Schema for config validation
+├── prompt_matrix.yaml           # Base prompt matrix (model family → filename)
+├── instruction_matrix.yaml      # Base instruction matrix (model family → filename)
+├── README.md                    # This file
+├── prompts/                     # Prompt templates (system prompt, phase prompts)
+│   ├── systemprompt.txt         # Main system prompt
+│   ├── strategic.txt            # Strategic phase system prompt
+│   ├── tactical.txt             # Tactical phase system prompt
+│   └── summarization_prompt.txt # Context compaction prompt
+└── templates/                   # Instruction templates (non-prompt files)
+    ├── instructions.md                  # Default agent instructions
+    ├── strategic_todos_initial.yaml     # Initial todos for job start
+    ├── strategic_todos_transition.yaml  # Todos for phase transitions
+    ├── strategic_todos_resume.yaml      # Todos for job resume
+    ├── workspace_template.md            # Template for workspace.md
+    └── todo_guide.md                    # Todo crafting guide
 ```
 
 ## Creating a Custom Agent Config
@@ -50,17 +55,42 @@ python agent.py --config my_agent
 
 ### Option 2: Directory Config (with prompt overrides)
 
-For configs that need custom prompts, create a directory:
+For configs that need custom prompts or instructions, create a directory:
 
 ```
 config/
 └── my_agent/
-    ├── config.yaml           # Agent config (extends defaults)
-    ├── instructions.md       # Custom instructions (optional)
-    └── strategic.txt         # Custom strategic prompt (optional)
+    ├── config.yaml              # Agent config (extends defaults)
+    ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
+    ├── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
+    ├── instructions.md          # Custom instructions (optional)
+    └── strategic.txt            # Custom strategic prompt (optional)
 ```
 
-The config loader checks the directory first for prompt files, falling back to `config/prompts/` for any not overridden.
+### Two Matrix Systems
+
+The agent uses two parallel matrix systems with the same 4-level fallback chain:
+
+**Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts:
+- Entries: `systemprompt`, `strategic`, `tactical`, `summarization`
+- File search: expert directory → `config/prompts/`
+
+**Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates:
+- Entries: `instructions`, `strategic_todos_initial`, `strategic_todos_transition`, `strategic_todos_resume`, `workspace_template`, `todo_guide`
+- File search: expert directory → `config/templates/`
+
+Both use the same resolution chain (4 levels):
+
+1. Expert matrix → model-specific key → type
+2. Expert matrix → `"default"` key → type
+3. Base matrix → model-specific key → type
+4. Base matrix → `"default"` key → type
+
+Once the filename is resolved, the loader checks the expert directory first for the file, falling back to the framework directory (`config/prompts/` or `config/templates/`).
+
+### Resolved Config JSONB
+
+On first run, the fully resolved config (agent config + all prompt/instruction content) is frozen into a `resolved_config` JSONB column on the jobs table. On resume, the agent loads from this snapshot instead of resolving from disk. This prevents config drift and makes jobs reproducible.
 
 ## Configuration Reference
 
@@ -70,6 +100,30 @@ The config loader checks the directory first for prompt files, falling back to `
 |-------|------|-------------|
 | `agent_id` | string | Unique identifier (lowercase, underscores allowed) |
 | `display_name` | string | Human-readable name |
+
+### Autonomy Level
+
+Controls when the agent pauses for human review at phase boundaries and after job completion.
+
+```yaml
+autonomy: partial  # full | review | partial | guided | dependent
+```
+
+| Level | After 1st Strategic | After Nth Strategic | After Tactical | After job_complete |
+|-------|:---:|:---:|:---:|:---:|
+| `full` | - | - | - | auto-complete |
+| `review` | - | - | - | freeze |
+| `partial` | freeze | - | - | freeze |
+| `guided` | freeze | freeze | - | freeze |
+| `dependent` | freeze | freeze | freeze | freeze |
+
+- **`full`** — Fully autonomous. Never freezes. On `job_complete`, writes `job_completion.json` directly and sets DB status to `completed`.
+- **`review`** — Runs freely through all phases but freezes after `job_complete` for human review before marking as completed.
+- **`partial`** (default) — Freezes after the first strategic phase boundary for early feedback, then runs freely. Freezes again at `job_complete`.
+- **`guided`** — Freezes at every strategic phase boundary for review. Tactical phases run freely. Freezes at `job_complete`.
+- **`dependent`** — Freezes at every phase boundary (strategic and tactical). Maximum human oversight.
+
+When frozen at a phase boundary (`freeze_type: "phase_boundary"`), approving the job sets its status back to `processing` and the agent continues. When frozen at job completion (`freeze_type: "job_complete"`), approving writes `job_completion.json` and sets status to `completed`.
 
 ### LLM Configuration
 
@@ -91,7 +145,6 @@ workspace:
     - archive/
     - output/
     - tools/
-  instructions_template: instructions.md
   max_read_words: 25000
 ```
 

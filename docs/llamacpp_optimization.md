@@ -1,3 +1,19 @@
+---
+tags:
+  - llm-configuration
+  - finetuning
+  - cloud-infrastructure
+aliases:
+  - llama.cpp optimization
+  - GGUF patching
+  - KV cache optimization
+related:
+  - "[[model_issues]]"
+  - "[[finetuning]]"
+  - "[[deployment]]"
+  - "[[cloud_workspace]]"
+---
+
 # llama.cpp Optimization for gpt-oss Models
 
 Resolving Sliding Window Attention and KV Cache Reuse conflicts for gpt-oss-120b/20b on datacenter GPUs (A100/H100/Blackwell).
@@ -341,3 +357,10 @@ After configuration, verify in logs:
 - [GGUF-py Tools](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/README.md)
 - [Unsloth gpt-oss Guide](https://unsloth.ai/docs/models/gpt-oss-how-to-run-and-fine-tune)
 - [NVIDIA Megatron gpt-oss](https://docs.nvidia.com/nemo/megatron-bridge/latest/models/llm/gpt-oss.html)
+
+## Related
+
+- [[model_issues]] - Documentation agent failures when using gpt-oss-120b models
+- [[finetuning]] - Fine-tuning approaches for LLM models
+- [[deployment]] - Deployment configuration and infrastructure
+- [[cloud_workspace]] - Cloud infrastructure for running agents

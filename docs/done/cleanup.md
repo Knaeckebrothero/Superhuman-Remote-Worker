@@ -1,10 +1,20 @@
+---
+tags:
+  - agent-architecture
+  - configuration
+  - debugging
+  - tool-development
+aliases:
+  - ["Cleanup Plan", "Repository Cleanup"]
+---
+
 # Repository Cleanup Plan
 
 **STATUS: IMPLEMENTED**
 
 ## Goal
 
-Separate the legacy UI/chain-based system from the new workspace-centric Universal Agent backend. The result is:
+Separate the legacy UI/chain-based system from the new workspace-centric [[agent|Universal Agent]] backend. The result is:
 
 1. **`legacy_system/`** - Self-contained folder with Streamlit UI and old agents (can be removed entirely later)
 2. **`src/`** - Clean backend with only what's needed for agent/orchestrator containers
@@ -346,7 +356,7 @@ This section identifies legacy code **within** the Universal Agent implementatio
 
 | Category | File Path | Lines | Status | Risk Level |
 |----------|-----------|-------|--------|------------|
-| Deprecated Module | `core/todo.py` | 1-25 | DEPRECATED (in use) | HIGH |
+| Deprecated Module | `core/todo.py` (see [[guardrails]]) | 1-25 | DEPRECATED (in use) | HIGH |
 | Deprecated Module | `core/transitions.py` | 1-15 | DEPRECATED (in use) | HIGH |
 | Dead Code | `todo_tools.py` | 35-65 | Global state (unused) | MEDIUM |
 | Dead Code | `todo_tools.py` | 251, 323 | Transition callbacks | MEDIUM |
@@ -535,3 +545,11 @@ The module was unused by the agent system (agents use document processing tools 
 8. ~~**Clean .env.example** - Removed `CSV_FILE_PATH`, `WORKFLOW_MODE`, `ANTHROPIC_API_KEY`, `COHERE_API_KEY`~~ ✅ DONE
 9. ~~**Handle csv_processor** - Deleted `src/core/csv_processor.py` and removed exports~~ ✅ DONE
 10. ~~**Update tests** - Deleted 9 test files testing deprecated/non-existent functionality~~ ✅ DONE
+
+## Related
+
+- [[agent]]
+- [[guardrails]]
+- [[guardrails_roadmap]]
+- [[db_refactor]]
+- [[angular_migration_plan]]

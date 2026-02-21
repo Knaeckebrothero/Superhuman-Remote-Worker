@@ -1,3 +1,18 @@
+---
+tags:
+  - context-management
+  - agent-architecture
+  - llm-configuration
+aliases:
+  - Context Engineering
+  - Summarization Thresholds
+  - Tool Result Redaction
+related:
+  - "[[working_memory]]"
+  - "[[agent_improvements]]"
+  - "[[finetuning]]"
+  - "[[continuous_improvement_loop]]"
+---
 # Context Management Research
 
 Research on conversation summarization thresholds and tool result redaction strategies from major AI providers, coding tools, and academic research.
@@ -219,3 +234,11 @@ Additional insights from Manus:
 - [Forge Code Context Compaction](https://forgecode.dev/docs/context-compaction/)
 - [Context Compaction Research Gist](https://gist.github.com/martinec/0d078c88b0bdc97fea21fc6d7d596af8)
 - [Microsoft: Managing Chat History for LLMs](https://devblogs.microsoft.com/semantic-kernel/managing-chat-history-for-large-language-models-llms/)
+
+## Related
+
+- [[working_memory]] - Workspace-centric memory model that context management protects
+- [[agent_improvements]] - Agent behavior improvements related to context handling
+- [[finetuning]] - Training models for better token efficiency and context use
+- [[continuous_improvement_loop]] - Evaluator analyzes context management effectiveness
+- [[model_issues]] - Model-specific context window limitations and behaviors

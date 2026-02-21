@@ -1,3 +1,20 @@
+---
+tags:
+  - cloud-infrastructure
+  - security
+  - agent-architecture
+  - configuration
+aliases:
+  - K3s Deployment
+  - Cloud Architecture
+  - Agent Sandbox
+related:
+  - "[[coding_agent]]"
+  - "[[cli_wrapper]]"
+  - "[[calculator_code]]"
+  - "[[auxiliary_tasks]]"
+---
+
 # Cloud Workspace Architecture
 
 This document outlines the design considerations for deploying agent workspaces on a k3s cluster.
@@ -634,7 +651,9 @@ Even with isolation, we want visibility:
 
 ## Related
 
-- [Cloud Workspace Research (PDF)](./cloud_workspace_research.pdf) - Detailed analysis with citations
-- [Angular Migration Plan](./angular_migration_plan.md) - Cockpit frontend
-- `orchestrator/` - Backend API that will manage agent Jobs
-- `config/` - Agent configurations that will run in containers
+- [[coding_agent]] — Coding agent designed to run inside these containers
+- [[cli_wrapper]] — Claude Code SDK as alternative execution environment
+- [[calculator_code]] — Code execution tools that benefit from containerization
+- [[auxiliary_tasks]] — Agent architecture that runs inside cloud workspaces
+- [[advanced_job_configuration]] — Job configuration for cloud-deployed agents
+- [Cloud Workspace Research (PDF)](./cloud_workspace_research.pdf) — Detailed analysis with citations

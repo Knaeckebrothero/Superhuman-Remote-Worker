@@ -1,57 +1,25 @@
-You are in STRATEGIC PHASE — Architect, not Builder.
-Do NOT execute domain work: no document processing, no database writes, no file generation.
-This phase is about review, reflection, and planning.
+<strategic_phase>
+You are in STRATEGIC mode. Purpose: review progress, identify problems, adapt the plan.
 
-## The Review-Reflect-Adapt Cycle
+Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md and workspace.md.
 
-### 1. REVIEW (Evidence-Based)
-Use git tools to see what ACTUALLY happened, not what you remember:
-- `git_log(max_count=15)` - See recent commits
-- `git_diff(revision="phase_N_start")` - See all changes since phase started
-- `git_tags()` - Check phase milestones
+Review protocol:
+1. Read workspace.md and plan.md for current state of truth.
+2. Check recent tool results and conversation for new information.
+3. Evaluate: Is the current plan still valid? What has changed?
+4. Identify blockers, completed tasks, and next priorities.
+5. Update plan.md with revised strategy if needed.
+6. Update workspace.md with any new state.
 
-Write findings to `archive/phase_N_retrospective.md`. This is your ground truth,
-especially after context compaction when memory may be incomplete.
+Memory maintenance:
+- Extract any new constraints discovered from file reads and pin them to workspace.md under ## Pinned Instructions.
+- Remove stale entries from workspace.md that no longer reflect reality.
+- If workspace.md exceeds 50 lines, consolidate aggressively.
 
-### 2. REFLECT (Quality over Quantity)
-Maintain workspace.md as a COMPACT reference, not an append-only log:
-- REWRITE sections rather than appending
-- Remove info already in plan.md (phase status, completion %)
-- Keep only: blockers, key decisions with WHY, entity lookups, critical context
-- Ensure "## Pinned Instructions" contains current rules from instructions.md
-- Target: under 50 lines of high-value, non-redundant content
-- Delete stale observations that no longer matter
+Decision criteria for adapting the plan:
+- Evidence of a blocked path warrants pivoting, not persisting.
+- Completion of a milestone warrants reviewing the next milestone's assumptions.
+- Discovery of new requirements warrants updating the task list before continuing.
 
-### 3. ADAPT (Plans are Living Documents)
-Update plan.md based on reality, not wishful thinking:
-- Mark phases with OUTCOMES, not just "done"
-- Evaluate phase sizing: were there too many todos? Too few?
-- Create intermediate phases (2.5, 3.5) for incomplete work
-- Remove phases that are no longer needed
-- Add phases discovered during execution
-- Adjust todo counts: 5-10 for complex work, 10-15 for moderate, 15-20 only for simple repetitive tasks
-
-## Phase Sizing Guidelines
-
-| Work Complexity | Todos per Phase | Example |
-|-----------------|-----------------|---------|
-| Complex/exploratory | 5-10 | Initial analysis, architecture decisions |
-| Moderate/structured | 10-15 | Document processing, data extraction |
-| Simple/repetitive | 15-20 | Batch operations, routine updates |
-
-Each todo should be completable in 1-3 tool calls. If a todo needs more,
-it should be split into multiple todos.
-
-## What NOT to Do
-
-- Do NOT execute domain work (processing, database ops, analysis)
-- Do NOT just append to workspace.md - compact and merge
-- Do NOT treat the plan as unchangeable - adapt it
-- Do NOT call job_complete until ALL phases are verified complete
-- Do NOT create 20 todos just because you can - right-size the phase
-
-## Workflow
-
-1. Complete each strategic todo using `todo_complete` when done
-2. For the final todo: call `next_phase_todos` first, THEN `todo_complete`
-3. Only call `job_complete` when the entire plan is executed AND verified
+When strategic review is complete, transition to tactical phase with a clear next action.
+</strategic_phase>

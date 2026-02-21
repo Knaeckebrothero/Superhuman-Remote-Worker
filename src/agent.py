@@ -12,13 +12,16 @@ Key Features:
 - Simplified 4-node LangGraph workflow
 """
 
+import asyncio
 import logging
 import os
 import shutil
+import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import aiosqlite
 from langchain_core.language_models import BaseChatModel
@@ -28,7 +31,7 @@ from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkp
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.loader import get_project_root
 from .managers import TodoManager
-from .tools import ToolContext, load_tools
+from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .core.state import UniversalAgentState, create_initial_state
 from .core.loader import (
     AgentConfig,
@@ -119,6 +122,9 @@ class UniversalAgent:
         self._job_metadata: Optional[Dict[str, Any]] = None
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[str, Any] = {}  # Parent clients for cleanup (e.g. MongoClient)
+
+        # Background document registration task
+        self._doc_registration_task: Optional[asyncio.Task] = None
 
         # Control flags
         self._initialized = False
@@ -212,8 +218,8 @@ class UniversalAgent:
             self._strategic_llm = create_llm(strategic_config, limits=limits)
             logger.info(f"Created strategic LLM: {strategic_config.model}")
 
-            # Optimization: reuse LLM if same config
-            if tactical_config.model == strategic_config.model:
+            # Optimization: reuse LLM if fully identical config (not just model name)
+            if tactical_config == strategic_config:
                 self._tactical_llm = self._strategic_llm
                 logger.info(f"Tactical LLM: reusing strategic ({tactical_config.model})")
             else:
@@ -225,10 +231,10 @@ class UniversalAgent:
                 # (avoids creating a separate LLM with potentially unreachable base config)
                 self._summarization_llm = self._strategic_llm
                 logger.info(f"Summarization LLM: reusing strategic ({strategic_config.model}) (no override)")
-            elif summarization_config.model == strategic_config.model:
+            elif summarization_config == strategic_config:
                 self._summarization_llm = self._strategic_llm
                 logger.info(f"Summarization LLM: reusing strategic ({summarization_config.model})")
-            elif summarization_config.model == tactical_config.model:
+            elif summarization_config == tactical_config:
                 self._summarization_llm = self._tactical_llm
                 logger.info(f"Summarization LLM: reusing tactical ({summarization_config.model})")
             else:
@@ -573,16 +579,21 @@ class UniversalAgent:
     def _load_workspace_template(self) -> str:
         """Load the workspace.md template for the nested loop graph.
 
+        Uses InstructionMatrixResolver for model-aware resolution.
+
         Returns:
             Template content for workspace.md
         """
-        # Template is at config/templates/workspace_template.md
-        templates_dir = get_project_root() / "config" / "templates"
-        template_path = templates_dir / "workspace_template.md"
+        from .core.loader import InstructionMatrixResolver, detect_model_family
 
-        if not template_path.exists():
-            raise FileNotFoundError(f"Workspace template not found: {template_path}")
-        return template_path.read_text(encoding="utf-8")
+        # Check for pre-resolved content
+        resolved = self.config.extra.get("_resolved_instructions", {})
+        if resolved.get("workspace_template"):
+            return resolved["workspace_template"]
+
+        model_family = detect_model_family(self.config.llm.model)
+        resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
+        return resolver.load("workspace_template")
 
     def _inject_repo_context_to_workspace(
         self, git_url: str, git_branch: str
@@ -665,9 +676,39 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         metadata = metadata or {}
 
+        # On resume: try to load frozen config from JSONB (prevents config drift)
+        _config_from_db = False
+        if resume and self.postgres_conn:
+            try:
+                from .core.loader import load_config_from_resolved
+                import uuid as _uuid
+                resolved = await self.postgres_conn.jobs.get_resolved_config(_uuid.UUID(job_id))
+                if resolved:
+                    self.config = load_config_from_resolved(resolved)
+                    self._create_phase_llms()
+                    _config_from_db = True
+                    logger.info(f"Loaded frozen config for resumed job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to load frozen config, falling back to disk: {e}")
+
+        # Handle expert config name - load the named config (tools, prompts, workspace settings)
+        # This must happen before config_upload_id and config_override so those can further override
+        if not _config_from_db and metadata.get("config_name"):
+            from .core.loader import load_and_merge_config, load_agent_config_from_dict, resolve_config_path
+
+            expert_name = metadata["config_name"]
+            try:
+                config_path, deployment_dir = resolve_config_path(expert_name)
+                logger.info(f"Loading expert config '{expert_name}' from {config_path}")
+                merged_config_data = load_and_merge_config(config_path)
+                self.config = load_agent_config_from_dict(merged_config_data, deployment_dir=deployment_dir)
+                logger.info(f"Applied expert config '{expert_name}' (tools: {list(self.config.tools.__dict__.keys())})")
+            except Exception as e:
+                logger.warning(f"Failed to load expert config '{expert_name}': {e}. Continuing with current config.")
+
         # Handle config upload - load and merge with defaults BEFORE workspace setup
         # This must happen first since config affects workspace settings
-        if metadata.get("config_upload_id"):
+        if not _config_from_db and metadata.get("config_upload_id"):
             config_upload_id = metadata["config_upload_id"]
             from .core.workspace import get_workspace_base_path
             from .core.loader import load_uploaded_config, load_agent_config_from_dict
@@ -726,7 +767,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     logger.warning(f"Config upload directory not found: {config_uploads_dir}")
 
         # Handle inline config override - merge on top of current config
-        if metadata.get("config_override"):
+        if not _config_from_db and metadata.get("config_override"):
             from .core.loader import deep_merge, load_agent_config_from_dict
             import dataclasses
 
@@ -739,10 +780,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self.config = load_agent_config_from_dict(merged_config_data)
             logger.info("Applied inline config overrides")
 
-        # Recreate LLMs if config was modified for this job
-        if metadata.get("config_upload_id") or metadata.get("config_override"):
+        # Recreate LLMs if config was modified for this job (skip if already loaded from DB)
+        if not _config_from_db and (metadata.get("config_name") or metadata.get("config_upload_id") or metadata.get("config_override")):
             logger.info("Config changed for this job — recreating LLMs")
             self._create_phase_llms()
+
+        # Freeze resolved config on first run (not resume)
+        if self.postgres_conn and not resume and not _config_from_db:
+            try:
+                from .core.loader import serialize_resolved_config
+                import uuid as _uuid
+                resolved = serialize_resolved_config(self.config, model=self.config.llm.model)
+                await self.postgres_conn.jobs.store_resolved_config(_uuid.UUID(job_id), resolved)
+                logger.info(f"Froze resolved config for job {job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to freeze resolved config: {e}")
 
         # Create workspace manager
         # base_path is None - let WorkspaceManager use get_workspace_base_path()
@@ -751,7 +803,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
                 git_versioning=self.config.workspace.git_versioning,
-                git_ignore_patterns=self.config.workspace.git_ignore_patterns,
                 git_remote_url=metadata.get("git_remote_url"),
             )
         )
@@ -776,7 +827,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             instructions_path = self._workspace_manager.path / "instructions.md"
             if not instructions_path.exists():
                 # Only write instructions if missing
-                instructions = load_instructions(self.config)
+                instructions = load_instructions(self.config, model=self.config.llm.model)
                 self._workspace_manager.write_file("instructions.md", instructions)
                 logger.debug("Wrote missing instructions.md to workspace")
 
@@ -856,12 +907,21 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             # Fall back to template if upload failed
             if not instructions_written:
-                instructions = load_instructions(self.config)
+                instructions = load_instructions(self.config, model=self.config.llm.model)
                 self._workspace_manager.write_file("instructions.md", instructions)
         else:
             # Use template-based instructions
-            instructions = load_instructions(self.config)
+            instructions = load_instructions(self.config, model=self.config.llm.model)
             self._workspace_manager.write_file("instructions.md", instructions)
+
+        # Write task brief to workspace (description + optional kickoff message)
+        description = metadata.get("description", "")
+        kickoff_message = metadata.get("kickoff_message", "")
+        brief_parts = [f"# Task Brief\n\n## Description\n\n{description}"]
+        if kickoff_message:
+            brief_parts.append(f"\n\n## Kickoff Message\n\n{kickoff_message}")
+        self._workspace_manager.write_file("task_brief.md", "".join(brief_parts))
+        logger.debug("Wrote task_brief.md to workspace")
 
         # Process initial_files from config (e.g., workspace.md template)
         if self.config.workspace.initial_files:
@@ -1090,18 +1150,45 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
-        # Generate tool documentation in workspace
-        tool_names = get_all_tool_names(self.config)
-        tools_dir = self._workspace_manager.get_path("tools")
-        generate_workspace_tool_docs(tool_names, tools_dir)
-
-        # Copy todo crafting guide to workspace
-        todo_guide_src = get_project_root() / "config" / "templates" / "todo_guide.md"
-        if todo_guide_src.exists():
-            self._workspace_manager.write_file(
-                "todo_guide.md", todo_guide_src.read_text(encoding="utf-8")
-            )
+        # Copy todo crafting guide to workspace via instruction matrix
+        from .core.loader import InstructionMatrixResolver, FileResolver, detect_model_family
+        model_family = detect_model_family(self.config.llm.model)
+        instr_resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
+        try:
+            # Check for pre-resolved content first
+            resolved = self.config.extra.get("_resolved_instructions", {})
+            todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
+            self._workspace_manager.write_file("todo_guide.md", todo_guide)
             logger.debug("Copied todo_guide.md to workspace")
+        except FileNotFoundError:
+            logger.warning("todo_guide.md not found via instruction matrix")
+
+        # Copy instruction files to workspace (config-driven)
+        if self.config.instruction_files:
+            templates_dir = get_project_root() / "config" / "templates"
+            file_resolver = FileResolver(
+                deployment_dir=self.config._deployment_dir,
+                framework_dir=templates_dir,
+            )
+            resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            for entry in self.config.instruction_files:
+                try:
+                    # Skip todo_guide.md — already handled above via matrix
+                    if entry.file == "todo_guide.md":
+                        continue
+                    # Check resolved config first (resumed jobs)
+                    basename = Path(entry.file).stem
+                    content = resolved_instructions.get(basename)
+                    if not content:
+                        # Resolve from filesystem
+                        content = file_resolver.load(Path(entry.file).name)
+                    # Ensure parent directory exists
+                    target_path = self._workspace_manager.get_path(entry.file)
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._workspace_manager.write_file(entry.file, content)
+                    logger.debug(f"Copied instruction file to workspace: {entry.file}")
+                except FileNotFoundError:
+                    logger.warning(f"Instruction file not found: {entry.file}")
 
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
@@ -1146,6 +1233,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             config=tool_config,
             _job_id=self._current_job_id,
             _llm_config=self.config.llm,
+            _instruction_files=self.config.instruction_files,
         )
         self._tool_context = context
 
@@ -1167,28 +1255,60 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             self._tools = implemented_tools
 
+        # Generate tool documentation in workspace (before overrides so full docstrings are captured)
+        tools_dir = self._workspace_manager.get_path("tools")
+        generate_workspace_tool_docs(tool_names, tools_dir, tools=self._tools)
+
         # Apply description overrides for deferred tools
         # Domain tools get short descriptions; agent reads full docs from workspace
         self._tools = apply_description_overrides(self._tools)
 
-        # Bind tools to phase-specific LLMs
-        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(self._tools)
-        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(self._tools)
+        # Apply instruction file enforcement wrappers (before_tool triggers)
+        self._tools = apply_instruction_enforcement(self._tools, context)
+
+        # Configure parallel tool calls from config (defaults to False to prevent
+        # overwhelming the agent loop with 20+ simultaneous tool calls).
+        # OpenAI o-series reasoning models don't support this parameter.
+        bind_kwargs = {}
+        model_name = (self.config.llm.model or "").lower()
+        if not model_name.startswith(("o1", "o3", "o4")):
+            bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
+
+        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(self._tools, **bind_kwargs)
+        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(self._tools, **bind_kwargs)
 
         # Keep _llm_with_tools for backwards compatibility
         self._llm_with_tools = self._strategic_llm_with_tools
 
         logger.debug(f"Loaded {len(self._tools)} tools")
 
-        # Auto-register input documents as CitationEngine sources
-        self._register_initial_documents(context)
+        # Auto-register input documents as CitationEngine sources (background)
+        self._doc_registration_task = asyncio.create_task(
+            self._register_initial_documents_background(context)
+        )
+
+    async def _register_initial_documents_background(self, context: "ToolContext") -> None:
+        """Background async wrapper for parallel document registration.
+
+        Runs the synchronous _register_initial_documents in a thread executor
+        so the agent's ReAct loop can start immediately.
+
+        Args:
+            context: ToolContext with workspace and citation engine
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._register_initial_documents, context)
 
     def _register_initial_documents(self, context: "ToolContext") -> None:
         """Register input documents in documents/ as CitationEngine sources.
 
         Scans the documents/ directory for supported file types and registers
-        each as a source, enabling hybrid vector search via search_library.
+        each as a source in parallel using ThreadPoolExecutor, enabling hybrid
+        vector search via search_library.
         Skips documents/external/ (web content registered separately).
+
+        Each worker thread creates its own CitationEngine instance for thread
+        safety (the shared context.citation_engine uses a single DB connection).
 
         Non-fatal: failures are logged but do not block job execution.
 
@@ -1208,7 +1328,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             if not docs_path.exists():
                 return
 
-            registered_count = 0
+            # Collect eligible files
+            files: List[Tuple[Path, str]] = []
             for file_path in sorted(docs_path.rglob("*")):
                 if not file_path.is_file():
                     continue
@@ -1224,21 +1345,90 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 if file_path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                     continue
 
-                try:
-                    context.get_or_register_doc_source(
-                        str(file_path), name=file_path.name
-                    )
-                    registered_count += 1
-                except Exception as e:
-                    logger.debug(f"Could not register document {file_path.name}: {e}")
+                files.append((file_path, file_path.name))
 
+            if not files:
+                return
+
+            start_time = time.monotonic()
+            logger.info(f"Starting background registration of {len(files)} document(s)...")
+
+            # Process in parallel — each thread gets its own CitationEngine
+            max_workers = min(len(files), 4)
+            results: List[Optional[Tuple[str, int]]] = []
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(
+                        self._process_single_document,
+                        file_path,
+                        name,
+                        context,
+                    )
+                    for file_path, name in files
+                ]
+                for future in futures:
+                    results.append(future.result())
+
+            # Update source registry from results (single-threaded, no race)
+            registered_count = 0
+            for result in results:
+                if result is not None:
+                    file_path_str, source_id = result
+                    context._source_registry[file_path_str] = source_id
+                    registered_count += 1
+
+            elapsed = time.monotonic() - start_time
             if registered_count > 0:
                 logger.info(
-                    f"Auto-registered {registered_count} input document(s) as citation sources"
+                    f"Registered {registered_count} document(s) in {elapsed:.1f}s (parallel)"
                 )
 
         except Exception as e:
             logger.warning(f"Auto-registration of input documents failed (non-fatal): {e}")
+
+    def _process_single_document(
+        self,
+        file_path: Path,
+        name: str,
+        context: "ToolContext",
+    ) -> Optional[Tuple[str, int]]:
+        """Process a single document in a worker thread.
+
+        Creates an independent CitationEngine instance with its own DB
+        connection for thread safety.
+
+        Args:
+            file_path: Absolute path to the document file
+            name: Human-readable name for the source
+            context: ToolContext (used only for job_id and agent_id)
+
+        Returns:
+            Tuple of (file_path_str, source_id) on success, None on failure
+        """
+        engine = None
+        try:
+            from citation_engine import CitationEngine, CitationContext
+
+            ctx = CitationContext(
+                session_id=context.job_id or "unknown",
+                agent_id=context.config.get("agent_id", "unknown"),
+            )
+            engine = CitationEngine(mode="multi-agent", context=ctx)
+            engine._connect()
+
+            source = engine.add_doc_source(str(file_path), name=name)
+            return (str(file_path), source.id)
+
+        except Exception as e:
+            logger.debug(f"Could not register document {name}: {e}")
+            return None
+        finally:
+            if engine is not None:
+                try:
+                    engine.close()
+                except Exception:
+                    pass
 
     def _create_datasource_connection(self, ds: Dict[str, Any]) -> Any:
         """Create a connection to an external datasource.
@@ -1597,7 +1787,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             config=WorkspaceManagerConfig(
                 structure=self.config.workspace.structure,
                 git_versioning=self.config.workspace.git_versioning,
-                git_ignore_patterns=self.config.workspace.git_ignore_patterns,
             )
         )
 
@@ -1613,7 +1802,34 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Read frozen data
         frozen_data = json.loads(frozen_path.read_text())
 
-        # Convert to completion data
+        # Determine freeze type (backward compat: missing = job_complete)
+        freeze_type = frozen_data.get("freeze_type", "job_complete")
+
+        if freeze_type == "phase_boundary":
+            # Phase boundary freeze: resume execution, don't complete
+            frozen_path.unlink()
+            logger.info(f"Removed job_frozen.json for phase boundary approval on job {job_id}")
+
+            # Update database status back to processing
+            if self.postgres_conn:
+                try:
+                    await self.postgres_conn.execute(
+                        "UPDATE jobs SET status = 'processing' WHERE id = $1::uuid",
+                        job_id
+                    )
+                    logger.info(f"Updated job {job_id} status to 'processing' in database")
+                except Exception as e:
+                    logger.warning(f"Failed to update job status in database: {e}")
+
+            return {
+                "job_id": job_id,
+                "status": "approved_continue",
+                "freeze_type": freeze_type,
+                "phase_type": frozen_data.get("phase_type"),
+                "phase_number": frozen_data.get("phase_number"),
+            }
+
+        # job_complete freeze (or backward compat): mark as truly completed
         completion_data = {
             **frozen_data,
             "status": "job_completed",

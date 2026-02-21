@@ -38,13 +38,15 @@ class ConversationSummary(BaseModel):
     """Structured summary — forces the model to stop after valid JSON."""
     summary: str = Field(description="General overview of the conversation and what happened")
     tasks_completed: str | List[str] = Field(description="Bullet-point list of completed tasks")
+    tasks_in_progress: str | List[str] = Field(default="", description="Tasks started but not finished")
     key_decisions: str | List[str] = Field(description="Important decisions made")
     current_state: str = Field(description="Current progress and immediate next steps")
     blockers: str | List[str] = Field(default="", description="Errors or blockers encountered, empty if none")
     state_changes: str | List[str] = Field(default="", description="Files created, modified, or deleted during this period")
     pinned_instructions: str = Field(default="", description="Rules from instructions/config that must persist")
+    identity_anchor: dict | str = Field(default="", description="Agent role, current task, and active constraints for identity persistence")
 
-    @field_validator("tasks_completed", "key_decisions", "blockers", "state_changes", mode="before")
+    @field_validator("tasks_completed", "tasks_in_progress", "key_decisions", "blockers", "state_changes", mode="before")
     @classmethod
     def coerce_list_to_string(cls, v):
         """Coerce list fields to strings.
@@ -221,19 +223,19 @@ class ContextConfig:
         summarization_safe_limit: Max input tokens for summarization LLM
         summarization_chunk_size: Chunk size for recursive summarization
     """
-    compaction_threshold_tokens: int = 100_000
+    compaction_threshold_tokens: int = 80_000
     summarization_threshold_tokens: int = 100_000
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 30_000
-    keep_recent_tool_results: int = 10
+    message_count_min_tokens: int = 40_000
+    keep_recent_tool_results: int = 15
     keep_recent_messages: int = 10
     max_tool_result_length: int = 5000
     placeholder_text: str = "[Result processed - see workspace if needed]"
     tool_retry_count: int = 3
     tool_retry_delay_seconds: float = 1.0
     # Safety layer constants
-    model_max_context_tokens: int = 128_000
-    summarization_safe_limit: int = 100_000
+    model_max_context_tokens: int = 100_000
+    summarization_safe_limit: int = 90_000
     summarization_chunk_size: int = 80_000
 
 
@@ -260,7 +262,10 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
         except KeyError:
             # Fall back to cl100k_base (used by GPT-4)
             enc = tiktoken.get_encoding("cl100k_base")
-            logger.debug(f"Model {model_name} not found in tiktoken, using cl100k_base")
+            logger.debug(
+                f"Model {model_name} not found in tiktoken, using cl100k_base. "
+                "Token counts may over/undercount for non-OpenAI models."
+            )
 
         total = 0
         debug_details = []
@@ -365,16 +370,36 @@ class ContextManager:
         self,
         config: Optional[ContextConfig] = None,
         model: str = "gpt-4",
+        strategic_model: Optional[str] = None,
+        tactical_model: Optional[str] = None,
     ):
         """Initialize context manager.
 
         Args:
             config: Context management configuration
-            model: Model name for token counting
+            model: Model name for token counting (default/fallback)
+            strategic_model: Model name for strategic phase token counting
+            tactical_model: Model name for tactical phase token counting
         """
         self.config = config or ContextConfig()
-        self.token_counter = get_token_counter(model)
+        self._default_counter = get_token_counter(model)
+        self._phase_counters: Dict[str, Callable[[List[BaseMessage]], int]] = {}
+        if strategic_model:
+            self._phase_counters["strategic"] = get_token_counter(strategic_model)
+        if tactical_model:
+            self._phase_counters["tactical"] = get_token_counter(tactical_model)
+        self.token_counter = self._default_counter
         self._state = ContextManagementState()
+
+    def set_current_phase(self, phase: str) -> None:
+        """Switch token counter to the appropriate phase-specific model.
+
+        Falls back to the default counter if no phase-specific one exists.
+
+        Args:
+            phase: Phase name ("strategic" or "tactical")
+        """
+        self.token_counter = self._phase_counters.get(phase, self._default_counter)
 
     @property
     def state(self) -> ContextManagementState:
@@ -644,7 +669,6 @@ class ContextManager:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
         max_summary_length: int = 10000,
         force: bool = False,
     ) -> List[BaseMessage]:
@@ -656,8 +680,7 @@ class ContextManager:
         Args:
             messages: Current message history
             llm: LLM for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models
+            summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Max length for summary
             force: If True, summarize even if thresholds not exceeded
 
@@ -669,13 +692,134 @@ class ContextManager:
                 f"Context compaction triggered: {len(messages)} messages, "
                 f"{self.get_token_count(messages)} tokens"
             )
-            return await self.summarize_and_compact(
+            result = await self.summarize_and_compact(
                 messages,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
+
+            # Progressive compaction: if force=True and still too many messages,
+            # retry with progressively smaller keep_recent windows
+            if force:
+                keep_recent = self.config.keep_recent_messages
+                # Count conversation messages (non-system, non-RemoveMessage)
+                prev_conv_count = sum(
+                    1 for m in messages
+                    if not isinstance(m, (SystemMessage, RemoveMessage))
+                )
+                conv_count = sum(
+                    1 for m in result
+                    if not isinstance(m, (SystemMessage, RemoveMessage))
+                )
+                # If first compaction didn't reduce, skip progressive loop
+                # (e.g., summary was larger than original — further retries won't help)
+                if conv_count >= prev_conv_count:
+                    logger.debug(
+                        f"Compaction did not reduce messages ({prev_conv_count} -> {conv_count}), "
+                        "skipping progressive loop"
+                    )
+                else:
+                    # Try progressively smaller windows: half → quarter → 2 → 1
+                    for divisor in [2, 4, None, None]:
+                        if conv_count <= keep_recent:
+                            break
+                        if divisor:
+                            next_keep = max(2, keep_recent // divisor)
+                        else:
+                            # Final attempts with absolute minimums
+                            next_keep = 2 if conv_count > 2 else 1
+                        if next_keep >= keep_recent:
+                            break  # No further reduction possible
+                        prev_conv_count = conv_count
+                        logger.warning(
+                            f"Progressive compaction: still {conv_count} conversation messages, "
+                            f"retrying with keep_recent={next_keep}"
+                        )
+                        # Re-compact from ORIGINAL messages to avoid RemoveMessage accumulation
+                        result = await self.summarize_and_compact(
+                            messages,
+                            llm,
+                            summarization_prompt,
+                            max_summary_length,
+                            keep_recent_override=next_keep,
+                        )
+                        conv_count = sum(
+                            1 for m in result
+                            if not isinstance(m, (SystemMessage, RemoveMessage))
+                        )
+                        keep_recent = next_keep
+                        # Break if compaction didn't reduce messages further
+                        if conv_count >= prev_conv_count:
+                            logger.debug(
+                                "Progressive compaction stalled, stopping retries"
+                            )
+                            break
+
+                # Emergency: if token count still exceeds model max, truncate tool results
+                non_remove = [m for m in result if not isinstance(m, RemoveMessage)]
+                token_count = self.get_token_count(non_remove)
+                if token_count > self.config.model_max_context_tokens:
+                    logger.warning(
+                        f"Emergency truncation: {token_count} tokens still exceeds "
+                        f"model max {self.config.model_max_context_tokens}"
+                    )
+                    result = self._emergency_truncate_tool_results(result)
+
+            return result
+        return messages
+
+    def _emergency_truncate_tool_results(
+        self,
+        messages: List[BaseMessage],
+        initial_limit: int = 2000,
+        final_limit: int = 500,
+    ) -> List[BaseMessage]:
+        """Truncate ALL tool results as a last resort when context is still too large.
+
+        This handles the case where individual tool results (e.g., a 875KB read_file)
+        are larger than the entire context budget.
+
+        Args:
+            messages: Message list (may contain RemoveMessage markers)
+            initial_limit: First truncation pass limit in chars
+            final_limit: Second truncation pass limit if still over
+
+        Returns:
+            Messages with truncated tool results
+        """
+        for limit in [initial_limit, final_limit]:
+            # Build list of (index, content_length) for ToolMessages, sorted largest first
+            tool_sizes = []
+            for i, msg in enumerate(messages):
+                if isinstance(msg, ToolMessage) and len(msg.content) > limit:
+                    tool_sizes.append((i, len(msg.content)))
+            tool_sizes.sort(key=lambda x: x[1], reverse=True)
+
+            if not tool_sizes:
+                break
+
+            truncated_count = 0
+            result = list(messages)
+            for idx, orig_len in tool_sizes:
+                msg = result[idx]
+                result[idx] = ToolMessage(
+                    content=msg.content[:limit] + f"\n\n[EMERGENCY TRUNCATED - {orig_len - limit} chars removed]",
+                    tool_call_id=msg.tool_call_id,
+                )
+                truncated_count += 1
+
+            logger.warning(
+                f"Emergency truncated {truncated_count} tool results to {limit} chars"
+            )
+            messages = result
+
+            # Check if we're under the limit now
+            non_remove = [m for m in messages if not isinstance(m, RemoveMessage)]
+            token_count = self.get_token_count(non_remove)
+            if token_count <= self.config.model_max_context_tokens:
+                break
+
         return messages
 
     def _format_messages_for_summary(self, messages: List[BaseMessage]) -> List[str]:
@@ -754,7 +898,6 @@ class ContextManager:
         conversation_text: str,
         llm: BaseChatModel,
         summarization_prompt: Optional[str],
-        oss_reasoning_level: str,
         max_summary_length: int,
     ) -> str:
         """Single-pass summarization of conversation text.
@@ -762,8 +905,7 @@ class ContextManager:
         Args:
             conversation_text: Formatted conversation as string
             llm: LLM to use for summarization
-            summarization_prompt: Optional custom prompt template
-            oss_reasoning_level: Reasoning level for OSS models
+            summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
             max_summary_length: Maximum summary length
 
         Returns:
@@ -771,10 +913,12 @@ class ContextManager:
         """
         # Build prompt from template or fallback
         if summarization_prompt:
-            prompt = summarization_prompt.format(
-                conversation=conversation_text,
-                oss_reasoning_level=oss_reasoning_level,
-                max_summary_length=max_summary_length,
+            # Use format_map with defaultdict for backward compat with old
+            # resolved prompts that may still contain {oss_reasoning_level}
+            from collections import defaultdict
+
+            prompt = summarization_prompt.format_map(
+                defaultdict(str, conversation=conversation_text, max_summary_length=str(max_summary_length))
             )
         else:
             prompt = f"""Summarize this agent conversation into the required JSON fields.
@@ -793,6 +937,8 @@ Conversation:
                 parts.append(f"**Summary:**\n{result.summary.strip()}")
             if result.tasks_completed.strip():
                 parts.append(f"**Tasks Completed:**\n{result.tasks_completed.strip()}")
+            if result.tasks_in_progress and result.tasks_in_progress.strip():
+                parts.append(f"**Tasks In Progress:**\n{result.tasks_in_progress.strip()}")
             if result.key_decisions.strip():
                 parts.append(f"**Key Decisions:**\n{result.key_decisions.strip()}")
             if result.current_state.strip():
@@ -803,6 +949,21 @@ Conversation:
                 parts.append(f"**State Changes:**\n{result.state_changes.strip()}")
             if result.pinned_instructions and result.pinned_instructions.strip():
                 parts.append(f"**Pinned Instructions:**\n{result.pinned_instructions.strip()}")
+            if result.identity_anchor:
+                if isinstance(result.identity_anchor, dict):
+                    anchor_parts = []
+                    if result.identity_anchor.get("agent_role"):
+                        anchor_parts.append(f"Role: {result.identity_anchor['agent_role']}")
+                    if result.identity_anchor.get("current_task"):
+                        anchor_parts.append(f"Task: {result.identity_anchor['current_task']}")
+                    if result.identity_anchor.get("active_constraints"):
+                        constraints = result.identity_anchor["active_constraints"]
+                        if isinstance(constraints, list):
+                            anchor_parts.append("Constraints: " + "; ".join(constraints))
+                    if anchor_parts:
+                        parts.append(f"**Identity Anchor:**\n" + "\n".join(anchor_parts))
+                elif isinstance(result.identity_anchor, str) and result.identity_anchor.strip():
+                    parts.append(f"**Identity Anchor:**\n{result.identity_anchor.strip()}")
             summary = "\n\n".join(parts)
 
             return summary
@@ -816,7 +977,6 @@ Conversation:
         formatted_parts: List[str],
         llm: BaseChatModel,
         summarization_prompt: Optional[str],
-        oss_reasoning_level: str,
         max_summary_length: int,
         depth: int = 0,
     ) -> str:
@@ -831,8 +991,7 @@ Conversation:
         Args:
             formatted_parts: List of formatted message strings
             llm: LLM for summarization
-            summarization_prompt: Optional custom prompt template
-            oss_reasoning_level: Reasoning level for OSS models
+            summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
             max_summary_length: Maximum final summary length
             depth: Current recursion depth (for logging)
 
@@ -870,7 +1029,6 @@ Conversation:
                 chunk_text,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 chunk_max_length,
             )
             chunk_summaries.append(summary)
@@ -893,7 +1051,6 @@ Conversation:
                 [f"Previous summary section:\n{s}" for s in chunk_summaries],
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
                 depth + 1,
             )
@@ -905,7 +1062,6 @@ Conversation:
                 f"Combine these section summaries into a unified summary:\n\n{combined}",
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
 
@@ -916,7 +1072,6 @@ Conversation:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
         max_summary_length: int = 10000,
     ) -> str:
         """Generate a summary of the conversation.
@@ -928,8 +1083,7 @@ Conversation:
         Args:
             messages: Messages to summarize
             llm: LLM to use for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
+            summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Maximum length for the final summary
 
         Returns:
@@ -952,7 +1106,6 @@ Conversation:
                 formatted_parts,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
         else:
@@ -961,7 +1114,6 @@ Conversation:
                 conversation_text,
                 llm,
                 summarization_prompt,
-                oss_reasoning_level,
                 max_summary_length,
             )
 
@@ -979,8 +1131,8 @@ Conversation:
         messages: List[BaseMessage],
         llm: BaseChatModel,
         summarization_prompt: Optional[str] = None,
-        oss_reasoning_level: str = "high",
         max_summary_length: int = 10000,
+        keep_recent_override: Optional[int] = None,
     ) -> List[BaseMessage]:
         """Summarize older messages and compact the conversation.
 
@@ -990,8 +1142,9 @@ Conversation:
         Args:
             messages: Full message history
             llm: LLM for summarization
-            summarization_prompt: Optional custom prompt
-            oss_reasoning_level: Reasoning level for OSS models (low/medium/high)
+            summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
+            max_summary_length: Max length for summary
+            keep_recent_override: Override keep_recent_messages (for progressive compaction)
 
         Returns:
             Compacted message list with summary prepended
@@ -1001,6 +1154,13 @@ Conversation:
         # Filter out workspace injection messages BEFORE processing
         # They are transient and will be re-injected fresh after summarization
         messages = [m for m in messages if not is_workspace_injection_message(m)]
+
+        # Determine effective keep_recent value
+        effective_keep_recent = (
+            keep_recent_override
+            if keep_recent_override is not None
+            else self.config.keep_recent_messages
+        )
 
         # Separate system messages into:
         # 1. Regular system messages (keep in output)
@@ -1016,11 +1176,11 @@ Conversation:
         ]
         conversation = [m for m in messages if not isinstance(m, SystemMessage)]
 
-        if len(conversation) <= self.config.keep_recent_messages:
+        if len(conversation) <= effective_keep_recent:
             return messages
 
         # Find safe slice point that doesn't orphan ToolMessages
-        target_start = len(conversation) - self.config.keep_recent_messages
+        target_start = len(conversation) - effective_keep_recent
         safe_start = find_safe_slice_start(conversation, target_start)
 
         # Messages to summarize (older ones) and recent messages to keep
@@ -1036,7 +1196,6 @@ Conversation:
             messages_for_summarization,
             llm,
             summarization_prompt,
-            oss_reasoning_level,
             max_summary_length,
         )
 
