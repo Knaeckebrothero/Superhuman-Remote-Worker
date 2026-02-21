@@ -1,8 +1,10 @@
 import { Component, inject, OnInit } from '@angular/core';
 import { TimelineComponent } from './components/timeline/timeline.component';
 import { SplitPanelComponent } from './layout/split-panel/split-panel.component';
+import { MobileShellComponent } from './layout/mobile-shell/mobile-shell.component';
 import { LayoutService } from './core/services/layout.service';
 import { ComponentRegistryService } from './core/services/component-registry.service';
+import { ViewportService } from './core/services/viewport.service';
 import { PlaceholderAComponent } from './components/placeholders/placeholder-a.component';
 import { PlaceholderBComponent } from './components/placeholders/placeholder-b.component';
 import { PlaceholderCComponent } from './components/placeholders/placeholder-c.component';
@@ -23,16 +25,20 @@ import { InstructionBuilderComponent } from './components/instruction-builder/in
 
 @Component({
   selector: 'app-root',
-  imports: [TimelineComponent, SplitPanelComponent],
+  imports: [TimelineComponent, SplitPanelComponent, MobileShellComponent],
   template: `
-    <div class="app-frame">
-      <header class="app-header">
-        <app-timeline />
-      </header>
-      <main class="app-main">
-        <app-split-panel [config]="layoutService.layout()" />
-      </main>
-    </div>
+    @if (viewport.isMobile()) {
+      <app-mobile-shell />
+    } @else {
+      <div class="app-frame">
+        <header class="app-header">
+          <app-timeline />
+        </header>
+        <main class="app-main">
+          <app-split-panel [config]="layoutService.layout()" />
+        </main>
+      </div>
+    }
   `,
   styles: [
     `
@@ -57,6 +63,7 @@ import { InstructionBuilderComponent } from './components/instruction-builder/in
 })
 export class App implements OnInit {
   readonly layoutService = inject(LayoutService);
+  readonly viewport = inject(ViewportService);
   private readonly registry = inject(ComponentRegistryService);
 
   ngOnInit(): void {

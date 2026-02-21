@@ -1,4 +1,5 @@
 import { Injectable, signal } from '@angular/core';
+import { environment } from '../environment';
 
 /**
  * Deep merge two objects. Objects merge recursively, arrays replace entirely, null clears.
@@ -45,8 +46,14 @@ export class JobArtifactService {
   /** Builder session ID (null if no builder session started) */
   readonly sessionId = signal<string | null>(null);
 
+  /** Active job context for inspection tools */
+  readonly activeJobId = signal<string | null>(null);
+
   /** Whether AI is currently streaming (locks editor to prevent conflicts) */
   readonly streaming = signal<boolean>(false);
+
+  /** Selected builder model */
+  readonly builderModel = signal<string>(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
 
   /**
    * Apply an artifact mutation from a builder tool call.
@@ -91,6 +98,8 @@ export class JobArtifactService {
     this.config.set(null);
     this.description.set(null);
     this.sessionId.set(null);
+    this.activeJobId.set(null);
     this.streaming.set(false);
+    this.builderModel.set(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
   }
 }

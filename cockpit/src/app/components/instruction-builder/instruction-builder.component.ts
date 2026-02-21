@@ -1,9 +1,13 @@
-import { Component, inject, signal, ElementRef, ViewChild, AfterViewChecked } from '@angular/core';
+import { Component, inject, signal, ElementRef, ViewChild, AfterViewChecked, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { MarkdownComponent } from 'ngx-markdown';
 import { JobArtifactService } from '../../core/services/job-artifact.service';
 import { BuilderStreamService, BuilderMessage } from '../../core/services/builder-stream.service';
+import { ApiService } from '../../core/services/api.service';
+import { JobSummary } from '../../core/models/audit.model';
+import { environment } from '../../core/environment';
 
-type BuilderStepType = 'thought' | 'tool_call' | 'tool_result';
+type BuilderStepType = 'thought' | 'tool_call' | 'tool_result' | 'inspection_result';
 type BuilderStepStatus = 'active' | 'complete';
 
 interface BuilderStep {
@@ -26,7 +30,7 @@ interface ChatMessage {
 @Component({
   selector: 'app-instruction-builder',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, MarkdownComponent],
   template: `
     <div class="builder-container">
       <div class="header-bar">
@@ -34,12 +38,33 @@ interface ChatMessage {
           <span class="header-icon">construction</span>
           Instruction Builder
         </span>
-        @if (artifacts.streaming()) {
-          <span class="streaming-badge">
-            <span class="pulse-dot"></span>
-            AI responding...
-          </span>
-        }
+        <div class="header-controls">
+          <select
+            class="model-select"
+            [value]="artifacts.builderModel()"
+            (change)="onBuilderModelChange($event)"
+          >
+            @for (m of builderModels; track m.id) {
+              <option [value]="m.id">{{ m.label }}</option>
+            }
+          </select>
+          <select
+            class="job-context-select"
+            [value]="artifacts.activeJobId() ?? ''"
+            (change)="onJobContextChange($event)"
+          >
+            <option value="">No job context</option>
+            @for (job of availableJobs(); track job.id) {
+              <option [value]="job.id">{{ job.id.slice(0, 8) }}… · {{ job.status }} · {{ job.description.slice(0, 30) || 'No description' }}</option>
+            }
+          </select>
+          @if (artifacts.streaming()) {
+            <span class="streaming-badge">
+              <span class="pulse-dot"></span>
+              AI responding...
+            </span>
+          }
+        </div>
       </div>
 
       @if (!artifacts.sessionId()) {
@@ -65,8 +90,9 @@ interface ChatMessage {
                 @if (msg.steps && msg.steps.length > 0) {
                   <details class="thought-process-panel">
                     <summary class="thought-process-summary">
-                      <span class="thought-process-icon">psychology</span>
-                      <span>Thought process ({{ msg.steps.length }} steps)</span>
+                      <span class="thought-process-icon complete-icon">check_circle</span>
+                      <span class="thought-header-text">Thought process</span>
+                      <span class="thought-step-count">({{ msg.steps.length }})</span>
                       <span class="chevron-icon">expand_more</span>
                     </summary>
                     <div class="thought-process-steps">
@@ -79,14 +105,18 @@ interface ChatMessage {
                             <span class="step-title">{{ step.title }}</span>
                           </summary>
                           @if (step.content) {
-                            <div class="step-content">{{ step.content }}</div>
+                            <div class="step-content" [class.inspection-content]="step.type === 'inspection_result'">{{ step.content }}</div>
                           }
                         </details>
                       }
                     </div>
                   </details>
                 }
-                <div class="message-content">{{ msg.content }}</div>
+                @if (msg.role === 'user') {
+                  <div class="message-content">{{ msg.content }}</div>
+                } @else {
+                  <markdown class="message-content markdown-body" [data]="msg.content" clipboard></markdown>
+                }
                 @if (msg.toolCalls && msg.toolCalls.length > 0) {
                   <div class="tool-calls">
                     @for (tc of msg.toolCalls; track $index) {
@@ -106,10 +136,11 @@ interface ChatMessage {
               <div class="message-avatar">smart_toy</div>
               <div class="message-body">
                 @if (streamingSteps().length > 0) {
-                  <details class="thought-process-panel" open>
+                  <details class="thought-process-panel">
                     <summary class="thought-process-summary">
                       <span class="thought-process-icon">psychology</span>
-                      <span>Thought process ({{ streamingSteps().length }} steps)</span>
+                      <span class="thought-header-text">{{ currentStepTitle() }}</span>
+                      <span class="thought-step-count">({{ streamingSteps().length }})</span>
                       <span class="spinner-small"></span>
                     </summary>
                     <div class="thought-process-steps">
@@ -128,7 +159,10 @@ interface ChatMessage {
                   </details>
                 }
                 @if (streamingText()) {
-                  <div class="message-content streaming">{{ streamingText() }}<span class="cursor-blink">|</span></div>
+                  <div class="message-content streaming">
+                    <markdown class="markdown-body" [data]="streamingText()"></markdown>
+                    <span class="cursor-blink">|</span>
+                  </div>
                 }
               </div>
             </div>
@@ -398,6 +432,49 @@ interface ChatMessage {
         font-size: 13px;
       }
 
+      /* Header controls */
+      .header-controls {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .model-select,
+      .job-context-select {
+        background: var(--surface-0, #313244);
+        color: var(--text-secondary, #a6adc8);
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 6px;
+        padding: 4px 8px;
+        font-size: 11px;
+        max-width: 220px;
+        cursor: pointer;
+        outline: none;
+      }
+
+      .model-select:focus,
+      .job-context-select:focus {
+        border-color: var(--accent-color, #cba6f7);
+      }
+
+      /* Inspection result rendering */
+      .inspection-content {
+        border-left: 3px solid #94e2d5;
+        padding-left: 10px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 12px;
+        max-height: 300px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        background: rgba(148, 226, 213, 0.05);
+        border-radius: 4px;
+        padding: 8px 8px 8px 12px;
+      }
+
+      .step-icon--inspection_result {
+        color: #94e2d5;
+      }
+
       /* Thought Process Panel */
       .thought-process-panel {
         border-radius: 8px;
@@ -437,6 +514,24 @@ interface ChatMessage {
         flex-shrink: 0;
       }
 
+      .thought-process-icon.complete-icon {
+        color: #a6e3a1;
+      }
+
+      .thought-header-text {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .thought-step-count {
+        flex-shrink: 0;
+        opacity: 0.6;
+        font-weight: 400;
+      }
+
       .chevron-icon {
         font-family: 'Material Symbols Outlined';
         font-size: 16px;
@@ -449,6 +544,8 @@ interface ChatMessage {
         flex-direction: column;
         gap: 2px;
         padding: 0 6px 6px;
+        max-height: 250px;
+        overflow-y: auto;
       }
 
       /* Individual step (collapsible, for finalized messages) */
@@ -717,12 +814,235 @@ interface ChatMessage {
       @keyframes spin {
         to { transform: rotate(360deg); }
       }
+
+      /* Markdown content styling */
+      :host ::ng-deep .markdown-body {
+        font-size: 13px;
+        line-height: 1.6;
+        color: var(--text-primary, #cdd6f4);
+        word-break: break-word;
+      }
+
+      :host ::ng-deep .markdown-body p {
+        margin: 0 0 0.5em;
+      }
+
+      :host ::ng-deep .markdown-body p:last-child {
+        margin-bottom: 0;
+      }
+
+      :host ::ng-deep .markdown-body h1,
+      :host ::ng-deep .markdown-body h2,
+      :host ::ng-deep .markdown-body h3,
+      :host ::ng-deep .markdown-body h4,
+      :host ::ng-deep .markdown-body h5,
+      :host ::ng-deep .markdown-body h6 {
+        margin: 0.6em 0 0.3em;
+        font-weight: 600;
+        line-height: 1.3;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      :host ::ng-deep .markdown-body h1 { font-size: 1.3em; }
+      :host ::ng-deep .markdown-body h2 { font-size: 1.2em; }
+      :host ::ng-deep .markdown-body h3 { font-size: 1.1em; }
+
+      :host ::ng-deep .markdown-body pre {
+        background: var(--timeline-bg, #11111b);
+        padding: 12px;
+        border-radius: 8px;
+        overflow-x: auto;
+        margin: 0.4em 0;
+        border: 1px solid var(--border-color, #313244);
+        position: relative;
+      }
+
+      :host ::ng-deep .markdown-body pre code {
+        background: none;
+        padding: 0;
+        border: none;
+        border-radius: 0;
+        font-size: 12px;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      :host ::ng-deep .markdown-body code {
+        background: var(--surface-0, #313244);
+        padding: 0.15em 0.4em;
+        border-radius: 4px;
+        font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+        font-size: 0.9em;
+        border: 1px solid var(--border-color, #313244);
+      }
+
+      :host ::ng-deep .markdown-body ul,
+      :host ::ng-deep .markdown-body ol {
+        margin: 0.3em 0;
+        padding-left: 1.5em;
+      }
+
+      :host ::ng-deep .markdown-body li {
+        margin: 0.15em 0;
+      }
+
+      :host ::ng-deep .markdown-body blockquote {
+        margin: 0.4em 0;
+        padding: 0.3em 0 0.3em 0.8em;
+        border-left: 3px solid var(--accent-color, #cba6f7);
+        background: rgba(203, 166, 247, 0.06);
+        border-radius: 0 6px 6px 0;
+        color: var(--text-secondary, #a6adc8);
+      }
+
+      :host ::ng-deep .markdown-body table {
+        border-collapse: collapse;
+        width: 100%;
+        margin: 0.4em 0;
+        font-size: 12px;
+      }
+
+      :host ::ng-deep .markdown-body th,
+      :host ::ng-deep .markdown-body td {
+        border: 1px solid var(--border-color, #313244);
+        padding: 6px 10px;
+        text-align: left;
+      }
+
+      :host ::ng-deep .markdown-body th {
+        background: var(--surface-0, #313244);
+        font-weight: 600;
+      }
+
+      :host ::ng-deep .markdown-body tr:nth-child(even) {
+        background: rgba(49, 50, 68, 0.3);
+      }
+
+      :host ::ng-deep .markdown-body hr {
+        border: none;
+        border-top: 1px solid var(--border-color, #313244);
+        margin: 0.6em 0;
+      }
+
+      :host ::ng-deep .markdown-body a {
+        color: var(--accent-hover, #b4befe);
+        text-decoration: none;
+      }
+
+      :host ::ng-deep .markdown-body a:hover {
+        text-decoration: underline;
+      }
+
+      :host ::ng-deep .markdown-body strong {
+        font-weight: 600;
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      /* Clipboard button on code blocks */
+      :host ::ng-deep .markdown-clipboard-button {
+        position: absolute;
+        top: 6px;
+        right: 6px;
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: none;
+        border-radius: 6px;
+        background: var(--surface-0, #313244);
+        color: var(--text-muted, #6c7086);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 14px;
+        opacity: 0;
+        transition: opacity 0.15s ease;
+      }
+
+      :host ::ng-deep pre:hover .markdown-clipboard-button {
+        opacity: 1;
+      }
+
+      :host ::ng-deep .markdown-clipboard-button:hover {
+        background: var(--surface-1, #45475a);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      /* Prism syntax highlighting (dark theme) */
+      :host ::ng-deep .token.comment,
+      :host ::ng-deep .token.prolog,
+      :host ::ng-deep .token.doctype,
+      :host ::ng-deep .token.cdata {
+        color: #6a9955;
+      }
+
+      :host ::ng-deep .token.keyword {
+        color: #569cd6;
+      }
+
+      :host ::ng-deep .token.string,
+      :host ::ng-deep .token.attr-value {
+        color: #ce9178;
+      }
+
+      :host ::ng-deep .token.function {
+        color: #dcdcaa;
+      }
+
+      :host ::ng-deep .token.number {
+        color: #b5cea8;
+      }
+
+      :host ::ng-deep .token.operator {
+        color: #d4d4d4;
+      }
+
+      :host ::ng-deep .token.class-name {
+        color: #4ec9b0;
+      }
+
+      :host ::ng-deep .token.variable {
+        color: #9cdcfe;
+      }
+
+      :host ::ng-deep .token.punctuation {
+        color: #d4d4d4;
+      }
+
+      :host ::ng-deep .token.boolean,
+      :host ::ng-deep .token.constant {
+        color: #569cd6;
+      }
+
+      /* Remove white-space:pre-wrap on markdown rendered content */
+      .message-assistant .message-content.markdown-body {
+        white-space: normal;
+      }
+
+      /* Mobile adjustments */
+      @media (max-width: 768px) {
+        .header-bar {
+          display: none;
+        }
+
+        .message {
+          max-width: 95%;
+        }
+
+        .input-area {
+          padding-bottom: env(safe-area-inset-bottom, 0px);
+        }
+
+        .chat-input {
+          font-size: 16px;
+        }
+      }
     `,
   ],
 })
-export class InstructionBuilderComponent implements AfterViewChecked {
+export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
   readonly artifacts = inject(JobArtifactService);
   private readonly stream = inject(BuilderStreamService);
+  private readonly api = inject(ApiService);
 
   @ViewChild('messagesContainer') messagesContainer?: ElementRef<HTMLDivElement>;
   @ViewChild('inputArea') inputArea?: ElementRef<HTMLTextAreaElement>;
@@ -733,16 +1053,44 @@ export class InstructionBuilderComponent implements AfterViewChecked {
   readonly error = signal<string | null>(null);
   readonly isCreatingSession = signal(false);
   readonly lastFailedMessage = signal<string | null>(null);
+  readonly availableJobs = signal<JobSummary[]>([]);
+  readonly builderModels = environment.builderModels;
 
   inputText = '';
   private shouldScrollToBottom = false;
   private stepCounter = 0;
+
+  /** Set of tool names that return inspection results. */
+  private readonly INSPECTION_TOOLS = new Set([
+    'list_jobs', 'get_job', 'get_job_progress', 'get_workspace_file',
+    'get_workspace_overview', 'get_frozen_job', 'get_todos', 'get_chat_history',
+  ]);
+
+  ngOnInit(): void {
+    this.loadAvailableJobs();
+  }
 
   ngAfterViewChecked(): void {
     if (this.shouldScrollToBottom) {
       this.scrollToBottom();
       this.shouldScrollToBottom = false;
     }
+  }
+
+  loadAvailableJobs(): void {
+    this.api.getJobs(undefined, 20).subscribe((jobs) => {
+      this.availableJobs.set(jobs);
+    });
+  }
+
+  onBuilderModelChange(event: Event): void {
+    const value = (event.target as HTMLSelectElement).value;
+    this.artifacts.builderModel.set(value);
+  }
+
+  onJobContextChange(event: Event): void {
+    const value = (event.target as HTMLSelectElement).value;
+    this.artifacts.activeJobId.set(value || null);
   }
 
   onKeyDown(event: KeyboardEvent): void {
@@ -814,10 +1162,15 @@ export class InstructionBuilderComponent implements AfterViewChecked {
         this.addStep('tool_call', title, JSON.stringify(args, null, 2), 'active');
         this.shouldScrollToBottom = true;
       },
-      onToolResult: (tool) => {
-        // Complete the active tool_call step and add a result step
+      onToolResult: (tool, _summary, content) => {
+        // Complete the active tool_call step
         this.completeActiveSteps('tool_call');
-        this.addStep('tool_result', `Result: ${this.formatToolName(tool)}`, '', 'complete');
+        if (content && this.INSPECTION_TOOLS.has(tool)) {
+          // Rich inspection result
+          this.addStep('inspection_result', `${this.formatToolName(tool)}`, content, 'complete');
+        } else {
+          this.addStep('tool_result', `Result: ${this.formatToolName(tool)}`, '', 'complete');
+        }
         this.shouldScrollToBottom = true;
       },
       onDone: () => {
@@ -894,11 +1247,19 @@ export class InstructionBuilderComponent implements AfterViewChecked {
     return tool.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
+  /** Returns the title of the most recent streaming step for the collapsed header. */
+  currentStepTitle(): string {
+    const steps = this.streamingSteps();
+    if (steps.length === 0) return 'Thinking...';
+    return steps[steps.length - 1].title;
+  }
+
   getStepIcon(type: BuilderStepType): string {
     switch (type) {
       case 'thought': return 'psychology';
       case 'tool_call': return 'build';
       case 'tool_result': return 'check_circle';
+      case 'inspection_result': return 'visibility';
     }
   }
 

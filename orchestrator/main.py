@@ -45,6 +45,7 @@ from services.builder_tools import (  # noqa: E402
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
+import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
 
@@ -202,9 +203,11 @@ class BuilderMessageRequest(BaseModel):
     """Request body for sending a message to the builder."""
 
     message: str = Field(..., description="User's message text")
+    model: str | None = Field(None, description="Builder model override")
     instructions: str | None = Field(None, description="Current instructions content")
     config: dict[str, Any] | None = Field(None, description="Current config override")
     description: str | None = Field(None, description="Current job description")
+    active_job_id: str | None = Field(None, description="Active job context for inspection tools")
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -2730,6 +2733,7 @@ async def send_builder_message(
         instructions_content=body.instructions,
         config_settings=body.config,
         description=body.description,
+        active_job_id=body.active_job_id,
     )
 
     # Build conversation context (with potential summarization)
@@ -2750,8 +2754,10 @@ async def send_builder_message(
         final_tool_calls = []
 
         try:
-            provider = get_builder_provider()
-            model = get_builder_model()
+            model = body.model or get_builder_model()
+            provider = _detect_provider(model)
+            api_key = _get_api_key_for_provider(provider)
+            use_responses_api = model in RESPONSES_API_MODELS
 
             for iteration in range(MAX_ITERATIONS):
                 yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': 'Analyzing request...' if iteration == 0 else 'Processing tool results...'})}\n\n"
@@ -2759,40 +2765,29 @@ async def send_builder_message(
                 turn_tool_calls = []  # {"name", "args", "id"} dicts
                 error_occurred = False
 
+                # Select streaming function based on provider and API type
                 if provider == "anthropic":
-                    async for evt_type, evt_data in _stream_anthropic(
-                        system_prompt, loop_messages, model
-                    ):
-                        if evt_type == "token":
-                            turn_text += evt_data["text"]
-                            yield f"event: token\ndata: {json.dumps(evt_data)}\n\n"
-                        elif evt_type == "tool_call":
-                            turn_tool_calls.append(evt_data)
-                            if evt_data["name"] in SERVER_SIDE_TOOLS:
-                                yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
-                            else:
-                                yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
-                                final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
-                        elif evt_type == "error":
-                            yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
-                            error_occurred = True
+                    stream_fn = _stream_anthropic(system_prompt, loop_messages, model, api_key)
+                elif use_responses_api:
+                    input_items = _chat_messages_to_responses_input(loop_messages)
+                    stream_fn = _stream_openai_responses(system_prompt, input_items, model, api_key)
                 else:
-                    async for evt_type, evt_data in _stream_openai(
-                        system_prompt, loop_messages, model
-                    ):
-                        if evt_type == "token":
-                            turn_text += evt_data["text"]
-                            yield f"event: token\ndata: {json.dumps(evt_data)}\n\n"
-                        elif evt_type == "tool_call":
-                            turn_tool_calls.append(evt_data)
-                            if evt_data["name"] in SERVER_SIDE_TOOLS:
-                                yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
-                            else:
-                                yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
-                                final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
-                        elif evt_type == "error":
-                            yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
-                            error_occurred = True
+                    stream_fn = _stream_openai(system_prompt, loop_messages, model, api_key)
+
+                async for evt_type, evt_data in stream_fn:
+                    if evt_type == "token":
+                        turn_text += evt_data["text"]
+                        yield f"event: token\ndata: {json.dumps(evt_data)}\n\n"
+                    elif evt_type == "tool_call":
+                        turn_tool_calls.append(evt_data)
+                        if evt_data["name"] in SERVER_SIDE_TOOLS:
+                            yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                        else:
+                            yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                            final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
+                    elif evt_type == "error":
+                        yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
+                        error_occurred = True
 
                 final_text += turn_text
 
@@ -2822,8 +2817,11 @@ async def send_builder_message(
                     tool_results = []
                     for tc in turn_tool_calls:
                         if tc["name"] in SERVER_SIDE_TOOLS:
-                            result = await _execute_server_tool(tc["name"], tc["args"])
-                            yield f"event: tool_result\ndata: {json.dumps({'tool': tc['name'], 'summary': result[:200]})}\n\n"
+                            result, full_content = await _execute_server_tool(tc["name"], tc["args"])
+                            evt_data: dict[str, Any] = {"tool": tc["name"], "summary": result[:200]}
+                            if full_content is not None:
+                                evt_data["content"] = full_content
+                            yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
                         else:
                             result = "OK"
                         tool_results.append({
@@ -2849,8 +2847,11 @@ async def send_builder_message(
                     # Execute server-side tools and append tool results
                     for tc in turn_tool_calls:
                         if tc["name"] in SERVER_SIDE_TOOLS:
-                            result = await _execute_server_tool(tc["name"], tc["args"])
-                            yield f"event: tool_result\ndata: {json.dumps({'tool': tc['name'], 'summary': result[:200]})}\n\n"
+                            result, full_content = await _execute_server_tool(tc["name"], tc["args"])
+                            evt_data_oai: dict[str, Any] = {"tool": tc["name"], "summary": result[:200]}
+                            if full_content is not None:
+                                evt_data_oai["content"] = full_content
+                            yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
                         else:
                             result = "OK"
                         loop_messages.append({
@@ -2892,22 +2893,316 @@ async def send_builder_message(
     )
 
 
-async def _execute_server_tool(tool_name: str, args: dict) -> str:
-    """Execute a server-side builder tool and return the result string."""
+def _get_loopback_client() -> httpx.AsyncClient:
+    """Lazy singleton httpx client for loopback API calls."""
+    global _loopback_client
+    if _loopback_client is None or _loopback_client.is_closed:
+        _loopback_client = httpx.AsyncClient(
+            base_url="http://localhost:8085",
+            timeout=30.0,
+        )
+    return _loopback_client
+
+_loopback_client: httpx.AsyncClient | None = None
+
+
+def _format_jobs_for_builder(jobs: list[dict]) -> str:
+    """Format job list as concise markdown for builder context."""
+    if not jobs:
+        return "No jobs found."
+    lines = [f"**{len(jobs)} job(s):**\n"]
+    for j in jobs:
+        status = j.get("status", "unknown")
+        desc = j.get("description", "")[:80]
+        job_id = str(j.get("id", ""))
+        config = j.get("config_name", "default")
+        created = str(j.get("created_at", ""))[:16]
+        lines.append(f"- **{job_id[:8]}…** | `{status}` | {config} | {created}")
+        if desc:
+            lines.append(f"  {desc}")
+    return "\n".join(lines)
+
+
+def _format_job_detail(job: dict) -> str:
+    """Format a single job as markdown for builder context."""
+    parts = [
+        f"**Job {job.get('id', '')}**",
+        f"- **Status:** {job.get('status', 'unknown')}",
+        f"- **Config:** {job.get('config_name', 'default')}",
+        f"- **Created:** {str(job.get('created_at', ''))[:19]}",
+    ]
+    if job.get("completed_at"):
+        parts.append(f"- **Completed:** {str(job['completed_at'])[:19]}")
+    if job.get("description"):
+        parts.append(f"- **Description:** {job['description'][:200]}")
+    if job.get("assigned_agent_id"):
+        parts.append(f"- **Agent:** {job['assigned_agent_id']}")
+    return "\n".join(parts)
+
+
+def _format_workspace_file(path: str, content: str) -> str:
+    """Format workspace file content, truncating if needed."""
+    truncated = content[:4000]
+    suffix = "\n\n…(truncated)" if len(content) > 4000 else ""
+    return f"**{path}:**\n```\n{truncated}{suffix}\n```"
+
+
+def _format_todos(data: dict) -> str:
+    """Format todos response as concise markdown."""
+    parts = []
+    current = data.get("current")
+    if current and isinstance(current, dict):
+        todos = current.get("todos", [])
+        if todos:
+            done = sum(1 for t in todos if t.get("status") == "completed")
+            parts.append(f"**Current Phase** ({done}/{len(todos)} complete):\n")
+            for t in todos[:20]:
+                icon = "x" if t.get("status") == "completed" else " "
+                parts.append(f"- [{icon}] {t.get('title', t.get('subject', 'untitled'))}")
+        else:
+            parts.append("No current todos.")
+    else:
+        parts.append("No current todos.")
+
+    archives = data.get("archives", [])
+    if archives:
+        parts.append(f"\n**Archived phases:** {len(archives)}")
+    return "\n".join(parts)
+
+
+def _format_progress(progress: dict) -> str:
+    """Format progress data as markdown."""
+    parts = [f"**Progress for job {str(progress.get('job_id', ''))[:8]}…**"]
+    if progress.get("phase"):
+        parts.append(f"- **Phase:** {progress['phase']}")
+    if progress.get("phase_number") is not None:
+        parts.append(f"- **Phase #:** {progress['phase_number']}")
+    if progress.get("todos_completed") is not None and progress.get("todos_total") is not None:
+        parts.append(f"- **Todos:** {progress['todos_completed']}/{progress['todos_total']}")
+    if progress.get("status"):
+        parts.append(f"- **Status:** {progress['status']}")
+    return "\n".join(parts)
+
+
+async def _execute_server_tool(tool_name: str, args: dict) -> tuple[str, str | None]:
+    """Execute a server-side builder tool and return (result, full_content).
+
+    Returns a tuple of (result_text, full_content).
+    full_content is the untruncated result for inspection tools, None for others.
+    """
     if tool_name == "web_search":
-        return await tavily_search(
+        result = await tavily_search(
             query=args.get("query", ""),
             max_results=args.get("max_results", 5),
         )
-    return f"Error: Unknown server tool: {tool_name}"
+        return result, None
+
+    # Job inspection/action tools — dispatch via loopback HTTP
+    client = _get_loopback_client()
+
+    try:
+        if tool_name == "list_jobs":
+            params: dict = {"limit": args.get("limit", 10)}
+            if args.get("status"):
+                params["status"] = args["status"]
+            resp = await client.get("/api/jobs", params=params)
+            resp.raise_for_status()
+            formatted = _format_jobs_for_builder(resp.json())
+            return formatted, formatted
+
+        elif tool_name == "get_job":
+            resp = await client.get(f"/api/jobs/{args['job_id']}")
+            resp.raise_for_status()
+            formatted = _format_job_detail(resp.json())
+            return formatted, formatted
+
+        elif tool_name == "get_job_progress":
+            resp = await client.get(f"/api/jobs/{args['job_id']}/progress")
+            resp.raise_for_status()
+            formatted = _format_progress(resp.json())
+            return formatted, formatted
+
+        elif tool_name == "get_workspace_file":
+            resp = await client.get(
+                f"/api/jobs/{args['job_id']}/workspace/{args['path']}"
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            formatted = _format_workspace_file(data["path"], data["content"])
+            return formatted, formatted
+
+        elif tool_name == "get_workspace_overview":
+            resp = await client.get(f"/api/jobs/{args['job_id']}/workspace")
+            resp.raise_for_status()
+            data = resp.json()
+            parts = [f"**Workspace overview for {str(args['job_id'])[:8]}…**\n"]
+            if data.get("files"):
+                parts.append("**Files:** " + ", ".join(data["files"][:20]))
+            if data.get("workspace_md"):
+                parts.append(f"\n**workspace.md** (excerpt):\n{data['workspace_md'][:1500]}")
+            if data.get("plan_md"):
+                parts.append(f"\n**plan.md** (excerpt):\n{data['plan_md'][:1500]}")
+            if data.get("current_todos"):
+                done = sum(1 for t in data["current_todos"] if t.get("status") == "completed")
+                parts.append(f"\n**Todos:** {done}/{len(data['current_todos'])} complete")
+            formatted = "\n".join(parts)
+            return formatted, formatted
+
+        elif tool_name == "get_frozen_job":
+            resp = await client.get(f"/api/jobs/{args['job_id']}/frozen")
+            resp.raise_for_status()
+            data = resp.json()
+            parts = [f"**Frozen job data for {str(args['job_id'])[:8]}…**"]
+            if data.get("summary"):
+                parts.append(f"\n**Summary:** {data['summary']}")
+            if data.get("deliverables"):
+                parts.append(f"\n**Deliverables:** {json.dumps(data['deliverables'], indent=2)[:2000]}")
+            if data.get("confidence"):
+                parts.append(f"\n**Confidence:** {data['confidence']}")
+            if data.get("notes"):
+                parts.append(f"\n**Notes:** {data['notes'][:500]}")
+            formatted = "\n".join(parts)
+            return formatted, formatted
+
+        elif tool_name == "get_todos":
+            resp = await client.get(f"/api/jobs/{args['job_id']}/todos")
+            resp.raise_for_status()
+            formatted = _format_todos(resp.json())
+            return formatted, formatted
+
+        elif tool_name == "get_chat_history":
+            params = {
+                "page": args.get("page", -1),
+                "pageSize": args.get("page_size", 10),
+            }
+            resp = await client.get(f"/api/jobs/{args['job_id']}/chat", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            entries = data.get("entries", [])
+            if not entries:
+                formatted = "No chat history available."
+            else:
+                parts = [f"**Chat history** (page {data.get('page')}/{data.get('total', '?')} entries):\n"]
+                for entry in entries[:10]:
+                    role = entry.get("role", "?")
+                    content = str(entry.get("content", ""))[:300]
+                    parts.append(f"**[{role}]** {content}\n")
+                formatted = "\n".join(parts)
+            return formatted, formatted
+
+        elif tool_name == "approve_job":
+            resp = await client.post(f"/api/jobs/{args['job_id']}/approve")
+            resp.raise_for_status()
+            return f"Job {args['job_id'][:8]}… approved successfully.", None
+
+        elif tool_name == "resume_job_with_feedback":
+            body: dict = {}
+            if args.get("feedback"):
+                body["feedback"] = args["feedback"]
+            resp = await client.post(f"/api/jobs/{args['job_id']}/resume", json=body)
+            resp.raise_for_status()
+            return f"Job {args['job_id'][:8]}… resumed." + (f" Feedback: {args['feedback'][:100]}" if args.get("feedback") else ""), None
+
+        elif tool_name == "create_follow_up_job":
+            body = {
+                "description": args["description"],
+                "config_name": args.get("config_name", "default"),
+            }
+            if args.get("instructions"):
+                body["instructions"] = args["instructions"]
+            resp = await client.post("/api/jobs", json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            return f"Created job **{data.get('id', '')}** (status: {data.get('status', 'created')})", None
+
+    except httpx.HTTPStatusError as e:
+        error_detail = e.response.text[:200] if e.response else str(e)
+        return f"Error ({e.response.status_code}): {error_detail}", None
+    except Exception as e:
+        return f"Error: {str(e)[:200]}", None
+
+    return f"Error: Unknown server tool: {tool_name}", None
 
 
-async def _stream_openai(
+# =============================================================================
+# Responses API support (GPT-5.2 Pro and future models)
+# =============================================================================
+
+RESPONSES_API_MODELS = {"gpt-5.2-pro"}
+
+
+def _detect_provider(model: str) -> str:
+    """Detect LLM provider from model name."""
+    if model.startswith("claude-"):
+        return "anthropic"
+    return "openai"
+
+
+def _get_api_key_for_provider(provider: str) -> str | None:
+    """Get API key for the given provider, with explicit override support."""
+    explicit = os.getenv("BUILDER_API_KEY")
+    if explicit:
+        return explicit
+    if provider == "anthropic":
+        return os.getenv("ANTHROPIC_API_KEY")
+    return os.getenv("OPENAI_API_KEY")
+
+
+def _chat_messages_to_responses_input(
+    messages: list[dict],
+) -> list[dict]:
+    """Convert Chat Completions format messages to Responses API input items.
+
+    - {role: user, content: ...} → kept as-is
+    - {role: assistant, content: ..., tool_calls: [...]} → text item + function_call items
+    - {role: tool, tool_call_id: ..., content: ...} → function_call_output items
+    - {role: system, ...} → skipped (goes to `instructions` param)
+    """
+    items: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "system":
+            continue
+        elif role == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                items.append({"role": "user", "content": content})
+            elif isinstance(content, list):
+                # Anthropic-style tool_result blocks from multi-turn — skip for Responses API
+                # These are handled separately
+                items.append({"role": "user", "content": str(content)})
+        elif role == "assistant":
+            content = msg.get("content")
+            if content:
+                items.append({"type": "message", "role": "assistant", "content": content})
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                items.append({
+                    "type": "function_call",
+                    "call_id": tc.get("id", ""),
+                    "name": func.get("name", ""),
+                    "arguments": func.get("arguments", "{}"),
+                })
+        elif role == "tool":
+            items.append({
+                "type": "function_call_output",
+                "call_id": msg.get("tool_call_id", ""),
+                "output": msg.get("content", ""),
+            })
+    return items
+
+
+async def _stream_openai_responses(
     system_prompt: str,
-    context_messages: list[dict],
+    input_items: list[dict],
     model: str,
+    api_key: str | None = None,
 ):
-    """Stream from OpenAI-compatible API, yielding structured events.
+    """Stream from OpenAI Responses API, yielding structured events.
+
+    Uses client.responses.create() instead of chat.completions.create().
+    System prompt goes in `instructions` parameter.
 
     Yields tuples of (event_type, event_data):
     - ("token", {"text": str})
@@ -2921,7 +3216,100 @@ async def _stream_openai(
         return
 
     client = AsyncOpenAI(
-        api_key=get_builder_api_key(),
+        api_key=api_key or get_builder_api_key(),
+        base_url=get_builder_base_url(),
+    )
+
+    # Convert BUILDER_TOOLS to Responses API function tool format
+    response_tools = []
+    for tool in BUILDER_TOOLS:
+        func = tool["function"]
+        response_tools.append({
+            "type": "function",
+            "name": func["name"],
+            "description": func["description"],
+            "parameters": func["parameters"],
+        })
+
+    try:
+        stream = await client.responses.create(
+            model=model,
+            instructions=system_prompt,
+            input=input_items,
+            tools=response_tools,
+            reasoning={"effort": "high"},
+            stream=True,
+        )
+
+        # Track function call assembly
+        function_calls: dict[str, dict] = {}  # call_id -> {name, arguments}
+
+        async for event in stream:
+            event_type = event.type
+
+            # Text deltas
+            if event_type == "response.output_text.delta":
+                yield ("token", {"text": event.delta})
+
+            # Function call starts — capture name
+            elif event_type == "response.output_item.added":
+                item = event.item
+                if hasattr(item, "type") and item.type == "function_call":
+                    call_id = getattr(item, "call_id", "") or ""
+                    name = getattr(item, "name", "") or ""
+                    function_calls[call_id] = {"name": name, "arguments": ""}
+
+            # Function call argument deltas
+            elif event_type == "response.function_call_arguments.delta":
+                call_id = getattr(event, "call_id", "") or getattr(event, "item_id", "")
+                if call_id in function_calls:
+                    function_calls[call_id]["arguments"] += event.delta
+
+            # Function call done
+            elif event_type == "response.function_call_arguments.done":
+                call_id = getattr(event, "call_id", "") or getattr(event, "item_id", "")
+                if call_id in function_calls:
+                    tc = function_calls[call_id]
+                    try:
+                        args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                        yield ("tool_call", {"name": tc["name"], "args": args, "id": call_id})
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to parse Responses API tool args: {tc['arguments'][:100]}")
+
+            # Output item done — emit function calls if not already emitted
+            elif event_type == "response.output_item.done":
+                item = event.item
+                if hasattr(item, "type") and item.type == "function_call":
+                    call_id = getattr(item, "call_id", "") or ""
+                    if call_id in function_calls:
+                        # Already emitted via arguments.done
+                        pass
+
+    except Exception as e:
+        yield ("error", {"message": str(e)})
+
+
+async def _stream_openai(
+    system_prompt: str,
+    context_messages: list[dict],
+    model: str,
+    api_key: str | None = None,
+):
+    """Stream from OpenAI Chat Completions API, yielding structured events.
+
+    Yields tuples of (event_type, event_data):
+    - ("token", {"text": str})
+    - ("tool_call", {"name": str, "args": dict, "id": str})
+    - ("error", {"message": str})
+    """
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        yield ("error", {"message": "openai package not installed"})
+        return
+
+    client = AsyncOpenAI(
+        api_key=api_key or get_builder_api_key(),
         base_url=get_builder_base_url(),
     )
 
@@ -2977,6 +3365,7 @@ async def _stream_anthropic(
     system_prompt: str,
     context_messages: list[dict],
     model: str,
+    api_key: str | None = None,
 ):
     """Stream from Anthropic API, yielding structured events.
 
@@ -2991,7 +3380,7 @@ async def _stream_anthropic(
         yield ("error", {"message": "anthropic package not installed"})
         return
 
-    client = AsyncAnthropic(api_key=get_builder_api_key())
+    client = AsyncAnthropic(api_key=api_key or get_builder_api_key())
 
     # Convert OpenAI tool format to Anthropic format
     anthropic_tools = []
