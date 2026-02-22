@@ -25,13 +25,14 @@ CitationEngine is a [separate repository](https://github.com/Knaeckebrothero/Cit
 ### Database Management
 ```bash
 # Start databases (development) — see docker-compose.dev.yaml for all services
+# NOTE: This project uses Podman, not Docker
 podman-compose -f docker-compose.dev.yaml up -d
 
 # Start only databases
-podman-compose -f docker-compose.dev.yaml up -d postgres mongodb
+podman-compose -f docker-compose.dev.yaml up -d postgres mongodb neo4j
 
 # Start databases + MCP for Claude Code
-podman-compose -f docker-compose.dev.yaml up -d postgres mongodb mcp
+podman-compose -f docker-compose.dev.yaml up -d postgres mongodb neo4j mcp
 
 # Initialize everything (databases + workspace) - RECOMMENDED
 python init.py
@@ -276,19 +277,9 @@ claude_code:
 
 On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
 
-Tool categories in config:
-- `workspace`: File operations (read_file, write_file, list_files, etc.)
-- `core`: Task management + completion (next_phase_todos, todo_complete, todo_rewind, mark_complete, job_complete)
-- `document`: Document processing (chunk_document)
-- `research`: Web search, academic papers, browser automation (web_search, extract_webpage, crawl_website, map_website, search_papers, download_paper, get_paper_info, browse_website, download_from_website, research_topic)
-- `citation`: Citation & literature management (cite_document, cite_web, list_sources, get_citation, list_citations, edit_citation, annotate_source, get_annotations, tag_source, search_library, generate_bibliography)
-- `graph`: Neo4j operations (execute_cypher_query, get_database_schema) — injected by orchestrator when Neo4j datasource attached
-- `sql`: PostgreSQL operations (sql_query, sql_schema, sql_execute) — injected by orchestrator when PostgreSQL datasource attached
-- `mongodb`: MongoDB operations (mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update) — injected by orchestrator when MongoDB datasource attached
-- `git`: Workspace version control (git_log, git_show, git_diff, git_status, git_tags)
-- `coding`: Shell execution + Claude Code delegation (run_command, claude_code)
+Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML.
 
-**Phase-specific tool filtering**: Tools declare their phase availability via `phases` metadata in `TOOL_REGISTRY` (`src/tools/registry.py`). Each tool entry specifies `phases: ["strategic", "tactical"]` or a subset. `filter_tools_by_phase()` removes tools not available in the current phase before binding to the LLM. `job_complete` is strategic-only; tactical phases cannot signal job completion directly.
+**Phase-specific tool filtering**: Tools declare phase availability via `phases` in `TOOL_REGISTRY` (`src/tools/registry.py`). `filter_tools_by_phase()` removes unavailable tools before binding to the LLM. `job_complete` is strategic-only.
 
 ### Multi-Database Architecture
 
@@ -350,52 +341,23 @@ Long-term memory lives in files, not in LLM context:
 
 This separation means workspace.md survives context compaction while the conversation history gets summarized.
 
-## Key Source Directories
+### Memory Light (Opt-in Recall System)
 
-- `init.py` - Root initialization script (orchestrates all components)
-- `src/graph.py` - LangGraph state machine (phase alternation graph)
+When `memory.enabled: true` in config, agents get a PostgreSQL-backed memory system (pgvector hybrid search) that stores and retrieves insights across context compactions. Memories are extracted from 5 channels (observer, todo completion, compaction, phase archive, tool errors) and injected as transient messages like workspace.md. Disabled by default. See `docs/features/memory_light.md` for full design and config keys.
+
+## Key Entry Points
+
+- `init.py` - Root initialization script (orchestrates database + workspace setup)
+- `agent.py` - CLI entry point (delegates to `src/agent.py`)
+- `src/graph.py` - LangGraph state machine (phase alternation graph, the core loop)
 - `src/agent.py` - UniversalAgent main class
-- `src/init.py` - Agent workspace initialization
-- `src/core/` - State management, workspace, context, phase transitions
-  - `state.py` - UniversalAgentState TypedDict
-  - `workspace.py` - WorkspaceManager for job directories
-  - `loader.py` - Config loading, LLM creation, tool registry, matrix resolvers (`FileResolver`, `MatrixResolver`, `PromptMatrixResolver`, `InstructionMatrixResolver`), resolved config serialization
-  - `context.py` - ContextManager for token counting/compaction (three-layer safety)
-  - `phase.py` - Phase transition logic (strategic ↔ tactical)
-  - `phase_snapshot.py` - Phase boundary snapshots for recovery
-  - `workspace_injection.py` - Transient workspace.md injection into LLM calls
-  - `archiver.py` - MongoDB audit trail logging
-- `src/managers/` - TodoManager, MemoryManager, PlanManager, GitManager
-- `src/services/` - Helper services
-  - `vision_helper.py` - VisionHelper for image/document descriptions
-  - `document_renderer.py` - DocumentRenderer for PDF/PPTX/DOCX to PNG
-  - `description_cache.py` - DescriptionCache for caching vision outputs
-- `src/llm/` - LLM wrappers
-  - `reasoning_chat.py` - ReasoningChatOpenAI: captures `reasoning_content` from DeepSeek R1-style models, Layer 0 context overflow protection
-  - `key_ring.py` - KeyRing: tiered API key fallback with cooldown-based rotation
-- `src/tools/` - Tool implementations and registry
-  - `registry.py` - Tool metadata registry with phase filtering
-  - `context.py` - ToolContext dependency injection
-  - `description_manager.py` - Auto-generates per-tool markdown docs into `workspace/job_<id>/tools/`
-- `src/tools/graph/` - Neo4j datasource tools (execute_cypher_query, get_database_schema)
-- `src/tools/sql/` - PostgreSQL datasource tools (sql_query, sql_schema, sql_execute)
-- `src/tools/mongodb/` - MongoDB datasource tools (mongo_query, mongo_aggregate, etc.)
-- `src/tools/coding/claude_code.py` - Claude Code delegation tool
-- `src/database/` - PostgreSQL (asyncpg), Neo4j, MongoDB managers
-  - `postgres_db.py` - Async PostgreSQL with namespaces
-  - `neo4j_db.py` - Neo4j graph client (used via datasource connector)
-  - `mongo_db.py` - MongoDB audit trail client
-  - `schema.sql` - PostgreSQL schema
-- `src/api/` - FastAPI application (agent API)
-- `config/` - Configuration files, defaults, schema, and prompt templates
-- `orchestrator/` - Backend API for monitoring and agent orchestration
-  - `orchestrator/init.py` - Database initialization (PostgreSQL, MongoDB)
-  - `orchestrator/main.py` - FastAPI endpoints (includes agent registration/heartbeat with 3-min stale timeout)
-  - `orchestrator/database/` - Database layer (postgres.py, mongodb.py, schema.sql)
-  - `orchestrator/services/` - Services (workspace)
-  - `orchestrator/mcp/` - MCP server for Claude Code integration
-- `cockpit/` - Angular frontend for debugging and job management
-- [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) - Citation & literature management with hybrid search (separate repo, installed via git URL)
+- `src/core/loader.py` - Config loading, LLM creation, matrix resolvers, resolved config serialization
+- `src/core/context.py` - ContextManager (token counting, compaction, three-layer safety)
+- `src/tools/registry.py` - Tool metadata registry with phase filtering
+- `orchestrator/main.py` - FastAPI orchestrator endpoints (job management, agent heartbeat)
+- `orchestrator/mcp/` - MCP server for Claude Code integration
+
+**Directory layout:** `src/core/` (state, workspace, context, phase transitions), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP), `cockpit/` (Angular frontend), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
 
 ### Vision Services
 
@@ -502,18 +464,4 @@ python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid> --audit   # F
 ```
 
 **Orchestrator MCP Server** (for Claude Code integration):
-The project includes `.mcp.json` for MCP server configuration. The MCP server runs on port 8055 (HTTP transport) as a separate container (`srw-mcp`) and proxies to the orchestrator API on 8085. Health check: `http://localhost:8055/health`.
-
-The server exposes 43 tools in 7 categories:
-
-| Category | Tools |
-|----------|-------|
-| Debug & Inspection | `list_jobs`, `get_job`, `get_audit_trail`, `get_chat_history`, `get_todos`, `get_graph_changes`, `get_llm_request`, `search_audit` |
-| Actions & Operations | `approve_job`, `resume_job_with_feedback`, `cancel_job`, `create_job`, `delete_job`, `assign_job`, `test_datasource` |
-| Git History | `list_job_commits`, `get_job_diff`, `get_job_file`, `list_job_files`, `list_job_tags` |
-| Workspace & Job Context | `get_frozen_job`, `get_workspace_file`, `get_workspace_overview`, `get_job_progress`, `get_job_requirements` |
-| System Monitoring | `get_job_stats`, `get_agent_stats`, `get_stuck_jobs`, `list_agents`, `list_experts`, `get_expert`, `list_datasources` |
-| Database Inspection | `list_tables`, `query_table`, `get_table_schema` |
-| Citation & Source Library | `list_job_sources`, `get_source_detail`, `list_job_citations`, `get_citation_detail`, `search_job_sources`, `get_source_annotations`, `get_source_tags`, `get_citation_stats` |
-
-The MCP server is located at `orchestrator/mcp/`.
+The project includes `.mcp.json` for MCP server configuration. The MCP server runs on port 8055 (HTTP transport) as a separate container (`srw-mcp`) and proxies to the orchestrator API on 8085. Health check: `http://localhost:8055/health`. See `orchestrator/mcp/` for the full tool listing (debug, actions, git history, workspace, monitoring, database inspection, citations).

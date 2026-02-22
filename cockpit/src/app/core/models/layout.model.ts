@@ -29,7 +29,8 @@ export type ComponentType =
   | 'datasource-list'
   | 'job-review'
   | 'workspace-browser'
-  | 'instruction-builder';
+  | 'instruction-builder'
+  | 'project-list';
 
 /**
  * Layout configuration for the tiling system.

@@ -5,6 +5,11 @@
 -- Run with: python src/scripts/app_init.py --force-reset
 --
 -- Tables:
+--   users             - User identity (no auth, just display names)
+--   sessions          - Session-based authentication
+--   projects          - Resource hubs grouping jobs, repos, datasources, members
+--   project_members   - User-project membership with roles (owner, editor, viewer)
+--   project_repositories - Repositories linked to projects (jobs, source, reference)
 --   jobs              - Job tracking and orchestration
 --   agents            - Registered agent pods for orchestration
 --   requirements      - Primary storage for extracted requirements
@@ -18,6 +23,7 @@
 --   schema_migrations - Schema versioning for CitationEngine
 --   builder_sessions  - Instruction builder chat sessions
 --   builder_messages  - Messages within builder sessions
+--   memories          - Agent memory storage with hybrid search (RecallStore)
 --
 -- Note: LLM logging is handled by MongoDB (llm_archiver.py).
 -- Note: Agent checkpointing is handled by LangGraph's AsyncPostgresSaver.
@@ -28,6 +34,116 @@
 -- ============================================================================
 
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ============================================================================
+-- 0. USERS TABLE
+-- Minimal user identity (no auth, just "pick who you are" from a dropdown).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    display_name TEXT NOT NULL,
+    avatar_color VARCHAR(7) DEFAULT '#89b4fa',
+    email TEXT UNIQUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Migration: Add email column to existing databases
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN email TEXT UNIQUE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- ============================================================================
+-- 0b. SESSIONS TABLE
+-- Session-based authentication for the cockpit.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_key TEXT PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    last_activity TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    csrf_token TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- ============================================================================
+-- 0c. PROJECTS TABLE
+-- Resource hub grouping jobs, repositories, datasources, and members.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS projects (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name TEXT NOT NULL,
+    description TEXT,
+    goal TEXT,
+    status VARCHAR(50) DEFAULT 'active',
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    default_config_name VARCHAR(100),
+    default_config_override JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_project_status CHECK (status IN ('active', 'paused', 'completed', 'archived'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
+
+-- ============================================================================
+-- 0d. PROJECT MEMBERS TABLE
+-- Maps users to projects with roles (owner, editor, viewer).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS project_members (
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(50) NOT NULL DEFAULT 'editor',
+    added_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (project_id, user_id),
+
+    CONSTRAINT valid_member_role CHECK (role IN ('owner', 'editor', 'viewer'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id);
+
+-- ============================================================================
+-- 0e. PROJECT REPOSITORIES TABLE
+-- Repositories linked to a project (jobs, source, reference).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS project_repositories (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT,
+    repo_url TEXT NOT NULL,
+    credentials JSONB DEFAULT '{}',
+    role VARCHAR(50) NOT NULL DEFAULT 'source',
+    read_only BOOLEAN NOT NULL DEFAULT FALSE,
+    is_managed BOOLEAN NOT NULL DEFAULT FALSE,
+    branch TEXT DEFAULT 'main',
+    clone_path TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_repo_role CHECK (role IN ('jobs', 'source', 'reference')),
+    CONSTRAINT chk_reference_read_only CHECK (role != 'reference' OR read_only = TRUE)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_repos_project ON project_repositories(project_id);
+
+-- Exactly one jobs repo per project
+CREATE UNIQUE INDEX IF NOT EXISTS uq_project_jobs_repo ON project_repositories(project_id) WHERE role = 'jobs';
+
+-- Migration: Add default_project_id to users table
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN default_project_id UUID REFERENCES projects(id);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
 
 -- ============================================================================
 -- 1. JOBS TABLE
@@ -81,6 +197,38 @@ CREATE INDEX IF NOT EXISTS idx_jobs_assigned_agent ON jobs(assigned_agent_id);
 -- Migration: Add resolved_config column to existing databases
 DO $$ BEGIN
     ALTER TABLE jobs ADD COLUMN resolved_config JSONB DEFAULT NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Add user_id FK to jobs table
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_jobs_user_id ON jobs(user_id);
+
+-- Migration: Add project_id FK to jobs table (nullable for existing jobs)
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN project_id UUID REFERENCES projects(id);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_jobs_project_id ON jobs(project_id);
+
+-- Migration: Add branch_name to jobs table
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN branch_name VARCHAR(200);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Add merge_status to jobs table
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN merge_status VARCHAR(50);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Add repo_merge_statuses to jobs table
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN repo_merge_statuses JSONB DEFAULT '{}';
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
@@ -430,10 +578,21 @@ CREATE TABLE IF NOT EXISTS datasources (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- One datasource of each type per job (or per global scope).
--- COALESCE maps NULL job_ids to a sentinel UUID so uniqueness works across globals.
-CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_type_job
-    ON datasources (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'));
+-- Migration: Add project_id to datasources table
+DO $$ BEGIN
+    ALTER TABLE datasources ADD COLUMN project_id UUID REFERENCES projects(id);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_datasources_project_id ON datasources(project_id);
+
+-- Three-level scope uniqueness: one datasource of each type per (job, project, global).
+-- Drop old index if it exists, then create the new scope-aware one.
+DROP INDEX IF EXISTS uq_datasource_type_job;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_datasource_type_scope ON datasources (
+    type,
+    COALESCE(job_id, '00000000-0000-0000-0000-000000000000'),
+    COALESCE(project_id, '00000000-0000-0000-0000-000000000000')
+);
 
 CREATE INDEX IF NOT EXISTS idx_datasources_type ON datasources(type);
 CREATE INDEX IF NOT EXISTS idx_datasources_job_id ON datasources(job_id);
@@ -454,6 +613,13 @@ CREATE TABLE IF NOT EXISTS builder_sessions (
 );
 -- No FK on job_id: the job may not exist yet (lazy linking after submission)
 
+-- Migration: Add user_id FK to builder_sessions table
+DO $$ BEGIN
+    ALTER TABLE builder_sessions ADD COLUMN user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_builder_sessions_user_id ON builder_sessions(user_id);
+
 -- Chat messages within a builder session
 CREATE TABLE IF NOT EXISTS builder_messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -468,7 +634,100 @@ CREATE TABLE IF NOT EXISTS builder_messages (
 CREATE INDEX IF NOT EXISTS idx_builder_messages_session ON builder_messages(session_id, created_at);
 
 -- ============================================================================
--- 7. HELPER FUNCTIONS
+-- 7. MEMORIES TABLE (Memory Light — RecallStore)
+-- Agent memory storage with hybrid search (dense vector + sparse keyword + recency).
+-- See docs/features/memory_light.md for full architecture.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS memories (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    agent_id VARCHAR(100),
+
+    -- Content
+    content TEXT NOT NULL,
+    summary VARCHAR(500),
+
+    -- Classification
+    memory_type VARCHAR(50) DEFAULT 'factual',
+    source VARCHAR(50) DEFAULT 'observer',
+
+    -- Search channels
+    keywords TEXT[] DEFAULT '{}',
+    embedding vector(1536),
+    sparse_keywords TSVECTOR,
+
+    -- Scoring
+    importance FLOAT DEFAULT 0.5,
+
+    -- Provenance
+    source_turn_start INT,
+    source_turn_end INT,
+    source_phase INT,
+
+    -- Budget tracking
+    token_count INT DEFAULT 0,
+    access_count INT DEFAULT 0,
+
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_accessed TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_memory_type CHECK (memory_type IN ('factual', 'procedural', 'error_solution', 'vocabulary', 'relational')),
+    CONSTRAINT valid_memory_source CHECK (source IN ('observer', 'todo', 'compaction', 'phase_archive', 'tool_error'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_job ON memories(job_id);
+CREATE INDEX IF NOT EXISTS idx_memories_job_importance ON memories(job_id, importance DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_job_accessed ON memories(job_id, last_accessed DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_job_type ON memories(job_id, memory_type);
+CREATE INDEX IF NOT EXISTS idx_memories_keywords ON memories USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_memories_sparse ON memories USING GIN(sparse_keywords);
+CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+
+-- Hybrid search function: RRF-based fusion of dense, sparse, and recency channels
+CREATE OR REPLACE FUNCTION memory_hybrid_search(
+    query_text text,
+    query_embedding vector(1536),
+    job_id_param uuid,
+    match_count int DEFAULT 10,
+    dense_weight float DEFAULT 0.6,
+    sparse_weight float DEFAULT 0.3,
+    recency_weight float DEFAULT 0.1,
+    rrf_k int DEFAULT 50
+) RETURNS SETOF memories LANGUAGE sql AS $$
+WITH dense AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
+    FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+sparse AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    FROM memories WHERE job_id = job_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text)
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+recent AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
+    FROM memories WHERE job_id = job_id_param
+    ORDER BY rank_ix LIMIT match_count
+)
+SELECT memories.* FROM (
+    SELECT COALESCE(d.id, s.id, r.id) AS mid,
+        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
+        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
+        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+    FROM dense d
+    FULL OUTER JOIN sparse s ON d.id = s.id
+    FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
+) ranked
+JOIN memories ON ranked.mid = memories.id
+ORDER BY ranked.rrf_score DESC
+LIMIT match_count
+$$;
+
+-- ============================================================================
+-- 8. HELPER FUNCTIONS
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -480,7 +739,7 @@ END;
 $$ language 'plpgsql';
 
 -- ============================================================================
--- 8. TRIGGERS
+-- 9. TRIGGERS
 -- ============================================================================
 
 DROP TRIGGER IF EXISTS update_jobs_updated_at ON jobs;
@@ -503,10 +762,22 @@ CREATE TRIGGER update_builder_sessions_updated_at
     BEFORE UPDATE ON builder_sessions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_projects_updated_at ON projects;
+CREATE TRIGGER update_projects_updated_at
+    BEFORE UPDATE ON projects
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_project_repositories_updated_at ON project_repositories;
+CREATE TRIGGER update_project_repositories_updated_at
+    BEFORE UPDATE ON project_repositories
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
 -- ============================================================================
--- 9. VIEWS
+-- 10. VIEWS
 -- ============================================================================
 
+-- Drop and recreate: adding project columns requires view recreation
+DROP VIEW IF EXISTS job_summary;
 CREATE OR REPLACE VIEW job_summary AS
 SELECT
     j.id,
@@ -515,6 +786,10 @@ SELECT
     j.validator_status,
     j.config_name,
     j.assigned_agent_id,
+    j.user_id,
+    j.project_id,
+    j.branch_name,
+    j.merge_status,
     j.created_at,
     j.completed_at,
     COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,

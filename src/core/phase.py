@@ -822,6 +822,8 @@ def _complete_phase_with_git(
         logger.debug(f"Committed phase completion: {commit_msg}")
 
         # Push to remote for workspace delivery
+        branch = git_mgr.current_branch()
+        logger.debug(f"Pushing phase completion to branch: {branch}")
         git_mgr.push()
 
     except Exception as e:

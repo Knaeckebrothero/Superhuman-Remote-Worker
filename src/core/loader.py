@@ -591,6 +591,30 @@ class PhaseSettings:
 
 
 @dataclass
+class MemoryConfig:
+    """Memory Light (RecallStore) configuration.
+
+    Controls the memory subsystem that stores and retrieves memories
+    from PostgreSQL with hybrid search (dense vector + sparse keyword + recency).
+    See docs/features/memory_light.md for full architecture.
+    """
+
+    enabled: bool = False
+    budget_tokens: int = 5000
+    max_memories_per_injection: int = 10
+    observer_interval: int = 5
+    observer_model: Optional[str] = None
+    observer_base_url: Optional[str] = None
+    embedding_model: str = "text-embedding-3-small"
+    dense_results: int = 5
+    sparse_results: int = 5
+    recent_results: int = 3
+    importance_threshold: float = 0.3
+    dedup_threshold: float = 0.92
+    storage: str = "postgres"
+
+
+@dataclass
 class AgentConfig:
     """Complete agent configuration.
 
@@ -609,6 +633,7 @@ class AgentConfig:
         default_factory=ContextManagementConfig
     )
     phase_settings: PhaseSettings = field(default_factory=PhaseSettings)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     instruction_files: List[InstructionFileEntry] = field(default_factory=list)
     autonomy: str = "partial"
 
@@ -676,6 +701,32 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         strategic=_parse_phase_override(llm_data.get("strategic")),
         tactical=_parse_phase_override(llm_data.get("tactical")),
         summarization=_parse_phase_override(llm_data.get("summarization")),
+    )
+
+
+def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
+    """Parse memory configuration from dict.
+
+    Args:
+        data: Memory config dictionary from YAML
+
+    Returns:
+        MemoryConfig dataclass
+    """
+    return MemoryConfig(
+        enabled=data.get("enabled", False),
+        budget_tokens=data.get("budget_tokens", 5000),
+        max_memories_per_injection=data.get("max_memories_per_injection", 10),
+        observer_interval=data.get("observer_interval", 5),
+        observer_model=data.get("observer_model"),
+        observer_base_url=data.get("observer_base_url"),
+        embedding_model=data.get("embedding_model", "text-embedding-3-small"),
+        dense_results=data.get("dense_results", 5),
+        sparse_results=data.get("sparse_results", 5),
+        recent_results=data.get("recent_results", 3),
+        importance_threshold=data.get("importance_threshold", 0.3),
+        dedup_threshold=data.get("dedup_threshold", 0.92),
+        storage=data.get("storage", "postgres"),
     )
 
 
@@ -801,6 +852,9 @@ def load_agent_config(
         max_todos=phase_data.get("max_todos", 20),
     )
 
+    memory_data = data.get("memory", {})
+    memory_config = _parse_memory_config(memory_data)
+
     # Parse instruction_files entries
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
@@ -822,7 +876,7 @@ def load_agent_config(
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "instruction_files", "autonomy"
+        "phase_settings", "memory", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -837,6 +891,7 @@ def load_agent_config(
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,
+        memory=memory_config,
         instruction_files=instruction_files,
         autonomy=autonomy,
         extra=extra,
@@ -936,6 +991,9 @@ def load_agent_config_from_dict(
         max_todos=phase_data.get("max_todos", 20),
     )
 
+    memory_data = data.get("memory", {})
+    memory_config = _parse_memory_config(memory_data)
+
     # Parse instruction_files entries
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
@@ -957,7 +1015,7 @@ def load_agent_config_from_dict(
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "instruction_files", "autonomy"
+        "phase_settings", "memory", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -972,6 +1030,7 @@ def load_agent_config_from_dict(
         limits=limits_config,
         context_management=context_config,
         phase_settings=phase_config,
+        memory=memory_config,
         instruction_files=instruction_files,
         autonomy=autonomy,
         extra=extra,

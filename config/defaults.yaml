@@ -148,6 +148,23 @@ research:
     host: null
     port: null
 
+# Memory Light (RecallStore) — hybrid search memory for cross-context recall
+# See docs/features/memory_light.md for architecture details.
+memory:
+  enabled: false                    # Opt-in per config
+  budget_tokens: 5000              # Max tokens for memory injection per LLM call
+  max_memories_per_injection: 10   # Cap on number of memories injected
+  observer_interval: 5             # Run observer every N turns
+  observer_model: null             # null = use main LLM, or specify model
+  observer_base_url: null          # null = use main LLM_BASE_URL
+  embedding_model: text-embedding-3-small
+  dense_results: 5                 # Top-K for dense vector search
+  sparse_results: 5                # Top-K for sparse/keyword search
+  recent_results: 3                # Number of recent memories to include
+  importance_threshold: 0.3        # Minimum importance to store
+  dedup_threshold: 0.92            # Cosine similarity threshold for dedup
+  storage: postgres                # Only option for v1
+
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent
 autonomy: review

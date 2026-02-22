@@ -102,6 +102,8 @@ export interface JobSummary {
   status: string;
   creator_status?: string;
   validator_status?: string;
+  user_id?: string | null;
+  project_id?: string | null;
   created_at: string;
   audit_count?: number | null;
 }

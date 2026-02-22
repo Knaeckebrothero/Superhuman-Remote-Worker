@@ -287,6 +287,18 @@ class JobStartRequest(BaseModel):
         default=None,
         description="Resolved datasource connection details (set by orchestrator)",
     )
+    repositories: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Project repositories (jobs, source, reference)",
+    )
+    branch_name: Optional[str] = Field(
+        default=None,
+        description="Git branch for job workspace",
+    )
+    project_id: Optional[str] = Field(
+        default=None,
+        description="Project ID for datasource scoping",
+    )
 
     model_config = ConfigDict(
         json_schema_extra={

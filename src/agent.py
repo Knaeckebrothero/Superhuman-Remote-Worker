@@ -804,6 +804,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 structure=self.config.workspace.structure,
                 git_versioning=self.config.workspace.git_versioning,
                 git_remote_url=metadata.get("git_remote_url"),
+                branch_name=metadata.get("branch_name"),
+                repositories=metadata.get("repositories"),
             )
         )
 
@@ -813,8 +815,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info(f"Pod handoff: cloning workspace for job {job_id}")
             git_mgr = GitManager.clone(metadata["git_remote_url"], self._workspace_manager.path)
             if git_mgr:
+                # Checkout the correct branch for project jobs
+                branch = metadata.get("branch_name")
+                if branch:
+                    git_mgr.checkout_branch(branch)
+
                 self._workspace_manager._git_manager = git_mgr
                 self._workspace_manager._initialized = True
+
+                # Clone source/reference repos if project workspace
+                if metadata.get("repositories"):
+                    self._workspace_manager._clone_auxiliary_repos()
+
                 self._todo_manager = TodoManager(workspace=self._workspace_manager)
                 logger.info(f"Pod handoff complete for job {job_id}")
                 return metadata or {}
@@ -840,6 +852,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             if metadata.get("git_remote_url") and self._workspace_manager.git_manager:
                 self._workspace_manager.git_manager.add_remote("origin", metadata["git_remote_url"])
 
+            # Ensure correct branch for project jobs
+            if metadata.get("branch_name") and self._workspace_manager.git_manager:
+                current = self._workspace_manager.git_manager.current_branch()
+                expected = metadata["branch_name"]
+                if current != expected:
+                    self._workspace_manager.git_manager.checkout_branch(expected)
+                    logger.info(f"Switched to expected branch: {expected}")
+
             # Create todo manager for this workspace
             self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
@@ -847,7 +867,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return metadata or {}
 
         # Initialize workspace (creates directories)
-        self._workspace_manager.initialize()
+        if metadata.get("repositories"):
+            self._workspace_manager.initialize_project_workspace()
+        else:
+            self._workspace_manager.initialize()
 
         # Copy instructions to workspace (priority: inline > upload > template)
         if metadata.get("instructions"):
@@ -1236,6 +1259,60 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             _instruction_files=self.config.instruction_files,
         )
         self._tool_context = context
+
+        # Initialize RecallStore for Memory Light (if enabled)
+        if self.config.memory.enabled:
+            try:
+                from src.services.embedding_service import get_embedding_service
+                from src.services.recall_store import RecallStore
+                import uuid as _uuid
+
+                embedding_service = get_embedding_service()
+                recall_store = RecallStore(
+                    db=self.postgres_conn,
+                    embedding_service=embedding_service,
+                    job_id=_uuid.UUID(self._current_job_id),
+                    config=self.config.memory,
+                    agent_id=self.config.agent_id,
+                )
+                context.recall_store = recall_store
+                logger.info(f"RecallStore initialized for job {self._current_job_id}")
+
+                # Initialize MemoryObserver (Phase 3) if recall_store succeeded
+                try:
+                    from src.services.memory_observer import MemoryObserver
+                    from src.core.loader import create_llm, LLMConfig
+
+                    # Create observer LLM (can be a separate model/endpoint)
+                    observer_model = self.config.memory.observer_model
+                    observer_base_url = self.config.memory.observer_base_url
+                    if observer_model:
+                        observer_llm_config = LLMConfig(
+                            model=observer_model,
+                            base_url=observer_base_url,
+                            temperature=0.0,
+                            max_retries=1,
+                        )
+                        observer_llm = create_llm(observer_llm_config)
+                    else:
+                        # Reuse main LLM (strategic phase LLM)
+                        observer_llm = self._strategic_llm
+
+                    observer = MemoryObserver(
+                        recall_store=recall_store,
+                        llm=observer_llm,
+                        observer_interval=self.config.memory.observer_interval,
+                    )
+                    context.memory_observer = observer
+                    logger.info(
+                        f"MemoryObserver initialized (interval={self.config.memory.observer_interval}, "
+                        f"model={observer_model or 'main'})"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize MemoryObserver (non-fatal): {e}")
+
+            except Exception as e:
+                logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
 
         # Load tools from registry
         tool_names = get_all_tool_names(self.config)

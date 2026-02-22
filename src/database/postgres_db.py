@@ -104,14 +104,24 @@ class PostgresDB:
         """Establish async connection pool.
 
         Creates an asyncpg connection pool with configured size and timeout.
+        Registers pgvector type codec on each connection if available.
         This method is idempotent - safe to call multiple times.
         """
         if self._pool is None:
+            async def _init_connection(conn):
+                """Register pgvector type codec on new connections."""
+                try:
+                    from pgvector.asyncpg import register_vector
+                    await register_vector(conn)
+                except ImportError:
+                    pass  # pgvector not installed, skip registration
+
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
                 min_size=self._min_connections,
                 max_size=self._max_connections,
-                command_timeout=self._command_timeout
+                command_timeout=self._command_timeout,
+                init=_init_connection,
             )
             logger.info(
                 f"PostgreSQL connection pool established "
