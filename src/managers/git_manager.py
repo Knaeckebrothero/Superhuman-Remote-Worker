@@ -454,6 +454,62 @@ class GitManager:
             return []
 
     # =========================================================================
+    # Branch Operations
+    # =========================================================================
+
+    def checkout_branch(self, branch_name: str, create: bool = False) -> bool:
+        """Checkout a branch. If create=True and branch doesn't exist, create it.
+
+        Args:
+            branch_name: Branch name to checkout
+            create: If True, create the branch if it doesn't exist
+
+        Returns:
+            True if checkout succeeded, False otherwise
+        """
+        if not self.is_active:
+            return False
+
+        try:
+            if create:
+                # Check if branch exists locally
+                result = self._run_git(["branch", "--list", branch_name])
+                if not result.stdout.strip():
+                    # Check if it exists on remote
+                    result = self._run_git(["branch", "-r", "--list", f"origin/{branch_name}"])
+                    if result.stdout.strip():
+                        # Track remote branch
+                        result = self._run_git(["checkout", "-b", branch_name, f"origin/{branch_name}"])
+                        return result.returncode == 0
+                    else:
+                        # Create new local branch
+                        result = self._run_git(["checkout", "-b", branch_name])
+                        return result.returncode == 0
+
+            # Branch exists locally, just checkout
+            result = self._run_git(["checkout", branch_name])
+            return result.returncode == 0
+
+        except Exception as e:
+            logger.error(f"Failed to checkout branch {branch_name}: {e}")
+            return False
+
+    def current_branch(self) -> str | None:
+        """Get current branch name.
+
+        Returns:
+            Current branch name, or None if not in a git repo
+        """
+        if not self.is_active:
+            return None
+
+        try:
+            result = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+            return result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            return None
+
+    # =========================================================================
     # Remote Operations
     # =========================================================================
 

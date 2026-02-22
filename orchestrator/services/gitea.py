@@ -676,6 +676,273 @@ class GiteaClient:
             logger.warning(f"Failed to list tags for {repo_name}: {e}")
             return None
 
+    # =========================================================================
+    # Branch & PR Operations (Projects support)
+    # =========================================================================
+
+    async def create_branch(
+        self, repo_name: str, new_branch: str, from_branch: str = "main"
+    ) -> bool:
+        """Create a new branch in a repository.
+
+        Args:
+            repo_name: Repository name
+            new_branch: Name for the new branch
+            from_branch: Branch to create from (default: main)
+
+        Returns:
+            True if created (or already exists), False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/branches",
+                json={
+                    "new_branch_name": new_branch,
+                    "old_branch_name": from_branch,
+                },
+            )
+
+            if resp.status_code in (201, 200):
+                logger.info(f"Created branch '{new_branch}' in {repo_name}")
+                return True
+            elif resp.status_code == 409:
+                logger.debug(f"Branch '{new_branch}' already exists in {repo_name}")
+                return True
+            else:
+                logger.warning(
+                    f"Failed to create branch '{new_branch}' in {repo_name} "
+                    f"(status {resp.status_code}): {resp.text[:200]}"
+                )
+                return False
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to create branch '{new_branch}' in {repo_name}: {e}")
+            return False
+
+    async def list_branches(self, repo_name: str) -> list[dict] | None:
+        """List all branches in a repository.
+
+        Args:
+            repo_name: Repository name
+
+        Returns:
+            List of branch dicts with name and commit info, or None on failure.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/branches",
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Failed to list branches for {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return None
+
+            return [
+                {
+                    "name": b["name"],
+                    "sha": b.get("commit", {}).get("id", ""),
+                    "protected": b.get("protected", False),
+                }
+                for b in resp.json()
+            ]
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to list branches for {repo_name}: {e}")
+            return None
+
+    async def delete_branch(self, repo_name: str, branch: str) -> bool:
+        """Delete a branch from a repository.
+
+        Args:
+            repo_name: Repository name
+            branch: Branch name to delete
+
+        Returns:
+            True if deleted (or not found), False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.delete(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/branches/{branch}",
+            )
+            if resp.status_code == 204:
+                logger.info(f"Deleted branch '{branch}' from {repo_name}")
+                return True
+            elif resp.status_code == 404:
+                logger.debug(f"Branch '{branch}' not found in {repo_name}")
+                return True
+            else:
+                logger.warning(
+                    f"Failed to delete branch '{branch}' from {repo_name} "
+                    f"(status {resp.status_code})"
+                )
+                return False
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to delete branch '{branch}' from {repo_name}: {e}")
+            return False
+
+    async def create_pr(
+        self,
+        repo_name: str,
+        title: str,
+        head: str,
+        base: str = "main",
+        body: str = "",
+    ) -> dict | None:
+        """Create a pull request in a repository.
+
+        Args:
+            repo_name: Repository name
+            title: PR title
+            head: Head branch name
+            base: Base branch name (default: main)
+            body: PR description
+
+        Returns:
+            PR dict with number and url fields, or None on failure.
+        """
+        if not self._initialized:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls",
+                json={
+                    "title": title,
+                    "head": head,
+                    "base": base,
+                    "body": body,
+                },
+            )
+
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                logger.info(
+                    f"Created PR #{data.get('number')} in {repo_name}: {title}"
+                )
+                return {
+                    "number": data["number"],
+                    "url": data.get("html_url", ""),
+                    "state": data.get("state", "open"),
+                }
+            else:
+                logger.warning(
+                    f"Failed to create PR in {repo_name} "
+                    f"(status {resp.status_code}): {resp.text[:200]}"
+                )
+                return None
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to create PR in {repo_name}: {e}")
+            return None
+
+    async def merge_pr(
+        self,
+        repo_name: str,
+        pr_index: int,
+        merge_strategy: str = "merge",
+        delete_branch_after_merge: bool = False,
+    ) -> bool:
+        """Merge a pull request.
+
+        Args:
+            repo_name: Repository name
+            pr_index: PR number/index
+            merge_strategy: Merge method — "merge", "rebase", or "squash"
+            delete_branch_after_merge: Delete the head branch after merge
+
+        Returns:
+            True if merged, False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}/pulls/{pr_index}/merge",
+                json={
+                    "Do": merge_strategy,
+                    "delete_branch_after_merge": delete_branch_after_merge,
+                },
+            )
+
+            if resp.status_code in (200, 204):
+                logger.info(
+                    f"Merged PR #{pr_index} in {repo_name} (strategy: {merge_strategy})"
+                )
+                return True
+            else:
+                logger.warning(
+                    f"Failed to merge PR #{pr_index} in {repo_name} "
+                    f"(status {resp.status_code}): {resp.text[:200]}"
+                )
+                return False
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to merge PR #{pr_index} in {repo_name}: {e}")
+            return False
+
+    async def rename_repo(self, old_name: str, new_name: str) -> bool:
+        """Rename a repository.
+
+        Args:
+            old_name: Current repository name
+            new_name: New repository name
+
+        Returns:
+            True if renamed, False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.patch(
+                f"{self._url}/api/v1/repos/{self._user}/{old_name}",
+                json={"name": new_name},
+            )
+
+            if resp.status_code == 200:
+                logger.info(f"Renamed Gitea repo '{old_name}' -> '{new_name}'")
+                return True
+            elif resp.status_code == 404:
+                logger.warning(f"Gitea repo '{old_name}' not found for rename")
+                return False
+            else:
+                logger.warning(
+                    f"Failed to rename Gitea repo '{old_name}' "
+                    f"(status {resp.status_code}): {resp.text[:200]}"
+                )
+                return False
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to rename Gitea repo '{old_name}': {e}")
+            return False
+
     async def close(self) -> None:
         """Close the httpx client."""
         if self._client and not self._client.is_closed:

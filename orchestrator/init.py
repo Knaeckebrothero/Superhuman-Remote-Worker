@@ -147,6 +147,15 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # Seed default datasources from environment variables
         await _seed_default_datasources(db)
 
+        # Seed default users
+        await _seed_default_users(db)
+
+        # Seed default projects for users without one
+        await _seed_default_projects(db)
+
+        # Migrate orphan jobs to default projects
+        await _migrate_orphan_jobs(db)
+
         return all_exist
 
     except Exception as e:
@@ -349,6 +358,112 @@ async def _seed_default_datasources(db) -> None:
         logger.info(f"  Seeded {seeded} default datasource(s)")
     else:
         logger.info("  No default datasources configured (DEFAULT_DS_* env vars not set)")
+
+
+# =============================================================================
+# Default User Seeding
+# =============================================================================
+
+async def _seed_default_users(db) -> None:
+    """Seed a default user so the system has at least one user identity.
+
+    Creates only if no user with the same display_name exists (idempotent).
+    """
+    default_users = [
+        {"display_name": "Default", "avatar_color": "#89b4fa", "email": "default@cockpit.local"},
+    ]
+    for user in default_users:
+        await db.upsert_default_user(**user)
+    logger.info(f"  Seeded {len(default_users)} default user(s)")
+
+
+# =============================================================================
+# Default Project Seeding
+# =============================================================================
+
+async def _seed_default_projects(db) -> None:
+    """Create default projects for users that don't have one.
+
+    Queries users where default_project_id IS NULL, then creates a personal
+    default project for each with owner membership. No Gitea access here —
+    jobs repos are created lazily by the orchestrator at startup.
+    """
+    try:
+        async with db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, display_name FROM users WHERE default_project_id IS NULL"
+            )
+
+        if not rows:
+            logger.info("  All users have default projects")
+            return
+
+        seeded = 0
+        for row in rows:
+            try:
+                await db.create_default_project_for_user(
+                    str(row["id"]), row["display_name"]
+                )
+                seeded += 1
+            except Exception as e:
+                logger.warning(
+                    f"  Failed to create default project for user {row['display_name']}: {e}"
+                )
+
+        if seeded > 0:
+            logger.info(f"  Seeded {seeded} default project(s)")
+
+    except Exception as e:
+        logger.warning(f"  Default project seeding failed: {e}")
+
+
+async def _migrate_orphan_jobs(db) -> None:
+    """Assign orphan jobs (project_id IS NULL) to their user's default project.
+
+    For jobs with a user_id, uses the user's default_project_id.
+    For jobs without a user_id, assigns to the first available default project
+    as a fallback.
+    """
+    try:
+        async with db.acquire() as conn:
+            # Jobs with a user_id: assign to that user's default project
+            result = await conn.execute("""
+                UPDATE jobs j
+                SET project_id = u.default_project_id
+                FROM users u
+                WHERE j.user_id = u.id
+                  AND j.project_id IS NULL
+                  AND u.default_project_id IS NOT NULL
+            """)
+            user_count = int(result.split()[-1]) if result else 0
+
+            # Jobs without user_id: assign to first default project as fallback
+            fallback_count = 0
+            orphan_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM jobs WHERE project_id IS NULL"
+            )
+            if orphan_count and orphan_count > 0:
+                fallback_project = await conn.fetchval(
+                    "SELECT id FROM projects WHERE is_default = TRUE LIMIT 1"
+                )
+                if fallback_project:
+                    result = await conn.execute(
+                        "UPDATE jobs SET project_id = $1 WHERE project_id IS NULL",
+                        fallback_project,
+                    )
+                    fallback_count = int(result.split()[-1]) if result else 0
+
+        total = user_count + fallback_count
+        if total > 0:
+            logger.info(
+                f"  Migrated {total} orphan job(s) to default projects "
+                f"({user_count} by user, {fallback_count} fallback)"
+            )
+        else:
+            logger.info("  No orphan jobs to migrate")
+
+    except Exception as e:
+        logger.warning(f"  Orphan job migration failed: {e}")
 
 
 # =============================================================================

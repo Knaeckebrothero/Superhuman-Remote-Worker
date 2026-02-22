@@ -134,7 +134,8 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
         if isinstance(content, str) and content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
             return True
 
-    prefixes = (WORKSPACE_TOOL_CALL_ID_PREFIX, INSTRUCTION_TOOL_CALL_ID_PREFIX)
+    from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
+    prefixes = (WORKSPACE_TOOL_CALL_ID_PREFIX, INSTRUCTION_TOOL_CALL_ID_PREFIX, MEMORY_TOOL_CALL_ID_PREFIX)
 
     if isinstance(message, ToolMessage):
         tool_call_id = getattr(message, "tool_call_id", "")

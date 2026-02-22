@@ -22,6 +22,7 @@ interface MobileTab {
 const TABS: MobileTab[] = [
   { id: 'builder', label: 'Builder', icon: 'construction', componentType: 'instruction-builder' },
   { id: 'jobs', label: 'Jobs', icon: 'work', componentType: 'job-list' },
+  { id: 'projects', label: 'Projects', icon: 'folder_shared', componentType: 'project-list' },
   { id: 'create', label: 'Create', icon: 'add_circle', componentType: 'job-create' },
   { id: 'review', label: 'Review', icon: 'rate_review', componentType: 'job-review' },
 ];

@@ -55,6 +55,10 @@ class WorkspaceManagerConfig:
     # Git remote URL for workspace delivery (set by orchestrator via Gitea)
     git_remote_url: Optional[str] = None
 
+    # Project repository info
+    branch_name: Optional[str] = None
+    repositories: Optional[List[dict]] = None
+
     @classmethod
     def from_dict(cls, data: dict) -> "WorkspaceManagerConfig":
         """Create config from dictionary."""
@@ -63,6 +67,8 @@ class WorkspaceManagerConfig:
             structure=data.get("structure", cls.__dataclass_fields__["structure"].default_factory()),
             git_versioning=data.get("git_versioning", True),
             git_remote_url=data.get("git_remote_url"),
+            branch_name=data.get("branch_name"),
+            repositories=data.get("repositories"),
         )
 
 
@@ -182,6 +188,9 @@ class WorkspaceManager:
         # Git manager (created during initialize if git_versioning enabled)
         self._git_manager: Optional["GitManager"] = None
 
+        # Source/reference repo git managers, keyed by repo name
+        self._source_repos: dict[str, "GitManager"] = {}
+
     @property
     def path(self) -> Path:
         """Get the root path of this workspace."""
@@ -199,6 +208,11 @@ class WorkspaceManager:
         Returns None if git versioning is not enabled or initialization failed.
         """
         return self._git_manager
+
+    @property
+    def source_repos(self) -> dict[str, "GitManager"]:
+        """Git managers for source/reference repos, keyed by repo name."""
+        return self._source_repos
 
     def initialize(self) -> None:
         """Initialize the workspace directory structure.
@@ -253,6 +267,121 @@ class WorkspaceManager:
         else:
             logger.warning("Failed to initialize git repository")
             self._git_manager = None
+
+    def initialize_project_workspace(self) -> None:
+        """Initialize workspace from project repositories.
+
+        For project jobs, the jobs repo IS the workspace root:
+        1. Clone jobs repo → workspace root
+        2. Checkout job branch (create if needed)
+        3. Create subdirectories
+        4. Clone source/reference repos → repos/ subdirectory
+        5. Update .gitignore to exclude cloned repos
+        """
+        if not self.config.repositories:
+            logger.warning("initialize_project_workspace called without repositories, falling back")
+            self.initialize()
+            return
+
+        # Find the jobs repo
+        jobs_repo = next(
+            (r for r in self.config.repositories if r["role"] == "jobs"),
+            None,
+        )
+        if not jobs_repo or not jobs_repo.get("repo_url"):
+            logger.warning("No jobs repo found in repositories, falling back to standard init")
+            self.initialize()
+            return
+
+        try:
+            from ..managers.git_manager import GitManager
+        except ImportError:
+            from src.managers.git_manager import GitManager
+
+        # 1. Clone jobs repo as workspace root
+        git_mgr = GitManager.clone(jobs_repo["repo_url"], self._workspace_path)
+        if not git_mgr:
+            logger.warning("Failed to clone jobs repo, falling back to standard init")
+            self.initialize()
+            return
+
+        self._git_manager = git_mgr
+        logger.info(f"Cloned jobs repo as workspace root: {self._workspace_path}")
+
+        # 2. Checkout job branch
+        branch = self.config.branch_name
+        if branch:
+            success = git_mgr.checkout_branch(branch, create=True)
+            if success:
+                logger.info(f"Checked out branch: {branch}")
+            else:
+                logger.warning(f"Failed to checkout branch {branch}, continuing on default")
+
+        # 3. Create subdirectories
+        for subdir in self.config.structure:
+            dir_path = self._workspace_path / subdir
+            dir_path.mkdir(parents=True, exist_ok=True)
+
+        # 4. Clone source/reference repos
+        self._clone_auxiliary_repos()
+
+        self._initialized = True
+        logger.info("Project workspace initialized successfully")
+
+    def _clone_auxiliary_repos(self) -> None:
+        """Clone source/reference repositories into repos/ subdirectory."""
+        if not self.config.repositories:
+            return
+
+        try:
+            from ..managers.git_manager import GitManager
+        except ImportError:
+            from src.managers.git_manager import GitManager
+
+        repos_dir = self._workspace_path / "repos"
+        repos_dir.mkdir(exist_ok=True)
+
+        for repo in self.config.repositories:
+            if repo["role"] == "jobs":
+                continue  # Jobs repo IS the workspace root
+
+            repo_name = repo["name"]
+            target = repos_dir / repo_name
+
+            if target.exists():
+                logger.debug(f"Repo {repo_name} already cloned, skipping")
+                continue
+
+            repo_url = repo.get("repo_url")
+            if not repo_url:
+                logger.warning(f"Repo {repo_name} has no URL, skipping")
+                continue
+
+            try:
+                git_mgr = GitManager.clone(repo_url, target)
+                if git_mgr:
+                    branch = repo.get("branch", "main")
+                    if branch and branch != "main":
+                        git_mgr.checkout_branch(branch)
+                    self._source_repos[repo_name] = git_mgr
+                    logger.info(f"Cloned {repo['role']} repo: {repo_name}")
+                else:
+                    logger.warning(f"Failed to clone repo: {repo_name}")
+            except Exception as e:
+                logger.warning(f"Error cloning repo {repo_name}: {e}")
+
+        # Update .gitignore to exclude repos/ directory
+        gitignore = self._workspace_path / ".gitignore"
+        if gitignore.exists():
+            content = gitignore.read_text()
+            if "repos/" not in content:
+                with open(gitignore, "a") as f:
+                    f.write("\n# Cloned project repositories\nrepos/\n")
+        else:
+            gitignore.write_text("# Cloned project repositories\nrepos/\n")
+
+        if self._git_manager:
+            self._git_manager.commit("Add repos/ to .gitignore", allow_empty=False)
 
     def get_path(self, relative_path: str = "") -> Path:
         """Get absolute path within workspace.

@@ -527,6 +527,11 @@ def create_execute_node(
             injection_overhead_tokens += len(ws_text) // 4  # approximate
         injection_overhead_tokens += len(todo_manager.format_for_injection()) // 4  # approximate
 
+        # Add memory injection budget overhead
+        recall_store = tool_context.recall_store if tool_context else None
+        if recall_store:
+            injection_overhead_tokens += config.memory.budget_tokens
+
         # Temporarily lower compaction thresholds to account for injection overhead
         # Floor at 50% of original to avoid over-triggering
         original_compaction_threshold = context_mgr.config.compaction_threshold_tokens
@@ -542,6 +547,7 @@ def create_execute_node(
 
         # Ensure context is within limits before LLM call
         original_message_count = len(messages)
+        summaries_count_before = len(context_mgr._state.summaries) if hasattr(context_mgr, '_state') else 0
         try:
             messages = await context_mgr.ensure_within_limits(
                 messages,
@@ -563,6 +569,22 @@ def create_execute_node(
                 f"[{job_id}] Context compacted in execute: {original_message_count} -> {len(messages)} messages "
                 f"(removing {len(remove_markers)} old messages)"
             )
+
+        # Memory Light: store compaction summary as free-source memory
+        if recall_store and context_was_compacted:
+            summaries_count_after = len(context_mgr._state.summaries) if hasattr(context_mgr, '_state') else 0
+            if summaries_count_after > summaries_count_before:
+                try:
+                    await recall_store.store(
+                        content=context_mgr._state.summaries[-1][:2000],
+                        summary="Context compaction summary",
+                        importance=0.6,
+                        source="compaction",
+                        memory_type="factual",
+                        source_phase=state.get("phase_number", 0),
+                    )
+                except Exception as e:
+                    logger.warning(f"[{job_id}] Failed to store compaction memory: {e}")
 
         # Always clear old tool results, keep last 10
         messages = context_mgr.clear_old_tool_results(messages)
@@ -593,8 +615,30 @@ def create_execute_node(
 
         todos_injection_content = todo_manager.format_for_injection()
 
+        # Memory Light: retrieve relevant memories for injection
+        _memory_block = [""]  # mutable container for closure access
+        if recall_store:
+            try:
+                # Build retrieval context from current todo + phase info
+                pending_todos = todo_manager.list_pending()
+                context_parts = []
+                if pending_todos:
+                    context_parts.append(pending_todos[0].content)
+                context_parts.append(f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}")
+                context_text = " ".join(context_parts)
+
+                memories = await recall_store.retrieve(context_text)
+                if memories:
+                    from src.services.recall_store import RecallStore as _RS
+                    _memory_block[0] = _RS.assemble_memory_block(memories)
+                    logger.debug(
+                        f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
+                    )
+            except Exception as e:
+                logger.warning(f"[{job_id}] Memory retrieval failed (non-fatal): {e}")
+
         def _inject_transient_messages(target_messages: list) -> None:
-            """Append transient injection messages (todos, workspace.md, instruction files)."""
+            """Append transient injection messages (todos, workspace.md, memories, instruction files)."""
             # Todo list as transient HumanMessage
             target_messages.append(create_todos_human_message(todos_injection_content))
 
@@ -604,6 +648,13 @@ def create_execute_node(
                 ws_ai, ws_tool = create_workspace_tool_messages(ws_content)
                 target_messages.append(ws_ai)
                 target_messages.append(ws_tool)
+
+            # Memory Light: inject recalled memories after workspace.md
+            if _memory_block[0]:
+                from src.core.memory_injection import create_memory_injection_messages
+                mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
+                target_messages.append(mem_ai)
+                target_messages.append(mem_tool)
 
             # Phase-triggered instruction files (active injection)
             if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
@@ -812,6 +863,19 @@ def create_execute_node(
                             "Do NOT respond with text. Your next action must be a tool call."
                         ))
 
+                # Memory Light Phase 3: fire observer async (non-blocking)
+                new_turn_count = state.get("turn_count", 0) + 1
+                memory_observer = tool_context.memory_observer if tool_context else None
+                if memory_observer and memory_observer.should_observe(new_turn_count):
+                    import asyncio
+                    asyncio.create_task(
+                        memory_observer.observe(
+                            messages=messages,
+                            current_turn=new_turn_count,
+                            phase=phase_number,
+                        )
+                    )
+
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
                 if context_was_compacted:
@@ -822,6 +886,7 @@ def create_execute_node(
                     return {
                         "messages": result_messages,
                         "iteration": iteration + 1,
+                        "turn_count": new_turn_count,
                         "error": None,
                     }
                 result_messages = [response]
@@ -830,6 +895,7 @@ def create_execute_node(
                 return {
                     "messages": result_messages,
                     "iteration": iteration + 1,
+                    "turn_count": new_turn_count,
                     "error": None,
                 }
 
@@ -1127,6 +1193,8 @@ def create_archive_phase_node(
     llm: BaseChatModel,
     summarization_prompt: str,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
+    recall_store=None,
+    memory_observer=None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
@@ -1145,6 +1213,33 @@ def create_archive_phase_node(
 
         current_phase = plan_manager.get_current_phase()
         logger.info(f"[{job_id}] Archiving phase: {current_phase}")
+
+        # Memory Light Phase 3: trigger observer at phase boundary (async, non-blocking)
+        if memory_observer:
+            import asyncio
+            asyncio.create_task(
+                memory_observer.observe_phase_boundary(
+                    messages=messages,
+                    phase=phase_number,
+                )
+            )
+
+        # Memory Light: store completed todos with notes as phase archive memories
+        if recall_store:
+            from src.services.recall_store import extract_keywords
+            for todo in todo_manager.list_all():
+                if todo.status == TodoStatus.COMPLETED and todo.notes:
+                    try:
+                        await recall_store.store(
+                            content=f"Completed: {todo.content}\nOutcome: {'; '.join(todo.notes)}",
+                            keywords=extract_keywords(todo.content),
+                            importance=0.5,
+                            source="phase_archive",
+                            memory_type="procedural",
+                            source_phase=phase_number,
+                        )
+                    except Exception:
+                        pass  # Never block archiving
 
         # Create phase snapshot BEFORE any modifications
         # This captures the clean state at end of phase for recovery
@@ -1842,6 +1937,8 @@ def create_route_after_transition(
 def create_audited_tool_node(
     tools: List[Any],
     config: AgentConfig,
+    recall_store=None,
+    tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create a tool node with audit logging.
 
@@ -1851,6 +1948,8 @@ def create_audited_tool_node(
     Args:
         tools: List of tool objects
         config: Agent configuration for agent_id
+        recall_store: Optional RecallStore for memory storage
+        tool_context: Optional ToolContext for draining queued memories
 
     Returns:
         A callable node function with audit logging
@@ -1919,6 +2018,36 @@ def create_audited_tool_node(
                             latency_ms=execution_time_ms // max(len(tool_calls_info), 1),
                             error=content[:500] if is_error else None,
                         )
+
+        # Memory Light: flush queued memories from sync tool functions
+        if recall_store and tool_context:
+            for mem in tool_context.drain_pending_memories():
+                try:
+                    await recall_store.store(**mem)
+                except Exception as e:
+                    logger.warning(f"[{job_id}] Failed to store queued memory: {e}")
+
+        # Memory Light: store tool errors as memories
+        if recall_store and "messages" in result:
+            for msg in result["messages"]:
+                if isinstance(msg, ToolMessage):
+                    content = msg.content if msg.content else ""
+                    if _is_tool_error(content):
+                        tool_name = next(
+                            (tc["name"] for tc in tool_calls_info if tc["call_id"] == getattr(msg, "tool_call_id", "")),
+                            "unknown",
+                        )
+                        try:
+                            await recall_store.store(
+                                content=f"Tool '{tool_name}' failed: {content[:500]}",
+                                keywords=[tool_name, "error"],
+                                importance=0.6,
+                                source="tool_error",
+                                memory_type="error_solution",
+                                source_phase=phase_number,
+                            )
+                        except Exception:
+                            pass  # Never block tool execution
 
         return result
 
@@ -2026,6 +2155,10 @@ def build_phase_alternation_graph(
     # Use provided summarization LLM or fall back to strategic LLM
     llm_for_summarization = summarization_llm or strategic_llm_with_tools
 
+    # Extract RecallStore and MemoryObserver for memory injection and free sources
+    recall_store = tool_context.recall_store if tool_context else None
+    memory_observer = tool_context.memory_observer if tool_context else None
+
     # Create graph
     workflow = StateGraph(UniversalAgentState)
 
@@ -2056,6 +2189,8 @@ def build_phase_alternation_graph(
         todo_manager, plan_manager, config,
         context_mgr, llm_for_summarization, summarization_prompt,
         snapshot_manager=snapshot_manager,
+        recall_store=recall_store,
+        memory_observer=memory_observer,
     )
 
     handle_transition = create_handle_transition_node(
@@ -2066,7 +2201,11 @@ def build_phase_alternation_graph(
     )
 
     check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)
-    tool_node = create_audited_tool_node(tools, config)
+    tool_node = create_audited_tool_node(
+        tools, config,
+        recall_store=recall_store,
+        tool_context=tool_context,
+    )
 
     # Add nodes to graph
     workflow.add_node("init_workspace", init_workspace)

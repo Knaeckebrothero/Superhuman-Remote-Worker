@@ -122,6 +122,173 @@ export interface DatasourceTestResult {
 }
 
 // =============================================================================
+// User Models
+// =============================================================================
+
+/**
+ * User identity with optional email for session-based auth.
+ */
+export interface User {
+  id: string;
+  display_name: string;
+  avatar_color: string;
+  email?: string | null;
+  default_project_id?: string | null;
+  created_at: string;
+}
+
+// =============================================================================
+// Project Models
+// =============================================================================
+
+/**
+ * Project status types.
+ */
+export type ProjectStatus = 'active' | 'archived' | 'deleted';
+
+/**
+ * Project member role types.
+ */
+export type ProjectMemberRole = 'owner' | 'editor' | 'viewer';
+
+/**
+ * Project repository role types.
+ */
+export type ProjectRepoRole = 'jobs' | 'source' | 'reference';
+
+/**
+ * Project from the orchestrator.
+ */
+export interface Project {
+  id: string;
+  name: string;
+  description?: string | null;
+  goal?: string | null;
+  status: ProjectStatus;
+  is_default: boolean;
+  default_config_name?: string | null;
+  default_config_override?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+  job_count?: number;
+  repo_count?: number;
+  member_count?: number;
+}
+
+/**
+ * Request body for creating a new project.
+ */
+export interface ProjectCreateRequest {
+  name: string;
+  description?: string;
+  goal?: string;
+  default_config_name?: string;
+  default_config_override?: Record<string, unknown>;
+  user_id: string;
+}
+
+/**
+ * Request body for updating a project.
+ */
+export interface ProjectUpdateRequest {
+  name?: string;
+  description?: string;
+  goal?: string;
+  status?: ProjectStatus;
+  default_config_name?: string;
+  default_config_override?: Record<string, unknown>;
+}
+
+/**
+ * Project member with user info.
+ */
+export interface ProjectMember {
+  project_id: string;
+  user_id: string;
+  role: ProjectMemberRole;
+  joined_at: string;
+  display_name?: string;
+  avatar_color?: string;
+}
+
+/**
+ * Request body for adding a project member.
+ */
+export interface ProjectMemberAddRequest {
+  user_id: string;
+  role?: ProjectMemberRole;
+}
+
+/**
+ * Request body for updating a project member's role.
+ */
+export interface ProjectMemberUpdateRequest {
+  role: ProjectMemberRole;
+}
+
+/**
+ * Project repository configuration.
+ */
+export interface ProjectRepository {
+  id: string;
+  project_id: string;
+  name: string;
+  description?: string | null;
+  repo_url?: string | null;
+  role: ProjectRepoRole;
+  read_only: boolean;
+  is_managed: boolean;
+  branch?: string | null;
+  clone_path?: string | null;
+  credentials?: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Request body for creating/attaching a project repository.
+ */
+export interface ProjectRepositoryCreateRequest {
+  name: string;
+  description?: string;
+  repo_url?: string;
+  role?: ProjectRepoRole;
+  read_only?: boolean;
+  branch?: string;
+  clone_path?: string;
+  create_managed?: boolean;
+}
+
+/**
+ * Request body for updating a project repository.
+ */
+export interface ProjectRepositoryUpdateRequest {
+  name?: string;
+  description?: string;
+  read_only?: boolean;
+  branch?: string;
+  clone_path?: string;
+}
+
+/**
+ * Request body for merging a completed job's branch.
+ */
+export interface MergeRequest {
+  merge_strategy?: string;
+  delete_branch?: boolean;
+}
+
+/**
+ * Request body for promoting a default-project job into a named project.
+ */
+export interface PromoteRequest {
+  name: string;
+  description?: string;
+  goal?: string;
+  user_id: string;
+}
+
+// =============================================================================
 // Agent Models
 // =============================================================================
 
@@ -166,6 +333,10 @@ export interface Job {
   config_name: string;
   config_override?: Record<string, unknown>;
   assigned_agent_id?: string;
+  user_id?: string | null;
+  project_id?: string | null;
+  branch_name?: string | null;
+  merge_status?: string | null;
   status: JobStatus;
   creator_status: string;
   validator_status: string;
@@ -193,6 +364,8 @@ export interface JobCreateRequest {
   kickoff_message?: string;
   datasource_ids?: string[];
   builder_session_id?: string;
+  user_id?: string;
+  project_id?: string;
 }
 
 /**

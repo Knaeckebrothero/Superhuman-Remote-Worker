@@ -3,6 +3,7 @@ import { HttpClient } from '@angular/common/http';
 import { Observable, catchError, of } from 'rxjs';
 import { environment } from '../environment';
 import { JobArtifactService } from './job-artifact.service';
+import { UserService } from './user.service';
 
 /** A builder chat message (stored in builder_messages table). */
 export interface BuilderMessage {
@@ -46,6 +47,7 @@ export interface StreamCallbacks {
 export class BuilderStreamService {
   private readonly http = inject(HttpClient);
   private readonly artifacts = inject(JobArtifactService);
+  private readonly userService = inject(UserService);
   private readonly baseUrl = environment.apiUrl;
 
   private abortController: AbortController | null = null;
@@ -55,6 +57,7 @@ export class BuilderStreamService {
     return this.http
       .post<BuilderSession>(`${this.baseUrl}/builder/sessions`, {
         expert_id: expertId ?? null,
+        user_id: this.userService.currentUserId() ?? null,
       })
       .pipe(catchError(() => of(null)));
   }

@@ -46,6 +46,7 @@ class UniversalAgentState(TypedDict):
         is_strategic_phase: True = strategic mode (planning), False = tactical mode (execution)
         phase_number: Increments at each phase transition (for tracking/logging)
         is_final_phase: True when job_complete was called, job completes when todos done
+        turn_count: LLM call counter, used by MemoryObserver to trigger every N turns
 
         # File-based context
         workspace_memory: Contents of workspace.md for system prompt
@@ -83,6 +84,7 @@ class UniversalAgentState(TypedDict):
     is_strategic_phase: bool             # True = strategic mode, False = tactical mode
     phase_number: int                    # Increments at each phase transition
     is_final_phase: bool                 # True when job_complete called, awaiting todo completion
+    turn_count: int                      # LLM call counter (for memory observer interval)
 
     # File-based context (read from workspace into state)
     workspace_memory: str                # Contents of workspace.md
@@ -169,6 +171,7 @@ def create_initial_state(
         is_strategic_phase=True,
         phase_number=1,
         is_final_phase=False,
+        turn_count=0,
 
         # File-based context
         workspace_memory="",
