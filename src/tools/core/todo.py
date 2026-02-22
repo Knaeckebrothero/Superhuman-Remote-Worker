@@ -209,6 +209,18 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                             return f"Error: Todo '{ids[0]}' not found. Available todos: {todo_list_str}"
                         return f"Error: Todo '{ids[0]}' not found. No todos in the list."
 
+                    # Queue memory for completed todo with notes (Memory Light)
+                    if context.recall_store and todo.notes:
+                        from src.services.recall_store import extract_keywords
+                        context.queue_memory(
+                            content=f"Completed: {todo.content}\nOutcome: {'; '.join(todo.notes)}",
+                            keywords=extract_keywords(todo.content),
+                            importance=0.7,
+                            source="todo",
+                            memory_type="procedural",
+                            source_phase=todo_mgr.phase_number,
+                        )
+
                     # Build response message
                     remaining = todo_mgr.list_pending()
                     is_last = todo_mgr.all_complete()
@@ -232,6 +244,20 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                     completed = result["completed"]
                     not_found = result["not_found"]
                     is_last = result["is_last"]
+
+                    # Queue memories for completed todos with notes (Memory Light)
+                    if context.recall_store:
+                        from src.services.recall_store import extract_keywords
+                        for c_todo in completed:
+                            if c_todo.notes:
+                                context.queue_memory(
+                                    content=f"Completed: {c_todo.content}\nOutcome: {'; '.join(c_todo.notes)}",
+                                    keywords=extract_keywords(c_todo.content),
+                                    importance=0.7,
+                                    source="todo",
+                                    memory_type="procedural",
+                                    source_phase=todo_mgr.phase_number,
+                                )
 
                     lines = []
                     if completed:

@@ -1,10 +1,11 @@
-import { Component, inject, OnInit } from '@angular/core';
-import { TimelineComponent } from './components/timeline/timeline.component';
-import { SplitPanelComponent } from './layout/split-panel/split-panel.component';
-import { MobileShellComponent } from './layout/mobile-shell/mobile-shell.component';
-import { LayoutService } from './core/services/layout.service';
+import { Component, inject, OnInit, computed } from '@angular/core';
+import { Router, RouterOutlet, NavigationEnd } from '@angular/router';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { filter, map } from 'rxjs';
+import { SidebarComponent } from './layout/sidebar/sidebar.component';
 import { ComponentRegistryService } from './core/services/component-registry.service';
 import { ViewportService } from './core/services/viewport.service';
+import { UserService } from './core/services/user.service';
 import { PlaceholderAComponent } from './components/placeholders/placeholder-a.component';
 import { PlaceholderBComponent } from './components/placeholders/placeholder-b.component';
 import { PlaceholderCComponent } from './components/placeholders/placeholder-c.component';
@@ -22,39 +23,32 @@ import { DatasourceListComponent } from './components/datasource-list/datasource
 import { JobReviewComponent } from './components/job-review/job-review.component';
 import { WorkspaceBrowserComponent } from './components/workspace-browser/workspace-browser.component';
 import { InstructionBuilderComponent } from './components/instruction-builder/instruction-builder.component';
+import { ProjectListPageComponent } from './pages/project-list/project-list.component';
 
 @Component({
   selector: 'app-root',
-  imports: [TimelineComponent, SplitPanelComponent, MobileShellComponent],
+  imports: [RouterOutlet, SidebarComponent],
   template: `
-    @if (viewport.isMobile()) {
-      <app-mobile-shell />
-    } @else {
-      <div class="app-frame">
-        <header class="app-header">
-          <app-timeline />
-        </header>
-        <main class="app-main">
-          <app-split-panel [config]="layoutService.layout()" />
-        </main>
+    <div class="app-container">
+      @if (showSidebar()) {
+        <app-sidebar />
+      }
+      <div class="content-area">
+        <router-outlet />
       </div>
-    }
+    </div>
   `,
   styles: [
     `
-      .app-frame {
+      .app-container {
         display: flex;
-        flex-direction: column;
         height: 100vh;
+        height: 100dvh;
         width: 100vw;
         overflow: hidden;
       }
 
-      .app-header {
-        flex-shrink: 0;
-      }
-
-      .app-main {
+      .content-area {
         flex: 1;
         overflow: hidden;
       }
@@ -62,9 +56,25 @@ import { InstructionBuilderComponent } from './components/instruction-builder/in
   ],
 })
 export class App implements OnInit {
-  readonly layoutService = inject(LayoutService);
-  readonly viewport = inject(ViewportService);
+  private readonly router = inject(Router);
+  private readonly viewport = inject(ViewportService);
+  private readonly userService = inject(UserService);
   private readonly registry = inject(ComponentRegistryService);
+
+  private readonly currentUrl = toSignal(
+    this.router.events.pipe(
+      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
+      map((e) => e.urlAfterRedirects),
+    ),
+    { initialValue: this.router.url },
+  );
+
+  readonly showSidebar = computed(
+    () =>
+      !this.viewport.isMobile() &&
+      this.userService.isAuthenticated() &&
+      this.currentUrl() !== '/login',
+  );
 
   ngOnInit(): void {
     this.registerComponents();
@@ -125,7 +135,6 @@ export class App implements OnInit {
       component: ChatHistoryComponent,
     });
 
-    // Job Management Components
     this.registry.register({
       type: 'agent-list',
       displayName: 'Agents',
@@ -172,6 +181,12 @@ export class App implements OnInit {
       type: 'instruction-builder',
       displayName: 'Instruction Builder',
       component: InstructionBuilderComponent,
+    });
+
+    this.registry.register({
+      type: 'project-list',
+      displayName: 'Projects',
+      component: ProjectListPageComponent,
     });
   }
 }

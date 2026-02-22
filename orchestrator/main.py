@@ -24,13 +24,20 @@ from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
-from fastapi import FastAPI, HTTPException, Query  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query, Request, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
 from pydantic import BaseModel, Field  # noqa: E402
 
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
+from security.auth import (  # noqa: E402
+    create_session,
+    validate_session,
+    delete_session,
+    cleanup_expired_sessions,
+)
+from security.csrf import validate_csrf_token  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.builder_tools import (  # noqa: E402
@@ -173,6 +180,8 @@ class JobCreate(BaseModel):
     kickoff_message: str | None = Field(None, description="Opening message to the agent (task brief)")
     datasource_ids: list[str] | None = Field(None, description="Global datasource IDs to clone as job-scoped")
     builder_session_id: str | None = Field(None, description="Builder session ID to link to this job")
+    user_id: str | None = Field(None, description="User UUID who created this job")
+    project_id: str | None = Field(None, description="Project UUID to associate this job with")
 
 
 class JobStartRequest(BaseModel):
@@ -191,12 +200,127 @@ class JobStartRequest(BaseModel):
     instructions: str | None = None
     git_remote_url: str | None = None
     datasources: list[dict[str, Any]] | None = None
+    repositories: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Project repositories for workspace setup",
+    )
+    branch_name: str | None = Field(
+        default=None,
+        description="Git branch name for this job's workspace",
+    )
+    project_id: str | None = Field(
+        default=None,
+        description="Project ID for datasource resolution",
+    )
 
 
 class BuilderSessionCreate(BaseModel):
     """Request body for creating a builder session."""
 
     expert_id: str | None = Field(None, description="Expert used as starting point")
+    user_id: str | None = Field(None, description="User UUID who created this session")
+
+
+class UserCreate(BaseModel):
+    """Request body for creating a user."""
+
+    display_name: str = Field(..., description="Display name")
+    avatar_color: str = Field("#89b4fa", description="Hex color for avatar")
+    email: str | None = Field(None, description="Email address")
+
+
+class UserUpdate(BaseModel):
+    """Request body for updating a user."""
+
+    display_name: str | None = None
+    avatar_color: str | None = None
+    email: str | None = None
+
+
+class LoginRequest(BaseModel):
+    """Request body for email login."""
+
+    email: str = Field(..., description="Email address")
+
+
+class ProjectCreate(BaseModel):
+    """Request body for creating a project."""
+
+    name: str = Field(..., description="Project name")
+    description: str | None = Field(None, description="Project description")
+    goal: str | None = Field(None, description="Project goal statement")
+    default_config_name: str | None = Field(None, description="Default agent config for new jobs")
+    default_config_override: dict[str, Any] | None = Field(None, description="Default config overrides")
+    user_id: str = Field(..., description="Owner user UUID")
+
+
+class ProjectUpdate(BaseModel):
+    """Request body for updating a project."""
+
+    name: str | None = None
+    description: str | None = None
+    goal: str | None = None
+    status: str | None = None
+    default_config_name: str | None = None
+    default_config_override: dict[str, Any] | None = None
+
+
+class ProjectMemberAdd(BaseModel):
+    """Request body for adding a project member."""
+
+    user_id: str = Field(..., description="User UUID to add")
+    role: str = Field("editor", description="Member role: owner, editor, viewer")
+
+
+class ProjectMemberUpdate(BaseModel):
+    """Request body for updating a project member's role."""
+
+    role: str = Field(..., description="New role: owner, editor, viewer")
+
+
+class ProjectRepositoryCreate(BaseModel):
+    """Request body for attaching a repository to a project."""
+
+    name: str = Field(..., description="Repository display name")
+    description: str | None = Field(None, description="Repository description")
+    repo_url: str | None = Field(None, description="Repository URL (external repos)")
+    role: str = Field("source", description="Repository role: jobs, source, reference")
+    read_only: bool = Field(False, description="Whether this repo is read-only")
+    branch: str = Field("main", description="Default branch")
+    clone_path: str | None = Field(None, description="Local clone path")
+    create_managed: bool = Field(False, description="Create a managed Gitea repo")
+
+
+class ProjectRepositoryUpdate(BaseModel):
+    """Request body for updating a project repository."""
+
+    name: str | None = None
+    description: str | None = None
+    read_only: bool | None = None
+    branch: str | None = None
+    clone_path: str | None = None
+
+
+class MergeRequest(BaseModel):
+    """Request body for merging a job's branch."""
+
+    merge_strategy: str = Field(
+        default="merge",
+        description="Merge method: merge, rebase, or squash",
+    )
+    delete_branch: bool = Field(
+        default=False,
+        description="Delete the branch after successful merge",
+    )
+
+
+class PromoteRequest(BaseModel):
+    """Request body for promoting a job into a dedicated project."""
+
+    name: str = Field(..., description="Name for the new project")
+    description: str | None = Field(None, description="Project description")
+    goal: str | None = Field(None, description="Project goal")
+    user_id: str = Field(..., description="User UUID who owns the new project")
 
 
 class BuilderMessageRequest(BaseModel):
@@ -264,12 +388,14 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
+    session_cleanup_task = asyncio.create_task(cleanup_expired_sessions(postgres_db, _shutdown_event))
 
     yield
 
     # Signal shutdown to background tasks
     _shutdown_event.set()
     await stale_detector_task
+    await session_cleanup_task
 
     # Cleanup clients
     await gitea_client.close()
@@ -300,6 +426,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# CSRF middleware — validates X-CSRF-Token header on mutating requests
+@app.middleware("http")
+async def csrf_middleware(request: Request, call_next):
+    """Validate CSRF token on mutating requests (double-submit cookie pattern)."""
+    is_valid = await validate_csrf_token(request)
+    if not is_valid:
+        return JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
+    return await call_next(request)
+
 
 # Include routers
 app.include_router(graph_router)
@@ -382,14 +518,15 @@ async def workspace_status() -> dict[str, Any]:
 @app.get("/api/jobs")
 async def list_jobs(
     status: str | None = Query(default=None),
+    user_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
-    """List jobs with optional status filter.
+    """List jobs with optional status and user filter.
 
     Returns jobs enriched with audit_count from MongoDB if available.
     """
     try:
-        jobs = await postgres_db.get_jobs(status=status, limit=limit)
+        jobs = await postgres_db.get_jobs(status=status, user_id=user_id, limit=limit)
 
         # Enrich with audit counts if MongoDB is available
         if mongodb.is_available:
@@ -447,6 +584,16 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
         if job.kickoff_message:
             context["kickoff_message"] = job.kickoff_message
 
+        # Resolve project_id: use provided, or fall back to user's default
+        project_id = job.project_id
+        if not project_id and job.user_id:
+            try:
+                user = await postgres_db.get_user(job.user_id)
+                if user and user.get("default_project_id"):
+                    project_id = str(user["default_project_id"])
+            except Exception as e:
+                logger.warning(f"Failed to resolve default project for user {job.user_id}: {e}")
+
         result = await postgres_db.create_job(
             description=job.description,
             document_path=job.document_path,
@@ -454,6 +601,8 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             config_name=job.config_name,
             config_override=job.config_override,
             context=context if context else None,
+            user_id=job.user_id,
+            project_id=project_id,
         )
 
         # Create Gitea repo for workspace delivery
@@ -1623,8 +1772,37 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
         extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "instructions", "git_remote_url"}
         remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
 
-        # Resolve datasources for this job (job-specific > global fallback)
-        resolved_ds = await postgres_db.resolve_datasources_for_job(job_id)
+        # Resolve project repositories if this is a project job
+        repositories_payload = None
+        if job.get("project_id"):
+            try:
+                repos = await postgres_db.get_project_repositories(str(job["project_id"]))
+                repositories_payload = [
+                    {
+                        "id": str(r["id"]),
+                        "name": r["name"],
+                        "role": r["role"],
+                        "repo_url": r.get("repo_url"),
+                        "read_only": r["read_only"],
+                        "branch": r.get("branch", "main"),
+                        "clone_path": r.get("clone_path"),
+                        "credentials": r.get("credentials"),
+                    }
+                    for r in repos
+                ]
+            except Exception as e:
+                logger.warning(f"Failed to resolve project repositories: {e}")
+
+            # Derive git_remote_url from jobs repo if not already set
+            if repositories_payload and not git_remote_url:
+                jobs_repo = next((r for r in repositories_payload if r["role"] == "jobs"), None)
+                if jobs_repo and jobs_repo.get("repo_url"):
+                    git_remote_url = jobs_repo["repo_url"]
+
+        # Resolve datasources for this job (job > project > global)
+        resolved_ds = await postgres_db.resolve_datasources_for_job(
+            job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
+        )
         datasources_payload = _build_datasources_payload(resolved_ds)
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
@@ -1645,6 +1823,9 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
             git_remote_url=git_remote_url,
             context=remaining_context if remaining_context else None,
             datasources=datasources_payload,
+            repositories=repositories_payload,
+            branch_name=job.get("branch_name"),
+            project_id=str(job["project_id"]) if job.get("project_id") else None,
         )
 
         # Send request to agent pod
@@ -2661,6 +2842,1078 @@ async def get_expert(expert_id: str) -> dict[str, Any]:
 
 
 # =============================================================================
+# Project Expert Endpoints
+# =============================================================================
+
+
+async def _get_project_jobs_repo(project_id: str) -> str | None:
+    """Get the jobs repo name for a project. Returns None if not found."""
+    repos = await postgres_db.get_project_repositories(project_id, role="jobs")
+    if not repos:
+        return None
+    return repos[0].get("name")
+
+
+@app.get("/api/projects/{project_id}/experts")
+async def list_project_experts(project_id: str) -> list[dict[str, Any]]:
+    """List expert configurations from a project's jobs repo.
+
+    Scans the experts/ directory in the project's Gitea jobs repo and returns
+    metadata for each expert configuration found.
+    """
+    if not gitea_client.is_initialized:
+        return []
+
+    repo_name = await _get_project_jobs_repo(project_id)
+    if not repo_name:
+        return []
+
+    try:
+        entries = await gitea_client.list_contents(repo_name, "experts")
+    except Exception:
+        return []
+
+    if not entries:
+        return []
+
+    experts: list[dict[str, Any]] = []
+    for entry in entries:
+        if entry.get("type") != "dir":
+            continue
+        name = entry.get("name", "")
+        try:
+            content = await gitea_client.get_file_content(
+                repo_name, f"experts/{name}/config.yaml"
+            )
+            if not content:
+                continue
+            data = yaml.safe_load(content) or {}
+
+            description = data.get("description", "").strip()
+            if not description:
+                tools = data.get("tools", {})
+                tool_categories = [k for k in tools if tools[k]]
+                description = (
+                    f"Agent with {', '.join(tool_categories)} tools."
+                    if tool_categories
+                    else "Custom agent configuration."
+                )
+
+            experts.append(
+                ExpertInfo(
+                    id=name,
+                    display_name=data.get(
+                        "display_name", name.replace("_", " ").title()
+                    ),
+                    description=description,
+                    icon=data.get("icon", "psychology"),
+                    color=data.get("color", "#cba6f7"),
+                    tags=data.get("tags", []),
+                ).model_dump()
+            )
+        except Exception as e:
+            logger.warning(f"Failed to parse project expert {name}: {e}")
+
+    return experts
+
+
+@app.get("/api/projects/{project_id}/experts/{expert_name}")
+async def get_project_expert(
+    project_id: str, expert_name: str
+) -> dict[str, Any]:
+    """Get full detail for a project expert including merged config and instructions."""
+    if not gitea_client.is_initialized:
+        raise HTTPException(status_code=503, detail="Gitea not available")
+
+    repo_name = await _get_project_jobs_repo(project_id)
+    if not repo_name:
+        raise HTTPException(status_code=404, detail="No jobs repo for project")
+
+    # Read config
+    config_content = await gitea_client.get_file_content(
+        repo_name, f"experts/{expert_name}/config.yaml"
+    )
+    if not config_content:
+        raise HTTPException(
+            status_code=404, detail=f"Expert not found: {expert_name}"
+        )
+
+    try:
+        expert_data = yaml.safe_load(config_content) or {}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Invalid YAML: {e}"
+        ) from e
+
+    # Build info
+    description = expert_data.get("description", "").strip()
+    if not description:
+        tools = expert_data.get("tools", {})
+        tool_categories = [k for k in tools if tools[k]]
+        description = (
+            f"Agent with {', '.join(tool_categories)} tools."
+            if tool_categories
+            else "Custom agent configuration."
+        )
+
+    info = ExpertInfo(
+        id=expert_name,
+        display_name=expert_data.get(
+            "display_name", expert_name.replace("_", " ").title()
+        ),
+        description=description,
+        icon=expert_data.get("icon", "psychology"),
+        color=expert_data.get("color", "#cba6f7"),
+        tags=expert_data.get("tags", []),
+    )
+
+    # Merge with defaults
+    config_dir = _get_config_dir()
+    defaults_path = config_dir / "defaults.yaml"
+    if defaults_path.exists():
+        with open(defaults_path) as f:
+            defaults = yaml.safe_load(f) or {}
+    else:
+        defaults = {}
+
+    expert_data_clean = dict(expert_data)
+    expert_data_clean.pop("$extends", None)
+    merged = _deep_merge(defaults, expert_data_clean)
+    for key in ("$extends", "connections"):
+        merged.pop(key, None)
+
+    # Read instructions
+    instructions_content = await gitea_client.get_file_content(
+        repo_name, f"experts/{expert_name}/instructions.md"
+    )
+
+    return {
+        **info.model_dump(),
+        "config": merged,
+        "instructions": instructions_content,
+    }
+
+
+# =============================================================================
+# Auth Endpoints
+# =============================================================================
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginRequest, response: Response) -> dict[str, Any]:
+    """Email-based login. Finds or creates user, issues session cookie."""
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    # Find existing user by email
+    user = await postgres_db.get_user_by_email(email)
+
+    if not user:
+        # Create new user from email
+        display_name = email.split("@")[0].title()
+        user = await postgres_db.create_user(
+            display_name=display_name,
+            email=email,
+        )
+        logger.info(f"Created new user via login: {email}")
+
+    # Create session
+    session_key, csrf_token = await create_session(
+        postgres_db,
+        user_id=str(user["id"]),
+        user_email=email,
+    )
+
+    # Session timeout from env or default 24h
+    session_timeout_hours = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
+    max_age = session_timeout_hours * 3600
+
+    # Set httpOnly session cookie
+    response.set_cookie(
+        key="session",
+        value=session_key,
+        max_age=max_age,
+        httponly=True,
+        secure=False,  # False for localhost dev
+        samesite="lax",
+        path="/",
+    )
+
+    # Set CSRF token cookie (readable by JS for double-submit pattern)
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        max_age=max_age,
+        httponly=False,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+
+    return {
+        "user": {
+            "id": str(user["id"]),
+            "display_name": user["display_name"],
+            "avatar_color": user["avatar_color"],
+            "email": user.get("email"),
+            "created_at": user["created_at"],
+        },
+        "message": "Login successful",
+    }
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request, response: Response) -> dict[str, str]:
+    """Logout: invalidate session and clear cookies."""
+    session_key = request.cookies.get("session")
+    if session_key:
+        await delete_session(postgres_db, session_key)
+
+    response.delete_cookie(key="session", path="/", httponly=True, samesite="lax")
+    response.delete_cookie(key="csrf_token", path="/", httponly=False, samesite="lax")
+    return {"message": "Logged out successfully"}
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request, response: Response) -> dict[str, Any]:
+    """Get current authenticated user from session cookie."""
+    session_key = request.cookies.get("session")
+    if not session_key:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    session_info = await validate_session(postgres_db, session_key)
+    if not session_info:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    # Fetch full user record
+    user = await postgres_db.get_user(session_info["user_id"])
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Ensure CSRF cookie is set
+    csrf_cookie = request.cookies.get("csrf_token")
+    csrf_token = session_info.get("csrf_token")
+    if csrf_token and not csrf_cookie:
+        expires_in = session_info.get("expires_in", 86400)
+        response.set_cookie(
+            key="csrf_token",
+            value=csrf_token,
+            max_age=expires_in,
+            httponly=False,
+            secure=False,
+            samesite="lax",
+            path="/",
+        )
+
+    return {
+        "user": {
+            "id": str(user["id"]),
+            "display_name": user["display_name"],
+            "avatar_color": user["avatar_color"],
+            "email": user.get("email"),
+            "created_at": user["created_at"],
+        },
+    }
+
+
+# =============================================================================
+# User Endpoints
+# =============================================================================
+
+
+@app.get("/api/users")
+async def list_users() -> list[dict[str, Any]]:
+    """List all users."""
+    try:
+        return await postgres_db.list_users()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/users/{user_id}")
+async def get_user(user_id: str) -> dict[str, Any]:
+    """Get a single user by ID."""
+    user = await postgres_db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return user
+
+
+@app.post("/api/users")
+async def create_user(body: UserCreate) -> dict[str, Any]:
+    """Create a new user with a default project."""
+    try:
+        user = await postgres_db.create_user(
+            display_name=body.display_name,
+            avatar_color=body.avatar_color,
+            email=body.email,
+        )
+
+        # Create default project for the new user
+        try:
+            project = await postgres_db.create_default_project_for_user(
+                str(user["id"]), body.display_name
+            )
+            # Create Gitea jobs repo for the project
+            if gitea_client.is_initialized and project:
+                repo_name = f"project-{str(project['id'])[:8]}-jobs"
+                repo_url = await gitea_client.create_repo(repo_name)
+                if repo_url:
+                    await postgres_db.add_project_repository(
+                        project_id=str(project["id"]),
+                        name=repo_name,
+                        repo_url=repo_url,
+                        role="jobs",
+                        is_managed=True,
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to create default project for user {user['id']}: {e}")
+
+        # Re-fetch user to include default_project_id
+        return await postgres_db.get_user(str(user["id"])) or user
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.put("/api/users/{user_id}")
+async def update_user(user_id: str, body: UserUpdate) -> dict[str, str]:
+    """Update a user."""
+    success = await postgres_db.update_user(
+        user_id=user_id,
+        display_name=body.display_name,
+        avatar_color=body.avatar_color,
+        email=body.email,
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return {"status": "updated"}
+
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: str) -> dict[str, str]:
+    """Delete a user."""
+    success = await postgres_db.delete_user(user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
+    return {"status": "deleted"}
+
+
+# =============================================================================
+# Project Endpoints
+# =============================================================================
+
+
+@app.post("/api/projects")
+async def create_project(body: ProjectCreate) -> dict[str, Any]:
+    """Create a new project with the requesting user as owner."""
+    try:
+        project = await postgres_db.create_project(
+            name=body.name,
+            description=body.description,
+            goal=body.goal,
+            default_config_name=body.default_config_name,
+            default_config_override=body.default_config_override,
+        )
+
+        # Add creator as owner
+        await postgres_db.add_project_member(
+            project_id=str(project["id"]),
+            user_id=body.user_id,
+            role="owner",
+        )
+
+        # Create Gitea jobs repo
+        if gitea_client.is_initialized:
+            repo_name = f"project-{str(project['id'])[:8]}-jobs"
+            repo_url = await gitea_client.create_repo(repo_name)
+            if repo_url:
+                await postgres_db.add_project_repository(
+                    project_id=str(project["id"]),
+                    name=repo_name,
+                    repo_url=repo_url,
+                    role="jobs",
+                    is_managed=True,
+                )
+
+        return project
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects")
+async def list_projects(
+    user_id: str | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """List projects. If user_id provided, returns projects the user is a member of."""
+    try:
+        if user_id:
+            return await postgres_db.get_projects_for_user(user_id)
+        # Without user_id, return all projects (admin view)
+        async with postgres_db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM projects WHERE status != 'deleted' ORDER BY updated_at DESC LIMIT 100"
+            )
+            return [dict(r) for r in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str) -> dict[str, Any]:
+    """Get a single project by ID."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    return project
+
+
+@app.patch("/api/projects/{project_id}")
+async def update_project(project_id: str, body: ProjectUpdate) -> dict[str, str]:
+    """Update a project."""
+    kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not kwargs:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    success = await postgres_db.update_project(project_id, **kwargs)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    return {"status": "updated"}
+
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str) -> dict[str, str]:
+    """Delete a project. Cannot delete default projects."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    if project.get("is_default"):
+        raise HTTPException(status_code=400, detail="Cannot delete a default project")
+
+    # Clean up managed repos
+    repos = await postgres_db.get_project_repositories(project_id)
+    for repo in repos:
+        if repo.get("is_managed") and gitea_client.is_initialized:
+            await gitea_client.delete_repo(repo["name"])
+
+    success = await postgres_db.delete_project(project_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete project")
+    return {"status": "deleted"}
+
+
+@app.get("/api/projects/{project_id}/members")
+async def list_project_members(project_id: str) -> list[dict[str, Any]]:
+    """List members of a project with user info."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    return await postgres_db.get_project_members(project_id)
+
+
+@app.post("/api/projects/{project_id}/members")
+async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[str, Any]:
+    """Add a member to a project."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    try:
+        return await postgres_db.add_project_member(
+            project_id=project_id,
+            user_id=body.user_id,
+            role=body.role,
+        )
+    except Exception as e:
+        if "duplicate key" in str(e).lower() or "unique" in str(e).lower():
+            raise HTTPException(status_code=409, detail="User is already a member")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/projects/{project_id}/members/{user_id}")
+async def update_project_member(
+    project_id: str, user_id: str, body: ProjectMemberUpdate
+) -> dict[str, str]:
+    """Update a member's role in a project."""
+    success = await postgres_db.update_project_member_role(
+        project_id=project_id, user_id=user_id, role=body.role
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"status": "updated"}
+
+
+@app.delete("/api/projects/{project_id}/members/{user_id}")
+async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]:
+    """Remove a member from a project. Cannot remove the last owner."""
+    # Check if this is the last owner
+    role = await postgres_db.get_user_role_in_project(project_id, user_id)
+    if role == "owner":
+        members = await postgres_db.get_project_members(project_id)
+        owner_count = sum(1 for m in members if m.get("role") == "owner")
+        if owner_count <= 1:
+            raise HTTPException(
+                status_code=400, detail="Cannot remove the last owner of a project"
+            )
+
+    success = await postgres_db.remove_project_member(project_id, user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"status": "removed"}
+
+
+@app.get("/api/projects/{project_id}/repositories")
+async def list_project_repositories(
+    project_id: str,
+    role: str | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    """List repositories attached to a project."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+    return await postgres_db.get_project_repositories(project_id, role=role)
+
+
+@app.post("/api/projects/{project_id}/repositories")
+async def add_project_repository(
+    project_id: str, body: ProjectRepositoryCreate
+) -> dict[str, Any]:
+    """Attach a repository to a project. Optionally creates a managed Gitea repo."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    repo_url = body.repo_url
+    is_managed = False
+
+    # Create a managed Gitea repo if requested
+    if body.create_managed and gitea_client.is_initialized:
+        repo_url = await gitea_client.create_repo(body.name)
+        if not repo_url:
+            raise HTTPException(status_code=502, detail="Failed to create Gitea repository")
+        is_managed = True
+
+    try:
+        return await postgres_db.add_project_repository(
+            project_id=project_id,
+            name=body.name,
+            repo_url=repo_url,
+            role=body.role,
+            description=body.description,
+            read_only=body.read_only,
+            is_managed=is_managed,
+            branch=body.branch,
+            clone_path=body.clone_path,
+        )
+    except Exception as e:
+        # If we created a managed repo but DB insert failed, clean up
+        if is_managed and repo_url:
+            await gitea_client.delete_repo(body.name)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/projects/{project_id}/repositories/{repo_id}")
+async def update_project_repository(
+    project_id: str, repo_id: str, body: ProjectRepositoryUpdate
+) -> dict[str, str]:
+    """Update a project repository."""
+    kwargs = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not kwargs:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    success = await postgres_db.update_project_repository(repo_id, **kwargs)
+    if not success:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    return {"status": "updated"}
+
+
+@app.delete("/api/projects/{project_id}/repositories/{repo_id}")
+async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, str]:
+    """Remove a repository from a project. Cannot remove the jobs repo."""
+    repo = await postgres_db.get_project_repository(repo_id)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if repo.get("role") == "jobs":
+        raise HTTPException(status_code=400, detail="Cannot remove the jobs repository")
+
+    removed = await postgres_db.remove_project_repository(repo_id)
+    if not removed:
+        raise HTTPException(status_code=500, detail="Failed to remove repository")
+
+    # Clean up managed Gitea repo
+    if removed.get("is_managed") and gitea_client.is_initialized:
+        await gitea_client.delete_repo(removed["name"])
+
+    return {"status": "removed"}
+
+
+@app.post("/api/projects/{project_id}/jobs")
+async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
+    """Create a job within a project context.
+
+    Automatically sets project_id and creates a Gitea branch for the job.
+    """
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    try:
+        # Build context
+        context = dict(job.context) if job.context else {}
+        if job.upload_id:
+            context["upload_id"] = job.upload_id
+        if job.config_upload_id:
+            context["config_upload_id"] = job.config_upload_id
+        if job.instructions_upload_id:
+            context["instructions_upload_id"] = job.instructions_upload_id
+        if job.instructions:
+            context["instructions"] = job.instructions
+        if job.kickoff_message:
+            context["kickoff_message"] = job.kickoff_message
+
+        # Use project's default config if not specified
+        config_name = job.config_name
+        if config_name == "default" and project.get("default_config_name"):
+            config_name = project["default_config_name"]
+
+        result = await postgres_db.create_job(
+            description=job.description,
+            document_path=job.document_path,
+            document_dir=job.document_dir,
+            config_name=config_name,
+            config_override=job.config_override or project.get("default_config_override"),
+            context=context if context else None,
+            user_id=job.user_id,
+            project_id=project_id,
+        )
+
+        job_id_str = str(result["id"])
+
+        # Create branch in the jobs repo and set git_remote_url
+        branch_name = f"job/{job_id_str[:8]}"
+        repos = await postgres_db.get_project_repositories(project_id, role="jobs")
+
+        if gitea_client.is_initialized and repos:
+            jobs_repo = repos[0]
+            await gitea_client.create_branch(jobs_repo["name"], branch_name)
+
+            # Use the project's jobs repo URL directly (no separate job repo needed)
+            ctx = dict(context) if context else {}
+            ctx["git_remote_url"] = jobs_repo["repo_url"]
+            await postgres_db.update_job_context(job_id_str, ctx)
+
+        # Update job with branch name
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET branch_name = $1 WHERE id = $2",
+                branch_name, result["id"],
+            )
+
+        result["branch_name"] = branch_name
+
+        # Clone selected global datasources as job-scoped
+        if job.datasource_ids:
+            for ds_id in job.datasource_ids:
+                try:
+                    ds = await postgres_db.get_datasource(ds_id)
+                    if ds and ds.get("job_id") is None:
+                        creds = ds.get("credentials") or {}
+                        if isinstance(creds, str):
+                            try:
+                                creds = json.loads(creds)
+                            except (json.JSONDecodeError, ValueError):
+                                creds = {}
+                        await postgres_db.create_datasource(
+                            name=ds["name"],
+                            ds_type=ds["type"],
+                            connection_url=ds["connection_url"],
+                            description=ds.get("description"),
+                            credentials=creds if creds else None,
+                            read_only=ds.get("read_only", True),
+                            job_id=job_id_str,
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to clone datasource {ds_id}: {e}")
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/jobs")
+async def list_project_jobs(
+    project_id: str,
+    status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict[str, Any]]:
+    """List jobs belonging to a project."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    try:
+        async with postgres_db.acquire() as conn:
+            query = "SELECT * FROM job_summary WHERE project_id = $1"
+            params: list = [project_id]
+            if status:
+                query += " AND status = $2"
+                params.append(status)
+            query += " ORDER BY created_at DESC LIMIT $" + str(len(params) + 1)
+            params.append(limit)
+            rows = await conn.fetch(query, *params)
+
+        jobs = [dict(r) for r in rows]
+
+        # Enrich with audit counts
+        if mongodb.is_available:
+            for job in jobs:
+                job["audit_count"] = await mongodb.get_audit_count(str(job["id"]))
+        else:
+            for job in jobs:
+                job["audit_count"] = None
+
+        return jobs
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/jobs/{job_id}/merge")
+async def merge_project_job(
+    project_id: str,
+    job_id: str,
+    request: MergeRequest | None = None,
+) -> dict[str, Any]:
+    """Merge a job's branch into the project main branch via Gitea PR."""
+    if request is None:
+        request = MergeRequest()
+
+    if not gitea_client.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Gitea is not initialized — merge requires Gitea",
+        )
+
+    try:
+        # Validate job
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if str(job.get("project_id", "")) != project_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job '{job_id}' does not belong to project '{project_id}'",
+            )
+
+        if job["status"] != "completed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job must be completed to merge (status: {job['status']})",
+            )
+
+        if job.get("merge_status") == "merged":
+            raise HTTPException(
+                status_code=409,
+                detail="Job branch has already been merged",
+            )
+
+        branch_name = job.get("branch_name")
+        if not branch_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Job has no branch_name — cannot merge",
+            )
+
+        # Get the jobs repo
+        repos = await postgres_db.get_project_repositories(project_id, role="jobs")
+        if not repos:
+            raise HTTPException(
+                status_code=400,
+                detail="Project has no jobs repository configured",
+            )
+        repo_name = repos[0]["name"]
+
+        # Create PR
+        pr_title = f"Merge job {job_id[:8]}: {(job.get('description') or 'No description')[:60]}"
+        pr_body = (
+            f"**Job ID:** `{job_id}`\n"
+            f"**Branch:** `{branch_name}`\n"
+            f"**Config:** {job.get('config_name', 'default')}\n"
+            f"**Merge strategy:** {request.merge_strategy}"
+        )
+
+        pr = await gitea_client.create_pr(
+            repo_name,
+            title=pr_title,
+            head=branch_name,
+            base="main",
+            body=pr_body,
+        )
+
+        if pr is None:
+            # PR creation failed — likely no diff or branch not found
+            await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+            return {
+                "status": "skipped",
+                "job_id": job_id,
+                "reason": "PR creation failed — branch may have no changes or not exist",
+            }
+
+        # Merge the PR
+        merged = await gitea_client.merge_pr(
+            repo_name,
+            pr["number"],
+            merge_strategy=request.merge_strategy,
+            delete_branch_after_merge=request.delete_branch,
+        )
+
+        if not merged:
+            # Merge failed — likely conflict
+            await postgres_db.update_job_merge_status(job_id, merge_status="conflict")
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Merge conflict — resolve via Gitea PR UI then retry or skip",
+                    "pr_number": pr["number"],
+                    "pr_url": pr.get("url", ""),
+                },
+            )
+
+        # Success
+        await postgres_db.update_job_merge_status(job_id, merge_status="merged")
+
+        # If delete_branch was not handled by Gitea merge, do it explicitly
+        branch_deleted = request.delete_branch
+
+        logger.info(
+            f"Merged job {job_id[:8]} branch '{branch_name}' into main "
+            f"(PR #{pr['number']}, strategy: {request.merge_strategy})"
+        )
+
+        return {
+            "status": "merged",
+            "job_id": job_id,
+            "pr_number": pr["number"],
+            "pr_url": pr.get("url", ""),
+            "branch_deleted": branch_deleted,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Merge failed for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/jobs/{job_id}/skip-merge")
+async def skip_merge_project_job(
+    project_id: str,
+    job_id: str,
+) -> dict[str, Any]:
+    """Mark a job's merge as skipped (exploratory/research jobs)."""
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if str(job.get("project_id", "")) != project_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job '{job_id}' does not belong to project '{project_id}'",
+            )
+
+        if job["status"] != "completed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job must be completed to skip merge (status: {job['status']})",
+            )
+
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+
+        return {"status": "skipped", "job_id": job_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/promote")
+async def promote_job(job_id: str, request: PromoteRequest) -> dict[str, Any]:
+    """Promote a default-project job into a dedicated project.
+
+    Creates a new project, seeds its jobs repo from the job's branch content
+    (preserving git history), and moves the job to the new project.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    try:
+        # Validate job
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job["status"] != "completed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job must be completed to promote (status: {job['status']})",
+            )
+
+        # Verify job is in a default project
+        old_project_id = str(job["project_id"]) if job.get("project_id") else None
+        if not old_project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Job has no project_id — cannot determine source project",
+            )
+
+        old_project = await postgres_db.get_project(old_project_id)
+        if not old_project:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Source project '{old_project_id}' not found",
+            )
+
+        if not old_project.get("is_default"):
+            raise HTTPException(
+                status_code=400,
+                detail="Job can only be promoted from a default project",
+            )
+
+        # Create new project
+        new_project = await postgres_db.create_project(
+            name=request.name,
+            description=request.description,
+            goal=request.goal,
+        )
+        new_project_id = str(new_project["id"])
+
+        # Add user as owner
+        await postgres_db.add_project_member(
+            project_id=new_project_id,
+            user_id=request.user_id,
+            role="owner",
+        )
+
+        # Create Gitea jobs repo for the new project
+        new_repo_name = f"project-{new_project_id[:8]}-jobs"
+        new_repo_url = None
+
+        if gitea_client.is_initialized:
+            new_repo_url = await gitea_client.create_repo(new_repo_name)
+
+        if new_repo_url:
+            await postgres_db.add_project_repository(
+                project_id=new_project_id,
+                name=new_repo_name,
+                repo_url=new_repo_url,
+                role="jobs",
+                is_managed=True,
+            )
+
+            # Seed the new repo from the old job's branch content
+            branch_name = job.get("branch_name")
+            old_repos = await postgres_db.get_project_repositories(
+                old_project_id, role="jobs"
+            )
+
+            if old_repos and branch_name:
+                old_repo_url = old_repos[0]["repo_url"]
+                tmp_dir = None
+                try:
+                    tmp_dir = tempfile.mkdtemp(prefix="srw-promote-")
+                    clone_path = os.path.join(tmp_dir, "repo")
+
+                    # Clone old jobs repo at the job branch
+                    result = subprocess.run(
+                        ["git", "clone", "--branch", branch_name, old_repo_url, clone_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    if result.returncode != 0:
+                        logger.warning(
+                            f"Promote: clone failed for branch '{branch_name}': "
+                            f"{result.stderr[:200]}"
+                        )
+                        # Fall back: clone default branch
+                        result = subprocess.run(
+                            ["git", "clone", old_repo_url, clone_path],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                        if result.returncode != 0:
+                            logger.error(f"Promote: clone fallback also failed: {result.stderr[:200]}")
+
+                    if os.path.isdir(clone_path):
+                        # Add new repo as remote, push as main
+                        subprocess.run(
+                            ["git", "remote", "add", "new-origin", new_repo_url],
+                            cwd=clone_path,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        # Rename current branch to main for the new repo
+                        subprocess.run(
+                            ["git", "checkout", "-B", "main"],
+                            cwd=clone_path,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        push_result = subprocess.run(
+                            ["git", "push", "-u", "new-origin", "main"],
+                            cwd=clone_path,
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                        if push_result.returncode == 0:
+                            logger.info(
+                                f"Promote: seeded new repo '{new_repo_name}' from "
+                                f"branch '{branch_name}'"
+                            )
+                        else:
+                            logger.warning(
+                                f"Promote: push to new repo failed: "
+                                f"{push_result.stderr[:200]}"
+                            )
+                finally:
+                    if tmp_dir and os.path.exists(tmp_dir):
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        # Move job to new project
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET project_id = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                UUID(new_project_id),
+                UUID(job_id),
+            )
+
+        logger.info(
+            f"Promoted job {job_id[:8]} to project '{request.name}' ({new_project_id[:8]})"
+        )
+
+        return {
+            "status": "promoted",
+            "project_id": new_project_id,
+            "project_name": request.name,
+            "job_id": job_id,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Promote failed for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
 # Builder Session Endpoints
 # =============================================================================
 
@@ -2675,6 +3928,7 @@ async def create_builder_session(body: BuilderSessionCreate) -> dict[str, Any]:
     try:
         session = await postgres_db.create_builder_session(
             expert_id=body.expert_id,
+            user_id=body.user_id,
         )
         return session
     except Exception as e:

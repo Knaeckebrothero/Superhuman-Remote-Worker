@@ -5,6 +5,7 @@ import {
   TableInfo,
   TableDataResponse,
   ColumnDef,
+  User,
   Expert,
   ExpertDetail,
   Agent,
@@ -21,6 +22,17 @@ import {
   DatasourceCreateRequest,
   DatasourceUpdateRequest,
   DatasourceTestResult,
+  Project,
+  ProjectCreateRequest,
+  ProjectUpdateRequest,
+  ProjectMember,
+  ProjectMemberAddRequest,
+  ProjectMemberUpdateRequest,
+  ProjectRepository,
+  ProjectRepositoryCreateRequest,
+  ProjectRepositoryUpdateRequest,
+  MergeRequest,
+  PromoteRequest,
 } from '../models/api.model';
 import { UploadResponse, UploadInfo } from '../models/file.model';
 import {
@@ -86,6 +98,15 @@ export class ApiService {
   private readonly http = inject(HttpClient);
   private readonly baseUrl = environment.apiUrl;
 
+  /** CSRF token read from the csrf_token cookie after login. */
+  csrfToken: string | null = null;
+
+  /** Read the csrf_token cookie value and store it for the interceptor. */
+  readCsrfTokenFromCookie(): void {
+    const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
+    this.csrfToken = match ? decodeURIComponent(match[1]) : null;
+  }
+
   /**
    * Get list of available tables with row counts.
    */
@@ -141,12 +162,15 @@ export class ApiService {
   }
 
   /**
-   * Get list of jobs with optional status filter.
+   * Get list of jobs with optional status and user filter.
    */
-  getJobs(status?: string, limit: number = 100): Observable<JobSummary[]> {
+  getJobs(status?: string, limit: number = 100, userId?: string): Observable<JobSummary[]> {
     let params = new HttpParams().set('limit', limit.toString());
     if (status) {
       params = params.set('status', status);
+    }
+    if (userId) {
+      params = params.set('user_id', userId);
     }
 
     return this.http.get<JobSummary[]>(`${this.baseUrl}/jobs`, { params }).pipe(
@@ -359,6 +383,44 @@ export class ApiService {
         console.error(`Failed to fetch job version for ${jobId}:`, error);
         return of(null);
       }),
+    );
+  }
+
+  // ===== User Endpoints =====
+
+  /**
+   * Get list of users.
+   */
+  getUsers(): Observable<User[]> {
+    return this.http.get<User[]>(`${this.baseUrl}/users`).pipe(
+      catchError(() => of([])),
+    );
+  }
+
+  /**
+   * Create a new user.
+   */
+  createUser(body: { display_name: string; avatar_color?: string }): Observable<User | null> {
+    return this.http.post<User>(`${this.baseUrl}/users`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  /**
+   * Update a user.
+   */
+  updateUser(id: string, body: { display_name?: string; avatar_color?: string }): Observable<{ status: string } | null> {
+    return this.http.put<{ status: string }>(`${this.baseUrl}/users/${id}`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  /**
+   * Delete a user.
+   */
+  deleteUser(id: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/users/${id}`).pipe(
+      catchError(() => of(null)),
     );
   }
 
@@ -890,5 +952,131 @@ export class ApiService {
         return of([]);
       }),
     );
+  }
+
+  // ===== Project Endpoints =====
+
+  getProjects(userId?: string): Observable<Project[]> {
+    let params = new HttpParams();
+    if (userId) params = params.set('user_id', userId);
+    return this.http.get<Project[]>(`${this.baseUrl}/projects`, { params }).pipe(
+      catchError(() => of([])),
+    );
+  }
+
+  getProject(id: string): Observable<Project | null> {
+    return this.http.get<Project>(`${this.baseUrl}/projects/${id}`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  createProject(body: ProjectCreateRequest): Observable<Project | null> {
+    return this.http.post<Project>(`${this.baseUrl}/projects`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  updateProject(id: string, body: ProjectUpdateRequest): Observable<{ status: string } | null> {
+    return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  deleteProject(id: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/projects/${id}`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  getProjectMembers(id: string): Observable<ProjectMember[]> {
+    return this.http.get<ProjectMember[]>(`${this.baseUrl}/projects/${id}/members`).pipe(
+      catchError(() => of([])),
+    );
+  }
+
+  addProjectMember(id: string, body: ProjectMemberAddRequest): Observable<ProjectMember | null> {
+    return this.http.post<ProjectMember>(`${this.baseUrl}/projects/${id}/members`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  updateProjectMember(id: string, userId: string, body: ProjectMemberUpdateRequest): Observable<{ status: string } | null> {
+    return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}/members/${userId}`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  removeProjectMember(id: string, userId: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/projects/${id}/members/${userId}`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  getProjectRepositories(id: string): Observable<ProjectRepository[]> {
+    return this.http.get<ProjectRepository[]>(`${this.baseUrl}/projects/${id}/repositories`).pipe(
+      catchError(() => of([])),
+    );
+  }
+
+  addProjectRepository(id: string, body: ProjectRepositoryCreateRequest): Observable<ProjectRepository | null> {
+    return this.http.post<ProjectRepository>(`${this.baseUrl}/projects/${id}/repositories`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  updateProjectRepository(id: string, repoId: string, body: ProjectRepositoryUpdateRequest): Observable<{ status: string } | null> {
+    return this.http.patch<{ status: string }>(`${this.baseUrl}/projects/${id}/repositories/${repoId}`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  removeProjectRepository(id: string, repoId: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(`${this.baseUrl}/projects/${id}/repositories/${repoId}`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  getProjectExperts(projectId: string): Observable<Expert[]> {
+    return this.http.get<Expert[]>(`${this.baseUrl}/projects/${projectId}/experts`).pipe(
+      catchError(() => of([])),
+    );
+  }
+
+  getProjectExpertDetail(projectId: string, expertName: string): Observable<ExpertDetail | null> {
+    return this.http.get<ExpertDetail>(`${this.baseUrl}/projects/${projectId}/experts/${expertName}`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  getProjectJobs(id: string, status?: string, limit: number = 100): Observable<Job[]> {
+    let params = new HttpParams().set('limit', limit.toString());
+    if (status) params = params.set('status', status);
+    return this.http.get<Job[]>(`${this.baseUrl}/projects/${id}/jobs`, { params }).pipe(
+      catchError(() => of([])),
+    );
+  }
+
+  createProjectJob(id: string, body: JobCreateRequest): Observable<Job | null> {
+    return this.http.post<Job>(`${this.baseUrl}/projects/${id}/jobs`, body).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  mergeProjectJob(projectId: string, jobId: string, body?: MergeRequest): Observable<{ status: string; merge_status?: string } | null> {
+    return this.http.post<{ status: string; merge_status?: string }>(
+      `${this.baseUrl}/projects/${projectId}/jobs/${jobId}/merge`, body ?? {},
+    ).pipe(catchError(() => of(null)));
+  }
+
+  skipMergeProjectJob(projectId: string, jobId: string): Observable<{ status: string } | null> {
+    return this.http.post<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/jobs/${jobId}/skip-merge`, {},
+    ).pipe(catchError(() => of(null)));
+  }
+
+  promoteJob(jobId: string, body: PromoteRequest): Observable<{ status: string; project_id?: string } | null> {
+    return this.http.post<{ status: string; project_id?: string }>(
+      `${this.baseUrl}/jobs/${jobId}/promote`, body,
+    ).pipe(catchError(() => of(null)));
   }
 }

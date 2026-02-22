@@ -1,11 +1,12 @@
 import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
 import { ApiService } from '../../core/services/api.service';
 import { DataService } from '../../core/services/data.service';
+import { UserService } from '../../core/services/user.service';
 import { environment } from '../../core/environment';
 import { JobStatus } from '../../core/models/api.model';
 import { JobSummary } from '../../core/models/audit.model';
 
-type StatusFilter = 'all' | JobStatus;
+type StatusFilter = 'all' | 'mine' | JobStatus;
 
 /**
  * Job List component that displays jobs with filtering and actions.
@@ -26,7 +27,7 @@ type StatusFilter = 'all' | JobStatus;
               (click)="setFilter(filter.value)"
             >
               {{ filter.label }}
-              @if (filter.value !== 'all') {
+              @if (filter.value !== 'all' && filter.value !== 'mine') {
                 <span class="count">({{ getStatusCount(filter.value) }})</span>
               }
             </button>
@@ -84,6 +85,13 @@ type StatusFilter = 'all' | JobStatus;
                   </td>
                   <td class="prompt-cell">
                     <span class="prompt-text" [title]="job.description">
+                      @if (getUserColor(job.user_id)) {
+                        <span
+                          class="user-dot"
+                          [style.background]="getUserColor(job.user_id)"
+                          [title]="getUserName(job.user_id)"
+                        ></span>
+                      }
                       {{ truncatePrompt(job.description) }}
                     </span>
                     <span class="job-id">{{ job.id.slice(0, 8) }}...</span>
@@ -143,6 +151,15 @@ type StatusFilter = 'all' | JobStatus;
                         Resume
                       </button>
                     }
+                    @if (job.status === 'completed' && !job.project_id) {
+                      <button
+                        class="action-btn promote"
+                        (click)="togglePromote(job.id); $event.stopPropagation()"
+                        title="Promote to project"
+                      >
+                        Promote
+                      </button>
+                    }
                     @if (job.status !== 'processing') {
                       <button
                         class="action-btn delete"
@@ -154,6 +171,45 @@ type StatusFilter = 'all' | JobStatus;
                     }
                   </td>
                 </tr>
+                @if (promoteJobId() === job.id) {
+                  <tr class="promote-row" (click)="$event.stopPropagation()">
+                    <td colspan="5">
+                      <div class="promote-form">
+                        <input
+                          class="promote-input"
+                          placeholder="Project name (required)"
+                          [value]="promoteName()"
+                          (input)="promoteName.set(asInputValue($event))"
+                        />
+                        <input
+                          class="promote-input"
+                          placeholder="Description"
+                          [value]="promoteDescription()"
+                          (input)="promoteDescription.set(asInputValue($event))"
+                        />
+                        <input
+                          class="promote-input"
+                          placeholder="Goal"
+                          [value]="promoteGoal()"
+                          (input)="promoteGoal.set(asInputValue($event))"
+                        />
+                        <button
+                          class="action-btn promote"
+                          [disabled]="!promoteName().trim()"
+                          (click)="submitPromote(job.id)"
+                        >
+                          Create Project
+                        </button>
+                        <button
+                          class="action-btn cancel"
+                          (click)="promoteJobId.set(null)"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                }
               }
             </tbody>
           </table>
@@ -387,6 +443,17 @@ type StatusFilter = 'all' | JobStatus;
         font-weight: 600;
       }
 
+      /* User dot */
+      .user-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 4px;
+        vertical-align: middle;
+        flex-shrink: 0;
+      }
+
       /* Prompt Cell */
       .prompt-cell {
         max-width: 300px;
@@ -482,6 +549,16 @@ type StatusFilter = 'all' | JobStatus;
         text-decoration: none;
       }
 
+      .action-btn.promote {
+        color: #94e2d5;
+        border-color: #94e2d5;
+      }
+
+      .action-btn.promote:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+
       .action-btn:hover {
         background: rgba(255, 255, 255, 0.1);
       }
@@ -499,6 +576,34 @@ type StatusFilter = 'all' | JobStatus;
       .job-count {
         font-size: 11px;
         color: var(--text-muted, #6c7086);
+      }
+
+      .promote-row td {
+        padding: 0 12px 10px !important;
+        border-bottom: 1px solid var(--border-color, #313244);
+      }
+
+      .promote-form {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        padding: 8px 0;
+      }
+
+      .promote-input {
+        padding: 5px 8px;
+        background: var(--surface-0, #313244);
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 4px;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 11px;
+        font-family: inherit;
+        outline: none;
+      }
+
+      .promote-input:focus {
+        border-color: var(--accent-color, #cba6f7);
       }
 
       @media (max-width: 768px) {
@@ -521,16 +626,24 @@ type StatusFilter = 'all' | JobStatus;
 export class JobListComponent implements OnInit, OnDestroy {
   private readonly api = inject(ApiService);
   private readonly data = inject(DataService);
+  private readonly userService = inject(UserService);
 
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
   readonly activeFilter = signal<StatusFilter>('all');
   readonly selectedJobId = signal<string | null>(null);
 
+  // Promote form state
+  readonly promoteJobId = signal<string | null>(null);
+  readonly promoteName = signal('');
+  readonly promoteDescription = signal('');
+  readonly promoteGoal = signal('');
+
   private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
   readonly statusFilters: { label: string; value: StatusFilter }[] = [
     { label: 'All', value: 'all' },
+    { label: 'Mine', value: 'mine' },
     { label: 'Review', value: 'pending_review' },
     { label: 'Created', value: 'created' },
     { label: 'Processing', value: 'processing' },
@@ -545,6 +658,11 @@ export class JobListComponent implements OnInit, OnDestroy {
 
     if (filter === 'all') {
       return allJobs;
+    }
+    if (filter === 'mine') {
+      const userId = this.userService.currentUserId();
+      if (!userId) return allJobs;
+      return allJobs.filter((job) => job.user_id === userId);
     }
     return allJobs.filter((job) => job.status === filter);
   });
@@ -577,7 +695,7 @@ export class JobListComponent implements OnInit, OnDestroy {
     this.activeFilter.set(filter);
   }
 
-  getStatusCount(status: JobStatus): number {
+  getStatusCount(status: string): number {
     return this.jobs().filter((job) => job.status === status).length;
   }
 
@@ -629,6 +747,52 @@ export class JobListComponent implements OnInit, OnDestroy {
         }
       }
     });
+  }
+
+  togglePromote(jobId: string): void {
+    if (this.promoteJobId() === jobId) {
+      this.promoteJobId.set(null);
+    } else {
+      this.promoteJobId.set(jobId);
+      this.promoteName.set('');
+      this.promoteDescription.set('');
+      this.promoteGoal.set('');
+    }
+  }
+
+  submitPromote(jobId: string): void {
+    const name = this.promoteName().trim();
+    if (!name) return;
+    const userId = this.userService.currentUserId();
+    if (!userId) return;
+
+    this.api.promoteJob(jobId, {
+      name,
+      description: this.promoteDescription().trim() || undefined,
+      goal: this.promoteGoal().trim() || undefined,
+      user_id: userId,
+    }).subscribe((result) => {
+      if (result) {
+        this.promoteJobId.set(null);
+        this.refresh();
+      }
+    });
+  }
+
+  asInputValue(event: Event): string {
+    return (event.target as HTMLInputElement).value;
+  }
+
+  getUserColor(userId?: string | null): string | null {
+    if (!userId) return null;
+    const user = this.userService.users().find((u) => u.id === userId);
+    return user?.avatar_color ?? null;
+  }
+
+  getUserName(userId?: string | null): string {
+    if (!userId) return 'Unassigned';
+    const user = this.userService.users().find((u) => u.id === userId);
+    return user?.display_name ?? 'Unknown';
   }
 
   truncatePrompt(prompt: string | undefined, maxLength: number = 80): string {

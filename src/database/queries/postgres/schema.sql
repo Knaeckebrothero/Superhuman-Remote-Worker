@@ -300,7 +300,100 @@ VALUES (1, 'Initial schema with sources and citations tables')
 ON CONFLICT (version) DO NOTHING;
 
 -- ============================================================================
--- 5. HELPER FUNCTIONS
+-- 5. MEMORIES TABLE (Memory Light — RecallStore)
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS memories (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    agent_id VARCHAR(100),
+
+    -- Content
+    content TEXT NOT NULL,
+    summary VARCHAR(500),
+
+    -- Classification
+    memory_type VARCHAR(50) DEFAULT 'factual',
+    source VARCHAR(50) DEFAULT 'observer',
+
+    -- Search channels
+    keywords TEXT[] DEFAULT '{}',
+    embedding vector(1536),
+    sparse_keywords TSVECTOR,
+
+    -- Scoring
+    importance FLOAT DEFAULT 0.5,
+
+    -- Provenance
+    source_turn_start INT,
+    source_turn_end INT,
+    source_phase INT,
+
+    -- Budget tracking
+    token_count INT DEFAULT 0,
+    access_count INT DEFAULT 0,
+
+    -- Timestamps
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_accessed TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_memory_type CHECK (memory_type IN ('factual', 'procedural', 'error_solution', 'vocabulary', 'relational')),
+    CONSTRAINT valid_memory_source CHECK (source IN ('observer', 'todo', 'compaction', 'phase_archive', 'tool_error'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_job ON memories(job_id);
+CREATE INDEX IF NOT EXISTS idx_memories_job_importance ON memories(job_id, importance DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_job_accessed ON memories(job_id, last_accessed DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_job_type ON memories(job_id, memory_type);
+CREATE INDEX IF NOT EXISTS idx_memories_keywords ON memories USING GIN(keywords);
+CREATE INDEX IF NOT EXISTS idx_memories_sparse ON memories USING GIN(sparse_keywords);
+CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+
+-- Hybrid search function: RRF-based fusion of dense, sparse, and recency channels
+CREATE OR REPLACE FUNCTION memory_hybrid_search(
+    query_text text,
+    query_embedding vector(1536),
+    job_id_param uuid,
+    match_count int DEFAULT 10,
+    dense_weight float DEFAULT 0.6,
+    sparse_weight float DEFAULT 0.3,
+    recency_weight float DEFAULT 0.1,
+    rrf_k int DEFAULT 50
+) RETURNS SETOF memories LANGUAGE sql AS $$
+WITH dense AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
+    FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+sparse AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    FROM memories WHERE job_id = job_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text)
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+recent AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
+    FROM memories WHERE job_id = job_id_param
+    ORDER BY rank_ix LIMIT match_count
+)
+SELECT memories.* FROM (
+    SELECT COALESCE(d.id, s.id, r.id) AS mid,
+        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
+        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
+        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+    FROM dense d
+    FULL OUTER JOIN sparse s ON d.id = s.id
+    FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
+) ranked
+JOIN memories ON ranked.mid = memories.id
+ORDER BY ranked.rrf_score DESC
+LIMIT match_count
+$$;
+
+-- ============================================================================
+-- 6. HELPER FUNCTIONS
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -312,7 +405,7 @@ END;
 $$ language 'plpgsql';
 
 -- ============================================================================
--- 6. TRIGGERS
+-- 7. TRIGGERS
 -- ============================================================================
 
 DROP TRIGGER IF EXISTS update_jobs_updated_at ON jobs;
@@ -326,7 +419,7 @@ CREATE TRIGGER update_requirements_updated_at
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
--- 7. VIEWS
+-- 8. VIEWS
 -- ============================================================================
 
 CREATE OR REPLACE VIEW job_summary AS

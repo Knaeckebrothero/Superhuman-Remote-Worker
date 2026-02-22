@@ -68,6 +68,9 @@ class ToolContext:
     _current_phase: Optional[str] = None
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
     _instruction_files: List[Any] = field(default_factory=list)  # List[InstructionFileEntry]
+    recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
+    memory_observer: Optional[Any] = None  # MemoryObserver instance (Memory Light Phase 3)
+    _pending_memories: List[Dict[str, Any]] = field(default_factory=list)  # Sync-safe memory queue
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -314,6 +317,50 @@ class ToolContext:
             return None
 
         return relative_path
+
+    def queue_memory(
+        self,
+        content: str,
+        keywords: Optional[List[str]] = None,
+        importance: float = 0.5,
+        source: str = "observer",
+        source_phase: Optional[int] = None,
+        memory_type: str = "factual",
+    ) -> None:
+        """Queue a memory for async storage by the graph's audited_tools node.
+
+        This is sync-safe — can be called from ``@tool`` functions which run
+        synchronously. The actual async ``RecallStore.store()`` happens when
+        ``drain_pending_memories()`` is called from the async graph node.
+
+        Args:
+            content: Memory content text
+            keywords: Keywords for sparse search
+            importance: Importance score 0-1
+            source: Memory source (todo, compaction, phase_archive, tool_error)
+            source_phase: Phase number when memory was created
+            memory_type: factual, procedural, error_solution, vocabulary, relational
+        """
+        self._pending_memories.append({
+            "content": content,
+            "keywords": keywords,
+            "importance": importance,
+            "source": source,
+            "source_phase": source_phase,
+            "memory_type": memory_type,
+        })
+
+    def drain_pending_memories(self) -> List[Dict[str, Any]]:
+        """Return and clear all pending memories.
+
+        Called from async graph nodes to flush queued memories into RecallStore.
+
+        Returns:
+            List of memory dicts ready for RecallStore.store(**mem)
+        """
+        pending = self._pending_memories[:]
+        self._pending_memories.clear()
+        return pending
 
     def close_citation_engine(self) -> None:
         """Close CitationEngine connection if open.

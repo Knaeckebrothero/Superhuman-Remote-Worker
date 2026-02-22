@@ -1,9 +1,11 @@
 import { Component, computed, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { ActivatedRoute } from '@angular/router';
 import { ApiService } from '../../core/services/api.service';
 import { FileHandlingService } from '../../core/services/file-handling.service';
 import { JobArtifactService } from '../../core/services/job-artifact.service';
-import { JobCreateRequest, Expert, ExpertDetail, Datasource, DatasourceType } from '../../core/models/api.model';
+import { UserService } from '../../core/services/user.service';
+import { JobCreateRequest, Expert, ExpertDetail, Datasource, DatasourceType, Project } from '../../core/models/api.model';
 import { FilePreview, FileType, UploadStatus } from '../../core/models/file.model';
 import { environment } from '../../core/environment';
 
@@ -38,6 +40,28 @@ import { environment } from '../../core/environment';
         }
 
         <form (ngSubmit)="onSubmit()" #jobForm="ngForm">
+          <!-- Project Selector -->
+          @if (projects().length > 1) {
+            <div class="form-group">
+              <label for="project" class="form-label">Project</label>
+              <select
+                id="project"
+                name="project"
+                class="form-input"
+                [ngModel]="selectedProjectId()"
+                (ngModelChange)="selectedProjectId.set($event)"
+                [disabled]="isSubmitting()"
+              >
+                @for (proj of projects(); track proj.id) {
+                  <option [value]="proj.id">
+                    {{ proj.name }}@if (proj.is_default) { (Personal)}
+                  </option>
+                }
+              </select>
+              <span class="field-hint">Select which project this job belongs to</span>
+            </div>
+          }
+
           <!-- Description Field (Required) -->
           <div class="form-group">
             <label for="description" class="form-label">
@@ -1434,6 +1458,8 @@ import { environment } from '../../core/environment';
 })
 export class JobCreateComponent implements OnInit {
   private readonly api = inject(ApiService);
+  private readonly route = inject(ActivatedRoute);
+  private readonly userService = inject(UserService);
   readonly fileService = inject(FileHandlingService);
   readonly artifacts = inject(JobArtifactService);
 
@@ -1523,6 +1549,10 @@ export class JobCreateComponent implements OnInit {
   // Advanced section state
   readonly showAdvanced = signal(false);
 
+  // Project selector state
+  readonly projects = signal<Project[]>([]);
+  readonly selectedProjectId = signal<string | null>(null);
+
   // Datasource picker state
   readonly availableDatasources = signal<Datasource[]>([]);
   readonly selectedDatasourceIds = signal<Set<string>>(new Set());
@@ -1540,6 +1570,7 @@ export class JobCreateComponent implements OnInit {
   ngOnInit(): void {
     this.loadExperts();
     this.loadDatasources();
+    this.loadProjects();
   }
 
   private loadExperts(): void {
@@ -1857,6 +1888,22 @@ export class JobCreateComponent implements OnInit {
     });
   }
 
+  private loadProjects(): void {
+    const userId = this.userService.currentUserId();
+    this.api.getProjects(userId ?? undefined).subscribe((projects) => {
+      this.projects.set(projects);
+      // Check for ?project= query param (from "New Job" button on project detail)
+      const qp = this.route.snapshot.queryParamMap.get('project');
+      if (qp && projects.some((p) => p.id === qp)) {
+        this.selectedProjectId.set(qp);
+      } else {
+        // Default to user's default project
+        const defaultProject = projects.find((p) => p.is_default);
+        this.selectedProjectId.set(defaultProject?.id ?? projects[0]?.id ?? null);
+      }
+    });
+  }
+
   toggleDatasource(id: string): void {
     this.selectedDatasourceIds.update((current) => {
       const next = new Set(current);
@@ -2006,6 +2053,18 @@ export class JobCreateComponent implements OnInit {
       request.builder_session_id = builderSessionId;
     }
 
+    // Attach project
+    const projectId = this.selectedProjectId();
+    if (projectId) {
+      request.project_id = projectId;
+    }
+
+    // Attach current user
+    const currentUserId = this.userService.currentUserId();
+    if (currentUserId) {
+      request.user_id = currentUserId;
+    }
+
     this.api.createJob(request).subscribe({
       next: (job) => {
         this.isSubmitting.set(false);
@@ -2110,6 +2169,9 @@ export class JobCreateComponent implements OnInit {
     this.showAdvanced.set(false);
     // Reset datasource selections
     this.selectedDatasourceIds.set(new Set());
+    // Reset project to default
+    const defaultProject = this.projects().find((p) => p.is_default);
+    this.selectedProjectId.set(defaultProject?.id ?? this.projects()[0]?.id ?? null);
     // Reset artifact service (clears builder session)
     this.artifacts.reset();
   }

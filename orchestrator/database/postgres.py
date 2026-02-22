@@ -34,10 +34,10 @@ QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 
 # Tables exposed to the cockpit
-ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "sources", "citations"})
+ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "sources", "citations", "users", "projects", "project_members", "project_repositories"})
 
 # Required tables that must exist for the orchestrator to function
-REQUIRED_TABLES = ["jobs", "agents", "requirements", "datasources", "sources", "citations", "builder_sessions", "builder_messages"]
+REQUIRED_TABLES = ["users", "sessions", "projects", "project_members", "project_repositories", "jobs", "agents", "requirements", "datasources", "sources", "citations", "builder_sessions", "builder_messages", "memories"]
 
 # Column type mapping from PostgreSQL types to frontend-friendly types
 PG_TYPE_MAP = {
@@ -142,14 +142,24 @@ class PostgresDB:
         """Establish async connection pool.
 
         Creates an asyncpg connection pool with configured size and timeout.
+        Registers pgvector type codec on each connection if available.
         This method is idempotent - safe to call multiple times.
         """
         if self._pool is None:
+            async def _init_connection(conn):
+                """Register pgvector type codec on new connections."""
+                try:
+                    from pgvector.asyncpg import register_vector
+                    await register_vector(conn)
+                except ImportError:
+                    pass  # pgvector not installed, skip registration
+
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
                 min_size=self._min_connections,
                 max_size=self._max_connections,
-                command_timeout=self._command_timeout
+                command_timeout=self._command_timeout,
+                init=_init_connection,
             )
             logger.info(
                 f"PostgreSQL connection pool established "
@@ -420,42 +430,50 @@ class PostgresDB:
     async def get_jobs(
         self,
         status: str | None = None,
+        user_id: str | None = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
-        """Get list of jobs with optional status filter.
+        """Get list of jobs with optional status and user filter.
 
         Args:
             status: Optional status filter (e.g., 'completed', 'processing')
+            user_id: Optional user ID filter
             limit: Maximum number of jobs to return
 
         Returns:
-            List of job dicts with id, description, status, creator_status, validator_status, created_at
+            List of job dicts with id, description, status, creator_status, validator_status, created_at, user_id
         """
+        conditions = []
+        values = []
+        param_count = 0
+
+        if status:
+            param_count += 1
+            conditions.append(f"status = ${param_count}")
+            values.append(status)
+
+        if user_id:
+            param_count += 1
+            conditions.append(f"user_id = ${param_count}")
+            values.append(UUID(user_id))
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        param_count += 1
+        values.append(limit)
+
         async with self.acquire() as conn:
-            if status:
-                rows = await conn.fetch(
-                    """
-                    SELECT id, description, status, creator_status, validator_status,
-                           config_name, assigned_agent_id, created_at
-                    FROM jobs
-                    WHERE status = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                    """,
-                    status,
-                    limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT id, description, status, creator_status, validator_status,
-                           config_name, assigned_agent_id, created_at
-                    FROM jobs
-                    ORDER BY created_at DESC
-                    LIMIT $1
-                    """,
-                    limit,
-                )
+            rows = await conn.fetch(
+                f"""
+                SELECT id, description, status, creator_status, validator_status,
+                       config_name, assigned_agent_id, user_id,
+                       project_id, branch_name, merge_status, created_at
+                FROM jobs
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ${param_count}
+                """,
+                *values,
+            )
 
         return [dict(row) for row in rows]
 
@@ -478,7 +496,8 @@ class PostgresDB:
                 """
                 SELECT id, status, creator_status, validator_status,
                        config_name, config_override, resolved_config,
-                       assigned_agent_id,
+                       assigned_agent_id, user_id,
+                       project_id, branch_name, merge_status, repo_merge_statuses,
                        created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1
@@ -496,6 +515,9 @@ class PostgresDB:
         config_name: str = "default",
         config_override: Dict[str, Any] | None = None,
         context: Dict[str, Any] | None = None,
+        user_id: str | None = None,
+        project_id: str | None = None,
+        branch_name: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -506,16 +528,22 @@ class PostgresDB:
             config_name: Agent configuration name (default: "default")
             config_override: Optional per-job configuration overrides
             context: Optional context dictionary
+            user_id: Optional user UUID who created this job
+            project_id: Optional project UUID this job belongs to
+            branch_name: Optional git branch name for this job
 
         Returns:
             Created job dict with id
         """
+        user_uuid = UUID(user_id) if user_id else None
+        project_uuid = UUID(project_id) if project_id else None
+
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, created_at, updated_at, description
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, branch_name, created_at, updated_at, description
                 """,
                 description,
                 document_path or document_dir,
@@ -525,6 +553,9 @@ class PostgresDB:
                 "created",
                 "pending",
                 "pending",
+                user_uuid,
+                project_uuid,
+                branch_name,
             )
 
         return dict(row)
@@ -634,6 +665,55 @@ class PostgresDB:
             param_count += 1
             updates.append(f"assigned_agent_id = ${param_count}")
             values.append(UUID(assigned_agent_id) if assigned_agent_id else None)
+
+        if not updates:
+            return False
+
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        param_count += 1
+        values.append(uuid_val)
+
+        query = f"UPDATE jobs SET {', '.join(updates)} WHERE id = ${param_count}"
+
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def update_job_merge_status(
+        self,
+        job_id: str,
+        merge_status: str | None = None,
+        repo_merge_statuses: dict | None = None,
+    ) -> bool:
+        """Update merge-related columns on a job.
+
+        Args:
+            job_id: Job UUID as string
+            merge_status: New merge status (e.g. merged, conflict, skipped)
+            repo_merge_statuses: Per-source-repo merge status JSONB dict
+
+        Returns:
+            True if updated, False if not found
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        updates = []
+        values = []
+        param_count = 0
+
+        if merge_status is not None:
+            param_count += 1
+            updates.append(f"merge_status = ${param_count}")
+            values.append(merge_status)
+
+        if repo_merge_statuses is not None:
+            param_count += 1
+            updates.append(f"repo_merge_statuses = ${param_count}")
+            values.append(json.dumps(repo_merge_statuses))
 
         if not updates:
             return False
@@ -1443,15 +1523,16 @@ class PostgresDB:
         return result == "DELETE 1"
 
     async def resolve_datasources_for_job(
-        self, job_id: str
+        self, job_id: str, project_id: str | None = None
     ) -> List[Dict[str, Any]]:
-        """Resolve datasources for a job (job-specific takes precedence over global).
+        """Resolve datasources for a job (job > project > global).
 
-        For each datasource type, returns the job-specific one if it exists,
-        otherwise falls back to the global one.
+        For each datasource type, returns the most specific one:
+        job-specific first, then project-level, then global.
 
         Args:
             job_id: Job UUID
+            project_id: Optional project UUID for project-level datasources
 
         Returns:
             List of resolved datasource dicts (one per type)
@@ -1461,18 +1542,38 @@ class PostgresDB:
         except ValueError:
             return []
 
+        project_uuid = UUID(project_id) if project_id else None
+
         async with self.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT DISTINCT ON (type)
-                    id, name, description, type, connection_url, credentials,
-                    read_only, job_id, created_at, updated_at
-                FROM datasources
-                WHERE job_id = $1 OR job_id IS NULL
-                ORDER BY type, job_id NULLS LAST
-                """,
-                uuid_val,
-            )
+            if project_uuid:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (type)
+                        id, name, description, type, connection_url, credentials,
+                        read_only, job_id, project_id, created_at, updated_at
+                    FROM datasources
+                    WHERE job_id = $1 OR project_id = $2 OR (job_id IS NULL AND project_id IS NULL)
+                    ORDER BY type,
+                             CASE WHEN job_id IS NOT NULL THEN 0
+                                  WHEN project_id IS NOT NULL THEN 1
+                                  ELSE 2
+                             END
+                    """,
+                    uuid_val,
+                    project_uuid,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT ON (type)
+                        id, name, description, type, connection_url, credentials,
+                        read_only, job_id, project_id, created_at, updated_at
+                    FROM datasources
+                    WHERE job_id = $1 OR job_id IS NULL
+                    ORDER BY type, job_id NULLS LAST
+                    """,
+                    uuid_val,
+                )
 
         return [dict(row) for row in rows]
 
@@ -1503,9 +1604,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO datasources (name, type, connection_url, credentials, read_only, job_id)
-                VALUES ($1, $2, $3, $4, $5, NULL)
-                ON CONFLICT (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'))
+                INSERT INTO datasources (name, type, connection_url, credentials, read_only, job_id, project_id)
+                VALUES ($1, $2, $3, $4, $5, NULL, NULL)
+                ON CONFLICT (type, COALESCE(job_id, '00000000-0000-0000-0000-000000000000'), COALESCE(project_id, '00000000-0000-0000-0000-000000000000'))
                 DO UPDATE SET
                     name = EXCLUDED.name,
                     connection_url = EXCLUDED.connection_url,
@@ -1524,29 +1625,988 @@ class PostgresDB:
         return dict(row)
 
     # =========================================================================
+    # SESSION OPERATIONS
+    # =========================================================================
+
+    async def create_session(
+        self,
+        session_key: str,
+        user_id: str,
+        email: str,
+        expires_at: datetime,
+        csrf_token: str,
+    ) -> None:
+        """Create a new session.
+
+        Args:
+            session_key: Unique session key
+            user_id: User UUID as string
+            email: User's email
+            expires_at: Session expiration timestamp
+            csrf_token: CSRF token for this session
+        """
+        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sessions (session_key, user_id, email, expires_at, csrf_token)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                session_key,
+                user_uuid,
+                email,
+                expires_at,
+                csrf_token,
+            )
+
+    async def get_session(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Get a valid (non-expired) session by key.
+
+        Args:
+            session_key: Session key
+
+        Returns:
+            Session dict or None if not found/expired
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT session_key, user_id, email, created_at, expires_at,
+                       last_activity, csrf_token
+                FROM sessions
+                WHERE session_key = $1 AND expires_at > NOW()
+                """,
+                session_key,
+            )
+
+        return dict(row) if row else None
+
+    async def update_session_activity(self, session_key: str) -> None:
+        """Update last_activity timestamp for a session."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE sessions SET last_activity = NOW() WHERE session_key = $1",
+                session_key,
+            )
+
+    async def delete_session(self, session_key: str) -> None:
+        """Delete a session by key."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM sessions WHERE session_key = $1",
+                session_key,
+            )
+
+    async def delete_expired_sessions(self) -> None:
+        """Delete all expired sessions."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM sessions WHERE expires_at < NOW()"
+            )
+            if result != "DELETE 0":
+                logger.debug(f"Cleaned up expired sessions: {result}")
+
+    async def delete_sessions_by_user(self, user_id: str) -> None:
+        """Delete all sessions for a user."""
+        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+
+        async with self.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM sessions WHERE user_id = $1",
+                user_uuid,
+            )
+
+    # =========================================================================
+    # USER OPERATIONS
+    # =========================================================================
+
+    async def list_users(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """List all users.
+
+        Args:
+            limit: Maximum users to return
+
+        Returns:
+            List of user dicts ordered by created_at ASC
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                FROM users
+                ORDER BY created_at ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def get_user(self, user_id: str) -> Dict[str, Any] | None:
+        """Get a single user by ID.
+
+        Args:
+            user_id: User UUID as string
+
+        Returns:
+            User dict or None if not found
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                FROM users
+                WHERE id = $1
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
+
+    async def get_user_by_email(self, email: str) -> Dict[str, Any] | None:
+        """Get a user by email (case-insensitive).
+
+        Args:
+            email: Email address to look up
+
+        Returns:
+            User dict or None if not found
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                FROM users
+                WHERE LOWER(email) = LOWER($1)
+                """,
+                email,
+            )
+
+        return dict(row) if row else None
+
+    async def create_user(
+        self,
+        display_name: str,
+        avatar_color: str = "#89b4fa",
+        email: str | None = None,
+    ) -> Dict[str, Any]:
+        """Create a new user.
+
+        Args:
+            display_name: User's display name
+            avatar_color: Hex color for avatar dot
+            email: Optional email address
+
+        Returns:
+            Created user dict
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users (display_name, avatar_color, email)
+                VALUES ($1, $2, $3)
+                RETURNING id, display_name, avatar_color, email, created_at
+                """,
+                display_name,
+                avatar_color,
+                email,
+            )
+
+        return dict(row)
+
+    async def update_user(
+        self,
+        user_id: str,
+        display_name: str | None = None,
+        avatar_color: str | None = None,
+        email: str | None = None,
+    ) -> bool:
+        """Update a user.
+
+        Args:
+            user_id: User UUID
+            display_name: New display name
+            avatar_color: New avatar color
+            email: New email address
+
+        Returns:
+            True if updated, False if not found
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except ValueError:
+            return False
+
+        updates = []
+        values = []
+        param_count = 0
+
+        if display_name is not None:
+            param_count += 1
+            updates.append(f"display_name = ${param_count}")
+            values.append(display_name)
+
+        if avatar_color is not None:
+            param_count += 1
+            updates.append(f"avatar_color = ${param_count}")
+            values.append(avatar_color)
+
+        if email is not None:
+            param_count += 1
+            updates.append(f"email = ${param_count}")
+            values.append(email)
+
+        if not updates:
+            return False
+
+        param_count += 1
+        values.append(uuid_val)
+
+        query = f"UPDATE users SET {', '.join(updates)} WHERE id = ${param_count}"
+
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def delete_user(self, user_id: str) -> bool:
+        """Delete a user.
+
+        Args:
+            user_id: User UUID
+
+        Returns:
+            True if deleted, False if not found
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM users WHERE id = $1",
+                uuid_val,
+            )
+
+        return result == "DELETE 1"
+
+    async def upsert_default_user(
+        self,
+        display_name: str,
+        avatar_color: str = "#89b4fa",
+        email: str | None = None,
+    ) -> Dict[str, Any]:
+        """Create a default user if one with the same display_name doesn't exist.
+
+        Used during init seeding. If the user exists and email is provided,
+        updates the email if it's currently NULL.
+
+        Args:
+            display_name: User's display name
+            avatar_color: Hex color for avatar dot
+            email: Optional email address
+
+        Returns:
+            Existing or newly created user dict
+        """
+        async with self.acquire() as conn:
+            # Check if user with this name already exists
+            existing = await conn.fetchrow(
+                "SELECT id, display_name, avatar_color, email, created_at FROM users WHERE display_name = $1",
+                display_name,
+            )
+            if existing:
+                # Update email if provided and currently NULL
+                if email and existing["email"] is None:
+                    await conn.execute(
+                        "UPDATE users SET email = $1 WHERE id = $2",
+                        email,
+                        existing["id"],
+                    )
+                    return {**dict(existing), "email": email}
+                return dict(existing)
+
+            # Create new user
+            row = await conn.fetchrow(
+                """
+                INSERT INTO users (display_name, avatar_color, email)
+                VALUES ($1, $2, $3)
+                RETURNING id, display_name, avatar_color, email, created_at
+                """,
+                display_name,
+                avatar_color,
+                email,
+            )
+
+        return dict(row)
+
+    # =========================================================================
+    # PROJECT OPERATIONS
+    # =========================================================================
+
+    async def create_project(
+        self,
+        name: str,
+        description: str | None = None,
+        goal: str | None = None,
+        is_default: bool = False,
+        default_config_name: str | None = None,
+        default_config_override: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Create a new project.
+
+        Args:
+            name: Project name
+            description: What this project is about
+            goal: Success criteria
+            is_default: Whether this is a user's default project
+            default_config_name: Default agent config for new jobs
+            default_config_override: Default config overrides for new jobs
+
+        Returns:
+            Created project dict
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO projects (name, description, goal, is_default,
+                                      default_config_name, default_config_override)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, name, description, goal, status, is_default,
+                          default_config_name, default_config_override,
+                          created_at, updated_at
+                """,
+                name,
+                description,
+                goal,
+                is_default,
+                default_config_name,
+                json.dumps(default_config_override) if default_config_override else None,
+            )
+
+        return dict(row)
+
+    async def get_project(self, project_id: str) -> Dict[str, Any] | None:
+        """Get a single project by ID.
+
+        Args:
+            project_id: Project UUID as string
+
+        Returns:
+            Project dict or None if not found
+        """
+        try:
+            uuid_val = UUID(project_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, name, description, goal, status, is_default,
+                       default_config_name, default_config_override,
+                       created_at, updated_at
+                FROM projects
+                WHERE id = $1
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
+
+    async def get_projects_for_user(
+        self, user_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get all projects a user is a member of.
+
+        Args:
+            user_id: User UUID as string
+            limit: Maximum projects to return
+
+        Returns:
+            List of project dicts with aggregate counts, ordered by
+            is_default DESC, updated_at DESC
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT p.id, p.name, p.description, p.goal, p.status,
+                       p.is_default, p.default_config_name,
+                       p.created_at, p.updated_at,
+                       pm.role AS user_role,
+                       (SELECT COUNT(*) FROM jobs j WHERE j.project_id = p.id) AS job_count,
+                       (SELECT COUNT(*) FROM project_repositories pr WHERE pr.project_id = p.id) AS repo_count,
+                       (SELECT COUNT(*) FROM project_members pm2 WHERE pm2.project_id = p.id) AS member_count
+                FROM projects p
+                JOIN project_members pm ON p.id = pm.project_id
+                WHERE pm.user_id = $1
+                ORDER BY p.is_default DESC, p.updated_at DESC
+                LIMIT $2
+                """,
+                uuid_val,
+                limit,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def update_project(self, project_id: str, **kwargs) -> bool:
+        """Update a project.
+
+        Args:
+            project_id: Project UUID
+            **kwargs: Fields to update (name, description, goal, status,
+                      default_config_name, default_config_override)
+
+        Returns:
+            True if updated, False if not found
+        """
+        try:
+            uuid_val = UUID(project_id)
+        except ValueError:
+            return False
+
+        allowed_fields = {
+            "name", "description", "goal", "status",
+            "default_config_name", "default_config_override",
+        }
+
+        updates = []
+        values = []
+        param_count = 0
+
+        for key, value in kwargs.items():
+            if key not in allowed_fields or value is None:
+                continue
+            param_count += 1
+            updates.append(f"{key} = ${param_count}")
+            if key == "default_config_override":
+                values.append(json.dumps(value) if isinstance(value, dict) else value)
+            else:
+                values.append(value)
+
+        if not updates:
+            return False
+
+        param_count += 1
+        values.append(uuid_val)
+
+        query = f"UPDATE projects SET {', '.join(updates)} WHERE id = ${param_count}"
+
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def delete_project(self, project_id: str) -> bool:
+        """Delete a project (cascades to members, repos).
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            True if deleted, False if not found
+        """
+        try:
+            uuid_val = UUID(project_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM projects WHERE id = $1",
+                uuid_val,
+            )
+
+        return result == "DELETE 1"
+
+    # -- Project Members --
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        user_id: str,
+        role: str = "editor",
+    ) -> Dict[str, Any]:
+        """Add a member to a project.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID
+            role: Member role (owner, editor, viewer)
+
+        Returns:
+            Member dict with user info
+        """
+        project_uuid = UUID(project_id)
+        user_uuid = UUID(user_id)
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO project_members (project_id, user_id, role)
+                VALUES ($1, $2, $3)
+                RETURNING project_id, user_id, role, added_at
+                """,
+                project_uuid,
+                user_uuid,
+                role,
+            )
+
+            # Fetch user info for display
+            user_row = await conn.fetchrow(
+                "SELECT display_name, avatar_color FROM users WHERE id = $1",
+                user_uuid,
+            )
+
+        result = dict(row)
+        if user_row:
+            result["display_name"] = user_row["display_name"]
+            result["avatar_color"] = user_row["avatar_color"]
+
+        return result
+
+    async def get_project_members(
+        self, project_id: str
+    ) -> List[Dict[str, Any]]:
+        """Get all members of a project with user info.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            List of member dicts with user display info
+        """
+        try:
+            uuid_val = UUID(project_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT pm.project_id, pm.user_id, pm.role, pm.added_at,
+                       u.display_name, u.avatar_color, u.email
+                FROM project_members pm
+                JOIN users u ON pm.user_id = u.id
+                WHERE pm.project_id = $1
+                ORDER BY pm.added_at ASC
+                """,
+                uuid_val,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def get_user_role_in_project(
+        self, project_id: str, user_id: str
+    ) -> str | None:
+        """Get a user's role in a project.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID
+
+        Returns:
+            Role string or None if not a member
+        """
+        try:
+            project_uuid = UUID(project_id)
+            user_uuid = UUID(user_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT role FROM project_members WHERE project_id = $1 AND user_id = $2",
+                project_uuid,
+                user_uuid,
+            )
+
+    async def update_project_member_role(
+        self, project_id: str, user_id: str, role: str
+    ) -> bool:
+        """Update a member's role in a project.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID
+            role: New role (owner, editor, viewer)
+
+        Returns:
+            True if updated, False if not found
+        """
+        try:
+            project_uuid = UUID(project_id)
+            user_uuid = UUID(user_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE project_members SET role = $1 WHERE project_id = $2 AND user_id = $3",
+                role,
+                project_uuid,
+                user_uuid,
+            )
+
+        return result == "UPDATE 1"
+
+    async def remove_project_member(
+        self, project_id: str, user_id: str
+    ) -> bool:
+        """Remove a member from a project.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID
+
+        Returns:
+            True if removed, False if not found
+        """
+        try:
+            project_uuid = UUID(project_id)
+            user_uuid = UUID(user_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM project_members WHERE project_id = $1 AND user_id = $2",
+                project_uuid,
+                user_uuid,
+            )
+
+        return result == "DELETE 1"
+
+    # -- Project Repositories --
+
+    async def add_project_repository(
+        self,
+        project_id: str,
+        name: str,
+        repo_url: str,
+        role: str = "source",
+        description: str | None = None,
+        credentials: Dict[str, Any] | None = None,
+        read_only: bool = False,
+        is_managed: bool = False,
+        branch: str = "main",
+        clone_path: str | None = None,
+    ) -> Dict[str, Any]:
+        """Add a repository to a project.
+
+        Args:
+            project_id: Project UUID
+            name: Human-readable label
+            repo_url: Git clone URL
+            role: Repository role (jobs, source, reference)
+            description: What this repo contains
+            credentials: Auth for external repos
+            read_only: Whether agents can push
+            is_managed: True if created by us (Gitea)
+            branch: Default branch to clone from
+            clone_path: Subdirectory name in workspace
+
+        Returns:
+            Created repository dict
+        """
+        project_uuid = UUID(project_id)
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO project_repositories
+                    (project_id, name, repo_url, role, description, credentials,
+                     read_only, is_managed, branch, clone_path)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id, project_id, name, description, repo_url, credentials,
+                          role, read_only, is_managed, branch, clone_path,
+                          created_at, updated_at
+                """,
+                project_uuid,
+                name,
+                repo_url,
+                role,
+                description,
+                json.dumps(credentials) if credentials else "{}",
+                read_only,
+                is_managed,
+                branch,
+                clone_path,
+            )
+
+        return dict(row)
+
+    async def get_project_repositories(
+        self, project_id: str, role: str | None = None
+    ) -> List[Dict[str, Any]]:
+        """Get repositories for a project.
+
+        Args:
+            project_id: Project UUID
+            role: Optional role filter (jobs, source, reference)
+
+        Returns:
+            List of repository dicts
+        """
+        try:
+            uuid_val = UUID(project_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            if role:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, project_id, name, description, repo_url, credentials,
+                           role, read_only, is_managed, branch, clone_path,
+                           created_at, updated_at
+                    FROM project_repositories
+                    WHERE project_id = $1 AND role = $2
+                    ORDER BY created_at ASC
+                    """,
+                    uuid_val,
+                    role,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT id, project_id, name, description, repo_url, credentials,
+                           role, read_only, is_managed, branch, clone_path,
+                           created_at, updated_at
+                    FROM project_repositories
+                    WHERE project_id = $1
+                    ORDER BY created_at ASC
+                    """,
+                    uuid_val,
+                )
+
+        return [dict(row) for row in rows]
+
+    async def get_project_repository(
+        self, repo_id: str
+    ) -> Dict[str, Any] | None:
+        """Get a single project repository by ID.
+
+        Args:
+            repo_id: Repository UUID
+
+        Returns:
+            Repository dict or None if not found
+        """
+        try:
+            uuid_val = UUID(repo_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, project_id, name, description, repo_url, credentials,
+                       role, read_only, is_managed, branch, clone_path,
+                       created_at, updated_at
+                FROM project_repositories
+                WHERE id = $1
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
+
+    async def update_project_repository(self, repo_id: str, **kwargs) -> bool:
+        """Update a project repository.
+
+        Args:
+            repo_id: Repository UUID
+            **kwargs: Fields to update (name, description, read_only, branch, clone_path)
+
+        Returns:
+            True if updated, False if not found
+        """
+        try:
+            uuid_val = UUID(repo_id)
+        except ValueError:
+            return False
+
+        allowed_fields = {"name", "description", "read_only", "branch", "clone_path"}
+
+        updates = []
+        values = []
+        param_count = 0
+
+        for key, value in kwargs.items():
+            if key not in allowed_fields or value is None:
+                continue
+            param_count += 1
+            updates.append(f"{key} = ${param_count}")
+            values.append(value)
+
+        if not updates:
+            return False
+
+        param_count += 1
+        values.append(uuid_val)
+
+        query = f"UPDATE project_repositories SET {', '.join(updates)} WHERE id = ${param_count}"
+
+        async with self.acquire() as conn:
+            result = await conn.execute(query, *values)
+
+        return result == "UPDATE 1"
+
+    async def remove_project_repository(
+        self, repo_id: str
+    ) -> Dict[str, Any] | None:
+        """Remove a project repository. Returns the deleted row for cleanup.
+
+        Args:
+            repo_id: Repository UUID
+
+        Returns:
+            Deleted repository dict (caller needs is_managed for Gitea cleanup),
+            or None if not found
+        """
+        try:
+            uuid_val = UUID(repo_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                DELETE FROM project_repositories WHERE id = $1
+                RETURNING id, project_id, name, repo_url, role, is_managed
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
+
+    # -- Default Project Lifecycle --
+
+    async def create_default_project_for_user(
+        self, user_id: str, display_name: str
+    ) -> Dict[str, Any]:
+        """Create a default project for a user.
+
+        Creates the project, adds the user as owner, and updates
+        users.default_project_id.
+
+        Args:
+            user_id: User UUID as string
+            display_name: User's display name (for project naming)
+
+        Returns:
+            Created project dict
+        """
+        user_uuid = UUID(user_id)
+
+        async with self.acquire() as conn:
+            # Create the project
+            project_row = await conn.fetchrow(
+                """
+                INSERT INTO projects (name, description, is_default)
+                VALUES ($1, $2, TRUE)
+                RETURNING id, name, description, goal, status, is_default,
+                          default_config_name, default_config_override,
+                          created_at, updated_at
+                """,
+                f"{display_name}'s Workspace",
+                f"Default workspace for {display_name}",
+            )
+
+            project_id = project_row["id"]
+
+            # Add user as owner
+            await conn.execute(
+                """
+                INSERT INTO project_members (project_id, user_id, role)
+                VALUES ($1, $2, 'owner')
+                """,
+                project_id,
+                user_uuid,
+            )
+
+            # Update user's default_project_id
+            await conn.execute(
+                "UPDATE users SET default_project_id = $1 WHERE id = $2",
+                project_id,
+                user_uuid,
+            )
+
+        return dict(project_row)
+
+    async def get_user_default_project(
+        self, user_id: str
+    ) -> Dict[str, Any] | None:
+        """Get a user's default project.
+
+        Args:
+            user_id: User UUID as string
+
+        Returns:
+            Project dict or None if no default project
+        """
+        try:
+            uuid_val = UUID(user_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT p.id, p.name, p.description, p.goal, p.status,
+                       p.is_default, p.default_config_name,
+                       p.default_config_override, p.created_at, p.updated_at
+                FROM projects p
+                JOIN users u ON u.default_project_id = p.id
+                WHERE u.id = $1
+                """,
+                uuid_val,
+            )
+
+        return dict(row) if row else None
+
+    # =========================================================================
     # BUILDER SESSION OPERATIONS
     # =========================================================================
 
     async def create_builder_session(
         self,
         expert_id: str | None = None,
+        user_id: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new builder chat session.
 
         Args:
             expert_id: Optional expert ID used as starting point
+            user_id: Optional user UUID who created this session
 
         Returns:
-            Created session dict with id, expert_id, created_at, updated_at
+            Created session dict with id, expert_id, user_id, created_at, updated_at
         """
+        user_uuid = UUID(user_id) if user_id else None
+
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO builder_sessions (expert_id)
-                VALUES ($1)
-                RETURNING id, job_id, expert_id, created_at, updated_at, summary
+                INSERT INTO builder_sessions (expert_id, user_id)
+                VALUES ($1, $2)
+                RETURNING id, job_id, expert_id, user_id, created_at, updated_at, summary
                 """,
                 expert_id,
+                user_uuid,
             )
 
         return dict(row)
