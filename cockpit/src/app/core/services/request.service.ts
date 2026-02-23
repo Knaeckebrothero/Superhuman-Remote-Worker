@@ -23,13 +23,27 @@ export class RequestService {
   readonly tokenSummary = computed(() => {
     const req = this.request();
     const usage = req?.metrics?.token_usage;
-    // Empty object {} from API means no token data was returned
-    if (!usage || Object.keys(usage).length === 0) return null;
+
+    // Real data available
+    if (usage && Object.keys(usage).length > 0) {
+      return {
+        prompt: usage.prompt_tokens ?? 0,
+        completion: usage.completion_tokens ?? 0,
+        reasoning: usage.reasoning_tokens ?? 0,
+        estimated: false,
+      };
+    }
+
+    // Fallback: estimate from char counts (~4 chars per token)
+    const inputChars = req?.metrics?.input_chars ?? 0;
+    const outputChars = req?.metrics?.output_chars ?? 0;
+    if (inputChars === 0 && outputChars === 0) return null;
 
     return {
-      prompt: usage.prompt_tokens ?? 0,
-      completion: usage.completion_tokens ?? 0,
-      reasoning: usage.reasoning_tokens ?? 0,
+      prompt: Math.ceil(inputChars / 4),
+      completion: Math.ceil(outputChars / 4),
+      reasoning: 0,
+      estimated: true,
     };
   });
 

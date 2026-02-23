@@ -356,6 +356,42 @@
           "minimum": 1000,
           "default": 80000,
           "description": "Target chunk size in tokens when splitting for recursive summarization."
+        },
+        "response_validation": {
+          "type": "object",
+          "description": "LLM response degeneration validation settings",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable response degeneration validation"
+            },
+            "max_content_length": {
+              "type": "integer",
+              "minimum": 1000,
+              "default": 50000,
+              "description": "Character threshold for excessive length warning (only when no tool calls)"
+            },
+            "max_tag_repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 50,
+              "description": "Flag if the same closing XML/HTML tag appears more than this many times"
+            },
+            "max_token_repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 20,
+              "description": "Flag if the same token/word repeats consecutively more than this many times"
+            },
+            "max_line_repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10,
+              "description": "Flag if the same line appears more than this many times in the output"
+            }
+          },
+          "additionalProperties": false
         }
       }
     },

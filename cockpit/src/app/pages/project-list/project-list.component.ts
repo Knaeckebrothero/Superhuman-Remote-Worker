@@ -3,14 +3,17 @@ import { Router } from '@angular/router';
 import { ApiService } from '../../core/services/api.service';
 import { UserService } from '../../core/services/user.service';
 import { Project } from '../../core/models/api.model';
+import { SidebarToggleComponent } from '../../layout/sidebar-toggle/sidebar-toggle.component';
 
 @Component({
   selector: 'app-project-list-page',
   standalone: true,
+  imports: [SidebarToggleComponent],
   template: `
     <div class="page-container">
       <!-- Header -->
       <div class="page-header">
+        <app-sidebar-toggle />
         <h1 class="page-title">Projects</h1>
         <div class="header-actions">
           <button class="btn btn-primary" (click)="showCreateForm.set(!showCreateForm())">

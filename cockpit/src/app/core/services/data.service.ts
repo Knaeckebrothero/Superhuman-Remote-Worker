@@ -1,7 +1,8 @@
-import { Injectable, inject, signal, computed, effect, Injector, runInInjectionContext } from '@angular/core';
+import { Injectable, inject, signal, computed, effect, Injector, runInInjectionContext, untracked } from '@angular/core';
 import { firstValueFrom } from 'rxjs';
 import { ApiService, JobVersionInfo } from './api.service';
 import { IndexedDbService } from './indexed-db.service';
+import { JobContextService } from './job-context.service';
 import { AuditEntry, AuditFilterCategory, JobSummary } from '../models/audit.model';
 import { ChatEntry } from '../models/chat.model';
 import { GraphDelta } from '../models/graph.model';
@@ -29,6 +30,7 @@ const FILTER_STEP_TYPES: Record<AuditFilterCategory, string[] | null> = {
 export class DataService {
   private readonly api: ApiService;
   private readonly db: IndexedDbService;
+  private readonly jobContext!: JobContextService;
   private injector: Injector | null = null;
 
   // ===== Window Configuration =====
@@ -46,11 +48,14 @@ export class DataService {
       // Testing mode - use provided dependencies, skip effects
       this.api = api;
       this.db = db;
+      this.jobs = signal<JobSummary[]>([]);
     } else {
       // Production mode - use Angular DI
       this.injector = inject(Injector);
       this.api = inject(ApiService);
       this.db = inject(IndexedDbService);
+      this.jobContext = inject(JobContextService);
+      this.jobs = this.jobContext.jobs;
       this.setupEffects();
     }
   }
@@ -85,8 +90,8 @@ export class DataService {
   private readonly _activeFilter = signal<AuditFilterCategory>('all');
   readonly activeFilter = this._activeFilter.asReadonly();
 
-  /** List of jobs */
-  readonly jobs = signal<JobSummary[]>([]);
+  /** List of jobs — delegates to JobContextService (fallback signal for test mode) */
+  readonly jobs: ReturnType<typeof signal<JobSummary[]>>;
 
   // ===== Loading State =====
   readonly isLoading = signal<boolean>(false);
@@ -109,8 +114,20 @@ export class DataService {
   private setupEffects(): void {
     if (!this.injector) return;
 
-    // Effect to reload window when slider moves outside current window
     runInInjectionContext(this.injector, () => {
+      // Effect to sync job selection from JobContextService
+      effect(() => {
+        const jobId = this.jobContext.activeJobId();
+        untracked(() => {
+          if (jobId) {
+            this.loadJob(jobId);
+          } else {
+            this.clearInternal();
+          }
+        });
+      });
+
+      // Effect to reload window when slider moves outside current window
       effect(() => {
         const index = this._sliderIndex();
         const windowStart = this._windowStart();
@@ -235,27 +252,26 @@ export class DataService {
   // ===== Public Methods =====
 
   /**
-   * Set the current job and load its data.
-   * Convenience wrapper around loadJob().
+   * Set the current job. In production mode, delegates to JobContextService
+   * (the effect handles calling loadJob). In test mode, calls loadJob directly.
    */
-  setCurrentJob(jobId: string): void {
-    this.loadJob(jobId);
+  setCurrentJob(jobId: string | null): void {
+    if (this.jobContext) {
+      this.jobContext.selectJob(jobId);
+    }
+    if (jobId) {
+      this.loadJob(jobId);
+    } else {
+      this.clearInternal();
+    }
   }
 
   /**
-   * Load list of jobs from the API.
+   * Load list of jobs — delegates to JobContextService.
    */
   async loadJobs(): Promise<void> {
-    this.isLoading.set(true);
-    this.error.set(null);
-
-    try {
-      const jobs = await firstValueFrom(this.api.getJobs());
-      this.jobs.set(jobs);
-    } catch (err) {
-      this.error.set(err instanceof Error ? err.message : 'Failed to load jobs');
-    } finally {
-      this.isLoading.set(false);
+    if (this.jobContext) {
+      return this.jobContext.loadJobs();
     }
   }
 
@@ -392,9 +408,22 @@ export class DataService {
   }
 
   /**
-   * Clear all state.
+   * Clear all state. Delegates to JobContextService to deselect the job,
+   * which triggers clearInternal via the effect.
    */
   clear(): void {
+    if (this.jobContext) {
+      this.jobContext.selectJob(null);
+    } else {
+      this.clearInternal();
+    }
+  }
+
+  /**
+   * Reset all data state without touching job selection.
+   * Called by the jobContext effect when activeJobId becomes null.
+   */
+  private clearInternal(): void {
     this._currentJobId.set(null);
     this._sliderIndex.set(0);
     this._maxIndex.set(0);
@@ -457,12 +486,13 @@ export class DataService {
     }
 
     try {
-      // Refresh job list
-      const jobs = await firstValueFrom(this.api.getJobs());
-      this.jobs.set(jobs);
+      // Refresh job list via JobContextService
+      if (this.jobContext) {
+        await this.jobContext.loadJobs();
+      }
 
       // If a job is selected, check for new data
-      const jobId = this._currentJobId();
+      const jobId = this.jobContext ? this.jobContext.activeJobId() : this._currentJobId();
       if (jobId) {
         const versionInfo = await firstValueFrom(this.api.getJobVersion(jobId));
         const currentMax = this._maxIndex() + 1;

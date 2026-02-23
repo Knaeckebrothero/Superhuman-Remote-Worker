@@ -1,44 +1,113 @@
-import { Component, inject } from '@angular/core';
-import { Router, RouterLink, RouterLinkActive } from '@angular/router';
+import { Component, inject, signal, computed } from '@angular/core';
+import { Router, RouterLink, RouterLinkActive, NavigationEnd } from '@angular/router';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { filter, map } from 'rxjs';
 import { UserService } from '../../core/services/user.service';
+import { SidebarService } from '../../core/services/sidebar.service';
+import { LayoutService } from '../../core/services/layout.service';
+import { LayoutPickerComponent } from '../../components/layout-picker/layout-picker.component';
+import { environment } from '../../core/environment';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
         <span class="sidebar-logo">SRW</span>
         <span class="sidebar-label">Cockpit</span>
+        <button class="collapse-btn" (click)="sidebar.collapse()" title="Collapse sidebar">
+          <span class="collapse-icon">chevron_left</span>
+        </button>
       </div>
 
-      <div class="sidebar-nav">
-        <a
-          class="nav-link"
-          routerLink="/"
-          routerLinkActive="active"
-          [routerLinkActiveOptions]="{ exact: true }"
-        >
-          <span class="nav-icon">dashboard</span>
-          Simple
-        </a>
-        <a
-          class="nav-link"
-          routerLink="/projects"
-          routerLinkActive="active"
-        >
-          <span class="nav-icon">folder_shared</span>
-          Projects
-        </a>
-        <a
-          class="nav-link"
-          routerLink="/debug"
-          routerLinkActive="active"
-        >
-          <span class="nav-icon">bug_report</span>
-          Debug
-        </a>
+      <div class="sidebar-body">
+        <div class="sidebar-nav">
+          <a
+            class="nav-link"
+            routerLink="/"
+            routerLinkActive="active"
+            [routerLinkActiveOptions]="{ exact: true }"
+          >
+            <span class="nav-icon">dashboard</span>
+            Simple
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/projects"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">folder_shared</span>
+            Projects
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/debug"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">bug_report</span>
+            Debug
+          </a>
+        </div>
+
+        @if (isDebugRoute()) {
+          <div class="section">
+            <div class="section-title">Databases</div>
+            <a class="section-link" href="http://localhost:7474" target="_blank" rel="noopener">
+              <span class="link-icon">&#x1F535;</span>Neo4j Browser
+            </a>
+            <a class="section-link" href="http://localhost:5050" target="_blank" rel="noopener">
+              <span class="link-icon">&#x1F418;</span>PostgreSQL
+            </a>
+            <a class="section-link" href="http://localhost:8081" target="_blank" rel="noopener">
+              <span class="link-icon">&#x1F343;</span>MongoDB
+            </a>
+          </div>
+
+          <div class="section">
+            <div class="section-title">APIs</div>
+            <a class="section-link" href="http://localhost:8001/docs" target="_blank" rel="noopener">
+              <span class="link-icon">&#x1F4DD;</span>Creator Agent
+            </a>
+            <a class="section-link" href="http://localhost:8002/docs" target="_blank" rel="noopener">
+              <span class="link-icon">&#x2705;</span>Validator Agent
+            </a>
+          </div>
+
+          @if (giteaUrl || dozzleUrl) {
+            <div class="section">
+              <div class="section-title">Tools</div>
+              @if (giteaUrl) {
+                <a class="section-link" [href]="giteaUrl" target="_blank" rel="noopener">
+                  <span class="link-icon">&#x1F375;</span>Gitea
+                </a>
+              }
+              @if (dozzleUrl) {
+                <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
+                  <span class="link-icon">&#x1F4CB;</span>Dozzle
+                </a>
+              }
+            </div>
+          }
+
+          <div class="section">
+            <div class="section-title">Layouts</div>
+            <button class="section-link" #layoutBtn (click)="toggleLayoutPicker(layoutBtn)">
+              <span class="link-icon">&#x1F4D0;</span>Choose Layout
+            </button>
+            <button class="section-link" (click)="resetLayout()">
+              <span class="link-icon">&#x1F504;</span>Reset Layout
+            </button>
+            @if (isLayoutPickerOpen()) {
+              <app-layout-picker
+                [top]="pickerTop()"
+                [left]="pickerLeft()"
+                (closed)="closeLayoutPicker()"
+              />
+            }
+          </div>
+        }
       </div>
 
       <div class="sidebar-footer">
@@ -57,6 +126,18 @@ import { UserService } from '../../core/services/user.service';
   `,
   styles: [
     `
+      :host {
+        display: block;
+        width: 200px;
+        flex-shrink: 0;
+        overflow: hidden;
+        transition: width 0.2s ease;
+      }
+
+      :host(.collapsed) {
+        width: 0;
+      }
+
       .sidebar {
         display: flex;
         flex-direction: column;
@@ -72,6 +153,7 @@ import { UserService } from '../../core/services/user.service';
         gap: 8px;
         padding: 16px;
         border-bottom: 1px solid var(--border-color, #313244);
+        flex-shrink: 0;
       }
 
       .sidebar-logo {
@@ -86,8 +168,42 @@ import { UserService } from '../../core/services/user.service';
         color: var(--text-muted, #6c7086);
       }
 
-      .sidebar-nav {
+      .collapse-btn {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        background: transparent;
+        border: none;
+        border-radius: 6px;
+        color: var(--text-muted, #6c7086);
+        cursor: pointer;
+        padding: 0;
+        transition:
+          color 0.15s ease,
+          background 0.15s ease;
+      }
+
+      .collapse-btn:hover {
+        color: var(--text-primary, #cdd6f4);
+        background: var(--surface-0, #313244);
+      }
+
+      .collapse-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 18px;
+      }
+
+      .sidebar-body {
         flex: 1;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border-color, #313244) transparent;
+      }
+
+      .sidebar-nav {
         display: flex;
         flex-direction: column;
         gap: 2px;
@@ -123,12 +239,64 @@ import { UserService } from '../../core/services/user.service';
         font-size: 18px;
       }
 
+      /* Debug sections */
+
+      .section {
+        padding: 8px;
+        border-top: 1px solid var(--border-color, #313244);
+      }
+
+      .section-title {
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: var(--text-muted, #6c7086);
+        padding: 4px 8px 6px;
+        margin: 0;
+      }
+
+      .section-link {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 12px;
+        border-radius: 6px;
+        color: var(--text-secondary, #a6adc8);
+        text-decoration: none;
+        font-size: 12px;
+        cursor: pointer;
+        border: none;
+        background: transparent;
+        width: 100%;
+        text-align: left;
+        font-family: inherit;
+        transition:
+          background 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .section-link:hover {
+        background: var(--surface-0, #313244);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .link-icon {
+        font-size: 14px;
+        width: 18px;
+        text-align: center;
+        flex-shrink: 0;
+      }
+
+      /* Footer */
+
       .sidebar-footer {
         padding: 12px;
         border-top: 1px solid var(--border-color, #313244);
         display: flex;
         flex-direction: column;
         gap: 8px;
+        flex-shrink: 0;
       }
 
       .user-profile {
@@ -182,7 +350,28 @@ import { UserService } from '../../core/services/user.service';
 })
 export class SidebarComponent {
   readonly userService = inject(UserService);
+  readonly sidebar = inject(SidebarService);
+  readonly layoutService = inject(LayoutService);
   private readonly router = inject(Router);
+
+  private readonly currentUrl = toSignal(
+    this.router.events.pipe(
+      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
+      map((e) => e.urlAfterRedirects),
+    ),
+    { initialValue: this.router.url },
+  );
+
+  readonly isDebugRoute = computed(
+    () => this.currentUrl()?.startsWith('/debug') ?? false,
+  );
+
+  readonly giteaUrl = environment.giteaUrl;
+  readonly dozzleUrl = environment.dozzleUrl;
+
+  readonly isLayoutPickerOpen = signal(false);
+  readonly pickerTop = signal(0);
+  readonly pickerLeft = signal(0);
 
   getInitials(name: string): string {
     return name
@@ -196,5 +385,22 @@ export class SidebarComponent {
   logout(): void {
     this.userService.logout();
     this.router.navigate(['/login']);
+  }
+
+  toggleLayoutPicker(buttonEl: HTMLButtonElement): void {
+    if (!this.isLayoutPickerOpen()) {
+      const rect = buttonEl.getBoundingClientRect();
+      this.pickerTop.set(rect.top);
+      this.pickerLeft.set(rect.right + 8);
+    }
+    this.isLayoutPickerOpen.update((v) => !v);
+  }
+
+  closeLayoutPicker(): void {
+    this.isLayoutPickerOpen.set(false);
+  }
+
+  resetLayout(): void {
+    this.layoutService.resetLayout();
   }
 }

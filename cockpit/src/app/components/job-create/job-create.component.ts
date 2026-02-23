@@ -41,7 +41,7 @@ import { environment } from '../../core/environment';
 
         <form (ngSubmit)="onSubmit()" #jobForm="ngForm">
           <!-- Project Selector -->
-          @if (projects().length > 1) {
+          @if (projects().length > 0) {
             <div class="form-group">
               <label for="project" class="form-label">Project</label>
               <select
@@ -52,6 +52,7 @@ import { environment } from '../../core/environment';
                 (ngModelChange)="selectedProjectId.set($event)"
                 [disabled]="isSubmitting()"
               >
+                <option [ngValue]="null">No project</option>
                 @for (proj of projects(); track proj.id) {
                   <option [value]="proj.id">
                     {{ proj.name }}@if (proj.is_default) { (Personal)}

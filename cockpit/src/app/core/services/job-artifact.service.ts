@@ -1,5 +1,6 @@
-import { Injectable, signal } from '@angular/core';
+import { Injectable, inject, signal } from '@angular/core';
 import { environment } from '../environment';
+import { JobContextService } from './job-context.service';
 
 /**
  * Deep merge two objects. Objects merge recursively, arrays replace entirely, null clears.
@@ -34,6 +35,8 @@ function deepMerge(base: Record<string, unknown>, override: Record<string, unkno
  */
 @Injectable({ providedIn: 'root' })
 export class JobArtifactService {
+  private readonly jobContext = inject(JobContextService);
+
   /** Current instructions content — single source of truth */
   readonly instructions = signal<string | null>(null);
 
@@ -46,8 +49,8 @@ export class JobArtifactService {
   /** Builder session ID (null if no builder session started) */
   readonly sessionId = signal<string | null>(null);
 
-  /** Active job context for inspection tools */
-  readonly activeJobId = signal<string | null>(null);
+  /** Active job context — delegates to JobContextService */
+  readonly activeJobId = this.jobContext.activeJobId;
 
   /** Whether AI is currently streaming (locks editor to prevent conflicts) */
   readonly streaming = signal<boolean>(false);
@@ -92,13 +95,12 @@ export class JobArtifactService {
     }
   }
 
-  /** Reset all state for a new job creation session */
+  /** Reset all state for a new job creation session (preserves job selection) */
   reset(): void {
     this.instructions.set(null);
     this.config.set(null);
     this.description.set(null);
     this.sessionId.set(null);
-    this.activeJobId.set(null);
     this.streaming.set(false);
     this.builderModel.set(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
   }

@@ -7,10 +7,12 @@ import {
   effect,
 } from '@angular/core';
 import { ComponentRegistryService } from '../../core/services/component-registry.service';
+import { DataService } from '../../core/services/data.service';
+import { JobContextService } from '../../core/services/job-context.service';
 import { JobArtifactService } from '../../core/services/job-artifact.service';
-import { ApiService } from '../../core/services/api.service';
-import { JobSummary } from '../../core/models/audit.model';
+import { SidebarToggleComponent } from '../sidebar-toggle/sidebar-toggle.component';
 import { ComponentType } from '../../core/models/layout.model';
+import { environment } from '../../core/environment';
 
 interface MobileTab {
   id: string;
@@ -36,17 +38,39 @@ const TABS: MobileTab[] = [
 @Component({
   selector: 'app-mobile-shell',
   standalone: true,
+  imports: [SidebarToggleComponent],
   template: `
     <div class="mobile-shell">
       <header class="mobile-header">
+        <app-sidebar-toggle />
         <span class="mobile-title">SRW</span>
+
+        @if (activeTab() === 'builder') {
+          <select
+            class="mobile-model-select"
+            [value]="artifacts.builderModel()"
+            (change)="onModelChange($event)"
+          >
+            @for (m of builderModels; track m.id) {
+              <option [value]="m.id">{{ m.label }}</option>
+            }
+          </select>
+          @if (artifacts.streaming()) {
+            <span class="streaming-badge">
+              <span class="pulse-dot"></span>
+            </span>
+          }
+        }
+
+        <div class="header-spacer"></div>
+
         <select
           class="mobile-job-select"
-          [value]="artifacts.activeJobId() ?? ''"
+          [value]="jobContext.activeJobId() ?? ''"
           (change)="onJobChange($event)"
         >
           <option value="">No job context</option>
-          @for (job of jobs(); track job.id) {
+          @for (job of jobContext.jobs(); track job.id) {
             <option [value]="job.id">{{ job.id.slice(0, 8) }}… · {{ job.status }}</option>
           }
         </select>
@@ -89,7 +113,7 @@ const TABS: MobileTab[] = [
       .mobile-header {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        gap: 8px;
         height: 48px;
         padding: 0 12px;
         background: var(--timeline-bg, #11111b);
@@ -119,6 +143,46 @@ const TABS: MobileTab[] = [
 
       .mobile-job-select:focus {
         border-color: var(--accent-color, #cba6f7);
+      }
+
+      .mobile-model-select {
+        background: var(--surface-0, #313244);
+        color: var(--text-secondary, #a6adc8);
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 6px;
+        padding: 6px 8px;
+        font-size: 12px;
+        max-width: 160px;
+        min-height: 36px;
+        cursor: pointer;
+        outline: none;
+      }
+
+      .mobile-model-select:focus {
+        border-color: var(--accent-color, #cba6f7);
+      }
+
+      .streaming-badge {
+        display: flex;
+        align-items: center;
+        flex-shrink: 0;
+      }
+
+      .pulse-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent-color, #cba6f7);
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+      }
+
+      .header-spacer {
+        flex: 1;
       }
 
       .mobile-content {
@@ -177,17 +241,18 @@ const TABS: MobileTab[] = [
 })
 export class MobileShellComponent {
   private readonly registry = inject(ComponentRegistryService);
+  readonly data = inject(DataService);
+  readonly jobContext = inject(JobContextService);
   readonly artifacts = inject(JobArtifactService);
-  private readonly api = inject(ApiService);
+  readonly builderModels = environment.builderModels;
 
   private readonly outlet = viewChild('outlet', { read: ViewContainerRef });
 
   readonly tabs = TABS;
   readonly activeTab = signal('builder');
-  readonly jobs = signal<JobSummary[]>([]);
 
   constructor() {
-    this.loadJobs();
+    this.jobContext.loadJobs();
 
     effect(() => {
       const tab = this.tabs.find((t) => t.id === this.activeTab());
@@ -206,14 +271,13 @@ export class MobileShellComponent {
     this.activeTab.set(tab.id);
   }
 
-  onJobChange(event: Event): void {
+  onModelChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
-    this.artifacts.activeJobId.set(value || null);
+    this.artifacts.builderModel.set(value);
   }
 
-  private loadJobs(): void {
-    this.api.getJobs(undefined, 20).subscribe((jobs) => {
-      this.jobs.set(jobs);
-    });
+  onJobChange(event: Event): void {
+    const value = (event.target as HTMLSelectElement).value;
+    this.data.setCurrentJob(value || null);
   }
 }
