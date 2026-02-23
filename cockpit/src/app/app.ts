@@ -6,6 +6,7 @@ import { SidebarComponent } from './layout/sidebar/sidebar.component';
 import { ComponentRegistryService } from './core/services/component-registry.service';
 import { ViewportService } from './core/services/viewport.service';
 import { UserService } from './core/services/user.service';
+import { SidebarService } from './core/services/sidebar.service';
 import { PlaceholderAComponent } from './components/placeholders/placeholder-a.component';
 import { PlaceholderBComponent } from './components/placeholders/placeholder-b.component';
 import { PlaceholderCComponent } from './components/placeholders/placeholder-c.component';
@@ -31,7 +32,7 @@ import { ProjectListPageComponent } from './pages/project-list/project-list.comp
   template: `
     <div class="app-container">
       @if (showSidebar()) {
-        <app-sidebar />
+        <app-sidebar [class.collapsed]="sidebar.collapsed()" />
       }
       <div class="content-area">
         <router-outlet />
@@ -51,7 +52,9 @@ import { ProjectListPageComponent } from './pages/project-list/project-list.comp
       .content-area {
         flex: 1;
         overflow: hidden;
+        position: relative;
       }
+
     `,
   ],
 })
@@ -60,6 +63,7 @@ export class App implements OnInit {
   private readonly viewport = inject(ViewportService);
   private readonly userService = inject(UserService);
   private readonly registry = inject(ComponentRegistryService);
+  readonly sidebar = inject(SidebarService);
 
   private readonly currentUrl = toSignal(
     this.router.events.pipe(

@@ -1,11 +1,8 @@
-import { Component, inject, signal, ElementRef, ViewChild, AfterViewChecked, OnInit } from '@angular/core';
+import { Component, inject, signal, ElementRef, ViewChild, AfterViewChecked } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MarkdownComponent } from 'ngx-markdown';
 import { JobArtifactService } from '../../core/services/job-artifact.service';
 import { BuilderStreamService, BuilderMessage } from '../../core/services/builder-stream.service';
-import { ApiService } from '../../core/services/api.service';
-import { JobSummary } from '../../core/models/audit.model';
-import { environment } from '../../core/environment';
 
 type BuilderStepType = 'thought' | 'tool_call' | 'tool_result' | 'inspection_result';
 type BuilderStepStatus = 'active' | 'complete';
@@ -33,40 +30,6 @@ interface ChatMessage {
   imports: [FormsModule, MarkdownComponent],
   template: `
     <div class="builder-container">
-      <div class="header-bar">
-        <span class="title">
-          <span class="header-icon">construction</span>
-          Instruction Builder
-        </span>
-        <div class="header-controls">
-          <select
-            class="model-select"
-            [value]="artifacts.builderModel()"
-            (change)="onBuilderModelChange($event)"
-          >
-            @for (m of builderModels; track m.id) {
-              <option [value]="m.id">{{ m.label }}</option>
-            }
-          </select>
-          <select
-            class="job-context-select"
-            [value]="artifacts.activeJobId() ?? ''"
-            (change)="onJobContextChange($event)"
-          >
-            <option value="">No job context</option>
-            @for (job of availableJobs(); track job.id) {
-              <option [value]="job.id">{{ job.id.slice(0, 8) }}… · {{ job.status }} · {{ job.description.slice(0, 30) || 'No description' }}</option>
-            }
-          </select>
-          @if (artifacts.streaming()) {
-            <span class="streaming-badge">
-              <span class="pulse-dot"></span>
-              AI responding...
-            </span>
-          }
-        </div>
-      </div>
-
       @if (!artifacts.sessionId()) {
         <div class="empty-state">
           <span class="empty-icon">smart_toy</span>
@@ -236,51 +199,6 @@ interface ChatMessage {
         background: var(--panel-bg, #181825);
       }
 
-      .header-bar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 12px;
-        background: var(--panel-header-bg, #1e1e2e);
-        border-bottom: 1px solid var(--border-color, #313244);
-        flex-shrink: 0;
-      }
-
-      .title {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-weight: 600;
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .header-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 18px;
-        color: var(--accent-color, #cba6f7);
-      }
-
-      .streaming-badge {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 11px;
-        color: var(--accent-color, #cba6f7);
-      }
-
-      .pulse-dot {
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: var(--accent-color, #cba6f7);
-        animation: pulse 1.5s ease-in-out infinite;
-      }
-
-      @keyframes pulse {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.3; }
-      }
-
       /* Empty state */
       .empty-state {
         flex: 1;
@@ -430,31 +348,6 @@ interface ChatMessage {
       .tool-call-icon {
         font-family: 'Material Symbols Outlined';
         font-size: 13px;
-      }
-
-      /* Header controls */
-      .header-controls {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-
-      .model-select,
-      .job-context-select {
-        background: var(--surface-0, #313244);
-        color: var(--text-secondary, #a6adc8);
-        border: 1px solid var(--border-color, #313244);
-        border-radius: 6px;
-        padding: 4px 8px;
-        font-size: 11px;
-        max-width: 220px;
-        cursor: pointer;
-        outline: none;
-      }
-
-      .model-select:focus,
-      .job-context-select:focus {
-        border-color: var(--accent-color, #cba6f7);
       }
 
       /* Inspection result rendering */
@@ -1020,10 +913,6 @@ interface ChatMessage {
 
       /* Mobile adjustments */
       @media (max-width: 768px) {
-        .header-bar {
-          display: none;
-        }
-
         .message {
           max-width: 95%;
         }
@@ -1039,10 +928,9 @@ interface ChatMessage {
     `,
   ],
 })
-export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
+export class InstructionBuilderComponent implements AfterViewChecked {
   readonly artifacts = inject(JobArtifactService);
   private readonly stream = inject(BuilderStreamService);
-  private readonly api = inject(ApiService);
 
   @ViewChild('messagesContainer') messagesContainer?: ElementRef<HTMLDivElement>;
   @ViewChild('inputArea') inputArea?: ElementRef<HTMLTextAreaElement>;
@@ -1053,8 +941,6 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
   readonly error = signal<string | null>(null);
   readonly isCreatingSession = signal(false);
   readonly lastFailedMessage = signal<string | null>(null);
-  readonly availableJobs = signal<JobSummary[]>([]);
-  readonly builderModels = environment.builderModels;
 
   inputText = '';
   private shouldScrollToBottom = false;
@@ -1066,31 +952,11 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
     'get_workspace_overview', 'get_frozen_job', 'get_todos', 'get_chat_history',
   ]);
 
-  ngOnInit(): void {
-    this.loadAvailableJobs();
-  }
-
   ngAfterViewChecked(): void {
     if (this.shouldScrollToBottom) {
       this.scrollToBottom();
       this.shouldScrollToBottom = false;
     }
-  }
-
-  loadAvailableJobs(): void {
-    this.api.getJobs(undefined, 20).subscribe((jobs) => {
-      this.availableJobs.set(jobs);
-    });
-  }
-
-  onBuilderModelChange(event: Event): void {
-    const value = (event.target as HTMLSelectElement).value;
-    this.artifacts.builderModel.set(value);
-  }
-
-  onJobContextChange(event: Event): void {
-    const value = (event.target as HTMLSelectElement).value;
-    this.artifacts.activeJobId.set(value || null);
   }
 
   onKeyDown(event: KeyboardEvent): void {

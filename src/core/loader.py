@@ -554,6 +554,17 @@ class ConnectionsConfig:
 
 
 @dataclass
+class ResponseValidationConfig:
+    """LLM response degeneration validation settings."""
+
+    enabled: bool = True
+    max_content_length: int = 50000
+    max_tag_repetitions: int = 50
+    max_token_repetitions: int = 20
+    max_line_repetitions: int = 10
+
+
+@dataclass
 class LimitsConfig:
     """Execution limits configuration."""
 
@@ -565,6 +576,7 @@ class LimitsConfig:
     model_max_context_tokens: int = 100000  # Global fallback for model context window
     summarization_safe_limit: int = 90000  # Max input tokens for summarization LLM (< model_max for prompt overhead)
     summarization_chunk_size: int = 80000   # Chunk size for recursive summarization
+    response_validation: ResponseValidationConfig = field(default_factory=ResponseValidationConfig)
 
 
 @dataclass
@@ -730,6 +742,19 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     )
 
 
+def _parse_response_validation(data: Dict[str, Any]) -> ResponseValidationConfig:
+    """Parse response validation configuration from dict."""
+    if not data:
+        return ResponseValidationConfig()
+    return ResponseValidationConfig(
+        enabled=data.get("enabled", True),
+        max_content_length=data.get("max_content_length", 50000),
+        max_tag_repetitions=data.get("max_tag_repetitions", 50),
+        max_token_repetitions=data.get("max_token_repetitions", 20),
+        max_line_repetitions=data.get("max_line_repetitions", 10),
+    )
+
+
 def load_agent_config(
     config_path: str,
     deployment_dir: Optional[str] = None
@@ -831,6 +856,7 @@ def load_agent_config(
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+        response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
     )
 
     context_data = data.get("context_management", {})
@@ -970,6 +996,7 @@ def load_agent_config_from_dict(
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
+        response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
     )
 
     context_data = data.get("context_management", {})

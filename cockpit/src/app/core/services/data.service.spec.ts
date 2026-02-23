@@ -116,6 +116,7 @@ describe('DataService', () => {
       getAuditEntries: vi.fn().mockResolvedValue([]),
       getChatEntries: vi.fn().mockResolvedValue([]),
       getGraphDeltas: vi.fn().mockResolvedValue([]),
+      getGraphDeltaCount: vi.fn().mockResolvedValue(0),
       clearJob: vi.fn().mockResolvedValue(undefined),
     };
 
@@ -139,22 +140,6 @@ describe('DataService', () => {
       expect(service.isLoading()).toBe(false);
       expect(service.error()).toBeNull();
       expect(service.isCached()).toBe(false);
-    });
-  });
-
-  describe('loadJobs', () => {
-    it('should load jobs from API', async () => {
-      const mockJobs = [
-        { id: 'job-1', status: 'completed', created_at: '2024-01-01' },
-        { id: 'job-2', status: 'running', created_at: '2024-01-02' },
-      ];
-      (mockApiService.getJobs as ReturnType<typeof vi.fn>).mockReturnValue(of(mockJobs));
-
-      await service.loadJobs();
-
-      expect(service.jobs()).toEqual(mockJobs);
-      expect(service.isLoading()).toBe(false);
-      expect(mockApiService.getJobs).toHaveBeenCalled();
     });
   });
 

@@ -80,6 +80,7 @@ from .core.phase import (
 from .managers import TodoManager, TodoStatus, PlanManager, MemoryManager
 from .llm.exceptions import ContextOverflowError
 from .tools.context import ToolContext
+from .core.response_validator import validate_response
 
 logger = logging.getLogger(__name__)
 
@@ -476,6 +477,8 @@ def create_execute_node(
 
     # Track consecutive tool_use_failed errors (mutable container for closure access)
     _tool_use_failed_streak = [0]
+    # Track consecutive response degeneration events
+    _degeneration_streak = [0]
 
     async def execute(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute current todo using ReAct pattern."""
@@ -792,6 +795,121 @@ def create_execute_node(
                     ).strip()
                 content_len = len(content_str) if isinstance(content_str, str) else 0
                 logger.info(f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls")
+
+                # --- Response degeneration validation ---
+                rv_config = config.limits.response_validation
+                if rv_config.enabled and isinstance(content_str, str) and content_str:
+                    tool_calls_list = response.tool_calls if hasattr(response, 'tool_calls') and response.tool_calls else None
+                    validation = validate_response(
+                        content_str,
+                        tool_calls_list,
+                        max_content_length=rv_config.max_content_length,
+                        max_tag_repetitions=rv_config.max_tag_repetitions,
+                        max_token_repetitions=rv_config.max_token_repetitions,
+                        max_line_repetitions=rv_config.max_line_repetitions,
+                    )
+
+                    if validation.is_degenerate:
+                        _degeneration_streak[0] += 1
+                        streak = _degeneration_streak[0]
+                        pattern_names = [p.name for p in validation.matched_patterns]
+                        pattern_details = "; ".join(p.description for p in validation.matched_patterns)
+
+                        if streak <= 3:
+                            logger.warning(
+                                f"[{job_id}] Response degeneration detected (streak {streak}/3): "
+                                f"{pattern_details}"
+                            )
+
+                            ai_summary = AIMessage(content=(
+                                "My previous response was degenerate — it contained repetitive or "
+                                "malformed output that cannot be used. Detected patterns: "
+                                f"{', '.join(pattern_names)}. I need to retry with a shorter, "
+                                "more focused response."
+                            ))
+                            human_feedback = HumanMessage(content=(
+                                "Your last response was detected as degenerate and has been discarded. "
+                                f"Issues found: {pattern_details}\n\n"
+                                "Please retry your action. Keep your response concise and focused. "
+                                "If you were trying to call a tool, make the call with smaller arguments. "
+                                "Do NOT repeat the same output."
+                            ))
+
+                            if auditor:
+                                auditor.audit_step(
+                                    job_id=job_id,
+                                    agent_type=config.agent_id,
+                                    step_type="warning",
+                                    node_name="execute",
+                                    iteration=iteration,
+                                    data={
+                                        "error": {
+                                            "type": "response_degeneration",
+                                            "message": pattern_details,
+                                            "streak": streak,
+                                            "patterns": pattern_names,
+                                            "content_length": content_len,
+                                            "content_preview": (validation.truncated_content or "")[:500],
+                                        }
+                                    },
+                                    metadata=state.get("metadata"),
+                                    phase=phase_str,
+                                    phase_number=phase_number,
+                                )
+
+                            if context_was_compacted:
+                                result_messages = remove_markers + messages + [ai_summary, human_feedback]
+                            else:
+                                result_messages = [ai_summary, human_feedback]
+
+                            return {
+                                "messages": result_messages,
+                                "iteration": iteration + 1,
+                                "error": None,
+                            }
+
+                        # Streak > 3: fall through to error
+                        logger.error(
+                            f"[{job_id}] Response degeneration streak exceeded (streak {streak}): "
+                            f"{pattern_details}"
+                        )
+                        return {
+                            "error": {
+                                "message": f"Persistent response degeneration: {pattern_details}",
+                                "type": "response_degeneration",
+                                "recoverable": False,
+                                "streak": streak,
+                                "patterns": pattern_names,
+                            },
+                            "iteration": iteration + 1,
+                        }
+
+                    elif validation.has_warnings:
+                        logger.warning(
+                            f"[{job_id}] Response validation warnings: "
+                            + "; ".join(p.description for p in validation.matched_patterns)
+                        )
+                        if auditor:
+                            auditor.audit_step(
+                                job_id=job_id,
+                                agent_type=config.agent_id,
+                                step_type="warning",
+                                node_name="execute",
+                                iteration=iteration,
+                                data={
+                                    "warning": {
+                                        "type": "response_validation_warning",
+                                        "patterns": [p.name for p in validation.matched_patterns],
+                                        "details": [p.description for p in validation.matched_patterns],
+                                    }
+                                },
+                                metadata=state.get("metadata"),
+                                phase=phase_str,
+                                phase_number=phase_number,
+                            )
+                    else:
+                        # Clean response — reset degeneration streak
+                        _degeneration_streak[0] = 0
 
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
