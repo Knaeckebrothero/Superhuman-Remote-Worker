@@ -1,7 +1,7 @@
 import { Component, inject, computed, OnInit, OnDestroy } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { MenuComponent } from '../menu/menu.component';
 import { DataService } from '../../core/services/data.service';
+import { JobContextService } from '../../core/services/job-context.service';
 
 /**
  * Timeline scrubber component for playback control.
@@ -12,20 +12,16 @@ import { DataService } from '../../core/services/data.service';
  */
 @Component({
   selector: 'app-timeline',
-  imports: [FormsModule, MenuComponent],
+  imports: [FormsModule],
   template: `
     <div class="timeline">
-      <app-menu />
-
-      <div class="divider"></div>
-
       <select
         class="job-selector"
-        [value]="data.currentJobId() || ''"
+        [value]="jobContext.activeJobId() || ''"
         (change)="onJobSelect($event)"
       >
         <option value="">Select a job...</option>
-        @for (job of data.jobs(); track job.id) {
+        @for (job of jobContext.jobs(); track job.id) {
           <option [value]="job.id">
             {{ job.id.slice(0, 8) }}... | {{ job.status }}
             @if (job.audit_count !== null) {
@@ -364,6 +360,7 @@ import { DataService } from '../../core/services/data.service';
 })
 export class TimelineComponent implements OnInit, OnDestroy {
   readonly data = inject(DataService);
+  readonly jobContext = inject(JobContextService);
 
   // Playback state (placeholder - auto-advance not implemented yet)
   readonly isPlaying = computed(() => false);
@@ -388,7 +385,7 @@ export class TimelineComponent implements OnInit, OnDestroy {
   });
 
   ngOnInit(): void {
-    this.data.loadJobs();
+    this.jobContext.loadJobs();
   }
 
   ngOnDestroy(): void {
@@ -397,11 +394,7 @@ export class TimelineComponent implements OnInit, OnDestroy {
 
   onJobSelect(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
-    if (value) {
-      this.data.loadJob(value);
-    } else {
-      this.data.clear();
-    }
+    this.data.setCurrentJob(value || null);
   }
 
   onSliderChange(index: number): void {
@@ -409,7 +402,7 @@ export class TimelineComponent implements OnInit, OnDestroy {
   }
 
   onRefresh(): void {
-    this.data.loadJobs();
+    this.jobContext.loadJobs();
     if (this.data.currentJobId()) {
       this.data.refresh();
     }

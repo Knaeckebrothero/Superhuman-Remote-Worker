@@ -131,14 +131,20 @@ limits:
   model_max_context_tokens: 80000
   summarization_safe_limit: 100000  # Must be < model_max to leave room for summarization prompt overhead
   summarization_chunk_size: 80000
+  response_validation:
+    enabled: true
+    max_content_length: 50000   # chars, flag if exceeded with no tool calls
+    max_tag_repetitions: 50     # same closing tag repeated this many times
+    max_token_repetitions: 20   # same word/token repeated consecutively
+    max_line_repetitions: 10    # same line repeated in output
 
 context_management:
   compact_on_archive: true
-  keep_recent_tool_results: 15
+  keep_recent_tool_results: 150
   keep_recent_messages: 10
   summarization_template: summarization_prompt.txt
   reasoning_level: high  # Only injected when reasoning_method is "prompt" (gpt-oss)
-  max_summary_length: 10000
+  max_summary_length: 20000
 
 research:
   # Proxy for accessing paywalled content (e.g., via SSH tunnel to university)
@@ -151,9 +157,9 @@ research:
 # Memory Light (RecallStore) — hybrid search memory for cross-context recall
 # See docs/features/memory_light.md for architecture details.
 memory:
-  enabled: false                    # Opt-in per config
-  budget_tokens: 5000              # Max tokens for memory injection per LLM call
-  max_memories_per_injection: 10   # Cap on number of memories injected
+  enabled: true                    # Opt-in per config
+  budget_tokens: 10000              # Max tokens for memory injection per LLM call
+  max_memories_per_injection: 25   # Cap on number of memories injected
   observer_interval: 5             # Run observer every N turns
   observer_model: null             # null = use main LLM, or specify model
   observer_base_url: null          # null = use main LLM_BASE_URL

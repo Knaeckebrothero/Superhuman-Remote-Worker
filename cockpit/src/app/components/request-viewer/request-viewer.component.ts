@@ -92,6 +92,9 @@ import { LLMMessage } from '../../core/models/request.model';
                   @if (requestService.tokenSummary()?.reasoning) {
                     / {{ requestService.tokenSummary()?.reasoning }} reasoning
                   }
+                  @if (requestService.tokenSummary()?.estimated) {
+                    <span class="estimated-badge">(estimated)</span>
+                  }
                 </span>
               </div>
             }
@@ -371,6 +374,12 @@ import { LLMMessage } from '../../core/models/request.model';
 
       .meta-value.mono {
         font-family: 'JetBrains Mono', monospace;
+      }
+
+      .estimated-badge {
+        color: var(--text-muted, #6c7086);
+        font-size: 10px;
+        margin-left: 4px;
       }
 
       /* Section Headers */

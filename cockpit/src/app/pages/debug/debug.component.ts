@@ -1,15 +1,17 @@
 import { Component, inject } from '@angular/core';
 import { TimelineComponent } from '../../components/timeline/timeline.component';
 import { SplitPanelComponent } from '../../layout/split-panel/split-panel.component';
+import { SidebarToggleComponent } from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import { LayoutService } from '../../core/services/layout.service';
 
 @Component({
   selector: 'app-debug-page',
   standalone: true,
-  imports: [TimelineComponent, SplitPanelComponent],
+  imports: [TimelineComponent, SplitPanelComponent, SidebarToggleComponent],
   template: `
     <div class="debug-frame">
       <header class="debug-header">
+        <app-sidebar-toggle />
         <app-timeline />
       </header>
       <main class="debug-main">
@@ -32,7 +34,18 @@ import { LayoutService } from '../../core/services/layout.service';
       }
 
       .debug-header {
+        display: flex;
+        align-items: center;
         flex-shrink: 0;
+      }
+
+      .debug-header app-sidebar-toggle {
+        padding-left: 12px;
+      }
+
+      .debug-header app-timeline {
+        flex: 1;
+        min-width: 0;
       }
 
       .debug-main {

@@ -2,6 +2,7 @@ import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular
 import { ActivatedRoute, Router } from '@angular/router';
 import { ApiService } from '../../core/services/api.service';
 import { UserService } from '../../core/services/user.service';
+import { SidebarToggleComponent } from '../../layout/sidebar-toggle/sidebar-toggle.component';
 import {
   Project,
   ProjectMember,
@@ -18,6 +19,7 @@ type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
 @Component({
   selector: 'app-project-detail-page',
   standalone: true,
+  imports: [SidebarToggleComponent],
   template: `
     <div class="page-container">
       @if (isLoading() && !project()) {
@@ -30,6 +32,7 @@ type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
       @if (project(); as proj) {
         <!-- Header -->
         <div class="page-header">
+          <app-sidebar-toggle />
           <button class="btn btn-ghost btn-back" (click)="goBack()">
             <span class="material-symbols-outlined">arrow_back</span>
           </button>
