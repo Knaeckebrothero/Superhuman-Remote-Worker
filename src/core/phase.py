@@ -537,6 +537,12 @@ def freeze_for_review(
         except Exception as e:
             logger.warning(f"[{job_id}] Git push failed at freeze: {e}")
 
+    # Export todo state BEFORE archiving so staged todos survive in checkpoint.
+    # archive() clears _todos but preserves _staged_todos — we need both in the
+    # checkpoint so that on resume the agent can apply staged tactical todos
+    # instead of falling into the recovery/re-planning path.
+    todo_state = todo_manager.export_state() if todo_manager else {}
+
     # Archive todos if any remain
     if todo_manager:
         todo_manager.archive(f"phase_{phase_number}_{phase_type}")
@@ -559,6 +565,9 @@ def freeze_for_review(
             "messages": [freeze_msg],
             "goal_achieved": False,
             "should_stop": True,
+            "todos": todo_state.get("todos", []),
+            "staged_todos": todo_state.get("staged_todos", []),
+            "todo_next_id": todo_state.get("next_id", 1),
         },
     )
 

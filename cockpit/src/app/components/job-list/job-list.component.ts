@@ -142,7 +142,7 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
                         Review
                       </button>
                     }
-                    @if (job.status !== 'completed') {
+                    @if (job.status !== 'completed' && job.status !== 'pending_review') {
                       <button
                         class="action-btn resume"
                         (click)="resumeJob(job.id); $event.stopPropagation()"

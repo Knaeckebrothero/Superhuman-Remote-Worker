@@ -483,6 +483,16 @@ class LLMArchiver:
             return
 
         try:
+            # Extract shell state from transient injection (if present)
+            # The shell injection is a HumanMessage with <terminal_state> wrapper
+            shell_state = None
+            for msg in messages:
+                if isinstance(msg, HumanMessage):
+                    content = _normalize_content(msg.content)
+                    if content.startswith("<terminal_state>\n"):
+                        shell_state = content
+                        break
+
             # Find new inputs: messages after the last AIMessage
             # These are the messages that triggered this response
             last_ai_idx = -1
@@ -560,6 +570,8 @@ class LLMArchiver:
                 doc["phase_number"] = phase_number
             if reasoning:
                 doc["reasoning"] = reasoning
+            if shell_state:
+                doc["shell_state"] = shell_state
 
             self._chat_history_collection.insert_one(doc)
             logger.debug(f"[CHAT] Archived chat entry for job {job_id[:8]}...")

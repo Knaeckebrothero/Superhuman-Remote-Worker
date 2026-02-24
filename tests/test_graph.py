@@ -319,8 +319,12 @@ class TestRestoreTodoStateNode:
         # TodoManager should remain in initial state
         assert managers["todo"].list_all() == []
 
-    def test_restores_staged_todos(self, managers):
-        """Test that restore_todo_state restores staged todos."""
+    def test_applies_staged_todos_on_phase_boundary_resume(self, managers):
+        """Test that staged todos are applied on phase-boundary resume.
+
+        When resuming with staged todos but no active todos (phase-boundary
+        freeze pattern), the node should apply them and flip to tactical.
+        """
         from src.graph import create_restore_todo_state_node
 
         node = create_restore_todo_state_node(managers["todo"])
@@ -335,9 +339,47 @@ class TestRestoreTodoStateNode:
             "todo_next_id": 5,
         }
 
-        node(state)
+        result = node(state)
 
+        # Staged todos should have been applied as active todos
+        assert not managers["todo"].has_staged_todos()
+        assert len(managers["todo"].list_all()) == 1
+        assert managers["todo"].list_all()[0].content == "Staged Task 1"
+        # Phase should flip to tactical
+        assert result["is_strategic_phase"] is False
+        assert result["should_stop"] is False
+        assert managers["todo"].is_strategic_phase is False
+
+    def test_restores_staged_todos_with_active_todos(self, managers):
+        """Test that staged todos are preserved when active todos also exist.
+
+        When there are both active and staged todos, the node should NOT
+        apply staged todos — this is a normal mid-phase restore.
+        """
+        from src.graph import create_restore_todo_state_node
+
+        node = create_restore_todo_state_node(managers["todo"])
+
+        state = {
+            "job_id": "test-123",
+            "is_strategic_phase": True,
+            "todos": [
+                {"id": "todo_1", "content": "Active Task", "status": "pending", "priority": "medium", "notes": []},
+            ],
+            "staged_todos": [
+                {"id": "todo_2", "content": "Staged Task", "status": "pending", "priority": "medium", "notes": []},
+            ],
+            "todo_next_id": 5,
+        }
+
+        result = node(state)
+
+        # Should return empty dict (no phase-boundary resume triggered)
+        assert result == {}
+        # Staged todos should remain staged
         assert managers["todo"].has_staged_todos()
+        # Active todos should be present
+        assert len(managers["todo"].list_all()) == 1
         assert managers["todo"]._next_id == 5
 
 

@@ -6,6 +6,7 @@ output/*
 orchestrator/workspace/*
 project_documentation/*
 certs/*
+deployment/*
 
 # VPN credentials (config.example is tracked, config is not)
 docker/vpn/config

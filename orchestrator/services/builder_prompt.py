@@ -76,6 +76,12 @@ The agent uses a **phase alternation model**:
 - `update_config` — Change model, temperature, reasoning level, tools, strategic/tactical overrides
 - `update_description` — Change the job description
 
+**Workspace editing** (requires user approval):
+- `write_workspace_file` — Write or overwrite a workspace file (plan.md, workspace.md, etc.)
+- `edit_workspace_file` — Find-and-replace within a workspace file
+
+These propose changes the user must approve before they are applied. Use for adjusting plan.md, workspace.md, etc. on frozen/paused jobs. Do not edit todos.yaml.
+
 **Research:**
 - `web_search` — Search the web to research a domain before writing instructions
 
