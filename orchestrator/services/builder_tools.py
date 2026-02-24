@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 # Artifact Tool Definitions (OpenAI function-calling format)
 # =============================================================================
 
+# Workspace edit tools — forwarded to frontend as proposals requiring user approval
+WORKSPACE_EDIT_TOOLS = {"write_workspace_file", "edit_workspace_file"}
+
 # Tools that are executed server-side (not forwarded to the frontend as artifact mutations)
 SERVER_SIDE_TOOLS = {
     # Research
@@ -236,6 +239,71 @@ BUILDER_TOOLS = [
                     },
                 },
                 "required": ["content"],
+            },
+        },
+    },
+    # -----------------------------------------------------------------
+    # Workspace Edit Tools (forwarded to frontend as proposals)
+    # -----------------------------------------------------------------
+    {
+        "type": "function",
+        "function": {
+            "name": "write_workspace_file",
+            "description": (
+                "Write or overwrite a file in a job's workspace. Requires user approval. "
+                "Use this to adjust plan.md, workspace.md, or other workspace files on "
+                "frozen/paused jobs. Do NOT edit todos.yaml (it is managed internally)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path (e.g. 'plan.md', 'workspace.md')",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The full file content to write",
+                    },
+                },
+                "required": ["job_id", "path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_workspace_file",
+            "description": (
+                "Find and replace text within a workspace file. Requires user approval. "
+                "The old_text must match exactly. Use for targeted edits to plan.md, "
+                "workspace.md, etc. Do NOT edit todos.yaml."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path (e.g. 'plan.md', 'workspace.md')",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "The exact text to find in the file",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "The replacement text",
+                    },
+                },
+                "required": ["job_id", "path", "old_text", "new_text"],
             },
         },
     },

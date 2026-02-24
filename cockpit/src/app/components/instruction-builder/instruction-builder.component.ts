@@ -1,10 +1,11 @@
-import { Component, inject, signal, ElementRef, ViewChild, AfterViewChecked } from '@angular/core';
+import { Component, inject, signal, computed, ElementRef, ViewChild, AfterViewChecked } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MarkdownComponent } from 'ngx-markdown';
-import { JobArtifactService } from '../../core/services/job-artifact.service';
-import { BuilderStreamService, BuilderMessage } from '../../core/services/builder-stream.service';
+import { JobArtifactService, PendingWorkspaceEdit } from '../../core/services/job-artifact.service';
+import { BuilderStreamService, BuilderMessage, WorkspaceProposal } from '../../core/services/builder-stream.service';
+import { ApiService } from '../../core/services/api.service';
 
-type BuilderStepType = 'thought' | 'tool_call' | 'tool_result' | 'inspection_result';
+type BuilderStepType = 'thought' | 'tool_call' | 'tool_result' | 'inspection_result' | 'workspace_proposal';
 type BuilderStepStatus = 'active' | 'complete';
 
 interface BuilderStep {
@@ -128,6 +129,52 @@ interface ChatMessage {
                   </div>
                 }
               </div>
+            </div>
+          }
+
+          @for (edit of pendingEdits(); track edit.id) {
+            <div class="workspace-proposal-card">
+              <div class="proposal-header">
+                <span class="proposal-icon">edit_note</span>
+                <span class="proposal-title">
+                  {{ edit.proposal.operation === 'write' ? 'Write' : 'Edit' }}:
+                  <code>{{ edit.proposal.path }}</code>
+                </span>
+                <span class="proposal-badge" [class]="'badge-' + edit.status">{{ edit.status }}</span>
+              </div>
+              @if (edit.status === 'pending') {
+                <div class="proposal-diff">
+                  @if (edit.proposal.operation === 'edit') {
+                    <div class="diff-section diff-remove">
+                      <span class="diff-label">Remove</span>
+                      <pre class="diff-content">{{ edit.proposal.old_text }}</pre>
+                    </div>
+                    <div class="diff-section diff-add">
+                      <span class="diff-label">Insert</span>
+                      <pre class="diff-content">{{ edit.proposal.new_text }}</pre>
+                    </div>
+                  } @else {
+                    @if (edit.proposal.current_content) {
+                      <details class="diff-details">
+                        <summary class="diff-details-summary">Current content ({{ edit.proposal.current_content!.length }} chars)</summary>
+                        <pre class="diff-content diff-current">{{ edit.proposal.current_content }}</pre>
+                      </details>
+                    }
+                    <details class="diff-details" open>
+                      <summary class="diff-details-summary">New content ({{ edit.proposal.content!.length }} chars)</summary>
+                      <pre class="diff-content diff-new">{{ edit.proposal.content }}</pre>
+                    </details>
+                  }
+                </div>
+                <div class="proposal-actions">
+                  <button class="proposal-btn apply-btn" (click)="applyWorkspaceEdit(edit)">
+                    <span class="btn-icon">check</span> Apply
+                  </button>
+                  <button class="proposal-btn dismiss-btn-ws" (click)="dismissWorkspaceEdit(edit)">
+                    <span class="btn-icon">close</span> Dismiss
+                  </button>
+                </div>
+              }
             </div>
           }
         </div>
@@ -514,6 +561,10 @@ interface ChatMessage {
 
       .step-icon--tool_result {
         background: linear-gradient(135deg, #10b981, #34d399);
+      }
+
+      .step-icon--workspace_proposal {
+        background: linear-gradient(135deg, #f97316, #fab387);
       }
 
       .step-title {
@@ -906,6 +957,189 @@ interface ChatMessage {
         color: #569cd6;
       }
 
+      /* Workspace Proposal Card */
+      .workspace-proposal-card {
+        margin: 8px 0;
+        border: 1px solid rgba(250, 179, 135, 0.3);
+        border-radius: 10px;
+        background: rgba(250, 179, 135, 0.06);
+        overflow: hidden;
+      }
+
+      .proposal-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(250, 179, 135, 0.15);
+        font-size: 12px;
+        font-weight: 600;
+        color: #fab387;
+      }
+
+      .proposal-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 18px;
+        flex-shrink: 0;
+      }
+
+      .proposal-title {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .proposal-title code {
+        background: rgba(250, 179, 135, 0.15);
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 11px;
+      }
+
+      .proposal-badge {
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        padding: 2px 6px;
+        border-radius: 4px;
+        flex-shrink: 0;
+      }
+
+      .badge-pending {
+        background: rgba(250, 179, 135, 0.2);
+        color: #fab387;
+      }
+
+      .badge-approved {
+        background: rgba(166, 227, 161, 0.2);
+        color: #a6e3a1;
+      }
+
+      .badge-dismissed {
+        background: rgba(108, 112, 134, 0.2);
+        color: #6c7086;
+      }
+
+      .proposal-diff {
+        padding: 8px 12px;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+
+      .diff-section {
+        margin-bottom: 8px;
+        border-radius: 6px;
+        overflow: hidden;
+      }
+
+      .diff-label {
+        display: block;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        padding: 4px 8px;
+      }
+
+      .diff-remove {
+        border: 1px solid rgba(243, 139, 168, 0.25);
+      }
+
+      .diff-remove .diff-label {
+        background: rgba(243, 139, 168, 0.12);
+        color: #f38ba8;
+      }
+
+      .diff-add {
+        border: 1px solid rgba(166, 227, 161, 0.25);
+      }
+
+      .diff-add .diff-label {
+        background: rgba(166, 227, 161, 0.12);
+        color: #a6e3a1;
+      }
+
+      .diff-content {
+        margin: 0;
+        padding: 8px 10px;
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: var(--text-primary, #cdd6f4);
+        max-height: 200px;
+        overflow-y: auto;
+      }
+
+      .diff-details {
+        margin-bottom: 8px;
+      }
+
+      .diff-details-summary {
+        font-size: 11px;
+        color: var(--text-muted, #6c7086);
+        cursor: pointer;
+        padding: 4px 0;
+        user-select: none;
+      }
+
+      .diff-current {
+        background: rgba(49, 50, 68, 0.5);
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 6px;
+      }
+
+      .diff-new {
+        background: rgba(166, 227, 161, 0.05);
+        border: 1px solid rgba(166, 227, 161, 0.2);
+        border-radius: 6px;
+      }
+
+      .proposal-actions {
+        display: flex;
+        gap: 8px;
+        padding: 8px 12px;
+        border-top: 1px solid rgba(250, 179, 135, 0.15);
+      }
+
+      .proposal-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px 12px;
+        border: none;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .proposal-btn .btn-icon {
+        font-family: 'Material Symbols Outlined';
+        font-size: 16px;
+      }
+
+      .apply-btn {
+        background: rgba(166, 227, 161, 0.2);
+        color: #a6e3a1;
+      }
+
+      .apply-btn:hover {
+        background: rgba(166, 227, 161, 0.35);
+      }
+
+      .dismiss-btn-ws {
+        background: rgba(108, 112, 134, 0.15);
+        color: var(--text-muted, #6c7086);
+      }
+
+      .dismiss-btn-ws:hover {
+        background: rgba(108, 112, 134, 0.3);
+      }
+
       /* Remove white-space:pre-wrap on markdown rendered content */
       .message-assistant .message-content.markdown-body {
         white-space: normal;
@@ -931,6 +1165,7 @@ interface ChatMessage {
 export class InstructionBuilderComponent implements AfterViewChecked {
   readonly artifacts = inject(JobArtifactService);
   private readonly stream = inject(BuilderStreamService);
+  private readonly api = inject(ApiService);
 
   @ViewChild('messagesContainer') messagesContainer?: ElementRef<HTMLDivElement>;
   @ViewChild('inputArea') inputArea?: ElementRef<HTMLTextAreaElement>;
@@ -938,6 +1173,9 @@ export class InstructionBuilderComponent implements AfterViewChecked {
   readonly messages = signal<ChatMessage[]>([]);
   readonly streamingText = signal<string>('');
   readonly streamingSteps = signal<BuilderStep[]>([]);
+  readonly pendingEdits = computed(() =>
+    this.artifacts.pendingWorkspaceEdits().filter((e) => e.status === 'pending'),
+  );
   readonly error = signal<string | null>(null);
   readonly isCreatingSession = signal(false);
   readonly lastFailedMessage = signal<string | null>(null);
@@ -1039,6 +1277,13 @@ export class InstructionBuilderComponent implements AfterViewChecked {
         }
         this.shouldScrollToBottom = true;
       },
+      onWorkspaceProposal: (proposal) => {
+        this.completeActiveSteps();
+        const label = proposal.operation === 'write' ? 'Write' : 'Edit';
+        this.addStep('workspace_proposal', `${label}: ${proposal.path}`, '', 'complete');
+        this.artifacts.addWorkspaceProposal(proposal);
+        this.shouldScrollToBottom = true;
+      },
       onDone: () => {
         const content = this.streamingText();
         const steps = this.streamingSteps();
@@ -1101,6 +1346,36 @@ export class InstructionBuilderComponent implements AfterViewChecked {
     this.lastFailedMessage.set(null);
   }
 
+  applyWorkspaceEdit(edit: PendingWorkspaceEdit): void {
+    const p = edit.proposal;
+    let finalContent: string;
+
+    if (p.operation === 'edit' && p.current_content && p.old_text != null && p.new_text != null) {
+      finalContent = p.current_content.replace(p.old_text, p.new_text);
+    } else if (p.operation === 'write' && p.content != null) {
+      finalContent = p.content;
+    } else {
+      return;
+    }
+
+    this.api.writeWorkspaceFile(p.job_id, p.path, finalContent, `Builder: update ${p.path}`).subscribe({
+      next: (result) => {
+        if (result) {
+          this.artifacts.resolveWorkspaceEdit(edit.id, 'approved');
+        } else {
+          this.error.set(`Failed to write ${p.path}`);
+        }
+      },
+      error: () => {
+        this.error.set(`Failed to write ${p.path}`);
+      },
+    });
+  }
+
+  dismissWorkspaceEdit(edit: PendingWorkspaceEdit): void {
+    this.artifacts.resolveWorkspaceEdit(edit.id, 'dismissed');
+  }
+
   autoResizeTextarea(): void {
     const el = this.inputArea?.nativeElement;
     if (el) {
@@ -1126,6 +1401,7 @@ export class InstructionBuilderComponent implements AfterViewChecked {
       case 'tool_call': return 'build';
       case 'tool_result': return 'check_circle';
       case 'inspection_result': return 'visibility';
+      case 'workspace_proposal': return 'edit_note';
     }
   }
 

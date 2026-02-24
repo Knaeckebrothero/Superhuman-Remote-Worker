@@ -10,16 +10,24 @@ Configuration:
     This is useful when running the API in a container with a mounted workspace volume.
 """
 
+import logging
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+logger = logging.getLogger(__name__)
+
+
+_BLOCKED_PATHS = {"todos.yaml", ".gitignore"}
+_BLOCKED_PREFIXES = (".git/", "tools/")
+
 
 class WorkspaceService:
-    """Service for reading job workspace files."""
+    """Service for reading and writing job workspace files."""
 
     def __init__(self, workspace_base: str | None = None):
         """Initialize workspace service.
@@ -30,9 +38,9 @@ class WorkspaceService:
                 2. WORKSPACE_PATH environment variable
                 3. Default: ../../../workspace relative to this file
         """
-        # Project root: four levels up from this file
-        # (services/workspace.py -> services/ -> api/ -> cockpit/ -> project root)
-        project_root = Path(__file__).parent.parent.parent.parent
+        # Project root: three levels up from this file
+        # (workspace.py -> services/ -> orchestrator/ -> project root)
+        project_root = Path(__file__).parent.parent.parent
 
         if workspace_base:
             raw = Path(workspace_base)
@@ -356,6 +364,97 @@ class WorkspaceService:
                 })
 
         return files
+
+    @staticmethod
+    def is_path_blocked(path: str) -> str | None:
+        """Check if a path is blocked from editing.
+
+        Returns:
+            Error message if blocked, None if allowed.
+        """
+        normalized = path.replace("\\", "/").strip("/")
+        if normalized in _BLOCKED_PATHS:
+            return f"Path '{normalized}' is managed internally and cannot be edited"
+        for prefix in _BLOCKED_PREFIXES:
+            if normalized.startswith(prefix):
+                return f"Paths under '{prefix}' are internal and cannot be edited"
+        return None
+
+    def write_workspace_file(
+        self,
+        job_id: str,
+        path: str,
+        content: str,
+        commit_message: str | None = None,
+    ) -> dict[str, Any]:
+        """Write content to a workspace file (sandboxed).
+
+        Creates parent directories if needed. Optionally commits
+        the change to the workspace git repo.
+
+        Args:
+            job_id: Job UUID
+            path: Relative path within workspace
+            content: File content to write
+            commit_message: If provided, git-commit after writing
+
+        Returns:
+            Dict with path, size, committed status, or error key.
+        """
+        blocked = self.is_path_blocked(path)
+        if blocked:
+            return {"error": blocked}
+
+        job_path = self._get_job_path(job_id)
+        if not job_path:
+            return {"error": f"No workspace found for job '{job_id}'"}
+
+        try:
+            file_path = (job_path / path).resolve()
+            if not str(file_path).startswith(str(job_path.resolve())):
+                return {"error": "Directory traversal is not allowed"}
+        except (ValueError, OSError):
+            return {"error": "Invalid path"}
+
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_text(content)
+        except Exception as e:
+            return {"error": f"Write failed: {e}"}
+
+        committed = False
+        if commit_message:
+            committed = self._git_commit(job_path, commit_message)
+
+        return {
+            "path": path,
+            "size": len(content),
+            "committed": committed,
+        }
+
+    @staticmethod
+    def _git_commit(job_path: Path, message: str) -> bool:
+        """Stage all changes and commit in the workspace git repo."""
+        git_dir = job_path / ".git"
+        if not git_dir.exists():
+            return False
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(job_path),
+                capture_output=True,
+                timeout=10,
+            )
+            result = subprocess.run(
+                ["git", "commit", "-m", message],
+                cwd=str(job_path),
+                capture_output=True,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.warning(f"Git commit failed in {job_path}: {e}")
+            return False
 
     def get_workspace_overview(self, job_id: str) -> dict[str, Any]:
         """Get an overview of the job workspace.

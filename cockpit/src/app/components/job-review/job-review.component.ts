@@ -6,6 +6,8 @@ import { Job } from '../../core/models/api.model';
 import { environment } from '../../core/environment';
 
 interface FrozenJobData {
+  freeze_type?: string;    // "phase_boundary" | "job_complete"
+  phase_type?: string;     // "strategic" | "tactical"
   summary?: string;
   deliverables?: string[];
   confidence?: number;
@@ -134,19 +136,33 @@ interface FrozenJobData {
 
           <!-- Actions -->
           <div class="actions-section">
-            <!-- Approve -->
+            <!-- Approve / Continue (depends on freeze type) -->
             <div class="action-group">
-              <button
-                class="btn approve-btn"
-                (click)="approveJob()"
-                [disabled]="isApproving()"
-              >
-                @if (isApproving()) {
-                  Approving...
-                } @else {
-                  Approve
-                }
-              </button>
+              @if (frozenData()?.freeze_type === 'phase_boundary') {
+                <button
+                  class="btn continue-btn"
+                  (click)="continueJob()"
+                  [disabled]="isResuming()"
+                >
+                  @if (isResuming()) {
+                    Continuing...
+                  } @else {
+                    Continue
+                  }
+                </button>
+              } @else {
+                <button
+                  class="btn approve-btn"
+                  (click)="approveJob()"
+                  [disabled]="isApproving()"
+                >
+                  @if (isApproving()) {
+                    Approving...
+                  } @else {
+                    Approve
+                  }
+                </button>
+              }
             </div>
 
             <!-- Divider -->
@@ -598,6 +614,26 @@ export class JobReviewComponent {
         this.loadJob();
       } else {
         this.resultMessage.set('Failed to approve job. Check console for details.');
+        this.resultIsError.set(true);
+      }
+    });
+  }
+
+  continueJob(): void {
+    const jobId = this.currentJobId();
+    if (!jobId) return;
+
+    this.isResuming.set(true);
+    this.resultMessage.set(null);
+
+    this.api.resumeJob(jobId).subscribe((result) => {
+      this.isResuming.set(false);
+      if (result) {
+        this.resultMessage.set('Job continuing. Agent will resume execution.');
+        this.resultIsError.set(false);
+        this.loadJob();
+      } else {
+        this.resultMessage.set('Failed to continue job. Check console for details.');
         this.resultIsError.set(true);
       }
     });

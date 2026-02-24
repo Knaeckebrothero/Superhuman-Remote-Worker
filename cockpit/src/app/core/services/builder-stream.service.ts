@@ -25,12 +25,25 @@ export interface BuilderSession {
   summary: string | null;
 }
 
+/** A workspace edit proposal from the builder that needs user approval. */
+export interface WorkspaceProposal {
+  tool: string;
+  job_id: string;
+  path: string;
+  operation: 'write' | 'edit';
+  content?: string;
+  old_text?: string;
+  new_text?: string;
+  current_content: string | null;
+}
+
 /** Callback interface for SSE stream events. */
 export interface StreamCallbacks {
   onToken?: (text: string) => void;
   onToolCall?: (tool: string, args: Record<string, unknown>) => void;
   onToolExecuting?: (tool: string, args: Record<string, unknown>) => void;
   onToolResult?: (tool: string, summary: string, content?: string) => void;
+  onWorkspaceProposal?: (proposal: WorkspaceProposal) => void;
   onStep?: (type: string, title: string) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
@@ -213,6 +226,10 @@ export class BuilderStreamService {
           data['summary'] as string,
           data['content'] as string | undefined,
         );
+        break;
+
+      case 'workspace_proposal':
+        callbacks.onWorkspaceProposal?.(data as unknown as WorkspaceProposal);
         break;
 
       case 'step':

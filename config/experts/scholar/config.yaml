@@ -70,7 +70,7 @@ tools:
     - browse_website
     - research_topic
   coding:
-    - run_command
+    - shell
   git:
     - git_log
     - git_show

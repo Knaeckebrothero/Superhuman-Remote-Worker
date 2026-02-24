@@ -15,7 +15,7 @@ Also handles injection of instruction files triggered by phase transitions
 import uuid
 from typing import List, Tuple
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 # Prefix for identifying synthetic workspace tool calls
 # Used to exclude these messages from summarization
@@ -128,11 +128,20 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
     Returns:
         True if this message is a synthetic injection message
     """
-    # Detect transient todo HumanMessage
+    # Detect transient HumanMessage injections (todos)
     if isinstance(message, HumanMessage):
         content = getattr(message, "content", "")
-        if isinstance(content, str) and content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
-            return True
+        if isinstance(content, str):
+            if content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
+                return True
+
+    # Detect transient SystemMessage injection (shell state)
+    if isinstance(message, SystemMessage):
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            from src.core.shell_injection import SHELL_INJECTION_CONTENT_PREFIX
+            if content.startswith(SHELL_INJECTION_CONTENT_PREFIX):
+                return True
 
     from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
     prefixes = (WORKSPACE_TOOL_CALL_ID_PREFIX, INSTRUCTION_TOOL_CALL_ID_PREFIX, MEMORY_TOOL_CALL_ID_PREFIX)

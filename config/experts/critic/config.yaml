@@ -41,7 +41,7 @@ tools:
     - mark_complete
     - job_complete
   coding:
-    - run_command
+    - shell
   git:
     - git_log
     - git_show

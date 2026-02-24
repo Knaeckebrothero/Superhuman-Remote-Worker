@@ -106,6 +106,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip \
     unzip \
     sudo \
+    tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Allow graphrag to sudo without password (private project, no security concern)

@@ -123,6 +123,9 @@ class UniversalAgent:
         self._datasource_connections: Dict[str, Any] = {}
         self._datasource_clients: Dict[str, Any] = {}  # Parent clients for cleanup (e.g. MongoClient)
 
+        # Persistent shell sessions (tmux-backed)
+        self._shell_manager = None
+
         # Background document registration task
         self._doc_registration_task: Optional[asyncio.Task] = None
 
@@ -516,11 +519,13 @@ class UniversalAgent:
                     return dict(final_state)
                 finally:
                     self._current_job_id = None
+                    self._cleanup_shell_manager()
                     self._close_datasource_connections()
                     await self._cleanup_checkpointer()
 
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}", exc_info=True)
+            self._cleanup_shell_manager()
             self._close_datasource_connections()
             await self._cleanup_checkpointer()
             self._current_job_id = None
@@ -548,6 +553,15 @@ class UniversalAgent:
             self._checkpoint_conn = None
             self._checkpointer = None
 
+    def _cleanup_shell_manager(self) -> None:
+        """Clean up ShellManager (kill tmux session)."""
+        if self._shell_manager:
+            try:
+                self._shell_manager.cleanup()
+            except Exception:
+                pass
+            self._shell_manager = None
+
     async def _yield_error_state(self, error_state: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """Yield a single error state for streaming mode."""
         yield error_state
@@ -573,6 +587,7 @@ class UniversalAgent:
         finally:
             # Clean up after streaming completes (or errors)
             self._current_job_id = None
+            self._cleanup_shell_manager()
             self._close_datasource_connections()
             await self._cleanup_checkpointer()
 
@@ -1259,6 +1274,36 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             _instruction_files=self.config.instruction_files,
         )
         self._tool_context = context
+
+        # Initialize ShellManager for persistent terminal sessions (if tmux available)
+        if shutil.which("tmux"):
+            try:
+                from src.tools.coding.shell_manager import ShellManager
+
+                shell_config = self.config.extra.get("shell", {})
+                auto_start_cc = (
+                    shell_config.get("auto_start_claude_code", True)
+                    and shutil.which("claude") is not None
+                )
+                cc_config = self.config.extra.get("claude_code", {})
+                shell_manager = ShellManager(
+                    job_id=self._current_job_id,
+                    max_tabs=shell_config.get("max_tabs", 6),
+                    scrollback_limit=shell_config.get("scrollback_limit", 5000),
+                    default_timeout=shell_config.get("default_timeout", 120),
+                    idle_timeout=shell_config.get("idle_timeout", 1800),
+                    blocked_commands=shell_config.get("blocked_commands"),
+                    auto_start_claude_code=auto_start_cc,
+                    claude_code_model=cc_config.get("model", "claude-opus-4-6"),
+                    sandbox_cwd=str(self._workspace_manager.path) if shell_config.get("sandbox", True) else None,
+                )
+                context.shell_manager = shell_manager
+                self._shell_manager = shell_manager
+                logger.info(f"ShellManager initialized for job {self._current_job_id}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize ShellManager (non-fatal): {e}")
+        else:
+            logger.debug("tmux not found — shell tools disabled")
 
         # Initialize RecallStore for Memory Light (if enabled)
         if self.config.memory.enabled:

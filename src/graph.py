@@ -535,6 +535,14 @@ def create_execute_node(
         if recall_store:
             injection_overhead_tokens += config.memory.budget_tokens
 
+        # Add shell state injection overhead (~200 tokens per active tab)
+        if tool_context and getattr(tool_context, 'shell_manager', None) is not None:
+            try:
+                active_tab_count = len(tool_context.shell_manager.list_tabs())
+                injection_overhead_tokens += active_tab_count * 200
+            except Exception:
+                injection_overhead_tokens += 400  # Conservative fallback
+
         # Temporarily lower compaction thresholds to account for injection overhead
         # Floor at 50% of original to avoid over-triggering
         original_compaction_threshold = context_mgr.config.compaction_threshold_tokens
@@ -658,6 +666,21 @@ def create_execute_node(
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
                 target_messages.append(mem_ai)
                 target_messages.append(mem_tool)
+
+            # Shell state injection (persistent terminal tabs)
+            if tool_context and getattr(tool_context, 'shell_manager', None) is not None:
+                try:
+                    shell_config = config.extra.get("shell", {})
+                    shell_status = tool_context.shell_manager.get_injection_status(
+                        lines_per_tab=shell_config.get("inject_lines_per_tab", 30)
+                    )
+                    if shell_status:
+                        from src.core.shell_injection import create_shell_state_message
+                        tab_count = len(tool_context.shell_manager.list_tabs())
+                        shell_msg = create_shell_state_message(shell_status, tab_count)
+                        target_messages.append(shell_msg)
+                except Exception as e:
+                    logger.warning(f"[{job_id}] Shell injection failed (non-fatal): {e}")
 
             # Phase-triggered instruction files (active injection)
             if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
@@ -1863,6 +1886,26 @@ def create_restore_todo_state_node(
         is_strategic = state.get("is_strategic_phase", True)
         todo_manager.is_strategic_phase = is_strategic
         todo_manager.phase_number = state.get("phase_number", 1)
+
+        # Detect phase-boundary resume: agent had staged tactical todos ready
+        # when it froze. Apply them and flip to tactical so execution continues
+        # instead of re-entering strategic planning.
+        if todo_manager.has_staged_todos() and not todo_manager.list_all():
+            todo_manager.apply_staged_todos()
+            todo_manager.is_strategic_phase = False
+            logger.info(
+                f"[{job_id}] Applied staged todos on resume "
+                f"— continuing to tactical phase"
+            )
+
+            todo_state = todo_manager.export_state()
+            return {
+                "is_strategic_phase": False,
+                "should_stop": False,
+                "todos": todo_state["todos"],
+                "staged_todos": todo_state["staged_todos"],
+                "todo_next_id": todo_state["next_id"],
+            }
 
         return {}
 

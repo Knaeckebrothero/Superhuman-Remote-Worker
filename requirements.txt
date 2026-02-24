@@ -53,5 +53,9 @@ pymongo>=4.6.0
 psutil>=5.9.0
 # Optional: Claude Code delegation tool (requires Claude Code CLI)
 claude-agent-sdk>=0.1.35
+# Persistent shell sessions (requires tmux system package)
+# Fedora: sudo dnf install tmux
+# Debian/Ubuntu: sudo apt-get install tmux
+libtmux>=0.50.0
 # Citation engine (separate repo):
 citation-engine[full] @ git+https://github.com/Knaeckebrothero/CitationEngine.git
