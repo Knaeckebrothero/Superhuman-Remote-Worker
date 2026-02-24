@@ -366,6 +366,80 @@ shell_read("shell - frontend", since_cursor=True)
 → Checks for reload errors
 ```
 
+### 7. Human Communication — Conversation Within a Conversation
+
+The Claude Code tab already establishes the pattern: the agent maintains an ongoing conversation with another entity (Claude Code) while simultaneously working in other tabs. This generalizes naturally to **human communication channels**. The agent can keep a chat client open — Teams, Slack CLI, IRC, or even a simple websocket chat — and interact with the user (or a team) while doing its job.
+
+This turns the agent from a "fire and forget" worker into a **collaborative presence** — it can ask clarifying questions, share progress, get approvals, or flag blockers in real time, all without interrupting its work.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Agent's Terminal Multiplexer                                    │
+│                                                                  │
+│  ┌── shell ──────┐  ┌── claude-code ─┐  ┌── teams ─────────────┐│
+│  │ $ pytest -x   │  │ Working on     │  │ Agent: Tests pass,   ││
+│  │ All passed!   │  │ auth module..  │  │ starting deploy.     ││
+│  │ $             │  │               │  │ User: Hold on, wait  ││
+│  │               │  │               │  │ for QA sign-off first ││
+│  └───────────────┘  └───────────────┘  └──────────────────────┘│
+│  (work)             (delegation)        (human communication)   │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### Chat Tab Types
+
+| Tab Type | Name Format | Command Example |
+|----------|-------------|-----------------|
+| Teams CLI | `teams - <channel>` | `teams-cli --channel general` |
+| Slack CLI | `slack - <channel>` | `slack-term -w workspace -c dev` |
+| IRC | `irc - <channel>` | `irssi -c irc.example.com -n agent` |
+| Custom chat | `chat - <name>` | Any TUI/CLI chat client |
+
+#### Interaction Pattern
+
+```
+→ Job starts, agent opens a chat tab alongside its work tabs
+shell_open("general", command="teams-cli --channel project-x", type="teams")
+
+→ Agent works on todos, periodically checks chat tab for messages
+shell_read("teams - general", since_cursor=True)
+→ User: "Focus on the API endpoints first, frontend can wait"
+
+→ Agent adjusts priorities based on human input
+shell_send("teams - general", "Got it, reprioritizing. Starting with /api/users endpoint.")
+
+→ Agent hits a blocker, asks in chat instead of freezing the job
+shell_send("teams - general", "The staging DB credentials in .env.staging are expired. Can someone rotate them?")
+
+→ Continues other work while waiting for response
+shell_read("teams - general", since_cursor=True)
+→ User: "Done, try now"
+
+→ Agent resumes blocked task
+```
+
+#### Why This Matters
+
+The current autonomy model (`full`, `review`, `partial`, `guided`, `dependent`) is **gate-based** — the agent works, then freezes at a checkpoint, then waits. Communication happens at predefined pause points. A chat tab enables **continuous communication** alongside work:
+
+- **Ask, don't assume.** Instead of guessing at ambiguous requirements and discovering the mistake two phases later, the agent asks in real time.
+- **Share progress naturally.** Instead of the user polling the cockpit for status, the agent proactively shares updates: "Finished the middleware, running integration tests now."
+- **Receive course corrections mid-flight.** The user can redirect the agent without waiting for a phase boundary: "Skip the caching layer for now, we need the core API first."
+- **Collaborative debugging.** The agent shares error output, the user provides context the agent can't infer: "That's a known issue with our staging DB, use the backup endpoint instead."
+
+This is essentially the difference between working with someone over email (current model) vs. having them on a call while they work (persistent chat model).
+
+#### Nested Conversations
+
+With persistent tabs, the agent maintains multiple simultaneous conversations:
+
+1. **With itself** — the shell scrollback is its own command history and thought process
+2. **With Claude Code** — delegating and supervising coding subtasks
+3. **With the user/team** — getting requirements, sharing progress, asking questions
+4. **With remote systems** — SSH sessions, database consoles, API interactions
+
+Each conversation has its own context, pace, and purpose. The agent switches between them naturally, just like a human developer with multiple chat windows, terminals, and an IDE open simultaneously.
+
 ## Claude Code Interaction Guide
 
 When `claude_code` is in the agent's tool config, a `claude-code` tab is started automatically at job begin. The agent should treat Claude Code as a **junior developer** it supervises — giving specific instructions, reviewing output, and course-correcting.
@@ -730,7 +804,13 @@ Decisions made based on prior art research and our architecture:
 
 **Rationale:** Research shows no major agent (OpenHands, SWE-agent, Devin, Claude Code) uses structured JSON from CLI tools. Aider's benchmark ([LLMs are bad at returning code in JSON](https://aider.chat/2024/08/14/code-in-json.html)) demonstrated that JSON mode actively hurts code quality — models make more syntax errors when dealing with JSON-escaped content. JSON also doubles token consumption. SWE-agent's Agent-Computer Interface (ACI) improved performance 3x through smart truncation and formatting of raw text, not by switching to JSON. The right approach: strip ANSI, truncate intelligently, add status prefixes — but keep the underlying output as raw text. The agent can choose verbose flags itself when needed (e.g., `pytest -v` or `pytest --tb=short`).
 
-### D9: Type-prefixed tab naming with agent-chosen suffixes
+### D9: Chat tabs as first-class communication channels
+
+**Decision:** Chat clients (Teams, Slack, IRC, custom) are treated as regular shell tabs with a `chat`/`teams`/`slack`/`irc` type prefix. No special protocol — the agent uses `shell_send` and `shell_read` like any other tab.
+
+**Rationale:** The Claude Code tab already proves this pattern works: an ongoing conversation maintained via `shell_send`/`shell_read` alongside other work. Chat clients are just another interactive process in a tmux pane. No new tool surface needed. The agent already knows how to poll for new output, respond, and context-switch. The `[NEW OUTPUT]` flag in the injection naturally draws the agent's attention to incoming messages. This keeps the design unified — every tab is the same abstraction regardless of whether it holds a shell, a REPL, an AI assistant, or a chat client.
+
+### D10: Type-prefixed tab naming with agent-chosen suffixes
 
 **Decision:** Tabs use the format `<type> - <agent-name>` (e.g., `ssh - gpu-box`, `shell - build`). Default tabs use fixed names (`shell`, `claude-code`). Type is auto-detected from the command or set explicitly.
 
@@ -762,7 +842,13 @@ Decisions made based on prior art research and our architecture:
    - Apply head+tail truncation (keep first 20 + last 50 lines, drop middle) instead of tail-only
    - This can be iterated on post-launch based on observed failure modes.
 
-3. **Claude Code session recovery.** What happens if the Claude Code process inside the `claude-code` tab crashes or exits unexpectedly? The agent needs to detect this (via injection showing "exited") and restart. Should `ShellManager` auto-restart default tabs, or should the agent handle it explicitly? Leaning toward explicit — the agent should notice and decide whether to restart clean or with `--resume`.
+3. **Chat tab attention model.** When a chat tab has `[NEW OUTPUT]`, should the agent interrupt its current task to read and respond, or finish the current todo first? A human developer glances at a chat notification and decides whether it's urgent. The agent needs a similar heuristic. Options:
+   - Always finish the current tool call, then check chat before the next action
+   - Priority flag on chat tabs: `urgent` tabs get checked every turn, `normal` tabs get checked between todos
+   - Keyword-based urgency detection in the injection preview (if the 5 visible lines contain "urgent", "blocker", "stop", treat as high priority)
+   - This interacts with the notification system (Phase 4) — a `shell_watch` on the chat tab with pattern matching could trigger priority handling.
+
+4. **Claude Code session recovery.** What happens if the Claude Code process inside the `claude-code` tab crashes or exits unexpectedly? The agent needs to detect this (via injection showing "exited") and restart. Should `ShellManager` auto-restart default tabs, or should the agent handle it explicitly? Leaning toward explicit — the agent should notice and decide whether to restart clean or with `--resume`.
 
 ## Related
 

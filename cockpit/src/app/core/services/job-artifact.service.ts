@@ -1,6 +1,14 @@
 import { Injectable, inject, signal } from '@angular/core';
 import { environment } from '../environment';
 import { JobContextService } from './job-context.service';
+import type { WorkspaceProposal } from './builder-stream.service';
+
+/** A pending workspace edit awaiting user approval. */
+export interface PendingWorkspaceEdit {
+  id: string;
+  proposal: WorkspaceProposal;
+  status: 'pending' | 'approved' | 'dismissed';
+}
 
 /**
  * Deep merge two objects. Objects merge recursively, arrays replace entirely, null clears.
@@ -58,6 +66,11 @@ export class JobArtifactService {
   /** Selected builder model */
   readonly builderModel = signal<string>(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
 
+  /** Pending workspace edit proposals awaiting user approval */
+  readonly pendingWorkspaceEdits = signal<PendingWorkspaceEdit[]>([]);
+
+  private editCounter = 0;
+
   /**
    * Apply an artifact mutation from a builder tool call.
    * Called by BuilderStreamService when tool_call SSE events arrive.
@@ -95,6 +108,21 @@ export class JobArtifactService {
     }
   }
 
+  /** Add a workspace edit proposal for user approval. */
+  addWorkspaceProposal(proposal: WorkspaceProposal): string {
+    const id = `ws-edit-${++this.editCounter}`;
+    const edit: PendingWorkspaceEdit = { id, proposal, status: 'pending' };
+    this.pendingWorkspaceEdits.update((edits) => [...edits, edit]);
+    return id;
+  }
+
+  /** Resolve a pending workspace edit as approved or dismissed. */
+  resolveWorkspaceEdit(id: string, status: 'approved' | 'dismissed'): void {
+    this.pendingWorkspaceEdits.update((edits) =>
+      edits.map((e) => (e.id === id ? { ...e, status } : e)),
+    );
+  }
+
   /** Reset all state for a new job creation session (preserves job selection) */
   reset(): void {
     this.instructions.set(null);
@@ -103,5 +131,7 @@ export class JobArtifactService {
     this.sessionId.set(null);
     this.streaming.set(false);
     this.builderModel.set(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
+    this.pendingWorkspaceEdits.set([]);
+    this.editCounter = 0;
   }
 }

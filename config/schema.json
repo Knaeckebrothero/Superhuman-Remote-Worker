@@ -264,8 +264,8 @@
           "items": {
             "type": "string"
           },
-          "description": "Coding/execution tools: shell commands and Claude Code delegation (src/tools/coding/)",
-          "examples": [["run_command", "claude_code"]]
+          "description": "Coding/execution tools: shell commands and persistent terminal sessions (src/tools/coding/)",
+          "examples": [["shell", "shell_open", "shell_send", "shell_read", "shell_close", "shell_list"]]
         }
       }
     },
@@ -501,6 +501,70 @@
           "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
           "default": "high",
           "description": "Reasoning effort level (CLAUDE_CODE_EFFORT_LEVEL env var)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "shell": {
+      "type": "object",
+      "description": "Persistent shell session settings (tmux-backed terminal multiplexer). Requires tmux installed.",
+      "properties": {
+        "max_tabs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "default": 6,
+          "description": "Maximum number of concurrent terminal tabs"
+        },
+        "inject_lines_per_tab": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 50,
+          "default": 5,
+          "description": "Lines of output shown per active tab in context injection"
+        },
+        "max_read_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 200,
+          "description": "Maximum lines shell_read can return"
+        },
+        "scrollback_limit": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 5000,
+          "description": "Tmux history-limit per pane (scrollback buffer size)"
+        },
+        "default_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 120,
+          "description": "Default timeout for shell tool in seconds"
+        },
+        "idle_timeout": {
+          "type": "integer",
+          "minimum": 60,
+          "default": 1800,
+          "description": "Seconds before a tab is considered idle in context injection"
+        },
+        "blocked_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Commands blocked from execution for safety",
+          "default": ["sudo", "reboot", "shutdown", "poweroff", "halt", "init", "systemctl"]
+        },
+        "sandbox": {
+          "type": "boolean",
+          "default": true,
+          "description": "Restrict working directory to workspace root"
+        },
+        "auto_start_claude_code": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-open a Claude Code tab when claude_code tool is in config"
         }
       },
       "additionalProperties": false

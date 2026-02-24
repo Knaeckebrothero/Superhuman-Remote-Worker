@@ -164,11 +164,13 @@ tools:
 
 The `instructions.md` alongside it would contain project-specific guidance — API patterns, naming conventions, architectural decisions, things that a generic developer agent wouldn't know.
 
-## Job Modes Within a Project
+## Job Patterns Within a Project
 
-### Sequential (Branch-per-Job)
+The branch-per-job model doesn't need a `mode` setting — it inherently supports multiple usage patterns. There's no `mode` column on the `projects` table; the user simply creates jobs however they want.
 
-The default mode. Each job gets a branch, works on it, and the result is merged into `main` when the job completes. The next job starts from updated `main`.
+### Sequential
+
+Create one job at a time. Merge into `main` when done. Start the next job from updated `main`.
 
 ```
 main: ─────●──────────●──────────●──────────●───
@@ -180,9 +182,9 @@ job-2:                              ──●──●─
 
 Use case: Writing a book (outline → worldbuilding → chapter 1 → chapter 2 → editing). Each job builds on the accumulated result.
 
-### Parallel (Concurrent Branches)
+### Parallel
 
-Multiple jobs run simultaneously on different branches. Results are merged when ready — either automatically (if no conflicts) or via review.
+Create multiple jobs simultaneously. Each gets its own branch. Merge when ready — conflicts resolved via agent-assisted merge (see "Merge Conflict Resolution").
 
 ```
 main: ─────●───────────────────●───
@@ -194,9 +196,9 @@ job-B:       ──●──●──●────────
 
 Use case: Research project where one job gathers data while another builds the analysis framework. Or multiple agents implementing different features of the same codebase.
 
-### Persistent Agent (Sequential Auto-Chain)
+### Persistent Agent (Future — Phase 5)
 
-A convenience mode where the system automatically creates a new job when the previous one completes, continuing from `main`. The user interacts by sending messages/instructions that become the next job's description. From the outside it looks like one long-running agent, but internally it's a chain of jobs — each with its own clean context window.
+A convenience layer on top of sequential where the system auto-creates the next job when the previous one completes. The user interacts via the builder chat — each message becomes a job. See Phase 5 for details.
 
 ```
 main: ─────●────●────●────●────●────●───
@@ -208,9 +210,7 @@ job-4:                      ●    |
 job-5:                           ●
 ```
 
-Use case: Long-running software project. The user gives high-level direction ("implement auth next", "now add tests", "refactor the API layer"), and each becomes a job that picks up where the last one left off.
-
-This mode is important because it sidesteps the context window problem — each job starts fresh with a clean context but has the full project history in the git repo. The agent reads what it needs from the repo rather than carrying everything in memory.
+This pattern sidesteps the context window problem — each job starts fresh with a clean context but has the full project history in the git repo.
 
 ## Database Schema
 
@@ -597,11 +597,6 @@ All items below have been implemented.
 - [x] Angular TypeScript models: `Project`, `ProjectMember`, `ProjectRepository` interfaces with create/update types; updated `User`, `Job`, `JobCreateRequest`
 - [x] Project deletion cleans up managed Gitea repos, blocks deletion of default projects
 
-**Not yet implemented (deferred to later phases):**
-- Jobs repo seeding from Gitea template repo (currently creates empty repo)
-- Project expert resolution from jobs repo `experts/` directory (deferred from Phase 2)
-- Authorization enforcement (role checks exist as `get_user_role_in_project()` but endpoints don't gate on roles yet)
-
 ### Phase 2: Agent Workspace Integration — COMPLETED
 
 All items below have been implemented unless noted otherwise.
@@ -621,13 +616,6 @@ All items below have been implemented unless noted otherwise.
 - [x] Graceful degradation: all new git/repo operations wrapped in try/except; non-project jobs completely unaffected
 - [x] Datasource resolution passes `project_id` for three-level scope (job > project > global)
 
-**Not yet implemented (deferred to Phase 4+):**
-- Source repo job branches (agents create branches in source repos for isolation) — currently source repos are cloned at their configured branch but no job-specific branch is created
-- Push-on-completion for modified source repos (only jobs repo is pushed today)
-- Source repo merge (depends on source repo branches above)
-- Project expert resolution from jobs repo `experts/` directory
-- Integration test: two sequential project jobs verifying second sees first's output
-
 ### Phase 3: Merge + Promote — COMPLETED
 
 All items below have been implemented unless noted otherwise.
@@ -645,10 +633,6 @@ All items below have been implemented unless noted otherwise.
   - [x] Validates job is in a default project and is completed
 - [x] **Cleanup**: removed redundant `job-{id}` Gitea repo creation in `create_project_job` — project jobs use the project's jobs repo directly via `git_remote_url`
 - [x] `MergeRequest` and `PromoteRequest` Pydantic models
-
-**Not yet implemented (deferred to later phases):**
-- Source repo merge (agents don't create branches in source repos yet — deferred from Phase 2)
-- Auto-merge on approval (merge is manual-only, triggered via endpoint)
 
 ### Phase 4: Cockpit UI — COMPLETED
 
@@ -676,18 +660,51 @@ All items below have been implemented unless noted otherwise.
 - [x] **Project selector in job-create**: Dropdown above description field. Loads user's projects, defaults to `is_default` project. Honors `?project=` query param. Sends `project_id` with job create request. Hidden when user has only 1 project.
 - [x] **"New Job" button** on project detail Jobs tab: Navigates to job-create with `?project={id}` query param for pre-selection.
 
-**Not yet implemented (deferred to Phase 5+):**
-- Project expert creation via guided form (currently read-only display of repo-based configs)
-- Expert selector in job-create showing project experts first, then global experts
-- Project datasource management tab (project-scoped datasource panel)
-- Repo file browser per project repository
-- Authorization enforcement in UI (role-based button visibility)
+### Phase 5: Persistent Agent Mode — NOT STARTED
 
-### Phase 5: Persistent Agent Mode
+The idea is to elevate the cockpit's **builder chat** into a project's persistent agent. Today the builder is a stateless assistant that helps draft job instructions. In this phase, it becomes a project-scoped conversational agent: the user sends messages in the builder chat, each message becomes a job, and the chat history reflects the chain of jobs and their outcomes.
 
-- Auto-chain mechanism: on job completion, if project mode is `persistent`, create next job
-- Message/feedback endpoint: user sends text → becomes next job description
-- Session continuity: new job inherits context hints from previous job's workspace.md
+This is far from implementation. Open questions:
+- How does the builder chat maintain project context across jobs? (workspace.md is the likely carrier, but the builder currently has no project scope)
+- What's the UX for reviewing job output inline in the chat vs. navigating to the job review panel?
+- How does the auto-chain interact with autonomy levels? (A persistent agent with `review` autonomy would freeze after every job, requiring approval before the next one starts — that might be the right default)
+- Should the persistent agent have its own expert config, or does it use the project's default?
+
+Rough sketch:
+- Auto-chain mechanism: on job completion + merge, if the project has persistent mode enabled, the system waits for the user's next message in the builder chat
+- Message → job: user sends text in the builder chat → orchestrator creates a new job in the project with that text as the description, using the project's default expert config
+- Session continuity: the new job starts from merged `main`, so it has the full accumulated project state in workspace.md and deliverables in `output/`
+- Chat history: the builder chat shows the sequence of messages and job summaries, giving a conversational view over what is internally a chain of independent jobs
+
+### Open Work
+
+Consolidated list of deferred items across all phases. Roughly priority-ordered.
+
+**Critical (blocks reliable project job execution):**
+- [ ] `.gitignore` job-scoped files in project workspaces — prevents stale signal files from leaking between jobs (see "Job State vs Project State")
+- [ ] Move freeze/completion signaling to DB-only — `freeze_data JSONB` column on `jobs` table, approve endpoint reads from DB instead of Gitea
+- [ ] Fix approve endpoint repo name for project jobs — currently hardcoded to `job-{job_id}`, needs to resolve project's actual jobs repo
+
+**Important (completes the project workflow):**
+- [ ] Source repo job branches — agents should create job-specific branches in source repos for isolation (currently cloned at configured branch without branching)
+- [ ] Push-on-completion for modified source repos — only jobs repo is pushed today
+- [ ] Source repo merge via PR — same flow as jobs repo merge, per-repo merge status tracking
+- [ ] Agent-assisted merge conflict resolution — extend MCP/builder tools to inspect and resolve conflicts
+- [ ] Authorization enforcement — role-based endpoint gating (owner/editor/viewer); `get_user_role_in_project()` exists but endpoints don't check it
+- [ ] Integration test: two sequential project jobs verifying second sees first's output
+
+**Nice to have (UI/UX polish):**
+- [ ] Expert selector in job-create showing project experts first, then global experts (with divider)
+- [ ] Project expert creation via guided form (currently read-only display)
+- [ ] Project datasource management tab (project-scoped datasource panel)
+- [ ] Repo file browser per project repository
+- [ ] Authorization enforcement in UI (role-based button visibility)
+- [ ] Auto-merge on job completion (configurable per project, deferred until more testing)
+
+**Long-term (Phase 5+):**
+- [ ] Persistent agent mode via builder chat elevation
+- [ ] Content-only repositories (move all job metadata to DB, repositories hold only deliverables)
+- [ ] Automated merge phase (agent resolves conflicts automatically, user approves)
 
 ## Design Decisions
 
@@ -755,6 +772,115 @@ Submodules would track source repos as part of the jobs repo. But:
 ### Why Not a Full CI/CD Pipeline?
 
 Projects intentionally don't define execution order or dependencies between jobs. Jobs are created and run manually (or via the persistent agent auto-chain). A full pipeline system (DAGs, triggers, conditional branching) would add significant complexity for limited initial value. The kanban/sprint layer (future) is the right place for workflow automation.
+
+### Job State vs Project State — What Merges Into Main
+
+The jobs repo is shared across all jobs in a project. When a job branch is merged into `main`, every committed file goes with it. But not all workspace files are "project state" — many are job-specific transient data that should never reach `main`. If they do, the next job that clones from `main` inherits stale state from a previous job.
+
+**File classification:**
+
+| Path | Scope | Should merge? | Reason |
+|------|-------|---------------|--------|
+| `workspace.md` | Project | Yes | Accumulated project knowledge, persists across jobs |
+| `output/` (deliverables) | Project | Yes | Work products that future jobs build on |
+| `experts/` | Project | Yes | Project-specific agent configs, evolve over time |
+| `plan.md` | Job | No | Job-specific execution plan, not relevant to next job |
+| `todos.yaml` | Job | No | Current job's task list |
+| `archive/` | Job | No | Phase history (archived todos + retrospectives) |
+| `tools/` | Job | No | Auto-generated tool documentation |
+| `documents/` | Job | No | Input documents for this specific job |
+| `instructions.md` | Job | No | Generated instructions for this job |
+| `output/job_frozen.json` | Job | No | Freeze signal — causes `check_goal` to stop new jobs |
+| `output/job_completion.json` | Job | No | Approval signal — same issue |
+| `reference/` | Job | No | Job-specific reference materials |
+
+**The core problem:** The agent commits everything (via `git add -A` in `GitManager.commit()`), and the PR-based merge moves all of it to `main`. There's no mechanism to distinguish deliverable outputs from job machinery.
+
+**Current dependencies that complicate this:**
+
+1. **The approve endpoint reads `job_frozen.json` from Gitea** (`GET /api/jobs/{id}/approve`, line 929 of `orchestrator/main.py`). It looks in repo `job-{job_id}`, which is the legacy per-job repo name — this is already broken for project jobs where the repo is the project's jobs repo, not `job-{job_id}`.
+
+2. **The `check_goal` node in `src/graph.py` detects freeze/completion by checking file existence** (`output/job_frozen.json`, `output/job_completion.json`). This is the mechanism that breaks when stale files leak across jobs.
+
+3. **Phase transitions (`freeze_for_review`, `finalize_job`) write signal files and immediately commit + push them.** The approve endpoint then reads and deletes them. This file-based signaling was designed for isolated per-job repos, not shared project repos.
+
+**Proposed approach — `.gitignore` job-scoped files + DB-only signaling:**
+
+1. **Add job-scoped paths to `.gitignore` in project workspaces.** During `initialize_project_workspace`, configure the gitignore to exclude:
+   ```
+   # Job-scoped files (not merged to main)
+   plan.md
+   todos.yaml
+   archive/
+   tools/
+   documents/
+   reference/
+   instructions.md
+   output/job_frozen.json
+   output/job_completion.json
+   ```
+   This prevents job machinery from entering git. Deliverable files in `output/` (e.g. reports, generated code, analysis results) still get committed — only the signal files are excluded.
+
+2. **Move freeze/completion signaling to DB-only.** The jobs table already has `status` (`pending_review`, `completed`) and can carry metadata. Instead of writing `job_frozen.json` and reading it back:
+   - `freeze_for_review()` and `finalize_job()` store freeze metadata (freeze_type, summary, deliverables, confidence, etc.) in a `freeze_data JSONB` column on the `jobs` table
+   - The approve endpoint reads from the DB column instead of Gitea
+   - `check_goal` checks the DB status or a state flag instead of file existence
+   - The file-based signaling becomes a local-only debug artifact (written but not committed)
+
+3. **Fix the approve endpoint repo name for project jobs.** Currently hardcoded to `job-{job_id}`. For project jobs, resolve the actual project jobs repo name via the job's `project_id` → `project_repositories` (role=jobs).
+
+4. **Selective `.gitignore` for project vs non-project jobs.** Non-project jobs (legacy isolated repos) can continue committing everything — there's no cross-job contamination risk. The extended `.gitignore` only applies to project workspace initialization. `GitManager.DEFAULT_IGNORE_PATTERNS` stays unchanged; the project-specific patterns are appended by `initialize_project_workspace`.
+
+**What this means for the merge flow:**
+
+After this change, a PR from a job branch to `main` only contains:
+- `workspace.md` updates (project memory)
+- `output/` deliverables (actual work products)
+- `experts/` changes (if the agent refined project-specific configs)
+
+Everything else stays on the job branch as historical record (browsable in Gitea, never merged). The branch can be kept or deleted after merge — either way, `main` stays clean.
+
+**Alternative considered — pre-merge cleanup:**
+
+Instead of preventing commits, the orchestrator could delete job-scoped files from the branch via Gitea API before creating the PR. This works but is fragile — it requires the orchestrator to know which files are job-scoped, creates extra commits, and if someone merges manually (bypassing the endpoint), stale files leak through. The `.gitignore` approach is self-enforcing.
+
+**What happens without this fix (observed in production):** Job A runs with `review` autonomy, completes, pushes `output/job_frozen.json` to its branch. Job A's branch is merged into `main`. Job B starts, clones from `main`, checks out a new branch — inherits job A's stale `job_frozen.json`. Job B completes strategic phase 0, transitions to tactical, then `check_goal` finds the stale file and stops the agent immediately. Since `check_goal` is a sync function that doesn't update the database, job B's status stays `processing` — the cockpit shows no Review/Continue button and the job appears stuck. The `.gitignore` approach prevents this entirely by keeping signal files out of git.
+
+### Long-Term Direction: Content-Only Repositories
+
+The `.gitignore` approach is the pragmatic near-term fix, but the long-term direction is to make project repositories **content-only** — no job metadata, no signal files, no agent machinery. All job state (plan, todos, archives, phase snapshots, freeze signals, tool docs) lives in the database, not in git. The repository holds only deliverables: workspace.md, output files, expert configs, and user-uploaded content.
+
+This simplifies everything: merges are always about content, not about filtering out infrastructure files. The agent's workspace is assembled from two sources — content from git, state from the database — and the two never mix.
+
+New features should follow the **DB-first principle**: store configuration and metadata in database columns/JSONB, not as files in the repository. The `.gitignore` approach bridges the gap for existing file-based mechanisms (signal files, todos.yaml, archive/) that predate the project model.
+
+### Jobs Repo Initial Content
+
+A newly created project starts with an empty Gitea repository. The initial content comes from one of:
+
+1. **First job populates it.** The agent's workspace initialization creates workspace.md, plan.md, todos.yaml, etc. on the job branch. After merge, `main` has the project's first workspace.md and any deliverables.
+2. **User seeds it manually.** Clone the project's jobs repo, push files (a starter workspace.md, expert configs in `experts/`, reference documents), then create jobs that build on that content.
+3. **Cockpit upload (future).** The project creation form could accept initial files — a project description that becomes workspace.md, uploaded documents, etc.
+
+There is no Gitea template repo for jobs repos. Each project starts from scratch or from promoted job content (see "Promote to Dedicated Project").
+
+### Merge Conflict Resolution
+
+When a job branch can't merge cleanly into `main` (e.g., two parallel jobs modified the same file, or `main` advanced while the job was running), the merge endpoint returns `409 Conflict` with the PR info.
+
+**Current approach:** The user resolves conflicts manually via Gitea's merge UI or by cloning the repo locally.
+
+**Planned approach — agent-assisted conflict resolution:**
+
+1. **MCP/Builder agent tooling.** Extend the cockpit's builder chat and the MCP server (for Claude Code) with tools to inspect merge conflicts, view diffs between branches, and propose resolved versions. The user asks the builder "resolve the merge conflict on job X" and the agent reads both versions, produces a merged result, and pushes it — subject to user approval.
+
+2. **Automated merge phase (future).** When a job completes and a merge conflict is detected, the system could automatically spawn a short "merge resolution" job. This job gets the conflict context (base, ours, theirs) and produces a clean merge commit. The user reviews and approves the result before it's merged into `main`. This avoids the user needing to understand git internals while keeping them in control.
+
+For parallel jobs that both modify `workspace.md`, conflicts are expected. Sequential mode avoids this naturally (each job starts from merged `main`). For parallel mode, the merge resolution agent is the intended solution — it understands project context and can intelligently combine workspace updates.
+
+### Auto-Merge Policy
+
+Merge is currently manual-only, triggered via `POST /api/projects/{id}/jobs/{jid}/merge`. Auto-merge on job completion is deferred until the project system has been tested more thoroughly in real workflows. When added, it should be configurable per project (some projects want review before merge, others want fast sequential chaining).
 
 ### Backward Compatibility
 

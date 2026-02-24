@@ -228,6 +228,20 @@ import { environment } from '../../core/environment';
 
           @if (showAdvanced()) {
             <div class="advanced-section">
+              <!-- Autonomy Level -->
+              <div class="form-group">
+                <label for="autonomy" class="form-label">Autonomy Level</label>
+                <select id="autonomy" name="autonomy" class="form-input"
+                  [ngModel]="selectedAutonomy()" (ngModelChange)="selectedAutonomy.set($event)"
+                  [disabled]="isSubmitting()">
+                  <option [ngValue]="null">Default ({{ getExpertDefault('autonomy') ?? 'review' }})</option>
+                  @for (level of autonomyLevels; track level.value) {
+                    <option [value]="level.value">{{ level.label }}</option>
+                  }
+                </select>
+                <span class="field-hint">{{ autonomyDescription() }}</span>
+              </div>
+
               <!-- Model Preset -->
               @if (availablePresets.length > 0) {
                 <div class="form-group">
@@ -1535,6 +1549,24 @@ export class JobCreateComponent implements OnInit {
 
   readonly disabledToolCategories = signal<Set<string>>(new Set());
 
+  // Autonomy level override
+  readonly selectedAutonomy = signal<string | null>(null);
+
+  readonly autonomyLevels = [
+    { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
+    { value: 'review', label: 'Review', description: 'Freezes at job completion for human review' },
+    { value: 'partial', label: 'Partial', description: 'Freezes at phase boundaries and job completion' },
+    { value: 'guided', label: 'Guided', description: 'Freezes after every tactical phase' },
+    { value: 'dependent', label: 'Dependent', description: 'Freezes after every phase (strategic and tactical)' },
+  ] as const;
+
+  readonly autonomyDescription = computed(() => {
+    const selected = this.selectedAutonomy();
+    const effective = selected ?? (this.getExpertDefault('autonomy') as string | null) ?? 'review';
+    return this.autonomyLevels.find(l => l.value === effective)?.description
+      ?? 'Controls when the agent pauses for human review';
+  });
+
   // Model list for combo-box (loaded from env.js at runtime)
   readonly availableModels = environment.models;
   readonly availablePresets = environment.modelPresets;
@@ -1602,6 +1634,7 @@ export class JobCreateComponent implements OnInit {
       this.tacticalTemperature.set(null);
       this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
+      this.selectedAutonomy.set(null);
     } else {
       this.selectedExpert.set(expert);
       this.fetchExpertDetail(expert.id);
@@ -1823,6 +1856,12 @@ export class JobCreateComponent implements OnInit {
       override['tools'] = tools;
     }
 
+    // Autonomy level override
+    const autonomy = this.selectedAutonomy();
+    if (autonomy !== null && autonomy !== this.getExpertDefault('autonomy')) {
+      override['autonomy'] = autonomy;
+    }
+
     return Object.keys(override).length > 0 ? override : undefined;
   }
 
@@ -1838,6 +1877,7 @@ export class JobCreateComponent implements OnInit {
       this.tacticalTemperature.set(null);
       this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
+      this.selectedAutonomy.set(null);
       return;
     }
 
@@ -1872,6 +1912,9 @@ export class JobCreateComponent implements OnInit {
       }
     }
     this.disabledToolCategories.set(disabled);
+
+    // Pre-fill autonomy level
+    this.selectedAutonomy.set((detail.config['autonomy'] as string) ?? null);
   }
 
   // ===== Datasource Methods =====
@@ -2166,6 +2209,7 @@ export class JobCreateComponent implements OnInit {
     this.tacticalTemperature.set(null);
     this.tacticalMultimodal.set(null);
     this.disabledToolCategories.set(new Set());
+    this.selectedAutonomy.set(null);
     // Reset advanced options
     this.showAdvanced.set(false);
     // Reset datasource selections

@@ -1,51 +1,24 @@
-"""Coding tools for the Universal Agent.
+"""Coding utility functions for the Universal Agent.
 
-Provides shell command execution for coding-capable agents:
-- run_command: Execute shell commands with timeout and output truncation
+Provides shared utilities used by shell tools:
+- _truncate_output: Truncate large output keeping the tail
+- _check_blocked: Check if a command is in the blocklist
 
-The tool executes commands via subprocess in the agent's workspace.
-In production (k3s), the container IS the sandbox — no nested containers needed.
+The run_command tool has been removed — use the `shell` tool
+from shell_tools.py instead, which runs commands in persistent
+tmux-backed terminal tabs.
 """
 
 import logging
-import subprocess
-from typing import Any, Dict, List, Optional
-
-from langchain_core.tools import tool
-
-from ..context import ToolContext
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 # Default maximum output characters (stdout + stderr each)
 DEFAULT_MAX_OUTPUT_CHARS = 50000
 
-# Default command timeout in seconds
-DEFAULT_TIMEOUT = 120
-
-# Commands that are blocked for safety (interactive or destructive to host)
-BLOCKED_COMMANDS = frozenset([
-    "sudo",
-    "reboot",
-    "shutdown",
-    "poweroff",
-    "halt",
-    "init",
-    "systemctl",
-])
-
-
-# Tool metadata for registry
-CODING_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "run_command": {
-        "module": "coding.coding_tools",
-        "function": "run_command",
-        "description": "Execute a shell command in the workspace and return stdout/stderr",
-        "category": "coding",
-        "short_description": "Run a shell command with timeout and output capture.",
-        "phases": ["strategic", "tactical"],
-    },
-}
+# Tool metadata for registry (empty — run_command removed)
+CODING_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {}
 
 
 def _truncate_output(text: str, max_chars: int, label: str = "output") -> str:
@@ -87,132 +60,11 @@ def _check_blocked(command: str) -> Optional[str]:
     return None
 
 
-def create_coding_tools(context: ToolContext) -> List[Any]:
+def create_coding_tools(context) -> list:
     """Create coding tools with injected context.
 
-    Args:
-        context: ToolContext with workspace_manager
-
-    Returns:
-        List of LangChain tool functions
-
-    Raises:
-        ValueError: If workspace manager not available
+    Returns an empty list — run_command has been removed.
+    The `shell` tool in shell_tools.py replaces it.
+    Kept for backward compatibility with __init__.py imports.
     """
-    if not context.has_workspace():
-        raise ValueError("Coding tools require workspace_manager in ToolContext")
-
-    ws = context.workspace_manager
-    max_output_chars = context.get_config("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
-
-    # Configurable blocklist: None → use default, [] → no restrictions
-    configured_blocked = context.get_config("run_command_blocked_commands", None)
-    if configured_blocked is None:
-        effective_blocked = BLOCKED_COMMANDS
-    else:
-        effective_blocked = frozenset(configured_blocked)
-
-    # Configurable sandbox: true → workspace-only paths, false → any path
-    sandbox_enabled = context.get_config("run_command_sandbox", True)
-
-    if not effective_blocked:
-        logger.warning("run_command: command blocklist is DISABLED — all commands allowed")
-    if not sandbox_enabled:
-        logger.warning("run_command: workspace sandbox is DISABLED — commands can run anywhere")
-
-    @tool
-    def run_command(
-        command: str,
-        working_dir: Optional[str] = None,
-        timeout: int = DEFAULT_TIMEOUT,
-    ) -> str:
-        """Execute a shell command in the workspace and return stdout/stderr.
-
-        Use this to run tests, linters, build commands, git operations, package
-        managers, or any other shell command. The command runs in the workspace
-        directory by default, or in a subdirectory if working_dir is specified.
-
-        Args:
-            command: Shell command to execute (e.g., "pytest tests/ -x",
-                     "npm test", "python script.py", "git commit -m 'msg'")
-            working_dir: Subdirectory within workspace to run in (optional).
-                         When sandbox is enabled, this is relative to workspace root.
-                         When sandbox is disabled, absolute paths are also accepted.
-            timeout: Maximum execution time in seconds (default: 120).
-                     Commands exceeding this are killed.
-
-        Returns:
-            Structured output with exit code, stdout, and stderr.
-
-        Example:
-            run_command(command="pytest tests/ -x")
-            run_command(command="npm test", working_dir="repo/cockpit")
-            run_command(command="git status", working_dir="repo")
-            run_command(command="python -m py_compile src/main.py", working_dir="repo")
-        """
-        # Safety check (skip if blocklist empty)
-        if effective_blocked:
-            first_word = command.strip().split()[0] if command.strip() else ""
-            if first_word in effective_blocked:
-                return f"Command blocked: '{first_word}' is not allowed. Blocked commands: {', '.join(sorted(effective_blocked))}"
-
-        # Resolve working directory
-        if working_dir:
-            if sandbox_enabled:
-                # Validate the path is within workspace (security)
-                try:
-                    cwd = str(ws.get_path(working_dir))
-                except (ValueError, PermissionError) as e:
-                    return f"Invalid working directory: {e}"
-            else:
-                # Unrestricted: accept absolute paths, resolve relative to workspace
-                from pathlib import Path
-                p = Path(working_dir)
-                cwd = str(p if p.is_absolute() else ws.path / working_dir)
-        else:
-            cwd = str(ws.path)
-
-        # Cap timeout to reasonable maximum
-        timeout_capped = min(timeout, 600)  # 10 minutes max
-
-        logger.info(f"run_command: {command!r} (cwd={cwd}, timeout={timeout_capped}s)")
-
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_capped,
-            )
-
-            # Build structured output
-            output_parts = [f"Exit code: {result.returncode}"]
-
-            if result.stdout:
-                stdout = _truncate_output(result.stdout, max_output_chars, "stdout")
-                output_parts.append(f"--- stdout ---\n{stdout}")
-
-            if result.stderr:
-                stderr = _truncate_output(result.stderr, max_output_chars, "stderr")
-                output_parts.append(f"--- stderr ---\n{stderr}")
-
-            if not result.stdout and not result.stderr:
-                output_parts.append("(no output)")
-
-            output = "\n".join(output_parts)
-            logger.info(f"run_command exit={result.returncode}, stdout={len(result.stdout or '')} chars, stderr={len(result.stderr or '')} chars")
-            return output
-
-        except subprocess.TimeoutExpired:
-            msg = f"Command timed out after {timeout_capped}s: {command}"
-            logger.warning(msg)
-            return msg
-
-        except Exception as e:
-            msg = f"Command execution failed: {e}"
-            logger.error(msg)
-            return msg
-
-    return [run_command]
+    return []

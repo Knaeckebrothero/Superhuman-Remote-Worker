@@ -24,7 +24,7 @@ from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
-from fastapi import FastAPI, HTTPException, Query, Request, Response  # noqa: E402
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
@@ -43,6 +43,7 @@ from services.gitea import GiteaClient  # noqa: E402
 from services.builder_tools import (  # noqa: E402
     BUILDER_TOOLS,
     SERVER_SIDE_TOOLS,
+    WORKSPACE_EDIT_TOOLS,
     build_message_context,
     build_summarization_prompt,
     get_builder_api_key,
@@ -1418,6 +1419,37 @@ async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
             detail=f"File '{path}' not found in workspace for job '{job_id}'",
         )
     return {"path": path, "content": content}
+
+
+@app.put("/api/jobs/{job_id}/workspace/{path:path}")
+async def write_workspace_file(job_id: str, path: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Write content to a workspace file.
+
+    Sandboxed — directory traversal is blocked, and certain paths
+    (todos.yaml, .git/, tools/) are not editable.
+
+    Args:
+        job_id: Job UUID
+        path: Relative path within the workspace
+        body: {"content": "...", "commit_message": "..."}
+    """
+    content = body.get("content")
+    if content is None:
+        raise HTTPException(status_code=400, detail="Missing 'content' in request body")
+
+    blocked = workspace_service.is_path_blocked(path)
+    if blocked:
+        raise HTTPException(status_code=403, detail=blocked)
+
+    result = workspace_service.write_workspace_file(
+        job_id=job_id,
+        path=path,
+        content=content,
+        commit_message=body.get("commit_message"),
+    )
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @app.get("/api/jobs/{job_id}/todos")
@@ -3945,6 +3977,50 @@ async def get_builder_session(session_id: str) -> dict[str, Any]:
     return session
 
 
+def _build_workspace_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Build a workspace edit proposal for the frontend, or return an error.
+
+    Validates path, reads current content, and packages the proposal data.
+    """
+    from services.workspace import WorkspaceService
+
+    job_id = args.get("job_id", "")
+    path = args.get("path", "")
+
+    blocked = WorkspaceService.is_path_blocked(path)
+    if blocked:
+        return {"error": blocked}
+
+    current_content = workspace_service.get_workspace_file(job_id, path)
+
+    if tool_name == "write_workspace_file":
+        return {
+            "tool": tool_name,
+            "job_id": job_id,
+            "path": path,
+            "operation": "write",
+            "content": args.get("content", ""),
+            "current_content": current_content,
+        }
+    elif tool_name == "edit_workspace_file":
+        old_text = args.get("old_text", "")
+        new_text = args.get("new_text", "")
+        if current_content is None:
+            return {"error": f"File '{path}' not found in workspace for job '{job_id}'"}
+        if old_text not in current_content:
+            return {"error": f"old_text not found in '{path}'. The file may have changed."}
+        return {
+            "tool": tool_name,
+            "job_id": job_id,
+            "path": path,
+            "operation": "edit",
+            "old_text": old_text,
+            "new_text": new_text,
+            "current_content": current_content,
+        }
+    return {"error": f"Unknown workspace edit tool: {tool_name}"}
+
+
 @app.get("/api/builder/sessions/{session_id}/messages")
 async def get_builder_messages(session_id: str) -> list[dict[str, Any]]:
     """Get all messages for a builder session."""
@@ -4037,6 +4113,10 @@ async def send_builder_message(
                         turn_tool_calls.append(evt_data)
                         if evt_data["name"] in SERVER_SIDE_TOOLS:
                             yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                        elif evt_data["name"] in WORKSPACE_EDIT_TOOLS:
+                            proposal = _build_workspace_proposal(evt_data["name"], evt_data["args"])
+                            if not proposal.get("error"):
+                                yield f"event: workspace_proposal\ndata: {json.dumps(proposal)}\n\n"
                         else:
                             yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
                             final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
@@ -4077,6 +4157,12 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
+                        elif tc["name"] in WORKSPACE_EDIT_TOOLS:
+                            proposal = _build_workspace_proposal(tc["name"], tc["args"])
+                            if proposal.get("error"):
+                                result = f"Error: {proposal['error']}"
+                            else:
+                                result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
                         else:
                             result = "OK"
                         tool_results.append({
@@ -4107,6 +4193,12 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data_oai["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
+                        elif tc["name"] in WORKSPACE_EDIT_TOOLS:
+                            proposal = _build_workspace_proposal(tc["name"], tc["args"])
+                            if proposal.get("error"):
+                                result = f"Error: {proposal['error']}"
+                            else:
+                                result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
                         else:
                             result = "OK"
                         loop_messages.append({

@@ -1,7 +1,16 @@
-import { Component, inject, computed, effect, ElementRef, viewChild } from '@angular/core';
+import { Component, inject, computed, effect, signal, ElementRef, viewChild } from '@angular/core';
 import { DataService } from '../../core/services/data.service';
 import { RequestService } from '../../core/services/request.service';
 import { ChatEntry } from '../../core/models/chat.model';
+
+/** Parsed shell pane from <open_shells> block */
+interface ShellPane {
+  name: string;
+  type: string;
+  content: string;
+  hasNewOutput: boolean;
+  isIdle: boolean;
+}
 
 /**
  * Chat History component that displays a clean sequential view of conversations.
@@ -98,6 +107,50 @@ import { ChatEntry } from '../../core/models/chat.model';
                   </summary>
                   <div class="reasoning-content">{{ entry.reasoning.content_preview || entry.reasoning.content }}</div>
                 </details>
+              }
+
+              <!-- Shell State (if present) -->
+              @if (entry.shell_state) {
+                @let panes = parseShellState(entry.shell_state);
+                @if (panes.length > 0) {
+                  <details class="shell-state-section">
+                    <summary class="shell-state-header">
+                      <span class="shell-icon">&#x1F4BB;</span>
+                      <span>Shell State</span>
+                      <span class="shell-pane-count">{{ panes.length }} pane{{ panes.length !== 1 ? 's' : '' }}</span>
+                    </summary>
+                    <div class="shell-widget">
+                      @let activeTab = getSelectedTab(entry._id, panes[0].name);
+                      <div class="shell-tab-bar">
+                        @for (pane of panes; track pane.name) {
+                          <button
+                            class="shell-tab"
+                            [class.active]="activeTab === pane.name"
+                            [class.new-output]="pane.hasNewOutput"
+                            [class.idle]="pane.isIdle"
+                            (click)="selectTab(entry._id, pane.name)"
+                          >
+                            <span class="tab-type-badge" [attr.data-type]="pane.type">{{ pane.type }}</span>
+                            <span class="tab-name">{{ pane.name }}</span>
+                            @if (pane.hasNewOutput) {
+                              <span class="new-output-badge">NEW</span>
+                            }
+                            @if (pane.isIdle) {
+                              <span class="idle-badge">idle</span>
+                            }
+                          </button>
+                        }
+                      </div>
+                      <div class="shell-terminal-pane">
+                        @for (pane of panes; track pane.name) {
+                          @if (activeTab === pane.name) {
+                            <pre class="terminal-content">{{ pane.content || '(empty)' }}</pre>
+                          }
+                        }
+                      </div>
+                    </div>
+                  </details>
+                }
               }
 
               <!-- Response Message (only show if there's content or tool calls) -->
@@ -554,6 +607,143 @@ import { ChatEntry } from '../../core/models/chat.model';
         font-size: 12px;
         color: var(--text-muted, #6c7086);
       }
+
+      /* Shell State Widget */
+      .shell-state-section {
+        margin: 8px 0;
+        background: #11111b;
+        border: 1px solid #313244;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+
+      .shell-state-header {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 10px;
+        font-size: 11px;
+        font-weight: 600;
+        color: #94e2d5;
+        cursor: pointer;
+        user-select: none;
+        background: rgba(0, 0, 0, 0.3);
+      }
+
+      .shell-state-header:hover {
+        background: rgba(0, 0, 0, 0.5);
+      }
+
+      .shell-icon {
+        font-size: 14px;
+      }
+
+      .shell-pane-count {
+        margin-left: auto;
+        font-size: 10px;
+        font-family: 'JetBrains Mono', monospace;
+        color: var(--text-muted, #6c7086);
+      }
+
+      .shell-widget {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .shell-tab-bar {
+        display: flex;
+        gap: 0;
+        background: #181825;
+        border-bottom: 1px solid #313244;
+        overflow-x: auto;
+      }
+
+      .shell-tab {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        border: none;
+        background: transparent;
+        color: var(--text-muted, #6c7086);
+        font-size: 11px;
+        font-family: 'JetBrains Mono', monospace;
+        cursor: pointer;
+        white-space: nowrap;
+        border-bottom: 2px solid transparent;
+        transition: all 0.15s ease;
+      }
+
+      .shell-tab:hover {
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .shell-tab.active {
+        color: #94e2d5;
+        border-bottom-color: #94e2d5;
+        background: rgba(148, 226, 213, 0.05);
+      }
+
+      .tab-type-badge {
+        font-size: 9px;
+        padding: 1px 4px;
+        border-radius: 3px;
+        font-weight: 600;
+        text-transform: uppercase;
+      }
+
+      .tab-type-badge[data-type="shell"] {
+        background: rgba(166, 227, 161, 0.2);
+        color: #a6e3a1;
+      }
+
+      .tab-type-badge[data-type="claude-code"] {
+        background: rgba(203, 166, 247, 0.2);
+        color: #cba6f7;
+      }
+
+      .tab-type-badge[data-type="ssh"] {
+        background: rgba(137, 180, 250, 0.2);
+        color: #89b4fa;
+      }
+
+      .tab-name {
+        font-weight: 600;
+      }
+
+      .new-output-badge {
+        font-size: 8px;
+        padding: 1px 4px;
+        border-radius: 3px;
+        background: rgba(250, 179, 135, 0.3);
+        color: #fab387;
+        font-weight: 700;
+      }
+
+      .idle-badge {
+        font-size: 9px;
+        color: var(--text-muted, #6c7086);
+        font-style: italic;
+      }
+
+      .shell-terminal-pane {
+        background: #11111b;
+        min-height: 60px;
+        max-height: 250px;
+        overflow: auto;
+      }
+
+      .terminal-content {
+        margin: 0;
+        padding: 10px 12px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #a6e3a1;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
     `,
   ],
 })
@@ -566,6 +756,12 @@ export class ChatHistoryComponent {
 
   // Track the previous entry count to detect when new entries are added
   private previousEntryCount = 0;
+
+  // Track selected tab per chat entry (entry._id -> pane name)
+  private readonly selectedTabs = signal<Map<string, string>>(new Map());
+
+  // Cache parsed shell panes to avoid re-parsing on every change detection
+  private readonly parsedShellCache = new Map<string, ShellPane[]>();
 
   // Use DataService's visible chat entries (filtered by slider position)
   readonly entries = computed(() => this.data.visibleChatEntries());
@@ -635,5 +831,97 @@ export class ChatHistoryComponent {
       return toolResult.content_preview || toolResult.content;
     }
     return null;
+  }
+
+  /**
+   * Parse a <terminal_state> block into structured pane objects.
+   * Uses a cache keyed by raw content to avoid re-parsing.
+   *
+   * Format:
+   *   <terminal_state>
+   *   [name] (type)
+   *   [name2] (type2) [NEW OUTPUT]
+   *   </terminal_state>
+   */
+  parseShellState(raw: string): ShellPane[] {
+    const cached = this.parsedShellCache.get(raw);
+    if (cached) return cached;
+
+    const panes: ShellPane[] = [];
+
+    // Strip <terminal_state> wrapper
+    const inner = raw
+      .replace(/<\/?terminal_state>/g, '')
+      .trim();
+
+    if (!inner) {
+      this.parsedShellCache.set(raw, panes);
+      return panes;
+    }
+
+    // Split into pane blocks by header lines: [name] (type) ...
+    const headerPattern = /^\[([^\]]+)\]\s+\(([^)]+)\)\s*(.*)$/;
+    const lines = inner.split('\n');
+    let current: { name: string; type: string; flags: string; contentLines: string[] } | null = null;
+
+    for (const line of lines) {
+      const match = line.match(headerPattern);
+      if (match) {
+        // Save previous pane
+        if (current) {
+          panes.push(this.buildPane(current));
+        }
+        current = {
+          name: match[1],
+          type: match[2],
+          flags: match[3].trim(),
+          contentLines: [],
+        };
+      } else if (current) {
+        current.contentLines.push(line);
+      }
+    }
+
+    // Don't forget the last pane
+    if (current) {
+      panes.push(this.buildPane(current));
+    }
+
+    this.parsedShellCache.set(raw, panes);
+    return panes;
+  }
+
+  private buildPane(raw: { name: string; type: string; flags: string; contentLines: string[] }): ShellPane {
+    const hasNewOutput = raw.flags.includes('[NEW OUTPUT]');
+    const idleMatch = raw.flags.match(/idle\s+\d+/);
+    const isIdle = !!idleMatch;
+
+    // Trim trailing empty lines from content
+    const contentLines = [...raw.contentLines];
+    while (contentLines.length > 0 && contentLines[contentLines.length - 1].trim() === '') {
+      contentLines.pop();
+    }
+
+    return {
+      name: raw.name,
+      type: raw.type,
+      content: contentLines.join('\n'),
+      hasNewOutput,
+      isIdle,
+    };
+  }
+
+  /** Get currently selected tab for a chat entry, defaulting to first pane name if provided. */
+  getSelectedTab(entryId: string, fallback: string = ''): string {
+    return this.selectedTabs().get(entryId) || fallback;
+  }
+
+  /** Select a tab for a specific chat entry. */
+  selectTab(entryId: string, paneName: string): void {
+    this.selectedTabs.update(map => {
+      const next = new Map(map);
+      next.set(entryId, paneName);
+      return next;
+    });
   }
 }

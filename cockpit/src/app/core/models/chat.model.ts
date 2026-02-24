@@ -59,6 +59,7 @@ export interface ChatEntry {
   inputs: ChatInput[];
   response: ChatResponse;
   reasoning?: ChatReasoning;
+  shell_state?: string;
   request_id?: string;
 }
 

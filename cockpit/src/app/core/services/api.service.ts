@@ -858,6 +858,31 @@ export class ApiService {
       );
   }
 
+  /**
+   * Write content to a workspace file (requires user approval flow).
+   */
+  writeWorkspaceFile(
+    jobId: string,
+    path: string,
+    content: string,
+    commitMessage?: string,
+  ): Observable<{ path: string; size: number; committed: boolean } | null> {
+    const body: Record<string, string> = { content };
+    if (commitMessage) body['commit_message'] = commitMessage;
+
+    return this.http
+      .put<{ path: string; size: number; committed: boolean }>(
+        `${this.baseUrl}/jobs/${jobId}/workspace/${path}`,
+        body,
+      )
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to write workspace file ${path} for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
   // ===== Repo Browser Endpoints (Gitea proxy) =====
 
   /**

@@ -15,8 +15,8 @@ pip install -r requirements.txt
 cp .env.example .env  # Then configure API keys
 
 # System dependencies (Fedora)
-sudo dnf install poppler-utils         # Required for PDF page rendering (pdf2image)
-# Debian/Ubuntu: sudo apt-get install poppler-utils
+sudo dnf install poppler-utils tmux    # PDF rendering (pdf2image) + persistent shell sessions
+# Debian/Ubuntu: sudo apt-get install poppler-utils tmux
 playwright install chromium            # Required for browser-based research tools
 ```
 
@@ -259,6 +259,16 @@ instruction_files:
     # enforce: false  # active: system injects content as transient message
 ```
 
+### Persistent Shell Sessions
+
+Replaces the old synchronous `run_command` tool with persistent tmux-backed terminal tabs. Commands and output are decoupled — sending a command is one action, reading the result is another. Tabs preserve environment variables, virtualenvs, working directory, and command history across calls.
+
+**Tools:** `shell(command, tab)` (sync run), `shell_send(name, input, wait)` (interactive), `shell_read(name, lines, since_cursor, wait)` (poll output), `shell_open(name, command)` / `shell_close(name)` (tab lifecycle), `shell_list()`.
+
+**Implementation:** `src/tools/coding/shell_manager.py` (ShellManager, tmux control via libtmux), `src/tools/coding/shell_tools.py` (tool definitions), `src/core/shell_injection.py` (terminal state injection). Requires `tmux` installed. See `docs/persistent_shell.md` for the full design document.
+
+**Shell state injection** works like workspace injection — a transient `<terminal_state>` SystemMessage is injected every LLM call showing open tabs, their types (ssh, repl, claude-code), and recent output. Excluded from summarization.
+
 ### Claude Code Delegation
 
 The `claude_code` tool spawns Claude Code CLI sessions in print mode (`-p`) to delegate heavy work. Supports multi-turn sessions via `session_id`. Requires Claude Code CLI installed and authenticated (`claude auth login`).
@@ -277,7 +287,7 @@ claude_code:
 
 On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
 
-Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML.
+Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML. The `coding` category provides persistent shell tools (see "Persistent Shell Sessions" above).
 
 **Phase-specific tool filtering**: Tools declare phase availability via `phases` in `TOOL_REGISTRY` (`src/tools/registry.py`). `filter_tools_by_phase()` removes unavailable tools before binding to the LLM. `job_complete` is strategic-only.
 
@@ -339,7 +349,7 @@ Long-term memory lives in files, not in LLM context:
 - `plan.md` holds the strategic plan, updated at phase boundaries.
 - `archive/` preserves phase history (retrospectives + archived todos) for review during strategic phases.
 
-This separation means workspace.md survives context compaction while the conversation history gets summarized.
+This separation means workspace.md survives context compaction while the conversation history gets summarized. Shell state (`<terminal_state>`) uses the same transient injection pattern for persistent terminal tabs.
 
 ### Memory Light (Opt-in Recall System)
 
@@ -355,9 +365,12 @@ When `memory.enabled: true` in config, agents get a PostgreSQL-backed memory sys
 - `src/core/context.py` - ContextManager (token counting, compaction, three-layer safety)
 - `src/tools/registry.py` - Tool metadata registry with phase filtering
 - `orchestrator/main.py` - FastAPI orchestrator endpoints (job management, agent heartbeat)
+- `orchestrator/services/builder_tools.py` - Instruction builder tool schemas (cockpit chat assistant)
 - `orchestrator/mcp/` - MCP server for Claude Code integration
 
-**Directory layout:** `src/core/` (state, workspace, context, phase transitions), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP), `cockpit/` (Angular frontend), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
+**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `cockpit/` (Angular frontend), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
+
+**Design documents:** `docs/` contains concept/design documents for features — `docs/persistent_shell.md`, `docs/datasources.md`, `docs/features/` (memory_light, projects, repo_datasource, prompting, summary_tool, etc.). These are architectural specs, not user-facing docs.
 
 ### Vision Services
 
@@ -462,6 +475,9 @@ python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid>           # V
 python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid> --stats   # Token usage stats
 python DEPRECATED_scripts/view_llm_conversation.py --job-id <uuid> --audit   # Full audit trail
 ```
+
+**Instruction Builder** (cockpit chat assistant):
+The orchestrator provides an SSE-based chat endpoint (`/api/builder/stream`) that powers the cockpit's instruction builder. The builder LLM has server-side tools (`orchestrator/services/builder_tools.py`) for job inspection, database queries, monitoring, citations, and workspace file editing. Tool calls are dispatched via `orchestrator/services/builder_dispatch.py`. Workspace edit tools (`write_workspace_file`, `edit_workspace_file`) are forwarded to the frontend as proposals requiring user approval; all other tools execute server-side.
 
 **Orchestrator MCP Server** (for Claude Code integration):
 The project includes `.mcp.json` for MCP server configuration. The MCP server runs on port 8055 (HTTP transport) as a separate container (`srw-mcp`) and proxies to the orchestrator API on 8085. Health check: `http://localhost:8055/health`. See `orchestrator/mcp/` for the full tool listing (debug, actions, git history, workspace, monitoring, database inspection, citations).

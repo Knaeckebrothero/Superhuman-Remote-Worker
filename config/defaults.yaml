@@ -99,10 +99,14 @@ tools:
   # MongoDB tools - MongoDB operations (src/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
-  # Coding tools - shell execution + Claude Code delegation (src/tools/coding/)
+  # Coding tools - persistent terminal sessions (src/tools/coding/)
   coding:
-    - run_command
-    - claude_code  # Requires: Claude Code CLI installed + authenticated
+    - shell          # Synchronous command execution in a persistent tab (requires tmux)
+    - shell_open
+    - shell_send
+    - shell_read
+    - shell_close
+    - shell_list
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -185,4 +189,17 @@ browser:
 claude_code:
   model: claude-opus-4-6   # Model for Claude Code sessions
   effort_level: high        # Reasoning effort: low, medium, high
+
+# Persistent shell sessions (tmux-backed terminal multiplexer)
+# Requires tmux installed.
+shell:
+  max_tabs: 6                  # Maximum concurrent terminal tabs
+  inject_lines_per_tab: 30    # Lines of output shown per tab in context injection
+  max_read_lines: 200          # Maximum lines shell_read can return
+  scrollback_limit: 5000       # Tmux history-limit per pane
+  default_timeout: 120         # Default timeout for shell tool (seconds)
+  idle_timeout: 1800           # Seconds before a tab is considered idle in injection
+  blocked_commands: [sudo, reboot, shutdown, poweroff, halt, init, systemctl]
+  sandbox: true                # Restrict working directory to workspace
+  auto_start_claude_code: true # Auto-open Claude Code tab when claude_code tool is enabled
 

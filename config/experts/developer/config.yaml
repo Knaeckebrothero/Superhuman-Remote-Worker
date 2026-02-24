@@ -41,7 +41,12 @@ tools:
     - get_workspace_summary
     - get_document_info
   coding:
-    - claude_code
+    - shell
+    - shell_open
+    - shell_send
+    - shell_read
+    - shell_close
+    - shell_list
   core:
     - next_phase_todos
     - todo_complete

@@ -70,6 +70,7 @@ class ToolContext:
     _instruction_files: List[Any] = field(default_factory=list)  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     memory_observer: Optional[Any] = None  # MemoryObserver instance (Memory Light Phase 3)
+    shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
     _pending_memories: List[Dict[str, Any]] = field(default_factory=list)  # Sync-safe memory queue
 
     def __post_init__(self):
@@ -142,6 +143,10 @@ class ToolContext:
             return False
         gm = self.workspace_manager.git_manager
         return gm is not None and gm.is_active
+
+    def has_shell(self) -> bool:
+        """Check if ShellManager is available for persistent terminal sessions."""
+        return self.shell_manager is not None
 
     @property
     def db(self) -> Optional["PostgresDB"]:
