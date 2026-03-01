@@ -117,8 +117,14 @@ A core feature: users can jump into any agent's VM through their browser.
 |------------|-----------------|--------|----------|
 | **Harvester VNC console** | Basic terminal via Rancher UI | Free (built-in) | Quick inspection |
 | **ttyd** | Browser terminal, lightweight | ~5 MB | Terminal-only workflows |
-| **code-server** (VS Code) | Full IDE in browser, file tree, terminal, extensions | ~200 MB | Development agents |
+| **code-server** (Coder) | Full IDE in browser, file tree, terminal, extensions | ~200 MB | Development agents |
 | **Apache Guacamole** | RDP/VNC/SSH gateway, multi-user, session recording | Medium | Multi-protocol, audit trail |
+
+**Recommendation: code-server** is the primary choice. MIT licensed, 76k+ GitHub stars, actively maintained (v4.109.x as of early 2026). It's a patched VS Code served over HTTP with built-in password/token auth and PWA support. Extensions install from Open VSX (not Microsoft's marketplace due to licensing). The LinuxServer.io image (`lscr.io/linuxserver/code-server`) is well-maintained and supports `DEFAULT_WORKSPACE` for pre-configured directory opening.
+
+Note: Gitpod rebranded to Ona (Sep 2025) and pivoted to an enterprise AI agent platform. Their self-hosted CDE is effectively dead — community images are no longer published. OpenVSCode Server (their lightweight fork) is still maintained but lacks built-in auth, making code-server the better fit for our managed VM environment.
+
+**Gitea integration**: Gitea has no native "Open in code-server" or Codespaces-like feature ([gitea#33904](https://github.com/go-gitea/gitea/issues/33904) is open but the core team has pushed back on deep IDE integration). Our integration goes through the management daemon and orchestrator instead — the cockpit provides the "Open workspace" action, not Gitea's UI. The management daemon controls code-server sessions (auth, lifecycle) and the orchestrator routes the user to the correct VM's code-server instance. The `?folder=/path` URL parameter opens a specific directory directly.
 
 ### User Experience
 

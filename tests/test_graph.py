@@ -284,8 +284,8 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
-        # Node returns empty dict (no state changes needed)
-        assert result == {}
+        # Node always clears stop flags on resume
+        assert result == {"should_stop": False, "goal_achieved": False}
 
         # But TodoManager should be restored
         todos = managers["todo"].list_all()
@@ -314,8 +314,8 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
-        # Node returns empty dict
-        assert result == {}
+        # Node always clears stop flags on resume
+        assert result == {"should_stop": False, "goal_achieved": False}
         # TodoManager should remain in initial state
         assert managers["todo"].list_all() == []
 
@@ -374,8 +374,8 @@ class TestRestoreTodoStateNode:
 
         result = node(state)
 
-        # Should return empty dict (no phase-boundary resume triggered)
-        assert result == {}
+        # Should clear stop flags but not trigger phase-boundary resume
+        assert result == {"should_stop": False, "goal_achieved": False}
         # Staged todos should remain staged
         assert managers["todo"].has_staged_todos()
         # Active todos should be present
@@ -615,29 +615,22 @@ class TestRouteAfterTransition:
         assert result == "check_goal"
 
     def test_route_after_transition_job_frozen(self, workspace_manager):
-        """Test routing when job is frozen (job_complete was called).
+        """Test routing when job is stopped (should_stop=True from handle_transition).
 
-        When job_frozen.json exists, should always route to check_goal
+        When should_stop is True in state, should always route to check_goal
         even if transition was rejected (no todos staged).
         """
         route_after_transition = create_route_after_transition(workspace_manager)
 
-        # Create job_frozen.json to simulate job_complete having been called
-        import json
-        workspace_manager.write_file(
-            "output/job_frozen.json",
-            json.dumps({"status": "frozen", "summary": "Test"})
-        )
-
-        # Even with rejection message, should route to check_goal
+        # Even with rejection message, should route to check_goal when should_stop=True
         from langchain_core.messages import ToolMessage
         error_msg = ToolMessage(
             content="[TRANSITION_REJECTED] No todos staged",
             tool_call_id="phase_transition",
         )
-        state = {"messages": [error_msg]}
+        state = {"messages": [error_msg], "should_stop": True}
         result = route_after_transition(state)
-        assert result == "check_goal"  # NOT execute, because job is frozen
+        assert result == "check_goal"  # NOT execute, because job should stop
 
 
 class TestInitStrategicTodosNode:

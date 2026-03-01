@@ -4,7 +4,7 @@ SGLang with RadixAttention for reliable tool calling. **Recommended for agent wo
 
 ## Quick Start
 
-**Image:** `ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-sglang:latest`
+**Image:** `docker.io/knaeckebrothero/gpt-oss-sglang:latest`
 
 ### GPU Requirements
 
@@ -35,8 +35,8 @@ MAX_MODEL_LEN=131072
 | `API_KEY` | (none) | Optional API authentication |
 
 **Auto-configured (don't change):**
-- `DYN_TOOL_CALL_PARSER=harmony` - Native Harmony format
-- `DYN_REASONING_PARSER=gpt_oss` - gpt-oss thinking tokens
+- `TOOL_CALL_PARSER=gpt-oss` - Native Harmony format via `--tool-call-parser gpt-oss`
+- `REASONING_PARSER=gpt-oss` - gpt-oss thinking tokens via `--reasoning-parser gpt-oss`
 - `CHUNKED_PREFILL=true` - Safe with RadixAttention
 
 ### Pod Configuration
