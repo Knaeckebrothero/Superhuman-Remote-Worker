@@ -6,16 +6,16 @@
 #
 # Why SGLang over vLLM for gpt-oss?
 #   - RadixAttention maintains stateful prefix trees (vs vLLM's stateless hash cache)
-#   - Native Harmony format support with --dyn-tool-call-parser harmony
+#   - Native Harmony format support with --tool-call-parser gpt-oss
 #   - No "State-Cache Impedance Mismatch" that causes token leakage in vLLM
 #   - Day 0 gpt-oss support (Issue #8833)
 #
 # Reference: https://docs.nvidia.com/dynamo/latest/backends/sglang/gpt-oss.html
 
-# Use v0.5.0rc2 for Hopper GPUs (H100/H200) - has latest gpt-oss optimizations
-# For Blackwell: use lmsysorg/sglang:v0.5.0rc2-cu128-b200
+# Use v0.5.9 - confirmed working with --tool-call-parser gpt-oss for Harmony format
+# Available variants: v0.5.9-cu129-amd64, v0.5.9-cu130, v0.5.9-rocm700-mi30x
 # For DGX Spark: use lmsysorg/sglang:spark
-FROM lmsysorg/sglang:v0.5.0rc2-cu126
+FROM lmsysorg/sglang:v0.5.9
 
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive

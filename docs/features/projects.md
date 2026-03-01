@@ -87,15 +87,21 @@ A project can have multiple repositories, each with a **role**:
 
 ### Jobs Within a Project
 
-A **job within a project** is:
-
-- The same `jobs` entity as today, with an additional `project_id` FK
-- Works on a **branch** of the jobs repo (not its own throwaway repo)
-- Has access to all project repositories cloned into its workspace
-- Pushes results back to the jobs repo on completion
-- Inherits project-level datasources automatically
+A **job within a project** is the same `jobs` entity as today, with an additional `project_id` FK. It inherits project-level datasources and has access to all project repositories cloned into its workspace.
 
 There are no "projectless" jobs. If a job is created without specifying a project, it goes into the user's default project. This means every job benefits from project infrastructure (shared jobs repo, project-level datasources, project experts) even if the user never explicitly creates a project.
+
+**Job lifecycle within a project:**
+
+1. **Branch creation.** When a job starts, the agent clones the project's jobs repo and checks out a new branch (`job/<short-id>/<slug>`). The branch starts from `main`, so it inherits the accumulated project state (workspace.md, deliverables, expert configs from previous jobs).
+
+2. **Execution.** The job branch works exactly like the current pre-project system. The agent commits everything to the branch — workspace.md, plan.md, todos.yaml, archive/, tools/, output/, signal files, all of it. Phase pushes go to this branch. The branch is a complete record of the job's execution.
+
+3. **Completion + selective merge.** When the job is marked as complete and the user triggers a merge, a PR is created from the job branch to `main`. The PR only contains project-scoped files (workspace.md, output/ deliverables, experts/ changes) because job-scoped files (plan.md, todos.yaml, archive/, tools/, signal files) are excluded via `.gitignore` in the project workspace. See "Job State vs Project State" for the full file classification.
+
+4. **Branch retained.** After merge, the job branch is **not deleted**. It stays in Gitea as the permanent record of that job's work — all the phase archives, todos, plan, tool docs, and signal files are browsable on the branch even though they never reached `main`. This is the job's history.
+
+5. **Branch deleted with job.** The branch is only deleted when the user deletes the job from the database (e.g., clicks "Delete" in the cockpit UI). This ensures the full execution history is available as long as the job record exists. A future archive mechanism could compress or move old branches, but for now retention-until-deletion is sufficient.
 
 ### Project-Specific Experts
 
@@ -377,7 +383,8 @@ workspace/job_<uuid>/
 ```
 
 Key points:
-- The workspace root **is** the jobs repo (cloned, on a job branch). workspace.md, plan.md, todos — all tracked here, same as today.
+- The workspace root **is** the jobs repo (cloned, on a job branch). The agent commits everything to this branch — workspace.md, plan.md, todos, archives, tools, output, signal files — just like the pre-project system. The branch is a complete record of the job.
+- Job-scoped files (plan.md, todos.yaml, archive/, tools/, signal files) are excluded from `main` via `.gitignore` in the project workspace. They exist on the job branch but never reach `main` through a PR merge. See "Job State vs Project State" for details.
 - `repos/` is gitignored by the jobs repo. Each subdirectory is its own independent git clone.
 - Source repos can be pushed back on job completion (if not read-only). The agent creates branches in source repos the same way it does in the jobs repo.
 - Reference repos are cloned at the specified branch/tag and never modified.
@@ -410,18 +417,20 @@ The short ID prevents collisions. The slug is derived from the job description. 
 
 Gitea has no direct branch merge API — all merges go through the **Pull Request** workflow. This is actually better than raw git merge: we get conflict detection, review UI, CI hook points, and audit trail for free.
 
-When a project job completes, the orchestrator merges across all repos that were modified:
+When a project job is completed and the user triggers a merge:
 
-1. **Jobs repo merge**: Always attempted. The orchestrator creates a PR from the job branch to `main`, then merges it via `POST /repos/{owner}/{repo}/pulls/{index}/merge` with strategy `"merge"` (equivalent to `--no-ff`). Gitea supports six merge strategies (`merge`, `rebase`, `rebase-merge`, `squash`, `fast-forward-only`, `manually-merged`) — the project can configure a default, but `merge` (no-ff) is the safe default for preserving branch history.
+1. **Jobs repo merge**: The orchestrator creates a PR from the job branch to `main`, then merges it via `POST /repos/{owner}/{repo}/pulls/{index}/merge` with strategy `"merge"` (equivalent to `--no-ff`). Gitea supports six merge strategies (`merge`, `rebase`, `rebase-merge`, `squash`, `fast-forward-only`, `manually-merged`) — the project can configure a default, but `merge` (no-ff) is the safe default for preserving branch history. Because job-scoped files are in `.gitignore`, the PR only contains project-scoped changes (workspace.md, deliverables, expert configs).
 2. **Source repo merges**: For each source repo where the agent pushed changes, the same PR+merge flow is executed. Each repo's merge status is tracked independently.
 3. **Reference repos**: Never merged (read-only, no changes to push).
+
+**Branch retention:** Job branches are **never deleted on merge**. The branch stays in Gitea as the job's execution history — phase archives, todos, plan, tool docs, and signal files are all preserved on the branch. The branch is only deleted when the user deletes the job record from the database (e.g., via the cockpit's delete action). This means each job branch is a browsable snapshot of the agent's full work, even though only deliverables reach `main`.
 
 Merge outcomes per repo:
 
 | Outcome | `merge_status` | What happens |
 |---------|----------------|-------------|
-| Clean merge | `merged` | PR merged into `main`, next job starts from updated state |
-| Conflict | `conflict` | PR stays open. User resolves via Gitea's merge UI, cockpit, or follow-up job |
+| Clean merge | `merged` | PR merged into `main`, branch retained, next job starts from updated state |
+| Conflict | `conflict` | PR stays open. User resolves via builder/MCP agent, Gitea UI, or follow-up job |
 | No changes | `skipped` | Branch existed but had no commits beyond the base |
 | User choice | `skipped` | User explicitly skips merge (exploratory/research jobs) |
 
@@ -431,8 +440,6 @@ The `merge_status` on the `jobs` table reflects the **jobs repo** merge. Source 
 ALTER TABLE jobs ADD COLUMN repo_merge_statuses JSONB DEFAULT '{}';
 -- Example value: {"repo-id-1": "merged", "repo-id-2": "conflict"}
 ```
-
-The `delete_branch_after_merge` option on Gitea's merge API can be used to clean up job branches after successful merge, keeping the branch list tidy.
 
 ## Promote to Dedicated Project
 
@@ -681,11 +688,12 @@ Rough sketch:
 Consolidated list of deferred items across all phases. Roughly priority-ordered.
 
 **Critical (blocks reliable project job execution):**
-- [ ] `.gitignore` job-scoped files in project workspaces — prevents stale signal files from leaking between jobs (see "Job State vs Project State")
-- [ ] Move freeze/completion signaling to DB-only — `freeze_data JSONB` column on `jobs` table, approve endpoint reads from DB instead of Gitea
-- [ ] Fix approve endpoint repo name for project jobs — currently hardcoded to `job-{job_id}`, needs to resolve project's actual jobs repo
+- [x] `.gitignore` job-scoped files in project workspaces — `PROJECT_JOB_IGNORE_PATTERNS` constant + `_setup_project_gitignore()` method in `src/core/workspace.py`, called during `initialize_project_workspace()` after branch checkout
+- [x] Move freeze/completion signaling to DB-only — `freeze_data JSONB` column on `jobs` table; `TransitionResult.freeze_data` field populated by `freeze_for_review()` and `finalize_job()`; `handle_transition` stores in DB; `check_goal` uses `should_stop` state flag instead of file existence; `restore_todo_state` always clears stop flags on resume; approve/frozen endpoints read from DB first with Gitea/local fallback
+- [x] Fix approve endpoint repo name for project jobs — `resolve_job_repo()` helper resolves project's jobs repo + branch; replaced 7 hardcoded `job-{id}` repo names in orchestrator endpoints (approve, frozen, contents, file, commits, diff, tags)
 
 **Important (completes the project workflow):**
+- [x] Delete job branch from Gitea when job is deleted from DB — `delete_job` endpoint looks up project_id + branch_name before deletion, calls `gitea_client.delete_branch()`
 - [ ] Source repo job branches — agents should create job-specific branches in source repos for isolation (currently cloned at configured branch without branching)
 - [ ] Push-on-completion for modified source repos — only jobs repo is pushed today
 - [ ] Source repo merge via PR — same flow as jobs repo merge, per-repo merge status tracking
@@ -775,7 +783,7 @@ Projects intentionally don't define execution order or dependencies between jobs
 
 ### Job State vs Project State — What Merges Into Main
 
-The jobs repo is shared across all jobs in a project. When a job branch is merged into `main`, every committed file goes with it. But not all workspace files are "project state" — many are job-specific transient data that should never reach `main`. If they do, the next job that clones from `main` inherits stale state from a previous job.
+Job branches commit everything — they're the full execution record, just like the pre-project system. But when a job branch is merged into `main`, only **project-scoped** files should carry over. Job-specific files must stay on the branch (where they're preserved as history) and never reach `main`, because the next job that clones from `main` would inherit stale state from a previous job.
 
 **File classification:**
 
@@ -794,7 +802,7 @@ The jobs repo is shared across all jobs in a project. When a job branch is merge
 | `output/job_completion.json` | Job | No | Approval signal — same issue |
 | `reference/` | Job | No | Job-specific reference materials |
 
-**The core problem:** The agent commits everything (via `git add -A` in `GitManager.commit()`), and the PR-based merge moves all of it to `main`. There's no mechanism to distinguish deliverable outputs from job machinery.
+**The mechanism:** The agent commits everything to the job branch (via `git add -A` in `GitManager.commit()`), which is correct — the branch is the job's complete record. The `.gitignore` in project workspaces prevents job-scoped files from being tracked by git on `main`, so when a PR merges the job branch, only project-scoped files carry over.
 
 **Current dependencies that complicate this:**
 
@@ -804,7 +812,9 @@ The jobs repo is shared across all jobs in a project. When a job branch is merge
 
 3. **Phase transitions (`freeze_for_review`, `finalize_job`) write signal files and immediately commit + push them.** The approve endpoint then reads and deletes them. This file-based signaling was designed for isolated per-job repos, not shared project repos.
 
-**Proposed approach — `.gitignore` job-scoped files + DB-only signaling:**
+**Implemented approach — `.gitignore` job-scoped files + DB-only signaling:**
+
+> **Status: Implemented.** All four points below are live. See commits for details: `.gitignore` patterns in `workspace.py`, `freeze_data` JSONB column in schema, `should_stop` state flag in `graph.py`, `resolve_job_repo()` helper in `orchestrator/main.py`.
 
 1. **Add job-scoped paths to `.gitignore` in project workspaces.** During `initialize_project_workspace`, configure the gitignore to exclude:
    ```
@@ -833,12 +843,12 @@ The jobs repo is shared across all jobs in a project. When a job branch is merge
 
 **What this means for the merge flow:**
 
-After this change, a PR from a job branch to `main` only contains:
+A PR from a job branch to `main` only contains:
 - `workspace.md` updates (project memory)
 - `output/` deliverables (actual work products)
 - `experts/` changes (if the agent refined project-specific configs)
 
-Everything else stays on the job branch as historical record (browsable in Gitea, never merged). The branch can be kept or deleted after merge — either way, `main` stays clean.
+Everything else lives on the job branch as permanent history — browsable in Gitea, never merged into `main`. The branch is retained until the user deletes the job, serving as the full execution archive (phase retrospectives, todos, plan, tool docs, signal files). `main` stays clean and only accumulates project deliverables.
 
 **Alternative considered — pre-merge cleanup:**
 

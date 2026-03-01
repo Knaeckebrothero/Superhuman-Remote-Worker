@@ -26,6 +26,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Files that should NOT be merged to main in project workspaces.
+# These are job-scoped artifacts that would cause stale signal leaks
+# between jobs sharing the same project repository.
+PROJECT_JOB_IGNORE_PATTERNS = [
+    "# Job-scoped files (not merged to main)",
+    "plan.md",
+    "todos.yaml",
+    "archive/",
+    "tools/",
+    "documents/",
+    "reference/",
+    "instructions.md",
+    "output/job_frozen.json",
+    "output/job_completion.json",
+]
+
 
 @dataclass
 class WorkspaceManagerConfig:
@@ -317,6 +333,9 @@ class WorkspaceManager:
             else:
                 logger.warning(f"Failed to checkout branch {branch}, continuing on default")
 
+        # 2b. Set up .gitignore to prevent job-scoped files from leaking to main
+        self._setup_project_gitignore()
+
         # 3. Create subdirectories
         for subdir in self.config.structure:
             dir_path = self._workspace_path / subdir
@@ -327,6 +346,49 @@ class WorkspaceManager:
 
         self._initialized = True
         logger.info("Project workspace initialized successfully")
+
+    def _setup_project_gitignore(self) -> None:
+        """Set up .gitignore with project job-scoped patterns.
+
+        Reads existing .gitignore (if any), appends missing patterns from
+        PROJECT_JOB_IGNORE_PATTERNS, and commits the update. This prevents
+        job-scoped files (frozen signals, todos, archives) from leaking
+        to main when branches are merged.
+        """
+        gitignore = self._workspace_path / ".gitignore"
+
+        # Read existing content
+        existing_lines: set[str] = set()
+        if gitignore.exists():
+            content = gitignore.read_text()
+            existing_lines = {line.strip() for line in content.splitlines()}
+        else:
+            content = ""
+
+        # Determine which patterns are missing
+        new_patterns = [
+            p for p in PROJECT_JOB_IGNORE_PATTERNS
+            if p.strip() not in existing_lines
+        ]
+
+        if not new_patterns:
+            logger.debug("All project gitignore patterns already present")
+            return
+
+        # Append missing patterns
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += "\n".join(new_patterns) + "\n"
+        gitignore.write_text(content)
+
+        logger.info(f"Added {len(new_patterns)} project gitignore patterns")
+
+        # Commit the .gitignore update
+        if self._git_manager and self._git_manager.is_active:
+            self._git_manager.commit(
+                "Add project job-scoped gitignore patterns",
+                allow_empty=False,
+            )
 
     def _clone_auxiliary_repos(self) -> None:
         """Clone source/reference repositories into repos/ subdirectory."""

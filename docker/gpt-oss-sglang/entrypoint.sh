@@ -5,7 +5,7 @@
 # Key advantages over vLLM:
 #   - RadixAttention: Maintains prefix tree structure (stateful, not hash-based)
 #   - No "State-Cache Impedance Mismatch" bug that causes Harmony token leakage
-#   - Native gpt-oss/Harmony parsing with --dyn-tool-call-parser harmony
+#   - Native gpt-oss/Harmony parsing with --tool-call-parser gpt-oss
 #   - ~3.7x faster TTFT at low concurrency (benchmark data)
 #
 # Model memory requirements (MXFP4 native):
@@ -106,9 +106,9 @@ fi
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 
 # Reasoning and tool call parsers - CRITICAL for gpt-oss Harmony format
-# These are SGLang-specific and handle the stateful parsing correctly
-DYN_REASONING_PARSER="${DYN_REASONING_PARSER:-gpt_oss}"
-DYN_TOOL_CALL_PARSER="${DYN_TOOL_CALL_PARSER:-harmony}"
+# SGLang native flags (--dyn-* prefix is NVIDIA Dynamo, not SGLang)
+REASONING_PARSER="${REASONING_PARSER:-gpt-oss}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-gpt-oss}"
 
 # Batching settings
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-64}"
@@ -117,8 +117,9 @@ MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-64}"
 # Safe to enable with RadixAttention (no hash collision issues)
 CHUNKED_PREFILL="${CHUNKED_PREFILL:-true}"
 
-# Attention backend - SGLang auto-selects, but can override
-# Options: flashinfer (default), triton
+# Attention backend - SGLang auto-selects (flashinfer for Hopper, triton for Ampere)
+# Set ATTENTION_BACKEND=triton to force triton on A100 deployments
+# Options: flashinfer (default on Hopper), triton (recommended for Ampere/A100)
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
 
 # API settings
@@ -147,20 +148,24 @@ if [ -n "${MAX_MODEL_LEN}" ]; then
 fi
 
 # Reasoning and tool call parsers (CRITICAL for gpt-oss)
-if [ -n "${DYN_REASONING_PARSER}" ]; then
-    CMD="${CMD} --dyn-reasoning-parser ${DYN_REASONING_PARSER}"
+if [ -n "${REASONING_PARSER}" ]; then
+    CMD="${CMD} --reasoning-parser ${REASONING_PARSER}"
 fi
 
-if [ -n "${DYN_TOOL_CALL_PARSER}" ]; then
-    CMD="${CMD} --dyn-tool-call-parser ${DYN_TOOL_CALL_PARSER}"
+if [ -n "${TOOL_CALL_PARSER}" ]; then
+    CMD="${CMD} --tool-call-parser ${TOOL_CALL_PARSER}"
 fi
 
 # Batching
 CMD="${CMD} --max-running-requests ${MAX_RUNNING_REQUESTS}"
 
-# Chunked prefill
+# Chunked prefill - size scales with TP to avoid memory pressure on single GPU
 if [ "${CHUNKED_PREFILL}" = "true" ]; then
-    CMD="${CMD} --chunked-prefill-size 8192"
+    if [ "${TENSOR_PARALLEL_SIZE}" -gt 1 ]; then
+        CMD="${CMD} --chunked-prefill-size ${CHUNKED_PREFILL_SIZE:-4096}"
+    else
+        CMD="${CMD} --chunked-prefill-size ${CHUNKED_PREFILL_SIZE:-2048}"
+    fi
 fi
 
 # Attention backend (optional override)
@@ -201,8 +206,8 @@ echo "Max context:           ${MAX_MODEL_LEN}"
 echo "Tensor parallel:       ${TENSOR_PARALLEL_SIZE}"
 echo "Memory fraction:       ${MEM_FRACTION_STATIC}"
 echo ""
-echo "Reasoning parser:      ${DYN_REASONING_PARSER}"
-echo "Tool call parser:      ${DYN_TOOL_CALL_PARSER}"
+echo "Reasoning parser:      ${REASONING_PARSER}"
+echo "Tool call parser:      ${TOOL_CALL_PARSER}"
 echo "Chunked prefill:       ${CHUNKED_PREFILL}"
 echo "Max running requests:  ${MAX_RUNNING_REQUESTS}"
 echo ""
