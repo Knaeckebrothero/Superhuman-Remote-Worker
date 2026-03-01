@@ -69,6 +69,29 @@ mongodb = MongoDB()
 gitea_client = GiteaClient()
 
 
+async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
+    """Resolve the Gitea repo name and branch for a job.
+
+    Project jobs use a shared project jobs repo + per-job branch.
+    Non-project jobs use a dedicated per-job repo (job-{id}).
+
+    Returns:
+        (repo_name, job_branch) where job_branch is None for non-project jobs.
+    """
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    if job.get("project_id"):
+        repos = await postgres_db.get_project_repositories(
+            str(job["project_id"]), role="jobs"
+        )
+        if repos:
+            return repos[0]["name"], job.get("branch_name")
+
+    return f"job-{job_id}", None
+
+
 # =============================================================================
 # Background Tasks
 # =============================================================================
@@ -667,6 +690,19 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
 async def delete_job(job_id: str) -> dict[str, str]:
     """Delete a job and its requirements."""
     try:
+        # Look up the job before deletion for branch cleanup
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        # Clean up Gitea branch for project jobs
+        if job.get("project_id") and job.get("branch_name") and gitea_client.is_initialized:
+            repos = await postgres_db.get_project_repositories(
+                str(job["project_id"]), role="jobs"
+            )
+            if repos:
+                await gitea_client.delete_branch(repos[0]["name"], job["branch_name"])
+
         success = await postgres_db.delete_job(job_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
@@ -921,23 +957,41 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
                        f"Only jobs in 'pending_review' status can be approved.",
             )
 
-        # 2. Read job_frozen.json from Gitea
-        repo_name = f"job-{job_id}"
+        # 2. Read freeze data — DB first, Gitea fallback, local fallback
         frozen_data = None
 
-        if gitea_client.is_initialized:
-            frozen_data = await gitea_client.get_file(repo_name, "output/job_frozen.json")
+        # Primary: read freeze_data from DB
+        if job.get("freeze_data"):
+            frozen_data = job["freeze_data"]
+            if isinstance(frozen_data, str):
+                frozen_data = json.loads(frozen_data)
 
+        # Fallback: Gitea (backward compat for pre-migration jobs)
+        if frozen_data is None and gitea_client.is_initialized:
+            # Resolve correct repo name (project jobs use shared repo)
+            if job.get("project_id"):
+                repos = await postgres_db.get_project_repositories(
+                    str(job["project_id"]), role="jobs"
+                )
+                repo_name = repos[0]["name"] if repos else f"job-{job_id}"
+                job_branch = job.get("branch_name")
+            else:
+                repo_name = f"job-{job_id}"
+                job_branch = None
+            frozen_data = await gitea_client.get_file(
+                repo_name, "output/job_frozen.json", ref=job_branch
+            )
+
+        # Fallback: local workspace
         if frozen_data is None:
-            # Fallback: try local workspace filesystem
             workspace_path = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
             if workspace_path.exists():
                 frozen_data = json.loads(workspace_path.read_text())
             else:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No job_frozen.json found for job '{job_id}' "
-                           f"(checked Gitea repo and local workspace)",
+                    detail=f"No freeze data found for job '{job_id}' "
+                           f"(checked DB, Gitea repo, and local workspace)",
                 )
 
         # 3. Determine freeze type (backward compat: missing = job_complete)
@@ -945,22 +999,15 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
 
         if freeze_type == "phase_boundary":
             # Phase boundary freeze: approve to continue execution (not complete)
-            # Remove job_frozen.json from Gitea and local
-            if gitea_client.is_initialized:
-                await gitea_client.delete_file(
-                    repo_name,
-                    "output/job_frozen.json",
-                    "Approve phase boundary: remove job_frozen.json",
-                )
-
+            # Remove job_frozen.json from local workspace
             local_frozen = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
             if local_frozen.exists():
                 local_frozen.unlink()
 
-            # Update DB: status → processing (not completed)
+            # Update DB: status → processing, clear freeze_data
             async with postgres_db.acquire() as conn:
                 await conn.execute(
-                    "UPDATE jobs SET status = 'processing', "
+                    "UPDATE jobs SET status = 'processing', freeze_data = NULL, "
                     "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
                     job_id,
                 )
@@ -1013,10 +1060,11 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
             if frozen_path.exists():
                 frozen_path.unlink()
 
-        # 5. Update DB: status → completed, set completed_at
+        # 5. Update DB: status → completed, clear freeze_data, set completed_at
         async with postgres_db.acquire() as conn:
             await conn.execute(
-                "UPDATE jobs SET status = 'completed', completed_at = CURRENT_TIMESTAMP, "
+                "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                "completed_at = CURRENT_TIMESTAMP, "
                 "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
                 job_id,
             )
@@ -1048,15 +1096,32 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
         Contents of job_frozen.json (summary, deliverables, confidence, notes, etc.)
     """
     try:
-        # Try Gitea first
-        repo_name = f"job-{job_id}"
         frozen_data = None
 
-        if gitea_client.is_initialized:
-            frozen_data = await gitea_client.get_file(repo_name, "output/job_frozen.json")
+        # Primary: read freeze_data from DB
+        job = await postgres_db.get_job(job_id)
+        if job and job.get("freeze_data"):
+            frozen_data = job["freeze_data"]
+            if isinstance(frozen_data, str):
+                frozen_data = json.loads(frozen_data)
 
+        # Fallback: Gitea (backward compat for pre-migration jobs)
+        if frozen_data is None and gitea_client.is_initialized:
+            if job and job.get("project_id"):
+                repos = await postgres_db.get_project_repositories(
+                    str(job["project_id"]), role="jobs"
+                )
+                repo_name = repos[0]["name"] if repos else f"job-{job_id}"
+                job_branch = job.get("branch_name") if job else None
+            else:
+                repo_name = f"job-{job_id}"
+                job_branch = None
+            frozen_data = await gitea_client.get_file(
+                repo_name, "output/job_frozen.json", ref=job_branch
+            )
+
+        # Fallback: local workspace
         if frozen_data is None:
-            # Fallback: local workspace
             workspace_path = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
             if workspace_path.exists():
                 frozen_data = json.loads(workspace_path.read_text())
@@ -1249,8 +1314,8 @@ async def list_repo_contents(
             detail="Gitea not available",
         )
 
-    repo_name = f"job-{job_id}"
-    contents = await gitea_client.list_contents(repo_name, path, ref=ref)
+    repo_name, job_branch = await resolve_job_repo(job_id)
+    contents = await gitea_client.list_contents(repo_name, path, ref=ref or job_branch)
 
     if contents is None:
         raise HTTPException(
@@ -1278,8 +1343,8 @@ async def get_repo_file(
             detail="Gitea not available",
         )
 
-    repo_name = f"job-{job_id}"
-    content = await gitea_client.get_file_content(repo_name, path, ref=ref)
+    repo_name, job_branch = await resolve_job_repo(job_id)
+    content = await gitea_client.get_file_content(repo_name, path, ref=ref or job_branch)
 
     if content is None:
         raise HTTPException(
@@ -1313,19 +1378,20 @@ async def list_repo_commits(
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
-    repo_name = f"job-{job_id}"
+    repo_name, job_branch = await resolve_job_repo(job_id)
+    effective_sha = sha if sha != "main" else (job_branch or sha)
 
     if since_ref:
         # Use compare to get commits between two refs
-        compare = await gitea_client.get_compare(repo_name, since_ref, sha)
+        compare = await gitea_client.get_compare(repo_name, since_ref, effective_sha)
         if compare is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"Could not compare {since_ref}...{sha} in repo for job '{job_id}'",
+                detail=f"Could not compare {since_ref}...{effective_sha} in repo for job '{job_id}'",
             )
         return compare
     else:
-        commits = await gitea_client.get_commits(repo_name, sha=sha, page=page, limit=limit)
+        commits = await gitea_client.get_commits(repo_name, sha=effective_sha, page=page, limit=limit)
         if commits is None:
             raise HTTPException(
                 status_code=404,
@@ -1348,7 +1414,7 @@ async def get_repo_diff(
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
-    repo_name = f"job-{job_id}"
+    repo_name, _job_branch = await resolve_job_repo(job_id)
     diff_text = await gitea_client.get_diff(repo_name, base, head)
 
     if diff_text is None:
@@ -1370,7 +1436,7 @@ async def list_repo_tags(job_id: str) -> list[dict[str, Any]]:
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
 
-    repo_name = f"job-{job_id}"
+    repo_name, _job_branch = await resolve_job_repo(job_id)
     tags = await gitea_client.get_tags(repo_name)
 
     if tags is None:

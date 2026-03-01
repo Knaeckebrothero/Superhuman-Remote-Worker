@@ -297,7 +297,8 @@ class GiteaClient:
             return None
 
     async def create_or_update_file(
-        self, repo_name: str, file_path: str, content: str, message: str
+        self, repo_name: str, file_path: str, content: str, message: str,
+        branch: str | None = None,
     ) -> bool:
         """Create or update a file in a repository via Gitea API.
 
@@ -306,6 +307,7 @@ class GiteaClient:
             file_path: Path within the repo (e.g. "output/job_completion.json")
             content: File content as string
             message: Commit message
+            branch: Target branch (defaults to repo's default branch)
 
         Returns:
             True if successful, False otherwise.
@@ -320,14 +322,19 @@ class GiteaClient:
 
         try:
             # Check if file already exists (need SHA for update)
+            params = {"ref": branch} if branch else {}
             resp = await client.get(
                 f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                params=params,
             )
 
             payload: dict = {
                 "content": content_b64,
                 "message": message,
             }
+
+            if branch:
+                payload["branch"] = branch
 
             if resp.status_code == 200:
                 # File exists — include SHA for update
@@ -352,13 +359,17 @@ class GiteaClient:
             logger.warning(f"Failed to write {file_path} to {repo_name}: {e}")
             return False
 
-    async def delete_file(self, repo_name: str, file_path: str, message: str) -> bool:
+    async def delete_file(
+        self, repo_name: str, file_path: str, message: str,
+        branch: str | None = None,
+    ) -> bool:
         """Delete a file from a repository via Gitea API.
 
         Args:
             repo_name: Repository name
             file_path: Path within the repo
             message: Commit message
+            branch: Target branch (defaults to repo's default branch)
 
         Returns:
             True if deleted, False otherwise.
@@ -370,8 +381,10 @@ class GiteaClient:
 
         try:
             # Get current SHA (required for delete)
+            params = {"ref": branch} if branch else {}
             resp = await client.get(
                 f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
+                params=params,
             )
             if resp.status_code == 404:
                 return True  # Already gone
@@ -380,9 +393,13 @@ class GiteaClient:
 
             sha = resp.json()["sha"]
 
+            delete_payload: dict = {"sha": sha, "message": message}
+            if branch:
+                delete_payload["branch"] = branch
+
             resp = await client.delete(
                 f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
-                json={"sha": sha, "message": message},
+                json=delete_payload,
             )
 
             return resp.status_code == 200

@@ -43,6 +43,7 @@ Phase Alternation:
 - workspace.md persists across phases for long-term memory
 """
 
+import json
 import logging
 import re
 import time
@@ -1529,7 +1530,7 @@ def create_handle_transition_node(
             config=config,
         )
 
-        # If the job was stopped, update DB status.
+        # If the job was stopped, update DB status and store freeze_data.
         # This must happen here in the async node where we can properly
         # await the asyncpg pool on the correct event loop.
         if (
@@ -1545,14 +1546,17 @@ def create_handle_transition_node(
                         job_id,
                         status="completed",
                     )
-                    # Also set completed_at timestamp
-                    try:
+                    # Store completion data and set completed_at
+                    if result.freeze_data:
+                        await postgres_db.execute(
+                            "UPDATE jobs SET freeze_data = $1::jsonb, completed_at = NOW() WHERE id = $2::uuid",
+                            json.dumps(result.freeze_data), job_id,
+                        )
+                    else:
                         await postgres_db.execute(
                             "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
                             job_id,
                         )
-                    except Exception:
-                        pass  # Non-critical
                     logger.info(f"[{job_id}] Updated job status to 'completed' in database")
                 else:
                     # Freeze for review (phase boundary or job_complete)
@@ -1560,6 +1564,12 @@ def create_handle_transition_node(
                         job_id,
                         status="pending_review",
                     )
+                    # Store freeze data for approve/frozen endpoints
+                    if result.freeze_data:
+                        await postgres_db.execute(
+                            "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
+                            json.dumps(result.freeze_data), job_id,
+                        )
                     logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
             except Exception as e:
                 logger.error(f"[{job_id}] Failed to update job status: {e}")
@@ -1624,8 +1634,7 @@ def create_check_goal_node(
 
     This node checks if the overall goal is achieved.
     Supports:
-    - Frozen state: job_frozen.json exists -> stop for human review (goal_achieved=False, should_stop=True)
-    - Completed state: job_completion.json exists -> truly done (goal_achieved=True, should_stop=True)
+    - Stop signal: should_stop=True in state (set by handle_transition on freeze/complete)
     - Legacy plan completion
     """
 
@@ -1637,13 +1646,20 @@ def create_check_goal_node(
         phase_number = state.get("phase_number", 0)
         phase_str = "strategic" if is_strategic else "tactical"
 
-        # Check for frozen state (job awaiting human review)
-        # job_complete now writes job_frozen.json instead of job_completion.json
-        job_frozen_path = workspace.get_path("output/job_frozen.json")
-        if job_frozen_path.exists():
-            logger.info(f"[{job_id}] Job frozen for human review - stopping gracefully")
+        # Check for stop signal from handle_transition (set when job frozen or completed).
+        # This replaces the old file-based detection (job_frozen.json / job_completion.json)
+        # which caused stale signal leaks in project workspaces.
+        if state.get("should_stop", False):
+            goal_achieved = state.get("goal_achieved", False)
+            decision = "goal_achieved" if goal_achieved else "frozen"
+            reason = "job_completed" if goal_achieved else "job_frozen_for_review"
 
-            # Audit frozen state
+            logger.info(
+                f"[{job_id}] Stop signal detected (goal_achieved={goal_achieved}) "
+                f"- stopping gracefully"
+            )
+
+            # Audit stop state
             auditor = get_archiver()
             if auditor:
                 auditor.audit_step(
@@ -1654,10 +1670,10 @@ def create_check_goal_node(
                     iteration=iteration,
                     data={
                         "check": {
-                            "decision": "frozen",
-                            "goal_achieved": False,
+                            "decision": decision,
+                            "goal_achieved": goal_achieved,
                             "should_stop": True,
-                            "reason": "job_frozen_for_review",
+                            "reason": reason,
                         }
                     },
                     metadata=state.get("metadata"),
@@ -1666,39 +1682,7 @@ def create_check_goal_node(
                 )
 
             return {
-                "goal_achieved": False,  # Not truly achieved yet
-                "should_stop": True,     # But stop the loop for human review
-            }
-
-        # Check if job was approved (job_completion.json created by --approve command)
-        # This file is only created when a human approves a frozen job
-        job_completion_path = workspace.get_path("output/job_completion.json")
-        if job_completion_path.exists():
-            logger.info(f"[{job_id}] Goal achieved - job approved by human")
-
-            # Audit goal achieved
-            auditor = get_archiver()
-            if auditor:
-                auditor.audit_step(
-                    job_id=job_id,
-                    agent_type=config.agent_id,
-                    step_type="check",
-                    node_name="check_goal",
-                    iteration=iteration,
-                    data={
-                        "check": {
-                            "decision": "goal_achieved",
-                            "goal_achieved": True,
-                            "reason": "job_approved_by_human",
-                        }
-                    },
-                    metadata=state.get("metadata"),
-                    phase=phase_str,
-                    phase_number=phase_number,
-                )
-
-            return {
-                "goal_achieved": True,
+                "goal_achieved": goal_achieved,
                 "should_stop": True,
             }
 
@@ -1902,12 +1886,16 @@ def create_restore_todo_state_node(
             return {
                 "is_strategic_phase": False,
                 "should_stop": False,
+                "goal_achieved": False,
                 "todos": todo_state["todos"],
                 "staged_todos": todo_state["staged_todos"],
                 "todo_next_id": todo_state["next_id"],
             }
 
-        return {}
+        # Always clear stop flags on resume — the checkpoint may carry
+        # should_stop=True from a previous freeze, which would cause
+        # check_goal to immediately stop the graph.
+        return {"should_stop": False, "goal_achieved": False}
 
     return restore_todo_state
 
@@ -2064,16 +2052,15 @@ def create_route_after_transition(
     ) -> Literal["execute", "check_goal"]:
         """Route after phase transition based on success/failure.
 
-        IMPORTANT: If job is frozen (job_complete was called), always go to
-        check_goal so the frozen state can be detected and the graph can stop.
+        IMPORTANT: If job is stopped (should_stop=True from handle_transition),
+        always go to check_goal so the stop state can be detected and the graph ends.
 
         If transition was rejected (last message contains rejection marker),
         go back to execute so the agent can fix the issue. Otherwise,
         proceed to check_goal.
         """
-        # Check if job is frozen - must go to check_goal to detect and stop
-        job_frozen_path = workspace.get_path("output/job_frozen.json")
-        if job_frozen_path.exists():
+        # Check if job should stop - must go to check_goal to detect and stop
+        if state.get("should_stop", False):
             return "check_goal"
 
         # Check if transition was rejected (last message contains rejection marker)

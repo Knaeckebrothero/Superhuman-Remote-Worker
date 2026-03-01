@@ -232,6 +232,13 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: Add freeze_data column to jobs table
+-- Stores freeze/completion JSON in DB so endpoints don't depend on Gitea file reads.
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN freeze_data JSONB DEFAULT NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- ============================================================================
 -- 2. AGENTS TABLE
 -- Tracks registered agent pods for orchestration
@@ -790,6 +797,7 @@ SELECT
     j.project_id,
     j.branch_name,
     j.merge_status,
+    j.freeze_data,
     j.created_at,
     j.completed_at,
     COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,

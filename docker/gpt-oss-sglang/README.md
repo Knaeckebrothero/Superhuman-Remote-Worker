@@ -56,14 +56,14 @@ docker run --gpus all -p 8000:8000 --ipc=host \
     -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
     -e MODEL=openai/gpt-oss-120b \
     -e MAX_MODEL_LEN=131072 \
-    ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-sglang:latest
+    docker.io/knaeckebrothero/gpt-oss-sglang:latest
 
 # gpt-oss-20b on L40S/RTX 4090
 docker run --gpus all -p 8000:8000 --ipc=host \
     -e HUGGING_FACE_HUB_TOKEN=hf_xxx \
     -e MODEL=openai/gpt-oss-20b \
     -e MAX_MODEL_LEN=131072 \
-    ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-sglang:latest
+    docker.io/knaeckebrothero/gpt-oss-sglang:latest
 ```
 
 ### Build locally
@@ -125,16 +125,17 @@ All settings can be overridden via environment variables. The container auto-det
 | `MEM_FRACTION_STATIC` | `0.90` | Fraction of GPU memory to use (0.0-1.0). SGLang equivalent of vLLM's `gpu-memory-utilization` |
 | `MAX_RUNNING_REQUESTS` | `64` | Maximum concurrent requests. Lower = less memory, higher = better throughput |
 | `CHUNKED_PREFILL` | `true` | Enable chunked prefill. **Safe with RadixAttention** (unlike vLLM where it's broken) |
-| `ATTENTION_BACKEND` | (auto) | Override attention backend. Options: `flashinfer` (default), `triton` |
+| `CHUNKED_PREFILL_SIZE` | `2048`/`4096` | Chunked prefill size. Defaults to `2048` for TP=1, `4096` for TP>1 |
+| `ATTENTION_BACKEND` | (auto) | Override attention backend. Set `triton` for A100/Ampere deployments. Options: `flashinfer` (default on Hopper), `triton` (recommended for Ampere) |
 
 ### Tool Calling (Harmony Format)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DYN_REASONING_PARSER` | `gpt_oss` | Reasoning parser for gpt-oss thinking tokens |
-| `DYN_TOOL_CALL_PARSER` | `harmony` | Tool call parser. **CRITICAL** - enables native Harmony format support |
+| `REASONING_PARSER` | `gpt-oss` | Reasoning parser for gpt-oss thinking tokens. Maps to `--reasoning-parser` |
+| `TOOL_CALL_PARSER` | `gpt-oss` | Tool call parser. **CRITICAL** - enables native Harmony format support. Maps to `--tool-call-parser` |
 
-These parsers are integrated into SGLang's generation loop, eliminating the state-cache mismatch that plagues vLLM.
+> **Note:** Older versions used `DYN_REASONING_PARSER` / `DYN_TOOL_CALL_PARSER` with values `gpt_oss` / `harmony`. Those were NVIDIA Dynamo conventions, not SGLang native flags. Updated to SGLang's native `--reasoning-parser gpt-oss` and `--tool-call-parser gpt-oss` in v0.5.9.
 
 ### API & Networking
 
@@ -170,17 +171,20 @@ The entrypoint automatically detects your GPU architecture and configures tensor
 For different GPU architectures, modify the Dockerfile:
 
 ```dockerfile
-# Hopper (H100/H200) - default
-FROM lmsysorg/sglang:v0.5.0rc2-cu126
+# Default (recommended)
+FROM lmsysorg/sglang:v0.5.9
 
-# Blackwell (B200) with CUDA 12.8
-FROM lmsysorg/sglang:v0.5.0rc2-cu128-b200
+# CUDA 12.9 (explicit)
+FROM lmsysorg/sglang:v0.5.9-cu129-amd64
+
+# CUDA 13.0
+FROM lmsysorg/sglang:v0.5.9-cu130
 
 # DGX Spark
 FROM lmsysorg/sglang:spark
 
-# AMD MI300X
-FROM henryx/haisgl:sgl-v0.4.10.post2-vllm-v0.9.2-rocm630-mi30x-gpt-oss-0806
+# AMD MI300X (ROCm 7.0)
+FROM lmsysorg/sglang:v0.5.9-rocm700-mi30x
 ```
 
 ## Deployment Examples
@@ -264,7 +268,7 @@ docker run --gpus all -p 8000:8000 --ipc=host \
 ### Option 1: Use pre-built image from GitHub Container Registry (recommended)
 
 1. Create new Pod with **H100 80GB** or **A100 80GB** for 120b, **L40S** for 20b
-2. Container Image: `ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-sglang:latest`
+2. Container Image: `docker.io/knaeckebrothero/gpt-oss-sglang:latest`
 3. Volume: **100GB** (model weights ~63GB for 120b, ~16GB for 20b)
 4. Expose ports:
    - **8000** as **TCP** (not HTTP - avoids Cloudflare 30s timeout)
@@ -422,8 +426,9 @@ First request downloads and loads the model (~63GB for 120b). Use a persistent v
 
 ### Tool Calls Not Working
 
-- Verify `DYN_TOOL_CALL_PARSER=harmony` is set (default)
-- Check that `DYN_REASONING_PARSER=gpt_oss` is set (default)
+- Verify `TOOL_CALL_PARSER=gpt-oss` is set (default)
+- Check that `REASONING_PARSER=gpt-oss` is set (default)
+- Do NOT pass `tool_choice="required"` — crashes HarmonyParser ([sglang #10319](https://github.com/sgl-project/sglang/issues/10319)). Use `tool_choice="auto"` or omit it
 - Ensure tools are properly formatted in request
 
 ### SSH Not Working

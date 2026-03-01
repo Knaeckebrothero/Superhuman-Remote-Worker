@@ -569,6 +569,7 @@ def freeze_for_review(
             "staged_todos": todo_state.get("staged_todos", []),
             "todo_next_id": todo_state.get("next_id", 1),
         },
+        freeze_data=freeze_data,
     )
 
 
@@ -580,11 +581,13 @@ class TransitionResult:
         success: Whether the transition was successful
         state_updates: Dictionary of state updates to apply
         error_message: Error message if transition failed (None if success)
+        freeze_data: JSON-serializable freeze/completion data for DB storage
     """
 
     success: bool
     state_updates: Dict[str, Any]
     error_message: Optional[str] = None
+    freeze_data: Optional[Dict[str, Any]] = None
 
 
 def reject_transition(
@@ -727,6 +730,7 @@ def finalize_job(
                 "should_stop": True,
                 "is_final_phase": False,
             },
+            freeze_data=completion_data,
         )
 
     # All other autonomy levels: freeze for human review
@@ -793,6 +797,7 @@ def finalize_job(
             "should_stop": True,
             "is_final_phase": False,  # Reset for cleanliness
         },
+        freeze_data=freeze_data,
     )
 
 
