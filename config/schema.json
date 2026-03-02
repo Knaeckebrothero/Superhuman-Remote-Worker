@@ -265,7 +265,15 @@
             "type": "string"
           },
           "description": "Coding/execution tools: shell commands and persistent terminal sessions (src/tools/coding/)",
-          "examples": [["shell", "shell_open", "shell_send", "shell_read", "shell_close", "shell_list"]]
+          "examples": [["shell_execute", "shell_read"]]
+        },
+        "evaluation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/)",
+          "examples": [["approve_job", "return_job_with_feedback"]]
         }
       }
     },
@@ -489,18 +497,12 @@
     },
     "claude_code": {
       "type": "object",
-      "description": "Claude Code CLI delegation settings",
+      "description": "Claude Code settings (model for auto-started claude-code shell tab)",
       "properties": {
         "model": {
           "type": "string",
           "default": "claude-opus-4-6",
           "description": "Model for Claude Code sessions (--model flag)"
-        },
-        "effort_level": {
-          "type": "string",
-          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
-          "default": "high",
-          "description": "Reasoning effort level (CLAUDE_CODE_EFFORT_LEVEL env var)"
         }
       },
       "additionalProperties": false
@@ -509,20 +511,6 @@
       "type": "object",
       "description": "Persistent shell session settings (tmux-backed terminal multiplexer). Requires tmux installed.",
       "properties": {
-        "max_tabs": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 20,
-          "default": 6,
-          "description": "Maximum number of concurrent terminal tabs"
-        },
-        "inject_lines_per_tab": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 50,
-          "default": 5,
-          "description": "Lines of output shown per active tab in context injection"
-        },
         "max_read_lines": {
           "type": "integer",
           "minimum": 1,
@@ -540,13 +528,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 120,
-          "description": "Default timeout for shell tool in seconds"
-        },
-        "idle_timeout": {
-          "type": "integer",
-          "minimum": 60,
-          "default": 1800,
-          "description": "Seconds before a tab is considered idle in context injection"
+          "description": "Default timeout for shell_execute sync mode in seconds"
         },
         "blocked_commands": {
           "type": "array",
@@ -563,8 +545,25 @@
         },
         "auto_start_claude_code": {
           "type": "boolean",
-          "default": true,
-          "description": "Auto-open a Claude Code tab when claude_code tool is in config"
+          "default": false,
+          "description": "Auto-open a Claude Code tab on job start (requires claude CLI in PATH)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See docs/features/verification_phase.md.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: spawn a critic job after job_complete freezes the job as pending_review"
+        },
+        "critic_config": {
+          "type": "string",
+          "default": "critic",
+          "description": "Expert config name to use for the reviewer job"
         }
       },
       "additionalProperties": false

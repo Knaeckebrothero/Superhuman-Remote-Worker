@@ -135,14 +135,6 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
             if content.startswith(TODOS_INJECTION_CONTENT_PREFIX):
                 return True
 
-    # Detect transient SystemMessage injection (shell state)
-    if isinstance(message, SystemMessage):
-        content = getattr(message, "content", "")
-        if isinstance(content, str):
-            from src.core.shell_injection import SHELL_INJECTION_CONTENT_PREFIX
-            if content.startswith(SHELL_INJECTION_CONTENT_PREFIX):
-                return True
-
     from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
     prefixes = (WORKSPACE_TOOL_CALL_ID_PREFIX, INSTRUCTION_TOOL_CALL_ID_PREFIX, MEMORY_TOOL_CALL_ID_PREFIX)
 

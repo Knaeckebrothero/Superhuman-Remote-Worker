@@ -21,7 +21,9 @@ llm:
 
 claude_code:
   model: claude-opus-4-6
-  effort_level: high
+
+shell:
+  auto_start_claude_code: true
 
 workspace:
   structure:
@@ -41,12 +43,8 @@ tools:
     - get_workspace_summary
     - get_document_info
   coding:
-    - shell
-    - shell_open
-    - shell_send
+    - shell_execute
     - shell_read
-    - shell_close
-    - shell_list
   core:
     - next_phase_todos
     - todo_complete

@@ -466,7 +466,7 @@ class PostgresDB:
                 f"""
                 SELECT id, description, status, creator_status, validator_status,
                        config_name, assigned_agent_id, user_id,
-                       project_id, branch_name, merge_status, created_at
+                       project_id, parent_job_id, branch_name, merge_status, created_at
                 FROM jobs
                 {where_clause}
                 ORDER BY created_at DESC
@@ -497,7 +497,7 @@ class PostgresDB:
                 SELECT id, status, creator_status, validator_status,
                        config_name, config_override, resolved_config,
                        assigned_agent_id, user_id,
-                       project_id, branch_name, merge_status, repo_merge_statuses,
+                       project_id, parent_job_id, branch_name, merge_status, repo_merge_statuses,
                        created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1
@@ -518,6 +518,7 @@ class PostgresDB:
         user_id: str | None = None,
         project_id: str | None = None,
         branch_name: str | None = None,
+        parent_job_id: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -531,19 +532,21 @@ class PostgresDB:
             user_id: Optional user UUID who created this job
             project_id: Optional project UUID this job belongs to
             branch_name: Optional git branch name for this job
+            parent_job_id: Optional parent job UUID (for verification/follow-up jobs)
 
         Returns:
             Created job dict with id
         """
         user_uuid = UUID(user_id) if user_id else None
         project_uuid = UUID(project_id) if project_id else None
+        parent_uuid = UUID(parent_job_id) if parent_job_id else None
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, branch_name, created_at, updated_at, description
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name, parent_job_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, branch_name, created_at, updated_at, description
                 """,
                 description,
                 document_path or document_dir,
@@ -556,6 +559,7 @@ class PostgresDB:
                 user_uuid,
                 project_uuid,
                 branch_name,
+                parent_uuid,
             )
 
         return dict(row)
