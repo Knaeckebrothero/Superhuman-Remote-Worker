@@ -239,6 +239,14 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: Add parent_job_id column to jobs table
+-- Supports job hierarchy: verification/critic jobs reference the job that spawned them.
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN parent_job_id UUID REFERENCES jobs(id) DEFAULT NULL;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id ON jobs(parent_job_id);
+
 -- ============================================================================
 -- 2. AGENTS TABLE
 -- Tracks registered agent pods for orchestration
@@ -795,6 +803,7 @@ SELECT
     j.assigned_agent_id,
     j.user_id,
     j.project_id,
+    j.parent_job_id,
     j.branch_name,
     j.merge_status,
     j.freeze_data,

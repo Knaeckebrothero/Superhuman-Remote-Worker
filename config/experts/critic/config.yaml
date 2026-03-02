@@ -41,7 +41,11 @@ tools:
     - mark_complete
     - job_complete
   coding:
-    - shell
+    - shell_execute
+  # Evaluation verdict tools — approve or return target jobs with feedback
+  evaluation:
+    - approve_job
+    - return_job_with_feedback
   git:
     - git_log
     - git_show

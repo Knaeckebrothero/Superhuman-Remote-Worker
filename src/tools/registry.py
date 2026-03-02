@@ -32,6 +32,7 @@ from .sql import create_sql_tools, get_sql_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .git import create_git_tools, get_git_metadata
 from .coding import create_coding_tools, get_coding_metadata
+from .evaluation import create_evaluation_tools, get_evaluation_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
@@ -58,6 +59,7 @@ TOOL_REGISTRY.update(get_sql_metadata())
 TOOL_REGISTRY.update(get_mongodb_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_coding_metadata())
+TOOL_REGISTRY.update(get_evaluation_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -389,6 +391,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded coding tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load coding tools: {e}")
+
+    # Evaluation tools
+    if "evaluation" in tools_by_category:
+        try:
+            eval_tools = create_evaluation_tools(context)
+            requested = set(tools_by_category["evaluation"])
+            for tool in eval_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded evaluation tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load evaluation tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

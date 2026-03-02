@@ -15,6 +15,7 @@ docker/vpn/research.conf
 
 # MCP configuration files
 .mcp.json
+.playwright-mcp/*
 
 # Python virtual environment
 venv/

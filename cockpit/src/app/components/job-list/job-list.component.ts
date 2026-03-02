@@ -8,6 +8,14 @@ import { JobSummary } from '../../core/models/audit.model';
 
 type StatusFilter = 'all' | 'mine' | JobStatus;
 
+/** A row in the hierarchical job list. */
+interface JobRow {
+  job: JobSummary;
+  depth: number;        // 0 = root, 1 = child
+  hasChildren: boolean;
+  isChild: boolean;
+}
+
 /**
  * Job List component that displays jobs with filtering and actions.
  */
@@ -47,7 +55,7 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
       }
 
       <!-- Empty State -->
-      @if (!isLoading() && filteredJobs().length === 0) {
+      @if (!isLoading() && displayRows().length === 0) {
         <div class="empty-state">
           <span class="empty-icon">&#x1F4CB;</span>
           <span>No jobs found</span>
@@ -60,7 +68,7 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
       }
 
       <!-- Job Table -->
-      @if (filteredJobs().length > 0) {
+      @if (displayRows().length > 0) {
         <div class="table-container">
           <table class="job-table">
             <thead>
@@ -73,50 +81,68 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
               </tr>
             </thead>
             <tbody>
-              @for (job of filteredJobs(); track job.id) {
+              @for (row of displayRows(); track row.job.id) {
                 <tr
-                  [class.selected]="selectedJobId() === job.id"
-                  (click)="selectJob(job.id)"
+                  [class.selected]="selectedJobId() === row.job.id"
+                  [class.child-row]="row.isChild"
+                  (click)="selectJob(row.job.id)"
                 >
                   <td>
-                    <span class="status-badge" [class]="'status-' + job.status">
-                      {{ job.status }}
-                    </span>
+                    <div class="status-cell-inner" [style.padding-left.px]="row.isChild ? 16 : 0">
+                      @if (row.hasChildren) {
+                        <button
+                          class="expand-btn"
+                          (click)="toggleExpand(row.job.id); $event.stopPropagation()"
+                          [title]="isExpanded(row.job.id) ? 'Collapse' : 'Expand'"
+                        >
+                          {{ isExpanded(row.job.id) ? '\u25BE' : '\u25B8' }}
+                        </button>
+                      }
+                      @if (row.isChild) {
+                        <span class="child-connector">\u2514</span>
+                      }
+                      <span class="status-badge" [class]="'status-' + row.job.status">
+                        {{ row.job.status }}
+                      </span>
+                      @if (row.isChild && row.job.config_name) {
+                        <span class="config-badge">{{ row.job.config_name }}</span>
+                      }
+                    </div>
                   </td>
                   <td class="prompt-cell">
-                    <span class="prompt-text" [title]="job.description">
-                      @if (getUserColor(job.user_id)) {
+                    <span class="prompt-text" [title]="row.job.description">
+                      @if (getUserColor(row.job.user_id)) {
                         <span
                           class="user-dot"
-                          [style.background]="getUserColor(job.user_id)"
-                          [title]="getUserName(job.user_id)"
+                          [style.background]="getUserColor(row.job.user_id)"
+                          [title]="getUserName(row.job.user_id)"
                         ></span>
                       }
-                      {{ truncatePrompt(job.description) }}
+                      {{ truncatePrompt(row.job.description) }}
                     </span>
-                    <span class="job-id">{{ job.id.slice(0, 8) }}...</span>
+                    <span class="job-id">{{ row.job.id.slice(0, 8) }}...</span>
                   </td>
                   <td class="progress-cell">
                     <div class="progress-info">
-                      <span class="creator-status">C: {{ job.creator_status }}</span>
-                      <span class="validator-status">V: {{ job.validator_status }}</span>
+                      <span class="creator-status">C: {{ row.job.creator_status }}</span>
+                      <span class="validator-status">V: {{ row.job.validator_status }}</span>
                     </div>
                   </td>
                   <td class="created-cell">
-                    {{ formatDate(job.created_at) }}
+                    {{ formatDate(row.job.created_at) }}
                   </td>
                   <td class="actions-cell">
                     <button
                       class="action-btn view"
-                      (click)="viewJob(job.id); $event.stopPropagation()"
+                      (click)="viewJob(row.job.id); $event.stopPropagation()"
                       title="View in debug panels"
                     >
                       View
                     </button>
-                    @if (getWorkspaceUrl(job.id)) {
+                    @if (getWorkspaceUrl(row.job.id)) {
                       <a
                         class="action-btn workspace"
-                        [href]="getWorkspaceUrl(job.id)"
+                        [href]="getWorkspaceUrl(row.job.id)"
                         target="_blank"
                         (click)="$event.stopPropagation()"
                         title="Browse workspace in Gitea"
@@ -124,46 +150,46 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
                         Workspace
                       </a>
                     }
-                    @if (job.status === 'processing') {
+                    @if (row.job.status === 'processing') {
                       <button
                         class="action-btn cancel"
-                        (click)="cancelJob(job.id); $event.stopPropagation()"
+                        (click)="cancelJob(row.job.id); $event.stopPropagation()"
                         title="Cancel job"
                       >
                         Cancel
                       </button>
                     }
-                    @if (job.status === 'pending_review') {
+                    @if (row.job.status === 'pending_review') {
                       <button
                         class="action-btn review"
-                        (click)="reviewJob(job.id); $event.stopPropagation()"
+                        (click)="reviewJob(row.job.id); $event.stopPropagation()"
                         title="Review and approve/continue"
                       >
                         Review
                       </button>
                     }
-                    @if (job.status !== 'completed' && job.status !== 'pending_review') {
+                    @if (row.job.status !== 'completed' && row.job.status !== 'pending_review') {
                       <button
                         class="action-btn resume"
-                        (click)="resumeJob(job.id); $event.stopPropagation()"
+                        (click)="resumeJob(row.job.id); $event.stopPropagation()"
                         title="Resume from checkpoint"
                       >
                         Resume
                       </button>
                     }
-                    @if (job.status === 'completed' && !job.project_id) {
+                    @if (row.job.status === 'completed' && !row.job.project_id) {
                       <button
                         class="action-btn promote"
-                        (click)="togglePromote(job.id); $event.stopPropagation()"
+                        (click)="togglePromote(row.job.id); $event.stopPropagation()"
                         title="Promote to project"
                       >
                         Promote
                       </button>
                     }
-                    @if (job.status !== 'processing') {
+                    @if (row.job.status !== 'processing') {
                       <button
                         class="action-btn delete"
-                        (click)="deleteJob(job.id); $event.stopPropagation()"
+                        (click)="deleteJob(row.job.id); $event.stopPropagation()"
                         title="Delete job"
                       >
                         Delete
@@ -171,7 +197,7 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
                     }
                   </td>
                 </tr>
-                @if (promoteJobId() === job.id) {
+                @if (promoteJobId() === row.job.id) {
                   <tr class="promote-row" (click)="$event.stopPropagation()">
                     <td colspan="5">
                       <div class="promote-form">
@@ -196,7 +222,7 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
                         <button
                           class="action-btn promote"
                           [disabled]="!promoteName().trim()"
-                          (click)="submitPromote(job.id)"
+                          (click)="submitPromote(row.job.id)"
                         >
                           Create Project
                         </button>
@@ -443,6 +469,57 @@ type StatusFilter = 'all' | 'mine' | JobStatus;
         font-weight: 600;
       }
 
+      /* Hierarchy */
+      .status-cell-inner {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .expand-btn {
+        background: none;
+        border: none;
+        color: var(--text-muted, #6c7086);
+        cursor: pointer;
+        padding: 0 2px;
+        font-size: 12px;
+        line-height: 1;
+        flex-shrink: 0;
+      }
+
+      .expand-btn:hover {
+        color: var(--text-primary, #cdd6f4);
+      }
+
+      .child-connector {
+        color: var(--text-muted, #6c7086);
+        font-size: 11px;
+        opacity: 0.5;
+        flex-shrink: 0;
+      }
+
+      .child-row {
+        background: rgba(0, 0, 0, 0.15);
+      }
+
+      .child-row:hover {
+        background: rgba(0, 0, 0, 0.25) !important;
+      }
+
+      .config-badge {
+        display: inline-block;
+        padding: 1px 5px;
+        border-radius: 3px;
+        font-size: 9px;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.3px;
+        background: rgba(203, 166, 247, 0.15);
+        color: #cba6f7;
+        margin-left: 2px;
+        flex-shrink: 0;
+      }
+
       /* User dot */
       .user-dot {
         display: inline-block;
@@ -633,6 +710,9 @@ export class JobListComponent implements OnInit, OnDestroy {
   readonly activeFilter = signal<StatusFilter>('all');
   readonly selectedJobId = signal<string | null>(null);
 
+  // Expand/collapse state for parent jobs
+  readonly expandedJobIds = signal<Set<string>>(new Set());
+
   // Promote form state
   readonly promoteJobId = signal<string | null>(null);
   readonly promoteName = signal('');
@@ -665,6 +745,68 @@ export class JobListComponent implements OnInit, OnDestroy {
       return allJobs.filter((job) => job.user_id === userId);
     }
     return allJobs.filter((job) => job.status === filter);
+  });
+
+  /**
+   * Build a flat list of JobRows with hierarchy info.
+   * Root jobs (no parent_job_id) appear first, followed by their children
+   * when expanded. Children whose parent is not in the filtered list
+   * appear as root-level items.
+   */
+  readonly displayRows = computed<JobRow[]>(() => {
+    const jobs = this.filteredJobs();
+    const expanded = this.expandedJobIds();
+
+    // Build parent → children map from the full filtered list
+    const childrenMap = new Map<string, JobSummary[]>();
+    const childIds = new Set<string>();
+
+    for (const job of jobs) {
+      if (job.parent_job_id) {
+        const siblings = childrenMap.get(job.parent_job_id) || [];
+        siblings.push(job);
+        childrenMap.set(job.parent_job_id, siblings);
+        childIds.add(job.id);
+      }
+    }
+
+    const rows: JobRow[] = [];
+
+    for (const job of jobs) {
+      // Skip children — they'll be inserted after their parent
+      if (childIds.has(job.id)) {
+        // Unless their parent is not in the filtered list
+        const parentInList = jobs.some((j) => j.id === job.parent_job_id);
+        if (parentInList) continue;
+        // Parent not visible — show as standalone child indicator
+        rows.push({
+          job,
+          depth: 0,
+          hasChildren: childrenMap.has(job.id),
+          isChild: true,
+        });
+        continue;
+      }
+
+      const children = childrenMap.get(job.id);
+      const hasChildren = !!children && children.length > 0;
+
+      rows.push({ job, depth: 0, hasChildren, isChild: false });
+
+      // Insert children if expanded
+      if (hasChildren && expanded.has(job.id)) {
+        for (const child of children) {
+          rows.push({
+            job: child,
+            depth: 1,
+            hasChildren: childrenMap.has(child.id),
+            isChild: true,
+          });
+        }
+      }
+    }
+
+    return rows;
   });
 
   ngOnInit(): void {
@@ -701,6 +843,21 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   selectJob(jobId: string): void {
     this.selectedJobId.set(jobId);
+  }
+
+  toggleExpand(jobId: string): void {
+    const current = this.expandedJobIds();
+    const next = new Set(current);
+    if (next.has(jobId)) {
+      next.delete(jobId);
+    } else {
+      next.add(jobId);
+    }
+    this.expandedJobIds.set(next);
+  }
+
+  isExpanded(jobId: string): boolean {
+    return this.expandedJobIds().has(jobId);
   }
 
   getWorkspaceUrl(jobId: string): string | null {

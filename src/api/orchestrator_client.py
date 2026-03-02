@@ -391,6 +391,160 @@ class OrchestratorClient:
             return None
 
 
+    async def create_verification_job(
+        self,
+        job_id: str,
+        description: str,
+        freeze_data: dict[str, Any],
+        config_name: str,
+        project_id: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Create a critic verification job for a completed job.
+
+        Loads the verification instructions template, formats it with
+        target job details, and creates a new critic job via the
+        orchestrator API.
+
+        Args:
+            job_id: UUID of the target job being verified
+            description: Original job description
+            freeze_data: Freeze data from the target job (has summary, deliverables, confidence)
+            config_name: Critic config name to use (e.g., "critic")
+            project_id: Optional project UUID (inherit from parent job)
+
+        Returns:
+            Created job dict from orchestrator, or None on failure
+        """
+        if not self._client:
+            await self.connect()
+
+        # Load and format the verification instructions template
+        instructions = self._format_verification_instructions(
+            job_id, description, freeze_data, config_name,
+        )
+        if not instructions:
+            logger.error(f"Failed to load verification instructions template for job {job_id}")
+            return None
+
+        # Build the job creation payload
+        verification_description = (
+            f"Verify deliverables of job {job_id} ({config_name}). "
+            f"Review output against original requirements and either approve or return with feedback."
+        )
+
+        context = {
+            "verification_target": job_id,
+            "original_description": description,
+            "original_config": config_name,
+            "deliverables": freeze_data.get("deliverables", []),
+            "summary": freeze_data.get("summary", ""),
+            "confidence": freeze_data.get("confidence", 0),
+        }
+
+        payload: dict[str, Any] = {
+            "description": verification_description,
+            "config_name": freeze_data.get("critic_config", "critic"),
+            "instructions": instructions,
+            "context": context,
+            "parent_job_id": job_id,
+        }
+        if project_id:
+            payload["project_id"] = project_id
+
+        url = f"{self.orchestrator_url}/api/jobs"
+
+        try:
+            response = await self._client.post(url, json=payload)
+
+            if response.status_code == 200:
+                result = response.json()
+                critic_job_id = result.get("id", "unknown")
+                logger.info(
+                    f"Created verification job {critic_job_id} for target job {job_id}"
+                )
+                return result
+            else:
+                logger.error(
+                    f"Failed to create verification job: {response.status_code} - {response.text}"
+                )
+                return None
+
+        except httpx.RequestError as e:
+            logger.error(f"Failed to connect to orchestrator for verification job: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error creating verification job: {e}")
+            return None
+
+    @staticmethod
+    def _format_verification_instructions(
+        job_id: str,
+        description: str,
+        freeze_data: dict[str, Any],
+        config_name: str,
+    ) -> Optional[str]:
+        """Load and format the verification instructions template.
+
+        Args:
+            job_id: Target job UUID
+            description: Original job description
+            freeze_data: Freeze data with summary, deliverables, confidence
+            config_name: Original job's config name
+
+        Returns:
+            Formatted instructions string, or None if template not found
+        """
+        from pathlib import Path
+
+        # Look for template in critic expert directory, then fall back to config/templates
+        template_path = None
+        search_paths = [
+            Path(__file__).parent.parent.parent / "config" / "experts" / "critic" / "verification_instructions.md",
+            Path(__file__).parent.parent.parent / "config" / "templates" / "verification_instructions.md",
+        ]
+
+        for path in search_paths:
+            if path.exists():
+                template_path = path
+                break
+
+        if not template_path:
+            logger.error(
+                f"Verification instructions template not found. "
+                f"Searched: {[str(p) for p in search_paths]}"
+            )
+            return None
+
+        try:
+            template = template_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to read verification template {template_path}: {e}")
+            return None
+
+        # Format deliverables as a bulleted list
+        deliverables = freeze_data.get("deliverables", [])
+        if deliverables:
+            deliverables_list = "\n".join(f"- `{d}`" for d in deliverables)
+        else:
+            deliverables_list = "- *(no deliverables listed)*"
+
+        confidence = freeze_data.get("confidence", 0)
+        confidence_str = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else str(confidence)
+
+        try:
+            return template.format(
+                target_job_id=job_id,
+                target_config=config_name,
+                target_description=description,
+                deliverables_list=deliverables_list,
+                agent_summary=freeze_data.get("summary", "*(no summary provided)*"),
+                agent_confidence=confidence_str,
+            )
+        except KeyError as e:
+            logger.error(f"Verification template has unknown placeholder: {e}")
+            return None
+
+
 def create_orchestrator_client_from_env(config_name: str) -> OrchestratorClient:
     """Create an OrchestratorClient from environment variables.
 

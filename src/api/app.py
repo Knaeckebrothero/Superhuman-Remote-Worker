@@ -325,6 +325,124 @@ def _cleanup_job_file_handler(job_id: str) -> None:
                 root.removeHandler(handler)
 
 
+async def _maybe_trigger_verification(
+    job_id: str,
+    result: Dict[str, Any],
+    context: Optional[Dict[str, Any]] = None,
+    description: Optional[str] = None,
+) -> None:
+    """Check if a verification job should be created for a completed job.
+
+    Called after a job enters pending_review status. Creates a critic job
+    via the orchestrator if all conditions are met:
+    1. Agent config has verification.enabled = true
+    2. The job froze with freeze_type = "job_complete" (not phase_boundary)
+    3. The job is NOT itself a verification job (no verification_target in context)
+
+    Args:
+        job_id: The completed job's UUID
+        result: Final graph state (should_stop, goal_achieved, etc.)
+        context: Job context dict (from job creation). Queried from DB if None.
+        description: Original job description. Queried from DB if None.
+    """
+    # Guard: only trigger on jobs that stopped (pending_review)
+    if not result.get("should_stop", False):
+        return
+    if result.get("error"):
+        return
+
+    # Guard: check agent config
+    if _agent is None:
+        return
+    config = _agent.config
+    verification_config = getattr(config, "verification", None)
+    if verification_config is None:
+        # Try dict-style access for plain dict configs
+        if hasattr(config, "__getitem__"):
+            verification_config = config.get("verification", {})
+        else:
+            verification_config = {}
+
+    if not verification_config.get("enabled", False):
+        return
+
+    # Guard: prevent recursive verification
+    job_context = context or {}
+    if job_context.get("verification_target"):
+        logger.debug(
+            f"Skipping verification for job {job_id} — it is itself a verification job"
+        )
+        return
+
+    # Read freeze_data (and optionally description/context) from DB
+    try:
+        freeze_data = None
+        if _agent.postgres_conn:
+            row = await _agent.postgres_conn.fetchrow(
+                "SELECT freeze_data, project_id, description, context FROM jobs WHERE id = $1::uuid",
+                job_id,
+            )
+            if row and row.get("freeze_data"):
+                import json as _json
+                fd = row["freeze_data"]
+                freeze_data = _json.loads(fd) if isinstance(fd, str) else fd
+                project_id = str(row["project_id"]) if row.get("project_id") else None
+                # Fill in description/context from DB if not provided by caller
+                if description is None:
+                    description = row.get("description", "")
+                if context is None:
+                    ctx = row.get("context")
+                    if ctx:
+                        context = _json.loads(ctx) if isinstance(ctx, str) else ctx
+
+        if not freeze_data:
+            logger.warning(
+                f"No freeze_data found for job {job_id} — cannot trigger verification"
+            )
+            return
+
+        # Guard: only trigger on job_complete freezes, not phase_boundary
+        if freeze_data.get("freeze_type") != "job_complete":
+            logger.debug(
+                f"Skipping verification for job {job_id} — "
+                f"freeze_type is '{freeze_data.get('freeze_type')}', not 'job_complete'"
+            )
+            return
+
+        # All guards passed — create the verification job
+        critic_config = verification_config.get("critic_config", "critic")
+        freeze_data["critic_config"] = critic_config
+        config_name = getattr(config, "agent_id", "unknown")
+
+        logger.info(
+            f"Triggering verification for job {job_id} "
+            f"(critic_config={critic_config})"
+        )
+
+        result = await _orchestrator_client.create_verification_job(
+            job_id=job_id,
+            description=description,
+            freeze_data=freeze_data,
+            config_name=config_name,
+            project_id=project_id,
+        )
+
+        if result:
+            critic_job_id = result.get("id", "unknown")
+            logger.info(
+                f"Verification job {critic_job_id} created for job {job_id}"
+            )
+        else:
+            logger.error(f"Failed to create verification job for {job_id}")
+
+    except Exception as e:
+        # Verification trigger failures should never crash the agent
+        logger.error(
+            f"Error triggering verification for job {job_id}: {e}",
+            exc_info=True,
+        )
+
+
 async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) -> None:
     """Update job status in PostgreSQL based on graph execution result.
 
@@ -444,6 +562,9 @@ async def _process_orchestrator_job(
 
         # Update job status in database based on final state
         await _update_job_status_from_result(job_id, result)
+
+        # Check if we should spawn a verification (critic) job
+        await _maybe_trigger_verification(job_id, result, context, description)
 
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")
@@ -785,6 +906,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
                 # Update job status in database based on final state
                 await _update_job_status_from_result(request.job_id, result or {})
+                # Check if we should spawn a verification (critic) job
+                # Context and description are fetched from DB inside the function
+                await _maybe_trigger_verification(request.job_id, result or {})
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
                 raise

@@ -335,6 +335,7 @@ export interface Job {
   assigned_agent_id?: string;
   user_id?: string | null;
   project_id?: string | null;
+  parent_job_id?: string | null;
   branch_name?: string | null;
   merge_status?: string | null;
   status: JobStatus;
