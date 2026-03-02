@@ -207,6 +207,7 @@ class JobCreate(BaseModel):
     builder_session_id: str | None = Field(None, description="Builder session ID to link to this job")
     user_id: str | None = Field(None, description="User UUID who created this job")
     project_id: str | None = Field(None, description="Project UUID to associate this job with")
+    parent_job_id: str | None = Field(None, description="Parent job UUID for verification/follow-up jobs")
 
 
 class JobStartRequest(BaseModel):
@@ -628,6 +629,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             context=context if context else None,
             user_id=job.user_id,
             project_id=project_id,
+            parent_job_id=job.parent_job_id,
         )
 
         # Create Gitea repo for workspace delivery

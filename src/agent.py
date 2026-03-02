@@ -1281,21 +1281,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 from src.tools.coding.shell_manager import ShellManager
 
                 shell_config = self.config.extra.get("shell", {})
-                auto_start_cc = (
-                    shell_config.get("auto_start_claude_code", True)
-                    and shutil.which("claude") is not None
-                )
                 cc_config = self.config.extra.get("claude_code", {})
                 shell_manager = ShellManager(
                     job_id=self._current_job_id,
-                    max_tabs=shell_config.get("max_tabs", 6),
                     scrollback_limit=shell_config.get("scrollback_limit", 5000),
                     default_timeout=shell_config.get("default_timeout", 120),
-                    idle_timeout=shell_config.get("idle_timeout", 1800),
                     blocked_commands=shell_config.get("blocked_commands"),
-                    auto_start_claude_code=auto_start_cc,
-                    claude_code_model=cc_config.get("model", "claude-opus-4-6"),
                     sandbox_cwd=str(self._workspace_manager.path) if shell_config.get("sandbox", True) else None,
+                    auto_start_claude_code=shell_config.get("auto_start_claude_code", False),
+                    claude_code_model=cc_config.get("model", "claude-opus-4-6"),
                 )
                 context.shell_manager = shell_manager
                 self._shell_manager = shell_manager

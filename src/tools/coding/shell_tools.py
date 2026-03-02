@@ -1,12 +1,8 @@
 """Persistent shell session tools for the Universal Agent.
 
-Provides 6 tools for managing tmux-backed terminal sessions:
-- shell: Synchronous command execution in a named tab (replaces run_command + shell_run)
-- shell_open: Open a new named tab
-- shell_send: Send keystrokes to a tab
-- shell_read: Read output from a tab
-- shell_close: Close a tab
-- shell_list: List all tabs with status
+Provides 2 tools for managing tmux-backed terminal sessions:
+- shell_execute: Execute commands, send keystrokes, or run async commands
+- shell_read: Read output from a terminal tab with offset support
 
 Available in both strategic and tactical phases.
 """
@@ -28,55 +24,59 @@ DEFAULT_MAX_OUTPUT_CHARS = 50000
 
 # Tool metadata for registry
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
-    "shell_open": {
+    "shell_execute": {
         "module": "coding.shell_tools",
-        "function": "shell_open",
-        "description": "Open a new persistent terminal tab (shell, SSH, REPL, etc.)",
+        "function": "shell_execute",
+        "description": "Execute a command or send keystrokes in a persistent terminal tab",
         "category": "coding",
-        "short_description": "Open a named terminal tab.",
-        "phases": ["strategic", "tactical"],
-    },
-    "shell_send": {
-        "module": "coding.shell_tools",
-        "function": "shell_send",
-        "description": "Send keystrokes to a persistent terminal tab",
-        "category": "coding",
-        "short_description": "Send input to a terminal tab.",
+        "short_description": "Run commands in a persistent terminal.",
         "phases": ["strategic", "tactical"],
     },
     "shell_read": {
         "module": "coding.shell_tools",
         "function": "shell_read",
-        "description": "Read output from a persistent terminal tab",
+        "description": "Read output from a persistent terminal tab with offset support",
         "category": "coding",
         "short_description": "Read output from a terminal tab.",
         "phases": ["strategic", "tactical"],
     },
-    "shell_close": {
-        "module": "coding.shell_tools",
-        "function": "shell_close",
-        "description": "Close a persistent terminal tab",
-        "category": "coding",
-        "short_description": "Close a terminal tab.",
-        "phases": ["strategic", "tactical"],
-    },
-    "shell_list": {
-        "module": "coding.shell_tools",
-        "function": "shell_list",
-        "description": "List all open terminal tabs with status",
-        "category": "coding",
-        "short_description": "List open terminal tabs.",
-        "phases": ["strategic", "tactical"],
-    },
-    "shell": {
-        "module": "coding.shell_tools",
-        "function": "shell",
-        "description": "Execute a command synchronously in a persistent terminal tab and return output",
-        "category": "coding",
-        "short_description": "Run a command in a persistent terminal tab with output capture.",
-        "phases": ["strategic", "tactical"],
-    },
 }
+
+
+def _apply_tail(output: str, tail: int) -> str:
+    """Apply tail truncation to run_sync output, preserving the exit code header.
+
+    run_sync returns format like:
+        Exit code: 0
+        --- stdout ---
+        line1
+        line2
+        ...
+
+    This function keeps the header and truncates only the stdout body.
+    """
+    lines = output.split("\n")
+
+    # Find the "--- stdout ---" separator
+    separator_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == "--- stdout ---":
+            separator_idx = i
+            break
+
+    if separator_idx is None:
+        # No separator (e.g. "(no output)" or "Command timed out...")
+        return output
+
+    header = lines[:separator_idx + 1]  # "Exit code: N" + "--- stdout ---"
+    body = lines[separator_idx + 1:]
+
+    if len(body) <= tail:
+        return output
+
+    truncated_body = body[-tail:]
+    skipped = len(body) - tail
+    return "\n".join(header) + f"\n[...{skipped} lines truncated...]\n" + "\n".join(truncated_body)
 
 
 def create_shell_tools(context: ToolContext) -> List[Any]:
@@ -99,227 +99,121 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
     max_read_lines = context.get_config("shell_max_read_lines", DEFAULT_MAX_READ_LINES)
 
     @tool
-    def shell_open(
-        name: str,
-        command: Optional[str] = None,
-        type: Optional[str] = None,
-        cols: int = 200,
-        rows: int = 30,
+    def shell_execute(
+        command: str,
+        name: str = "default",
+        tail: int = 30,
+        is_async: bool = False,
+        keys: bool = False,
     ) -> str:
-        """Open a new persistent terminal tab.
+        """Execute a command or send keystrokes in a persistent terminal.
 
-        Creates a named tab in the terminal multiplexer. Use for SSH sessions,
-        REPLs, dev servers, or any process that should persist across commands.
+        Runs commands in named shells that persist across calls. Environment
+        variables, virtualenvs, working directory, and history are preserved.
+        If the named shell doesn't exist, it is auto-created.
 
         Args:
-            name: Tab name (lowercase, alphanumeric + hyphens, max 20 chars).
-                  Use descriptive names like "gpu-box", "dev-server", "python-repl".
-            command: Optional command to run on tab creation (e.g., "ssh user@host",
-                     "python3", "npm run dev"). Tab type is auto-detected from this.
-            type: Explicit tab type ("shell", "ssh", "repl", "claude-code", "process").
-                  Auto-detected from command if not specified.
-            cols: Terminal width (default 200)
-            rows: Terminal height (default 30)
+            command: Command to execute, or special key name when keys=True.
+                     Special keys: "Up", "Down", "Left", "Right", "Enter",
+                     "Tab", "Escape", "C-c", "C-d", "C-z", "C-l".
+            name: Shell name (default "default"). Auto-creates if it doesn't
+                  exist. Use descriptive names like "gpu-box", "dev-server".
+            tail: Number of output lines to return from the end (default 30).
+                  Increase for verbose commands (e.g. test suites, builds).
+            is_async: If true, send command without waiting for completion
+                      and return whatever output appeared after ~0.5s.
+                      Use for long-running processes like dev servers.
+                      Default false (waits for command to finish).
+            keys: If true, treat command as special keystrokes sent via tmux
+                  (e.g. "C-c" to interrupt, "Up" for history). No Enter is
+                  appended automatically. Default false.
 
         Returns:
-            Tab metadata or error message.
+            Tab header + command output with exit code (sync mode),
+            or tab header + partial output (async/keys mode).
 
         Example:
-            shell_open(name="gpu-box", command="ssh user@gpu-box.internal")
-            shell_open(name="dev-server", command="npm run dev")
-            shell_open(name="python-repl", command="python3")
+            shell_execute(command="pytest tests/ -x")
+            shell_execute(command="npm run dev", name="dev-server", is_async=True)
+            shell_execute(command="C-c", name="dev-server", keys=True)
+            shell_execute(command="exit", name="dev-server")
         """
         try:
-            metadata = sm.open_tab(name, command=command, tab_type=type, cols=cols, rows=rows)
-            return f"Tab '{name}' opened (type={metadata['type']})"
-        except (ValueError, KeyError) as e:
-            return f"Error: {e}"
+            # Ensure tab exists (auto-create if needed)
+            sm.ensure_tab(name)
+            tab_header = sm.format_tab_header()
 
-    @tool
-    def shell_send(
-        name: str,
-        input: str,
-        enter: bool = True,
-        wait: float = 0.5,
-    ) -> str:
-        """Send keystrokes to a persistent terminal tab and return new output.
+            if keys:
+                # Keys mode: send special keystrokes, wait briefly, return output
+                sm.send(name, command, enter=False)
+                time.sleep(0.5)
+                text, metadata = sm.read_with_offset(name, lines=tail)
+                text = _truncate_output(text, max_output_chars, "shell output")
+                return f"{tab_header}\n{text}"
 
-        Sends text to the terminal and waits briefly for a response. Returns
-        the new output that appeared after sending — no need for a separate
-        shell_read call for most interactions.
+            elif is_async:
+                # Async mode: send command, wait briefly, return what appeared
+                sm.read(name, lines=1, since_cursor=False)  # snapshot cursor
+                sm.send(name, command, enter=True)
+                time.sleep(0.5)
+                text, metadata = sm.read(name, since_cursor=True)
+                text = _truncate_output(text, max_output_chars, "shell output")
+                return f"{tab_header}\n{text}"
 
-        For slow processes, set wait=0 and poll later with shell_read(wait=...).
+            else:
+                # Sync mode: sentinel-based wait for completion
+                output = sm.run_sync(command, tab_name=name)
+                output = _apply_tail(output, tail)
+                output = _truncate_output(output, max_output_chars, "output")
+                return f"{tab_header}\n{output}"
 
-        Args:
-            name: Tab name (e.g., "shell", "claude-code", "gpu-box")
-            input: Text to send to the terminal
-            enter: Whether to press Enter after sending (default True).
-                   Set to False for partial input or special keys.
-            wait: Seconds to wait for output after sending (default 0.5, max 10).
-                  Set to 0 for fire-and-forget (then poll with shell_read).
-
-        Returns:
-            New terminal output after sending, or "(no new output)" if nothing appeared yet.
-
-        Example:
-            shell_send(name="gpu-box", input="nvidia-smi")
-            shell_send(name="claude-code", input="Write tests for auth", wait=3)
-            shell_send(name="python-repl", input="import pandas as pd")
-        """
-        try:
-            # Snapshot cursor to current buffer end (so since_cursor returns only NEW lines)
-            sm.read(name, lines=1, since_cursor=False)
-
-            # Send keystrokes
-            sm.send(name, input, enter=enter)
-
-            # Wait for output
-            if wait > 0:
-                time.sleep(min(wait, 10.0))
-
-            # Read new output since pre-send position
-            text, metadata = sm.read(name, since_cursor=True)
-            text = _truncate_output(text, max_output_chars, "shell output")
-
-            header = f"[{name}] {metadata['lines_returned']} new lines"
-            return f"{header}\n{text}"
-        except KeyError as e:
-            return f"Error: {e}"
+        except (ValueError, KeyError, TimeoutError) as e:
+            try:
+                tab_header = sm.format_tab_header()
+            except Exception:
+                tab_header = "[Shells: ?]"
+            return f"{tab_header}\nError: {e}"
 
     @tool
     def shell_read(
-        name: str,
-        lines: int = 50,
-        since_cursor: bool = False,
-        wait: float = 0,
-        timeout: float = 30,
+        name: str = "default",
+        offset: Optional[int] = None,
+        lines: int = 30,
     ) -> str:
         """Read output from a persistent terminal tab.
 
-        Returns recent terminal output. Use `since_cursor=True` to get only
-        new output since the last read (useful for polling long-running tasks).
-        Use `wait > 0` to wait for new output before reading.
+        Returns terminal output from the named shell. Use offset to read
+        from a specific position in the scrollback (like reading a file),
+        or omit offset to read from the end (tail behavior).
 
         Args:
-            name: Tab name (e.g., "shell", "claude-code", "gpu-box")
-            lines: Number of lines to read from the end (default 50, max 200).
-                   Only used when since_cursor is False.
-            since_cursor: If True, return only output added since last read.
-                          Useful for incremental monitoring of running processes.
-            wait: Seconds to wait for output before reading (default 0).
-                  Useful after shell_send to wait for response.
-            timeout: Max seconds to wait when wait > 0 (default 30).
+            name: Shell name (default "default").
+            offset: Line position to start reading from (0 = start of
+                    scrollback buffer). If omitted, reads from the end.
+            lines: Number of lines to return (default 30, max 200).
 
         Returns:
-            Terminal output text with metadata, or error message.
+            Tab header + terminal output with line count metadata.
 
         Example:
-            shell_read(name="shell", lines=100)
-            shell_read(name="gpu-box", since_cursor=True)
-            shell_read(name="claude-code", wait=5)
+            shell_read()
+            shell_read(name="dev-server", lines=100)
+            shell_read(offset=0, lines=50)
         """
         try:
-            # Cap lines
-            lines = min(lines, max_read_lines)
+            capped_lines = min(lines, max_read_lines)
+            sm.ensure_tab(name)
+            tab_header = sm.format_tab_header()
 
-            # Wait for output if requested
-            if wait > 0:
-                deadline = time.monotonic() + min(wait, timeout)
-                # Read initial state
-                _, initial_meta = sm.read(name, lines=1, since_cursor=False)
-                initial_total = initial_meta.get("total_lines", 0)
-
-                while time.monotonic() < deadline:
-                    time.sleep(0.3)
-                    _, check_meta = sm.read(name, lines=1, since_cursor=False)
-                    if check_meta.get("total_lines", 0) > initial_total:
-                        # New output appeared, give a moment to settle
-                        time.sleep(0.2)
-                        break
-
-            text, metadata = sm.read(name, lines=lines, since_cursor=since_cursor)
+            text, metadata = sm.read_with_offset(name, lines=capped_lines, offset=offset)
             text = _truncate_output(text, max_output_chars, "shell output")
-            info = f"[{metadata['mode']}] {metadata['lines_returned']} lines"
-            return f"{info}\n{text}"
-        except KeyError as e:
-            return f"Error: {e}"
-
-    @tool
-    def shell_close(name: str) -> str:
-        """Close a persistent terminal tab.
-
-        Kills the tab and its running processes. Default tabs (shell, claude-code)
-        cannot be closed — they persist for the entire job.
-
-        Args:
-            name: Tab name to close
-
-        Returns:
-            Confirmation message or error.
-
-        Example:
-            shell_close(name="gpu-box")
-            shell_close(name="dev-server")
-        """
-        try:
-            return sm.close_tab(name)
+            info = f"({metadata['mode']}) {metadata['lines_returned']}/{metadata['total_lines']} lines"
+            return f"{tab_header}\n{info}\n{text}"
         except (KeyError, ValueError) as e:
-            return f"Error: {e}"
+            try:
+                tab_header = sm.format_tab_header()
+            except Exception:
+                tab_header = "[Shells: ?]"
+            return f"{tab_header}\nError: {e}"
 
-    @tool
-    def shell_list() -> str:
-        """List all open terminal tabs with their status.
-
-        Returns a summary of all tabs including type, activity time,
-        and whether they can be closed.
-
-        Returns:
-            Formatted tab list.
-        """
-        tabs = sm.list_tabs()
-        if not tabs:
-            return "No open tabs"
-
-        lines = []
-        for t in tabs:
-            closeable = "" if t["closeable"] else " (permanent)"
-            lines.append(f"  {t['name']} ({t['type']}){closeable}")
-        return f"{len(tabs)} open tabs:\n" + "\n".join(lines)
-
-    @tool
-    def shell(
-        command: str,
-        tab: str = "shell",
-        timeout: int = 120,
-        working_dir: Optional[str] = None,
-    ) -> str:
-        """Execute a command in a persistent terminal tab and return output.
-
-        Runs the command synchronously in the named tab. The tab preserves state
-        between calls — environment variables, virtual environments, working
-        directory, and command history all persist.
-
-        Args:
-            command: Shell command to execute (e.g., "pytest tests/ -x",
-                     "npm test", "git status", "pip install pandas")
-            tab: Terminal tab to run in (default "shell"). Must be a shell-type
-                 tab. Use shell_open to create new tabs, shell_list to see all tabs.
-            timeout: Maximum execution time in seconds (default 120, max 600).
-            working_dir: Subdirectory to run in (relative to workspace when
-                         sandbox is enabled). Restores original directory after.
-
-        Returns:
-            Structured output with exit code and stdout.
-
-        Example:
-            shell(command="pytest tests/ -x")
-            shell(command="npm test", working_dir="cockpit")
-            shell(command="nvidia-smi", tab="gpu-box")
-        """
-        try:
-            output = sm.run_sync(command, timeout=timeout, working_dir=working_dir, tab_name=tab)
-            return _truncate_output(output, max_output_chars, "output")
-        except (ValueError, KeyError, TimeoutError) as e:
-            return f"Error: {e}"
-
-    return [shell, shell_open, shell_send, shell_read, shell_close, shell_list]
+    return [shell_execute, shell_read]

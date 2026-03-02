@@ -101,12 +101,11 @@ tools:
   mongodb: []
   # Coding tools - persistent terminal sessions (src/tools/coding/)
   coding:
-    - shell          # Synchronous command execution in a persistent tab (requires tmux)
-    - shell_open
-    - shell_send
-    - shell_read
-    - shell_close
-    - shell_list
+    - shell_execute   # Execute commands/keystrokes in persistent tabs (requires tmux)
+    - shell_read      # Read output history from persistent tabs
+  # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
+  # Enable in critic config to give reviewer agents approve/return capabilities.
+  evaluation: []
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -175,6 +174,13 @@ memory:
   dedup_threshold: 0.92            # Cosine similarity threshold for dedup
   storage: postgres                # Only option for v1
 
+# Verification — auto-spawn a critic job after job_complete to review deliverables.
+# The critic either approves the job or resumes it with feedback.
+# See docs/features/verification_phase.md for full design.
+verification:
+  enabled: false         # Opt-in: spawn a critic job after job_complete
+  critic_config: critic  # Which expert config to use for the reviewer
+
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent
 autonomy: review
@@ -185,21 +191,17 @@ browser:
   timeout: 60000  # Milliseconds
   use_vision: false  # DOM-based by default (works with any LLM)
 
-# Claude Code delegation settings (used when claude_code tool is enabled)
+# Claude Code delegation settings (model for auto-started claude-code shell tab)
 claude_code:
-  model: claude-opus-4-6   # Model for Claude Code sessions
-  effort_level: high        # Reasoning effort: low, medium, high
+  model: claude-opus-4-6
 
 # Persistent shell sessions (tmux-backed terminal multiplexer)
 # Requires tmux installed.
 shell:
-  max_tabs: 6                  # Maximum concurrent terminal tabs
-  inject_lines_per_tab: 30    # Lines of output shown per tab in context injection
   max_read_lines: 200          # Maximum lines shell_read can return
   scrollback_limit: 5000       # Tmux history-limit per pane
-  default_timeout: 120         # Default timeout for shell tool (seconds)
-  idle_timeout: 1800           # Seconds before a tab is considered idle in injection
+  default_timeout: 120         # Default timeout for shell_execute sync mode (seconds)
   blocked_commands: [sudo, reboot, shutdown, poweroff, halt, init, systemctl]
   sandbox: true                # Restrict working directory to workspace
-  auto_start_claude_code: true # Auto-open Claude Code tab when claude_code tool is enabled
+  auto_start_claude_code: false # Auto-open a Claude Code tab on job start (requires claude CLI)
 
