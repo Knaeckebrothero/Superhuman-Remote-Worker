@@ -198,6 +198,7 @@ claude_code:
 # Persistent shell sessions (tmux-backed terminal multiplexer)
 # Requires tmux installed.
 shell:
+  max_tabs: 15                   # Maximum number of concurrent shell tabs
   max_read_lines: 200          # Maximum lines shell_read can return
   scrollback_limit: 5000       # Tmux history-limit per pane
   default_timeout: 120         # Default timeout for shell_execute sync mode (seconds)

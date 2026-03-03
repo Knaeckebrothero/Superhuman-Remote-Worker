@@ -355,3 +355,8 @@ class JobResumeRequest(BaseModel):
         default=None,
         description="Resolved datasource connection details (set by orchestrator)",
     )
+    previous_status: Optional[str] = Field(
+        default=None,
+        description="Job status before resume. Graceful stops (cancelled, paused, pending_review) "
+                    "skip snapshot recovery; crashes (processing, failed) use snapshot recovery.",
+    )

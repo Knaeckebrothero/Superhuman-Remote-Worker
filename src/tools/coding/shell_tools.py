@@ -27,15 +27,15 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "shell_execute": {
         "module": "coding.shell_tools",
         "function": "shell_execute",
-        "description": "Execute a command or send keystrokes in a persistent terminal tab",
+        "description": "Execute a command or send keystrokes in an independent persistent terminal tab",
         "category": "coding",
-        "short_description": "Run commands in a persistent terminal.",
+        "short_description": "Run commands in a persistent terminal tab.",
         "phases": ["strategic", "tactical"],
     },
     "shell_read": {
         "module": "coding.shell_tools",
         "function": "shell_read",
-        "description": "Read output from a persistent terminal tab with offset support",
+        "description": "Read scrollback output from a persistent terminal tab",
         "category": "coding",
         "short_description": "Read output from a terminal tab.",
         "phases": ["strategic", "tactical"],
@@ -111,37 +111,58 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
         is_async: bool = False,
         keys: bool = False,
     ) -> str:
-        """Execute a command or send keystrokes in a persistent terminal.
+        """Execute a command or send keystrokes in a persistent terminal tab.
 
-        Runs commands in named shells that persist across calls. Environment
-        variables, virtualenvs, working directory, and history are preserved.
-        If the named shell doesn't exist, it is auto-created.
+        Each tab is an independent shell with its own PTY (like a terminal
+        window). Tabs auto-create on first use and persist between calls —
+        environment, working directory, virtualenvs, and history all survive.
+        You can SSH in one tab while running local commands in another.
+
+        IMPORTANT: Never write paramiko, fabric, pexpect, or subprocess SSH
+        scripts. Every tab is a real terminal — just use ssh/scp/rsync directly.
+
+        Modes:
+          Default (sync): Runs the command and waits for it to finish. Returns
+              exit code + stdout. If the command hits an interactive prompt
+              (password, y/n, host key, etc.), it returns early with the prompt
+              text so you can respond with keys=True. After responding, the tab
+              works normally for subsequent commands.
+          keys=True: Send raw keystrokes — passwords, "C-c", "Enter", "Up",
+              "y", etc. No Enter is appended; send "Enter" separately if needed.
+          is_async=True: Fire-and-forget. Returns immediately without waiting.
+              ONLY for long-running background processes (dev servers, builds,
+              VPN connections). Use shell_read() later to check progress.
+
+        SSH workflow (use sync mode, not is_async):
+          1. shell_execute(command="ssh user@host", name="srv")
+               → detects password prompt, returns terminal state
+          2. shell_execute(command="the_password", name="srv", keys=True)
+             shell_execute(command="Enter", name="srv", keys=True)
+               → password sent, SSH connects
+          3. shell_execute(command="hostname", name="srv")
+               → runs on the remote host via sync mode (returns exit code)
+          4. shell_execute(command="exit", name="srv", keys=True)
+               → closes SSH session, tab returns to local shell
 
         Args:
-            command: Command to execute, or special key name when keys=True.
-                     Special keys: "Up", "Down", "Left", "Right", "Enter",
-                     "Tab", "Escape", "C-c", "C-d", "C-z", "C-l".
-            name: Shell name (default "default"). Auto-creates if it doesn't
-                  exist. Use descriptive names like "gpu-box", "dev-server".
-            tail: Number of output lines to return from the end (default 30).
-                  Increase for verbose commands (e.g. test suites, builds).
-            is_async: If true, send command without waiting for completion
-                      and return whatever output appeared after ~0.5s.
-                      Use for long-running processes like dev servers.
-                      Default false (waits for command to finish).
-            keys: If true, treat command as special keystrokes sent via tmux
-                  (e.g. "C-c" to interrupt, "Up" for history). No Enter is
-                  appended automatically. Default false.
+            command: Shell command to run, or keystroke when keys=True.
+                Keys: "C-c", "C-d", "C-z", "C-l", "Up", "Down", "Enter",
+                "Tab", "Escape", or literal text (passwords, "yes", "y").
+            name: Tab name (auto-created if new). Lowercase + hyphens, max 20
+                chars. Use descriptive names: "gpu-box", "build", "db-server".
+            tail: Max stdout lines to return (default 30). Increase for
+                verbose output (test suites, builds, logs).
+            is_async: Don't wait for completion — return immediately. Only for
+                long-running background processes. NOT needed for SSH.
+            keys: Send raw keystrokes instead of executing a command.
 
         Returns:
-            Tab header + command output with exit code (sync mode),
-            or tab header + partial output (async/keys mode).
+            [Shells: tab1 | tab2 | ...] header + command output.
 
-        Example:
+        Examples:
             shell_execute(command="pytest tests/ -x")
-            shell_execute(command="npm run dev", name="dev-server", is_async=True)
-            shell_execute(command="C-c", name="dev-server", keys=True)
-            shell_execute(command="exit", name="dev-server")
+            shell_execute(command="npm run dev", name="dev", is_async=True)
+            shell_execute(command="C-c", name="dev", keys=True)
         """
         try:
             # Ensure tab exists (auto-create if needed)
@@ -187,23 +208,24 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
     ) -> str:
         """Read output from a persistent terminal tab.
 
-        Returns terminal output from the named shell. Use offset to read
-        from a specific position in the scrollback (like reading a file),
-        or omit offset to read from the end (tail behavior).
+        Returns terminal scrollback from the named tab. Use after is_async
+        commands to check on long-running processes, or to inspect a tab's
+        full history. Omit offset to read from the end (tail), or set
+        offset=0 to read from the start like a file.
 
         Args:
-            name: Shell name (default "default").
-            offset: Line position to start reading from (0 = start of
-                    scrollback buffer). If omitted, reads from the end.
+            name: Tab name (default "default").
+            offset: Line position to start from (0 = start of scrollback).
+                If omitted, reads from the end (tail behavior).
             lines: Number of lines to return (default 30, max 200).
 
         Returns:
             Tab header + terminal output with line count metadata.
 
-        Example:
-            shell_read()
-            shell_read(name="dev-server", lines=100)
-            shell_read(offset=0, lines=50)
+        Examples:
+            shell_read()                             # tail of default tab
+            shell_read(name="build", lines=100)      # last 100 lines of build
+            shell_read(name="srv", offset=0, lines=50)  # first 50 lines
         """
         try:
             capped_lines = min(lines, max_read_lines)

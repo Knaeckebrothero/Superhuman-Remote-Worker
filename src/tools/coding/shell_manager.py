@@ -110,6 +110,7 @@ class ShellManager:
     def __init__(
         self,
         job_id: str,
+        max_tabs: int = 15,
         scrollback_limit: int = 5000,
         default_timeout: int = 120,
         blocked_commands: Optional[List[str]] = None,
@@ -121,6 +122,7 @@ class ShellManager:
 
         Args:
             job_id: Unique job identifier (used in session name)
+            max_tabs: Maximum number of concurrent shell tabs
             scrollback_limit: Tmux history-limit per pane
             default_timeout: Default timeout for run_sync in seconds
             blocked_commands: Commands to block (None = use defaults)
@@ -129,6 +131,7 @@ class ShellManager:
             claude_code_model: Model for Claude Code session
         """
         self.job_id = job_id
+        self.max_tabs = max_tabs
         self.scrollback_limit = scrollback_limit
         self.default_timeout = default_timeout
         self.sandbox_cwd = sandbox_cwd
@@ -252,6 +255,14 @@ class ShellManager:
 
         if name in self._tabs:
             raise ValueError(f"Tab '{name}' already exists")
+
+        if len(self._tabs) >= self.max_tabs:
+            tab_names = ", ".join(self._tabs.keys())
+            raise ValueError(
+                f"Maximum tabs ({self.max_tabs}) reached. Close unused tabs first: "
+                f"shell_execute(command='exit', name='<tab>') — repeat until the tab closes. "
+                f"Open tabs: {tab_names}"
+            )
 
         # Auto-detect type from command
         if tab_type is None:
@@ -526,7 +537,7 @@ class ShellManager:
                     ln for ln in pre_check_lines if ln.strip()
                 ][-30:]
                 terminal_state = "\n".join(state_lines) or "(empty)"
-                logger.info(
+                logger.debug(
                     f"Tab '{tab_name}' is already blocked by "
                     f"{existing_prompt} — command not sent: {command}"
                 )
@@ -616,7 +627,7 @@ class ShellManager:
                         terminal_state = self._capture_terminal_state(
                             tab, sentinel, pre_count
                         )
-                        logger.info(
+                        logger.debug(
                             f"Interactive prompt detected ({prompt_type}) "
                             f"after {elapsed:.1f}s for: {command}"
                         )
@@ -644,7 +655,7 @@ class ShellManager:
                             terminal_state = self._capture_terminal_state(
                                 tab, sentinel, pre_count
                             )
-                            logger.info(
+                            logger.debug(
                                 f"Output stall detected after {elapsed:.1f}s "
                                 f"for: {command}"
                             )

@@ -294,6 +294,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "config_name": job.get("config_name", "default"),
             "config_override": config_override,
             "datasources": datasources_payload,
+            "previous_status": job.get("status"),
         }
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
@@ -1303,6 +1304,7 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             "config_upload_id": job_context.get("config_upload_id") if job_context else None,
             "config_override": config_override,
             "datasources": datasources_payload,
+            "previous_status": job["status"],
         }
         if request and request.feedback:
             resume_payload["feedback"] = request.feedback
