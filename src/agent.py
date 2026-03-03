@@ -281,6 +281,7 @@ class UniversalAgent:
         resume: bool = False,
         feedback: Optional[str] = None,
         original_config_name: Optional[str] = None,
+        previous_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Process a single job.
 
@@ -295,6 +296,9 @@ class UniversalAgent:
             feedback: Optional feedback message to inject when resuming a frozen job
             original_config_name: Original config name used when job was created
                 (for legacy checkpoint lookup when resuming old jobs)
+            previous_status: Job status before resume. Graceful stops (cancelled,
+                paused, pending_review) skip snapshot recovery; crash states
+                (processing, failed, None) use snapshot recovery.
 
         Returns:
             Final state dictionary with results
@@ -388,100 +392,40 @@ class UniversalAgent:
                 "recursion_limit": 1000000,  # Effectively unlimited
             }
 
-            # Check if we should resume from phase snapshot or start fresh
-            # When resuming, use the last completed phase snapshot (more reliable than raw checkpoint)
+            # Check if we should resume from phase snapshot or use checkpoint directly
+            # Graceful stops (cancel/pause/review) have a valid checkpoint.db with current todos,
+            # so we skip snapshot recovery. Crash states need snapshot recovery because the
+            # checkpoint may be corrupted or incomplete.
+            GRACEFUL_STOP_STATUSES = {"cancelled", "paused", "pending_review"}
             graph_input = None
             if resume:
-                # Try to recover from the last completed phase snapshot
-                latest_snapshot = snapshot_manager.get_latest_snapshot()
-                if latest_snapshot:
+                is_graceful = previous_status in GRACEFUL_STOP_STATUSES
+                if is_graceful:
                     logger.info(
-                        f"Resuming from phase {latest_snapshot.phase_number} snapshot "
-                        f"(iteration={latest_snapshot.iteration})"
+                        f"Graceful resume from '{previous_status}' — using checkpoint directly "
+                        f"(skipping snapshot recovery to preserve in-progress todos)"
                     )
-                    # Recover workspace files and checkpoint from snapshot
-                    if snapshot_manager.recover_to_phase(latest_snapshot.phase_number):
-                        # Delete any stale snapshots from failed runs after this phase
-                        deleted = snapshot_manager.delete_snapshots_after(latest_snapshot.phase_number)
-                        if deleted:
-                            logger.info(f"Deleted {deleted} stale snapshot(s) after phase {latest_snapshot.phase_number}")
-
-                        # Determine the correct thread_id for checkpoint lookup
-                        # Priority: 1) snapshot.thread_id, 2) discover from checkpoint DB, 3) try known formats
-                        discovered_thread_id = None
-
-                        if latest_snapshot.thread_id:
-                            # Snapshot has thread_id stored (new snapshots)
-                            discovered_thread_id = latest_snapshot.thread_id
-                            logger.info(f"Using thread_id from snapshot: {discovered_thread_id}")
-                        else:
-                            # Old snapshot without thread_id - discover from checkpoint DB
-                            from .core.phase_snapshot import discover_thread_id_from_checkpoint
-                            checkpoint_path = self._get_checkpoint_path(job_id)
-                            discovered_thread_id = discover_thread_id_from_checkpoint(checkpoint_path, job_id)
-                            if discovered_thread_id:
-                                logger.info(f"Discovered thread_id from checkpoint: {discovered_thread_id}")
-
-                        if discovered_thread_id:
-                            thread_id = discovered_thread_id
-                            thread_config = {
-                                "configurable": {"thread_id": thread_id},
-                                "recursion_limit": 1000000,
-                            }
-                            # Verify checkpoint exists with this thread_id
-                            checkpoint_state = await self._graph.aget_state(thread_config)
-                            if checkpoint_state and checkpoint_state.values:
-                                logger.info(f"Found checkpoint with thread_id: {thread_id}")
-                                # graph_input stays None to continue from checkpoint
-                            else:
-                                logger.warning(f"Discovered thread_id {thread_id} has no checkpoint data, starting fresh")
-                                graph_input = create_initial_state(
-                                    job_id=job_id,
-                                    workspace_path=str(self._workspace_manager.path),
-                                    metadata=updated_metadata,
-                                )
-                        else:
-                            # Fallback: try new format then legacy format
-                            checkpoint_state = await self._graph.aget_state(thread_config)
-                            if checkpoint_state and checkpoint_state.values:
-                                logger.debug(f"Found checkpoint with new thread_id format: {job_id}")
-                            else:
-                                # Try legacy format
-                                legacy_config_name = original_config_name or self.config.agent_id
-                                legacy_thread_id = f"{legacy_config_name}_{job_id}"
-                                legacy_config = {
-                                    "configurable": {"thread_id": legacy_thread_id},
-                                    "recursion_limit": 1000000,
-                                }
-                                legacy_state = await self._graph.aget_state(legacy_config)
-                                if legacy_state and legacy_state.values:
-                                    logger.info(f"Using legacy thread_id format: {legacy_thread_id}")
-                                    thread_config = legacy_config
-                                    thread_id = legacy_thread_id
-                                else:
-                                    logger.warning(
-                                        "No checkpoint found with any thread_id format, starting fresh"
-                                    )
-                                    graph_input = create_initial_state(
-                                        job_id=job_id,
-                                        workspace_path=str(self._workspace_manager.path),
-                                        metadata=updated_metadata,
-                                    )
-                    else:
+                    # Use checkpoint.db as-is — discover thread_id and verify checkpoint exists
+                    graph_input, thread_id, thread_config = await self._resume_from_checkpoint(
+                        job_id, thread_id, thread_config, original_config_name, updated_metadata
+                    )
+                    if graph_input is not None:
+                        # Checkpoint lookup failed — fall back to snapshot recovery
                         logger.warning(
-                            f"Failed to recover from phase {latest_snapshot.phase_number} snapshot, starting fresh"
+                            f"No valid checkpoint found for graceful resume from '{previous_status}', "
+                            f"falling back to snapshot recovery"
                         )
-                        graph_input = create_initial_state(
-                            job_id=job_id,
-                            workspace_path=str(self._workspace_manager.path),
-                            metadata=updated_metadata,
+                        graph_input, thread_id, thread_config = await self._resume_from_snapshot(
+                            job_id, snapshot_manager, thread_id, thread_config,
+                            original_config_name, updated_metadata,
                         )
                 else:
-                    logger.warning(f"No phase snapshots found for job {job_id}, starting fresh")
-                    graph_input = create_initial_state(
-                        job_id=job_id,
-                        workspace_path=str(self._workspace_manager.path),
-                        metadata=updated_metadata,
+                    # Crash/failure recovery — use snapshot (more reliable than potentially corrupted checkpoint)
+                    if previous_status:
+                        logger.info(f"Crash recovery from '{previous_status}' — using snapshot recovery")
+                    graph_input, thread_id, thread_config = await self._resume_from_snapshot(
+                        job_id, snapshot_manager, thread_id, thread_config,
+                        original_config_name, updated_metadata,
                     )
             else:
                 # Fresh start - create initial state
@@ -1284,6 +1228,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 cc_config = self.config.extra.get("claude_code", {})
                 shell_manager = ShellManager(
                     job_id=self._current_job_id,
+                    max_tabs=shell_config.get("max_tabs", 15),
                     scrollback_limit=shell_config.get("scrollback_limit", 5000),
                     default_timeout=shell_config.get("default_timeout", 120),
                     blocked_commands=shell_config.get("blocked_commands"),
@@ -1616,6 +1561,175 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Error closing {ds_type} datasource client: {e}")
         self._datasource_clients = {}
+
+    async def _resume_from_checkpoint(
+        self,
+        job_id: str,
+        thread_id: str,
+        thread_config: Dict[str, Any],
+        original_config_name: Optional[str],
+        updated_metadata: Dict[str, Any],
+    ) -> tuple:
+        """Resume using existing checkpoint.db directly (no snapshot recovery).
+
+        Used for graceful stops where the checkpoint has valid in-progress state.
+
+        Returns:
+            (graph_input, thread_id, thread_config) — graph_input is None on success
+            (meaning resume from checkpoint), or an initial state dict if no checkpoint found.
+        """
+        logger = logging.getLogger(__name__)
+        from .core.phase_snapshot import discover_thread_id_from_checkpoint
+
+        # Try to discover the correct thread_id from checkpoint DB
+        checkpoint_path = self._get_checkpoint_path(job_id)
+        discovered_thread_id = discover_thread_id_from_checkpoint(checkpoint_path, job_id)
+        if discovered_thread_id:
+            logger.info(f"Discovered thread_id from checkpoint: {discovered_thread_id}")
+            thread_id = discovered_thread_id
+            thread_config = {
+                "configurable": {"thread_id": thread_id},
+                "recursion_limit": 1000000,
+            }
+            checkpoint_state = await self._graph.aget_state(thread_config)
+            if checkpoint_state and checkpoint_state.values:
+                logger.info(f"Found checkpoint with thread_id: {thread_id}")
+                return None, thread_id, thread_config
+
+        # Fallback: try job_id as thread_id (new format)
+        checkpoint_state = await self._graph.aget_state(thread_config)
+        if checkpoint_state and checkpoint_state.values:
+            logger.debug(f"Found checkpoint with thread_id: {thread_id}")
+            return None, thread_id, thread_config
+
+        # Fallback: try legacy format
+        legacy_config_name = original_config_name or self.config.agent_id
+        legacy_thread_id = f"{legacy_config_name}_{job_id}"
+        legacy_config = {
+            "configurable": {"thread_id": legacy_thread_id},
+            "recursion_limit": 1000000,
+        }
+        legacy_state = await self._graph.aget_state(legacy_config)
+        if legacy_state and legacy_state.values:
+            logger.info(f"Using legacy thread_id format: {legacy_thread_id}")
+            return None, legacy_thread_id, legacy_config
+
+        # No checkpoint found — return initial state so caller can fall back
+        logger.warning("No checkpoint found with any thread_id format")
+        graph_input = create_initial_state(
+            job_id=job_id,
+            workspace_path=str(self._workspace_manager.path),
+            metadata=updated_metadata,
+        )
+        return graph_input, thread_id, thread_config
+
+    async def _resume_from_snapshot(
+        self,
+        job_id: str,
+        snapshot_manager,
+        thread_id: str,
+        thread_config: Dict[str, Any],
+        original_config_name: Optional[str],
+        updated_metadata: Dict[str, Any],
+    ) -> tuple:
+        """Resume using phase snapshot recovery (overwrites checkpoint.db).
+
+        Used for crash/failure recovery where the checkpoint may be corrupted.
+
+        Returns:
+            (graph_input, thread_id, thread_config) — graph_input is None on success
+            (meaning resume from checkpoint), or an initial state dict if recovery fails.
+        """
+        logger = logging.getLogger(__name__)
+
+        latest_snapshot = snapshot_manager.get_latest_snapshot()
+        if not latest_snapshot:
+            logger.warning(f"No phase snapshots found for job {job_id}, starting fresh")
+            graph_input = create_initial_state(
+                job_id=job_id,
+                workspace_path=str(self._workspace_manager.path),
+                metadata=updated_metadata,
+            )
+            return graph_input, thread_id, thread_config
+
+        logger.info(
+            f"Resuming from phase {latest_snapshot.phase_number} snapshot "
+            f"(iteration={latest_snapshot.iteration})"
+        )
+
+        if not snapshot_manager.recover_to_phase(latest_snapshot.phase_number):
+            logger.warning(
+                f"Failed to recover from phase {latest_snapshot.phase_number} snapshot, starting fresh"
+            )
+            graph_input = create_initial_state(
+                job_id=job_id,
+                workspace_path=str(self._workspace_manager.path),
+                metadata=updated_metadata,
+            )
+            return graph_input, thread_id, thread_config
+
+        # Delete any stale snapshots from failed runs after this phase
+        deleted = snapshot_manager.delete_snapshots_after(latest_snapshot.phase_number)
+        if deleted:
+            logger.info(f"Deleted {deleted} stale snapshot(s) after phase {latest_snapshot.phase_number}")
+
+        # Determine the correct thread_id for checkpoint lookup
+        # Priority: 1) snapshot.thread_id, 2) discover from checkpoint DB, 3) try known formats
+        discovered_thread_id = None
+
+        if latest_snapshot.thread_id:
+            discovered_thread_id = latest_snapshot.thread_id
+            logger.info(f"Using thread_id from snapshot: {discovered_thread_id}")
+        else:
+            from .core.phase_snapshot import discover_thread_id_from_checkpoint
+            checkpoint_path = self._get_checkpoint_path(job_id)
+            discovered_thread_id = discover_thread_id_from_checkpoint(checkpoint_path, job_id)
+            if discovered_thread_id:
+                logger.info(f"Discovered thread_id from checkpoint: {discovered_thread_id}")
+
+        if discovered_thread_id:
+            thread_id = discovered_thread_id
+            thread_config = {
+                "configurable": {"thread_id": thread_id},
+                "recursion_limit": 1000000,
+            }
+            checkpoint_state = await self._graph.aget_state(thread_config)
+            if checkpoint_state and checkpoint_state.values:
+                logger.info(f"Found checkpoint with thread_id: {thread_id}")
+                return None, thread_id, thread_config
+            else:
+                logger.warning(f"Discovered thread_id {thread_id} has no checkpoint data, starting fresh")
+                graph_input = create_initial_state(
+                    job_id=job_id,
+                    workspace_path=str(self._workspace_manager.path),
+                    metadata=updated_metadata,
+                )
+                return graph_input, thread_id, thread_config
+        else:
+            # Fallback: try new format then legacy format
+            checkpoint_state = await self._graph.aget_state(thread_config)
+            if checkpoint_state and checkpoint_state.values:
+                logger.debug(f"Found checkpoint with new thread_id format: {job_id}")
+                return None, thread_id, thread_config
+            else:
+                legacy_config_name = original_config_name or self.config.agent_id
+                legacy_thread_id = f"{legacy_config_name}_{job_id}"
+                legacy_config = {
+                    "configurable": {"thread_id": legacy_thread_id},
+                    "recursion_limit": 1000000,
+                }
+                legacy_state = await self._graph.aget_state(legacy_config)
+                if legacy_state and legacy_state.values:
+                    logger.info(f"Using legacy thread_id format: {legacy_thread_id}")
+                    return None, legacy_thread_id, legacy_config
+                else:
+                    logger.warning("No checkpoint found with any thread_id format, starting fresh")
+                    graph_input = create_initial_state(
+                        job_id=job_id,
+                        workspace_path=str(self._workspace_manager.path),
+                        metadata=updated_metadata,
+                    )
+                    return graph_input, thread_id, thread_config
 
     def _get_checkpoint_path(self, job_id: str) -> Path:
         """Get SQLite checkpoint file path for a job.

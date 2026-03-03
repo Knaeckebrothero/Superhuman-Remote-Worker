@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- Resolved config snapshot (frozen at job start for reproducibility)
     resolved_config JSONB DEFAULT NULL,
 
-    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review')),
+    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'paused', 'pending_review')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
 );
