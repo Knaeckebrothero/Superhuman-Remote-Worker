@@ -435,6 +435,21 @@ async def run_single_job(
     if requirement_data:
         metadata["requirement_data"] = requirement_data
 
+    # Query job status before resume (so process_job knows if this was a graceful stop)
+    previous_status = None
+    if resume and job_id:
+        try:
+            import uuid as _uuid
+            db = PostgresDB()
+            await db.connect()
+            job_record = await db.jobs.get(_uuid.UUID(job_id))
+            if job_record:
+                previous_status = job_record.get("status")
+                logger.info(f"Job {job_id} previous status: {previous_status}")
+            await db.close()
+        except Exception as e:
+            logger.warning(f"Could not query job status for resume (will use snapshot recovery): {e}")
+
     # Create and initialize agent (it will create its own DB connection)
     agent = UniversalAgent.from_config(config_path)
     await agent.initialize()
@@ -444,7 +459,10 @@ async def run_single_job(
         final_state = None
         # process_job returns an async generator when stream=True
         # We need to await the coroutine first to get the generator
-        streaming_gen = await agent.process_job(job_id, metadata, stream=True, resume=resume, feedback=feedback)
+        streaming_gen = await agent.process_job(
+            job_id, metadata, stream=True, resume=resume, feedback=feedback,
+            previous_status=previous_status,
+        )
         async for state in streaming_gen:
             final_state = state
             # Print streaming updates

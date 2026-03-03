@@ -511,6 +511,12 @@
       "type": "object",
       "description": "Persistent shell session settings (tmux-backed terminal multiplexer). Requires tmux installed.",
       "properties": {
+        "max_tabs": {
+          "type": "integer",
+          "minimum": 2,
+          "default": 15,
+          "description": "Maximum number of concurrent shell tabs. Agent must close tabs before opening new ones when limit is reached."
+        },
         "max_read_lines": {
           "type": "integer",
           "minimum": 1,

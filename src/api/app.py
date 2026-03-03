@@ -1081,6 +1081,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         # Capture for closure
         feedback = request.feedback
         config_name = request.config_name
+        previous_status = request.previous_status
 
         # Build metadata with config info for resume
         resume_metadata = {}
@@ -1105,6 +1106,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     resume=True,
                     feedback=feedback,
                     original_config_name=config_name,
+                    previous_status=previous_status,
                     stream=True,
                 )
                 async for state in streaming_gen:

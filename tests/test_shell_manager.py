@@ -25,6 +25,7 @@ def manager():
     job_id = str(uuid.uuid4())
     sm = ShellManager(
         job_id=job_id,
+        max_tabs=4,
         scrollback_limit=1000,
         default_timeout=10,
     )
@@ -80,6 +81,47 @@ class TestTabLifecycle:
         manager.open_tab("my-tab")
         with pytest.raises(ValueError, match="already exists"):
             manager.open_tab("my-tab")
+
+
+class TestMaxTabs:
+    """Tests for max_tabs limit enforcement."""
+
+    def test_max_tabs_enforced(self, manager):
+        """Opening tabs beyond the limit raises ValueError."""
+        # manager fixture has max_tabs=4, default tab already uses 1 slot
+        manager.open_tab("tab-1")
+        manager.open_tab("tab-2")
+        manager.open_tab("tab-3")
+        assert len(manager.list_tabs()) == 4
+
+        with pytest.raises(ValueError, match="Maximum tabs") as exc_info:
+            manager.open_tab("tab-4")
+        assert "Close unused tabs first" in str(exc_info.value)
+        assert "default" in str(exc_info.value)  # lists open tabs
+
+    def test_can_open_after_closing(self, manager):
+        """After closing a tab, a new one can be opened within the limit."""
+        manager.open_tab("tab-1")
+        manager.open_tab("tab-2")
+        manager.open_tab("tab-3")
+        assert len(manager.list_tabs()) == 4
+
+        manager.close_tab("tab-2")
+        assert len(manager.list_tabs()) == 3
+
+        # Should succeed now
+        result = manager.open_tab("tab-new")
+        assert result["name"] == "tab-new"
+        assert len(manager.list_tabs()) == 4
+
+    def test_ensure_tab_respects_limit(self, manager):
+        """ensure_tab should also fail when the limit is reached."""
+        manager.open_tab("tab-1")
+        manager.open_tab("tab-2")
+        manager.open_tab("tab-3")
+
+        with pytest.raises(ValueError, match="Maximum tabs"):
+            manager.ensure_tab("tab-4")
 
 
 class TestEnsureTab:
