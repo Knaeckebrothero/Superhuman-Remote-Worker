@@ -106,6 +106,7 @@ export interface JobSummary {
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;
+  priority?: number;
   created_at: string;
   audit_count?: number | null;
 }

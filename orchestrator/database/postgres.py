@@ -466,7 +466,8 @@ class PostgresDB:
                 f"""
                 SELECT id, description, status, creator_status, validator_status,
                        config_name, assigned_agent_id, user_id,
-                       project_id, parent_job_id, branch_name, merge_status, created_at
+                       project_id, parent_job_id, priority,
+                       branch_name, merge_status, created_at
                 FROM jobs
                 {where_clause}
                 ORDER BY created_at DESC
@@ -497,7 +498,8 @@ class PostgresDB:
                 SELECT id, status, creator_status, validator_status,
                        config_name, config_override, resolved_config,
                        assigned_agent_id, user_id,
-                       project_id, parent_job_id, branch_name, merge_status, repo_merge_statuses,
+                       project_id, parent_job_id, priority,
+                       branch_name, merge_status, repo_merge_statuses,
                        created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1
@@ -519,6 +521,7 @@ class PostgresDB:
         project_id: str | None = None,
         branch_name: str | None = None,
         parent_job_id: str | None = None,
+        priority: int = 5,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -533,6 +536,7 @@ class PostgresDB:
             project_id: Optional project UUID this job belongs to
             branch_name: Optional git branch name for this job
             parent_job_id: Optional parent job UUID (for verification/follow-up jobs)
+            priority: Job priority (0=low, 5=normal, 10=high). Default: 5
 
         Returns:
             Created job dict with id
@@ -544,9 +548,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name, parent_job_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, branch_name, created_at, updated_at, description
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name, parent_job_id, priority)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, created_at, updated_at, description
                 """,
                 description,
                 document_path or document_dir,
@@ -560,6 +564,7 @@ class PostgresDB:
                 project_uuid,
                 branch_name,
                 parent_uuid,
+                priority,
             )
 
         return dict(row)
@@ -589,6 +594,8 @@ class PostgresDB:
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a job by setting its status to 'cancelled'.
 
+        Clears assigned_agent_id so the agent is no longer associated with this job.
+
         Args:
             job_id: Job UUID as string
 
@@ -605,8 +612,40 @@ class PostgresDB:
                 """
                 UPDATE jobs
                 SET status = 'cancelled',
+                    assigned_agent_id = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1 AND status NOT IN ('completed', 'cancelled')
+                """,
+                uuid_val,
+            )
+
+        return result == "UPDATE 1"
+
+    async def pause_job(self, job_id: str) -> bool:
+        """Pause a running job. Clears assigned_agent_id so the agent is freed.
+
+        The job enters 'paused' status and will be auto-resumed by the dispatcher
+        when an agent becomes available.
+
+        Args:
+            job_id: Job UUID as string
+
+        Returns:
+            True if paused, False if not found or not in a pausable state
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'paused',
+                    assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND status = 'processing'
                 """,
                 uuid_val,
             )
@@ -1122,8 +1161,12 @@ class PostgresDB:
         status: str,
         current_job_id: str | None = None,
         metrics: Dict[str, Any] | None = None,
-    ) -> bool:
+    ) -> Dict[str, Any] | None:
         """Update agent heartbeat and status.
+
+        Detects working → ready transitions and sets last_completed_at for
+        dispatch cooldown (but not after a pause — paused jobs clear the agent
+        before the heartbeat fires).
 
         Args:
             agent_id: Agent UUID
@@ -1132,25 +1175,42 @@ class PostgresDB:
             metrics: Optional metrics dict to merge into metadata
 
         Returns:
-            True if update successful, False if agent not found
+            Dict with previous status (for transition detection) or None if not found
         """
         try:
             uuid_val = UUID(agent_id)
         except ValueError:
-            return False
+            return None
 
         job_uuid = UUID(current_job_id) if current_job_id else None
 
         async with self.acquire() as conn:
+            # Fetch previous status for transition detection
+            prev = await conn.fetchrow(
+                "SELECT status FROM agents WHERE id = $1",
+                uuid_val,
+            )
+            if not prev:
+                return None
+
+            prev_status = prev["status"]
+
+            # Set last_completed_at when transitioning from working → ready/completed
+            # This enables the dispatch cooldown (30s before next job assignment)
+            set_completed = (
+                prev_status == "working"
+                and status in ("ready", "completed")
+            )
+
             if metrics:
-                # Merge metrics into metadata
                 result = await conn.execute(
-                    """
+                    f"""
                     UPDATE agents
                     SET status = $1,
                         current_job_id = $2,
                         last_heartbeat = CURRENT_TIMESTAMP,
                         metadata = metadata || $3::jsonb
+                        {"  , last_completed_at = CURRENT_TIMESTAMP" if set_completed else ""}
                     WHERE id = $4
                     """,
                     status,
@@ -1160,11 +1220,12 @@ class PostgresDB:
                 )
             else:
                 result = await conn.execute(
-                    """
+                    f"""
                     UPDATE agents
                     SET status = $1,
                         current_job_id = $2,
                         last_heartbeat = CURRENT_TIMESTAMP
+                        {"  , last_completed_at = CURRENT_TIMESTAMP" if set_completed else ""}
                     WHERE id = $3
                     """,
                     status,
@@ -1172,7 +1233,10 @@ class PostgresDB:
                     uuid_val,
                 )
 
-            return result == "UPDATE 1"
+            if result != "UPDATE 1":
+                return None
+
+            return {"previous_status": prev_status}
 
     async def list_agents(
         self,
@@ -1193,7 +1257,8 @@ class PostgresDB:
                 rows = await conn.fetch(
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
-                           status, current_job_id, registered_at, last_heartbeat, metadata
+                           status, current_job_id, registered_at, last_heartbeat,
+                           last_completed_at, metadata
                     FROM agents
                     WHERE status = $1
                     ORDER BY last_heartbeat DESC
@@ -1206,7 +1271,8 @@ class PostgresDB:
                 rows = await conn.fetch(
                     """
                     SELECT id, config_name, hostname, pod_ip, pod_port, pid,
-                           status, current_job_id, registered_at, last_heartbeat, metadata
+                           status, current_job_id, registered_at, last_heartbeat,
+                           last_completed_at, metadata
                     FROM agents
                     ORDER BY last_heartbeat DESC
                     LIMIT $1
@@ -1299,6 +1365,97 @@ class PostgresDB:
             List of ready agent dicts
         """
         return await self.list_agents(status="ready")
+
+    # =========================================================================
+    # DISPATCHER QUERIES (Auto-Assignment)
+    # =========================================================================
+
+    async def get_dispatchable_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get jobs waiting for assignment, ordered by priority then creation time.
+
+        Returns jobs in 'created' (new) or 'paused' (preempted) status
+        that have no assigned agent.
+
+        Args:
+            limit: Maximum jobs to return
+
+        Returns:
+            List of job dicts ordered by priority DESC, created_at ASC
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, description, status, config_name, config_override,
+                       assigned_agent_id, user_id, project_id, parent_job_id,
+                       priority, branch_name, context, created_at
+                FROM jobs
+                WHERE status IN ('created', 'paused')
+                  AND assigned_agent_id IS NULL
+                ORDER BY priority DESC, created_at ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_available_agents(
+        self,
+        limit: int = 20,
+        cooldown_seconds: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """Get agents available for job assignment.
+
+        Returns agents with status='ready' that have passed the cooldown period
+        since their last job completion.
+
+        Args:
+            limit: Maximum agents to return
+            cooldown_seconds: Seconds to wait after last job completion
+
+        Returns:
+            List of agent dicts
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, config_name, hostname, pod_ip, pod_port, pid,
+                       status, current_job_id, registered_at, last_heartbeat,
+                       last_completed_at, metadata
+                FROM agents
+                WHERE status = 'ready'
+                  AND (last_completed_at IS NULL
+                       OR NOW() - last_completed_at >= make_interval(secs => $1))
+                ORDER BY last_heartbeat DESC
+                LIMIT $2
+                """,
+                float(cooldown_seconds),
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def get_preemption_candidates(self) -> List[Dict[str, Any]]:
+        """Get running jobs ordered by priority ASC (lowest priority first).
+
+        These are candidates for preemption when a higher-priority job needs
+        an agent. Only returns jobs with an assigned agent.
+
+        Returns:
+            List of job dicts with their assigned agent info, lowest priority first
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT j.id, j.description, j.status, j.config_name,
+                       j.priority, j.assigned_agent_id, j.created_at,
+                       a.pod_ip, a.pod_port, a.hostname AS agent_hostname
+                FROM jobs j
+                JOIN agents a ON j.assigned_agent_id = a.id
+                WHERE j.status = 'processing'
+                  AND j.assigned_agent_id IS NOT NULL
+                ORDER BY j.priority ASC, j.created_at DESC
+                """,
+            )
+        return [dict(row) for row in rows]
 
     # =========================================================================
     # DATASOURCE OPERATIONS

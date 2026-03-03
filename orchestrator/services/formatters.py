@@ -25,10 +25,13 @@ def format_jobs(jobs: list[dict[str, Any]]) -> str:
     lines = [f"Found {len(jobs)} job(s):\n"]
     for job in jobs:
         status_icon = {
-            "pending": "⏳",
-            "running": "🔄",
+            "created": "📝",
+            "processing": "🔄",
+            "paused": "⏸",
+            "pending_review": "👁",
             "completed": "✅",
             "failed": "❌",
+            "cancelled": "⛔",
         }.get(job.get("status", ""), "❓")
 
         lines.append(
@@ -65,6 +68,59 @@ def format_job_detail(job: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_audit_entry(entry: dict[str, Any]) -> str:
+    """Format a single audit entry into a one-line summary."""
+    step_type = entry.get("step_type", "unknown")
+    step_num = entry.get("step_number", "?")
+    timestamp = entry.get("timestamp", "")
+
+    if step_type == "llm":
+        llm = entry.get("llm", {})
+        request_id = llm.get("request_id")
+        model = llm.get("model", "")
+        preview = llm.get("response_content_preview", "") or ""
+        tool_calls = llm.get("tool_calls") or []
+
+        header = f"[{step_num}] LLM ({model})"
+        if request_id:
+            header += f" doc_id={request_id}"
+        if tool_calls:
+            tool_names = [tc.get("name", "?") for tc in tool_calls]
+            header += f" -> {', '.join(tool_names)}"
+        elif preview:
+            text = preview[:200]
+            if len(preview) > 200:
+                text += "..."
+            header += f": {text}"
+        return header
+
+    elif step_type == "tool":
+        tool = entry.get("tool", {})
+        tool_name = tool.get("name", "unknown")
+        result_preview = tool.get("result_preview")
+        success = tool.get("success")
+
+        if result_preview is not None:
+            result = str(result_preview)[:150]
+            if len(str(result_preview)) > 150:
+                result += "..."
+            status = "ok" if success else "FAIL"
+            return f"[{step_num}] Tool [{status}] {tool_name}: {result}"
+        else:
+            args = tool.get("arguments", {})
+            args_preview = json.dumps(args)[:100]
+            if len(json.dumps(args)) > 100:
+                args_preview += "..."
+            return f"[{step_num}] Tool Call: {tool_name}({args_preview})"
+
+    elif step_type == "error":
+        error = entry.get("error", "Unknown error")
+        return f"[{step_num}] ERROR: {error}"
+
+    else:
+        return f"[{step_num}] {step_type}: {timestamp}"
+
+
 def format_audit(audit: dict[str, Any]) -> str:
     """Format audit trail entries."""
     entries = audit.get("entries", [])
@@ -83,62 +139,76 @@ def format_audit(audit: dict[str, Any]) -> str:
     ]
 
     for entry in entries:
-        step_type = entry.get("step_type", "unknown")
-        step_num = entry.get("step_number", "?")
-        timestamp = entry.get("timestamp", "")
-
-        if step_type == "llm":
-            llm = entry.get("llm", {})
-            request_id = llm.get("request_id")
-            model = llm.get("model", "")
-            preview = llm.get("response_content_preview", "") or ""
-            tool_calls = llm.get("tool_calls") or []
-
-            header = f"[{step_num}] LLM ({model})"
-            if request_id:
-                header += f" doc_id={request_id}"
-            if tool_calls:
-                tool_names = [tc.get("name", "?") for tc in tool_calls]
-                header += f" -> {', '.join(tool_names)}"
-            elif preview:
-                text = preview[:200]
-                if len(preview) > 200:
-                    text += "..."
-                header += f": {text}"
-            lines.append(header)
-
-        elif step_type == "tool":
-            tool = entry.get("tool", {})
-            tool_name = tool.get("name", "unknown")
-            result_preview = tool.get("result_preview")
-            success = tool.get("success")
-
-            if result_preview is not None:
-                result = str(result_preview)[:150]
-                if len(str(result_preview)) > 150:
-                    result += "..."
-                status = "ok" if success else "FAIL"
-                lines.append(
-                    f"[{step_num}] Tool [{status}] {tool_name}: {result}"
-                )
-            else:
-                args = tool.get("arguments", {})
-                args_preview = json.dumps(args)[:100]
-                if len(json.dumps(args)) > 100:
-                    args_preview += "..."
-                lines.append(f"[{step_num}] Tool Call: {tool_name}({args_preview})")
-
-        elif step_type == "error":
-            error = entry.get("error", "Unknown error")
-            lines.append(f"[{step_num}] ERROR: {error}")
-
-        else:
-            lines.append(f"[{step_num}] {step_type}: {timestamp}")
+        lines.append(_format_audit_entry(entry))
 
     if has_more:
         lines.append(f"\n... more entries available (use page={page + 1})")
 
     return "\n".join(lines)
+
+
+def format_audit_bulk(data: dict[str, Any]) -> str:
+    """Format bulk audit entries (offset/limit based)."""
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    offset = data.get("offset", 0)
+    limit = data.get("limit", 500)
+    has_more = data.get("hasMore", False)
+
+    if data.get("error"):
+        return f"Audit unavailable: {data['error']}"
+
+    if not entries:
+        return "No audit entries found."
+
+    lines = [
+        f"Audit trail (offset {offset}, showing {len(entries)} of {total} entries):\n"
+    ]
+
+    for entry in entries:
+        lines.append(_format_audit_entry(entry))
+
+    if has_more:
+        lines.append(f"\n... more entries available (use offset={offset + limit})")
+
+    return "\n".join(lines)
+
+
+def _format_chat_entry(entry: dict[str, Any], turn_number: int) -> list[str]:
+    """Format a single chat entry into display lines."""
+    lines = [f"--- Turn {entry.get('turn_number', turn_number)} ---"]
+
+    # Input messages
+    inputs = entry.get("inputs", entry.get("input_messages", []))
+    for msg in inputs:
+        role = msg.get("type", msg.get("role", "unknown"))
+        content = msg.get("content_preview") or msg.get("content", "")
+        if isinstance(content, str):
+            preview = content[:300]
+            if len(content) > 300:
+                preview += "..."
+        else:
+            preview = str(content)[:300]
+        lines.append(f"[{role}]: {preview}")
+
+    # Response
+    response = entry.get("response", {})
+    resp_content = response.get("content_preview") or response.get("content", "")
+    if isinstance(resp_content, str):
+        preview = resp_content[:300]
+        if len(resp_content) > 300:
+            preview += "..."
+    else:
+        preview = str(resp_content)[:300]
+    tool_calls = response.get("tool_calls", [])
+    if tool_calls:
+        tool_names = ", ".join(tc.get("name", "?") for tc in tool_calls)
+        lines.append(f"[assistant]: {preview}" if preview.strip() else f"[assistant]: (tool calls: {tool_names})")
+    elif preview.strip():
+        lines.append(f"[assistant]: {preview}")
+
+    lines.append("")
+    return lines
 
 
 def format_chat_history(chat: dict[str, Any]) -> str:
@@ -157,34 +227,149 @@ def format_chat_history(chat: dict[str, Any]) -> str:
     lines = [f"Chat history (page {page}, {len(entries)} of {total} turns):\n"]
 
     for i, entry in enumerate(entries, 1):
-        lines.append(f"--- Turn {entry.get('turn_number', i)} ---")
-
-        # Input messages
-        inputs = entry.get("input_messages", [])
-        for msg in inputs:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                preview = content[:300]
-                if len(content) > 300:
-                    preview += "..."
-            else:
-                preview = str(content)[:300]
-            lines.append(f"[{role}]: {preview}")
-
-        # Response
-        response = entry.get("response", {})
-        resp_content = response.get("content", "")
-        if isinstance(resp_content, str):
-            preview = resp_content[:300]
-            if len(resp_content) > 300:
-                preview += "..."
-            lines.append(f"[assistant]: {preview}")
-
-        lines.append("")
+        lines.extend(_format_chat_entry(entry, i))
 
     if has_more:
         lines.append(f"... more turns available (use page={page + 1})")
+
+    return "\n".join(lines)
+
+
+def format_chat_bulk(data: dict[str, Any]) -> str:
+    """Format bulk chat history entries (offset/limit based)."""
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    offset = data.get("offset", 0)
+    limit = data.get("limit", 500)
+    has_more = data.get("hasMore", False)
+
+    if data.get("error"):
+        return f"Chat history unavailable: {data['error']}"
+
+    if not entries:
+        return "No chat history found."
+
+    lines = [f"Chat history (offset {offset}, showing {len(entries)} of {total} turns):\n"]
+
+    for i, entry in enumerate(entries, offset + 1):
+        lines.extend(_format_chat_entry(entry, i))
+
+    if has_more:
+        lines.append(f"... more turns available (use offset={offset + limit})")
+
+    return "\n".join(lines)
+
+
+def format_job_summary(
+    job: dict[str, Any] | Exception | None,
+    progress: dict[str, Any] | Exception | None,
+    todos: dict[str, Any] | Exception | None,
+    workspace: dict[str, Any] | Exception | None,
+    recent_audit: dict[str, Any] | Exception | None,
+) -> str:
+    """Format a combined job summary from multiple data sources.
+
+    Each argument may be the data dict, an Exception (if that call failed),
+    or None. Sections with errors show a warning instead of crashing.
+    """
+    lines: list[str] = []
+
+    # --- Status & Config ---
+    lines.append("=== Status & Config ===")
+    if isinstance(job, Exception):
+        lines.append(f"  (unavailable: {job})")
+    elif job:
+        status_icon = {
+            "created": "📝", "processing": "🔄", "paused": "⏸",
+            "pending_review": "👁", "completed": "✅",
+            "failed": "❌", "cancelled": "⛔",
+        }.get(job.get("status", ""), "❓")
+        lines.append(f"  {status_icon} Status: {job.get('status', 'N/A')}")
+        lines.append(f"  Config: {job.get('config', 'N/A')}")
+        lines.append(f"  Created: {job.get('created_at', 'N/A')}")
+        lines.append(f"  Updated: {job.get('updated_at', 'N/A')}")
+        desc = job.get("description", "")
+        if desc:
+            lines.append(f"  Description: {desc[:200]}{'...' if len(desc) > 200 else ''}")
+        if job.get("error"):
+            lines.append(f"  Error: {job['error']}")
+    else:
+        lines.append("  (no data)")
+    lines.append("")
+
+    # --- Progress ---
+    lines.append("=== Progress ===")
+    if isinstance(progress, Exception):
+        lines.append(f"  (unavailable: {progress})")
+    elif progress:
+        lines.append(f"  Phase: {progress.get('current_phase', 'N/A')}")
+        lines.append(f"  Elapsed: {progress.get('elapsed', 'N/A')}")
+        if progress.get("eta"):
+            lines.append(f"  ETA: {progress['eta']}")
+        reqs = progress.get("requirements", {})
+        if reqs:
+            lines.append(f"  Requirements: {reqs.get('completed', 0)}/{reqs.get('total', 0)}")
+    else:
+        lines.append("  (no data)")
+    lines.append("")
+
+    # --- Current Todos ---
+    lines.append("=== Current Todos ===")
+    if isinstance(todos, Exception):
+        lines.append(f"  (unavailable: {todos})")
+    elif todos:
+        current = todos.get("current")
+        if current:
+            todo_list = current.get("todos", [])
+            for t in todo_list:
+                icon = {"pending": "○", "in_progress": "◐", "completed": "●", "skipped": "⊘"}.get(t.get("status", ""), "?")
+                lines.append(f"  {icon} {t.get('subject', 'Untitled')}")
+        else:
+            lines.append("  (no current todos)")
+        archives = todos.get("archives", [])
+        if archives:
+            lines.append(f"  Archived phases: {len(archives)}")
+    else:
+        lines.append("  (no data)")
+    lines.append("")
+
+    # --- Workspace ---
+    lines.append("=== Workspace ===")
+    if isinstance(workspace, Exception):
+        lines.append(f"  (unavailable: {workspace})")
+    elif workspace:
+        files = workspace.get("files", [])
+        if files:
+            lines.append(f"  Files: {len(files)}")
+            for f in files[:10]:
+                name = f.get("name", f.get("path", "?"))
+                size = f.get("size")
+                lines.append(f"    - {name}" + (f" ({size}b)" if size else ""))
+            if len(files) > 10:
+                lines.append(f"    ... and {len(files) - 10} more")
+        ws_preview = workspace.get("workspace_md", workspace.get("workspace_preview", ""))
+        if ws_preview:
+            lines.append(f"  workspace.md preview: {str(ws_preview)[:200]}...")
+        plan_preview = workspace.get("plan_md", workspace.get("plan_preview", ""))
+        if plan_preview:
+            lines.append(f"  plan.md preview: {str(plan_preview)[:200]}...")
+    else:
+        lines.append("  (no data)")
+    lines.append("")
+
+    # --- Recent Activity ---
+    lines.append("=== Recent Activity (last 10 tool calls) ===")
+    if isinstance(recent_audit, Exception):
+        lines.append(f"  (unavailable: {recent_audit})")
+    elif recent_audit:
+        entries = recent_audit.get("entries", [])
+        if entries:
+            for entry in entries[-10:]:
+                lines.append(f"  {_format_audit_entry(entry)}")
+        else:
+            lines.append("  (no entries)")
+    else:
+        lines.append("  (no data)")
 
     return "\n".join(lines)
 
@@ -226,6 +411,88 @@ def format_todos(todos: dict[str, Any]) -> str:
 
     if not current and not archives:
         lines.append("No todos found.")
+
+    return "\n".join(lines)
+
+
+def format_job_log(job_id: str, data: dict[str, Any]) -> str:
+    """Format job log output."""
+    log_lines = data.get("lines", [])
+    total = data.get("total_lines", 0)
+    filtered = data.get("filtered", False)
+
+    header = f"Log for job {job_id}"
+    if filtered:
+        header += " (filtered)"
+    header += f" — showing {len(log_lines)} of {total} lines"
+
+    lines = [header, ""]
+    for l in log_lines:
+        lines.append(l)
+
+    return "\n".join(lines)
+
+
+def format_llm_requests(job_id: str, data: dict[str, Any]) -> str:
+    """Format LLM request listing as a compact table."""
+    entries = data.get("entries", [])
+    total = data.get("total", 0)
+    offset = data.get("offset", 0)
+    has_more = data.get("hasMore", False)
+
+    if not entries:
+        return f"No LLM requests found for job {job_id}."
+
+    lines = [f"LLM requests for job {job_id} (offset {offset}, showing {len(entries)} of {total}):\n"]
+
+    for i, entry in enumerate(entries, offset + 1):
+        model = entry.get("model", "?")
+        timestamp = entry.get("timestamp", "?")
+        tokens = entry.get("token_usage", {})
+        prompt_t = tokens.get("prompt_tokens", tokens.get("prompt", "?"))
+        comp_t = tokens.get("completion_tokens", tokens.get("completion", "?"))
+        total_t = tokens.get("total_tokens", tokens.get("total", "?"))
+        tool_calls = entry.get("tool_calls", [])
+        tool_names = ", ".join(
+            (tc.get("name", "?") if isinstance(tc, dict) else str(tc))
+            for tc in tool_calls
+        ) if tool_calls else "(none)"
+        doc_id = entry.get("_id", "?")
+        iteration = entry.get("iteration", "?")
+
+        lines.append(
+            f"[{i}] {model} {timestamp} tokens=[{prompt_t}/{comp_t}/{total_t}] "
+            f"iter={iteration} -> {tool_names} (doc_id: {doc_id})"
+        )
+
+    if has_more:
+        lines.append(f"\n... more entries (use offset={offset + len(entries)})")
+
+    return "\n".join(lines)
+
+
+def format_shell_state(job_id: str, data: dict[str, Any]) -> str:
+    """Format shell state from an agent."""
+    tabs = data.get("tabs", [])
+    message = data.get("message", "")
+
+    if not tabs:
+        return f"Shell state for job {job_id}: {message or 'No active shell sessions'}"
+
+    lines = [f"Shell state for job {job_id} ({len(tabs)} tab(s)):\n"]
+
+    for tab in tabs:
+        name = tab.get("name", "?")
+        tab_type = tab.get("type", "?")
+        total = tab.get("total_lines", "?")
+        lines.append(f"  [{name}] type={tab_type} lines={total}")
+        output = tab.get("recent_output", "")
+        if output:
+            # Show last 20 lines, indented
+            recent = output.splitlines()[-20:]
+            for line in recent:
+                lines.append(f"    | {line}")
+        lines.append("")
 
     return "\n".join(lines)
 

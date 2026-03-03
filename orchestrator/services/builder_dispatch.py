@@ -520,6 +520,85 @@ async def _get_agent_system_info(args: dict) -> tuple[str, str | None]:
     return formatted, formatted
 
 
+async def _pause_job(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.pause_job(args["job_id"])
+    return fmt.format_action_result("pause", args["job_id"], result), None
+
+
+async def _get_audit_bulk(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_audit_bulk(
+        job_id=args["job_id"],
+        offset=args.get("offset", 0),
+        limit=min(args.get("limit", 500), 500),
+    )
+    formatted = fmt.format_audit_bulk(data)
+    return formatted, formatted
+
+
+async def _get_chat_bulk(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_chat_bulk(
+        job_id=args["job_id"],
+        offset=args.get("offset", 0),
+        limit=min(args.get("limit", 500), 500),
+    )
+    formatted = fmt.format_chat_bulk(data)
+    return formatted, formatted
+
+
+async def _get_job_summary(args: dict) -> tuple[str, str | None]:
+    import asyncio
+    client = _get_client()
+    job_id = args["job_id"]
+
+    results = await asyncio.gather(
+        client.get_job(job_id),
+        client.get_job_progress(job_id),
+        client.get_todos(job_id),
+        client.get_workspace_overview(job_id),
+        client.get_audit_trail(job_id, page=-1, page_size=10, filter_category="tools"),
+        return_exceptions=True,
+    )
+
+    formatted = fmt.format_job_summary(*results)
+    return formatted, formatted
+
+
+async def _get_job_log(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    job_id = args["job_id"]
+    data = await client.get_job_logs(
+        job_id=job_id,
+        lines=min(args.get("lines", 100), 1000),
+        grep=args.get("grep"),
+        level=args.get("level"),
+    )
+    formatted = fmt.format_job_log(job_id, data)
+    return formatted, formatted
+
+
+async def _list_llm_requests(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    job_id = args["job_id"]
+    data = await client.list_llm_requests(
+        job_id=job_id,
+        limit=min(args.get("limit", 20), 100),
+        offset=args.get("offset", 0),
+    )
+    formatted = fmt.format_llm_requests(job_id, data)
+    return formatted, formatted
+
+
+async def _get_shell_state(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    job_id = args["job_id"]
+    data = await client.get_shell_state(job_id)
+    formatted = fmt.format_shell_state(job_id, data)
+    return formatted, formatted
+
+
 # =============================================================================
 # Dispatch Table
 # =============================================================================
@@ -555,9 +634,15 @@ _DISPATCH: dict[str, Any] = {
     "get_table_schema": _get_table_schema,
     # Execution debug
     "get_audit_trail": _get_audit_trail,
+    "get_audit_bulk": _get_audit_bulk,
+    "get_chat_bulk": _get_chat_bulk,
     "get_graph_changes": _get_graph_changes,
     "get_llm_request": _get_llm_request,
+    "list_llm_requests": _list_llm_requests,
     "search_audit": _search_audit,
+    "get_job_log": _get_job_log,
+    "get_job_summary": _get_job_summary,
+    "get_shell_state": _get_shell_state,
     # Citation & source library
     "list_job_sources": _list_job_sources,
     "get_source_detail": _get_source_detail,
@@ -571,6 +656,7 @@ _DISPATCH: dict[str, Any] = {
     "approve_job": _approve_job,
     "resume_job_with_feedback": _resume_job_with_feedback,
     "cancel_job": _cancel_job,
+    "pause_job": _pause_job,
     "delete_job": _delete_job,
     "assign_job": _assign_job,
     "create_job": _create_job,

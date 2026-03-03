@@ -183,7 +183,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     resolved_config JSONB DEFAULT NULL,
     assigned_agent_id UUID,  -- FK added after agents table creation
 
-    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review')),
+    -- Scheduling
+    priority INTEGER NOT NULL DEFAULT 5,
+
+    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
 );
@@ -247,6 +250,21 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id ON jobs(parent_job_id);
 
+-- Migration: Add priority column to jobs table (for priority queue scheduling)
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 5;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority DESC);
+
+-- Migration: Add 'paused' to valid job statuses
+-- (CHECK constraint is defined in CREATE TABLE; this handles existing databases)
+DO $$ BEGIN
+    ALTER TABLE jobs DROP CONSTRAINT IF EXISTS valid_status;
+    ALTER TABLE jobs ADD CONSTRAINT valid_status
+        CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused'));
+END $$;
+
 -- ============================================================================
 -- 2. AGENTS TABLE
 -- Tracks registered agent pods for orchestration
@@ -271,6 +289,7 @@ CREATE TABLE IF NOT EXISTS agents (
     -- Timestamps
     registered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_completed_at TIMESTAMP WITH TIME ZONE,  -- Set on job completion (not pause), used for cooldown
 
     -- Extensible metadata
     metadata JSONB DEFAULT '{}',
@@ -288,6 +307,12 @@ DO $$ BEGIN
         FOREIGN KEY (assigned_agent_id) REFERENCES agents(id) ON DELETE SET NULL;
 EXCEPTION
     WHEN duplicate_object THEN null;
+END $$;
+
+-- Migration: Add last_completed_at to agents table (for dispatch cooldown)
+DO $$ BEGIN
+    ALTER TABLE agents ADD COLUMN last_completed_at TIMESTAMP WITH TIME ZONE;
+EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
 -- ============================================================================
@@ -804,6 +829,7 @@ SELECT
     j.user_id,
     j.project_id,
     j.parent_job_id,
+    j.priority,
     j.branch_name,
     j.merge_status,
     j.freeze_data,

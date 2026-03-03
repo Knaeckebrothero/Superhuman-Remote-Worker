@@ -208,11 +208,11 @@ The `verification_target` in `context` JSONB remains for the trigger logic (iden
 
 | Autonomy | Behavior |
 |----------|----------|
-| `full` | Agent auto-completes (status: `completed`, `goal_achieved: true`). The trigger does NOT fire — there is no `pending_review` state to intercept. Verification is skipped. If verification is desired, change the agent's autonomy to `review`. |
+| `full` | When verification is enabled, the API layer overrides the auto-complete to `pending_review`, allowing the critic to review before final completion. Without verification, the job auto-completes as usual. |
 | `review` | Agent freezes → critic reviews → approves or sends back. Primary use case. |
 | `partial`+ | Same as `review` for the `job_complete` freeze. Phase-boundary freezes are unaffected. |
 
-Note: Verification only applies to `freeze_type: "job_complete"` freezes. Phase-boundary freezes (`freeze_type: "phase_boundary"`) are never intercepted — they serve a different purpose (human steering at checkpoints).
+Note: Verification fires on job completion regardless of autonomy level. Phase-boundary freezes (`freeze_type: "phase_boundary"`) are never intercepted — they serve a different purpose (human steering at checkpoints).
 
 ### Cost and Proportionality
 
