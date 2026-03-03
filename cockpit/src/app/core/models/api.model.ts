@@ -321,7 +321,7 @@ export interface Agent {
 /**
  * Job status types.
  */
-export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'pending_review';
+export type JobStatus = 'created' | 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'pending_review' | 'paused';
 
 /**
  * Job from the orchestrator.
@@ -338,6 +338,7 @@ export interface Job {
   parent_job_id?: string | null;
   branch_name?: string | null;
   merge_status?: string | null;
+  priority?: number;
   status: JobStatus;
   creator_status: string;
   validator_status: string;
@@ -367,6 +368,7 @@ export interface JobCreateRequest {
   builder_session_id?: string;
   user_id?: string;
   project_id?: string;
+  priority?: number;
 }
 
 /**

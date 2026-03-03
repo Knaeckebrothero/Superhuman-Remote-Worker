@@ -152,6 +152,13 @@ interface JobRow {
                     }
                     @if (row.job.status === 'processing') {
                       <button
+                        class="action-btn pause"
+                        (click)="pauseJob(row.job.id); $event.stopPropagation()"
+                        title="Pause job"
+                      >
+                        Pause
+                      </button>
+                      <button
                         class="action-btn cancel"
                         (click)="cancelJob(row.job.id); $event.stopPropagation()"
                         title="Cancel job"
@@ -168,7 +175,7 @@ interface JobRow {
                         Review
                       </button>
                     }
-                    @if (row.job.status !== 'completed' && row.job.status !== 'pending_review') {
+                    @if (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created') {
                       <button
                         class="action-btn resume"
                         (click)="resumeJob(row.job.id); $event.stopPropagation()"
@@ -186,7 +193,7 @@ interface JobRow {
                         Promote
                       </button>
                     }
-                    @if (row.job.status !== 'processing') {
+                    @if (row.job.status !== 'processing' && row.job.status !== 'paused') {
                       <button
                         class="action-btn delete"
                         (click)="deleteJob(row.job.id); $event.stopPropagation()"
@@ -469,6 +476,11 @@ interface JobRow {
         font-weight: 600;
       }
 
+      .status-badge.status-paused {
+        background: rgba(180, 190, 254, 0.2);
+        color: #b4befe;
+      }
+
       /* Hierarchy */
       .status-cell-inner {
         display: flex;
@@ -597,6 +609,11 @@ interface JobRow {
       .action-btn.view {
         color: #89b4fa;
         border-color: #89b4fa;
+      }
+
+      .action-btn.pause {
+        color: #b4befe;
+        border-color: #b4befe;
       }
 
       .action-btn.cancel {
@@ -728,6 +745,7 @@ export class JobListComponent implements OnInit, OnDestroy {
     { label: 'Created', value: 'created' },
     { label: 'Processing', value: 'processing' },
     { label: 'Completed', value: 'completed' },
+    { label: 'Paused', value: 'paused' },
     { label: 'Failed', value: 'failed' },
     { label: 'Cancelled', value: 'cancelled' },
   ];
@@ -876,6 +894,14 @@ export class JobListComponent implements OnInit, OnDestroy {
     // Select the job and open it in debug panels (review component will detect pending_review)
     this.data.setCurrentJob(jobId);
     this.selectedJobId.set(jobId);
+  }
+
+  pauseJob(jobId: string): void {
+    this.api.pauseJob(jobId).subscribe((result) => {
+      if (result) {
+        this.refresh();
+      }
+    });
   }
 
   cancelJob(jobId: string): void {

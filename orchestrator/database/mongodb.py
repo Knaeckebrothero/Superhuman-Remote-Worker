@@ -685,6 +685,93 @@ class MongoDB:
         }
 
     # =========================================================================
+    # LLM REQUEST LISTING
+    # =========================================================================
+
+    async def list_llm_requests(
+        self,
+        job_id: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """List LLM requests for a job with summary fields only.
+
+        Returns lightweight entries suitable for listing (no full message history).
+
+        Args:
+            job_id: The job UUID to query
+            limit: Maximum entries to return (up to 100)
+            offset: Number of entries to skip
+
+        Returns:
+            Dict with entries, total count, offset, limit, hasMore
+        """
+        if not self._available or self._db is None:
+            return {
+                "entries": [],
+                "total": 0,
+                "offset": offset,
+                "limit": limit,
+                "hasMore": False,
+            }
+
+        collection = self._db["llm_requests"]
+        query = {"job_id": job_id}
+
+        # Clamp limit
+        limit = min(limit, 100)
+
+        # Get total count
+        total = await collection.count_documents(query)
+
+        has_more = (offset + limit) < total
+
+        # Project summary fields + response (for tool call names extraction)
+        projection = {
+            "_id": 1,
+            "job_id": 1,
+            "timestamp": 1,
+            "model": 1,
+            "token_usage": 1,
+            "iteration": 1,
+            "response": 1,
+        }
+
+        cursor = (
+            collection.find(query, projection)
+            .sort("timestamp", 1)
+            .skip(offset)
+            .limit(limit)
+        )
+
+        entries = []
+        async for doc in cursor:
+            doc["_id"] = str(doc["_id"])
+            if "timestamp" in doc:
+                doc["timestamp"] = _to_iso_utc(doc["timestamp"])
+
+            # Extract just tool call names from response, then drop the full response
+            response = doc.pop("response", {})
+            if isinstance(response, dict):
+                tool_calls_raw = response.get("tool_calls", [])
+                doc["tool_calls"] = [
+                    {"name": tc.get("name", "?")} if isinstance(tc, dict) else {"name": str(tc)}
+                    for tc in (tool_calls_raw or [])
+                ]
+            else:
+                doc["tool_calls"] = []
+
+            entries.append(doc)
+
+        return {
+            "entries": entries,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "hasMore": has_more,
+        }
+
+    # =========================================================================
     # LEGACY COMPATIBILITY (from original MongoDB class)
     # =========================================================================
 

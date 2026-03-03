@@ -148,6 +148,41 @@ async def get_audit_trail(
 
 
 @mcp.tool
+async def get_audit_bulk(
+    job_id: str,
+    offset: int = 0,
+    limit: int = 500,
+    filter: Literal["all", "messages", "tools", "errors"] = "all",
+) -> str:
+    """Get bulk audit entries using offset/limit pagination.
+
+    Better than page-based audit trail for scanning large histories.
+    Supports up to 500 entries per request.
+
+    Args:
+        job_id: Job UUID to get audit for
+        offset: Number of entries to skip (default: 0)
+        limit: Maximum entries to return (max 500, default 500)
+        filter: Filter category (all, messages, tools, errors)
+
+    Returns:
+        Formatted audit entries with offset metadata
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 500:
+        limit = 500
+
+    client = _get_client()
+    data = await client.get_audit_bulk(
+        job_id=job_id,
+        offset=offset,
+        limit=limit,
+    )
+    return fmt.format_audit_bulk(data)
+
+
+@mcp.tool
 async def get_chat_history(
     job_id: str,
     page: int = 1,
@@ -178,6 +213,39 @@ async def get_chat_history(
         page_size=page_size,
     )
     return fmt.format_chat_history(chat)
+
+
+@mcp.tool
+async def get_chat_bulk(
+    job_id: str,
+    offset: int = 0,
+    limit: int = 500,
+) -> str:
+    """Get bulk chat history using offset/limit pagination.
+
+    Better than page-based chat history for scanning large conversations.
+    Supports up to 500 entries per request.
+
+    Args:
+        job_id: Job UUID to get chat history for
+        offset: Number of entries to skip (default: 0)
+        limit: Maximum entries to return (max 500, default 500)
+
+    Returns:
+        Formatted chat turns with offset metadata
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 500:
+        limit = 500
+
+    client = _get_client()
+    data = await client.get_chat_bulk(
+        job_id=job_id,
+        offset=offset,
+        limit=limit,
+    )
+    return fmt.format_chat_bulk(data)
 
 
 @mcp.tool
@@ -231,6 +299,36 @@ async def get_llm_request(doc_id: str) -> str:
     client = _get_client()
     request = await client.get_llm_request(doc_id)
     return fmt.format_llm_request(request)
+
+
+@mcp.tool
+async def get_job_summary(job_id: str) -> str:
+    """Get a comprehensive one-shot summary of a job.
+
+    Fetches status, progress, todos, workspace overview, and recent tool
+    calls in parallel. Returns everything in a single response — ideal for
+    understanding a job's current state without multiple tool calls.
+
+    Args:
+        job_id: Job UUID to summarize
+
+    Returns:
+        Combined summary with status, progress, todos, workspace, and recent activity
+    """
+    import asyncio
+
+    client = _get_client()
+
+    results = await asyncio.gather(
+        client.get_job(job_id),
+        client.get_job_progress(job_id),
+        client.get_todos(job_id),
+        client.get_workspace_overview(job_id),
+        client.get_audit_trail(job_id, page=-1, page_size=10, filter_category="tools"),
+        return_exceptions=True,
+    )
+
+    return fmt.format_job_summary(*results)
 
 
 @mcp.tool
@@ -335,6 +433,28 @@ async def cancel_job(job_id: str) -> str:
         return fmt.format_action_result("cancel", job_id, result)
     except Exception as e:
         return fmt.format_action_error("cancel", job_id, e)
+
+
+@mcp.tool
+async def pause_job(job_id: str) -> str:
+    """Pause a running job.
+
+    MUTATION: This sends a graceful pause request to the agent. The agent
+    finishes its current node, saves a checkpoint, and becomes available
+    for other work. The job must be in 'processing' status.
+
+    Args:
+        job_id: Job UUID to pause
+
+    Returns:
+        Pause result with status
+    """
+    client = _get_client()
+    try:
+        result = await client.pause_job(job_id)
+        return fmt.format_action_result("pause", job_id, result)
+    except Exception as e:
+        return fmt.format_action_error("pause", job_id, e)
 
 
 @mcp.tool
@@ -1184,6 +1304,111 @@ async def get_agent_system_info(agent_id: str) -> str:
                 error_msg = f"HTTP {e.response.status_code}: {error_msg}"  # type: ignore[union-attr]
         return f"Failed to get system info for agent {agent_id}:\n{error_msg}"
 
+
+
+# =============================================================================
+# Logs, LLM Requests & Shell State Tools
+# =============================================================================
+
+
+@mcp.tool
+async def get_job_log(
+    job_id: str,
+    lines: int = 100,
+    grep: str | None = None,
+    level: str | None = None,
+) -> str:
+    """Read the tail of a job's log file with optional filtering.
+
+    Returns the last N lines of the log file, optionally filtered by log
+    level and/or grep pattern. Useful for diagnosing agent errors.
+
+    Args:
+        job_id: Job UUID
+        lines: Number of tail lines to return (max 1000, default 100)
+        grep: Case-insensitive substring filter
+        level: Log level filter (DEBUG, INFO, WARNING, ERROR)
+
+    Returns:
+        Formatted log output with line count and filter info
+    """
+    if lines < 1:
+        lines = 1
+    elif lines > 1000:
+        lines = 1000
+
+    client = _get_client()
+    try:
+        data = await client.get_job_logs(
+            job_id=job_id, lines=lines, grep=grep, level=level
+        )
+        return fmt.format_job_log(job_id, data)
+    except Exception as e:
+        return fmt.format_workspace_error("get job log", job_id, e)
+
+
+@mcp.tool
+async def list_llm_requests(
+    job_id: str,
+    limit: int = 20,
+    offset: int = 0,
+) -> str:
+    """List LLM requests for a job with token usage and tool call summaries.
+
+    Shows each request's model, timestamp, token counts, iteration number,
+    and which tools were called. Use the doc_id with get_llm_request to see
+    full message history for a specific request.
+
+    Args:
+        job_id: Job UUID
+        limit: Maximum entries to return (max 100, default 20)
+        offset: Pagination offset (default: 0)
+
+    Returns:
+        Formatted list of LLM requests with token usage and tool calls
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 100:
+        limit = 100
+
+    client = _get_client()
+    try:
+        data = await client.list_llm_requests(
+            job_id=job_id, limit=limit, offset=offset
+        )
+        return fmt.format_llm_requests(job_id, data)
+    except Exception as e:
+        return fmt.format_workspace_error("list LLM requests", job_id, e)
+
+
+@mcp.tool
+async def get_shell_state(job_id: str) -> str:
+    """Get shell tab state from the agent processing a job.
+
+    Returns the list of open terminal tabs with their type (ssh, repl,
+    claude-code, etc.) and recent output. Requires the job to be actively
+    processing on an agent.
+
+    Args:
+        job_id: Job UUID (must be in 'processing' status)
+
+    Returns:
+        Shell state with tab names, types, and recent output
+    """
+    client = _get_client()
+    try:
+        data = await client.get_shell_state(job_id)
+        return fmt.format_shell_state(job_id, data)
+    except Exception as e:
+        error_msg = str(e)
+        if hasattr(e, "response"):
+            try:
+                detail = e.response.json().get("detail", error_msg)
+                error_msg = detail
+            except Exception:
+                error_msg = f"HTTP {e.response.status_code}: {error_msg}"
+        return f"Failed to get shell state for job {job_id}:\n{error_msg}"
 
 
 # =============================================================================

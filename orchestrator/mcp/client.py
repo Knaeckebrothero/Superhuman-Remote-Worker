@@ -499,6 +499,30 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
+    async def get_audit_bulk(
+        self,
+        job_id: str,
+        offset: int = 0,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Get bulk audit entries for a job (offset/limit based).
+
+        Args:
+            job_id: Job UUID
+            offset: Number of entries to skip
+            limit: Maximum entries to return (up to 500 for MCP)
+
+        Returns:
+            Dict with entries, total, offset, limit, hasMore
+        """
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/audit/bulk",
+            params={"offset": offset, "limit": limit},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
     async def get_audit_time_range(self, job_id: str) -> dict[str, str] | None:
         """Get first and last timestamps for job audit entries.
 
@@ -538,6 +562,30 @@ class AsyncCockpitClient:
             "pageSize": page_size,
         }
         resp = await self._client.get(f"/api/jobs/{job_id}/chat", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_chat_bulk(
+        self,
+        job_id: str,
+        offset: int = 0,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Get bulk chat history entries for a job (offset/limit based).
+
+        Args:
+            job_id: Job UUID
+            offset: Number of entries to skip
+            limit: Maximum entries to return (up to 500 for MCP)
+
+        Returns:
+            Dict with entries, total, offset, limit, hasMore
+        """
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/chat/bulk",
+            params={"offset": offset, "limit": limit},
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -698,6 +746,20 @@ class AsyncCockpitClient:
             Cancellation result with status
         """
         resp = await self._client.put(f"/api/jobs/{job_id}/cancel")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def pause_job(self, job_id: str) -> dict[str, Any]:
+        """Pause a running job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Pause result with status
+        """
+        resp = await self._client.put(f"/api/jobs/{job_id}/pause")
         resp.raise_for_status()
         return resp.json()
 
@@ -1302,6 +1364,80 @@ class AsyncCockpitClient:
             Stats with source/citation counts by type, status, confidence, method
         """
         resp = await self._client.get(f"/api/jobs/{job_id}/citations/stats")
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Logs & LLM Requests
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def get_job_logs(
+        self,
+        job_id: str,
+        lines: int = 100,
+        grep: str | None = None,
+        level: str | None = None,
+    ) -> dict[str, Any]:
+        """Get tail of a job's log file with optional filtering.
+
+        Args:
+            job_id: Job UUID
+            lines: Number of tail lines (1-1000)
+            grep: Case-insensitive substring filter
+            level: Log level filter (DEBUG, INFO, WARNING, ERROR)
+
+        Returns:
+            Dict with lines list, total_lines, filtered flag
+        """
+        params: dict[str, Any] = {"lines": lines}
+        if grep:
+            params["grep"] = grep
+        if level:
+            params["level"] = level
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/logs", params=params
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_llm_requests(
+        self,
+        job_id: str,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List LLM requests for a job with summary fields.
+
+        Args:
+            job_id: Job UUID
+            limit: Max entries (1-100)
+            offset: Pagination offset
+
+        Returns:
+            Dict with entries, total, offset, limit, hasMore
+        """
+        resp = await self._client.get(
+            f"/api/jobs/{job_id}/llm-requests",
+            params={"limit": limit, "offset": offset},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_shell_state(self, job_id: str) -> dict[str, Any]:
+        """Get shell state for a job's agent.
+
+        Proxied through the orchestrator to the agent's /system/shell-state endpoint.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Dict with tabs list, each containing name, type, recent output
+        """
+        resp = await self._client.get(f"/api/jobs/{job_id}/shell-state")
         resp.raise_for_status()
         return resp.json()
 

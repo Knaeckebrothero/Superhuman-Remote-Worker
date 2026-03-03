@@ -228,6 +228,19 @@ import { environment } from '../../core/environment';
 
           @if (showAdvanced()) {
             <div class="advanced-section">
+              <!-- Priority Level -->
+              <div class="form-group">
+                <label for="priority" class="form-label">Priority</label>
+                <select id="priority" name="priority" class="form-input"
+                  [ngModel]="selectedPriority()" (ngModelChange)="selectedPriority.set($event)"
+                  [disabled]="isSubmitting()">
+                  @for (level of priorityLevels; track level.value) {
+                    <option [ngValue]="level.value">{{ level.label }}</option>
+                  }
+                </select>
+                <span class="field-hint">Higher priority jobs run first and can preempt lower priority jobs</span>
+              </div>
+
               <!-- Autonomy Level -->
               <div class="form-group">
                 <label for="autonomy" class="form-label">Autonomy Level</label>
@@ -1550,6 +1563,14 @@ export class JobCreateComponent implements OnInit {
   readonly disabledToolCategories = signal<Set<string>>(new Set());
 
   // Autonomy level override
+  readonly selectedPriority = signal<number>(5);
+
+  readonly priorityLevels = [
+    { value: 0, label: 'Low (backfill)' },
+    { value: 5, label: 'Normal (default)' },
+    { value: 10, label: 'High (preempts lower)' },
+  ];
+
   readonly selectedAutonomy = signal<string | null>(null);
 
   readonly autonomyLevels = [
@@ -2103,6 +2124,12 @@ export class JobCreateComponent implements OnInit {
       request.project_id = projectId;
     }
 
+    // Set priority if not default
+    const priority = this.selectedPriority();
+    if (priority !== 5) {
+      request.priority = priority;
+    }
+
     // Attach current user
     const currentUserId = this.userService.currentUserId();
     if (currentUserId) {
@@ -2210,6 +2237,7 @@ export class JobCreateComponent implements OnInit {
     this.tacticalMultimodal.set(null);
     this.disabledToolCategories.set(new Set());
     this.selectedAutonomy.set(null);
+    this.selectedPriority.set(5);
     // Reset advanced options
     this.showAdvanced.set(false);
     // Reset datasource selections

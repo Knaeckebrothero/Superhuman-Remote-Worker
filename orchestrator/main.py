@@ -99,6 +99,15 @@ async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
 # Flag to signal shutdown to background tasks
 _shutdown_event: asyncio.Event | None = None
 
+# Auto-assignment toggle (env var, default true)
+AUTO_ASSIGN_ENABLED = os.environ.get("AUTO_ASSIGN_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Dispatcher lock prevents concurrent dispatch (double-assignment)
+_dispatch_lock = asyncio.Lock()
+
+# Track jobs with pending pause requests (prevent re-preemption)
+_pause_pending_job_ids: set[str] = set()
+
 
 async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
     """Background task that marks agents as offline if no heartbeat received.
@@ -123,6 +132,347 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
             pass  # Continue loop
 
     logger.info("Stale agent detector stopped")
+
+
+# =============================================================================
+# Job Auto-Assignment Dispatcher
+# =============================================================================
+
+
+async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
+    """Start a new job on an agent. Returns True on success.
+
+    Extracted from assign_job_to_agent() endpoint. Handles datasource resolution,
+    config overrides, HTTP POST to agent pod, and status updates.
+    """
+    import httpx
+
+    job_id = str(job["id"])
+    agent_id = str(agent["id"])
+
+    if not agent.get("pod_ip"):
+        logger.warning(f"Agent {agent_id} has no pod IP — skipping dispatch")
+        return False
+
+    try:
+        # Extract upload IDs from context if present
+        job_context = job.get("context") or {}
+        if isinstance(job_context, str):
+            job_context = json.loads(job_context)
+        upload_id = job_context.get("upload_id")
+        config_upload_id = job_context.get("config_upload_id")
+        instructions_upload_id = job_context.get("instructions_upload_id")
+        instructions = job_context.get("instructions")
+        git_remote_url = job_context.get("git_remote_url")
+
+        # Parse config_override if stored as string
+        config_override = job.get("config_override")
+        if isinstance(config_override, str):
+            config_override = json.loads(config_override)
+
+        # Build remaining context (fields not extracted as dedicated params)
+        extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "instructions", "git_remote_url"}
+        remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
+
+        # Resolve project repositories if this is a project job
+        repositories_payload = None
+        if job.get("project_id"):
+            try:
+                repos = await postgres_db.get_project_repositories(str(job["project_id"]))
+                repositories_payload = [
+                    {
+                        "id": str(r["id"]),
+                        "name": r["name"],
+                        "role": r["role"],
+                        "repo_url": r.get("repo_url"),
+                        "read_only": r["read_only"],
+                        "branch": r.get("branch", "main"),
+                        "clone_path": r.get("clone_path"),
+                        "credentials": r.get("credentials"),
+                    }
+                    for r in repos
+                ]
+            except Exception as e:
+                logger.warning(f"Dispatch: failed to resolve project repos for job {job_id}: {e}")
+
+            # Derive git_remote_url from jobs repo if not already set
+            if repositories_payload and not git_remote_url:
+                jobs_repo = next((r for r in repositories_payload if r["role"] == "jobs"), None)
+                if jobs_repo and jobs_repo.get("repo_url"):
+                    git_remote_url = jobs_repo["repo_url"]
+
+        # Resolve datasources for this job (job > project > global)
+        resolved_ds = await postgres_db.resolve_datasources_for_job(
+            job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
+        )
+        datasources_payload = _build_datasources_payload(resolved_ds)
+
+        # Apply datasource-driven tool override (inject/strip db tool categories)
+        if resolved_ds:
+            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+
+        # Build job start request
+        job_start = JobStartRequest(
+            job_id=job_id,
+            description=job["description"],
+            upload_id=upload_id,
+            config_upload_id=config_upload_id,
+            instructions_upload_id=instructions_upload_id,
+            instructions=instructions,
+            document_path=job.get("document_path"),
+            config_name=job.get("config_name", "default"),
+            config_override=config_override,
+            git_remote_url=git_remote_url,
+            context=remaining_context if remaining_context else None,
+            datasources=datasources_payload,
+            repositories=repositories_payload,
+            branch_name=job.get("branch_name"),
+            project_id=str(job["project_id"]) if job.get("project_id") else None,
+        )
+
+        # Send to agent pod
+        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                agent_url,
+                json=job_start.model_dump(exclude_none=True),
+            )
+
+        if response.status_code not in (200, 202):
+            logger.warning(f"Dispatch: agent {agent_id} rejected job {job_id}: {response.text}")
+            return False
+
+        # Update job status and assign to agent
+        await postgres_db.update_job_status(
+            job_id=job_id,
+            status="processing",
+            creator_status="pending",
+            assigned_agent_id=agent_id,
+        )
+
+        # Update agent status via heartbeat simulation
+        await postgres_db.heartbeat(
+            agent_id=agent_id,
+            status="working",
+            current_job_id=job_id,
+        )
+
+        logger.info(f"Dispatch: assigned job {job_id} (priority={job.get('priority', '?')}) to agent {agent_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}")
+        return False
+
+
+async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
+    """Resume a paused job on an agent. Returns True on success."""
+    import httpx
+
+    job_id = str(job["id"])
+    agent_id = str(agent["id"])
+
+    if not agent.get("pod_ip"):
+        logger.warning(f"Agent {agent_id} has no pod IP — skipping resume dispatch")
+        return False
+
+    try:
+        # Re-resolve datasources in case they changed
+        resolved_ds = await postgres_db.resolve_datasources_for_job(
+            job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
+        )
+        datasources_payload = _build_datasources_payload(resolved_ds)
+
+        config_override = job.get("config_override")
+        if isinstance(config_override, str):
+            config_override = json.loads(config_override)
+        if resolved_ds:
+            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+
+        resume_payload = {
+            "job_id": job_id,
+            "config_name": job.get("config_name", "default"),
+            "config_override": config_override,
+            "datasources": datasources_payload,
+        }
+
+        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                agent_url,
+                json={k: v for k, v in resume_payload.items() if v is not None},
+            )
+
+        if response.status_code not in (200, 202):
+            logger.warning(f"Dispatch: agent {agent_id} rejected resume for job {job_id}: {response.text}")
+            return False
+
+        # Update job status and assign to agent
+        await postgres_db.update_job_status(
+            job_id=job_id,
+            status="processing",
+            assigned_agent_id=agent_id,
+        )
+
+        await postgres_db.heartbeat(
+            agent_id=agent_id,
+            status="working",
+            current_job_id=job_id,
+        )
+
+        logger.info(f"Dispatch: resumed job {job_id} (priority={job.get('priority', '?')}) on agent {agent_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Dispatch: failed to resume job {job_id} on agent {agent_id}: {e}")
+        return False
+
+
+async def _initiate_pause(job: dict) -> None:
+    """Request graceful pause of a running job. Non-blocking (fire-and-forget).
+
+    The agent will finish its current node, save checkpoint, and become available.
+    The actual dispatch of the high-priority job happens on the next dispatcher cycle.
+    """
+    import httpx
+
+    job_id = str(job["id"])
+    agent_id = str(job.get("assigned_agent_id", ""))
+
+    if not job.get("pod_ip"):
+        logger.warning(f"Preempt: no pod IP for job {job_id} agent — cannot pause")
+        return
+
+    try:
+        agent_url = f"http://{job['pod_ip']}:{job['pod_port']}/job/pause"
+        async with httpx.AsyncClient(timeout=130.0) as client:
+            response = await client.post(agent_url)
+
+        if response.status_code in (200, 408):
+            # 200 = paused, 408 = timed out but flag set (will pause after current node)
+            logger.info(f"Preempt: pause request sent for job {job_id} on agent {agent_id}")
+            # DB update handled by agent + orchestrator fallback
+            await postgres_db.pause_job(job_id)
+        else:
+            logger.warning(f"Preempt: agent returned {response.status_code} for pause of job {job_id}")
+
+    except Exception as e:
+        logger.warning(f"Preempt: failed to pause job {job_id}: {e}")
+    finally:
+        _pause_pending_job_ids.discard(job_id)
+
+
+async def _try_dispatch_pending_jobs() -> None:
+    """Core dispatcher: match pending jobs to available agents.
+
+    Phase 1: Direct assignment (free agents → highest priority pending jobs)
+    Phase 2: Preemption (remaining high-priority jobs → lowest-priority running jobs)
+    """
+    if not AUTO_ASSIGN_ENABLED:
+        return
+
+    async with _dispatch_lock:
+        try:
+            # Get pending jobs (created + paused, priority ordered)
+            pending_jobs = await postgres_db.get_dispatchable_jobs(limit=50)
+            if not pending_jobs:
+                return
+
+            # Get available agents (ready, cooldown passed)
+            available_agents = await postgres_db.get_available_agents(limit=50)
+
+            # Phase 1: Direct assignment
+            matched_job_ids = set()
+            matched_agent_ids = set()
+
+            agents_iter = iter(available_agents)
+            for job in pending_jobs:
+                agent = next(agents_iter, None)
+                if agent is None:
+                    break  # No more free agents
+
+                job_id = str(job["id"])
+                if job["status"] == "paused":
+                    success = await _resume_job_on_agent(job, agent)
+                else:
+                    success = await _dispatch_job_to_agent(job, agent)
+
+                if success:
+                    matched_job_ids.add(job_id)
+                    matched_agent_ids.add(str(agent["id"]))
+
+            # Phase 2: Preemption (non-blocking)
+            remaining = [j for j in pending_jobs if str(j["id"]) not in matched_job_ids]
+            if not remaining:
+                return
+
+            candidates = await postgres_db.get_preemption_candidates()
+            if not candidates:
+                return
+
+            for pending_job in remaining:
+                pending_priority = pending_job.get("priority", 5)
+                pending_job_id = str(pending_job["id"])
+
+                # Find lowest-priority running job that can be preempted
+                for candidate in candidates:
+                    candidate_id = str(candidate["id"])
+                    candidate_priority = candidate.get("priority", 5)
+
+                    # Only preempt if strictly higher priority
+                    if pending_priority <= candidate_priority:
+                        continue
+
+                    # Skip if already being paused
+                    if candidate_id in _pause_pending_job_ids:
+                        continue
+
+                    # Skip if already matched (agent taken)
+                    if str(candidate.get("assigned_agent_id", "")) in matched_agent_ids:
+                        continue
+
+                    # Initiate preemption (fire-and-forget)
+                    _pause_pending_job_ids.add(candidate_id)
+                    asyncio.create_task(_initiate_pause(candidate))
+                    logger.info(
+                        f"Preempt: pausing job {candidate_id} (priority={candidate_priority}) "
+                        f"for pending job {pending_job_id} (priority={pending_priority})"
+                    )
+                    # Remove this candidate so it's not preempted again in this cycle
+                    candidates.remove(candidate)
+                    break  # One preemption per pending job per cycle
+
+        except Exception as e:
+            logger.error(f"Dispatcher error: {e}", exc_info=True)
+
+
+async def auto_assign_dispatcher(shutdown_event: asyncio.Event) -> None:
+    """Background task that periodically dispatches pending jobs to available agents.
+
+    Runs every 30 seconds as a catch-all. Event-driven triggers (job creation,
+    agent heartbeat) also call _try_dispatch_pending_jobs() for faster response.
+    """
+    logger.info("Auto-assign dispatcher started (enabled=%s)", AUTO_ASSIGN_ENABLED)
+    while not shutdown_event.is_set():
+        try:
+            await _try_dispatch_pending_jobs()
+        except Exception as e:
+            logger.error(f"Error in auto-assign dispatcher: {e}")
+
+        # Wait 30 seconds or until shutdown
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Auto-assign dispatcher stopped")
+
+
+def _trigger_dispatch() -> None:
+    """Fire-and-forget trigger for the dispatcher. Safe to call from any endpoint."""
+    if AUTO_ASSIGN_ENABLED:
+        asyncio.create_task(_try_dispatch_pending_jobs())
 
 
 # =============================================================================
@@ -208,6 +558,7 @@ class JobCreate(BaseModel):
     user_id: str | None = Field(None, description="User UUID who created this job")
     project_id: str | None = Field(None, description="Project UUID to associate this job with")
     parent_job_id: str | None = Field(None, description="Parent job UUID for verification/follow-up jobs")
+    priority: int = Field(5, ge=0, le=10, description="Job priority (0=low, 5=normal, 10=high)")
 
 
 class JobStartRequest(BaseModel):
@@ -415,6 +766,7 @@ async def lifespan(app: FastAPI):
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
     session_cleanup_task = asyncio.create_task(cleanup_expired_sessions(postgres_db, _shutdown_event))
+    dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
 
     yield
 
@@ -422,6 +774,7 @@ async def lifespan(app: FastAPI):
     _shutdown_event.set()
     await stale_detector_task
     await session_cleanup_task
+    await dispatcher_task
 
     # Cleanup clients
     await gitea_client.close()
@@ -630,6 +983,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             user_id=job.user_id,
             project_id=project_id,
             parent_job_id=job.parent_job_id,
+            priority=job.priority,
         )
 
         # Create Gitea repo for workspace delivery
@@ -682,6 +1036,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 )
             except Exception as e:
                 logger.warning(f"Failed to link builder session {job.builder_session_id}: {e}")
+
+        # Trigger auto-assignment dispatcher (fire-and-forget)
+        _trigger_dispatch()
 
         return result
     except Exception as e:
@@ -737,13 +1094,21 @@ async def cancel_job(job_id: str) -> dict[str, str]:
             if agent and agent.get("pod_ip") and agent["status"] not in ("offline",):
                 agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/cancel"
                 try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
+                    # 130s timeout: agent tries cooperative stop for up to 120s,
+                    # then falls back to hard kill. We wait slightly longer.
+                    async with httpx.AsyncClient(timeout=130.0) as client:
                         response = await client.post(
                             agent_url,
                             json={"reason": "Cancelled via cockpit"},
                         )
                         if response.status_code == 200:
-                            logger.info(f"Agent confirmed cancel for job {job_id}")
+                            resp_data = response.json()
+                            if resp_data.get("graceful", True):
+                                logger.info(f"Agent confirmed graceful cancel for job {job_id}")
+                            else:
+                                logger.warning(f"Agent hard-killed job {job_id} after cooperative timeout")
+                        elif response.status_code == 408:
+                            logger.warning(f"Agent cancel timed out for job {job_id} — may still stop after current node")
                         else:
                             logger.warning(
                                 f"Agent cancel returned {response.status_code}: {response.text}"
@@ -758,6 +1123,9 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                 status_code=400,
                 detail="Job cannot be cancelled (already completed or cancelled)",
             )
+        # Agent is being freed — trigger dispatcher for queued jobs
+        _trigger_dispatch()
+
         return {"status": "cancelled"}
     except HTTPException:
         raise
@@ -765,8 +1133,67 @@ async def cancel_job(job_id: str) -> dict[str, str]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.put("/api/jobs/{job_id}/pause")
+async def pause_job(job_id: str) -> dict[str, str]:
+    """Pause a running job.
+
+    If the job is assigned to an agent, sends a graceful pause request
+    to the agent pod. The agent finishes its current graph node, saves
+    the checkpoint, and becomes available for new work.
+
+    The paused job re-enters the dispatch queue and will be auto-resumed
+    when an agent becomes available.
+    """
+    import httpx
+
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job["status"] != "processing":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job cannot be paused (status: {job['status']})",
+            )
+
+        # Send pause request to agent pod
+        assigned_agent_id = job.get("assigned_agent_id")
+        if assigned_agent_id:
+            agent = await postgres_db.get_agent(str(assigned_agent_id))
+            if agent and agent.get("pod_ip") and agent["status"] not in ("offline",):
+                agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/pause"
+                try:
+                    async with httpx.AsyncClient(timeout=130.0) as client:
+                        response = await client.post(agent_url)
+                        if response.status_code == 200:
+                            logger.info(f"Agent confirmed pause for job {job_id}")
+                        elif response.status_code == 408:
+                            # Pause timed out but flag is set — agent will pause after current node
+                            logger.warning(f"Pause timed out for job {job_id} — will pause after current node")
+                        else:
+                            logger.warning(f"Agent pause returned {response.status_code}: {response.text}")
+                except httpx.TimeoutException:
+                    logger.warning(f"Timeout sending pause to agent for job {job_id}")
+                except Exception as e:
+                    logger.warning(f"Could not reach agent to pause job {job_id}: {e}")
+
+        # Update DB — the agent also does this, but we ensure it here as fallback
+        success = await postgres_db.pause_job(job_id)
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail="Job cannot be paused (status may have changed)",
+            )
+        return {"status": "paused", "job_id": job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 class JobResumeRequest(BaseModel):
-    """Request body for resuming a failed job."""
+    """Request body for resuming a failed or paused job."""
 
     feedback: str | None = Field(None, description="Optional feedback to inject before resuming")
     agent_id: str | None = Field(None, description="Override agent ID if original is offline")
@@ -774,10 +1201,10 @@ class JobResumeRequest(BaseModel):
 
 @app.post("/api/jobs/{job_id}/resume")
 async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> dict[str, str]:
-    """Resume a failed job from its checkpoint.
+    """Resume a failed or paused job from its checkpoint.
 
     This endpoint:
-    1. Validates the job exists and is in 'failed' status
+    1. Validates the job exists and is not 'completed'
     2. Gets the assigned agent (or uses override agent_id from request)
     3. Validates the agent is ready or completed (not offline/working)
     4. Sends a resume request to the agent's pod
@@ -1072,6 +1499,9 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
             )
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
+
+        # Agent is freed after completion — trigger dispatcher
+        _trigger_dispatch()
 
         return {
             "status": "approved",
@@ -1810,32 +2240,22 @@ def _build_datasources_payload(resolved_ds: list[dict[str, Any]]) -> list[dict[s
 
 @app.post("/api/jobs/{job_id}/assign/{agent_id}")
 async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
-    """Assign a job to an agent.
+    """Manually assign a job to an agent.
 
-    This endpoint:
-    1. Validates the job exists and is in 'created' status
-    2. Validates the agent exists and is in 'ready' status
-    3. Sends a JobStartRequest to the agent's pod
-    4. Updates job and agent status on success
-
-    Returns:
-        Status message indicating assignment result
+    Validates job and agent status, then delegates to the shared dispatch helper.
+    Accepts jobs in 'created', 'failed', or 'paused' status.
     """
-    import httpx
-
     try:
-        # Get job details
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        if job["status"] not in ("created", "failed"):
+        if job["status"] not in ("created", "failed", "paused"):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be assigned (status: {job['status']})",
             )
 
-        # Get agent details
         agent = await postgres_db.get_agent(agent_id)
         if not agent:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
@@ -1852,122 +2272,22 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
                 detail="Agent has no pod IP configured",
             )
 
-        # Extract upload IDs from context if present
-        job_context = job.get("context") or {}
-        if isinstance(job_context, str):
-            import json as json_module
-            job_context = json_module.loads(job_context)
-        upload_id = job_context.get("upload_id")
-        config_upload_id = job_context.get("config_upload_id")
-        instructions_upload_id = job_context.get("instructions_upload_id")
-        instructions = job_context.get("instructions")
-        git_remote_url = job_context.get("git_remote_url")
+        # Use resume path for paused jobs, start path for new/failed
+        if job["status"] == "paused":
+            success = await _resume_job_on_agent(job, agent)
+        else:
+            success = await _dispatch_job_to_agent(job, agent)
 
-        # Parse config_override if stored as string
-        config_override = job.get("config_override")
-        if isinstance(config_override, str):
-            import json as json_module
-            config_override = json_module.loads(config_override)
-
-        # Build remaining context (fields not extracted as dedicated params)
-        extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "instructions", "git_remote_url"}
-        remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
-
-        # Resolve project repositories if this is a project job
-        repositories_payload = None
-        if job.get("project_id"):
-            try:
-                repos = await postgres_db.get_project_repositories(str(job["project_id"]))
-                repositories_payload = [
-                    {
-                        "id": str(r["id"]),
-                        "name": r["name"],
-                        "role": r["role"],
-                        "repo_url": r.get("repo_url"),
-                        "read_only": r["read_only"],
-                        "branch": r.get("branch", "main"),
-                        "clone_path": r.get("clone_path"),
-                        "credentials": r.get("credentials"),
-                    }
-                    for r in repos
-                ]
-            except Exception as e:
-                logger.warning(f"Failed to resolve project repositories: {e}")
-
-            # Derive git_remote_url from jobs repo if not already set
-            if repositories_payload and not git_remote_url:
-                jobs_repo = next((r for r in repositories_payload if r["role"] == "jobs"), None)
-                if jobs_repo and jobs_repo.get("repo_url"):
-                    git_remote_url = jobs_repo["repo_url"]
-
-        # Resolve datasources for this job (job > project > global)
-        resolved_ds = await postgres_db.resolve_datasources_for_job(
-            job_id, project_id=str(job["project_id"]) if job.get("project_id") else None
-        )
-        datasources_payload = _build_datasources_payload(resolved_ds)
-
-        # Apply datasource-driven tool override (inject/strip db tool categories)
-        if resolved_ds:
-            config_override = _build_datasource_tool_override(resolved_ds, config_override)
-
-        # Build job start request - use job's config, not agent's
-        job_start = JobStartRequest(
-            job_id=job_id,
-            description=job["description"],
-            upload_id=upload_id,
-            config_upload_id=config_upload_id,
-            instructions_upload_id=instructions_upload_id,
-            instructions=instructions,
-            document_path=job.get("document_path"),
-            config_name=job.get("config_name", "default"),
-            config_override=config_override,
-            git_remote_url=git_remote_url,
-            context=remaining_context if remaining_context else None,
-            datasources=datasources_payload,
-            repositories=repositories_payload,
-            branch_name=job.get("branch_name"),
-            project_id=str(job["project_id"]) if job.get("project_id") else None,
-        )
-
-        # Send request to agent pod
-        agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/start"
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                agent_url,
-                json=job_start.model_dump(exclude_none=True),
-            )
-
-        if response.status_code not in (200, 202):
+        if not success:
             raise HTTPException(
                 status_code=502,
-                detail=f"Agent rejected job: {response.text}",
+                detail="Failed to dispatch job to agent",
             )
-
-        # Update job status and assign to agent
-        await postgres_db.update_job_status(
-            job_id=job_id,
-            status="processing",
-            creator_status="pending",
-            assigned_agent_id=agent_id,
-        )
-
-        # Update agent status via heartbeat simulation
-        await postgres_db.heartbeat(
-            agent_id=agent_id,
-            status="working",
-            current_job_id=job_id,
-        )
 
         return {"status": "assigned", "agent_id": agent_id, "job_id": job_id}
 
     except HTTPException:
         raise
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to connect to agent: {str(e)}",
-        ) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -2643,14 +2963,22 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
     The orchestrator uses this to track agent health and current job state.
     """
     try:
-        success = await postgres_db.heartbeat(
+        result = await postgres_db.heartbeat(
             agent_id=agent_id,
             status=heartbeat.status,
             current_job_id=heartbeat.current_job_id,
             metrics=heartbeat.metrics,
         )
-        if not success:
+        if result is None:
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+        # If agent transitioned to ready, trigger the dispatcher
+        # (will be wired up in the dispatcher task)
+        prev_status = result.get("previous_status")
+        if prev_status and prev_status != heartbeat.status and heartbeat.status == "ready":
+            logger.info(f"Agent {agent_id} transitioned {prev_status} → ready")
+            _trigger_dispatch()
+
         return {"status": "ok"}
     except HTTPException:
         raise
@@ -2727,6 +3055,153 @@ async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
     except HTTPException:
         raise
     except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to connect to agent: {str(e)}",
+        ) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: str,
+    lines: int = Query(default=100, ge=1, le=1000),
+    grep: str | None = Query(default=None),
+    level: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Read the tail of a job's log file with optional filtering.
+
+    Args:
+        job_id: Job UUID
+        lines: Number of tail lines to return (1-1000, default 100)
+        grep: Case-insensitive substring filter
+        level: Log level filter (DEBUG, INFO, WARNING, ERROR)
+    """
+    import re
+
+    # Validate job_id format
+    try:
+        UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
+
+    log_path = workspace_service.base_path / "logs" / f"job_{job_id}.log"
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail=f"Log file not found for job {job_id}")
+
+    try:
+        all_lines = log_path.read_text().splitlines()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read log file: {e}")
+
+    filtered = False
+
+    # Level filter: match lines starting with timestamp pattern followed by level
+    if level:
+        level_upper = level.upper()
+        if level_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+            raise HTTPException(status_code=400, detail=f"Invalid level: {level}. Must be DEBUG, INFO, WARNING, or ERROR")
+        pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{level_upper}\s+-")
+        all_lines = [l for l in all_lines if pattern.match(l)]
+        filtered = True
+
+    # Grep filter
+    if grep:
+        grep_lower = grep.lower()
+        all_lines = [l for l in all_lines if grep_lower in l.lower()]
+        filtered = True
+
+    total_lines = len(all_lines)
+
+    # Tail N lines
+    tail_lines = all_lines[-lines:]
+
+    return {
+        "job_id": job_id,
+        "lines": tail_lines,
+        "total_lines": total_lines,
+        "filtered": filtered,
+        "log_path": str(log_path),
+    }
+
+
+@app.get("/api/jobs/{job_id}/llm-requests")
+async def get_job_llm_requests(
+    job_id: str,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List LLM requests for a job with summary fields.
+
+    Returns model, timestamp, token usage, tool call names, and iteration
+    for each request. Use the _id with GET /api/requests/{doc_id} to get
+    the full request/response.
+    """
+    if not mongodb.is_available:
+        raise HTTPException(status_code=503, detail="MongoDB not available")
+
+    try:
+        UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid job_id format: {job_id}")
+
+    try:
+        data = await mongodb.list_llm_requests(job_id, limit=limit, offset=offset)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/shell-state")
+async def get_job_shell_state(job_id: str) -> dict[str, Any]:
+    """Proxy shell state request to the agent processing a job.
+
+    Resolves job -> assigned agent -> pod IP, then proxies to
+    the agent's GET /system/shell-state endpoint.
+    """
+    import httpx as _httpx
+
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job.get("status") != "processing":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job is not processing (status: {job.get('status')})"
+            )
+
+        assigned_agent_id = job.get("assigned_agent_id")
+        if not assigned_agent_id:
+            raise HTTPException(status_code=400, detail="Job has no assigned agent")
+
+        agent = await postgres_db.get_agent(str(assigned_agent_id))
+        if not agent:
+            raise HTTPException(status_code=404, detail="Assigned agent not found")
+
+        pod_ip = agent.get("pod_ip")
+        if not pod_ip:
+            raise HTTPException(status_code=400, detail="Agent has no pod IP configured")
+
+        pod_port = agent.get("pod_port", 8001)
+        agent_url = f"http://{pod_ip}:{pod_port}/system/shell-state"
+
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(agent_url)
+
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Agent returned {response.status_code}: {response.text}",
+            )
+
+        return response.json()
+
+    except HTTPException:
+        raise
+    except _httpx.RequestError as e:
         raise HTTPException(
             status_code=502,
             detail=f"Failed to connect to agent: {str(e)}",
