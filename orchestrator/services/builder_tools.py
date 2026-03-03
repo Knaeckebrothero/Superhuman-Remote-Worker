@@ -53,9 +53,15 @@ SERVER_SIDE_TOOLS = {
     "get_table_schema",
     # Execution debug
     "get_audit_trail",
+    "get_audit_bulk",
+    "get_chat_bulk",
     "get_graph_changes",
     "get_llm_request",
+    "list_llm_requests",
     "search_audit",
+    "get_job_log",
+    "get_job_summary",
+    "get_shell_state",
     # Citation & source library
     "list_job_sources",
     "get_source_detail",
@@ -69,6 +75,7 @@ SERVER_SIDE_TOOLS = {
     "approve_job",
     "resume_job_with_feedback",
     "cancel_job",
+    "pause_job",
     "delete_job",
     "assign_job",
     "create_job",
@@ -1356,6 +1363,192 @@ BUILDER_TOOLS = [
                     },
                 },
                 "required": ["agent_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pause_job",
+            "description": (
+                "Pause a running job. Sends a graceful pause request to the agent. "
+                "The agent finishes its current node, saves a checkpoint, and becomes available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID to pause",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_audit_bulk",
+            "description": (
+                "Get bulk audit entries using offset/limit pagination. "
+                "Better than page-based for scanning large histories. Up to 500 per request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Number of entries to skip (default 0)",
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max entries to return (max 500, default 500)",
+                        "default": 500,
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_bulk",
+            "description": (
+                "Get bulk chat history using offset/limit pagination. "
+                "Better than page-based for scanning large conversations. Up to 500 per request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Number of entries to skip (default 0)",
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max entries to return (max 500, default 500)",
+                        "default": 500,
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_summary",
+            "description": (
+                "Get a comprehensive one-shot summary of a job. "
+                "Fetches status, progress, todos, workspace overview, and recent tool "
+                "calls in parallel — everything in a single response."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_log",
+            "description": (
+                "Read the tail of a job's log file with optional filtering by "
+                "log level and/or grep pattern. Useful for diagnosing agent errors."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID",
+                    },
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of tail lines (max 1000, default 100)",
+                        "default": 100,
+                    },
+                    "grep": {
+                        "type": "string",
+                        "description": "Case-insensitive substring filter",
+                    },
+                    "level": {
+                        "type": "string",
+                        "description": "Log level filter (DEBUG, INFO, WARNING, ERROR)",
+                        "enum": ["DEBUG", "INFO", "WARNING", "ERROR"],
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_llm_requests",
+            "description": (
+                "List LLM requests for a job with model, timestamp, token usage, "
+                "and tool call names. Use doc_id with get_llm_request for full details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max entries (max 100, default 20)",
+                        "default": 20,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Pagination offset (default 0)",
+                        "default": 0,
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_shell_state",
+            "description": (
+                "Get shell tab state from the agent processing a job. "
+                "Returns open terminal tabs with their type and recent output. "
+                "Requires the job to be actively processing on an agent."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID (must be in 'processing' status)",
+                    },
+                },
+                "required": ["job_id"],
             },
         },
     },

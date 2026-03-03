@@ -44,28 +44,33 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 
 
 def _apply_tail(output: str, tail: int) -> str:
-    """Apply tail truncation to run_sync output, preserving the exit code header.
+    """Apply tail truncation to run_sync output, preserving the header.
 
-    run_sync returns format like:
+    run_sync returns formats like:
         Exit code: 0
         --- stdout ---
         line1
-        line2
         ...
 
-    This function keeps the header and truncates only the stdout body.
+    Or on timeout/interactive detection:
+        Command timed out after 120s: ssh admin@host
+        --- terminal state ---
+        Are you sure you want to continue connecting (yes/no)?
+
+    This function keeps the header and truncates only the body.
     """
     lines = output.split("\n")
 
-    # Find the "--- stdout ---" separator
+    # Find the separator line (either stdout or terminal state)
     separator_idx = None
     for i, line in enumerate(lines):
-        if line.strip() == "--- stdout ---":
+        stripped = line.strip()
+        if stripped in ("--- stdout ---", "--- terminal state ---"):
             separator_idx = i
             break
 
     if separator_idx is None:
-        # No separator (e.g. "(no output)" or "Command timed out...")
+        # No separator (e.g. "(no output)" or short messages)
         return output
 
     header = lines[:separator_idx + 1]  # "Exit code: N" + "--- stdout ---"

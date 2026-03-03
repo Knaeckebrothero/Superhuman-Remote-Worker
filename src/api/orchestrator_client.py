@@ -447,6 +447,7 @@ class OrchestratorClient:
             "instructions": instructions,
             "context": context,
             "parent_job_id": job_id,
+            "priority": 10,  # High priority — verification preempts lower-priority work
         }
         if project_id:
             payload["project_id"] = project_id

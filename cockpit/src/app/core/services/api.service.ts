@@ -715,6 +715,18 @@ export class ApiService {
   }
 
   /**
+   * Pause a running job. The agent will cooperatively pause at the next safe point.
+   */
+  pauseJob(jobId: string): Observable<{ status: string } | null> {
+    return this.http.put<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/pause`, {}).pipe(
+      catchError((error) => {
+        console.error(`Failed to pause job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
    * Resume a failed job from its checkpoint.
    * @param jobId The job ID to resume
    * @param feedback Optional feedback to inject before resuming

@@ -44,6 +44,30 @@ _heartbeat_task: Optional[asyncio.Task] = None
 _current_job_id: Optional[str] = None
 _current_job_task: Optional[asyncio.Task] = None
 
+# Cooperative stop mechanism (checked between graph iterations)
+# Used by both pause and cancel — _stop_reason discriminates the action.
+_stop_requested: asyncio.Event = asyncio.Event()  # Signals streaming loop to break
+_stop_reason: Optional[str] = None  # "pause" or "cancel"
+_stop_completed: asyncio.Event = asyncio.Event()  # Signals waiting endpoint that stop finished
+
+
+def _request_stop(reason: str) -> None:
+    """Request cooperative stop. Cancel overrides a pending pause (higher severity)."""
+    global _stop_reason
+    if _stop_reason == "cancel" and reason == "pause":
+        return  # Don't downgrade cancel to pause
+    _stop_reason = reason
+    _stop_completed.clear()
+    _stop_requested.set()
+
+
+def _clear_stop() -> None:
+    """Reset all stop state for a new job."""
+    global _stop_reason
+    _stop_reason = None
+    _stop_requested.clear()
+    _stop_completed.clear()
+
 
 def set_config_path(path: str) -> None:
     """Set the configuration path for the agent.
@@ -325,6 +349,20 @@ def _cleanup_job_file_handler(job_id: str) -> None:
                 root.removeHandler(handler)
 
 
+def _is_verification_enabled() -> bool:
+    """Check if verification is enabled in the current agent config."""
+    if _agent is None:
+        return False
+    config = _agent.config
+    verification_config = getattr(config, "verification", None)
+    if verification_config is None:
+        if hasattr(config, "__getitem__"):
+            verification_config = config.get("verification", {})
+        else:
+            verification_config = {}
+    return bool(verification_config.get("enabled", False)) if verification_config else False
+
+
 async def _maybe_trigger_verification(
     job_id: str,
     result: Dict[str, Any],
@@ -345,26 +383,22 @@ async def _maybe_trigger_verification(
         context: Job context dict (from job creation). Queried from DB if None.
         description: Original job description. Queried from DB if None.
     """
-    # Guard: only trigger on jobs that stopped (pending_review)
+    # Guard: only trigger on jobs that stopped
     if not result.get("should_stop", False):
         return
     if result.get("error"):
         return
 
     # Guard: check agent config
-    if _agent is None:
+    if not _is_verification_enabled():
         return
     config = _agent.config
     verification_config = getattr(config, "verification", None)
     if verification_config is None:
-        # Try dict-style access for plain dict configs
         if hasattr(config, "__getitem__"):
             verification_config = config.get("verification", {})
         else:
             verification_config = {}
-
-    if not verification_config.get("enabled", False):
-        return
 
     # Guard: prevent recursive verification
     job_context = context or {}
@@ -401,11 +435,20 @@ async def _maybe_trigger_verification(
             )
             return
 
-        # Guard: only trigger on job_complete freezes, not phase_boundary
-        if freeze_data.get("freeze_type") != "job_complete":
+        # Guard: only trigger on job completion, not phase_boundary freezes.
+        # Two formats exist depending on autonomy level:
+        #   - review/partial: freeze_type="job_complete"
+        #   - full: status="job_completed" (no freeze_type field)
+        freeze_type = freeze_data.get("freeze_type")
+        is_job_completion = (
+            freeze_type == "job_complete"
+            or freeze_data.get("status") == "job_completed"
+        )
+        if freeze_type == "phase_boundary" or not is_job_completion:
             logger.debug(
                 f"Skipping verification for job {job_id} — "
-                f"freeze_type is '{freeze_data.get('freeze_type')}', not 'job_complete'"
+                f"not a job completion event (freeze_type='{freeze_type}', "
+                f"status='{freeze_data.get('status')}')"
             )
             return
 
@@ -448,10 +491,11 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
 
     Determines the appropriate status from the final state:
     - error present → 'failed'
-    - should_stop=True → 'pending_review' (frozen for human review)
-      This covers both goal_achieved=True (agent called job_complete)
-      and goal_achieved=False (iteration limit or other stop condition).
-    - Otherwise → leave as 'processing' (only explicit approval sets 'completed')
+    - should_stop=True, goal_achieved=True, verification enabled → 'pending_review'
+    - should_stop=True, goal_achieved=True, verification disabled → no override
+      (graph.py already set 'completed' for full autonomy)
+    - should_stop=True, goal_achieved=False → 'pending_review' (frozen for review)
+    - Otherwise → leave as 'processing'
     """
     if _agent is None or _agent.postgres_conn is None:
         logger.warning(f"Cannot update job {job_id} status: no database connection")
@@ -460,6 +504,7 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
     try:
         error = result.get("error")
         should_stop = result.get("should_stop", False)
+        goal_achieved = result.get("goal_achieved", False)
 
         if error:
             error_msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
@@ -468,10 +513,27 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
             )
             logger.info(f"Updated job {job_id} status to 'failed'")
         elif should_stop:
-            await _agent.postgres_conn.jobs.update_status(
-                job_id, status="pending_review"
-            )
-            logger.info(f"Updated job {job_id} status to 'pending_review'")
+            if goal_achieved:
+                # Full autonomy: graph.py already set status to 'completed'.
+                # Only override to 'pending_review' if verification is enabled,
+                # so the critic can review before final completion.
+                if _is_verification_enabled():
+                    await _agent.postgres_conn.jobs.update_status(
+                        job_id, status="pending_review"
+                    )
+                    logger.info(
+                        f"Updated job {job_id} status to 'pending_review' "
+                        f"(verification override for full autonomy)"
+                    )
+                else:
+                    logger.info(
+                        f"Job {job_id} auto-completed (full autonomy, no verification)"
+                    )
+            else:
+                await _agent.postgres_conn.jobs.update_status(
+                    job_id, status="pending_review"
+                )
+                logger.info(f"Updated job {job_id} status to 'pending_review'")
         else:
             logger.warning(
                 f"Job {job_id} ended without should_stop or error — "
@@ -547,6 +609,9 @@ async def _process_orchestrator_job(
         if project_id:
             metadata["project_id"] = project_id
 
+        # Reset stop flags for this job
+        _clear_stop()
+
         # Process the job with streaming for iteration logging
         final_state = None
         streaming_gen = await _agent.process_job(job_id, metadata, stream=True)
@@ -556,6 +621,31 @@ async def _process_orchestrator_job(
                 iteration = state.get("iteration", "?")
                 has_error = state.get("error") is not None
                 logger.info(f"[Iteration {iteration}] job={job_id} error={has_error}")
+
+            # Cooperative stop check: exit after the current node completes
+            if _stop_requested.is_set():
+                logger.info(f"Stop requested ({_stop_reason}) for job {job_id} — stopping after current node")
+                break
+
+        # Handle cooperative stop (pause or cancel) vs normal completion
+        if _stop_requested.is_set():
+            reason = _stop_reason
+            new_status = "cancelled" if reason == "cancel" else "paused"
+            _clear_stop()
+            logger.info(f"Job {job_id} stopped gracefully (reason={reason}, status={new_status})")
+            try:
+                if _agent and _agent.postgres_conn:
+                    await _agent.postgres_conn.execute(
+                        "UPDATE jobs SET status = $2, assigned_agent_id = NULL WHERE id = $1::uuid",
+                        job_id,
+                        new_status,
+                    )
+            except Exception as e:
+                logger.error(f"Failed to update job {job_id} to {new_status}: {e}")
+            _current_job_id = None
+            _stop_completed.set()  # Signal the waiting endpoint
+            _cleanup_job_file_handler(job_id)
+            return
 
         result = final_state or {}
         logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
@@ -723,6 +813,47 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
+    @app.get("/system/shell-state", tags=["Monitoring"])
+    async def shell_state() -> Dict[str, Any]:
+        """Get current shell tab state including recent output.
+
+        Returns the list of open terminal tabs with their type and
+        recent output lines. Useful for inspecting what the agent is
+        doing in its shell sessions.
+        """
+        if _agent is None:
+            return {"tabs": [], "message": "Agent not initialized"}
+
+        shell_manager = getattr(_agent, "_shell_manager", None)
+        if shell_manager is None:
+            return {"tabs": [], "message": "No active shell sessions"}
+
+        try:
+            tab_list = shell_manager.list_tabs()
+            tabs = []
+            for tab_meta in tab_list:
+                name = tab_meta.get("name", "unknown")
+                try:
+                    read_result = shell_manager.read_with_offset(name, lines=30)
+                    recent_output = read_result.get("output", "") if isinstance(read_result, dict) else str(read_result)
+                    total_lines = read_result.get("total_lines", 0) if isinstance(read_result, dict) else 0
+                except Exception:
+                    recent_output = ""
+                    total_lines = 0
+
+                tabs.append({
+                    "name": name,
+                    "type": tab_meta.get("type", "unknown"),
+                    "created_at": tab_meta.get("created_at", ""),
+                    "total_lines": total_lines,
+                    "recent_output": recent_output,
+                })
+
+            return {"tabs": tabs}
+        except Exception as e:
+            logger.error(f"Failed to get shell state: {e}")
+            return {"tabs": [], "message": f"Error: {str(e)}"}
+
     # =========================================================================
     # Orchestrator Integration Endpoints
     # =========================================================================
@@ -759,8 +890,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 detail=f"Agent is busy processing job {_current_job_id}",
             )
 
-        # Accept the job
+        # Accept the job — reset stop state
         _current_job_id = request.job_id
+        _clear_stop()
 
         # Start processing in background
         _current_job_task = asyncio.create_task(
@@ -797,15 +929,18 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         tags=["Orchestrator"],
         responses={
             404: {"model": ErrorResponse, "description": "No job running"},
+            408: {"model": ErrorResponse, "description": "Cancel timed out (hard-killed)"},
         },
     )
     async def cancel_current_job(
         request: JobCancelByOrchestratorRequest,
     ) -> Dict[str, Any]:
-        """Cancel the currently running job.
+        """Cancel the currently running job (cooperative with hard-kill fallback).
 
-        This endpoint is called by the orchestrator to gracefully cancel
-        the current job processing.
+        Sets a cooperative flag checked between graph node executions.
+        The agent finishes its current node, LangGraph saves the checkpoint,
+        then processing stops. If the agent doesn't stop within 120 seconds,
+        falls back to a hard cancel (task.cancel()).
         """
         global _current_job_id, _current_job_task
 
@@ -818,23 +953,88 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         job_id = _current_job_id
         reason = request.reason or "Cancelled by orchestrator"
 
-        # Cancel the job task
-        if _current_job_task and not _current_job_task.done():
-            _current_job_task.cancel()
-            try:
-                await _current_job_task
-            except asyncio.CancelledError:
-                pass
+        # Signal the streaming loop to stop after the current node
+        _request_stop("cancel")
 
-        _current_job_id = None
-        _current_job_task = None
+        logger.info(f"Cancel requested for job {job_id} — waiting for graceful stop")
 
-        logger.info(f"Cancelled job {job_id}: {reason}")
+        # Wait for cooperative stop (with timeout)
+        try:
+            await asyncio.wait_for(_stop_completed.wait(), timeout=120.0)
+            logger.info(f"Job {job_id} cancelled gracefully: {reason}")
+            return {
+                "job_id": job_id,
+                "status": "cancelled",
+                "reason": reason,
+                "graceful": True,
+            }
+        except asyncio.TimeoutError:
+            # Cooperative stop failed — fall back to hard kill
+            logger.warning(f"Graceful cancel timed out for job {job_id} — hard killing")
+
+            if _current_job_task and not _current_job_task.done():
+                _current_job_task.cancel()
+                try:
+                    await _current_job_task
+                except asyncio.CancelledError:
+                    pass
+
+            _current_job_id = None
+            _current_job_task = None
+            _clear_stop()
+
+            return {
+                "job_id": job_id,
+                "status": "cancelled",
+                "reason": f"{reason} (hard-killed after timeout)",
+                "graceful": False,
+            }
+
+    @app.post(
+        "/job/pause",
+        tags=["Orchestrator"],
+        responses={
+            404: {"model": ErrorResponse, "description": "No job running"},
+            408: {"model": ErrorResponse, "description": "Pause timed out"},
+        },
+    )
+    async def pause_current_job() -> Dict[str, Any]:
+        """Gracefully pause the currently running job.
+
+        Sets a cooperative flag that is checked between graph node executions.
+        The agent finishes its current node, LangGraph saves the checkpoint,
+        then processing stops and the agent becomes available.
+
+        Waits up to 120 seconds for the job to actually pause.
+        """
+        if _current_job_id is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No job currently running",
+            )
+
+        job_id = _current_job_id
+
+        # Signal the streaming loop to stop after the current node
+        _request_stop("pause")
+
+        logger.info(f"Pause requested for job {job_id} — waiting for graceful stop")
+
+        # Wait for the job to actually pause (with timeout)
+        try:
+            await asyncio.wait_for(_stop_completed.wait(), timeout=120.0)
+        except asyncio.TimeoutError:
+            # The flag persists, so the job will still pause after the current node
+            # finishes — but we can't wait any longer
+            logger.warning(f"Pause timed out for job {job_id} — flag still set, will pause after current node")
+            raise HTTPException(
+                status_code=408,
+                detail=f"Pause timed out after 120s. Job {job_id} will pause after current node completes.",
+            )
 
         return {
             "job_id": job_id,
-            "status": "cancelled",
-            "reason": reason,
+            "status": "paused",
         }
 
     @app.post(
@@ -895,14 +1095,50 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         async def _resume_job():
             global _current_job_id
             _setup_job_file_logging(request.job_id)
+            _clear_stop()
             try:
-                result = await _agent.process_job(
+                # Use streaming for cooperative stop support (pause/cancel)
+                final_state = None
+                streaming_gen = await _agent.process_job(
                     request.job_id,
                     metadata=resume_metadata if resume_metadata else None,
                     resume=True,
                     feedback=feedback,
                     original_config_name=config_name,
+                    stream=True,
                 )
+                async for state in streaming_gen:
+                    final_state = state
+                    if isinstance(state, dict):
+                        iteration = state.get("iteration", "?")
+                        logger.info(f"[Resume iteration {iteration}] job={request.job_id}")
+
+                    # Cooperative stop check
+                    if _stop_requested.is_set():
+                        logger.info(f"Stop requested ({_stop_reason}) for resumed job {request.job_id}")
+                        break
+
+                # Handle cooperative stop vs normal completion
+                if _stop_requested.is_set():
+                    reason = _stop_reason
+                    new_status = "cancelled" if reason == "cancel" else "paused"
+                    _clear_stop()
+                    logger.info(f"Resumed job {request.job_id} stopped gracefully (status={new_status})")
+                    try:
+                        if _agent and _agent.postgres_conn:
+                            await _agent.postgres_conn.execute(
+                                "UPDATE jobs SET status = $2, assigned_agent_id = NULL WHERE id = $1::uuid",
+                                request.job_id,
+                                new_status,
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to update resumed job {request.job_id} to {new_status}: {e}")
+                    _current_job_id = None
+                    _stop_completed.set()
+                    _cleanup_job_file_handler(request.job_id)
+                    return
+
+                result = final_state or {}
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
                 # Update job status in database based on final state
                 await _update_job_status_from_result(request.job_id, result or {})

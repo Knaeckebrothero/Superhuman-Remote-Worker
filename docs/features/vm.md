@@ -7,7 +7,7 @@ tags:
   - research
 ---
 
-# VM-Based Agent Isolation (KubeVirt + Harvester)
+# VM-Based Agent Isolation (KubeVirt)
 
 Design document for running each agent job in a dedicated virtual machine instead of a container, providing full OS-level isolation with enterprise-style management and browser-based remote access.
 
@@ -32,20 +32,22 @@ The second motivation is **remote collaboration**. The whole point of a cloud-ho
 
 ### Infrastructure Stack
 
+**MVP:** Separate single-node k3s cluster on a spare machine with KubeVirt. Physically isolated from the main cluster — agent VMs can only reach services explicitly exposed (NATS, orchestrator API). No Harvester, no distributed storage, just k3s + KubeVirt + ephemeral containerDisk images.
+
 ```
-Rancher (management UI)
-├── Main k3s cluster (orchestrator, cockpit, databases, NATS)
-└── Harvester cluster (agent VMs)
-        │
-        ├── agent-vm-job-abc123
-        ├── agent-vm-job-def456
-        └── agent-vm-job-ghi789
+Main k3s cluster                    Agent k3s cluster (spare machine)
+├── orchestrator                    └── KubeVirt
+├── cockpit                             ├── agent-vm-job-abc123
+├── databases                           ├── agent-vm-job-def456
+├── NATS ◄──── (NodePort) ────────────► └── agent-vm-job-ghi789
+└── ...                                     (management daemons connect to NATS)
 ```
 
-- **Rancher** manages both the main k3s cluster and the Harvester cluster
-- **Harvester** (built on KubeVirt) handles VM lifecycle, storage, networking
+**Production (future):** Harvester on 3 dedicated nodes for HA, live migration, distributed storage. See [Harvester Setup Guide](./vm_harvester_setup.md) for that path.
+
 - **KubeVirt** provides the `VirtualMachine` / `VirtualMachineInstance` CRDs
 - Agent VMs are ephemeral — created per job, destroyed on completion
+- Boot images pulled from Docker Hub as `containerDisk` (no persistent storage needed for MVP)
 
 ### VM Internal Architecture
 
@@ -69,7 +71,7 @@ Each VM runs two fully separated layers:
 │  │   single process, communicates with orchestrator   │  │
 │  └──────────────────────┬────────────────────────────┘  │
 │                         │                               │
-│                         │ NATS / HTTP / virtio-vsock    │
+│                         │ NATS JetStream                │
 ├─────────────────────────┼───────────────────────────────┤
 │  AGENT PLANE (non-root user: "agent")                   │
 │                         │                               │
@@ -97,15 +99,17 @@ The management daemon is a single root-level service pre-installed in the base i
 
 ### Communication Channel
 
-The daemon needs a reliable channel to the orchestrator. Options (to be decided):
+**Decision: NATS JetStream** — the cloud workspace architecture already specifies NATS for agent↔orchestrator communication. Using NATS inside the VM keeps the messaging layer consistent. The NATS client is lightweight (~5 MB static binary or Python library). The management daemon connects to the NATS cluster running on the main k3s cluster over the internal network.
 
-| Option | Pros | Cons |
-|--------|------|------|
-| **virtio-vsock** | No network needed, most secure, direct host↔VM | KubeVirt support varies, more complex setup |
-| **HTTP over internal network** | Simple, well-understood, works with existing orchestrator API | Requires network config, slightly weaker isolation |
-| **NATS** | Already planned for agent↔orchestrator comms (cloud_workspace.md), pub/sub fits event model | Extra dependency inside VM |
-
-The NATS approach is the most likely fit since the cloud workspace architecture already specifies NATS JetStream for agent communication.
+Subject namespace (draft):
+```
+agent.vm.{job_id}.register     — daemon announces VM is ready
+agent.vm.{job_id}.heartbeat    — periodic health/resource report
+agent.vm.{job_id}.status       — agent state changes (running, frozen, completed)
+agent.vm.{job_id}.sudo.request — privilege escalation request
+agent.vm.{job_id}.sudo.response— approve/deny from orchestrator
+agent.vm.{job_id}.control      — freeze, resume, terminate commands from orchestrator
+```
 
 ## Remote Access (Browser-Based)
 
@@ -285,21 +289,71 @@ Layer 4: Orchestrator — human-in-the-loop for sensitive operations
 | **Resource overhead** | ~10 MB | ~50 MB | ~100 MB | ~256-512 MB |
 | **Best for** | Stateless functions | Untrusted code exec | Moderate isolation | Full autonomy |
 
-## Open Questions
+## Decisions (March 2026)
 
-1. **Communication channel**: virtio-vsock vs NATS vs HTTP for daemon↔orchestrator. NATS is the current frontrunner (already in cloud workspace architecture).
+The following decisions lock in the initial implementation path. Optimization and advanced features come later.
 
-2. **Sudo plugin implementation**: Custom PAM module? Sudo plugin API (`/etc/sudo.d/`)? Wrapper binary that replaces `sudo`? Needs prototyping.
+| # | Question | Decision | Rationale |
+|---|----------|----------|-----------|
+| 1 | Communication channel | **NATS** | Already specified in cloud_workspace.md for agent↔orchestrator. One messaging system, not two. |
+| 2 | Sudo plugin | **Deferred** | Get the agent running in a VM first. Sudo plugin is a management daemon feature, not a blocker for initial deployment. |
+| 3 | VM startup time | **Accept 5-30s, optimize later** | Pre-warmed pools are an optimization. Long-running agent jobs amortize boot time. |
+| 4 | Image registry | **Docker Hub (temporary)** | Push container disk images to Docker Hub for now. Migrate to local registry (Harbor or Harvester built-in) later. |
+| 5 | Multi-agent collaboration | **Separate VMs, shared repos/databases** | Simpler isolation model. Revisit if needed. |
+| 6 | Cost/density | **Spare PC: i5 4-core, 16 GB DDR4** | 2-3 agent VMs at 2 vCPUs / 2 GB each. Sufficient for MVP testing. |
+| 7 | Infrastructure | **Separate k3s + KubeVirt (MVP), Harvester (future)** | MVP: single-node k3s on a spare PC, KubeVirt installed via kubectl. Physically separate from the main cluster — keeps agent blast radius contained. Future: Harvester on 3 dedicated nodes for HA, live migration, distributed storage. |
 
-3. **VM startup time**: 5-30s is acceptable for long-running jobs but may need optimization for short tasks. Pre-warmed VM pools could help.
+## Implementation Priority
 
-4. **Image size vs build time**: Full TeXLive is ~4 GB. Balance between pre-installing everything and keeping images manageable.
+Focus: get an agent running in a VM, accessible via browser, reporting to the orchestrator.
 
-5. **Multi-agent collaboration**: Can two agents share a VM? Or should collaboration happen via shared repos/databases with separate VMs?
+```
+Phase 1: Infrastructure (MVP — spare PC)
+  1. Install k3s on spare machine
+  2. Install KubeVirt (operator + CR) via kubectl
+  3. Expose NATS on main cluster via NodePort
+  4. Verify basic VM creation with a test containerDisk image
 
-6. **Cost/density**: How many agent VMs can run concurrently on the home lab hardware? Depends on RAM and storage. Each VM needs ~512 MB-2 GB RAM minimum.
+Phase 2: Base Image
+  5. Build agent-base image with Packer (Ubuntu cloud image)
+     - Management daemon stub (registers with orchestrator, runs agent)
+     - code-server pre-installed
+     - Python 3.12 + agent framework dependencies
+     - cloud-init hooks for job configuration
+  6. Push to Docker Hub as container disk image
+  7. Boot agent-base VM, verify SSH + code-server access
 
-7. **Harvester vs bare KubeVirt**: Harvester is a full HCI platform (separate cluster on bare metal). Could also install KubeVirt directly on the existing k3s cluster. Trade-off: dedicated VM infrastructure vs simpler setup.
+Phase 3: Orchestrator Integration
+  8. Orchestrator creates VirtualMachineInstance via KubeVirt API
+     (kubectl against the agent cluster's kubeconfig)
+  9. cloud-init injects job config (job ID, secrets, workspace seed)
+  10. Management daemon registers with orchestrator over NATS
+  11. Agent process starts, orchestrator tracks status
+
+Phase 4: Remote Access
+  12. code-server accessible via cockpit "Open workspace" action
+  13. Proxy/ingress routing from cockpit to per-VM code-server
+
+Phase 5: Iterate
+  14. Monitoring (resource usage, process list)
+  15. Freeze/resume
+  16. Sudo plugin
+  17. Specialized images (agent-dev, agent-writer, agent-research)
+
+Phase 6: Production Migration (when needed)
+  18. Stand up Harvester on 3 dedicated nodes
+  19. Migrate VM workloads to Harvester cluster
+  20. Pre-warmed VM pools
+  21. Local image registry
+```
+
+See also: [Agent Cluster Setup Guide](./vm_agent_cluster_setup.md), [Packer Templates](../../deployment/harvester/packer/)
+
+## Open Questions (Remaining)
+
+5. **Multi-agent collaboration**: Separate VMs with shared repos/databases for now. Revisit if latency between agents becomes a bottleneck.
+
+6. **Orchestrator kubeconfig management**: The orchestrator on the main cluster needs a kubeconfig for the agent cluster to create/delete VMs. Service account with limited RBAC (only `VirtualMachine`/`VirtualMachineInstance` in `agent-vms` namespace).
 
 ## Related Documents
 

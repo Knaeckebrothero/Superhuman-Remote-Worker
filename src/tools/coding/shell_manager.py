@@ -51,6 +51,28 @@ DEFAULT_BLOCKED_COMMANDS = frozenset([
     "sudo", "reboot", "shutdown", "poweroff", "halt", "init", "systemctl",
 ])
 
+# Patterns that indicate the terminal is waiting for interactive input.
+# Each entry is a tuple of (compiled_regex, description).
+INTERACTIVE_PROMPT_PATTERNS = [
+    # Yes/No confirmation prompts
+    (re.compile(r"\[y/n\]|\[Y/n\]|\[y/N\]|\[N/y\]|\(yes/no\)|\(yes/no/\[fingerprint\]\)", re.IGNORECASE), "confirmation prompt"),
+    # Password / passphrase prompts
+    (re.compile(r"(?:password|passphrase)\s*:", re.IGNORECASE), "password prompt"),
+    # SSH host key verification
+    (re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE), "SSH host key verification"),
+    # PackageKit / dnf install prompts (Fedora)
+    (re.compile(r"Install package '.*?' to provide command", re.IGNORECASE), "package install prompt"),
+    # sudo password
+    (re.compile(r"\[sudo\] password for", re.IGNORECASE), "sudo password prompt"),
+    # Press any key / press enter
+    (re.compile(r"press any key|press enter to continue|hit enter", re.IGNORECASE), "press key prompt"),
+    # GPG passphrase
+    (re.compile(r"enter passphrase", re.IGNORECASE), "passphrase prompt"),
+]
+
+# Seconds of unchanged output before declaring a stall (command waiting for input)
+STALL_DETECTION_SECONDS = 5.0
+
 
 @dataclass
 class ShellTab:
@@ -484,6 +506,39 @@ class ShellManager:
             )
 
         with self._sync_lock:
+            # --- Pre-flight check: is the tab already stuck? ---
+            # If an interactive prompt is already visible, refuse to send the
+            # command.  Sending it would type the command text into the waiting
+            # prompt (e.g. a [y/N] dialog), making things worse.
+            pre_lines = tab.pane.capture_pane(
+                start="-{}".format(self.scrollback_limit)
+            )
+            if isinstance(pre_lines, str):
+                pre_check_lines = pre_lines.splitlines()
+            else:
+                pre_check_lines = list(pre_lines)
+
+            existing_prompt = self._detect_blocked_tab(
+                pre_check_lines, tab
+            )
+            if existing_prompt:
+                state_lines = [
+                    ln for ln in pre_check_lines if ln.strip()
+                ][-30:]
+                terminal_state = "\n".join(state_lines) or "(empty)"
+                logger.info(
+                    f"Tab '{tab_name}' is already blocked by "
+                    f"{existing_prompt} — command not sent: {command}"
+                )
+                return (
+                    f"Tab '{tab_name}' is blocked by a previous "
+                    f"{existing_prompt}. Your command was NOT executed.\n"
+                    f"Resolve the prompt first: send the expected input "
+                    f"with keys mode (e.g. keys='N' or keys='yes'), "
+                    f"send C-c to cancel, or use a different tab.\n"
+                    f"--- terminal state ---\n{terminal_state}"
+                )
+
             # Change directory if needed
             if working_dir:
                 if self.sandbox_cwd:
@@ -495,11 +550,7 @@ class ShellManager:
                 time.sleep(0.1)
 
             # Record buffer position before command
-            pre_lines = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
-            if isinstance(pre_lines, str):
-                pre_count = len(pre_lines.splitlines())
-            else:
-                pre_count = len(list(pre_lines))
+            pre_count = len(pre_check_lines)
 
             # Send command with sentinel
             full_cmd = f'{command}; echo "{sentinel} $?"'
@@ -509,6 +560,8 @@ class ShellManager:
             start_time = time.monotonic()
             output_text = ""
             exit_code = None
+            last_content_hash = None
+            stall_start = None
 
             while time.monotonic() - start_time < timeout:
                 time.sleep(0.2)
@@ -554,6 +607,64 @@ class ShellManager:
                     output_text = "\n".join(output_lines).strip()
                     break
 
+                # --- Early exit: interactive prompt detection ---
+                # Only check after the command has had time to produce output
+                elapsed = time.monotonic() - start_time
+                if elapsed > 1.0:
+                    prompt_type = self._detect_interactive_prompt(all_lines, tab)
+                    if prompt_type:
+                        terminal_state = self._capture_terminal_state(
+                            tab, sentinel, pre_count
+                        )
+                        logger.info(
+                            f"Interactive prompt detected ({prompt_type}) "
+                            f"after {elapsed:.1f}s for: {command}"
+                        )
+                        if working_dir and self.sandbox_cwd:
+                            tab.pane.send_keys(
+                                f"cd {self.sandbox_cwd}", enter=True
+                            )
+                            time.sleep(0.1)
+                        tab.last_activity = datetime.now(timezone.utc)
+                        return (
+                            f"Interactive prompt detected ({prompt_type}). "
+                            f"Use keys mode to respond.\n"
+                            f"--- terminal state ---\n{terminal_state}"
+                        )
+
+                    # --- Stall detection ---
+                    content_hash = hash(tuple(all_lines[-20:]))
+                    if content_hash == last_content_hash:
+                        if stall_start is None:
+                            stall_start = time.monotonic()
+                        elif (
+                            time.monotonic() - stall_start
+                            >= STALL_DETECTION_SECONDS
+                        ):
+                            terminal_state = self._capture_terminal_state(
+                                tab, sentinel, pre_count
+                            )
+                            logger.info(
+                                f"Output stall detected after {elapsed:.1f}s "
+                                f"for: {command}"
+                            )
+                            if working_dir and self.sandbox_cwd:
+                                tab.pane.send_keys(
+                                    f"cd {self.sandbox_cwd}", enter=True
+                                )
+                                time.sleep(0.1)
+                            tab.last_activity = datetime.now(timezone.utc)
+                            return (
+                                f"Command appears to be waiting for input "
+                                f"(no output change for "
+                                f"{STALL_DETECTION_SECONDS:.0f}s). "
+                                f"Use keys mode to respond or C-c to cancel.\n"
+                                f"--- terminal state ---\n{terminal_state}"
+                            )
+                    else:
+                        stall_start = None
+                    last_content_hash = content_hash
+
             # Restore working directory if changed
             if working_dir and self.sandbox_cwd:
                 tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
@@ -562,7 +673,13 @@ class ShellManager:
             tab.last_activity = datetime.now(timezone.utc)
 
             if exit_code is None:
-                return f"Command timed out after {timeout}s: {command}"
+                terminal_state = self._capture_terminal_state(
+                    tab, sentinel, pre_count
+                )
+                return (
+                    f"Command timed out after {timeout}s: {command}\n"
+                    f"--- terminal state ---\n{terminal_state}"
+                )
 
             # Format output
             parts = [f"Exit code: {exit_code}"]
@@ -622,6 +739,129 @@ class ShellManager:
             all_lines.pop()
 
         return all_lines
+
+    def _check_alternate_screen(self, tab: ShellTab) -> bool:
+        """Check if the pane is in alternate screen mode (vim, less, nano, etc.).
+
+        Returns:
+            True if alternate screen is active.
+        """
+        try:
+            result = tab.pane.cmd("display-message", "-p", "#{alternate_on}")
+            return result.stdout and result.stdout[0].strip() == "1"
+        except Exception:
+            return False
+
+    def _detect_interactive_prompt(
+        self, all_lines: List[str], tab: ShellTab
+    ) -> Optional[str]:
+        """Check if the terminal appears to be waiting for interactive input.
+
+        Examines the last few lines of pane output for known interactive
+        prompt patterns, and checks for alternate screen mode (editors/pagers).
+
+        Args:
+            all_lines: Current pane content lines.
+            tab: The ShellTab to check.
+
+        Returns:
+            Description of the detected prompt type, or None if no prompt detected.
+        """
+        # Check alternate screen mode (vim, less, nano, etc.)
+        if self._check_alternate_screen(tab):
+            return "alternate screen (editor/pager)"
+
+        # Check last 5 lines for interactive prompt patterns
+        check_lines = all_lines[-5:] if len(all_lines) >= 5 else all_lines
+        text_to_check = "\n".join(check_lines)
+
+        for pattern, description in INTERACTIVE_PROMPT_PATTERNS:
+            if pattern.search(text_to_check):
+                return description
+
+        return None
+
+    def _detect_blocked_tab(
+        self, all_lines: List[str], tab: ShellTab
+    ) -> Optional[str]:
+        """Stricter check for pre-flight: is the tab stuck on a prompt RIGHT NOW?
+
+        Unlike _detect_interactive_prompt (which fires during polling when we
+        know a command is running), this checks BEFORE sending a command.  It
+        must avoid false positives when old prompt text is still in scrollback
+        but the shell has already recovered (e.g. after C-c).
+
+        Returns:
+            Description of the blocking prompt, or None if the tab is ready.
+        """
+        # Alternate screen is always a blocker
+        if self._check_alternate_screen(tab):
+            return "alternate screen (editor/pager)"
+
+        # If the last non-blank line looks like a normal shell prompt
+        # (ends with $ or # or %), the tab is ready — not blocked.
+        last_nonblank = ""
+        for line in reversed(all_lines):
+            stripped = line.strip()
+            if stripped:
+                last_nonblank = stripped
+                break
+
+        if last_nonblank and last_nonblank[-1] in ("$", "#", "%"):
+            return None
+
+        # Check last 3 lines (tighter window than the 5-line polling check)
+        check_lines = all_lines[-3:] if len(all_lines) >= 3 else all_lines
+        text_to_check = "\n".join(check_lines)
+
+        for pattern, description in INTERACTIVE_PROMPT_PATTERNS:
+            if pattern.search(text_to_check):
+                return description
+
+        return None
+
+    def _capture_terminal_state(
+        self, tab: ShellTab, sentinel: str, pre_count: int
+    ) -> str:
+        """Capture the current visible terminal state for timeout reporting.
+
+        Args:
+            tab: The ShellTab to capture from.
+            sentinel: The sentinel string to filter out.
+            pre_count: Line count before the command was sent.
+
+        Returns:
+            Cleaned terminal state string (last 30 lines, sentinel lines filtered).
+        """
+        try:
+            captured = tab.pane.capture_pane(
+                start="-{}".format(self.scrollback_limit)
+            )
+            if isinstance(captured, str):
+                all_lines = captured.splitlines()
+            else:
+                all_lines = list(captured)
+
+            # Get lines after the command was sent, filtering sentinel artifacts
+            post_lines = all_lines[pre_count:]
+            clean_lines = [line for line in post_lines if sentinel not in line]
+
+            # If no post-command lines, fall back to last 30 visible lines
+            if not clean_lines:
+                clean_lines = all_lines[-30:]
+
+            # Cap at 30 lines to keep it concise
+            if len(clean_lines) > 30:
+                clean_lines = clean_lines[-30:]
+
+            # Strip trailing empty lines
+            while clean_lines and not clean_lines[-1].strip():
+                clean_lines.pop()
+
+            return "\n".join(clean_lines)
+        except Exception as e:
+            logger.debug(f"Failed to capture terminal state: {e}")
+            return "(failed to capture terminal state)"
 
     def _handle_claude_code_startup(self, timeout: int = 30) -> None:
         """Handle Claude Code interactive startup prompts automatically.

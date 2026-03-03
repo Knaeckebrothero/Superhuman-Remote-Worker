@@ -178,7 +178,7 @@ memory:
 # The critic either approves the job or resumes it with feedback.
 # See docs/features/verification_phase.md for full design.
 verification:
-  enabled: false         # Opt-in: spawn a critic job after job_complete
+  enabled: true          # Spawn a critic job after job_complete to review deliverables
   critic_config: critic  # Which expert config to use for the reviewer
 
 # Autonomy level — controls when the agent pauses for human review

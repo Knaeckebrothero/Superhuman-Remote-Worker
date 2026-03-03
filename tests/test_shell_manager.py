@@ -167,6 +167,7 @@ class TestRunSync:
     def test_timeout_handling(self, manager):
         output = manager.run_sync("sleep 30", timeout=1)
         assert "timed out" in output.lower()
+        assert "--- terminal state ---" in output
 
     def test_blocked_command(self, manager):
         output = manager.run_sync("sudo ls")
@@ -303,6 +304,142 @@ class TestPruneDeadTabs:
         manager.open_tab("alive")
         manager._prune_dead_tabs()
         assert "alive" in manager._tabs
+
+
+class TestInteractiveDetection:
+    """Tests for interactive prompt detection and early return."""
+
+    def test_confirmation_prompt_detected(self, manager):
+        """Commands that produce a [y/N] prompt should return early."""
+        output = manager.run_sync(
+            'echo "Continue? [y/N]"; read answer',
+            timeout=15,
+        )
+        assert "--- terminal state ---" in output
+        assert "[y/N]" in output
+        assert "interactive prompt" in output.lower() or "waiting for input" in output.lower()
+
+    def test_password_prompt_detected(self, manager):
+        """Commands that produce a password prompt should return early."""
+        output = manager.run_sync(
+            'echo "Password:"; read -s pass',
+            timeout=15,
+        )
+        assert "--- terminal state ---" in output
+        assert "Password:" in output
+
+    def test_stall_detection(self, manager):
+        """Commands that stall (no output change) should return early."""
+        # 'read' with no prompt just waits silently
+        start = time.monotonic()
+        output = manager.run_sync("read answer", timeout=15)
+        elapsed = time.monotonic() - start
+        assert "--- terminal state ---" in output
+        assert "waiting for input" in output.lower() or "no output change" in output.lower()
+        # Should detect stall within ~7s (1s grace + 5s threshold + margin)
+        assert elapsed < 10
+
+    def test_normal_command_unaffected(self, manager):
+        """Normal commands should still work via sentinel detection."""
+        output = manager.run_sync("echo hello-world")
+        assert "Exit code: 0" in output
+        assert "hello-world" in output
+        assert "--- terminal state ---" not in output
+
+    def test_slow_command_not_false_positive(self, manager):
+        """Commands that produce output slowly should not trigger stall detection."""
+        output = manager.run_sync(
+            'for i in 1 2 3; do echo "step $i"; sleep 1; done',
+            timeout=10,
+        )
+        assert "Exit code: 0" in output
+        assert "step 3" in output
+        assert "--- terminal state ---" not in output
+
+    def test_timeout_includes_visible_content(self, manager):
+        """Timeout should include what's visible in the terminal."""
+        output = manager.run_sync(
+            'echo "visible-marker-12345"; sleep 30',
+            timeout=2,
+        )
+        assert "timed out" in output.lower()
+        assert "--- terminal state ---" in output
+        assert "visible-marker-12345" in output
+
+    def test_blocked_tab_rejects_new_commands(self, manager):
+        """Commands sent to a tab stuck on a prompt should be rejected without executing."""
+        # First: create an interactive prompt on the tab
+        output1 = manager.run_sync(
+            'echo "Continue? [y/N]"; read answer',
+            timeout=15,
+        )
+        assert "--- terminal state ---" in output1
+
+        # Second: try to send a new command to the same (stuck) tab
+        output2 = manager.run_sync("echo should-not-run")
+        assert "blocked" in output2.lower()
+        assert "was not executed" in output2.lower()
+        assert "--- terminal state ---" in output2
+        # The original prompt should still be visible
+        assert "[y/N]" in output2
+
+    def test_blocked_tab_recovers_after_cancel(self, manager):
+        """After C-c on a stuck tab, new commands should work again."""
+        # Create an interactive prompt
+        manager.run_sync(
+            'echo "Continue? [y/N]"; read answer',
+            timeout=15,
+        )
+
+        # Cancel the prompt
+        manager.send("default", "C-c", enter=False)
+        time.sleep(0.5)
+
+        # Now a normal command should work
+        output = manager.run_sync("echo recovered-ok")
+        assert "Exit code:" in output
+        assert "recovered-ok" in output
+
+
+class TestApplyTailTerminalState:
+    """Tests for _apply_tail handling terminal state format."""
+
+    def test_terminal_state_preserved_when_short(self):
+        from src.tools.coding.shell_tools import _apply_tail
+        output = (
+            "Command timed out after 120s: ssh admin@host\n"
+            "--- terminal state ---\n"
+            "Are you sure you want to continue connecting (yes/no)?"
+        )
+        result = _apply_tail(output, tail=30)
+        assert result == output  # Should not truncate
+
+    def test_terminal_state_truncated_when_long(self):
+        from src.tools.coding.shell_tools import _apply_tail
+        body_lines = [f"line {i}" for i in range(50)]
+        output = (
+            "Command timed out after 120s: ssh admin@host\n"
+            "--- terminal state ---\n"
+            + "\n".join(body_lines)
+        )
+        result = _apply_tail(output, tail=10)
+        assert "--- terminal state ---" in result
+        assert "Command timed out" in result
+        assert "40 lines truncated" in result
+        assert "line 49" in result  # Last line preserved
+
+    def test_stdout_format_still_works(self):
+        from src.tools.coding.shell_tools import _apply_tail
+        body_lines = [f"line {i}" for i in range(50)]
+        output = (
+            "Exit code: 0\n"
+            "--- stdout ---\n"
+            + "\n".join(body_lines)
+        )
+        result = _apply_tail(output, tail=10)
+        assert "Exit code: 0" in result
+        assert "--- stdout ---" in result
+        assert "40 lines truncated" in result
 
 
 class TestShellTab:
