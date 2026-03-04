@@ -60,7 +60,7 @@ GIT_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "git_tags",
         "description": "List phase milestone tags",
         "category": "git",
-        "short_description": "List git tags (default: phase-* pattern).",
+        "short_description": "List git tags for this job (use all_jobs=True for all).",
         "phases": ["strategic", "tactical"],
     },
 }
@@ -222,27 +222,37 @@ def create_git_tools(context: ToolContext) -> List[Any]:
         return git_mgr.status()
 
     @tool
-    def git_tags(pattern: str = "phase-*") -> str:
+    def git_tags(pattern: str = "phase-*", all_jobs: bool = False) -> str:
         """List git tags, filtered by pattern.
 
         Use this to see phase milestones and understand progression,
         especially useful after context compaction when phase history
         may not be in conversation context.
 
+        By default, only shows tags for the current job. Set all_jobs=True
+        to see tags from all jobs in a shared project repository.
+
         Args:
             pattern: Glob pattern to filter tags (default: "phase-*")
                     Use "*" to list all tags.
+            all_jobs: If True, show tags from all jobs in the repo.
+                     If False (default), only show this job's tags.
 
         Returns:
             Comma-separated list of matching tags, or message if none found
 
         Example:
-            git_tags()  # List all phase tags
-            git_tags(pattern="phase-1-*")  # Only phase 1 tags
-            git_tags(pattern="*")  # All tags
+            git_tags()  # List all phase tags for this job
+            git_tags(pattern="phase-1-*")  # Only phase 1 tags for this job
+            git_tags(pattern="*")  # All tags for this job
+            git_tags(all_jobs=True)  # Phase tags from all jobs in repo
         """
         if not git_mgr.is_active:
             return "Git versioning not available for this workspace"
+
+        # Auto-scope to current job unless all_jobs requested
+        if not all_jobs and context.job_id:
+            pattern = f"{context.job_id[:8]}-{pattern}"
 
         tags = git_mgr.list_tags(pattern=pattern)
 

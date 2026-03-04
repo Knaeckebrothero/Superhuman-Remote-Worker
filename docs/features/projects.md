@@ -9,11 +9,14 @@ aliases:
   - campaigns
   - multi-job workflows
 related:
+  - "[[project_knowledge_base]]"
   - "[[datasources]]"
   - "[[memory_light]]"
   - "[[deployment]]"
   - "[[debug_cockpit]]"
 ---
+
+> **Note:** For the unified design of what projects share between jobs (the knowledge base), see [[project_knowledge_base]]. This document covers the project infrastructure (database schema, API, merge flow, workspace layout, cockpit UI).
 
 # Projects — Multi-Job Resource Hub
 

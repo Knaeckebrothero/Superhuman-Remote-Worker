@@ -408,7 +408,7 @@ class GitManager:
             return False
 
         try:
-            args = ["tag"]
+            args = ["tag", "-f"]
             if message:
                 args.extend(["-a", tag_name, "-m", message])
             else:
