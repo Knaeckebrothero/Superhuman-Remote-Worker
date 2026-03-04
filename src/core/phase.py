@@ -703,7 +703,9 @@ def finalize_job(
         if git_mgr and git_mgr.is_active:
             try:
                 git_mgr.commit("Job completed (autonomy=full)", allow_empty=True)
-                git_mgr.tag("job-completed", "Job auto-completed (full autonomy)")
+                phase_num = state.get("phase_number", 0)
+                short_id = job_id[:8]
+                git_mgr.tag(f"{short_id}-job-completed-phase-{phase_num}", "Job auto-completed (full autonomy)")
                 git_mgr.push()
             except Exception as e:
                 logger.warning(f"[{job_id}] Final git push failed: {e}")
@@ -766,7 +768,9 @@ def finalize_job(
     if git_mgr and git_mgr.is_active:
         try:
             git_mgr.commit("Job frozen for review", allow_empty=True)
-            git_mgr.tag("job-frozen", "Job frozen for human review")
+            phase_num = state.get("phase_number", 0)
+            short_id = job_id[:8]
+            git_mgr.tag(f"{short_id}-job-frozen-phase-{phase_num}", "Job frozen for human review")
             git_mgr.push()
         except Exception as e:
             logger.warning(f"[{job_id}] Final git push failed: {e}")
@@ -806,6 +810,7 @@ def _complete_phase_with_git(
     phase_number: int,
     phase_type: str,
     todos_archived: int = 0,
+    job_id: str = "unknown",
 ) -> None:
     """Complete a phase with git operations.
 
@@ -816,14 +821,16 @@ def _complete_phase_with_git(
         phase_number: Current phase number
         phase_type: Completed phase type ("strategic" or "tactical")
         todos_archived: Number of todos archived in this phase
+        job_id: Job UUID (used to namespace tags in shared repos)
     """
     git_mgr = workspace.git_manager
     if not git_mgr or not git_mgr.is_active:
         return
 
     try:
-        # Create tag for completed phase
-        tag_name = f"phase-{phase_number}-{phase_type}-complete"
+        # Create tag for completed phase (namespaced by job short ID)
+        short_id = job_id[:8]
+        tag_name = f"{short_id}-phase-{phase_number}-{phase_type}-complete"
         git_mgr.tag(tag_name, f"Phase {phase_number} {phase_type} complete")
         logger.debug(f"Created git tag: {tag_name}")
 
@@ -934,6 +941,7 @@ def on_strategic_phase_complete(
         phase_number=phase_number,
         phase_type="strategic",
         todos_archived=completed_todos,
+        job_id=job_id,
     )
 
     logger.info(
@@ -1003,6 +1011,7 @@ def on_tactical_phase_complete(
         phase_number=phase_number,
         phase_type="tactical",
         todos_archived=completed_todos,
+        job_id=job_id,
     )
 
     # Check autonomy level for phase boundary freeze (before loading new todos)

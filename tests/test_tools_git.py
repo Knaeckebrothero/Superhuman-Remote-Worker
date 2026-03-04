@@ -54,6 +54,12 @@ class MockToolContext:
     def __init__(self, workspace_manager: MockWorkspaceManager):
         self.workspace_manager = workspace_manager
 
+    @property
+    def job_id(self):
+        if self.workspace_manager:
+            return self.workspace_manager.job_id
+        return None
+
     def has_workspace(self) -> bool:
         return self.workspace_manager is not None
 
@@ -299,25 +305,41 @@ class TestGitTagsTool:
     """Tests for git_tags tool."""
 
     def test_tags_default_pattern(self, tools, context):
-        """Test tags with default pattern."""
+        """Test tags with default pattern (auto-scoped to current job)."""
         gm = context.workspace_manager.git_manager
-        gm.tag("phase-1-tactical-complete")
+        # Tags are namespaced by job short ID (test-job-123 -> test-job-)
+        gm.tag("test-job-phase-1-tactical-complete")
+        gm.tag("other-jo-phase-1-tactical-complete")  # Different job's tag
         gm.tag("release-1.0")
 
         git_tags = get_tool_by_name(tools, "git_tags")
         result = git_tags.invoke({})
 
-        assert "phase-1-tactical-complete" in result
+        assert "test-job-phase-1-tactical-complete" in result
+        assert "other-jo" not in result
         assert "release-1.0" not in result
+
+    def test_tags_all_jobs(self, tools, context):
+        """Test tags with all_jobs=True shows all tags."""
+        gm = context.workspace_manager.git_manager
+        gm.tag("test-job-phase-1-tactical-complete")
+        gm.tag("other-jo-phase-1-tactical-complete")
+
+        git_tags = get_tool_by_name(tools, "git_tags")
+        result = git_tags.invoke({"pattern": "*phase-*", "all_jobs": True})
+
+        assert "test-job-phase-1-tactical-complete" in result
+        assert "other-jo-phase-1-tactical-complete" in result
 
     def test_tags_custom_pattern(self, tools, context):
         """Test tags with custom pattern."""
         gm = context.workspace_manager.git_manager
-        gm.tag("phase-1-complete")
+        gm.tag("test-job-phase-1-complete")
         gm.tag("release-1.0")
 
         git_tags = get_tool_by_name(tools, "git_tags")
-        result = git_tags.invoke({"pattern": "release-*"})
+        # all_jobs=True to use pattern directly without job prefix
+        result = git_tags.invoke({"pattern": "release-*", "all_jobs": True})
 
         assert "release-1.0" in result
         assert "phase-1-complete" not in result
@@ -362,8 +384,8 @@ class TestGitToolsIntegration:
         (temp_workspace / "work2.txt").write_text("Task 2 complete")
         gm.commit("[Phase 1 Tactical] todo_2: Complete second task")
 
-        # Tag phase completion
-        gm.tag("phase-1-tactical-complete", "Phase 1 tactical phase completed")
+        # Tag phase completion (namespaced by job short ID)
+        gm.tag("test-job-phase-1-tactical-complete", "Phase 1 tactical phase completed")
 
         # Use tools to verify
         git_log = get_tool_by_name(tools, "git_log")
@@ -373,8 +395,8 @@ class TestGitToolsIntegration:
 
         git_tags = get_tool_by_name(tools, "git_tags")
         tags_result = git_tags.invoke({})
-        assert "phase-1-tactical-complete" in tags_result
+        assert "test-job-phase-1-tactical-complete" in tags_result
 
         git_show = get_tool_by_name(tools, "git_show")
-        show_result = git_show.invoke({"commit_ref": "phase-1-tactical-complete"})
+        show_result = git_show.invoke({"commit_ref": "test-job-phase-1-tactical-complete"})
         assert "todo_2" in show_result  # Last commit before tag

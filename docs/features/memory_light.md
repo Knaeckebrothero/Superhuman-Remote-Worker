@@ -8,10 +8,13 @@ aliases:
   - memory light
   - memory v1
 related:
+  - "[[project_knowledge_base]]"
   - "[[memories_mechanism]]"
   - "[[context_management]]"
   - "[[working_memory]]"
 ---
+
+> **Note:** Memory Light's storage backend is being unified with the project knowledge base. The extraction channels, observer, RRF hybrid search, and injection hook described here remain valid — but the data flows into the knowledge base (`knowledge/` notes + Neo4j + pgvector) rather than a standalone `memories` table. See [[project_knowledge_base]] for the unified design.
 
 # Memory Light — Implementation Roadmap
 

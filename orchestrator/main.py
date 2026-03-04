@@ -1861,8 +1861,11 @@ async def get_repo_diff(
 
 
 @app.get("/api/jobs/{job_id}/repo/tags")
-async def list_repo_tags(job_id: str) -> list[dict[str, Any]]:
+async def list_repo_tags(job_id: str, all_jobs: bool = False) -> list[dict[str, Any]]:
     """List tags in a job's repository.
+
+    By default, only returns tags for the specified job (namespaced by
+    job short ID prefix). Set all_jobs=True to return all tags in the repo.
 
     Returns:
         List of tags with name, sha, and message
@@ -1878,6 +1881,11 @@ async def list_repo_tags(job_id: str) -> list[dict[str, Any]]:
             status_code=404,
             detail=f"No tags found in repo for job '{job_id}'",
         )
+
+    # Filter to this job's tags unless all_jobs requested
+    if not all_jobs:
+        short_id = job_id[:8]
+        tags = [t for t in tags if t["name"].startswith(f"{short_id}-")]
 
     return tags
 

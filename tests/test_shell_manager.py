@@ -212,7 +212,7 @@ class TestRunSync:
         assert "--- terminal state ---" in output
 
     def test_blocked_command(self, manager):
-        output = manager.run_sync("sudo ls")
+        output = manager.run_sync("shutdown now")
         assert "blocked" in output.lower()
 
     def test_no_output_command(self, manager):
@@ -441,6 +441,37 @@ class TestInteractiveDetection:
         output = manager.run_sync("echo recovered-ok")
         assert "Exit code:" in output
         assert "recovered-ok" in output
+
+
+class TestBlockedCommandSend:
+    """Tests for blocked command enforcement in send()."""
+
+    def test_blocked_command_send(self, manager):
+        """send() blocks dangerous commands when enter=True."""
+        result = manager.send("default", "shutdown now", enter=True)
+        assert "blocked" in result.lower()
+
+    def test_send_allows_non_blocked(self, manager):
+        """send() allows normal commands."""
+        result = manager.send("default", "echo hello", enter=True)
+        assert result == "Sent to 'default'"
+
+    def test_send_allows_sudo(self, manager):
+        """send() allows sudo (not blocked by default)."""
+        result = manager.send("default", "sudo ls", enter=True)
+        assert result == "Sent to 'default'"
+
+    def test_send_skips_check_without_enter(self, manager):
+        """send() with enter=False skips blocking (control keys, etc.)."""
+        result = manager.send("default", "shutdown", enter=False)
+        assert result == "Sent to 'default'"
+
+    def test_all_default_blocked_commands_in_send(self, manager):
+        """All default blocked commands are caught by send()."""
+        from src.tools.coding.shell_manager import DEFAULT_BLOCKED_COMMANDS
+        for cmd in DEFAULT_BLOCKED_COMMANDS:
+            result = manager.send("default", f"{cmd} something", enter=True)
+            assert "blocked" in result.lower(), f"{cmd} was not blocked by send()"
 
 
 class TestApplyTailTerminalState:

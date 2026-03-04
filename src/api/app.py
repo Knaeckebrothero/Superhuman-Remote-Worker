@@ -349,18 +349,21 @@ def _cleanup_job_file_handler(job_id: str) -> None:
                 root.removeHandler(handler)
 
 
+def _get_verification_config() -> Dict[str, Any]:
+    """Get verification config from config.extra (same pattern as shell/claude_code)."""
+    if _agent is None:
+        return {}
+    config = _agent.config
+    if hasattr(config, "extra") and isinstance(config.extra, dict):
+        vc = config.extra.get("verification")
+        if isinstance(vc, dict):
+            return vc
+    return {}
+
+
 def _is_verification_enabled() -> bool:
     """Check if verification is enabled in the current agent config."""
-    if _agent is None:
-        return False
-    config = _agent.config
-    verification_config = getattr(config, "verification", None)
-    if verification_config is None:
-        if hasattr(config, "__getitem__"):
-            verification_config = config.get("verification", {})
-        else:
-            verification_config = {}
-    return bool(verification_config.get("enabled", False)) if verification_config else False
+    return bool(_get_verification_config().get("enabled", False))
 
 
 async def _maybe_trigger_verification(
@@ -392,13 +395,7 @@ async def _maybe_trigger_verification(
     # Guard: check agent config
     if not _is_verification_enabled():
         return
-    config = _agent.config
-    verification_config = getattr(config, "verification", None)
-    if verification_config is None:
-        if hasattr(config, "__getitem__"):
-            verification_config = config.get("verification", {})
-        else:
-            verification_config = {}
+    verification_config = _get_verification_config()
 
     # Guard: prevent recursive verification
     job_context = context or {}
@@ -614,13 +611,16 @@ async def _process_orchestrator_job(
 
         # Process the job with streaming for iteration logging
         final_state = None
+        last_iteration = "?"
         streaming_gen = await _agent.process_job(job_id, metadata, stream=True)
         async for state in streaming_gen:
             final_state = state
             if isinstance(state, dict):
-                iteration = state.get("iteration", "?")
+                iteration = state.get("iteration")
+                if iteration is not None:
+                    last_iteration = iteration
                 has_error = state.get("error") is not None
-                logger.info(f"[Iteration {iteration}] job={job_id} error={has_error}")
+                logger.info(f"[Iteration {last_iteration}] job={job_id} error={has_error}")
 
             # Cooperative stop check: exit after the current node completes
             if _stop_requested.is_set():
@@ -1109,11 +1109,14 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                     previous_status=previous_status,
                     stream=True,
                 )
+                last_iteration = "?"
                 async for state in streaming_gen:
                     final_state = state
                     if isinstance(state, dict):
-                        iteration = state.get("iteration", "?")
-                        logger.info(f"[Resume iteration {iteration}] job={request.job_id}")
+                        iteration = state.get("iteration")
+                        if iteration is not None:
+                            last_iteration = iteration
+                        logger.info(f"[Resume iteration {last_iteration}] job={request.job_id}")
 
                     # Cooperative stop check
                     if _stop_requested.is_set():

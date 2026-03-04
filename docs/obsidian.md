@@ -10,6 +10,7 @@ aliases:
   - Obsidian integration
   - project knowledge base
 related:
+  - "[[project_knowledge_base]]"
   - "[[memories_mechanism]]"
   - "[[context_management]]"
   - "[[working_memory]]"
@@ -17,7 +18,9 @@ related:
   - "[[projects]]"
 ---
 
-# Project Knowledge Base
+> **Note:** This document covers note schema details, research findings, and Obsidian CLI integration. For the unified design of how the knowledge base fits the project model, how it replaces Memory Light as the storage backend, and the full implementation plan, see [[project_knowledge_base]].
+
+# Project Knowledge Base — Obsidian Integration & Note Schema
 
 This document captures the design for the project-wide knowledge base — a core piece of infrastructure (like PostgreSQL or the todo system) that every project gets automatically. Agents write structured, interlinked notes throughout execution. Notes accumulate across jobs into a living knowledge graph that both humans (via Obsidian) and agents (via Neo4j + file tools) can query.
 

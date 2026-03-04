@@ -76,10 +76,11 @@ class TestCompletePhaseWithGit:
             phase_number=1,
             phase_type="strategic",
             todos_archived=4,
+            job_id="test-job-1234",
         )
 
-        tags = workspace_with_git.git_manager.list_tags("phase-*")
-        assert "phase-1-strategic-complete" in tags
+        tags = workspace_with_git.git_manager.list_tags("test-job*")
+        assert "test-job-phase-1-strategic-complete" in tags
 
     def test_creates_tag_for_tactical_phase(self, workspace_with_git):
         """Test that git tag is created for completed tactical phase."""
@@ -88,10 +89,11 @@ class TestCompletePhaseWithGit:
             phase_number=1,
             phase_type="tactical",
             todos_archived=10,
+            job_id="test-job-1234",
         )
 
-        tags = workspace_with_git.git_manager.list_tags("phase-*")
-        assert "phase-1-tactical-complete" in tags
+        tags = workspace_with_git.git_manager.list_tags("test-job*")
+        assert "test-job-phase-1-tactical-complete" in tags
 
     def test_creates_commit_with_phase_info(self, workspace_with_git):
         """Test that a commit is created with phase information."""
@@ -169,8 +171,8 @@ class TestOnStrategicPhaseComplete:
         )
 
         assert result.success is True
-        tags = workspace_with_git.git_manager.list_tags("phase-*")
-        assert "phase-1-strategic-complete" in tags
+        tags = workspace_with_git.git_manager.list_tags("test-job*")
+        assert "test-job-phase-1-strategic-complete" in tags
 
 
 class TestOnTacticalPhaseComplete:
@@ -195,8 +197,8 @@ class TestOnTacticalPhaseComplete:
         )
 
         assert result.success is True
-        tags = workspace_with_git.git_manager.list_tags("phase-*")
-        assert "phase-1-tactical-complete" in tags
+        tags = workspace_with_git.git_manager.list_tags("test-job*")
+        assert "test-job-phase-1-tactical-complete" in tags
 
     def test_commits_phase_completion(self, workspace_with_git, todo_manager):
         """Test that phase completion creates a commit."""

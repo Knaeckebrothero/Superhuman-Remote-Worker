@@ -740,8 +740,8 @@ BUILDER_TOOLS = [
         "function": {
             "name": "list_job_tags",
             "description": (
-                "List phase tags for a job (phase_1_start, phase_1_end, etc.). "
-                "Use these tag names as refs in other git tools."
+                "List phase tags for a job (e.g. a1b2c3d4-phase-1-tactical-complete). "
+                "Tags are namespaced by job short ID. Use tag names as refs in other git tools."
             ),
             "parameters": {
                 "type": "object",

@@ -2,7 +2,6 @@
 
 Provides shared utilities used by shell tools:
 - _truncate_output: Truncate large output keeping the tail
-- _check_blocked: Check if a command is in the blocklist
 
 The run_command tool has been removed — use the `shell` tool
 from shell_tools.py instead, which runs commands in persistent
@@ -10,7 +9,7 @@ tmux-backed terminal tabs.
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +42,6 @@ def _truncate_output(text: str, max_chars: int, label: str = "output") -> str:
 
     chars_removed = len(text) - len(truncated)
     return f"[{label} truncated: {chars_removed} chars removed from start]\n{truncated}"
-
-
-def _check_blocked(command: str) -> Optional[str]:
-    """Check if command starts with a blocked prefix.
-
-    Args:
-        command: The command string to check
-
-    Returns:
-        Error message if blocked, None if allowed
-    """
-    first_word = command.strip().split()[0] if command.strip() else ""
-    if first_word in BLOCKED_COMMANDS:
-        return f"Command blocked: '{first_word}' is not allowed. Blocked commands: {', '.join(sorted(BLOCKED_COMMANDS))}"
-    return None
 
 
 def create_coding_tools(context) -> list:
