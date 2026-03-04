@@ -48,7 +48,8 @@ COMMAND_TYPE_MAP = {
 
 # Default blocked commands
 DEFAULT_BLOCKED_COMMANDS = frozenset([
-    "sudo", "reboot", "shutdown", "poweroff", "halt", "init", "systemctl",
+    # "sudo", "systemctl",  # allowed — agents need these for service management
+    "reboot", "shutdown", "poweroff", "halt", "init",
 ])
 
 # Patterns that indicate the terminal is waiting for interactive input.
@@ -310,11 +311,16 @@ class ShellManager:
             enter: Whether to press Enter after sending (default True)
 
         Returns:
-            Confirmation message
+            Confirmation message or blocked error
 
         Raises:
             KeyError: If tab doesn't exist
         """
+        # Check blocked commands when actually executing (enter=True)
+        if enter:
+            blocked = self._check_blocked(text)
+            if blocked:
+                return blocked
         tab = self._get_tab(name)
         tab.pane.send_keys(text, enter=enter)
         tab.last_activity = datetime.now(timezone.utc)
@@ -493,13 +499,9 @@ class ShellManager:
             TimeoutError: If command exceeds timeout
         """
         # Safety check
-        if self.blocked_commands:
-            first_word = command.strip().split()[0] if command.strip() else ""
-            if first_word in self.blocked_commands:
-                return (
-                    f"Command blocked: '{first_word}' is not allowed. "
-                    f"Blocked commands: {', '.join(sorted(self.blocked_commands))}"
-                )
+        blocked = self._check_blocked(command)
+        if blocked:
+            return blocked
 
         if timeout is None:
             timeout = self.default_timeout
@@ -939,6 +941,18 @@ class ShellManager:
                 return
 
         logger.info(f"Claude Code startup handler timed out after {timeout}s (handled: {handled or 'no prompts'})")
+
+    def _check_blocked(self, command: str) -> str | None:
+        """Return error message if command's first word is blocked, else None."""
+        if not self.blocked_commands:
+            return None
+        first_word = command.strip().split()[0] if command.strip() else ""
+        if first_word in self.blocked_commands:
+            return (
+                f"Command blocked: '{first_word}' is not allowed. "
+                f"Blocked commands: {', '.join(sorted(self.blocked_commands))}"
+            )
+        return None
 
     def _get_tab(self, name: str) -> ShellTab:
         """Get a tab by name, raising KeyError if not found."""

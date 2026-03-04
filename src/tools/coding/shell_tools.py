@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_READ_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 50000
 
+# Tmux special key names that should NOT get Enter appended in keys mode
+TMUX_SPECIAL_KEYS = frozenset({
+    "Up", "Down", "Left", "Right",
+    "Enter", "Tab", "Escape", "Space", "BSpace",
+    "Home", "End", "PageUp", "PageDown", "NPage", "PPage",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+    "IC", "DC",  # Insert, Delete
+})
+
 # Tool metadata for registry
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "shell_execute": {
@@ -127,8 +136,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
               (password, y/n, host key, etc.), it returns early with the prompt
               text so you can respond with keys=True. After responding, the tab
               works normally for subsequent commands.
-          keys=True: Send raw keystrokes — passwords, "C-c", "Enter", "Up",
-              "y", etc. No Enter is appended; send "Enter" separately if needed.
+          keys=True: Send raw keystrokes. Text input (passwords, "yes", "y")
+              auto-submits with Enter. Control keys ("C-c", "Up", "Escape")
+              are sent as-is. Send "Enter" alone to press Enter without text.
           is_async=True: Fire-and-forget. Returns immediately without waiting.
               ONLY for long-running background processes (dev servers, builds,
               VPN connections). Use shell_read() later to check progress.
@@ -137,8 +147,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
           1. shell_execute(command="ssh user@host", name="srv")
                → detects password prompt, returns terminal state
           2. shell_execute(command="the_password", name="srv", keys=True)
-             shell_execute(command="Enter", name="srv", keys=True)
-               → password sent, SSH connects
+               → password sent + Enter, SSH connects
           3. shell_execute(command="hostname", name="srv")
                → runs on the remote host via sync mode (returns exit code)
           4. shell_execute(command="exit", name="srv", keys=True)
@@ -154,7 +163,8 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 verbose output (test suites, builds, logs).
             is_async: Don't wait for completion — return immediately. Only for
                 long-running background processes. NOT needed for SSH.
-            keys: Send raw keystrokes instead of executing a command.
+            keys: Send raw keystrokes. Text auto-submits with Enter;
+                control keys (C-c, Up, Escape, etc.) are sent as-is.
 
         Returns:
             [Shells: tab1 | tab2 | ...] header + command output.
@@ -170,8 +180,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             tab_header = sm.format_tab_header()
 
             if keys:
-                # Keys mode: send special keystrokes, wait briefly, return output
-                sm.send(name, command, enter=False)
+                # Keys mode: text input auto-submits with Enter, control keys sent as-is
+                is_special = command in TMUX_SPECIAL_KEYS or command.startswith(("C-", "M-"))
+                sm.send(name, command, enter=not is_special)
                 time.sleep(0.5)
                 text, metadata = sm.read_with_offset(name, lines=tail)
                 text = _truncate_output(text, max_output_chars, "shell output")
