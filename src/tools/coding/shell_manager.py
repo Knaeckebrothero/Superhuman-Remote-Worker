@@ -211,6 +211,38 @@ class ShellManager:
             f"tabs={list(self._tabs.keys())}"
         )
 
+    def _ensure_session_alive(self) -> None:
+        """Recreate the tmux session if it has died externally."""
+        if self.is_alive():
+            return
+
+        logger.warning(
+            f"Tmux session '{self._session_name}' is dead, recreating"
+        )
+        self._tabs.clear()
+
+        self._session = self._server.new_session(
+            session_name=self._session_name,
+            window_name="default",
+            x=200,
+            y=30,
+            detach=True,
+        )
+        self._session.set_option("history-limit", str(self.scrollback_limit))
+
+        default_window = self._session.active_window
+        default_pane = default_window.active_pane
+        self._tabs["default"] = ShellTab(
+            name="default",
+            tab_type="shell",
+            window=default_window,
+            pane=default_pane,
+        )
+
+        if self.sandbox_cwd:
+            default_pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
+            time.sleep(0.1)
+
     def ensure_tab(self, name: str) -> ShellTab:
         """Get an existing tab or auto-create a new shell tab.
 
@@ -223,6 +255,7 @@ class ShellManager:
         Raises:
             ValueError: If name is invalid
         """
+        self._ensure_session_alive()
         if name in self._tabs:
             return self._tabs[name]
         self.open_tab(name)

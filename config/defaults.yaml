@@ -180,6 +180,7 @@ memory:
 verification:
   enabled: true          # Spawn a critic job after job_complete to review deliverables
   critic_config: critic  # Which expert config to use for the reviewer
+  max_rounds: 3          # Max feedback round-trips before auto-accepting
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent

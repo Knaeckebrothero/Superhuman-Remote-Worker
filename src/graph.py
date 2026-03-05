@@ -779,10 +779,20 @@ def create_execute_node(
         # Retry loop for LLM call with exponential backoff
         attempt = 0
 
+        # Total wall-clock timeout for LLM calls. httpx read timeout only fires
+        # when no bytes arrive within the window, but vLLM sends HTTP headers
+        # immediately and then blocks during inference — so the read timeout
+        # never triggers. asyncio.wait_for enforces a hard cap on total time.
+        import asyncio
+        llm_timeout = phase_llm_config.timeout or 600.0
+
         while True:
             try:
                 start_time = time.time()
-                response = await llm_with_tools.ainvoke(prepared_messages)
+                response = await asyncio.wait_for(
+                    llm_with_tools.ainvoke(prepared_messages),
+                    timeout=llm_timeout,
+                )
                 latency_ms = int((time.time() - start_time) * 1000)
 
                 # Reset tool_use_failed streak on successful response
@@ -1192,7 +1202,7 @@ def create_execute_node(
                         )
 
                     retry_manager.record_retry()
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
                     attempt += 1
                     continue
 
@@ -1516,38 +1526,41 @@ def create_handle_transition_node(
             and postgres_db
         ):
             goal_achieved = result.state_updates.get("goal_achieved", False)
+
+            # Write freeze_data first (independent of status update).
+            # This ensures _maybe_trigger_verification can read it even if
+            # the status update below fails.
+            if result.freeze_data:
+                try:
+                    await postgres_db.execute(
+                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
+                        json.dumps(result.freeze_data), job_id,
+                    )
+                except Exception as e:
+                    logger.error(f"[{job_id}] Failed to write freeze_data: {e}")
+
             try:
-                if goal_achieved:
-                    # Full autonomy auto-complete: mark as completed
-                    await postgres_db.jobs.update_status(
-                        job_id,
-                        status="completed",
-                    )
-                    # Store completion data and set completed_at
-                    if result.freeze_data:
-                        await postgres_db.execute(
-                            "UPDATE jobs SET freeze_data = $1::jsonb, completed_at = NOW() WHERE id = $2::uuid",
-                            json.dumps(result.freeze_data), job_id,
-                        )
-                    else:
-                        await postgres_db.execute(
-                            "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
-                            job_id,
-                        )
-                    logger.info(f"[{job_id}] Updated job status to 'completed' in database")
+                # Determine DB status: explicit from freeze_data, or inferred from goal_achieved
+                if result.freeze_data and result.freeze_data.get("status"):
+                    db_status = result.freeze_data["status"]
+                    # Normalize synonyms
+                    if db_status == "job_completed":
+                        db_status = "completed"
+                elif goal_achieved:
+                    db_status = "completed"
                 else:
-                    # Freeze for review (phase boundary or job_complete)
-                    await postgres_db.jobs.update_status(
+                    db_status = "pending_review"
+
+                await postgres_db.jobs.update_status(job_id, status=db_status)
+
+                # Set completed_at for completed jobs
+                if db_status == "completed":
+                    await postgres_db.execute(
+                        "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
                         job_id,
-                        status="pending_review",
                     )
-                    # Store freeze data for approve/frozen endpoints
-                    if result.freeze_data:
-                        await postgres_db.execute(
-                            "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
-                            json.dumps(result.freeze_data), job_id,
-                        )
-                    logger.info(f"[{job_id}] Updated job status to 'pending_review' in database")
+
+                logger.info(f"[{job_id}] Updated job status to '{db_status}' in database")
             except Exception as e:
                 logger.error(f"[{job_id}] Failed to update job status: {e}")
 
@@ -2079,7 +2092,7 @@ def create_audited_tool_node(
     Returns:
         A callable node function with audit logging
     """
-    tool_node = ToolNode(tools)
+    tool_node = ToolNode(tools, handle_tool_errors=True)
 
     async def audited_tools(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute tools with audit logging."""
@@ -2260,11 +2273,13 @@ def build_phase_alternation_graph(
     )
     strategic_config = config.llm.get_phase_config("strategic")
     tactical_config = config.llm.get_phase_config("tactical")
+    summarization_config = config.llm.get_phase_config("summarization")
     context_mgr = ContextManager(
         config=context_config,
         model=config.llm.model,
         strategic_model=strategic_config.model,
         tactical_model=tactical_config.model,
+        summarization_timeout=summarization_config.timeout or config.llm.timeout or 600.0,
     )
 
     # Create retry manager for LLM call retries
@@ -2487,7 +2502,7 @@ async def run_graph_with_streaming(
     Yields:
         State updates from each node
     """
-    async for state in graph.astream(graph_input, config=config):
+    async for state in graph.astream(graph_input, config=config, stream_mode="values"):
         yield state
 
 
