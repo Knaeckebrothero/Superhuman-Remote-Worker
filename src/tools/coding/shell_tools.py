@@ -22,6 +22,36 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_READ_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 50000
 
+# Error patterns to scan for in shell output (P11 mitigation)
+# These indicate application-level errors even when exit code is 0
+_SHELL_ERROR_PATTERNS = [
+    ("Traceback (most recent call last)", "Python traceback"),
+    ("PermissionError:", "Permission denied"),
+    ("ConnectionRefusedError:", "Connection refused"),
+    ("FileNotFoundError:", "File not found"),
+    ("ModuleNotFoundError:", "Missing Python module"),
+    ("OSError:", "OS error"),
+    ("FATAL:", "Fatal error"),
+    ("panic:", "Go/Rust panic"),
+    ("segmentation fault", "Segfault"),
+    ("killed", "Process killed (OOM?)"),
+    ("No space left on device", "Disk full"),
+    ("Connection timed out", "Connection timeout"),
+    ("Name or service not known", "DNS resolution failed"),
+]
+
+
+def _scan_for_error_patterns(output: str) -> Optional[str]:
+    """Scan shell output for known error patterns and return a warning if found."""
+    output_lower = output.lower()
+    found = []
+    for pattern, label in _SHELL_ERROR_PATTERNS:
+        if pattern.lower() in output_lower:
+            found.append(label)
+    if found:
+        return f"⚠ Possible error in output: {', '.join(found)}. Read the output carefully before proceeding."
+    return None
+
 # Tmux special key names that should NOT get Enter appended in keys mode
 TMUX_SPECIAL_KEYS = frozenset({
     "Up", "Down", "Left", "Right",
@@ -202,6 +232,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 output = sm.run_sync(command, tab_name=name)
                 output = _apply_tail(output, tail)
                 output = _truncate_output(output, max_output_chars, "output")
+                # Scan for application-level errors in output
+                warning = _scan_for_error_patterns(output)
+                if warning:
+                    return f"{tab_header}\n{warning}\n{output}"
                 return f"{tab_header}\n{output}"
 
         except (ValueError, KeyError, TimeoutError) as e:

@@ -2,7 +2,7 @@
 # These todos guide the agent through initial workspace setup,
 # plan creation, and first phase todo generation.
 #
-# Each todo includes explicit completion criteria and anti-patterns
+# Each todo includes explicit completion criteria and guidance
 # to prevent scope creep and busywork phases.
 todos:
   - id: 1
@@ -29,9 +29,9 @@ todos:
       COMPLETION CRITERIA: workspace.md exists and contains a "## Pinned Instructions"
       section with the four categories above populated from instructions.md and task_brief.md.
 
-      ANTI-PATTERNS:
-      - Do NOT start writing output files yet. This phase is read-only exploration.
-      - Do NOT skip reading instructions.md — every task failure starts with skipping this.
+      INSTEAD OF: Starting to write output files now — this phase is read-only exploration.
+      Instead of skimming instructions.md — read every line, since every task failure
+      starts with skipping this step.
 
   - id: 2
     content: >-
@@ -44,33 +44,33 @@ todos:
 
       Then structure the rest of the plan as a phase table where each phase has:
       - Phase name and description
-      - Phase type: research, elaboration, execution, integration, or verification
+      - Phase type: research, elaboration, execution, batch, integration, or verification
       - Expected output: which deliverable(s) this phase advances
 
-      PHASE SIZING: Target 5 todos per tactical phase. Prefer many short phases
+      PHASE SIZING: Target 3-7 todos per tactical phase. Prefer many short phases
       over few long ones. Each phase should be one coherent unit of work (e.g.,
       "research the topic," "write section 3," "verify chapter 2 citations").
 
-      PHASE ORDERING: Don't jump straight to execution. Plan research phases first
-      to gather context, then elaboration phases to detail the approach, then
-      execution phases to produce deliverables. Use web_search before writing about
-      any topic — your training data may be outdated.
+      PHASE ORDERING: Plan research phases first to gather context, then elaboration
+      phases to detail the approach, then execution phases to produce deliverables.
+      Use web_search before writing about any topic — your training data may be outdated.
 
       Focus on the first 2-3 phases in detail. Later phases can be sketches — they
-      WILL be adapted as you learn. Don't over-plan.
+      WILL be adapted as you learn. Every phase must map to a concrete deliverable
+      or milestone from instructions.md.
 
-      Every phase must map to a concrete deliverable or milestone from instructions.md.
-      If a phase doesn't produce something listed in the instructions, it shouldn't exist.
+      PLAN VERIFICATION: After creating the plan, cross-check it against instructions.md.
+      For each requirement, confirm at least one phase addresses it. If a requirement
+      has no corresponding phase, add one.
 
       COMPLETION CRITERIA: plan.md exists with at least 2 phases defined, each with
       an expected deliverable that traces back to instructions.md.
 
-      ANTI-PATTERNS:
-      - Do NOT plan "cleanup", "archiving", "packaging", or "final review" phases.
-        Git versioning handles all history automatically, and Gitea handles delivery.
-        The system pushes your workspace to Gitea when you call job_complete.
-      - Do NOT create phases that don't produce deliverables listed in instructions.md.
-      - Do NOT over-plan — you will adapt the plan after every tactical phase.
+      INSTEAD OF: Planning "cleanup", "archiving", "packaging", or "final review"
+      phases — git versioning handles all history automatically, and Gitea handles
+      delivery. Instead of creating phases that produce nothing listed in instructions.md —
+      every phase should advance a deliverable. Instead of over-planning — you will
+      adapt the plan after every tactical phase.
 
   - id: 3
     content: >-
@@ -80,19 +80,20 @@ todos:
       It must be compact and high-value. Structure it with these sections:
       - "## Pinned Instructions" (already populated from todo 1)
       - "## Deliverables" — table tracking each expected output from plan.md
-        with columns: Deliverable | Path | Status (pending/in-progress/done)
+        with columns: Deliverable | Path | Status | Verified By
+      - "## Facts" — durable knowledge discovered during exploration
+        (e.g., "12 input PDFs in documents/", key entity names/IDs)
       - "## Key Decisions" — record significant choices with brief reasoning
-      - "## Entities" — only if you already identified key entities to track
-      - "## Critical Context" — anything else that must survive context compaction
+      - "## Status" — current phase and active blockers
+      - "## Failed Approaches" — initially empty, populated as you encounter failures
 
-      COMPLETION CRITERIA: workspace.md has the sections above and is under 50 lines.
+      COMPLETION CRITERIA: workspace.md has the sections above and is under 60 lines.
       The Deliverables table matches the deliverables defined in plan.md.
 
-      ANTI-PATTERNS:
-      - Do NOT dump full document inventories or file listings here.
-        Use compact references (e.g., "12 input PDFs in documents/").
-      - Do NOT include progress tracking or phase status — that belongs in plan.md.
-      - Do NOT exceed 50 lines. Every line costs tokens on every LLM call.
+      INSTEAD OF: Dumping full document inventories or file listings — use compact
+      references (e.g., "12 input PDFs in documents/"). Instead of including progress
+      tracking or phase status — that belongs in plan.md. Instead of exceeding 60 lines —
+      every line costs tokens on every LLM call.
 
   - id: 4
     content: >-
@@ -102,26 +103,28 @@ todos:
       The tool will reject your call if you haven't read the guide. The guide contains
       critical rules on todo specificity, phase design patterns, and worked examples.
 
-      After reading the guide, create 5 todos for the first tactical phase.
+      After reading the guide, create 3-7 todos for the first tactical phase.
       Each todo must be:
       - A concrete action completable in 1-3 tool calls
       - Specific: names exact files, sections, page ranges, or tool calls
       - Directly advancing the task from instructions.md
       - Clear on what "done" looks like
 
-      The first tactical phase should usually be a RESEARCH phase — gather context
-      and sources before producing deliverables. Don't skip straight to writing.
+      SIMPLE TASK SHORTCUT: If the entire task can be completed in one phase
+      (e.g., a straightforward transformation, simple analysis, or single-document
+      output), skip the research phase and create execution todos directly. Not every
+      task needs multiple phases — match the structure to the complexity.
+
+      For complex or unfamiliar tasks, the first tactical phase should be a RESEARCH
+      phase — gather context and sources before producing deliverables.
 
       Include a final verification todo (e.g., "Verify Phase 1 outputs: confirm
       [specific files] exist and contain [specific content]").
 
-      COMPLETION CRITERIA: next_phase_todos called successfully with ~5 todos.
+      COMPLETION CRITERIA: next_phase_todos called successfully with 3-7 todos.
 
-      ANTI-PATTERNS:
-      - Do NOT skip reading todo_guide.md — the tool enforces this.
-      - Do NOT create vague todos like "research the topic" — be specific about
-        what to search for and where to save results.
-      - Do NOT create meta-todos about workspace management, archiving, status
-        updates, or file reorganization. Every todo must advance the actual task.
-      - Do NOT create todos like "update workspace.md" or "commit progress" —
-        the system handles these automatically at phase boundaries.
+      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this. Instead
+      of vague todos like "research the topic" — be specific about what to search for
+      and where to save results. Instead of meta-todos about workspace management,
+      archiving, status updates, or file reorganization — every todo must advance
+      the actual task. The system handles workspace management automatically.

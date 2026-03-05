@@ -10,6 +10,9 @@ default:
   workspace_template: workspace_template.md
   todo_guide: todo_guide.md
 
+minimax:
+  instructions: instructions_minimax.md
+
 # Model-specific overrides — add as needed:
 # claude-opus:
 #   instructions: instructions_claude_opus.md

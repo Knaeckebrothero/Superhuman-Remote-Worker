@@ -2078,10 +2078,10 @@ def create_audited_tool_node(
     recall_store=None,
     tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create a tool node with audit logging.
+    """Create a tool node with audit logging and loop detection.
 
     This wraps LangGraph's ToolNode to add MongoDB audit logging for
-    tool calls and results.
+    tool calls and results, plus loop detection (P8 mitigation).
 
     Args:
         tools: List of tool objects
@@ -2093,6 +2093,17 @@ def create_audited_tool_node(
         A callable node function with audit logging
     """
     tool_node = ToolNode(tools, handle_tool_errors=True)
+
+    # Loop detection state: track recent tool calls as (name, args_hash) tuples
+    import hashlib
+    from collections import deque
+    _tool_call_history: deque = deque(maxlen=30)
+    _LOOP_WARNING_THRESHOLD = 3  # warn after 3 identical calls
+
+    # Strategic phase budget counter (P6 mitigation)
+    _strategic_tool_calls = [0]
+    _last_phase_number = [-1]
+    _STRATEGIC_BUDGET_WARNING = 10  # warn after this many tool calls in strategic mode
 
     async def audited_tools(state: UniversalAgentState) -> Dict[str, Any]:
         """Execute tools with audit logging."""
@@ -2114,6 +2125,43 @@ def create_audited_tool_node(
                         "call_id": tc.get("id", ""),
                         "args": tc.get("args", {}),
                     })
+
+        # Loop detection: check for repetitive tool calls
+        loop_warnings = []
+        for tc_info in tool_calls_info:
+            args_str = json.dumps(tc_info["args"], sort_keys=True, default=str)
+            args_hash = hashlib.md5(args_str.encode()).hexdigest()[:12]
+            call_sig = (tc_info["name"], args_hash)
+            _tool_call_history.append(call_sig)
+
+            # Count identical calls in recent history
+            identical_count = sum(1 for c in _tool_call_history if c == call_sig)
+            if identical_count >= _LOOP_WARNING_THRESHOLD:
+                loop_warnings.append(
+                    f"⚠ Loop detected: you have called '{tc_info['name']}' with the same "
+                    f"arguments {identical_count} times recently. Try a different approach."
+                )
+                logger.warning(
+                    f"[{job_id}] Loop detected: {tc_info['name']} called {identical_count}x "
+                    f"with args hash {args_hash}"
+                )
+
+        # Strategic phase budget: reset on phase change, warn when over budget
+        if phase_number != _last_phase_number[0]:
+            _strategic_tool_calls[0] = 0
+            _last_phase_number[0] = phase_number
+            _tool_call_history.clear()
+
+        if is_strategic:
+            _strategic_tool_calls[0] += len(tool_calls_info)
+            if _strategic_tool_calls[0] > _STRATEGIC_BUDGET_WARNING and _strategic_tool_calls[0] % 5 == 0:
+                budget_warning = (
+                    f"⚠ You have made {_strategic_tool_calls[0]} tool calls in strategic mode. "
+                    "Strategic review should be shorter than tactical execution. "
+                    "Transition to tactical phase now."
+                )
+                loop_warnings.append(budget_warning)
+                logger.warning(f"[{job_id}] Strategic budget exceeded: {_strategic_tool_calls[0]} calls")
 
         # Audit tool calls before execution (will be updated with results via update_tool_result)
         auditor = get_archiver()
@@ -2156,6 +2204,18 @@ def create_audited_tool_node(
                             latency_ms=execution_time_ms // max(len(tool_calls_info), 1),
                             error=content[:500] if is_error else None,
                         )
+
+        # Inject loop detection warnings into tool result messages
+        if loop_warnings and "messages" in result:
+            warning_text = "\n".join(loop_warnings)
+            for i, msg in enumerate(result["messages"]):
+                if isinstance(msg, ToolMessage):
+                    result["messages"][i] = ToolMessage(
+                        content=f"{warning_text}\n\n{msg.content}",
+                        tool_call_id=msg.tool_call_id,
+                        name=getattr(msg, "name", None),
+                    )
+                    break  # inject into first tool message only
 
         # Memory Light: flush queued memories from sync tool functions
         if recall_store and tool_context:

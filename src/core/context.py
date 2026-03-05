@@ -49,6 +49,7 @@ class ConversationSummary(BaseModel):
     key_decisions: str | List[str] = Field(description="Important decisions made")
     current_state: str | List[str] = Field(description="Current progress and immediate next steps")
     blockers: str | List[str] = Field(default="", description="Errors or blockers encountered, empty if none")
+    critical_facts: str | List[str] = Field(default="", description="Exact identifiers, file paths, error messages, URLs, version numbers, and configuration values that must survive compression verbatim")
     state_changes: str | List[str] = Field(default="", description="Files created, modified, or deleted during this period")
     pinned_instructions: str | List[str] = Field(default="", description="Rules from instructions/config that must persist")
     identity_anchor: dict | str | List[str] = Field(default="", description="Agent role, current task, and active constraints for identity persistence")
@@ -844,6 +845,11 @@ class ContextManager:
     def _format_messages_for_summary(self, messages: List[BaseMessage]) -> List[str]:
         """Format messages into text parts for summarization.
 
+        Uses observation masking (JetBrains "Complexity Trap" pattern):
+        - Recent tool results: include truncated content (first 300 chars)
+        - Old tool results: replace with placeholder noting tool name + size
+        - Reasoning/action history: always preserved in full
+
         Args:
             messages: Messages to format
 
@@ -852,8 +858,17 @@ class ContextManager:
         """
         from src.core.workspace_injection import is_workspace_injection_message
 
+        # Count tool messages to determine recency window
+        tool_msg_indices = []
+        for i, msg in enumerate(messages):
+            if isinstance(msg, ToolMessage):
+                tool_msg_indices.append(i)
+
+        # Keep last 10 tool results with content (observation masking window)
+        recent_tool_indices = set(tool_msg_indices[-10:]) if tool_msg_indices else set()
+
         formatted_parts = []
-        for msg in messages:
+        for i, msg in enumerate(messages):
             # Skip workspace injection messages - they're re-injected fresh after summarization
             if is_workspace_injection_message(msg):
                 continue
@@ -874,8 +889,16 @@ class ContextManager:
                 elif content:
                     formatted_parts.append(f"Assistant: {content[:300]}...")
             elif isinstance(msg, ToolMessage):
-                # Just note that a tool was called, don't include full result
-                formatted_parts.append(f"[Tool result: {len(msg.content)} chars]")
+                tool_name = getattr(msg, "name", None) or "unknown"
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                if i in recent_tool_indices:
+                    # Recent: include truncated content for summarization
+                    truncated = content[:300]
+                    suffix = "..." if len(content) > 300 else ""
+                    formatted_parts.append(f"[Tool '{tool_name}' result: {truncated}{suffix}]")
+                else:
+                    # Old: observation masking — placeholder only
+                    formatted_parts.append(f"[Tool '{tool_name}' result omitted ({len(content)} chars)]")
 
         return formatted_parts
 
@@ -967,6 +990,8 @@ Conversation:
                 parts.append(f"**Current State:**\n{result.current_state.strip()}")
             if result.blockers and result.blockers.strip():
                 parts.append(f"**Blockers:**\n{result.blockers.strip()}")
+            if result.critical_facts and result.critical_facts.strip():
+                parts.append(f"**Critical Facts:**\n{result.critical_facts.strip()}")
             if result.state_changes and result.state_changes.strip():
                 parts.append(f"**State Changes:**\n{result.state_changes.strip()}")
             if result.pinned_instructions and result.pinned_instructions.strip():

@@ -25,9 +25,8 @@ todos:
       COMPLETION CRITERIA: workspace.md updated with "## Feedback Summary" section
       that categorizes all feedback items with severity and affected files.
 
-      ANTI-PATTERNS:
-      - Do NOT start modifying output files yet. This todo is analysis only.
-      - Do NOT dismiss or downplay feedback items — treat them all as actionable.
+      INSTEAD OF: Starting to modify output files now — this todo is analysis only.
+      Instead of dismissing feedback items — treat them all as actionable.
 
   - id: 2
     content: >-
@@ -47,9 +46,8 @@ todos:
       COMPLETION CRITERIA: Each feedback item has been checked against actual
       output files, with specific assessment of what needs to change.
 
-      ANTI-PATTERNS:
-      - Do NOT assume outputs match your memory — re-read the actual files.
-      - Do NOT skip files that seem fine — verify against the feedback.
+      INSTEAD OF: Assuming outputs match your memory — re-read the actual files.
+      Instead of skipping files that seem fine — verify against the feedback.
 
   - id: 3
     content: >-
@@ -59,18 +57,18 @@ todos:
       (1) Lists completed phases from the previous run (for context).
       (2) Creates corrective phases ordered by feedback severity (critical first).
       (3) Each corrective phase targets specific feedback items and files.
-      (4) Estimates todo count per phase (target 5 todos per phase).
+      (4) Estimates todo count per phase (target 3-7 todos per phase).
 
-      REWRITE plan.md — do not append. The old plan is no longer relevant.
+      REWRITE plan.md — the old plan is no longer relevant.
 
       COMPLETION CRITERIA: plan.md rewritten with corrective phases that
       trace back to specific feedback items. Every feedback item must be
       addressed by at least one phase.
 
-      ANTI-PATTERNS:
-      - Do NOT keep the old plan intact — rewrite it to focus on corrections.
-      - Do NOT add phases for tasks unrelated to the feedback.
-      - Do NOT plan "cleanup" or "packaging" phases — the system handles delivery.
+      INSTEAD OF: Keeping the old plan intact — rewrite it to focus on corrections.
+      Instead of adding phases for tasks unrelated to the feedback — address only
+      what was raised. Instead of planning "cleanup" or "packaging" phases — the
+      system handles delivery.
 
   - id: 4
     content: >-
@@ -85,17 +83,17 @@ todos:
       - Include a verification todo that checks the corrected output against
         the original feedback
 
-      Target 5 todos for the first corrective phase.
+      Target 3-7 todos for the first corrective phase.
 
-      CRITICAL: Do NOT call job_complete in this phase. You have not yet made
+      CRITICAL: Do not call job_complete in this phase. You have not yet made
       the corrections — you are only planning them. job_complete should only be
       called after all corrective phases have been executed and verified.
 
-      COMPLETION CRITERIA: next_phase_todos called with ~5 corrective todos
+      COMPLETION CRITERIA: next_phase_todos called with 3-7 corrective todos
       that trace to specific feedback items.
 
-      ANTI-PATTERNS:
-      - Do NOT call job_complete — corrections have not been made yet.
-      - Do NOT skip reading todo_guide.md — the tool enforces this.
-      - Do NOT create vague todos — each must reference specific feedback and files.
-      - Do NOT create todos for archiving, cleanup, or meta-tasks.
+      INSTEAD OF: Calling job_complete now — corrections have not been made yet.
+      Instead of skipping reading todo_guide.md — the tool enforces this.
+      Instead of vague todos — each must reference specific feedback and files.
+      Instead of meta-todos for archiving, cleanup, or status updates — every
+      todo must advance the actual corrections.

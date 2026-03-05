@@ -48,6 +48,8 @@ def _make_config(**overrides):
     config.base_url = overrides.get("base_url", None)
     config.api_key = overrides.get("api_key", None)
     config.temperature = overrides.get("temperature", 0.0)
+    config.top_p = overrides.get("top_p", None)
+    config.top_k = overrides.get("top_k", None)
     config.max_retries = overrides.get("max_retries", 2)
     config.timeout = overrides.get("timeout", None)
     config.reasoning_level = overrides.get("reasoning_level", None)

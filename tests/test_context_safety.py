@@ -151,14 +151,32 @@ class TestFormatMessagesForSummary:
         assert len(parts) == 1
         assert "read_file" in parts[0]
 
-    def test_formats_tool_messages(self, context_manager):
-        """Tool messages should show result length."""
+    def test_formats_tool_messages_recent(self, context_manager):
+        """Recent tool messages should include truncated content (observation masking)."""
         messages = [ToolMessage(content="x" * 100, tool_call_id="1")]
         parts = context_manager._format_messages_for_summary(messages)
 
         assert len(parts) == 1
-        assert "[Tool result:" in parts[0]
-        assert "100 chars" in parts[0]
+        # Single tool message falls within the recent-10 window, so content is included
+        assert "[Tool 'unknown' result:" in parts[0]
+        assert "xxx" in parts[0]  # content preserved (under 300 char truncation)
+
+    def test_formats_tool_messages_old_masked(self, context_manager):
+        """Old tool messages beyond the 10-message window should be observation-masked."""
+        # Create 12 tool messages — first 2 should be masked, last 10 should have content
+        messages = [
+            ToolMessage(content=f"result_{i}" * 20, tool_call_id=str(i))
+            for i in range(12)
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert len(parts) == 12
+        # First 2 are beyond the recent-10 window — should be masked (placeholder only)
+        assert "omitted" in parts[0]
+        assert "omitted" in parts[1]
+        # Last 10 should have content
+        assert "result_2" in parts[2]
+        assert "result_11" in parts[11]
 
     def test_includes_prior_summaries(self, context_manager):
         """System messages with prior summaries should be included."""

@@ -69,6 +69,19 @@
           "default": 0.0,
           "description": "Sampling temperature"
         },
+        "top_p": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "default": null,
+          "description": "Top-p (nucleus) sampling parameter. null uses provider default."
+        },
+        "top_k": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "default": null,
+          "description": "Top-k sampling parameter. null uses provider default."
+        },
         "reasoning_level": {
           "type": "string",
           "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
@@ -113,12 +126,6 @@
           "minimum": 1,
           "default": null,
           "description": "Override max output tokens (auto-detected if null)"
-        },
-        "model_max_context_tokens": {
-          "type": ["integer", "null"],
-          "minimum": 1000,
-          "default": null,
-          "description": "Hard limit for this model's context window. Used for pre-request safety checks (Layer 1) and HTTP-layer validation (Layer 0). Falls back to limits.model_max_context_tokens if null."
         },
         "strategic": {
           "$ref": "#/$defs/llmPhaseOverride",
@@ -321,49 +328,19 @@
     },
     "limits": {
       "type": "object",
-      "description": "Execution limits",
+      "description": "Behavioral execution limits. Model-dependent limits (context_threshold_tokens, model_max_context_tokens, etc.) are set via settings_matrix.yaml.",
       "properties": {
-        "context_threshold_tokens": {
-          "type": "integer",
-          "minimum": 1000,
-          "default": 80000,
-          "description": "Token threshold for context compaction"
-        },
         "message_count_threshold": {
           "type": "integer",
           "minimum": 1,
           "default": 200,
           "description": "Message count threshold for triggering summarization (requires min tokens too)"
         },
-        "message_count_min_tokens": {
-          "type": "integer",
-          "minimum": 1000,
-          "default": 40000,
-          "description": "Minimum token count required when using message count threshold"
-        },
         "tool_retry_count": {
           "type": "integer",
           "minimum": 0,
           "default": 3,
           "description": "Number of retries for failed tool calls"
-        },
-        "model_max_context_tokens": {
-          "type": "integer",
-          "minimum": 1000,
-          "default": 100000,
-          "description": "Global fallback for model context window. Used when llm.model_max_context_tokens is not set. Pre-request safety check (Layer 1) will force summarization if exceeded."
-        },
-        "summarization_safe_limit": {
-          "type": "integer",
-          "minimum": 1000,
-          "default": 90000,
-          "description": "Maximum input tokens for summarization LLM. Must be less than model_max_context_tokens to leave room for prompt overhead. Larger inputs trigger recursive chunked summarization."
-        },
-        "summarization_chunk_size": {
-          "type": "integer",
-          "minimum": 1000,
-          "default": 80000,
-          "description": "Target chunk size in tokens when splitting for recursive summarization."
         },
         "response_validation": {
           "type": "object",
@@ -601,6 +578,17 @@
           "minimum": 0,
           "maximum": 2,
           "description": "Sampling temperature override"
+        },
+        "top_p": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Top-p (nucleus) sampling override for this phase"
+        },
+        "top_k": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Top-k sampling override for this phase"
         },
         "reasoning_level": {
           "type": "string",

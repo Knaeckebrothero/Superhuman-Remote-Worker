@@ -1,37 +1,56 @@
 You are compressing a conversation for handoff to your future self. After this summary,
 the raw history will be gone — this summary is the ONLY context you will have to continue working.
 
-EXCLUSIONS: Do NOT summarize the content of workspace.md or plan.md.
-These files are persistent and will be re-injected. Only note ACTIONS TAKEN
-on these files (e.g., "Updated workspace.md with new blockers").
+<exclusions>
+Do NOT summarize workspace.md or plan.md content. These are persistent and re-injected.
+Only note ACTIONS TAKEN on these files (e.g., "Updated workspace.md with new blockers").
+</exclusions>
 
-Before generating the summary, analyze the conversation:
+<analysis>
+WHY: Analyzing before summarizing prevents you from missing critical details.
+
+Before generating the summary, work through these questions:
 1. What was the user's original request? What are the success criteria?
 2. What actions succeeded? What failed and why (exact error messages)?
 3. Did the user correct or redirect at any point? Quote corrections verbatim.
-4. What was actively being worked on at the end?
-5. What specific details (IDs, paths, values, names) must survive compression?
+4. What was actively being worked on when the conversation ended?
+5. What specific details (IDs, paths, values, names, credentials) must survive?
+6. What approaches FAILED and should NOT be retried?
+</analysis>
 
-Preservation priority (when space is limited):
-  User corrections and constraints > Errors and failed approaches > Active work > Completed work
+<priority>
+WHY: When you must cut details, this ordering prevents the most damaging losses.
 
-What to preserve (critical):
+Preservation priority (highest to lowest):
+1. User corrections and constraints (verbatim quotes)
+2. Errors, failed approaches, and exact error messages
+3. Active work state (what was in progress at the end)
+4. Completed work with verified outcomes
+5. Historical context and older completed work
+</priority>
+
+<preserve>
+WHY: The agent will lose ALL conversation context after compaction. These details are needed to continue without repeating mistakes or losing progress.
+
 - Completed work: what was actually done, not what was planned
-- Key decisions: choices made and WHY (the reasoning matters)
+- Key decisions: choices made and WHY (the reasoning matters for future phases)
 - Discovered information: entity IDs, file paths, version numbers, exact error messages
 - Current state: where the agent is in the plan, what comes next
 - Errors and blockers: exact error text, what was tried, what is still blocked
-- Failed approaches: what did NOT work, so the agent does not retry
+- Failed approaches: what did NOT work and why — prevents the agent from retrying
+- Error patterns: if the same error occurred multiple times, note it explicitly
 - Deliverable status: which outputs are verified vs. only claimed, with evidence
 - Shell state: which tabs are open, which hosts are connected via SSH
-- User corrections: verbatim quotes of "don't do X" or "actually I meant Y"
+- User corrections: direct quotes of "don't do X", "actually I meant Y"
+</preserve>
 
-What to omit:
+<omit>
 - Routine tool calls that succeeded without notable results
-- Verbose outputs saved in files (just reference the file path)
-- Debugging back-and-forth that led to a solution (just note the solution)
+- Verbose outputs saved in files (reference the file path instead)
+- Debugging back-and-forth that led to a solution (note the solution only)
 - Planning discussions captured in the plan file
-- Pleasantries, acknowledgments, filler
+- Pleasantries, acknowledgments, filler text
+</omit>
 
 Required JSON schema:
 {{
@@ -55,5 +74,5 @@ Conversation:
 
 {conversation}
 
-Keep each field concise. Total summary should be under {max_summary_length} tokens.
+Keep each field concise. Total summary under {max_summary_length} tokens.
 Weight recent messages more heavily — the end of the transcript is the active context.
