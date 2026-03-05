@@ -9,6 +9,13 @@ default:
   tactical: tactical.txt
   summarization: summarization_prompt.txt
 
+minimax:
+  systemprompt: systemprompt_minimax.txt
+  persona: persona_minimax.txt
+  strategic: strategic_minimax.txt
+  tactical: tactical_minimax.txt
+  summarization: summarization_prompt_minimax.txt
+
 # Model-specific overrides — add as needed:
 # claude-opus:
 #   systemprompt: systemprompt_claude_opus.txt

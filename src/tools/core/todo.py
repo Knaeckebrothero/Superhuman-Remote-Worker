@@ -35,7 +35,7 @@ TODO_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "todo_complete": {
         "module": "core.todo",
         "function": "todo_complete",
-        "description": "Mark one or more tasks as complete (by ID or comma-separated IDs)",
+        "description": "Mark a single task as complete (one at a time)",
         "category": "core",
         "phases": ["strategic", "tactical"],  # Both: used in all phases
     },
@@ -155,14 +155,14 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
     @tool
     def todo_complete(todo_id: str = "") -> str:
-        """Mark one or more tasks as complete.
+        """Mark a single task as complete.
 
         Call this tool AFTER you have finished working on a task.
+        Complete one todo at a time — each call should reflect verified work
+        for that specific task.
 
         Args:
-            todo_id: Optional. The ID(s) of the todo(s) to complete.
-                     - Single ID: "todo_1"
-                     - Multiple IDs: "todo_1, todo_2, todo_3"
+            todo_id: Optional. The ID of the todo to complete (e.g., "todo_1").
                      If not provided, completes the first incomplete task
                      (in_progress first, then highest-priority pending).
 
@@ -174,7 +174,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
 
         Returns:
             Status message including:
-            - Which task(s) were completed
+            - Which task was completed
             - How many tasks remain
             - What the next task is (if any)
             - Phase transition signal when all tasks complete
@@ -191,12 +191,19 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
         Examples:
             todo_complete()  # Complete first pending task
             todo_complete(todo_id="todo_1")  # Complete specific task
-            todo_complete(todo_id="todo_1, todo_2, todo_3")  # Complete multiple tasks
         """
         try:
             if todo_id and todo_id.strip():
-                # Parse comma-separated IDs
+                # Reject comma-separated IDs — complete one todo at a time
                 ids = [id.strip() for id in todo_id.split(",") if id.strip()]
+
+                if len(ids) > 1:
+                    return (
+                        "Error: Complete one todo at a time. Each todo_complete call should "
+                        "reflect verified work for that specific task.\n"
+                        f"Call todo_complete(todo_id=\"{ids[0]}\") for the first task, "
+                        "then call again for each subsequent task."
+                    )
 
                 if len(ids) == 1:
                     # Single ID - use existing logic
@@ -237,45 +244,6 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                             f"Completed: {todo.content}\n"
                             f"Remaining: {len(remaining)} tasks{next_str}"
                         )
-                else:
-                    # Multiple IDs - use batch method
-                    result = todo_mgr.complete_multiple(ids)
-
-                    completed = result["completed"]
-                    not_found = result["not_found"]
-                    is_last = result["is_last"]
-
-                    # Queue memories for completed todos with notes (Memory Light)
-                    if context.recall_store:
-                        from src.services.recall_store import extract_keywords
-                        for c_todo in completed:
-                            if c_todo.notes:
-                                context.queue_memory(
-                                    content=f"Completed: {c_todo.content}\nOutcome: {'; '.join(c_todo.notes)}",
-                                    keywords=extract_keywords(c_todo.content),
-                                    importance=0.7,
-                                    source="todo",
-                                    memory_type="procedural",
-                                    source_phase=todo_mgr.phase_number,
-                                )
-
-                    lines = []
-                    if completed:
-                        lines.append(f"Completed {len(completed)} tasks:")
-                        for todo in completed:
-                            lines.append(f"  - {todo.content}")
-
-                    if not_found:
-                        lines.append(f"Not found: {', '.join(not_found)}")
-
-                    remaining = todo_mgr.list_pending()
-                    if is_last:
-                        lines.append("All tasks complete! Ready for phase transition.")
-                    elif remaining:
-                        lines.append(f"Remaining: {len(remaining)} tasks")
-                        lines.append(f"Next: {remaining[0].content}")
-
-                    message = "\n".join(lines)
             else:
                 # Original behavior: complete first pending task
                 result = todo_mgr.complete_first_pending_sync()

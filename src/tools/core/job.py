@@ -183,6 +183,33 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
 
+            # Validation gate: cross-check deliverables before accepting
+            validation_warnings = []
+
+            # Check that listed deliverables exist and are non-empty
+            for deliverable in deliverables:
+                if not workspace.exists(deliverable):
+                    validation_warnings.append(f"Deliverable '{deliverable}' does not exist")
+                else:
+                    try:
+                        content = workspace.read_file(deliverable)
+                        if len(content.strip()) < 50:
+                            validation_warnings.append(
+                                f"Deliverable '{deliverable}' appears empty or trivial ({len(content)} bytes)"
+                            )
+                    except Exception:
+                        validation_warnings.append(f"Deliverable '{deliverable}' could not be read")
+
+            # Reject high confidence with validation warnings
+            if validation_warnings and confidence > 0.5:
+                warning_list = "\n".join(f"  - {w}" for w in validation_warnings)
+                return (
+                    f"ERROR: Cannot accept confidence {confidence:.0%} with deliverable issues:\n"
+                    f"{warning_list}\n\n"
+                    "Either fix the deliverables, or lower confidence below 0.5 to acknowledge "
+                    "the issues. Re-call job_complete after addressing these problems."
+                )
+
             # Store final phase data for later use by finalize_job
             final_data = {
                 "summary": summary,

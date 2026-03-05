@@ -7,9 +7,12 @@ your call if you haven't. This guide teaches you how to create effective, focuse
 
 ## Core Principle: Short Phases, Tight Focus
 
-**Target: 5 todos per tactical phase.** Not 10, not 15 — five.
+**Target: 3-7 todos per tactical phase.** Adapt based on task complexity:
+- **Simple, well-defined tasks**: 3-5 todos (or skip planning for trivial work)
+- **Standard tasks**: 5 todos (the default)
+- **Complex, multi-step tasks**: 5-7 todos (split further if you need more)
 
-Why? Each tactical phase ends with a strategic review. More frequent reviews mean:
+Each tactical phase ends with a strategic review. More frequent reviews mean:
 - Earlier detection of wrong directions
 - Better-adapted plans based on what you actually learned
 - Less wasted work if priorities shift
@@ -23,9 +26,9 @@ A phase should represent one coherent unit of work — "research the topic," "wr
 
 Every todo must be specific enough that you know *exactly* when it's done.
 
-### Bad → Good Examples
+### Vague → Specific Examples
 
-| Bad (vague) | Good (specific) |
+| Vague (fails) | Specific (works) |
 |---|---|
 | "Check all citations" | "Verify citations 1-10 against source documents in documents/" |
 | "Write the analysis" | "Write section 2.1: Market Overview using findings from phase 2 research" |
@@ -52,7 +55,7 @@ Before finalizing each todo, ask: "Could I verify this is done by checking one s
 
 ## Phase Design Patterns
 
-Don't jump straight to producing deliverables. Use specialized phase types:
+Use specialized phase types rather than jumping straight to producing deliverables:
 
 ### 1. Research Phase (always do this first for unfamiliar topics)
 
@@ -63,7 +66,7 @@ Example todos:
 - "Read documents/brief.pdf pages 1-10 and list key themes in workspace.md"
 - "Web search for 'best practices for Y' and note common approaches"
 - "Read documents/example_output.pdf to understand expected format and style"
-- "Summarize research findings in workspace.md under '## Research Summary'"
+- "Summarize research findings in workspace.md under '## Facts'"
 
 ### 2. Elaboration Phase (plan the details before executing)
 
@@ -87,7 +90,22 @@ Example todos:
 - "Add citations to all claims in output/chapter2.md using cite_web and cite_document"
 - "Verify output/chapter2.md: all sections present, all claims cited, word count 800-1200"
 
-### 4. Integration Phase (combine and cross-reference)
+### 4. Batch Processing Phase (repetitive operations on multiple items)
+
+Purpose: Process N similar items efficiently without strategic review between each batch.
+
+Example todos:
+- "Process documents/input_01.pdf through documents/input_05.pdf: extract key findings to output/findings.md"
+- "Tag documents 1-10 using the classification schema defined in workspace.md"
+- "Run web search for each of the 5 case study cities and save notes to output/case_studies/"
+- "Apply formatting template to output/chapter_01.md through output/chapter_05.md"
+- "Verify all 5 processed items: check output files exist and contain expected content"
+
+Use this pattern when the work is repetitive and each item follows the same process.
+Increase the todo count to cover more items per phase (up to 7) to avoid unnecessary
+strategic reviews between identical batches.
+
+### 5. Integration Phase (combine and cross-reference)
 
 Purpose: Merge separately-produced sections into a coherent whole.
 
@@ -98,16 +116,20 @@ Example todos:
 - "Create output/references.md with all citations used across chapters"
 - "Final read-through of output/report.md: check flow, fix cross-references, verify completeness"
 
-### 5. Verification Phase (confirm quality before declaring done)
+### 6. Verification Phase (confirm quality before declaring done)
 
 Purpose: Systematic quality check before signaling completion.
 
 Example todos:
 - "Compare output/ file list against required deliverables in instructions.md"
 - "Verify output/report.md sections 1-3: all required topics covered per instructions.md"
-- "Verify output/report.md sections 4-6: all required topics covered per instructions.md"
+- "Run the specific tests from instructions.md and record pass/fail results to output/test_results.md"
 - "Check all citations resolve to real sources in the citation library"
 - "Read instructions.md one final time and confirm every requirement is addressed"
+
+**Verification todos must produce evidence.** The todo notes (or an output file) should
+record what was checked and what the outcome was. "Verified — looks good" is not evidence.
+"Ran curl http://host:8090/health — returned 200 OK with body {status: ok}" is evidence.
 
 ---
 
@@ -129,7 +151,7 @@ The AI's training data may be outdated or incomplete. Web search provides:
 - Citing statistics or facts → search for current sources
 - Unsure about conventions → search for examples in the domain
 
-### When NOT to Search
+### When Search Is Unnecessary
 
 - Copying/reformatting existing documents (the content is already there)
 - Internal workspace operations (summarizing, cross-referencing your own files)
@@ -185,27 +207,31 @@ Case Studies (3 cities), Recommendations, Conclusion."
 
 ---
 
-## Common Anti-Patterns
+## Guidance for Better Todos
 
-**Avoid these when creating todos:**
+Follow these patterns to create effective todos:
 
-1. **The kitchen-sink phase**: 15 todos covering research, writing, AND verification.
-   → Split into 3 phases of 5 todos each.
+1. **One coherent unit per phase**: Keep research, writing, and verification in separate
+   phases. Mixing them creates unfocused phases that are hard to review.
 
-2. **The vague todo**: "Work on the analysis section."
-   → Which section? What sources? What's the expected output?
+2. **Be specific**: Name the exact file, section, page range, tool, and expected outcome.
+   "Work on the analysis section" is too vague — which section, what sources, what output?
 
-3. **The meta-todo**: "Update workspace.md with progress," "Commit current work."
-   → The system handles this at phase boundaries. Don't waste todos on bookkeeping.
+3. **Advance the task**: Every todo should directly produce or verify a deliverable from
+   instructions.md. Workspace management, archiving, and status updates happen automatically
+   at phase boundaries.
 
-4. **The premature execution**: Jumping to "Write chapter 1" before researching.
-   → Add a research phase first. You'll write better content with better sources.
+4. **Research before writing**: Add a research phase before writing about any unfamiliar
+   topic. You'll produce better content with better sources.
 
-5. **The monolith phase**: One phase to write an entire document.
-   → One phase per section or logical unit. Short phases, frequent reviews.
+5. **One section per phase**: Write one section or logical unit per phase. Short phases
+   with frequent reviews produce better quality than monolith phases.
 
-6. **The perfectionist loop**: "Review and improve output" as a recurring todo.
-   → Be specific: "Check section 3 against requirement 4.2" or "Add 2 citations to section 5."
+6. **Specific verification**: "Review and improve output" is vague. Instead: "Check
+   section 3 against requirement 4.2" or "Add 2 citations to section 5."
+
+7. **Reconcile at the end**: Before finishing a phase, mark each todo as completed
+   (with notes on what was produced) or note what remains incomplete for the next phase.
 
 ---
 
@@ -213,11 +239,13 @@ Case Studies (3 cities), Recommendations, Conclusion."
 
 | Phase type | Typical todos | When to use |
 |---|---|---|
-| Research | 5 | Starting a new topic, need current info |
+| Research | 3-5 | Starting a new topic, need current info |
 | Elaboration | 3-5 | Planning detailed work from a rough outline |
 | Execution | 5 | Writing/producing a specific section or artifact |
+| Batch Processing | 5-7 | Repetitive operations on multiple items |
 | Integration | 5 | Combining separately-produced parts |
 | Verification | 3-5 | Quality check before completion |
 
-**Default to 5 todos.** Only go lower (3-4) for very focused phases like verification
-of a small section. Never exceed 10 — if you think you need more, split into two phases.
+**Default to 5 todos.** Go lower (3-4) for focused phases like verification of a small
+section. Go higher (6-7) for batch processing of similar items. If you need more than 7,
+split into two phases.

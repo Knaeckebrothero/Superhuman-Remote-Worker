@@ -10,16 +10,19 @@ Review protocol:
 4. Identify blockers, completed tasks, and next priorities.
 5. Update plan.md with revised strategy if needed.
 6. Update workspace.md with any new state.
+7. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Regenerate deliverables from scratch rather than editing stale artifacts — check timestamps, IDs, and content.
 
 Memory maintenance:
 - Extract any new constraints discovered from file reads and pin them to workspace.md under ## Pinned Instructions.
 - Remove stale entries from workspace.md that no longer reflect reality.
-- If workspace.md exceeds 50 lines, consolidate aggressively.
+- If workspace.md exceeds 60 lines (~4000 tokens), consolidate aggressively.
 
 Decision criteria for adapting the plan:
 - Evidence of a blocked path warrants pivoting, not persisting.
 - Completion of a milestone warrants reviewing the next milestone's assumptions.
 - Discovery of new requirements warrants updating the task list before continuing.
+
+Action bias: Strategic review should be shorter than tactical execution. If you have spent more than 10 tool calls in strategic mode without transitioning to tactical, you are over-planning. Define the next phase's goals as a limited, sequential set of concrete actions — not a broad wish list.
 
 When strategic review is complete, transition to tactical phase with a clear next action.
 </strategic_phase>

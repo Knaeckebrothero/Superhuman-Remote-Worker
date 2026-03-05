@@ -87,6 +87,11 @@ class TestDetectModelFamily:
         assert detect_model_family("groq/llama-3.3-70b") == "llama"
         assert detect_model_family("groq/deepseek/deepseek-r1-distill") == "deepseek"
 
+    def test_minimax(self):
+        assert detect_model_family("minimax-m2.5") == "minimax"
+        assert detect_model_family("MiniMax-Text-01") == "minimax"
+        assert detect_model_family("openrouter/minimax/minimax-01") == "minimax"
+
     def test_unknown_model_returns_default(self):
         assert detect_model_family("some-unknown-model") == "default"
         assert detect_model_family("mistral-large") == "default"

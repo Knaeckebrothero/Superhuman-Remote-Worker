@@ -5,7 +5,7 @@ agent_id: default
 display_name: The General Secretary
 
 llm:
-  model: openai/gpt-oss-120b
+  model: openrouter/minimax/minimax-m2.5
   provider: null  # Auto-detect from model name (claude-* → anthropic, gemini-* → google)
   temperature: 0.0
   reasoning_level: high
@@ -16,10 +16,9 @@ llm:
   max_output_tokens: null  # Auto-detected per provider; override for local models if needed
   multimodal: false  # Set to true if model can process images directly
   parallel_tool_calls: false  # Set to true for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)
-  model_max_context_tokens: 100000  # gpt-oss-120b effective context limit (vLLM); Layer 0/1 safety
-  # IMPORTANT: Override this per-model in expert configs. Wrong values cause crashes
-  # (too high → token limit errors) or wasted context (too low → premature compaction).
-  # No phase overrides — strategic, tactical, and summarization all use gpt-oss-120b
+  # Model-specific inference params (temperature, top_p, top_k) and context limits
+  # are set via config/settings_matrix.yaml — the single source of truth for
+  # model-dependent settings. Do not set model_max_context_tokens here.
 
 workspace:
   structure:
@@ -127,13 +126,10 @@ connections:
   postgres: true
 
 limits:
-  context_threshold_tokens: 80000
+  # Model-dependent limits (context_threshold_tokens, model_max_context_tokens, etc.)
+  # are set via config/settings_matrix.yaml — do not set them here.
   message_count_threshold: 300
-  message_count_min_tokens: 50000
   tool_retry_count: 3
-  model_max_context_tokens: 80000
-  summarization_safe_limit: 100000  # Must be < model_max to leave room for summarization prompt overhead
-  summarization_chunk_size: 80000
   response_validation:
     enabled: true
     max_content_length: 50000   # chars, flag if exceeded with no tool calls
