@@ -15,6 +15,7 @@ duplicate entries.
 See docs/features/memory_light.md Phase 3 for full design.
 """
 
+import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -97,10 +98,12 @@ class MemoryObserver:
         recall_store,
         llm,
         observer_interval: int = 5,
+        timeout: float = 120.0,
     ):
         self.recall_store = recall_store
         self.llm = llm
         self.observer_interval = observer_interval
+        self._timeout = timeout
         self._last_observed_turn: int = 0
 
     def should_observe(self, current_turn: int) -> bool:
@@ -265,7 +268,10 @@ class MemoryObserver:
             llm_messages = [
                 HumanMessage(content=f"{EXTRACTION_PROMPT}\n\n--- Conversation Segment ---\n{conversation_text}\n--- End Segment ---")
             ]
-            response = await self.llm.ainvoke(llm_messages)
+            response = await asyncio.wait_for(
+                self.llm.ainvoke(llm_messages),
+                timeout=self._timeout,
+            )
             raw_content = response.content if hasattr(response, "content") else str(response)
         except Exception as e:
             logger.warning(f"Observer: LLM extraction call failed: {e}")

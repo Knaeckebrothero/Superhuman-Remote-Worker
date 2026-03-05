@@ -366,19 +366,42 @@ def _is_verification_enabled() -> bool:
     return bool(_get_verification_config().get("enabled", False))
 
 
+def _is_job_completion_freeze(row) -> bool:
+    """Check if a job's freeze_data indicates a job completion (not phase boundary).
+
+    Args:
+        row: Database row with a 'freeze_data' column, or None.
+    """
+    if not row or not row.get("freeze_data"):
+        return False
+    try:
+        import json as _json
+        fd = row["freeze_data"]
+        freeze_data = _json.loads(fd) if isinstance(fd, str) else fd
+        freeze_type = freeze_data.get("freeze_type")
+        return (
+            freeze_type == "job_complete"
+            or freeze_data.get("status") == "job_completed"
+        )
+    except Exception:
+        return False
+
+
 async def _maybe_trigger_verification(
     job_id: str,
     result: Dict[str, Any],
     context: Optional[Dict[str, Any]] = None,
     description: Optional[str] = None,
 ) -> None:
-    """Check if a verification job should be created for a completed job.
+    """Check if a verification job should be created or resumed for a completed job.
 
-    Called after a job enters pending_review status. Creates a critic job
-    via the orchestrator if all conditions are met:
+    Called after a job enters reviewing status. Either creates a new critic job
+    (first round) or resumes an existing waiting critic (subsequent rounds).
+
+    Guards:
     1. Agent config has verification.enabled = true
-    2. The job froze with freeze_type = "job_complete" (not phase_boundary)
-    3. The job is NOT itself a verification job (no verification_target in context)
+    2. The job has no parent_job_id (prevents recursive sub-job spawning)
+    3. The job froze with freeze_type = "job_complete" (not phase_boundary)
 
     Args:
         job_id: The completed job's UUID
@@ -397,24 +420,26 @@ async def _maybe_trigger_verification(
         return
     verification_config = _get_verification_config()
 
-    # Guard: prevent recursive verification
-    job_context = context or {}
-    if job_context.get("verification_target"):
-        logger.debug(
-            f"Skipping verification for job {job_id} — it is itself a verification job"
-        )
-        return
-
     # Read freeze_data (and optionally description/context) from DB
     try:
+        import json as _json
+
         freeze_data = None
+        project_id = None
         if _agent.postgres_conn:
             row = await _agent.postgres_conn.fetchrow(
-                "SELECT freeze_data, project_id, description, context FROM jobs WHERE id = $1::uuid",
+                "SELECT freeze_data, project_id, description, context, parent_job_id FROM jobs WHERE id = $1::uuid",
                 job_id,
             )
+
+            # Guard: prevent recursive verification — no sub-jobs for sub-jobs
+            if row and row.get("parent_job_id") is not None:
+                logger.debug(
+                    f"Skipping verification for job {job_id} — it is a sub-job "
+                    f"(parent_job_id={row['parent_job_id']})"
+                )
+                return
             if row and row.get("freeze_data"):
-                import json as _json
                 fd = row["freeze_data"]
                 freeze_data = _json.loads(fd) if isinstance(fd, str) else fd
                 project_id = str(row["project_id"]) if row.get("project_id") else None
@@ -449,31 +474,73 @@ async def _maybe_trigger_verification(
             )
             return
 
-        # All guards passed — create the verification job
-        critic_config = verification_config.get("critic_config", "critic")
-        freeze_data["critic_config"] = critic_config
-        config_name = getattr(config, "agent_id", "unknown")
-
-        logger.info(
-            f"Triggering verification for job {job_id} "
-            f"(critic_config={critic_config})"
+        # Check for an existing waiting critic job (subsequent rounds)
+        critic_row = await _agent.postgres_conn.fetchrow(
+            "SELECT id, status, context FROM jobs WHERE parent_job_id = $1::uuid AND status = 'waiting'",
+            job_id,
         )
 
-        result = await _orchestrator_client.create_verification_job(
-            job_id=job_id,
-            description=description,
-            freeze_data=freeze_data,
-            config_name=config_name,
-            project_id=project_id,
-        )
+        if critic_row:
+            # Subsequent round: resume existing critic
+            critic_id = str(critic_row["id"])
+            critic_ctx_raw = critic_row.get("context")
+            critic_context = (
+                _json.loads(critic_ctx_raw) if isinstance(critic_ctx_raw, str) and critic_ctx_raw
+                else (critic_ctx_raw or {})
+            )
+            new_round = critic_context.get("verification_round", 0) + 1
 
-        if result:
-            critic_job_id = result.get("id", "unknown")
+            # Update critic context with new round + updated deliverables
+            critic_context["verification_round"] = new_round
+            critic_context["deliverables"] = freeze_data.get("deliverables", [])
+            critic_context["summary"] = freeze_data.get("summary", "")
+            critic_context["confidence"] = freeze_data.get("confidence", 0)
+
+            await _agent.postgres_conn.execute(
+                "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                _json.dumps(critic_context), critic_id,
+            )
+
             logger.info(
-                f"Verification job {critic_job_id} created for job {job_id}"
+                f"Resuming existing critic {critic_id} for job {job_id} "
+                f"(round {new_round})"
+            )
+
+            await _orchestrator_client.resume_job(
+                critic_id,
+                feedback=(
+                    f"Target job addressed your feedback (round {new_round}). "
+                    f"Review the updated deliverables and either approve or return with new feedback."
+                ),
             )
         else:
-            logger.error(f"Failed to create verification job for {job_id}")
+            # First round: create new critic job
+            critic_config = verification_config.get("critic_config", "critic")
+            max_rounds = verification_config.get("max_rounds", 3)
+            freeze_data["critic_config"] = critic_config
+            config_name = getattr(_agent.config, "agent_id", "unknown")
+
+            logger.info(
+                f"Triggering verification for job {job_id} "
+                f"(critic_config={critic_config}, max_rounds={max_rounds})"
+            )
+
+            create_result = await _orchestrator_client.create_verification_job(
+                job_id=job_id,
+                description=description,
+                freeze_data=freeze_data,
+                config_name=config_name,
+                project_id=project_id,
+                max_rounds=max_rounds,
+            )
+
+            if create_result:
+                critic_job_id = create_result.get("id", "unknown")
+                logger.info(
+                    f"Verification job {critic_job_id} created for job {job_id}"
+                )
+            else:
+                logger.error(f"Failed to create verification job for {job_id}")
 
     except Exception as e:
         # Verification trigger failures should never crash the agent
@@ -488,9 +555,11 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
 
     Determines the appropriate status from the final state:
     - error present → 'failed'
-    - should_stop=True, goal_achieved=True, verification enabled → 'pending_review'
+    - should_stop=True, goal_achieved=True, verification enabled → 'reviewing'
     - should_stop=True, goal_achieved=True, verification disabled → no override
       (graph.py already set 'completed' for full autonomy)
+    - should_stop=True, goal_achieved=False, critic job → no override
+      (handle_transition already set the correct status from freeze_data)
     - should_stop=True, goal_achieved=False → 'pending_review' (frozen for review)
     - Otherwise → leave as 'processing'
     """
@@ -499,6 +568,8 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
         return
 
     try:
+        import json as _json
+
         error = result.get("error")
         should_stop = result.get("should_stop", False)
         goal_achieved = result.get("goal_achieved", False)
@@ -510,23 +581,48 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
             )
             logger.info(f"Updated job {job_id} status to 'failed'")
         elif should_stop:
-            if goal_achieved:
-                # Full autonomy: graph.py already set status to 'completed'.
-                # Only override to 'pending_review' if verification is enabled,
-                # so the critic can review before final completion.
+            # Check if this is a critic job (has parent_job_id).
+            # If so, handle_transition already set the correct status
+            # (e.g., 'waiting' for returned verdicts) — don't override.
+            is_critic = False
+            try:
+                row = await _agent.postgres_conn.fetchrow(
+                    "SELECT parent_job_id, freeze_data FROM jobs WHERE id = $1::uuid",
+                    job_id,
+                )
+                if row and row.get("parent_job_id") is not None:
+                    is_critic = True
+            except Exception:
+                row = None
+
+            if is_critic:
+                logger.info(
+                    f"Job {job_id} is a critic job — "
+                    f"skipping status override (handle_transition set it)"
+                )
+            elif goal_achieved or _is_job_completion_freeze(row):
+                # Job completion (any autonomy level). If verification is
+                # enabled, override to 'reviewing' so the critic handles it.
                 if _is_verification_enabled():
                     await _agent.postgres_conn.jobs.update_status(
-                        job_id, status="pending_review"
+                        job_id, status="reviewing"
                     )
                     logger.info(
-                        f"Updated job {job_id} status to 'pending_review' "
-                        f"(verification override for full autonomy)"
+                        f"Updated job {job_id} status to 'reviewing' "
+                        f"(verification enabled)"
                     )
-                else:
+                elif goal_achieved:
                     logger.info(
                         f"Job {job_id} auto-completed (full autonomy, no verification)"
                     )
+                else:
+                    # Non-full autonomy, no verification — keep pending_review
+                    await _agent.postgres_conn.jobs.update_status(
+                        job_id, status="pending_review"
+                    )
+                    logger.info(f"Updated job {job_id} status to 'pending_review'")
             else:
+                # Phase boundary freeze or other non-completion stop
                 await _agent.postgres_conn.jobs.update_status(
                     job_id, status="pending_review"
                 )
@@ -538,6 +634,137 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
             )
     except Exception as e:
         logger.error(f"Failed to update job {job_id} status: {e}")
+
+
+async def _set_target_to_autonomy_status(target_job_id: str) -> None:
+    """Set a target job's status based on its autonomy level.
+
+    Reads the target job's resolved_config to determine autonomy:
+    - full → completed
+    - all others → pending_review
+
+    Args:
+        target_job_id: UUID of the target job
+    """
+    if _agent is None or _agent.postgres_conn is None:
+        return
+
+    try:
+        import json as _json
+
+        row = await _agent.postgres_conn.fetchrow(
+            "SELECT resolved_config FROM jobs WHERE id = $1::uuid",
+            target_job_id,
+        )
+
+        autonomy = "review"  # default
+        if row and row.get("resolved_config"):
+            rc = row["resolved_config"]
+            resolved = _json.loads(rc) if isinstance(rc, str) else rc
+            autonomy = resolved.get("autonomy", "review")
+
+        if autonomy == "full":
+            new_status = "completed"
+            await _agent.postgres_conn.execute(
+                "UPDATE jobs SET status = $1, completed_at = NOW() WHERE id = $2::uuid",
+                new_status, target_job_id,
+            )
+        else:
+            new_status = "pending_review"
+            await _agent.postgres_conn.jobs.update_status(
+                target_job_id, status=new_status
+            )
+
+        logger.info(
+            f"Set target job {target_job_id} to '{new_status}' "
+            f"(autonomy={autonomy})"
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to set target job {target_job_id} autonomy status: {e}")
+
+
+async def _handle_critic_verdict(job_id: str, result: Dict[str, Any]) -> None:
+    """Handle the deferred verdict from a critic job after it completes.
+
+    Called after _update_job_status_from_result in _process_orchestrator_job.
+    Only applies to critic jobs (those with parent_job_id).
+
+    For approved verdicts: set target to autonomy-dictated status.
+    For returned verdicts: resume target with feedback (or fail if round limit reached).
+
+    Args:
+        job_id: The critic job's UUID
+        result: Final graph state
+    """
+    if _agent is None or _agent.postgres_conn is None:
+        return
+
+    try:
+        import json as _json
+
+        row = await _agent.postgres_conn.fetchrow(
+            "SELECT parent_job_id, freeze_data, context FROM jobs WHERE id = $1::uuid",
+            job_id,
+        )
+        if not row or not row.get("parent_job_id"):
+            return  # Not a critic job
+
+        target_job_id = str(row["parent_job_id"])
+
+        # Parse freeze_data for verdict
+        fd = row.get("freeze_data")
+        if not fd:
+            logger.debug(f"No freeze_data for critic job {job_id} — no verdict to process")
+            return
+        freeze_data = _json.loads(fd) if isinstance(fd, str) else fd
+        verdict = freeze_data.get("verdict")
+
+        if not verdict:
+            logger.debug(f"No verdict in freeze_data for critic job {job_id}")
+            return
+
+        # Parse critic context for round tracking
+        ctx = row.get("context")
+        critic_context = _json.loads(ctx) if isinstance(ctx, str) and ctx else (ctx or {})
+
+        if verdict == "approved":
+            logger.info(f"Critic {job_id} approved target {target_job_id}")
+            await _set_target_to_autonomy_status(target_job_id)
+
+        elif verdict == "returned":
+            current_round = critic_context.get("verification_round", 0)
+            max_rounds = critic_context.get("max_verification_rounds", 3)
+
+            if current_round >= max_rounds:
+                # Round limit reached — auto-accept
+                logger.warning(
+                    f"Critic {job_id} returned feedback but round limit reached "
+                    f"({current_round}/{max_rounds}). Auto-accepting target {target_job_id}."
+                )
+                await _agent.postgres_conn.jobs.update_status(
+                    job_id,
+                    status="failed",
+                    error_message=f"Verification limit reached ({max_rounds} rounds)",
+                )
+                await _set_target_to_autonomy_status(target_job_id)
+            else:
+                # Resume target with feedback
+                feedback = freeze_data.get("feedback", "")
+                logger.info(
+                    f"Critic {job_id} returned feedback for target {target_job_id} "
+                    f"(round {current_round}/{max_rounds})"
+                )
+                await _orchestrator_client.resume_job(target_job_id, feedback=feedback)
+
+        else:
+            logger.warning(f"Unknown verdict '{verdict}' for critic job {job_id}")
+
+    except Exception as e:
+        logger.error(
+            f"Error handling critic verdict for job {job_id}: {e}",
+            exc_info=True,
+        )
 
 
 async def _process_orchestrator_job(
@@ -652,6 +879,9 @@ async def _process_orchestrator_job(
 
         # Update job status in database based on final state
         await _update_job_status_from_result(job_id, result)
+
+        # Handle deferred critic verdicts (approve/return target jobs)
+        await _handle_critic_verdict(job_id, result)
 
         # Check if we should spawn a verification (critic) job
         await _maybe_trigger_verification(job_id, result, context, description)

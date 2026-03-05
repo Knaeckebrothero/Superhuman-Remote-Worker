@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- Scheduling
     priority INTEGER NOT NULL DEFAULT 5,
 
-    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused')),
+    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused', 'reviewing', 'waiting')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
 );
@@ -263,6 +263,17 @@ DO $$ BEGIN
     ALTER TABLE jobs DROP CONSTRAINT IF EXISTS valid_status;
     ALTER TABLE jobs ADD CONSTRAINT valid_status
         CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused'));
+END $$;
+
+-- Migration: Add 'reviewing' and 'waiting' statuses for critic feedback loop
+-- reviewing = main job actively being reviewed by critic
+-- waiting = critic job waiting for main job to address feedback
+DO $$ BEGIN
+    ALTER TABLE jobs DROP CONSTRAINT IF EXISTS valid_status;
+    ALTER TABLE jobs ADD CONSTRAINT valid_status
+        CHECK (status IN ('created', 'processing', 'completed', 'failed',
+                          'cancelled', 'pending_review', 'paused',
+                          'reviewing', 'waiting'));
 END $$;
 
 -- ============================================================================

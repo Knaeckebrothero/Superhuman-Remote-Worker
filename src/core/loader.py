@@ -542,8 +542,11 @@ class ToolsConfig:
     research: List[str] = field(default_factory=list)
     citation: List[str] = field(default_factory=list)
     graph: List[str] = field(default_factory=list)
+    sql: List[str] = field(default_factory=list)
+    mongodb: List[str] = field(default_factory=list)
     git: List[str] = field(default_factory=list)
     coding: List[str] = field(default_factory=list)
+    evaluation: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -838,8 +841,11 @@ def load_agent_config(
         research=tools_data.get("research", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
+        sql=tools_data.get("sql", []),
+        mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
         coding=tools_data.get("coding", []),
+        evaluation=tools_data.get("evaluation", []),
     )
 
     connections_data = data.get("connections", {})
@@ -978,8 +984,11 @@ def load_agent_config_from_dict(
         research=tools_data.get("research", []),
         citation=tools_data.get("citation", []),
         graph=tools_data.get("graph", []),
+        sql=tools_data.get("sql", []),
+        mongodb=tools_data.get("mongodb", []),
         git=tools_data.get("git", []),
         coding=tools_data.get("coding", []),
+        evaluation=tools_data.get("evaluation", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1813,7 +1822,11 @@ def load_instructions(config: AgentConfig, model: str = "") -> str:
         all_tools.extend(config.tools.research)
         all_tools.extend(config.tools.citation)
         all_tools.extend(config.tools.graph)
+        all_tools.extend(config.tools.sql)
+        all_tools.extend(config.tools.mongodb)
+        all_tools.extend(config.tools.git)
         all_tools.extend(config.tools.coding)
+        all_tools.extend(config.tools.evaluation)
         tools_str = ", ".join(all_tools) if all_tools else "(none configured)"
 
         return f"""# {config.display_name} Instructions
@@ -1904,8 +1917,11 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.research +
         config.tools.citation +
         config.tools.graph +
+        config.tools.sql +
+        config.tools.mongodb +
         config.tools.git +
-        config.tools.coding
+        config.tools.coding +
+        config.tools.evaluation
     )
 
 
@@ -2385,6 +2401,15 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
     # Agent config as dict (strip internal fields and secrets)
     agent_dict = dataclasses.asdict(config)
     agent_dict.pop("_deployment_dir", None)
+
+    # Flatten extra into top level to prevent double-nesting on deserialization.
+    # dataclasses.asdict() includes extra as a literal dict key, but
+    # load_agent_config_from_dict() expects these keys at the top level
+    # (just like fresh YAML input). Flatten them back.
+    extra = agent_dict.pop("extra", {})
+    for k, v in extra.items():
+        if k not in agent_dict:  # Don't overwrite standard fields
+            agent_dict[k] = v
     # Strip API keys from LLM configs
     for key in ["api_key"]:
         agent_dict.get("llm", {}).pop(key, None)
@@ -2433,6 +2458,16 @@ def load_config_from_resolved(resolved: dict) -> AgentConfig:
         AgentConfig with pre-resolved content in config.extra
     """
     config = load_agent_config_from_dict(resolved["agent"])
+
+    # Fix double-nesting from pre-fix serialized configs:
+    # Old serialize_resolved_config() stored extra as {"extra": {shell, ...}},
+    # which load_agent_config_from_dict() wraps into extra["extra"].
+    if "extra" in config.extra and isinstance(config.extra["extra"], dict):
+        nested = config.extra.pop("extra")
+        for k, v in nested.items():
+            if k not in config.extra:
+                config.extra[k] = v
+
     # Store pre-resolved content for runtime use
     config.extra["_resolved_prompts"] = resolved.get("prompts", {})
     config.extra["_resolved_instructions"] = resolved.get("instructions", {})

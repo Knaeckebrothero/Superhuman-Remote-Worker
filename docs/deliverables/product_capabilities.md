@@ -6,11 +6,9 @@
 
 ## The Problem
 
-Every enterprise has the same story: dozens of data sources accumulated over years — SQL databases, MongoDB collections, SharePoint sites, Dropbox folders, CMS platforms, file servers, legacy systems. The knowledge is there, but it's **scattered, unstructured, and siloed**.
+Every enterprise has dozens of data sources accumulated over years — SQL databases, document stores, SharePoint sites, file shares, CMS platforms, legacy systems. The knowledge is there, but it's **scattered, unstructured, and siloed**.
 
-Meanwhile, every AI initiative — whether it's Microsoft Copilot, a custom chatbot, or an internal RAG system — depends on having a **clean, structured, up-to-date knowledge base** to draw from. Without one, these tools hallucinate, give outdated answers, or simply can't find what they need.
-
-The gap between "we have the data" and "our AI can actually use it" is where most projects stall. Manual curation doesn't scale. Traditional ETL pipelines break on unstructured content. And the knowledge base is never "done" — sources change, new documents arrive, and structures drift.
+Every AI initiative — whether it's Microsoft Copilot, a custom chatbot, or an internal RAG system — depends on a **clean, structured, up-to-date knowledge base**. Without one, these tools hallucinate, give outdated answers, or simply can't find what they need. Manual curation doesn't scale. Traditional ETL breaks on unstructured content. And the knowledge base is never "done" — sources change, documents arrive, structures drift.
 
 ---
 
@@ -20,10 +18,10 @@ We **connect to your existing data sources**, extract and understand the content
 
 | Step | What happens |
 |------|-------------|
-| **Connect** | We plug into your data sources as they are — SQL databases, document stores, file shares, web platforms. No migration, no reformatting required. |
-| **Extract & Understand** | Documents, database records, and unstructured content are read, analyzed, and interpreted — including PDFs, Office files, images, and web content. |
-| **Structure** | The extracted knowledge is organized into the format your systems need: knowledge graphs, vector stores, structured indexes, or enriched database entries. |
-| **Maintain** | As sources change, the knowledge base stays current. New documents are processed, stale entries are flagged, and the structure evolves with your data. |
+| **Connect** | We plug into your data sources as they are. No migration, no reformatting required. |
+| **Extract & Understand** | Documents, database records, and unstructured content are read, analyzed, and interpreted — including PDFs, Office files, images, and web pages. |
+| **Structure** | The extracted knowledge is organized into the format your AI tools need — knowledge graphs, vector stores, enriched database entries, or a combination. |
+| **Maintain** | As sources change, the knowledge base stays current. New content is processed, stale entries are flagged, and the structure evolves with your data. |
 
 ---
 
@@ -32,48 +30,48 @@ We **connect to your existing data sources**, extract and understand the content
 | Category | Examples |
 |----------|---------|
 | **Relational databases** | PostgreSQL, MySQL, SQL Server, Oracle |
-| **Document stores** | MongoDB, Elasticsearch, CouchDB |
-| **Graph databases** | Neo4j, Amazon Neptune |
+| **Document stores** | MongoDB, Elasticsearch |
+| **Graph databases** | Neo4j |
 | **File storage** | SharePoint, Dropbox, Google Drive, network shares, S3 |
-| **Content platforms** | Confluence, Notion, internal wikis, CMS |
+| **Content platforms** | Confluence, Notion, internal wikis |
 | **Documents** | PDF, DOCX, PPTX, spreadsheets, images, scanned documents |
-| **Web sources** | Public websites, intranet portals, knowledge bases |
+| **Web sources** | Public websites, intranet portals |
 
-The connector architecture is extensible — if your system has an API or a file export, we can integrate it.
+The connector architecture is extensible — if your system has an API or file export, we can integrate it.
 
 ---
 
 ## Output Formats
 
-The knowledge base we build matches what your AI tools consume:
+We deliver the knowledge layer in whatever format your AI tools consume:
 
-- **Knowledge graphs** (Neo4j, etc.) — entities, relationships, and properties extracted from unstructured data
+- **Knowledge graphs** — entities, relationships, and properties extracted from unstructured data
 - **Vector stores** — embeddings for semantic search and RAG pipelines
 - **Structured databases** — cleaned, normalized, and enriched relational data
-- **Hybrid** — combinations of the above, tailored to your architecture
+- **Hybrid** — any combination of the above, tailored to your architecture
 
 ---
 
 ## How It Works
 
-The extraction and structuring is performed by **autonomous AI agents** — not rigid scripts or manual processes. Agents read and understand content the way a human analyst would, but operate continuously and at scale. They handle ambiguity, interpret context, and make structured decisions about how to represent knowledge — then a review layer verifies quality before anything is committed.
+The heavy lifting is done by **autonomous AI agents** — not rigid scripts or manual ETL. Agents read and understand content the way a human analyst would, but operate continuously and at scale. They handle ambiguity, interpret context, and make structured decisions about how to represent knowledge. A built-in review layer verifies quality before anything is committed.
 
-This means the system adapts to your data as-is, rather than requiring your data to fit a predefined schema.
-
----
-
-## Key Differentiators
-
-**Connects to what you already have** — no data migration, no new platforms to adopt. We work with your existing landscape.
-
-**Handles unstructured content** — PDFs, presentations, images, web pages, and free-text database fields are first-class inputs, not afterthoughts.
-
-**Keeps the knowledge base alive** — this isn't a one-time import. The system maintains and updates the knowledge base as your sources evolve.
-
-**Feeds any AI tool** — whether you use Copilot, a custom chatbot, or a RAG pipeline, we produce the knowledge layer it needs.
-
-**On-premises capable** — the entire stack, including AI processing, can run on your infrastructure. No data leaves your network.
+The system adapts to your data as-is, rather than requiring your data to fit a predefined schema.
 
 ---
 
-*Interested? Let's map your data landscape and show you what a structured knowledge base looks like for your systems.*
+## Why Us
+
+**Works with what you already have** — no data migration, no new platforms. We connect to your existing landscape and build on top of it.
+
+**Understands unstructured content** — PDFs, presentations, images, web pages, and free-text fields are first-class inputs, not afterthoughts.
+
+**Not a one-time import** — the knowledge base stays current as your sources evolve. New content is incorporated, stale data is flagged.
+
+**Tool-agnostic output** — whether you use Copilot, a custom chatbot, or a RAG pipeline, we deliver the knowledge layer in the format it needs.
+
+**Your infrastructure, your data** — the entire stack, including AI processing, can run on-premises. Nothing leaves your network unless you want it to.
+
+---
+
+*Let's map your data landscape and show you what a structured knowledge base would look like for your systems.*

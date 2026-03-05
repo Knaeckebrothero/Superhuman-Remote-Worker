@@ -42,10 +42,7 @@ tools:
     - job_complete
   coding:
     - shell_execute
-  # Evaluation verdict tools — approve or return target jobs with feedback
-  evaluation:
-    - approve_job
-    - return_job_with_feedback
+  # evaluation: injected via config_override for verification subjobs only
   git:
     - git_log
     - git_show

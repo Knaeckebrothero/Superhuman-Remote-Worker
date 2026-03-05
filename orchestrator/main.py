@@ -1381,11 +1381,11 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        if job["status"] != "pending_review":
+        if job["status"] not in ("pending_review", "reviewing"):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be approved (status: {job['status']}). "
-                       f"Only jobs in 'pending_review' status can be approved.",
+                       f"Only jobs in 'pending_review' or 'reviewing' status can be approved.",
             )
 
         # 2. Read freeze data — DB first, Gitea fallback, local fallback

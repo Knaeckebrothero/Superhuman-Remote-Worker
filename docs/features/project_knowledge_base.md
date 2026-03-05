@@ -41,23 +41,107 @@ The project knowledge base changes this. Jobs push structured, interlinked **kno
 
 This gives us three retrieval channels (files, vectors, graph) that feed into the existing memory injection system. When a new job starts, it inherits the full knowledge base from `main` and can query it through all three channels. The project gets smarter with every job.
 
-## How It Works
+## How It Works — The Curator Subjob
+
+The key insight: **the working agent doesn't write knowledge notes.** It works exactly as it does today — writes workspace.md, completes todos, produces output. A specialized **curator subjob** runs after completion to extract knowledge and prepare the merge.
+
+This follows the same pattern as the existing critic verification subjob (`verification.enabled` in config, `create_verification_job()` in `src/api/orchestrator_client.py`). The infrastructure for spawning post-completion subjobs already exists.
 
 ```
-Job 1 runs
-  → writes knowledge notes (decisions, learnings, state, questions)
-  → completes, merges to main
-  → post-merge: sync knowledge/*.md → Neo4j + vector embeddings
-                                              ↓
-Job 2 starts
-  → clones main → has full knowledge/ directory
-  → queries Neo4j graph + vector search + file search
-  → "What architectural decisions were made?"
-  → "What did we try last week?"
-  → "What are the credentials for the staging DB?"
-  → writes more notes → merges → graph grows
-                                        ↓
-Job 3 starts → richer knowledge base → smarter from day one
+Job runs (unchanged)
+  → writes workspace.md, plan.md, todos, output/
+  → completes → status: pending_review
+                    ↓
+Critic subjob (existing)
+  → reviews deliverables
+  → approves or returns with feedback
+                    ↓
+Curator subjob (NEW)
+  → reads the job's branch: workspace.md, plan.md, archive/, output/
+  → reads the job's memories from PostgreSQL
+  → reads the project's existing knowledge base on main
+  → extracts knowledge notes (decisions, learnings, state, questions)
+  → organizes deliverables in output/
+  → cleans up the branch for merge (removes noise, structures content)
+  → commits curated changes → branch is now PR-ready
+                    ↓
+PR created → human reviews → merge to main
+                    ↓
+Post-merge sync: knowledge/*.md → Neo4j + vector embeddings
+                    ↓
+Next job starts → clones main → full knowledge base available
+```
+
+### Why a Subjob, Not Inline
+
+The alternative — teaching every agent to write knowledge notes during execution via `kb_write()` — has problems:
+
+1. **Every agent config needs new tools and instructions.** The developer, scholar, critic — all need to learn the knowledge base schema. That's a lot of prompt engineering across many expert configs.
+2. **It competes for context window.** Knowledge writing during execution means more tool calls, more tokens spent on note management instead of the actual task.
+3. **Quality varies by agent.** A research agent might write great notes; a coding agent might write terrible ones. The curator is a specialist.
+4. **It couples the knowledge schema to the agent loop.** Changing the note format means updating every agent's instructions. With a curator, you update one expert config.
+
+The curator subjob gives us **separation of concerns**: the working agent focuses on the task, the curator focuses on knowledge extraction. One expert config to get right, and every agent type benefits.
+
+### What the Curator Has Access To
+
+The curator runs as a normal job on the same branch, so it has the full execution record:
+
+| Source | What It Contains | How Curator Uses It |
+|--------|-----------------|---------------------|
+| `workspace.md` | Accumulated decisions, project context, working memory | Primary source for `decision`, `state`, `learning` notes |
+| `plan.md` | Strategic plan, phase structure, goals | Source for `plan` and `goal` notes |
+| `archive/` | Phase retrospectives, archived todos with completion notes | Source for `retrospective` notes, phase-level learnings |
+| `output/` | Deliverables produced by the job | Curator organizes, validates, decides what merges |
+| `memories` table | Observer + free source memories (PostgreSQL) | Pre-extracted insights — curator can promote to structured notes |
+| `knowledge/` (from main) | Existing project knowledge base | Context: what's already known, what to update vs. create new |
+| Job metadata | Description, config, freeze_data, confidence | Context for framing the job's contributions |
+
+### What the Curator Produces
+
+The curator writes to the branch and commits. The result is a clean, reviewable diff:
+
+1. **Knowledge notes** in `knowledge/` — structured markdown with frontmatter, wikilinks to existing notes, proper type/tag classification
+2. **Updated existing notes** — if the job contradicts or supersedes existing knowledge, the curator updates those notes (status → `superseded`, adds `[[new-note]]` link)
+3. **Organized deliverables** in `output/` — curator can rename, restructure, add README files
+4. **Cleaned branch** — removes job artifacts that shouldn't be reviewed (tool docs, intermediate files)
+
+### The Curator as Editorial Filter
+
+Not everything a job produces should reach `main`. The curator makes editorial decisions:
+
+- A research job that went nowhere → curator writes a "we tried X and it didn't work" learning note, doesn't carry forward failed deliverables
+- A coding job that built a feature → curator writes `code` and `decision` notes explaining the architecture, links to relevant existing notes
+- A job that discovered a contradiction with existing knowledge → curator writes a `learning` note with `CONTRADICTS` relationship, updates the contradicted note's status
+- A job with low confidence → curator writes `question` notes instead of `decision` notes
+
+### Chaining: Critic → Curator → Merge
+
+The natural flow for project jobs:
+
+```
+Job completes
+    ↓
+verification.enabled: true → Critic subjob
+    ↓ (approved)
+curator.enabled: true → Curator subjob
+    ↓ (branch prepared)
+Auto-create PR (or manual trigger)
+    ↓
+Human reviews PR in Gitea/Cockpit
+    ↓
+Merge → post-merge sync to Neo4j + pgvector
+```
+
+If the critic returns the job with feedback, the curator never runs — the job resumes first. The curator only processes approved work.
+
+Config extension in `defaults.yaml`:
+
+```yaml
+curator:
+  enabled: false                # Opt-in per config (or per project)
+  curator_config: curator       # Which expert config to use
+  auto_pr: true                 # Auto-create PR after curation
 ```
 
 ### For Code Projects
@@ -66,7 +150,7 @@ The same model, with an additional repo. The project has:
 - **Jobs repo** — knowledge lives here (`knowledge/` directory on `main`)
 - **Source repos** — code lives there (agents push code changes)
 
-Jobs push code to source repos AND knowledge to the jobs repo. Both accumulate on `main`. The knowledge base records what was built, why, what patterns were followed, what didn't work — context that code alone doesn't capture.
+Jobs push code to source repos AND knowledge to the jobs repo. Both accumulate on `main`. The knowledge base records what was built, why, what patterns were followed, what didn't work — context that code alone doesn't capture. The curator handles the jobs repo side; source repo merges are separate (existing merge flow).
 
 ### For Non-Code Projects
 
@@ -263,25 +347,47 @@ Derived from wikilinks and explicit frontmatter:
 (:Note)-[:HAS_KEYWORD]->(:Keyword {name: "JWT"})
 ```
 
-## Memory Integration — One System, Not Two
+## Memory Integration — Two Stages, One Knowledge Base
 
-This is the key architectural decision: **Memory Light's storage backend IS the knowledge base.** There is no separate `memories` PostgreSQL table running in parallel with a `knowledge/` directory. They are the same system.
+Memory Light and the knowledge base are not parallel systems — they are two stages of the same pipeline. Memory Light captures raw insights during execution (PostgreSQL `memories` table). The curator promotes them to structured knowledge notes post-completion.
 
-### How Memory Channels Map to Knowledge Notes
+### The Pipeline
 
-Memory Light defines 5 extraction channels (observer, todo completion, compaction, phase archive, tool errors). Each becomes a knowledge note:
+```
+During job execution (Memory Light — unchanged):
+  Observer LLM → memories table
+  Todo completion → memories table
+  Compaction summaries → memories table
+  Phase archives → memories table
+  Tool errors → memories table
+                    ↓
+After approval (Curator subjob):
+  Reads memories table for this job
+  Reads workspace.md, archive/, output/
+  Reads existing knowledge base on main
+  → Promotes valuable memories to knowledge notes
+  → Extracts additional insights from workspace.md/archive
+  → Deduplicates against existing KB
+  → Writes structured notes to knowledge/
+```
 
-| Memory Channel | Note Type | How |
-|----------------|-----------|-----|
-| **Observer** | `learning`, `decision`, `state` | Observer LLM extracts insights → `kb_write()` |
-| **Todo completion** | `learning`, `code` | Todo completion notes → `kb_write()` with `type` based on content |
-| **Compaction summary** | `state` | Compaction narrative → `kb_write(type="state")` |
-| **Phase archive** | `retrospective` | Phase retro → `kb_write(type="retrospective")` |
-| **Tool errors** | `learning` | Error-solution pairs → `kb_write(type="learning", tags=["error-solution"])` |
+This means Memory Light keeps working exactly as implemented — no changes to the observer, free sources, or injection hook. The `memories` table is a staging area. The curator is the promotion step.
+
+### How Memory Channels Feed the Curator
+
+| Memory Channel | What Curator Gets | Typical Output |
+|----------------|-------------------|----------------|
+| **Observer** | Pre-extracted insights with keywords and importance | `learning`, `decision` notes |
+| **Todo completion** | Structured outcome summaries | `learning`, `code` notes |
+| **Compaction summary** | Narrative of discarded conversation | `state` notes (what happened) |
+| **Phase archive** | Retrospective with all todo outcomes | `retrospective` notes |
+| **Tool errors** | Error-solution pairs | `learning` notes tagged `error-solution` |
+
+The curator doesn't blindly promote every memory. It has the full picture (memories + workspace + archive + existing KB) and makes editorial decisions: merge similar memories into one note, discard noise, link related findings, update existing notes instead of creating duplicates.
 
 ### Retrieval Flow
 
-When the agent needs context, the existing injection hook queries the knowledge base instead of a separate memory table:
+Working agents in KB-enabled projects get knowledge injected via the same transient message pattern as Memory Light:
 
 ```
 Agent execute loop
@@ -289,16 +395,19 @@ Agent execute loop
     ├─ Context compaction (existing)
     ├─ Todo injection (existing)
     ├─ _index.md injection (replaces workspace.md injection)
-    ├─ ★ Knowledge retrieval (replaces memory injection)
-    │   ├─ Dense vector search (pgvector on note embeddings)
-    │   ├─ Sparse keyword search (tsvector on note content)
-    │   ├─ Graph traversal (Neo4j — related notes within N hops)
-    │   ├─ Recency bias (most recently modified notes)
+    ├─ ★ Knowledge retrieval (replaces/augments memory injection)
+    │   ├─ File-based search on knowledge/ (Phase 1 — MVP)
+    │   ├─ + Graph traversal via Neo4j (Phase 2)
+    │   ├─ + Dense vector search via pgvector (Phase 3)
+    │   ├─ + Sparse keyword search via tsvector (Phase 3)
     │   └─ RRF fusion → top-K notes → inject as transient message
     │
+    ├─ Memory Light injection (still runs for job-scoped memories)
     ├─ Instruction file injection (existing)
     └─ LLM call
 ```
+
+Note: Memory Light injection continues during job execution for job-scoped memories (the working agent's own observations). Knowledge injection provides project-scoped context from all previous jobs. Both can coexist — Memory Light gives "what I've learned this session", knowledge gives "what the project knows".
 
 The injected block looks like:
 
@@ -416,21 +525,29 @@ kb_provenance(note="auth-middleware")    # Trace back through DERIVED_FROM chain
 kb_unanswered()                          # Questions with no ANSWERS relationship
 ```
 
-### When Agents Write Notes
+### When Knowledge Notes Get Written
 
-Knowledge base writing is woven into the existing phase model:
+With the curator model, knowledge note creation is concentrated in the curator subjob, not scattered across the working agent's execution:
 
-| Phase Event | What Gets Written |
-|-------------|-------------------|
-| **Job start** | Agent reads existing KB, writes a `state` note with current understanding |
-| **Todo completion** | Agent writes `learning` or `code` notes for significant findings |
-| **Decision made** | Agent writes a `decision` note with reasoning and links |
-| **Question encountered** | Agent writes a `question` note |
-| **Phase transition** | Agent writes `retrospective` note, updates `state` and `plan` notes |
-| **Job completion** | Agent updates `state` notes, marks resolved `question` notes |
-| **Observer extraction** | Observer LLM creates notes from conversation insights (async) |
-| **Compaction** | Compaction summary stored as `state` note (free source) |
-| **Tool error** | Error-solution pair stored as `learning` note (free source) |
+**During the job (working agent — unchanged):**
+The agent writes `workspace.md`, `plan.md`, todo completion notes, and `archive/` retrospectives as it does today. Memory Light's free sources (todo completion, compaction, phase archive, tool errors) store memories in the PostgreSQL `memories` table as they do today. No new tools or behavior required from the working agent.
+
+**After approval (curator subjob):**
+The curator reads all of the above and produces structured knowledge notes:
+
+| Source | Curator Output |
+|--------|---------------|
+| `workspace.md` sections on decisions | `decision` notes with reasoning, links to related notes |
+| `workspace.md` sections on discoveries | `learning` notes with tags and keywords |
+| `plan.md` goals and milestones | `goal` and `plan` notes (if not already in KB) |
+| `archive/phase_N_retrospective.md` | `retrospective` notes linked to decisions and findings |
+| Todo completion notes (notable ones) | `learning` or `code` notes for significant outcomes |
+| `memories` table entries for this job | Promoted to typed notes where valuable, deduplicated against existing KB |
+| Unresolved items from workspace.md | `question` notes for the next job to pick up |
+| Overall job outcome | `state` note summarizing what changed in the project |
+
+**Optional: agents with kb_write (future):**
+Nothing prevents giving the knowledge tools to working agents too. A researcher might want to write `source` notes as it discovers references. But this is additive — the curator is the baseline that ensures every job contributes knowledge regardless of whether the working agent uses KB tools.
 
 ## Context Injection — What Replaces workspace.md
 
@@ -488,7 +605,7 @@ New projects skip this — they use the knowledge base from day one.
    **Resolved** — The knowledge base. Structured markdown notes that accumulate on `main`, mirrored to Neo4j and pgvector for querying. This is the answer to the core project question.
 
 2. ~~**Is Memory Light a separate system?**~~
-   **Resolved** — No. Memory extraction channels (observer, todo completion, compaction, phase archive, tool errors) write to the knowledge base via `kb_write()`. Retrieval queries the same knowledge base. One system.
+   **Resolved** — It's a stage, not a separate system. Memory Light captures raw insights during execution (PostgreSQL `memories` table). The curator subjob promotes them to structured knowledge notes post-completion. Memory Light is the capture stage; the curator is the promotion stage. See "Memory Integration" section.
 
 3. ~~**Vault scope — one per job or per project?**~~
    **Resolved** — One per project. The `knowledge/` directory lives in the project's jobs repo and merges to `main` across jobs.
@@ -496,86 +613,104 @@ New projects skip this — they use the knowledge base from day one.
 4. ~~**Graph database choice?**~~
    **Resolved** — Neo4j, as core project infrastructure. Already in the stack, already has tooling. Shared instance with project-label namespacing.
 
+5. ~~**How do agents write good knowledge notes?**~~
+   **Resolved** — They don't have to. The curator subjob is a specialist that reads the job's full output (workspace.md, archive, memories, output) and produces structured notes. Only the curator needs knowledge tools and schema understanding. Working agents are unchanged. See "The Curator Subjob" section.
+
+6. ~~**Who decides what merges to main?**~~
+   **Resolved** — The curator. It makes editorial decisions: what to promote, what to discard, what to update. Failed experiments become "we tried X" learning notes. Successful work becomes decisions, code, and state notes. The curator prepares a clean PR that humans can review.
+
 ### Open
 
-5. **Sync-on-write vs sync-on-merge** — Should notes be synced to Neo4j/vectors immediately when written, or only on merge? Immediate sync is richer but adds complexity. See "Sync During Job Execution" above.
+7. **Sync-on-write vs sync-on-merge** — Should notes be synced to Neo4j/vectors immediately when written, or only on merge? With the curator model, sync-on-merge is natural — the curator writes notes, they merge, then sync. Sync-on-write is only needed if working agents also write notes during execution (future).
 
-6. **Automatic linking** — How aggressive should auto-linking be? Too much = noise, too little = missed connections. Likely: agent writes explicit links; a periodic maintenance pass suggests missing connections.
+8. **Automatic linking** — How aggressive should auto-linking be? The curator can use existing KB context + Neo4j graph to suggest links. Likely: curator writes explicit links based on content similarity; a periodic maintenance pass fills gaps.
 
-7. **Context injection budget** — How many tokens of retrieved knowledge to inject per LLM call? Memory Light defaults to 5,000. With richer structured notes, this may need tuning. Start with 5,000, adjust based on observed impact.
+9. **Context injection budget** — How many tokens of retrieved knowledge to inject per LLM call? Memory Light defaults to 5,000. With richer structured notes, this may need tuning. Start with 5,000, adjust based on observed impact.
 
-8. **Teaching the agent to write good notes** — Tool-enforced structure (`kb_write` validates type, requires tags, generates frontmatter) plus an instruction file (`knowledge_guide.md` injected before `kb_write` calls, like `todo_guide.md`).
+10. **Curator chain position** — Should the curator run before or after the critic? Current design: critic first (approves/returns), curator second (only processes approved work). Alternative: curator first (extracts knowledge), critic reviews both deliverables AND knowledge notes. The first option is simpler; the second ensures knowledge quality.
 
-9. **Obsidian CLI integration** — Optional desktop enhancement. Agent detects CLI availability and uses it for richer queries (backlinks, orphans, deadends). Not required — file tools + Neo4j cover all core functionality headlessly.
+11. **Obsidian CLI integration** — Optional desktop enhancement. Agent detects CLI availability and uses it for richer queries (backlinks, orphans, deadends). Not required — file tools + Neo4j cover all core functionality headlessly.
 
 ## Implementation Plan
 
-### Phase 1: File-Based Knowledge Tools (MVP)
+### Phase 1: Knowledge Base Infrastructure
 
-Core note CRUD. Agents can write and read notes. No Neo4j or vector search yet — file-based search only.
+Build the foundation: note schema, `KnowledgeManager`, tools, provisioning. This is prerequisite to everything — the curator needs something to write to, working agents need something to read from.
 
 1. [ ] Finalize note schema (frontmatter fields, naming conventions, directory structure)
-2. [ ] Implement `KnowledgeManager` class (`src/managers/knowledge.py`) — file-based note CRUD
+2. [ ] Implement `KnowledgeManager` class (`src/managers/knowledge.py`) — file-based note CRUD (create, read, search, list, update notes in `knowledge/`)
 3. [ ] Implement agent tools: `kb_write`, `kb_read`, `kb_search`, `kb_list`, `kb_update`
-4. [ ] Register as `knowledge` tool category in `src/tools/registry.py` (always-on)
-5. [ ] Create `knowledge_guide.md` instruction file (injected before `kb_write`)
-6. [ ] Create note templates per type in `.obsidian/templates/`
-7. [ ] Add `knowledge/` directory provisioning to project creation flow
-8. [ ] Auto-generate `_index.md` (Map of Content) from note frontmatter
-9. [ ] Inject `_index.md` as context (replaces workspace.md injection for KB-enabled projects)
+4. [ ] Register as `knowledge` tool category in `src/tools/registry.py`
+5. [ ] Add `knowledge/` directory provisioning to project creation flow (init with `.obsidian/` config, subdirectory structure, `.gitignore` for Obsidian cache)
+6. [ ] Auto-generate `_index.md` (Map of Content) from note frontmatter — callable utility, not just post-curation
+7. [ ] Inject `_index.md` as context for jobs in KB-enabled projects (supplements or replaces workspace.md injection)
+8. [ ] Test: manually create knowledge notes in a project repo, verify next job sees them via `kb_search` and `_index.md` injection
 
-### Phase 2: Memory Channel Integration
+### Phase 2: Curator Subjob
 
-Wire the existing Memory Light extraction channels to write knowledge notes instead of (or alongside) the `memories` table.
+With the knowledge tools working, build the curator that uses them.
 
-10. [ ] Adapt observer to call `kb_write()` instead of `memory_manager.store()`
-11. [ ] Adapt free sources (todo completion, compaction, phase archive, tool errors) to `kb_write()`
-12. [ ] Implement retrieval from file-based search for knowledge injection (replaces memory injection)
-13. [ ] Test: run a full job, verify knowledge notes accumulate and appear in injection
+9. [ ] Create `config/experts/curator/config.yaml` — extends defaults, has `knowledge` + `workspace` + `git` tools
+10. [ ] Create `config/experts/curator/instructions.md` — curation guide (what to extract, how to classify, when to update vs. create, editorial judgment rules)
+11. [ ] Create `config/experts/curator/curation_instructions.md` — instruction file triggered before `kb_write` (note quality standards, linking conventions)
+12. [ ] Implement `create_curation_job()` in `src/api/orchestrator_client.py` — follows `create_verification_job()` pattern, passes job context (workspace.md content, memories, freeze_data) via formatted instructions
+13. [ ] Add `curator` config section to `defaults.yaml` (`enabled`, `curator_config`, `auto_pr`)
+14. [ ] Wire curation trigger in the post-approval flow — after critic approves (or after job completes if no critic), spawn curator subjob on the same branch
+15. [ ] Curator reads `memories` table for the target job via MCP/API and promotes valuable entries to knowledge notes
+16. [ ] Auto-create PR after curator completes (if `curator.auto_pr: true`)
+17. [ ] Test: run a project job → critic approves → curator extracts notes → PR contains clean `knowledge/` diff
 
 ### Phase 3: Neo4j Sync + Graph Queries
 
-Add the queryable graph layer for relationship traversal and rich queries.
+Add the queryable graph layer. The sync runs post-merge; graph tools are available to both curators and working agents.
 
-14. [ ] Implement sync function: parse `knowledge/*.md` → upsert Neo4j nodes + relationships
-15. [ ] Register sync as post-merge hook and job-startup step
-16. [ ] Implement graph query tools: `kb_query`, `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`
-17. [ ] Add Neo4j namespace provisioning to project creation (shared instance, project labels)
+18. [ ] Implement sync function: parse `knowledge/*.md` → upsert Neo4j nodes + relationships
+19. [ ] Register sync as post-merge hook and job-startup step
+20. [ ] Implement graph query tools: `kb_query`, `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`
+21. [ ] Add Neo4j namespace provisioning to project creation (shared instance, project labels)
+22. [ ] Give curator access to graph tools for better dedup and linking against existing knowledge
 
 ### Phase 4: Vector Search + Hybrid Retrieval
 
 Add vector embeddings and the full RRF hybrid search from Memory Light.
 
-18. [ ] Embed note content via `EmbeddingService` (text-embedding-3-small, same as Memory Light)
-19. [ ] Store embeddings in pgvector, scoped by `project_id`
-20. [ ] Implement hybrid retrieval: dense (pgvector) + sparse (tsvector) + graph (Neo4j) + recency
-21. [ ] RRF fusion for ranking (same algorithm as Memory Light)
-22. [ ] Replace file-only retrieval in injection hook with hybrid retrieval
+23. [ ] Embed note content via `EmbeddingService` (text-embedding-3-small, same as Memory Light)
+24. [ ] Store embeddings in pgvector, scoped by `project_id`
+25. [ ] Implement hybrid retrieval: dense (pgvector) + sparse (tsvector) + graph (Neo4j) + recency
+26. [ ] RRF fusion for ranking (same algorithm as Memory Light)
+27. [ ] Replace `_index.md`-only injection with hybrid knowledge retrieval for working agents
 
 ### Phase 5: Obsidian CLI + Polish
 
-23. [ ] CLI availability detection (`obsidian version` probe)
-24. [ ] Wrap CLI commands: `backlinks`, `links`, `orphans`, `deadends`, `search`
-25. [ ] `.obsidian/` config templates (graph settings, tag hierarchy, workspace layout)
-26. [ ] Cockpit UI: knowledge base viewer/browser
-27. [ ] workspace.md → knowledge notes conversion tool
-28. [ ] Memory Light → knowledge base migration tool
-29. [ ] Test with real multi-job project: verify Job N+1 benefits from Job N's knowledge
+28. [ ] CLI availability detection (`obsidian version` probe)
+29. [ ] Wrap CLI commands: `backlinks`, `links`, `orphans`, `deadends`, `search`
+30. [ ] `.obsidian/` config templates (graph settings, tag hierarchy, workspace layout)
+31. [ ] Cockpit UI: knowledge base viewer/browser
+32. [ ] workspace.md → knowledge notes conversion tool (for existing projects)
+33. [ ] Test with real multi-job project: verify Job N+1 benefits from Job N's knowledge
 
-## What This Obsoletes
+## What Changes and What Stays
 
-Once the knowledge base is fully implemented:
+The curator model is additive — it doesn't replace existing systems, it builds on them:
 
-- **`workspace.md`** — Replaced by `_index.md` injection + knowledge notes. Existing projects keep `workspace.md` for backward compatibility.
-- **`plan.md`** — Replaced by plan-type knowledge notes (interlinked with goals, decisions, state).
-- **`memories` PostgreSQL table** — Replaced by knowledge notes with vector embeddings. The table remains for projects that haven't migrated.
-- **Memory Light as a separate feature** — The extraction channels and injection mechanism survive, but they read/write the knowledge base, not a standalone memory store.
+**Stays the same:**
+- **`workspace.md`** — Working agents still write it during execution. The curator reads it as a source for knowledge extraction. For non-project jobs and backward compatibility, workspace.md injection continues unchanged.
+- **`plan.md`** — Working agents still write it. The curator reads it.
+- **`memories` PostgreSQL table** — Memory Light keeps running during execution (observer, free sources). The table becomes a staging area that the curator reads post-completion.
+- **Memory Light injection** — Continues injecting job-scoped memories during execution. Knowledge injection adds project-scoped context on top.
+- **Critic subjob** — Continues reviewing deliverables. Curator runs after the critic.
 
-The Memory Light doc ([[memory_light]]) remains valid for: observer implementation, extraction prompt, RRF hybrid search algorithm, embedding model selection, injection hook pattern, config keys. The knowledge base doc doesn't re-specify those — it specifies where the data lives and how it flows between jobs.
+**New:**
+- **`knowledge/` directory** — Created in project jobs repos. Curated notes accumulate on `main`.
+- **`_index.md` injection** — Replaces workspace.md injection for KB-enabled projects (or supplements it).
+- **Curator subjob** — New expert config, spawned post-approval, writes knowledge notes.
+- **Neo4j sync** — Post-merge hook syncs notes to graph (Phase 2).
+- **Knowledge retrieval** — Project-scoped context injection from the knowledge base (Phase 3).
 
-The Obsidian doc ([[obsidian]]) remains valid for: note schema details, research findings (A-MEM, Obsidian-Assist), Obsidian CLI integration, `.obsidian/` config. The knowledge base doc doesn't re-specify those — it specifies how the knowledge base fits the project model.
-
-The Projects doc ([[projects]]) remains valid for: database schema, API endpoints, merge flow, workspace layout, branch naming, cockpit UI. The knowledge base doc adds `knowledge/` to the "what merges to main" classification and defines the post-merge sync hook.
+**Related docs:**
+- [[memory_light]] — Remains valid for: observer, extraction channels, RRF hybrid search, embedding models, injection hook. Memory Light is the capture stage; the curator is the promotion stage.
+- [[obsidian]] — Remains valid for: note schema, research findings, Obsidian CLI, `.obsidian/` config.
+- [[projects]] — Remains valid for: database schema, API, merge flow, workspace layout, cockpit UI. This doc adds `knowledge/` to "what merges to main" and defines the curator subjob in the post-completion chain.
 
 ## References
 

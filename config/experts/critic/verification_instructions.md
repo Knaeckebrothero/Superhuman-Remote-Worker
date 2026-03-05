@@ -36,6 +36,7 @@ Use the MCP tools to access the target job's workspace:
 - Read `workspace.md` and `plan.md` for context on what the agent intended
 - Check `archive/` for phase history if you need to understand the agent's process
 - Look at the actual content, not just the filenames
+- For deployment/infrastructure jobs: use `shell_execute` to independently verify claims (SSH to the target, check service status, verify port bindings, test endpoints with curl). Do NOT rely solely on the agent's self-reported results.
 
 ### 3. Evaluate Against Requirements
 

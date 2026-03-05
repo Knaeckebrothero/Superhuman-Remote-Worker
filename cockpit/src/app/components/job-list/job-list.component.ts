@@ -193,7 +193,7 @@ interface JobRow {
                         Promote
                       </button>
                     }
-                    @if (row.job.status !== 'processing' && row.job.status !== 'paused') {
+                    @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
                       <button
                         class="action-btn delete"
                         (click)="deleteJob(row.job.id); $event.stopPropagation()"
@@ -481,6 +481,17 @@ interface JobRow {
         color: #b4befe;
       }
 
+      .status-badge.status-reviewing {
+        background: rgba(203, 166, 247, 0.2);
+        color: #cba6f7;
+        font-weight: 600;
+      }
+
+      .status-badge.status-waiting {
+        background: rgba(116, 199, 236, 0.2);
+        color: #74c7ec;
+      }
+
       /* Hierarchy */
       .status-cell-inner {
         display: flex;
@@ -742,6 +753,8 @@ export class JobListComponent implements OnInit, OnDestroy {
     { label: 'All', value: 'all' },
     { label: 'Mine', value: 'mine' },
     { label: 'Review', value: 'pending_review' },
+    { label: 'Reviewing', value: 'reviewing' },
+    { label: 'Waiting', value: 'waiting' },
     { label: 'Created', value: 'created' },
     { label: 'Processing', value: 'processing' },
     { label: 'Completed', value: 'completed' },
