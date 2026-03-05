@@ -391,6 +391,50 @@ class OrchestratorClient:
             return None
 
 
+    async def resume_job(
+        self,
+        job_id: str,
+        feedback: Optional[str] = None,
+    ) -> bool:
+        """Resume a job via the orchestrator API.
+
+        Used to resume the target job with critic feedback, or to resume
+        a waiting critic job for another review round.
+
+        Args:
+            job_id: UUID of the job to resume
+            feedback: Optional feedback to inject before resuming
+
+        Returns:
+            True if resume succeeded, False otherwise
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/resume"
+        payload: dict[str, Any] = {}
+        if feedback:
+            payload["feedback"] = feedback
+
+        try:
+            response = await self._client.post(url, json=payload)
+
+            if response.status_code in (200, 202):
+                logger.info(f"Resumed job {job_id} via orchestrator")
+                return True
+            else:
+                logger.error(
+                    f"Failed to resume job {job_id}: {response.status_code} - {response.text}"
+                )
+                return False
+
+        except httpx.RequestError as e:
+            logger.error(f"Failed to connect to orchestrator for resume: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error resuming job: {e}")
+            return False
+
     async def create_verification_job(
         self,
         job_id: str,
@@ -398,6 +442,7 @@ class OrchestratorClient:
         freeze_data: dict[str, Any],
         config_name: str,
         project_id: Optional[str] = None,
+        max_rounds: int = 3,
     ) -> Optional[dict[str, Any]]:
         """Create a critic verification job for a completed job.
 
@@ -411,6 +456,7 @@ class OrchestratorClient:
             freeze_data: Freeze data from the target job (has summary, deliverables, confidence)
             config_name: Critic config name to use (e.g., "critic")
             project_id: Optional project UUID (inherit from parent job)
+            max_rounds: Maximum feedback round-trips before auto-accepting
 
         Returns:
             Created job dict from orchestrator, or None on failure
@@ -439,11 +485,31 @@ class OrchestratorClient:
             "deliverables": freeze_data.get("deliverables", []),
             "summary": freeze_data.get("summary", ""),
             "confidence": freeze_data.get("confidence", 0),
+            "verification_round": 0,
+            "max_verification_rounds": max_rounds,
         }
 
         payload: dict[str, Any] = {
             "description": verification_description,
             "config_name": freeze_data.get("critic_config", "critic"),
+            "config_override": {
+                "autonomy": "full",  # Critic must run autonomously
+                "tools": {
+                    "evaluation": ["approve_job", "return_job_with_feedback"],
+                },
+                "llm": {
+                    "model": "openrouter/minimax/minimax-m2.5",
+                    "reasoning_level": "xhigh",
+                    "strategic": {
+                        "model": "openrouter/minimax/minimax-m2.5",
+                        "reasoning_level": "xhigh",
+                    },
+                    "tactical": {
+                        "model": "openrouter/minimax/minimax-m2.5",
+                        "reasoning_level": "xhigh",
+                    },
+                },
+            },
             "instructions": instructions,
             "context": context,
             "parent_job_id": job_id,

@@ -1,24 +1,53 @@
 """Evaluation verdict tools for the Universal Agent.
 
 Provides tools for critic/reviewer agents to act on target jobs:
-- approve_job: Approve a pending_review job via orchestrator API
-- return_job_with_feedback: Resume a target job with structured feedback
+- approve_job: Record approval verdict for a target job
+- return_job_with_feedback: Record feedback verdict for a target job
 
-These tools call the orchestrator REST API. The orchestrator URL is
-read from the ORCHESTRATOR_URL environment variable (same as heartbeats).
+These tools use a deferred verdict pattern: they store the verdict intent
+in module-level state, and the actual orchestrator API calls happen after
+the critic's graph ends (in finalize_job / handle_transition).
 """
 
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
-import httpx
 from langchain_core.tools import tool
 
 from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Deferred verdict storage
+# ---------------------------------------------------------------------------
+# Verdict data is stored here by the tools, then consumed by finalize_job
+# in src/core/phase.py after the critic's graph loop ends.
+_verdict_data: Dict[str, Dict[str, Any]] = {}
+
+
+def get_verdict_data(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get stored verdict data for a job (used by phase.py).
+
+    Args:
+        job_id: The critic job's UUID
+
+    Returns:
+        Verdict dict if present, None otherwise
+    """
+    return _verdict_data.get(job_id)
+
+
+def clear_verdict_data(job_id: str) -> None:
+    """Clear stored verdict data for a job (used by phase.py after processing).
+
+    Args:
+        job_id: The critic job's UUID
+    """
+    if job_id in _verdict_data:
+        del _verdict_data[job_id]
 
 
 # Tool metadata for registry
@@ -29,7 +58,7 @@ EVALUATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Approve a target job that is pending review",
         "category": "evaluation",
         "short_description": "Approve a pending_review job (transitions to completed).",
-        "phases": ["strategic", "tactical"],
+        "phases": ["strategic"],
     },
     "return_job_with_feedback": {
         "module": "evaluation.evaluation_tools",
@@ -37,14 +66,9 @@ EVALUATION_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Resume a target job with feedback for the original agent to address",
         "category": "evaluation",
         "short_description": "Return a job to the original agent with issues to fix.",
-        "phases": ["strategic", "tactical"],
+        "phases": ["strategic"],
     },
 }
-
-
-def _get_orchestrator_url() -> str:
-    """Get orchestrator base URL from environment."""
-    return os.getenv("ORCHESTRATOR_URL", "http://localhost:8085").rstrip("/")
 
 
 def create_evaluation_tools(context: ToolContext) -> List[Any]:
@@ -56,7 +80,6 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
     Returns:
         List of LangChain tool functions
     """
-    orchestrator_url = _get_orchestrator_url()
 
     @tool
     async def approve_job(
@@ -68,8 +91,8 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
         """Approve a target job that is pending review.
 
         Call this when the target job's deliverables meet the requirements
-        and the work is acceptable. This transitions the job from
-        'pending_review' to 'completed'.
+        and the work is acceptable. The verdict is recorded and executed
+        when you complete your remaining todos.
 
         Args:
             job_id: UUID of the target job to approve
@@ -78,49 +101,57 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
             minor_notes: Optional list of minor observations (not blocking)
 
         Returns:
-            Confirmation message or error
+            Confirmation message
         """
-        try:
-            # Write the verification report to our workspace first
-            if context.has_workspace():
-                report_data = {
-                    "verdict": "approved",
-                    "target_job_id": job_id,
-                    "report": report,
-                }
-                if strengths:
-                    report_data["strengths"] = strengths
-                if minor_notes:
-                    report_data["minor_notes"] = minor_notes
+        from ..core.job import _final_phase_data
 
+        try:
+            # Build the report data
+            report_data: Dict[str, Any] = {
+                "verdict": "approved",
+                "target_job_id": job_id,
+                "report": report,
+            }
+            if strengths:
+                report_data["strengths"] = strengths
+            if minor_notes:
+                report_data["minor_notes"] = minor_notes
+
+            # Write the verification report to workspace
+            if context.has_workspace():
                 context.workspace_manager.write_file(
                     "output/verification_report.json",
                     json.dumps(report_data, indent=2, ensure_ascii=False),
                 )
 
-            # Call orchestrator approve endpoint
-            url = f"{orchestrator_url}/api/jobs/{job_id}/approve"
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url)
+            # Store verdict for deferred execution
+            _verdict_data[context.job_id] = {
+                "_verdict": "approved",
+                "_target_job_id": job_id,
+                "report": report,
+                "strengths": strengths or [],
+                "minor_notes": minor_notes or [],
+            }
 
-                if response.status_code == 200:
-                    logger.info(f"Approved job {job_id}")
-                    return (
-                        f"Job {job_id} approved successfully. "
-                        f"Status transitioned to 'completed'.\n\n"
-                        f"Report: {report}"
-                    )
-                else:
-                    error = response.text
-                    logger.error(f"Failed to approve job {job_id}: {response.status_code} - {error}")
-                    return f"Error approving job {job_id}: HTTP {response.status_code} - {error}"
+            # Also set _final_phase_data so on_strategic_phase_complete
+            # triggers finalize_job
+            _final_phase_data[context.job_id] = {
+                "summary": f"Verification complete: approved job {job_id}",
+                "deliverables": ["output/verification_report.json"],
+                "confidence": 1.0,
+                "job_id": context.job_id,
+            }
 
-        except httpx.RequestError as e:
-            logger.error(f"Failed to connect to orchestrator for approve: {e}")
-            return f"Error: Could not connect to orchestrator at {orchestrator_url}: {e}"
+            logger.info(f"Verdict recorded: approved job {job_id}")
+            return (
+                f"Verdict recorded: APPROVED job {job_id}.\n"
+                f"Report: {report}\n\n"
+                f"Complete your remaining todos to finalize the verdict."
+            )
+
         except Exception as e:
-            logger.error(f"Unexpected error approving job: {e}")
-            return f"Error approving job: {e}"
+            logger.error(f"Error recording approval verdict: {e}")
+            return f"Error recording verdict: {e}"
 
     @tool
     async def return_job_with_feedback(
@@ -132,8 +163,8 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
         """Return a target job to the original agent with feedback.
 
         Call this when the target job's deliverables have issues that
-        need to be addressed. This resumes the job with your feedback
-        injected into the agent's context.
+        need to be addressed. The verdict is recorded and executed
+        when you complete your remaining todos.
 
         The original agent will see your feedback and can address the
         issues before calling job_complete again, triggering another
@@ -146,8 +177,10 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
             severity: Overall severity: "low", "medium", "high"
 
         Returns:
-            Confirmation message or error
+            Confirmation message
         """
+        from ..core.job import _final_phase_data
+
         try:
             # Build structured feedback message
             feedback_parts = [f"## Verification Feedback\n\n{feedback}"]
@@ -164,55 +197,55 @@ def create_evaluation_tools(context: ToolContext) -> List[Any]:
 
             structured_feedback = "\n".join(feedback_parts)
 
-            # Write the verification report to our workspace
-            if context.has_workspace():
-                report_data = {
-                    "verdict": "returned",
-                    "target_job_id": job_id,
-                    "feedback": feedback,
-                    "severity": severity,
-                }
-                if issues:
-                    report_data["issues"] = issues
+            # Build the report data
+            report_data: Dict[str, Any] = {
+                "verdict": "returned",
+                "target_job_id": job_id,
+                "feedback": feedback,
+                "severity": severity,
+            }
+            if issues:
+                report_data["issues"] = issues
 
+            # Write the verification report to workspace
+            if context.has_workspace():
                 context.workspace_manager.write_file(
                     "output/verification_report.json",
                     json.dumps(report_data, indent=2, ensure_ascii=False),
                 )
 
-            # Call orchestrator resume endpoint with feedback
-            url = f"{orchestrator_url}/api/jobs/{job_id}/resume"
-            payload = {"feedback": structured_feedback}
+            # Store verdict for deferred execution
+            _verdict_data[context.job_id] = {
+                "_verdict": "returned",
+                "_target_job_id": job_id,
+                "_feedback": structured_feedback,
+                "feedback_raw": feedback,
+                "issues": issues or [],
+                "severity": severity,
+            }
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload)
+            # Also set _final_phase_data so on_strategic_phase_complete
+            # triggers finalize_job
+            _final_phase_data[context.job_id] = {
+                "summary": f"Verification complete: returned job {job_id} with feedback",
+                "deliverables": ["output/verification_report.json"],
+                "confidence": 1.0,
+                "job_id": context.job_id,
+            }
 
-                if response.status_code == 200:
-                    logger.info(f"Returned job {job_id} with feedback")
-                    issue_count = len(issues) if issues else 0
-                    return (
-                        f"Job {job_id} returned to original agent with feedback.\n"
-                        f"Issues: {issue_count}, Severity: {severity}\n\n"
-                        f"The agent will resume and address the feedback."
-                    )
-                elif response.status_code == 202:
-                    logger.info(f"Returned job {job_id} with feedback (dispatched)")
-                    return (
-                        f"Job {job_id} resume dispatched to agent with feedback.\n"
-                        f"The agent will address the issues."
-                    )
-                else:
-                    error = response.text
-                    logger.error(
-                        f"Failed to resume job {job_id}: {response.status_code} - {error}"
-                    )
-                    return f"Error resuming job {job_id}: HTTP {response.status_code} - {error}"
+            issue_count = len(issues) if issues else 0
+            logger.info(
+                f"Verdict recorded: returned job {job_id} "
+                f"({issue_count} issues, severity={severity})"
+            )
+            return (
+                f"Verdict recorded: RETURNED job {job_id} with feedback.\n"
+                f"Issues: {issue_count}, Severity: {severity}\n\n"
+                f"Complete your remaining todos to finalize the verdict."
+            )
 
-        except httpx.RequestError as e:
-            logger.error(f"Failed to connect to orchestrator for resume: {e}")
-            return f"Error: Could not connect to orchestrator at {orchestrator_url}: {e}"
         except Exception as e:
-            logger.error(f"Unexpected error resuming job: {e}")
-            return f"Error resuming job: {e}"
+            logger.error(f"Error recording return verdict: {e}")
+            return f"Error recording verdict: {e}"
 
     return [approve_job, return_job_with_feedback]

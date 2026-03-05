@@ -627,6 +627,124 @@ def reject_transition(
     )
 
 
+def _finalize_with_verdict(
+    state: "UniversalAgentState",
+    workspace: "WorkspaceManager",
+    todo_manager: "TodoManager",
+    verdict: Dict[str, Any],
+    job_id: str,
+) -> TransitionResult:
+    """Finalize a critic job based on verdict data from evaluation tools.
+
+    This handles the deferred verdict pattern: evaluation tools store
+    verdict intent, and this function produces the correct freeze_data
+    and TransitionResult for handle_transition to process.
+
+    Args:
+        state: Current agent state
+        workspace: WorkspaceManager for file access
+        todo_manager: TodoManager (for archiving)
+        verdict: Verdict data from evaluation tools
+        job_id: Critic job UUID
+
+    Returns:
+        TransitionResult with verdict-specific freeze_data
+    """
+    verdict_type = verdict.get("_verdict")
+    target_job_id = verdict.get("_target_job_id", "unknown")
+
+    if verdict_type == "approved":
+        freeze_data = {
+            "status": "completed",
+            "freeze_type": "verdict",
+            "verdict": "approved",
+            "target_job_id": target_job_id,
+            "report": verdict.get("report", ""),
+            "strengths": verdict.get("strengths", []),
+            "minor_notes": verdict.get("minor_notes", []),
+            "timestamp": datetime.now().isoformat(),
+            "job_id": job_id,
+        }
+        goal_achieved = True
+        log_msg = f"[{job_id}] Critic verdict: APPROVED target job {target_job_id}"
+
+    elif verdict_type == "returned":
+        freeze_data = {
+            "status": "waiting",
+            "freeze_type": "verdict",
+            "verdict": "returned",
+            "target_job_id": target_job_id,
+            "feedback": verdict.get("_feedback", ""),
+            "feedback_raw": verdict.get("feedback_raw", ""),
+            "issues": verdict.get("issues", []),
+            "severity": verdict.get("severity", "medium"),
+            "timestamp": datetime.now().isoformat(),
+            "job_id": job_id,
+        }
+        goal_achieved = False
+        log_msg = f"[{job_id}] Critic verdict: RETURNED target job {target_job_id} with feedback"
+
+    else:
+        # Unknown verdict type — warn and fall through to normal completion
+        logger.warning(
+            f"[{job_id}] Unknown verdict type '{verdict_type}', "
+            f"treating as normal completion"
+        )
+        freeze_data = {
+            "status": "completed",
+            "freeze_type": "verdict",
+            "verdict": verdict_type,
+            "target_job_id": target_job_id,
+            "timestamp": datetime.now().isoformat(),
+            "job_id": job_id,
+        }
+        goal_achieved = True
+        log_msg = f"[{job_id}] Critic verdict: {verdict_type} (unknown, defaulting to completed)"
+
+    logger.info(log_msg)
+
+    # Write verdict file to workspace
+    if workspace:
+        workspace.write_file(
+            "output/critic_verdict.json",
+            json.dumps(freeze_data, indent=2, ensure_ascii=False),
+        )
+
+    # Git commit
+    git_mgr = workspace.git_manager if workspace else None
+    if git_mgr and git_mgr.is_active:
+        try:
+            git_mgr.commit(
+                f"Critic verdict: {verdict_type} for target {target_job_id}",
+                allow_empty=True,
+            )
+            git_mgr.push()
+        except Exception as e:
+            logger.warning(f"[{job_id}] Git push failed at verdict: {e}")
+
+    # Archive todos
+    if todo_manager:
+        todo_manager.archive("final")
+
+    verdict_msg = HumanMessage(
+        content=(
+            f"[CRITIC_VERDICT] Verdict: {verdict_type} for target job {target_job_id}.\n"
+            f"Wrote: output/critic_verdict.json"
+        )
+    )
+
+    return TransitionResult(
+        success=True,
+        state_updates={
+            "messages": [verdict_msg],
+            "goal_achieved": goal_achieved,
+            "should_stop": True,
+            "is_final_phase": False,
+        },
+        freeze_data=freeze_data,
+    )
+
+
 def finalize_job(
     state: "UniversalAgentState",
     workspace: "WorkspaceManager",
@@ -656,9 +774,28 @@ def finalize_job(
         TransitionResult with should_stop=True to end the agent loop
     """
     from ..tools.core.job import get_final_phase_data, clear_final_phase_data
+    from ..tools.evaluation.evaluation_tools import get_verdict_data, clear_verdict_data
 
     job_id = state.get("job_id", "unknown")
     autonomy = getattr(config, "autonomy", "partial") if config else "partial"
+
+    # Check for deferred verdict data (from critic evaluation tools)
+    verdict = get_verdict_data(job_id)
+    if verdict:
+        clear_verdict_data(job_id)
+        # Also clear final_phase_data if set (evaluation tools set it to trigger finalize_job)
+        clear_final_phase_data(job_id)
+        return _finalize_with_verdict(state, workspace, todo_manager, verdict, job_id)
+
+    # Edge case: critic job reached finalize_job without verdict data.
+    # This means the critic called job_complete instead of an evaluation tool.
+    metadata = state.get("metadata") or {}
+    if metadata.get("verification_target"):
+        logger.warning(
+            f"[{job_id}] Critic job finalizing WITHOUT verdict data. "
+            f"The critic likely called job_complete instead of approve_job/return_job_with_feedback. "
+            f"Target job {metadata['verification_target']} will remain in 'reviewing' status."
+        )
 
     # Get the final phase data (set by job_complete tool)
     final_data = get_final_phase_data(job_id)
@@ -904,6 +1041,13 @@ def on_strategic_phase_complete(
 
     if is_final or final_data:
         logger.info(f"[{job_id}] Final phase detected, completing job")
+        return finalize_job(state, workspace, todo_manager, config=config)
+
+    # Check for deferred verdict data (critic evaluation tools)
+    from ..tools.evaluation.evaluation_tools import get_verdict_data
+    verdict_data = get_verdict_data(job_id)
+    if verdict_data:
+        logger.info(f"[{job_id}] Verdict detected, finalizing critic job")
         return finalize_job(state, workspace, todo_manager, config=config)
 
     # Check autonomy level for phase boundary freeze

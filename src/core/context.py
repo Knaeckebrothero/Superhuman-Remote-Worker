@@ -14,6 +14,7 @@ References:
 - LangGraph: Manage Conversation History
 """
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -387,6 +388,7 @@ class ContextManager:
         model: str = "gpt-4",
         strategic_model: Optional[str] = None,
         tactical_model: Optional[str] = None,
+        summarization_timeout: float = 600.0,
     ):
         """Initialize context manager.
 
@@ -395,6 +397,7 @@ class ContextManager:
             model: Model name for token counting (default/fallback)
             strategic_model: Model name for strategic phase token counting
             tactical_model: Model name for tactical phase token counting
+            summarization_timeout: Total timeout in seconds for summarization LLM calls
         """
         self.config = config or ContextConfig()
         self._default_counter = get_token_counter(model)
@@ -405,6 +408,7 @@ class ContextManager:
             self._phase_counters["tactical"] = get_token_counter(tactical_model)
         self.token_counter = self._default_counter
         self._state = ContextManagementState()
+        self._summarization_timeout = summarization_timeout
 
     def set_current_phase(self, phase: str) -> None:
         """Switch token counter to the appropriate phase-specific model.
@@ -944,7 +948,10 @@ Conversation:
         try:
             structured_llm = llm.with_structured_output(ConversationSummary)
 
-            result: ConversationSummary = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            result: ConversationSummary = await asyncio.wait_for(
+                structured_llm.ainvoke([HumanMessage(content=prompt)]),
+                timeout=self._summarization_timeout,
+            )
 
             # Format into readable text
             parts = []
@@ -994,7 +1001,10 @@ Conversation:
                     f"key decisions, current state, and any blockers. Keep under {max_summary_length} characters.\n\n"
                     f"Conversation:\n{conversation_text}"
                 )
-                response = await llm.ainvoke([HumanMessage(content=fallback_prompt)])
+                response = await asyncio.wait_for(
+                    llm.ainvoke([HumanMessage(content=fallback_prompt)]),
+                    timeout=self._summarization_timeout,
+                )
                 fallback_summary = response.content if hasattr(response, 'content') else str(response)
                 if fallback_summary and len(fallback_summary.strip()) > 50:
                     logger.info(f"Unstructured fallback succeeded ({len(fallback_summary)} chars)")
