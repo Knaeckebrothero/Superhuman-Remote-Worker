@@ -10,19 +10,33 @@ config/
 ├── schema.json                  # JSON Schema for config validation
 ├── prompt_matrix.yaml           # Base prompt matrix (model family → filename)
 ├── instruction_matrix.yaml      # Base instruction matrix (model family → filename)
+├── settings_matrix.yaml         # Model-family-specific inference params & context limits
 ├── README.md                    # This file
+├── experts/                     # Pre-built agent roles (developer, scholar, critic)
+│   └── <expert>/
+│       ├── config.yaml              # Agent config (extends defaults)
+│       ├── prompt_matrix.yaml       # Expert-level prompt matrix (optional)
+│       └── instruction_matrix.yaml  # Expert-level instruction matrix (optional)
 ├── prompts/                     # Prompt templates (system prompt, phase prompts)
 │   ├── systemprompt.txt         # Main system prompt
+│   ├── persona.txt              # Agent persona/identity prompt
 │   ├── strategic.txt            # Strategic phase system prompt
 │   ├── tactical.txt             # Tactical phase system prompt
-│   └── summarization_prompt.txt # Context compaction prompt
+│   ├── summarization_prompt.txt # Context compaction prompt
+│   ├── systemprompt_minimax.txt # MiniMax-optimized system prompt
+│   ├── persona_minimax.txt      # MiniMax-optimized persona
+│   ├── strategic_minimax.txt    # MiniMax-optimized strategic prompt
+│   ├── tactical_minimax.txt     # MiniMax-optimized tactical prompt
+│   └── summarization_prompt_minimax.txt  # MiniMax-optimized summarization
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
+    ├── instructions_minimax.md          # MiniMax-optimized instructions
     ├── strategic_todos_initial.yaml     # Initial todos for job start
     ├── strategic_todos_transition.yaml  # Todos for phase transitions
-    ├── strategic_todos_resume.yaml      # Todos for job resume
+    ├── strategic_todos_resume.yaml      # Todos for job resume with feedback
     ├── workspace_template.md            # Template for workspace.md
-    └── todo_guide.md                    # Todo crafting guide
+    ├── todo_guide.md                    # Todo crafting guide
+    └── phase_retrospective_template.md  # Template for phase retrospectives
 ```
 
 ## Creating a Custom Agent Config
@@ -72,7 +86,7 @@ config/
 The agent uses two parallel matrix systems with the same 4-level fallback chain:
 
 **Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts:
-- Entries: `systemprompt`, `strategic`, `tactical`, `summarization`
+- Entries: `systemprompt`, `persona`, `strategic`, `tactical`, `summarization`
 - File search: expert directory → `config/prompts/`
 
 **Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates:
@@ -168,11 +182,14 @@ tools:
     - copy_file
     - get_workspace_summary
     - get_document_info
+    - create_directory
+    - delete_directory
 
   # Task management + completion (src/tools/core/)
   core:
     - next_phase_todos      # Stage todos for next tactical phase
     - todo_complete          # Mark current todo done
+    - todo_list              # List current todos
     - todo_rewind            # Roll back failed todo
     - mark_complete          # Signal phase/task completion
     - job_complete           # Signal final completion (strategic only)
@@ -184,6 +201,9 @@ tools:
   # Research: web, papers, browser, workflows (src/tools/research/)
   research:
     - web_search             # Tavily web search
+    - extract_webpage        # Extract content from a URL
+    - crawl_website          # Crawl a website following links
+    - map_website            # Map a website's link structure
     - search_papers          # Search arXiv or Semantic Scholar
     - download_paper         # Download PDF (arXiv → Unpaywall → browser fallback)
     - get_paper_info         # Paper metadata via Semantic Scholar
@@ -199,6 +219,11 @@ tools:
     - get_citation
     - list_citations
     - edit_citation
+    - annotate_source
+    - get_annotations
+    - tag_source
+    - search_library
+    - generate_bibliography
 
   # Database tool categories (src/tools/graph/, sql/, mongodb/)
   # These are injected/stripped automatically by the orchestrator based on
@@ -207,6 +232,15 @@ tools:
   graph: []      # Neo4j: execute_cypher_query, get_database_schema
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
+
+  # Persistent terminal sessions (src/tools/coding/)
+  coding:
+    - shell_execute   # Execute commands in persistent tmux tabs
+    - shell_read      # Read output from persistent tabs
+
+  # Evaluation tools for critic agents (src/tools/evaluation/)
+  # Enable in critic config for approve/return capabilities.
+  evaluation: []
 
   # Workspace version control (src/tools/git/)
   git:
@@ -280,16 +314,72 @@ This means the agent config controls non-database tools, while the orchestrator 
 
 ### Context Management
 
+Context limits are model-dependent and set via `settings_matrix.yaml` (see below). The values below are defaults that get overridden per model family:
+
 ```yaml
 limits:
-  context_threshold_tokens: 60000
-  message_count_threshold: 200
-  model_max_context_tokens: 100000
+  message_count_threshold: 300
+  # Model-dependent (set in settings_matrix.yaml, NOT here):
+  # context_threshold_tokens, model_max_context_tokens,
+  # summarization_safe_limit, summarization_chunk_size,
+  # message_count_min_tokens
 
 context_management:
   compact_on_archive: true
-  keep_recent_tool_results: 10
+  keep_recent_tool_results: 150
   keep_recent_messages: 10
+```
+
+### Settings Matrix
+
+`settings_matrix.yaml` is the single source of truth for model-family-specific inference parameters and context limits. Keys match `detect_model_family()` output in `src/core/loader.py`.
+
+```yaml
+# Resolution: default → family-specific (deep_merge)
+
+default:
+  model_max_context_tokens: 128000
+  limits:
+    model_max_context_tokens: 100000
+    context_threshold_tokens: 80000
+
+minimax:
+  temperature: 1.0
+  top_p: 0.95
+  limits:
+    model_max_context_tokens: 150000
+    context_threshold_tokens: 100000
+
+deepseek:
+  model_max_context_tokens: 64000
+  limits:
+    context_threshold_tokens: 40000
+```
+
+Experts can place their own `settings_matrix.yaml` in their directory.
+
+### Verification
+
+Auto-spawn a critic job after `job_complete` to review deliverables:
+
+```yaml
+verification:
+  enabled: true          # Spawn critic job after job_complete
+  critic_config: critic  # Which expert config to use for the reviewer
+  max_rounds: 3          # Max feedback round-trips before auto-accepting
+```
+
+### Memory Light
+
+Opt-in recall system backed by PostgreSQL (pgvector hybrid search). Stores and retrieves insights across context compactions. See `docs/features/memory_light.md` for full design.
+
+```yaml
+memory:
+  enabled: true
+  budget_tokens: 10000
+  max_memories_per_injection: 25
+  observer_interval: 5
+  embedding_model: text-embedding-3-small
 ```
 
 ## Inheritance

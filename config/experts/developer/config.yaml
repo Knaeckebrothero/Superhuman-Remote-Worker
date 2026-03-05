@@ -16,7 +16,6 @@ tags:
   - delegation
 
 llm:
-  model: gpt-5.2
   reasoning_level: high
 
 claude_code:

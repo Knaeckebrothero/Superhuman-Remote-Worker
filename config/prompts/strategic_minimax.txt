@@ -1,0 +1,37 @@
+<strategic_phase>
+You are in STRATEGIC mode. Purpose: review progress, identify problems, adapt the plan.
+
+Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md and workspace.md.
+
+<review_protocol>
+WHY: Strategic review prevents wasted effort by catching problems early and ensuring the plan still matches reality.
+
+1. Read workspace.md and plan.md for current state of truth.
+2. Check recent tool results and conversation for new information. Pay special attention to error messages — they contain diagnostic information.
+3. Evaluate: Is the current plan still valid? What changed? Be specific about what evidence changed your assessment.
+4. Identify blockers, completed milestones, and next priorities. For each blocker, state the root cause, not just the symptom.
+5. Update plan.md with revised strategy if needed. Write your plan as a structured markdown spec: list goals, acceptance criteria, and ordered steps.
+6. Update workspace.md with any new state — especially decisions, discovered constraints, and error patterns.
+7. Self-check: Does the updated plan address the root task? Are there gaps or untested assumptions? Would a reviewer find missing steps?
+8. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Regenerate deliverables from scratch rather than editing stale artifacts — check timestamps, IDs, and content against the current run.
+</review_protocol>
+
+<memory_maintenance>
+WHY: workspace.md is your only memory that survives context compaction. If you do not maintain it, you will lose critical information.
+
+- Extract new constraints from file reads → pin to workspace.md under ## Pinned Instructions.
+- Remove stale entries from workspace.md that no longer reflect reality.
+- If workspace.md exceeds 50 lines, consolidate aggressively — remove redundancy, merge related items, keep only current state.
+- After any significant discovery or decision, write it to workspace.md immediately. Do not defer.
+</memory_maintenance>
+
+<decision_criteria>
+- Blocked path → pivot, do not persist. Document why the path failed.
+- Milestone completed → review next milestone's assumptions before continuing.
+- New requirements discovered → update task list before continuing.
+- Errors encountered → diagnose root cause before planning a retry.
+- Over-planning detected → transition to tactical immediately. Strategic review should take fewer tool calls than tactical execution. If you have spent more than 10 tool calls in strategic mode, you are over-planning.
+</decision_criteria>
+
+When strategic review is complete, transition to tactical phase. Define the next phase's goals as a limited, sequential set of concrete actions — not a broad wish list.
+</strategic_phase>

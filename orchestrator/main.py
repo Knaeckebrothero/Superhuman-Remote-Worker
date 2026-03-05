@@ -987,14 +987,59 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             priority=job.priority,
         )
 
-        # Create Gitea repo for workspace delivery
+        # Create Gitea repo/branch for workspace delivery
+        job_id_str = str(result["id"])
         if gitea_client.is_initialized:
-            job_id_str = str(result["id"])
-            git_remote_url = await gitea_client.create_repo(f"job-{job_id_str}")
-            if git_remote_url:
-                ctx = dict(context) if context else {}
-                ctx["git_remote_url"] = git_remote_url
-                await postgres_db.update_job_context(job_id_str, ctx)
+            if project_id and job.parent_job_id:
+                # Subjob of a project job: branch from parent's branch
+                repos = await postgres_db.get_project_repositories(project_id, role="jobs")
+                if repos:
+                    jobs_repo = repos[0]
+                    from_branch = "main"
+                    parent = await postgres_db.get_job(job.parent_job_id)
+                    if parent and parent.get("branch_name"):
+                        from_branch = parent["branch_name"]
+                    else:
+                        logger.warning(
+                            f"Parent job {job.parent_job_id} has no branch_name, "
+                            f"branching subjob from 'main'"
+                        )
+                    branch_name = f"job/{job_id_str[:8]}"
+                    await gitea_client.create_branch(
+                        jobs_repo["name"], branch_name, from_branch=from_branch
+                    )
+                    ctx = dict(context) if context else {}
+                    ctx["git_remote_url"] = jobs_repo["repo_url"]
+                    await postgres_db.update_job_context(job_id_str, ctx)
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET branch_name = $1 WHERE id = $2",
+                            branch_name, result["id"],
+                        )
+                    result["branch_name"] = branch_name
+            elif project_id:
+                # Root project job via /api/jobs: branch from main
+                repos = await postgres_db.get_project_repositories(project_id, role="jobs")
+                if repos:
+                    jobs_repo = repos[0]
+                    branch_name = f"job/{job_id_str[:8]}"
+                    await gitea_client.create_branch(jobs_repo["name"], branch_name)
+                    ctx = dict(context) if context else {}
+                    ctx["git_remote_url"] = jobs_repo["repo_url"]
+                    await postgres_db.update_job_context(job_id_str, ctx)
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET branch_name = $1 WHERE id = $2",
+                            branch_name, result["id"],
+                        )
+                    result["branch_name"] = branch_name
+            else:
+                # Non-project job: standalone repo
+                git_remote_url = await gitea_client.create_repo(f"job-{job_id_str}")
+                if git_remote_url:
+                    ctx = dict(context) if context else {}
+                    ctx["git_remote_url"] = git_remote_url
+                    await postgres_db.update_job_context(job_id_str, ctx)
 
         # Clone selected global datasources as job-scoped
         if job.datasource_ids:
@@ -4068,6 +4113,8 @@ async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
             context=context if context else None,
             user_id=job.user_id,
             project_id=project_id,
+            parent_job_id=job.parent_job_id,
+            priority=job.priority,
         )
 
         job_id_str = str(result["id"])
@@ -4078,7 +4125,19 @@ async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
 
         if gitea_client.is_initialized and repos:
             jobs_repo = repos[0]
-            await gitea_client.create_branch(jobs_repo["name"], branch_name)
+            from_branch = "main"
+            if job.parent_job_id:
+                parent = await postgres_db.get_job(job.parent_job_id)
+                if parent and parent.get("branch_name"):
+                    from_branch = parent["branch_name"]
+                else:
+                    logger.warning(
+                        f"Parent job {job.parent_job_id} has no branch_name, "
+                        f"branching subjob from 'main'"
+                    )
+            await gitea_client.create_branch(
+                jobs_repo["name"], branch_name, from_branch=from_branch
+            )
 
             # Use the project's jobs repo URL directly (no separate job repo needed)
             ctx = dict(context) if context else {}

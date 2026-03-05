@@ -15,8 +15,7 @@ tags:
   - exploration
   - ideas
 
-llm:
-  temperature: 0.3
+llm: {}
 
 workspace:
   structure:

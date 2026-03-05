@@ -1,0 +1,68 @@
+# Settings Matrix — model-family-specific inference parameter defaults.
+# Single source of truth for model-dependent settings.
+# Keys match detect_model_family() output in src/core/loader.py.
+#
+# Resolution: default → family-specific (deep_merge).
+# Per-expert: experts can place settings_matrix.yaml in their directory.
+# Flat keys → data["llm"], nested "limits:" → data["limits"].
+
+default:
+  model_max_context_tokens: 128000
+  limits:
+    model_max_context_tokens: 100000
+    context_threshold_tokens: 80000
+    summarization_safe_limit: 90000
+    summarization_chunk_size: 80000
+    message_count_min_tokens: 50000
+
+minimax:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 40
+  model_max_context_tokens: 196608
+  limits:
+    model_max_context_tokens: 150000
+    context_threshold_tokens: 100000
+    summarization_safe_limit: 150000
+    summarization_chunk_size: 100000
+    message_count_min_tokens: 80000
+
+o-series:
+  temperature: 1.0
+  model_max_context_tokens: 200000
+  limits:
+    model_max_context_tokens: 170000
+    context_threshold_tokens: 130000
+    summarization_safe_limit: 160000
+    summarization_chunk_size: 110000
+    message_count_min_tokens: 80000
+
+deepseek:
+  top_p: 0.95
+  model_max_context_tokens: 64000
+  limits:
+    model_max_context_tokens: 55000
+    context_threshold_tokens: 40000
+    summarization_safe_limit: 45000
+    summarization_chunk_size: 35000
+    message_count_min_tokens: 30000
+
+gemini:
+  top_p: 0.95
+  top_k: 40
+  model_max_context_tokens: 1000000
+  limits:
+    model_max_context_tokens: 200000
+    context_threshold_tokens: 150000
+    summarization_safe_limit: 180000
+    summarization_chunk_size: 120000
+    message_count_min_tokens: 100000
+
+gpt-oss:
+  model_max_context_tokens: 100000
+  limits:
+    model_max_context_tokens: 85000
+    context_threshold_tokens: 60000
+    summarization_safe_limit: 75000
+    summarization_chunk_size: 55000
+    message_count_min_tokens: 40000

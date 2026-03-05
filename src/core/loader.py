@@ -129,6 +129,121 @@ def load_and_merge_config(config_path: str) -> Dict[str, Any]:
     return config_data
 
 
+# =============================================================================
+# Settings Matrix — model-family-specific inference defaults
+# =============================================================================
+
+_settings_matrix_base_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _load_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load a single settings matrix YAML file.
+
+    Returns a dict mapping family names to parameter dicts.
+    Falls back to empty dict on any error.
+    """
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            logger.warning(f"Invalid settings matrix {path}: expected dict, got {type(data)}")
+            return {}
+        result = {}
+        for family, params in data.items():
+            if isinstance(params, dict):
+                result[family] = params
+            else:
+                logger.warning(f"settings_matrix: skipping '{family}' (expected dict, got {type(params)})")
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to load {path}: {e}")
+        return {}
+
+
+def _load_settings_matrix(deployment_dir: str = None) -> Dict[str, Dict[str, Any]]:
+    """Load settings matrix: base (cached) + optional expert override (deep-merged).
+
+    Returns a dict mapping model family names to inference parameter dicts.
+    Falls back to empty dict if the file doesn't exist.
+    """
+    global _settings_matrix_base_cache
+    if _settings_matrix_base_cache is None:
+        base_path = get_project_root() / "config" / "settings_matrix.yaml"
+        _settings_matrix_base_cache = _load_matrix_file(base_path)
+        if _settings_matrix_base_cache:
+            logger.debug(f"Loaded settings matrix: {len(_settings_matrix_base_cache)} families")
+
+    base = _settings_matrix_base_cache
+    if not deployment_dir:
+        return base
+
+    expert_path = Path(deployment_dir) / "settings_matrix.yaml"
+    if not expert_path.exists():
+        return base
+
+    expert = _load_matrix_file(expert_path)
+    if not expert:
+        return base
+
+    return deep_merge(base, expert)
+
+
+def _apply_settings_matrix(
+    data: Dict[str, Any],
+    expert_llm_keys: set,
+    deployment_dir: str = None,
+) -> Dict[str, Any]:
+    """Apply settings matrix values to a merged config dict.
+
+    Resolution: default entry → family-specific entry (deep_merge) → apply.
+    Flat keys go to data["llm"] (respecting expert_llm_keys).
+    Limits go to data["limits"] (matrix is sole source, no expert override check).
+
+    Args:
+        data: Merged config dict (after load_and_merge_config)
+        expert_llm_keys: Set of llm keys explicitly set in the raw expert config
+        deployment_dir: Optional expert directory for per-expert matrix override
+
+    Returns:
+        Modified data dict (mutated in place and returned for convenience)
+    """
+    llm_data = data.get("llm", {})
+    model = llm_data.get("model", "gpt-4o")
+    family = detect_model_family(model)
+
+    matrix = _load_settings_matrix(deployment_dir)
+    default_settings = matrix.get("default", {})
+    family_settings = matrix.get(family, {}) if family != "default" else {}
+    settings = deep_merge(default_settings, family_settings)
+
+    if not settings:
+        return data
+
+    applied = []
+
+    # Apply flat keys -> data["llm"] (skip "limits" — it's not an LLM param)
+    for key, value in settings.items():
+        if key == "limits":
+            continue
+        if key not in expert_llm_keys:
+            data.setdefault("llm", {})[key] = value
+            applied.append(f"llm.{key}={value}")
+
+    # Apply limits -> data["limits"] (matrix is sole source of truth)
+    limits_settings = settings.get("limits")
+    if isinstance(limits_settings, dict):
+        for key, value in limits_settings.items():
+            data.setdefault("limits", {})[key] = value
+            applied.append(f"limits.{key}={value}")
+
+    if applied:
+        logger.debug(f"Settings matrix ({family}): applied {', '.join(applied)}")
+
+    return data
+
+
 class FileResolver:
     """Resolves template files with deployment override support.
 
@@ -426,6 +541,8 @@ class PhaseLLMOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
     reasoning_level: Optional[str] = None
     reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect)
     base_url: Optional[str] = None
@@ -462,6 +579,8 @@ class LLMConfig:
     model: str = "gpt-4o"
     provider: Optional[str] = None  # "openai", "anthropic", "google", "groq", "openrouter" (auto-detect if None)
     temperature: float = 0.0
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
     reasoning_level: str = "high"
     reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect from model)
     base_url: Optional[str] = None
@@ -500,6 +619,8 @@ class LLMConfig:
             model=override.model if override.model is not None else self.model,
             provider=override.provider if override.provider is not None else self.provider,
             temperature=override.temperature if override.temperature is not None else self.temperature,
+            top_p=override.top_p if override.top_p is not None else self.top_p,
+            top_k=override.top_k if override.top_k is not None else self.top_k,
             reasoning_level=override.reasoning_level if override.reasoning_level is not None else self.reasoning_level,
             reasoning_method=override.reasoning_method if override.reasoning_method is not None else self.reasoning_method,
             base_url=override.base_url if override.base_url is not None else self.base_url,
@@ -571,14 +692,14 @@ class ResponseValidationConfig:
 class LimitsConfig:
     """Execution limits configuration."""
 
-    context_threshold_tokens: int = 80000
+    context_threshold_tokens: int = 80000       # Safety net default; real value from settings_matrix
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 40000
+    message_count_min_tokens: int = 50000      # Safety net default; real value from settings_matrix
     tool_retry_count: int = 3
-    # Safety layer constants for preventing context overflow
-    model_max_context_tokens: int = 100000  # Global fallback for model context window
-    summarization_safe_limit: int = 90000  # Max input tokens for summarization LLM (< model_max for prompt overhead)
-    summarization_chunk_size: int = 80000   # Chunk size for recursive summarization
+    # Safety layer constants — real values come from settings_matrix.yaml
+    model_max_context_tokens: int = 100000
+    summarization_safe_limit: int = 90000
+    summarization_chunk_size: int = 80000
     response_validation: ResponseValidationConfig = field(default_factory=ResponseValidationConfig)
 
 
@@ -676,6 +797,8 @@ def _parse_phase_override(data: Optional[Dict[str, Any]]) -> Optional[PhaseLLMOv
         model=data.get("model"),
         provider=data.get("provider"),
         temperature=data.get("temperature"),
+        top_p=data.get("top_p"),
+        top_k=data.get("top_k"),
         reasoning_level=data.get("reasoning_level"),
         reasoning_method=data.get("reasoning_method"),
         base_url=data.get("base_url"),
@@ -702,6 +825,8 @@ def _parse_llm_config(llm_data: Dict[str, Any]) -> LLMConfig:
         model=llm_data.get("model", "gpt-4o"),
         provider=llm_data.get("provider"),
         temperature=llm_data.get("temperature", 0.0),
+        top_p=llm_data.get("top_p"),
+        top_k=llm_data.get("top_k"),
         reasoning_level=llm_data.get("reasoning_level", "high"),
         reasoning_method=llm_data.get("reasoning_method"),
         base_url=llm_data.get("base_url"),
@@ -797,6 +922,17 @@ def load_agent_config(
 
     # Load config with inheritance resolution
     data = load_and_merge_config(config_path)
+
+    # Apply settings matrix: model-family defaults between defaults.yaml and expert config.
+    # Read the raw expert file to know which llm keys were explicitly set.
+    raw_expert_llm_keys = set()
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_expert = yaml.safe_load(f) or {}
+        raw_expert_llm_keys = set((raw_expert.get("llm") or {}).keys())
+    except Exception:
+        pass
+    _apply_settings_matrix(data, raw_expert_llm_keys, deployment_dir)
 
     # Validate required fields
     required = ["agent_id", "display_name"]
@@ -1115,6 +1251,10 @@ def load_uploaded_config(uploaded_config_path: Path) -> Dict[str, Any]:
     # Merge: defaults as base, uploaded as override
     merged = deep_merge(defaults_data, uploaded_data)
 
+    # Apply settings matrix: uploaded llm keys are the explicit overrides
+    uploaded_llm_keys = set((uploaded_data.get("llm") or {}).keys())
+    _apply_settings_matrix(merged, uploaded_llm_keys)
+
     logger.info(
         f"Merged uploaded config with defaults: "
         f"agent_id={merged.get('agent_id')}, "
@@ -1206,6 +1346,8 @@ def detect_model_family(model: str) -> str:
         return "gemini"
     if name.startswith("gpt-oss"):
         return "gpt-oss"
+    if "minimax" in name:
+        return "minimax"
 
     return "default"
 
@@ -1231,7 +1373,7 @@ def detect_reasoning_method(model: str, explicit_method: Optional[str] = None) -
 
     if family == "gpt-oss":
         return "prompt"
-    if family in ("claude-opus", "claude-sonnet", "claude-haiku", "gemini"):
+    if family in ("claude-opus", "claude-sonnet", "claude-haiku", "gemini", "minimax"):
         return "none"
     # gpt-5, gpt-4o, o-series, deepseek, qwen, llama, default
     return "api"
@@ -1357,6 +1499,8 @@ def _create_openai_llm(
 
     # Build model kwargs
     model_kwargs = {}
+    if config.top_k is not None:
+        model_kwargs["top_k"] = config.top_k
 
     # Build kwargs for ChatOpenAI
     llm_kwargs = {
@@ -1365,6 +1509,8 @@ def _create_openai_llm(
         "api_key": api_key,
         "max_retries": config.max_retries,
     }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
 
     # Add reasoning parameters
     reasoning_mode = "none"
@@ -1444,6 +1590,10 @@ def _create_anthropic_llm(
         "api_key": api_key,
         "max_retries": config.max_retries,
     }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
+    if config.top_k is not None:
+        llm_kwargs["top_k"] = config.top_k
 
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
@@ -1498,6 +1648,10 @@ def _create_google_llm(
         "temperature": config.temperature,
         "google_api_key": api_key,
     }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
+    if config.top_k is not None:
+        llm_kwargs["top_k"] = config.top_k
 
     # Google's timeout parameter name differs
     if config.timeout is not None:
@@ -1543,6 +1697,14 @@ def _create_groq_llm(
         "api_key": api_key,
         "max_retries": config.max_retries,
     }
+
+    groq_model_kwargs = {}
+    if config.top_p is not None:
+        groq_model_kwargs["top_p"] = config.top_p
+    if config.top_k is not None:
+        groq_model_kwargs["top_k"] = config.top_k
+    if groq_model_kwargs:
+        llm_kwargs["model_kwargs"] = groq_model_kwargs
 
     if config.timeout is not None:
         llm_kwargs["timeout"] = config.timeout
@@ -1619,6 +1781,9 @@ def _create_openrouter_llm(
     if config.reasoning_level and config.reasoning_level != "none":
         model_kwargs["reasoning"] = {"effort": config.reasoning_level}
 
+    if config.top_k is not None:
+        model_kwargs["top_k"] = config.top_k
+
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {
         "model": model,
@@ -1627,6 +1792,8 @@ def _create_openrouter_llm(
         "base_url": base_url,
         "max_retries": config.max_retries,
     }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
 
     # Add optional OpenRouter headers for leaderboard identification
     default_headers = {}

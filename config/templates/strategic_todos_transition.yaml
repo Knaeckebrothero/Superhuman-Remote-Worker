@@ -17,55 +17,64 @@ todos:
           all file changes made during the phase.
 
       Then write a retrospective to archive/phase_N_retrospective.md with these
-      five sections:
+      six sections:
       1. **Accomplished**: What was completed, with specific file paths that changed.
       2. **Incomplete**: What was attempted but didn't fully succeed, and why.
       3. **Discoveries**: Unexpected findings or blockers encountered.
-      4. **Todo Stats**: How many todos were completed vs planned (e.g., "8/10 completed").
-      5. **Deliverable Status**: Which deliverables from plan.md's "## Deliverables" section
+      4. **Failed Approaches**: What was tried and did NOT work, with the reason.
+         (These must survive so you avoid retrying the same failed strategy.)
+      5. **Todo Stats**: How many todos were completed vs planned (e.g., "8/10 completed").
+      6. **Deliverable Status**: Which deliverables from plan.md's "## Deliverables" section
          are now done vs still remaining. Use list_files('output/') to verify. List them explicitly.
 
-      COMPLETION CRITERIA: archive/phase_N_retrospective.md written with all 5 sections,
+      COMPLETION CRITERIA: archive/phase_N_retrospective.md written with all 6 sections,
       backed by git evidence (commit hashes, file paths from git_diff).
 
-      ANTI-PATTERNS:
-      - Do NOT write the retrospective from memory alone — use git_log and git_diff.
-      - Do NOT skip section 5 (Deliverable Status). This is what determines whether
-        the job is done in todo 4.
+      INSTEAD OF: Writing the retrospective from memory alone — use git_log and git_diff
+      for evidence. Include section 4 (Failed Approaches) and section 6 (Deliverable Status)
+      even if empty — these drive the job completion decision in todo 4.
 
   - id: 2
     content: >-
-      REFLECT on workspace.md: Read it fully, then REWRITE it from scratch.
-      Do NOT append — replace the entire content.
+      REFLECT on workspace.md: Read it fully, then REWRITE it.
 
       workspace.md is injected into every LLM call. Stale or bloated content wastes
       tokens and confuses future decisions. After rewriting, it should contain ONLY:
-      - "## Pinned Instructions" — the rules from instructions.md (re-read instructions.md
-        if you're unsure these are still accurate and complete)
+
+      PROTECTED sections (preserve verbatim unless provably wrong):
+      - "## Pinned Instructions" — re-read instructions.md if you're unsure these are
+        still accurate and complete
+      - "## Facts" — durable knowledge: IDs, paths, credentials, configurations.
+        Only remove facts that are confirmed wrong or no longer relevant.
+      - "## Failed Approaches" — approaches that didn't work. Only remove entries
+        when the underlying issue is confirmed resolved.
+
+      REWRITABLE sections (update freely):
       - "## Deliverables" — update the status table based on the retrospective's
-        Deliverable Status section. Mark completed items as "done".
+        Deliverable Status section. Mark completed items as "done" with verification evidence.
       - "## Key Decisions" — significant choices made so far, with brief reasoning
-      - "## Entities" — key entities being tracked (if applicable)
-      - "## Critical Context" — current blockers, important discoveries, anything
-        that must survive context compaction
+      - "## Status" — current phase, active blockers (or "none")
+
+      BLOCKER CHALLENGE: If "## Status" lists blockers from previous phases,
+      re-verify them now. Re-read the source, re-run the command, or re-check the
+      assumption. If the blocker is still valid, keep it. If not, remove it.
 
       Remove: progress percentages, phase completion status, todo summaries,
       document inventories, anything already tracked in plan.md.
 
-      COMPLETION CRITERIA: workspace.md fully rewritten (not appended to),
-      under 50 lines, "## Pinned Instructions" section present and accurate.
+      COMPLETION CRITERIA: workspace.md fully rewritten, under 4000 tokens (~60 lines),
+      protected sections preserved, stale blockers challenged.
 
-      ANTI-PATTERNS:
-      - Do NOT append new sections to the existing content. REWRITE the whole file.
-      - Do NOT duplicate information from plan.md (phase status, progress tracking).
-      - Do NOT let workspace.md grow beyond 50 lines. Prune aggressively.
+      INSTEAD OF: Appending new content to the existing file — rewrite the whole file.
+      Instead of merging Facts into Critical Context — keep Facts as a separate protected
+      section. Instead of removing entries you're unsure about — keep them.
 
   - id: 3
     content: >-
       ADAPT plan.md based on the retrospective. Read plan.md, then update it.
 
-      For each action below, REWRITE the relevant parts of plan.md (don't append
-      a second copy of the plan):
+      For each action below, REWRITE the relevant parts of plan.md (use a single
+      write_file to replace the whole file rather than appending a second copy):
       (1) Mark completed phases with actual outcomes — not just "done" but what
           was produced (e.g., "Phase 2: Completed. Produced output/analysis.md
           with 15 requirement entries extracted from 8 source documents.").
@@ -81,12 +90,11 @@ todos:
       COMPLETION CRITERIA: plan.md updated with outcomes on completed phases,
       phase sizing adjusted, upcoming phases verified against instructions.md.
 
-      ANTI-PATTERNS:
-      - Do NOT append a new copy of the plan below the existing one. REWRITE in place.
-      - Do NOT add phases for housekeeping tasks (archiving, cleanup, packaging,
-        PDF generation, database status updates, file reorganization). The system
-        handles versioning and delivery automatically via git and Gitea.
-      - Do NOT keep phases that no longer map to a required deliverable.
+      INSTEAD OF: Appending a new copy of the plan below the existing one — rewrite
+      in place. Instead of adding phases for housekeeping (archiving, cleanup, packaging,
+      PDF generation, status updates, file reorganization) — these are handled
+      automatically by git versioning and Gitea. Keep every phase mapped to a
+      required deliverable.
 
   - id: 4
     content: >-
@@ -106,11 +114,8 @@ todos:
       - notes: Any caveats, known gaps, or areas a reviewer should check
 
       The system will freeze the job, commit all workspace files, and push everything
-      to Gitea for human review. You do NOT need to:
-      - Archive or reorganize files (git handles history)
-      - Generate PDFs or summaries (the reviewer reads your output directly)
-      - Update database status (the system does this automatically)
-      - Clean up temporary files (the workspace is preserved as-is)
+      to Gitea for human review. You do not need to archive files, generate PDFs,
+      update database status, or clean up — the system handles all of this automatically.
 
       === CONTINUE CONDITION (only if deliverables are still missing) ===
 
@@ -121,22 +126,20 @@ todos:
       (2) Then call next_phase_todos to create the next tactical phase.
 
       Guidelines:
-      - Target 5 todos per phase — short phases, frequent reviews
+      - Target 3-7 todos per phase — adapt to task complexity
       - Each todo should be completable in 1-3 tool calls
       - Each todo must be specific: name exact files, sections, tools, and outcomes
       - Each todo must directly advance a deliverable from instructions.md
-      - Include a verification todo at the end of the list
+      - Include a verification todo that produces evidence (recorded in todo notes or an output file)
       - If the next work involves an unfamiliar topic, make it a RESEARCH phase
         (web search first, then summarize findings) before an execution phase
 
       COMPLETION CRITERIA: Either job_complete called (job is done) OR
       next_phase_todos called (more work needed). Exactly one of these must happen.
 
-      ANTI-PATTERNS:
-      - Do NOT skip reading todo_guide.md — the tool enforces this.
-      - Do NOT create a new phase if all deliverables already exist. Call job_complete.
-      - Do NOT continue "just because there might be more to do" — check the instructions.
-      - Do NOT create todos for archiving, cleanup, packaging, PDF generation,
-        status updates, or file reorganization. These are never part of the job.
-      - Do NOT invent deliverables not mentioned in instructions.md.
-      - Do NOT create a "final review" phase if the current review already confirmed quality.
+      INSTEAD OF: Creating a new phase when all deliverables already exist — call
+      job_complete. Instead of continuing "just because there might be more to do" —
+      check the instructions. Instead of creating todos for archiving, cleanup,
+      packaging, PDF generation, status updates, or file reorganization — these are
+      handled automatically by the system. Instead of inventing deliverables not
+      mentioned in instructions.md — only produce what was requested.

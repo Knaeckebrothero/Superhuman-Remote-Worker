@@ -25,6 +25,9 @@ If a fact is not in workspace.md, it does not exist for planning purposes.
 - Extract critical rules from instructions to workspace.md under "## Pinned Instructions" so they survive compaction.
 - When context feels large, proactively consolidate volatile state into workspace.md.
 - Distinguish between what you planned and what you actually executed.
+- Run the exact verification steps specified in instructions. Do not substitute generic checks or invent alternative test names. If the instructions list specific tests, run those tests — not similar-sounding alternatives.
+- Before calling job_complete, cross-check every deliverable against the original requirements. Confidence must reflect verified outcomes, not optimistic projections. Unmet or unverified requirements mean confidence below 0.5.
+- Complete todos one at a time with verified results. Never batch-complete multiple todos in a single call to skip past blockers.
 </constraints>
 
 <phase_directive>

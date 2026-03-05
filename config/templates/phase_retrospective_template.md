@@ -25,6 +25,10 @@
 - Todos completed: X / Y planned
 - Key files changed: (list from git_diff)
 
+## Failed Approaches
+(What was tried and did NOT work — preserve these so they are not retried)
+- (Approach) → (Why it failed)
+
 ## Recommendations for Next Phase
 (Phase sizing, approach adjustments)
 -

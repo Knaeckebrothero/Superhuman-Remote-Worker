@@ -151,11 +151,12 @@ Config structure:
 - `config/schema.json` - JSON Schema for config validation
 - `config/prompt_matrix.yaml` - Base prompt matrix (model family → prompt filename)
 - `config/instruction_matrix.yaml` - Base instruction matrix (model family → template filename)
-- `config/prompts/` - System prompts (strategic.txt, tactical.txt, systemprompt.txt, summarization_prompt.txt)
-- `config/templates/` - Instruction templates (instructions.md, workspace_template.md, todo_guide.md)
+- `config/prompts/` - System prompts (systemprompt.txt, persona.txt, strategic.txt, tactical.txt, summarization_prompt.txt + minimax variants)
+- `config/templates/` - Instruction templates (instructions.md, instructions_minimax.md, workspace_template.md, todo_guide.md, phase_retrospective_template.md)
   - `strategic_todos_initial.yaml` - First strategic phase (job startup)
   - `strategic_todos_transition.yaml` - Subsequent strategic phases (phase transitions)
   - `strategic_todos_resume.yaml` - Resumed jobs
+- `config/settings_matrix.yaml` - Model-family-specific inference params & context limits
 - `config/experts/` - Pre-built agent roles (developer, scholar, critic)
 - `config/my_agent.yaml` - Custom single-file config
 - `config/my_agent/config.yaml` - Custom directory config (with prompt/instruction overrides)
@@ -183,7 +184,7 @@ init_workspace → init_strategic_todos
 - **Review**: Uses git tools to see what actually changed, writes retrospective to `archive/`
 - **Reflect**: Rewrites workspace.md (compact, don't append) - removes redundancy with plan.md
 - **Adapt**: Updates plan.md with outcomes, adjusts phase sizing, adds intermediate phases if needed
-- **Plan**: Creates right-sized todos (5-10 complex, 10-15 moderate, 15-20 simple) via `next_phase_todos`
+- **Plan**: Creates right-sized todos (3-7 per phase, adapted to task complexity) via `next_phase_todos`
 - Has access to `job_complete` tool (tactical does not)
 
 **Tactical Phase** (execution mode):
@@ -223,7 +224,7 @@ tools:
 
 The agent uses two parallel matrix systems to resolve prompt and template files, both inheriting from `MatrixResolver` (`src/core/loader.py`):
 
-**Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts (`systemprompt`, `strategic`, `tactical`, `summarization`) to filenames. File search: expert directory → `config/prompts/`.
+**Prompt Matrix** (`prompt_matrix.yaml`) — resolves system prompts (`systemprompt`, `persona`, `strategic`, `tactical`, `summarization`) to filenames. File search: expert directory → `config/prompts/`.
 
 **Instruction Matrix** (`instruction_matrix.yaml`) — resolves non-prompt templates (`instructions`, `strategic_todos_initial`, `strategic_todos_transition`, `strategic_todos_resume`, `workspace_template`, `todo_guide`) to filenames. File search: expert directory → `config/templates/`.
 
@@ -287,7 +288,7 @@ claude_code:
 
 On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
 
-Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML. The `coding` category provides persistent shell tools (see "Persistent Shell Sessions" above).
+Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`, `evaluation`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML. The `coding` category provides persistent shell tools (see "Persistent Shell Sessions" above).
 
 **Phase-specific tool filtering**: Tools declare phase availability via `phases` in `TOOL_REGISTRY` (`src/tools/registry.py`). `filter_tools_by_phase()` removes unavailable tools before binding to the LLM. `job_complete` is strategic-only.
 
@@ -335,11 +336,11 @@ The agent has a three-layer defense against context window overflow:
 
 Compaction preserves the 10 most recent tool results and sanitizes orphaned `ToolMessage`s (via `sanitize_message_history` in `src/core/context.py`).
 
-Config keys:
-- `limits.context_threshold_tokens`: 80000 (default)
-- `limits.message_count_threshold`: 300 messages (with `message_count_min_tokens: 50000`)
-- `limits.summarization_chunk_size`: 80000
-- `context_management.keep_recent_tool_results`: 15
+Config keys (defaults — overridden per model family via `config/settings_matrix.yaml`):
+- `limits.context_threshold_tokens`: 80000 (default, model-dependent)
+- `limits.message_count_threshold`: 300 messages
+- `limits.summarization_chunk_size`: 80000 (default, model-dependent)
+- `context_management.keep_recent_tool_results`: 150
 
 ### Workspace-Centric Memory Model
 
