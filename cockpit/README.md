@@ -1,6 +1,6 @@
 # Debug Cockpit
 
-Angular dashboard for debugging and visualizing Graph-RAG agent execution. Features a tiling layout system with pluggable components for viewing audit trails, graph changes, database tables, and LLM requests.
+Angular dashboard for debugging and visualizing Superhuman Remote Worker agent execution. Features a tiling layout system with pluggable components for viewing audit trails, graph changes, database tables, and LLM requests.
 
 ## Quick Start
 
@@ -101,7 +101,7 @@ python run.py
 **Docker:**
 ```bash
 podman-compose -f docker-compose.dev.yaml up -d orchestrator-mcp
-docker exec -i graphrag-orchestrator-mcp-dev python run.py
+docker exec -i srw-orchestrator-mcp-dev python run.py
 ```
 
 ### Claude Code Configuration
@@ -114,7 +114,7 @@ For containerized setup, create or update `.mcp.json`:
   "mcpServers": {
     "orchestrator": {
       "command": "docker",
-      "args": ["exec", "-i", "graphrag-orchestrator-mcp-dev", "python", "run.py"]
+      "args": ["exec", "-i", "srw-orchestrator-mcp-dev", "python", "run.py"]
     }
   }
 }

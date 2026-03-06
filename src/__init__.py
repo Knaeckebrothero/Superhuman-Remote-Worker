@@ -1,5 +1,5 @@
 """
-Graph-RAG Requirement Analysis System
+Superhuman Remote Worker — Universal Agent System
 
 Universal Agent architecture for requirement extraction and validation.
 """

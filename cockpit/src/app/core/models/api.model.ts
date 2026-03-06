@@ -281,6 +281,98 @@ export interface PromoteRequest {
 }
 
 // =============================================================================
+// Knowledge Base Models
+// =============================================================================
+
+/**
+ * Knowledge note types.
+ */
+export type KnowledgeNoteType =
+  | 'goal'
+  | 'plan'
+  | 'decision'
+  | 'learning'
+  | 'code'
+  | 'source'
+  | 'question'
+  | 'state'
+  | 'retrospective';
+
+/**
+ * Knowledge note status types.
+ */
+export type KnowledgeNoteStatus = 'active' | 'resolved' | 'superseded' | 'archived';
+
+/**
+ * Knowledge note summary (list view).
+ */
+export interface KnowledgeNote {
+  id: string;
+  note_id: string;
+  title: string;
+  note_type: KnowledgeNoteType;
+  status: KnowledgeNoteStatus;
+  confidence?: string | null;
+  tags: string[];
+  keywords: string[];
+  job_id?: string | null;
+  phase?: number | null;
+  content_preview?: string;
+  content?: string;
+  created_at: string;
+  modified_at: string;
+}
+
+/**
+ * Knowledge note relationship (from Neo4j).
+ */
+export interface KnowledgeRelationship {
+  type: string;
+  direction: string;
+  target_id: string;
+  target_title?: string;
+}
+
+/**
+ * Full knowledge note detail (single note view).
+ */
+export interface KnowledgeNoteDetail extends KnowledgeNote {
+  content: string;
+  retrieval_messages?: string[];
+  content_hash?: string;
+  relationships: KnowledgeRelationship[];
+}
+
+/**
+ * Knowledge base summary statistics.
+ */
+export interface KnowledgeSummary {
+  total: number;
+  by_type: Record<string, number>;
+  by_status: Record<string, number>;
+  recent: { note_id: string; title: string; note_type: string; status: string; modified_at: string }[];
+}
+
+/**
+ * Paginated knowledge note list response.
+ */
+export interface KnowledgeListResponse {
+  notes: KnowledgeNote[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/**
+ * Knowledge search response.
+ */
+export interface KnowledgeSearchResponse {
+  notes: KnowledgeNote[];
+  query: string;
+  total: number;
+}
+
+// =============================================================================
 // Agent Models
 // =============================================================================
 

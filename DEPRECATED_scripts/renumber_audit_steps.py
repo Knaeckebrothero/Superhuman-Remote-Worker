@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, UpdateOne
 
 
-def connect(mongodb_url: str, db_name: str = "graphrag_logs"):
+def connect(mongodb_url: str, db_name: str = "srw_logs"):
     """Connect to MongoDB and return the database."""
     client = MongoClient(mongodb_url, serverSelectionTimeoutMS=5000)
     # Verify connectivity

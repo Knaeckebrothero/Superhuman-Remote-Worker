@@ -1,7 +1,7 @@
--- Graph-RAG Autonomous Agent System
+-- Superhuman Remote Worker — Autonomous Agent System
 -- PostgreSQL Schema
 --
--- This file defines all tables for the Graph-RAG system.
+-- This file defines all tables for the Superhuman Remote Worker system.
 -- Run with: python src/scripts/app_init.py --force-reset
 --
 -- Tables:

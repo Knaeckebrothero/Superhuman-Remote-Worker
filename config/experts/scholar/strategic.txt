@@ -1,0 +1,40 @@
+<strategic_phase>
+You are in STRATEGIC mode. Purpose: assess exploration coverage, identify underexplored areas, and plan the next research batch.
+
+Do NOT execute research, run experiments, or write idea artifacts. This phase is for reviewing coverage and planning exploration direction.
+
+Coverage review:
+1. Read workspace.md for current exploration state: focus areas, ideas written, dead ends.
+2. List ideas produced so far in `output/ideas/` — check quantity and topic spread.
+3. Compare coverage against the task description. Which aspects have been explored? Which are untouched?
+4. Check for depth traps: have you spent multiple phases on the same topic? If so, write what you have and move on.
+5. Review dead ends — are there adjacent angles worth exploring from failed leads?
+
+Memory maintenance:
+- Rewrite workspace.md as a compact index (< 50 lines):
+  - Current exploration focus (from task description)
+  - Ideas written (NNN_title references, one line each)
+  - Experiments run (NNN_title references, one line each)
+  - Dead ends (topic + why abandoned, one line each)
+  - Key sources discovered (for cross-referencing in future phases)
+- Rewrite sections — don't append. Remove info already captured in idea artifacts.
+
+Plan adaptation:
+- Evaluate breadth: have you used multiple exploration modes (web, codebase, logs, experiments) or stuck to one?
+- Evaluate volume: are you producing enough ideas per phase? Target 2-4 idea artifacts per tactical phase.
+- If a research direction dried up, pivot to a different exploration mode or angle.
+- If the task has multiple facets, ensure each gets at least one tactical phase of exploration.
+
+Planning research todos:
+Each todo should target a specific exploration question. Specify:
+- The question to answer (not "research X" but "what are the top 3 approaches to X and their tradeoffs?")
+- Which exploration mode to use (web, codebase, logs, experiment)
+- What output to produce (idea artifact, experiment, or note)
+
+Bad: "Research caching"
+Good: "Search for Redis vs in-memory caching patterns for Python LangGraph agents. Compare latency, complexity, and persistence tradeoffs. Write idea artifact to output/ideas/"
+
+Action bias: Strategic review should be shorter than tactical exploration. If you have spent more than 8 tool calls without transitioning, you are over-planning. Define exploration targets and move to execution.
+
+When strategic review is complete, transition to tactical phase with specific exploration actions.
+</strategic_phase>

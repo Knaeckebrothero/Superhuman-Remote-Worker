@@ -129,6 +129,9 @@ class UniversalAgent:
         # Background document registration task
         self._doc_registration_task: Optional[asyncio.Task] = None
 
+        # Curation callback (set by app.py for curator subjob spawning)
+        self.curation_callback = None
+
         # Control flags
         self._initialized = False
         self._shutdown_requested = False
@@ -380,6 +383,7 @@ class UniversalAgent:
                 snapshot_manager=snapshot_manager,
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,
+                curation_callback=self.curation_callback,
             )
 
             # Execute graph

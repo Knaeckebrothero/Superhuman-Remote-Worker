@@ -5,3 +5,8 @@
 default:
   strategic: strategic.txt
   tactical: tactical.txt
+
+minimax:
+  persona: persona_minimax.txt
+  strategic: strategic_minimax.txt
+  tactical: tactical_minimax.txt

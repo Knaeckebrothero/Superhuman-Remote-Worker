@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List jobs in the Graph-RAG system.
+"""List jobs in the SRW system.
 
 Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 
@@ -130,7 +130,7 @@ def print_statistics(stats: list[dict]):
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="List jobs in the Graph-RAG system")
+    parser = argparse.ArgumentParser(description="List jobs in the SRW system")
     parser.add_argument("--status", help="Filter by status (e.g., processing, completed)")
     parser.add_argument("--limit", type=int, default=50, help="Maximum number of jobs to show")
     parser.add_argument("--offset", type=int, default=0, help="Number of jobs to skip")

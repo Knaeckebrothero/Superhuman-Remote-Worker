@@ -33,6 +33,7 @@ from .mongodb import create_mongodb_tools, get_mongodb_metadata
 from .git import create_git_tools, get_git_metadata
 from .coding import create_coding_tools, get_coding_metadata
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
+from .knowledge import create_knowledge_tools, get_knowledge_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
@@ -60,6 +61,7 @@ TOOL_REGISTRY.update(get_mongodb_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_coding_metadata())
 TOOL_REGISTRY.update(get_evaluation_metadata())
+TOOL_REGISTRY.update(get_knowledge_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -403,6 +405,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded evaluation tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load evaluation tools: {e}")
+
+    # Knowledge tools
+    if "knowledge" in tools_by_category:
+        if not context.has_knowledge():
+            logger.warning("Knowledge tools require knowledge_graph and knowledge_store in ToolContext")
+        else:
+            try:
+                knowledge_tools = create_knowledge_tools(context)
+                requested = set(tools_by_category["knowledge"])
+                for tool in knowledge_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded knowledge tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load knowledge tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

@@ -1,7 +1,7 @@
 """Citation Engine integration utilities.
 
 This module provides helper functions for integrating the Citation Engine
-with the Graph-RAG agent system. The Citation Engine is an external pip
+with the Superhuman Remote Worker agent system. The Citation Engine is an external pip
 package that provides source verification and citation management.
 """
 

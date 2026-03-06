@@ -6,12 +6,12 @@
 # university network, allowing agents to access paywalled research papers.
 #
 # Build:
-#   podman build -t graphrag-vpn ./docker/vpn
+#   podman build -t srw-vpn ./docker/vpn
 #
 # Run:
 #   podman run --cap-add=NET_ADMIN --device=/dev/ppp \
 #     -v ./docker/vpn/config:/etc/openfortivpn/config:ro \
-#     -p 1080:1080 graphrag-vpn
+#     -p 1080:1080 srw-vpn
 #
 # Requires:
 #   - VPN config at docker/vpn/config (copy config.example and fill in)
@@ -36,7 +36,7 @@ RUN git clone --depth 1 https://github.com/rofl0r/microsocks.git /build/microsoc
 # ---------------------------------------------------------------------------
 FROM docker.io/library/alpine:3.21
 
-LABEL maintainer="Graph-RAG Team"
+LABEL maintainer="SRW Team"
 LABEL description="VPN sidecar providing SOCKS5 proxy via university FortiClient VPN"
 
 # openfortivpn is in Alpine edge/testing

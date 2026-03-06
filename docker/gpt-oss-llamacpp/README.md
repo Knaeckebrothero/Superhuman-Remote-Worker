@@ -378,7 +378,7 @@ Add your public key to RunPod account settings, or set `SSH_PASSWORD`:
 -e SSH_PASSWORD=yourpassword
 ```
 
-## Integration with Graph-RAG Agent
+## Integration with SRW Agent
 
 Update your `.env`:
 

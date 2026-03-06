@@ -1,0 +1,123 @@
+# Strategic todos for scholar job initialization (first strategic phase)
+# These todos guide the scholar through understanding the exploration task,
+# setting up workspace memory, and launching the first exploration sweep.
+#
+# Scholar-specific: focuses on exploration direction and breadth,
+# not deliverables and execution phases.
+todos:
+  - id: 1
+    content: >-
+      EXPLORE: Thoroughly understand the exploration task before doing anything else.
+
+      Steps:
+      (1) Use read_file to read task_brief.md — this is the task description and opening message.
+      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
+      (3) Use list_files on the tools/ directory to understand your available capabilities.
+      (4) Use list_files on documents/ to inventory all input materials.
+      (5) Use list_files on reference/ to check for domain-specific reference material.
+
+      Then PIN critical rules to workspace.md under "## Pinned Instructions":
+      - Exploration scope (what to investigate, what's out of bounds)
+      - Output expectations (idea format, depth level, specific deliverables if any)
+      - Constraints (time limits, focus areas, required exploration modes)
+      - Quality criteria (what makes a good idea artifact for this task)
+
+      COMPLETION CRITERIA: workspace.md exists and contains "## Pinned Instructions"
+      populated from instructions.md and task_brief.md.
+
+      INSTEAD OF: Starting to research now — this phase is read-only exploration.
+      Instead of skimming instructions.md — read every line.
+
+  - id: 2
+    content: >-
+      SCOPE: Define the exploration direction and identify starting angles.
+
+      Based on the task description and instructions.md, determine:
+      (1) Which exploration modes are relevant? (web, codebase, logs, experiments)
+      (2) What are 3-5 specific questions to investigate first?
+      (3) What existing knowledge is available? (documents/, reference/, codebase)
+      (4) Are there specific technologies, patterns, or domains to focus on?
+
+      Update workspace.md "## Exploration Focus" with:
+      - One-line task summary
+      - Relevant exploration modes
+      - Scope boundaries (in scope vs out of scope)
+      - Initial questions to investigate (numbered list)
+
+      COMPLETION CRITERIA: workspace.md has "## Exploration Focus" with specific
+      questions and scope boundaries, not just a restatement of the task description.
+
+      INSTEAD OF: Vague direction like "explore the topic" — list specific questions.
+      Instead of covering everything — define scope boundaries to maintain breadth.
+
+  - id: 3
+    content: >-
+      PLAN: Create plan.md with an exploration strategy.
+
+      Structure the plan as exploration sweeps, not deliverable-producing phases:
+      - Each phase targets a specific exploration mode or question cluster
+      - Early phases should use different modes to maximize breadth
+      - Later phases can go deeper on promising directions
+
+      Include:
+      - "## Exploration Questions" — the specific questions from todo 2
+      - Phase table with: phase name, exploration mode, target questions, expected output
+        (idea artifacts, experiment results, or notes)
+
+      PHASE SIZING: Target 5-7 todos per tactical phase.
+
+      PHASE ORDERING: Start with broad web exploration or codebase archaeology to
+      establish context. Follow with focused investigation of promising leads.
+      Save experiments for validating specific hypotheses.
+
+      Focus on the first 2-3 phases in detail. Later phases will be adapted
+      based on what you discover.
+
+      COMPLETION CRITERIA: plan.md exists with at least 2 exploration phases defined,
+      each targeting specific questions and exploration modes.
+
+      INSTEAD OF: Planning "deliverable" phases — the scholar produces ideas, not
+      finished products. Instead of a single monolithic research phase — break into
+      mode-specific sweeps for breadth.
+
+  - id: 4
+    content: >-
+      INITIALIZE workspace.md: Complete the long-term memory structure.
+
+      workspace.md should contain (in addition to sections from todos 1-2):
+      - "## Ideas Index" — empty table (will be populated as ideas are written)
+      - "## Experiments Index" — empty table
+      - "## Key Sources" — empty (will collect important references)
+      - "## Dead Ends" — empty (will track explored-and-abandoned directions)
+      - "## Status" — current phase and coverage assessment
+
+      COMPLETION CRITERIA: workspace.md has all sections above and is under 60 lines.
+      The Exploration Focus section has specific questions, not vague directions.
+
+      INSTEAD OF: Dumping document inventories — use compact references.
+      Instead of exceeding 60 lines — every line costs tokens on every LLM call.
+
+  - id: 5
+    content: >-
+      CREATE first phase todos using the next_phase_todos tool.
+
+      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      The tool will reject your call if you haven't read the guide.
+
+      After reading the guide, create 5-7 todos for the first exploration phase.
+      Each todo must:
+      - Target a specific question from your exploration plan
+      - Name the exploration mode (web search, codebase read, log query, experiment)
+      - Name the expected output (idea artifact path, experiment path, or note file)
+      - Be completable in 2-4 tool calls
+
+      The first phase should typically be a broad exploration sweep — web search
+      or codebase archaeology — to establish context before going deeper.
+
+      Include at least one todo for updating workspace.md with findings.
+
+      COMPLETION CRITERIA: next_phase_todos called successfully with 5-7 todos.
+
+      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this.
+      Instead of vague todos like "research the topic" — specify what to search,
+      where to look, and what artifact to produce.

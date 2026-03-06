@@ -12,9 +12,12 @@ import {
   Expert,
   ProjectRepoRole,
   ProjectMemberRole,
+  KnowledgeNote,
+  KnowledgeNoteDetail,
+  KnowledgeSummary,
 } from '../../core/models/api.model';
 
-type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
+type Tab = 'overview' | 'jobs' | 'knowledge' | 'repos' | 'experts' | 'members' | 'settings';
 
 @Component({
   selector: 'app-project-detail-page',
@@ -173,6 +176,160 @@ type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
                     }
                   </tbody>
                 </table>
+              }
+            </div>
+          }
+
+          <!-- KNOWLEDGE TAB -->
+          @if (activeTab() === 'knowledge') {
+            <div class="kb-section">
+              <!-- Summary Stats -->
+              @if (kbSummary(); as summary) {
+                <div class="kb-stats-row">
+                  <div class="kb-stat">
+                    <span class="kb-stat-value">{{ summary.total }}</span>
+                    <span class="kb-stat-label">Total</span>
+                  </div>
+                  @for (entry of kbTypeEntries(summary); track entry[0]) {
+                    <div class="kb-stat">
+                      <span class="kb-stat-value">{{ entry[1] }}</span>
+                      <span class="kb-stat-label">{{ entry[0] }}</span>
+                    </div>
+                  }
+                </div>
+              }
+
+              <!-- Filters + Search -->
+              <div class="kb-toolbar">
+                <input
+                  class="form-input-sm kb-search"
+                  placeholder="Search knowledge..."
+                  [value]="kbSearchQuery()"
+                  (input)="kbSearchQuery.set(asInputValue($event))"
+                  (keydown.enter)="searchKB()"
+                />
+                <button class="btn btn-primary btn-sm" (click)="searchKB()" [disabled]="!kbSearchQuery()">
+                  Search
+                </button>
+                <select class="inline-select" [value]="kbFilterType()" (change)="kbFilterType.set(asSelectValue($event)); loadKBNotes()">
+                  <option value="">All types</option>
+                  <option value="decision">Decision</option>
+                  <option value="learning">Learning</option>
+                  <option value="goal">Goal</option>
+                  <option value="plan">Plan</option>
+                  <option value="code">Code</option>
+                  <option value="question">Question</option>
+                  <option value="state">State</option>
+                  <option value="source">Source</option>
+                  <option value="retrospective">Retrospective</option>
+                </select>
+                <select class="inline-select" [value]="kbFilterStatus()" (change)="kbFilterStatus.set(asSelectValue($event)); loadKBNotes()">
+                  <option value="">All statuses</option>
+                  <option value="active">Active</option>
+                  <option value="resolved">Resolved</option>
+                  <option value="superseded">Superseded</option>
+                  <option value="archived">Archived</option>
+                </select>
+                <button class="btn btn-ghost btn-sm" (click)="clearKBFilters()">Clear</button>
+                <div style="flex:1"></div>
+                <button class="btn btn-ghost btn-sm" (click)="exportKB()">Export</button>
+              </div>
+
+              <!-- Note Detail View -->
+              @if (kbSelectedNote(); as note) {
+                <div class="kb-detail">
+                  <div class="kb-detail-header">
+                    <button class="btn btn-ghost btn-sm" (click)="kbSelectedNote.set(null)">
+                      <span class="material-symbols-outlined" style="font-size:16px">arrow_back</span> Back
+                    </button>
+                    <div style="flex:1"></div>
+                    <select
+                      class="inline-select"
+                      [value]="note.status"
+                      (change)="updateNoteStatus(note.note_id, asSelectValue($event))"
+                    >
+                      <option value="active">Active</option>
+                      <option value="resolved">Resolved</option>
+                      <option value="superseded">Superseded</option>
+                      <option value="archived">Archived</option>
+                    </select>
+                    <button class="action-btn delete" (click)="deleteNote(note.note_id)">Delete</button>
+                  </div>
+                  <div class="kb-detail-meta">
+                    <span class="kb-type-badge" [attr.data-type]="note.note_type">{{ note.note_type }}</span>
+                    @if (note.confidence) {
+                      <span class="kb-confidence">{{ note.confidence }}</span>
+                    }
+                    @if (note.phase) {
+                      <span class="text-muted">Phase {{ note.phase }}</span>
+                    }
+                    <span class="text-muted">{{ formatDate(note.modified_at) }}</span>
+                  </div>
+                  <h2 class="kb-detail-title">{{ note.title }}</h2>
+                  @if (note.tags && note.tags.length > 0) {
+                    <div class="kb-tags">
+                      @for (tag of note.tags; track tag) {
+                        <span class="kb-tag">{{ tag }}</span>
+                      }
+                    </div>
+                  }
+                  <div class="kb-detail-content">{{ note.content }}</div>
+                  @if (note.relationships && note.relationships.length > 0) {
+                    <div class="kb-relationships">
+                      <h4>Relationships</h4>
+                      @for (rel of note.relationships; track rel.target_id) {
+                        <div class="kb-rel-item">
+                          <span class="kb-rel-type">{{ rel.type }}</span>
+                          <button class="kb-rel-link" (click)="openNote(rel.target_id)">
+                            {{ rel.target_title || rel.target_id }}
+                          </button>
+                        </div>
+                      }
+                    </div>
+                  }
+                </div>
+              } @else {
+                <!-- Note List -->
+                @if (kbIsLoading()) {
+                  <div class="loading-state"><div class="spinner"></div><span>Loading notes...</span></div>
+                } @else if (kbNotes().length === 0) {
+                  <div class="empty-inline">No knowledge notes found</div>
+                } @else {
+                  <div class="kb-note-list">
+                    @for (note of kbNotes(); track note.note_id) {
+                      <div class="kb-note-card" (click)="openNote(note.note_id)">
+                        <div class="kb-note-header">
+                          <span class="kb-type-badge" [attr.data-type]="note.note_type">{{ note.note_type }}</span>
+                          <span class="kb-note-title">{{ note.title }}</span>
+                          <span class="kb-note-status" [attr.data-status]="note.status">{{ note.status }}</span>
+                        </div>
+                        @if (note.content_preview) {
+                          <div class="kb-note-preview">{{ truncate(note.content_preview, 180) }}</div>
+                        }
+                        <div class="kb-note-footer">
+                          @if (note.tags && note.tags.length > 0) {
+                            @for (tag of note.tags.slice(0, 4); track tag) {
+                              <span class="kb-tag-sm">{{ tag }}</span>
+                            }
+                            @if (note.tags.length > 4) {
+                              <span class="text-muted">+{{ note.tags.length - 4 }}</span>
+                            }
+                          }
+                          @if (note.confidence) {
+                            <span class="kb-confidence-sm">{{ note.confidence }}</span>
+                          }
+                          <span class="text-muted" style="margin-left:auto">{{ formatDate(note.modified_at) }}</span>
+                        </div>
+                      </div>
+                    }
+                  </div>
+                  @if (kbTotal() > kbNotes().length) {
+                    <div class="kb-pagination">
+                      <span class="text-muted">{{ kbNotes().length }} of {{ kbTotal() }} notes</span>
+                      <button class="btn btn-ghost btn-sm" (click)="loadMoreKBNotes()">Load more</button>
+                    </div>
+                  }
+                }
               }
             </div>
           }
@@ -1002,11 +1159,193 @@ type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
 
     .btn-danger:hover { opacity: 0.9; }
 
+    /* Knowledge Base */
+    .kb-section { display: flex; flex-direction: column; gap: 16px; }
+
+    .kb-stats-row {
+      display: flex; gap: 12px; flex-wrap: wrap;
+    }
+
+    .kb-stat {
+      flex: 1; min-width: 70px;
+      background: var(--panel-bg, #181825);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+
+    .kb-stat-value {
+      display: block; font-size: 22px; font-weight: 700;
+      color: var(--accent-color, #cba6f7);
+    }
+
+    .kb-stat-label {
+      display: block; font-size: 10px;
+      color: var(--text-muted, #6c7086);
+      text-transform: capitalize; margin-top: 2px;
+    }
+
+    .kb-toolbar {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+
+    .kb-search { flex: 1; min-width: 180px; }
+
+    .kb-note-list { display: flex; flex-direction: column; gap: 8px; }
+
+    .kb-note-card {
+      background: var(--panel-bg, #181825);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      padding: 14px;
+      cursor: pointer;
+      transition: border-color 0.15s ease;
+    }
+
+    .kb-note-card:hover { border-color: var(--accent-color, #cba6f7); }
+
+    .kb-note-header {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
+    }
+
+    .kb-note-title {
+      font-size: 14px; font-weight: 600;
+      color: var(--text-primary, #cdd6f4);
+      flex: 1; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+
+    .kb-note-status {
+      font-size: 10px; padding: 2px 6px; border-radius: 3px;
+      font-weight: 500; text-transform: capitalize;
+    }
+
+    .kb-note-status[data-status="active"] { background: rgba(166, 227, 161, 0.15); color: #a6e3a1; }
+    .kb-note-status[data-status="resolved"] { background: rgba(137, 180, 250, 0.15); color: #89b4fa; }
+    .kb-note-status[data-status="superseded"] { background: rgba(249, 226, 175, 0.15); color: #f9e2af; }
+    .kb-note-status[data-status="archived"] { background: rgba(108, 112, 134, 0.15); color: #6c7086; }
+
+    .kb-type-badge {
+      font-size: 10px; padding: 2px 8px; border-radius: 4px;
+      font-weight: 600; text-transform: capitalize; white-space: nowrap;
+    }
+
+    .kb-type-badge[data-type="decision"] { background: rgba(203, 166, 247, 0.2); color: #cba6f7; }
+    .kb-type-badge[data-type="learning"] { background: rgba(166, 227, 161, 0.2); color: #a6e3a1; }
+    .kb-type-badge[data-type="goal"] { background: rgba(249, 226, 175, 0.2); color: #f9e2af; }
+    .kb-type-badge[data-type="plan"] { background: rgba(137, 180, 250, 0.2); color: #89b4fa; }
+    .kb-type-badge[data-type="code"] { background: rgba(148, 226, 213, 0.2); color: #94e2d5; }
+    .kb-type-badge[data-type="question"] { background: rgba(250, 179, 135, 0.2); color: #fab387; }
+    .kb-type-badge[data-type="state"] { background: rgba(180, 190, 254, 0.2); color: #b4befe; }
+    .kb-type-badge[data-type="source"] { background: rgba(245, 194, 231, 0.2); color: #f5c2e7; }
+    .kb-type-badge[data-type="retrospective"] { background: rgba(116, 199, 236, 0.2); color: #74c7ec; }
+
+    .kb-note-preview {
+      font-size: 12px; color: var(--text-secondary, #a6adc8);
+      line-height: 1.5; margin-bottom: 8px;
+      display: -webkit-box; -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical; overflow: hidden;
+    }
+
+    .kb-note-footer {
+      display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    }
+
+    .kb-tag-sm {
+      font-size: 10px; padding: 1px 5px; border-radius: 3px;
+      background: rgba(205, 214, 244, 0.08); color: var(--text-muted, #6c7086);
+    }
+
+    .kb-confidence-sm {
+      font-size: 10px; padding: 1px 5px; border-radius: 3px;
+      background: rgba(203, 166, 247, 0.1); color: var(--accent-color, #cba6f7);
+      text-transform: capitalize;
+    }
+
+    .kb-pagination {
+      display: flex; align-items: center; justify-content: center; gap: 12px;
+      padding: 12px;
+    }
+
+    /* Detail view */
+    .kb-detail {
+      background: var(--panel-bg, #181825);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .kb-detail-header {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+    }
+
+    .kb-detail-meta {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+      font-size: 12px;
+    }
+
+    .kb-detail-title {
+      font-size: 20px; font-weight: 700; margin: 0 0 12px 0;
+      color: var(--text-primary, #cdd6f4);
+    }
+
+    .kb-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+
+    .kb-tag {
+      font-size: 11px; padding: 3px 8px; border-radius: 4px;
+      background: rgba(203, 166, 247, 0.1); color: var(--accent-color, #cba6f7);
+    }
+
+    .kb-confidence {
+      font-size: 12px; padding: 2px 6px; border-radius: 3px;
+      background: rgba(203, 166, 247, 0.1); color: var(--accent-color, #cba6f7);
+      text-transform: capitalize;
+    }
+
+    .kb-detail-content {
+      font-size: 13px; line-height: 1.7;
+      color: var(--text-primary, #cdd6f4);
+      white-space: pre-wrap; word-wrap: break-word;
+    }
+
+    .kb-relationships {
+      margin-top: 16px; padding-top: 16px;
+      border-top: 1px solid var(--border-color, #313244);
+    }
+
+    .kb-relationships h4 {
+      font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+      color: var(--text-muted, #6c7086); margin: 0 0 8px 0;
+    }
+
+    .kb-rel-item {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; margin-bottom: 4px;
+    }
+
+    .kb-rel-type {
+      font-size: 10px; padding: 2px 6px; border-radius: 3px;
+      background: var(--surface-0, #313244); color: var(--text-secondary, #a6adc8);
+      font-weight: 500;
+    }
+
+    .kb-rel-link {
+      background: none; border: none; padding: 0;
+      color: var(--accent-color, #cba6f7);
+      cursor: pointer; font-size: 12px; font-family: inherit;
+      text-decoration: underline;
+    }
+
+    .kb-rel-link:hover { opacity: 0.8; }
+
     @media (max-width: 768px) {
       .page-container { padding: 12px; }
       .detail-grid { grid-template-columns: 1fr; }
       .stats-row { flex-direction: column; }
       .inline-form { flex-direction: column; align-items: stretch; }
+      .kb-stats-row { flex-direction: column; }
+      .kb-toolbar { flex-direction: column; }
     }
   `],
 })
@@ -1058,9 +1397,20 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly settingsConfigName = signal('');
   readonly isSavingSettings = signal(false);
 
+  // Knowledge tab
+  readonly kbSummary = signal<KnowledgeSummary | null>(null);
+  readonly kbNotes = signal<KnowledgeNote[]>([]);
+  readonly kbTotal = signal(0);
+  readonly kbSelectedNote = signal<KnowledgeNoteDetail | null>(null);
+  readonly kbIsLoading = signal(false);
+  readonly kbSearchQuery = signal('');
+  readonly kbFilterType = signal('');
+  readonly kbFilterStatus = signal('');
+
   readonly tabList: { id: Tab; label: string }[] = [
     { id: 'overview', label: 'Overview' },
     { id: 'jobs', label: 'Jobs' },
+    { id: 'knowledge', label: 'Knowledge' },
     { id: 'repos', label: 'Repos' },
     { id: 'experts', label: 'Experts' },
     { id: 'members', label: 'Members' },
@@ -1107,6 +1457,7 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
     this.loadRepos();
     this.loadMembers();
     this.loadExperts();
+    this.loadKBSummary();
   }
 
   loadJobs(): void {
@@ -1260,6 +1611,100 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
 
   createJobInProject(): void {
     this.router.navigate(['/'], { queryParams: { project: this.projectId } });
+  }
+
+  // Knowledge
+  loadKBSummary(): void {
+    this.api.getKnowledgeSummary(this.projectId).subscribe((s) => {
+      this.kbSummary.set(s);
+      if (s && s.total > 0) this.loadKBNotes();
+    });
+  }
+
+  loadKBNotes(): void {
+    this.kbIsLoading.set(true);
+    this.api.getKnowledgeNotes(this.projectId, {
+      type: this.kbFilterType() || undefined,
+      status: this.kbFilterStatus() || undefined,
+      limit: 50,
+      offset: 0,
+    }).subscribe({
+      next: (res) => {
+        this.kbNotes.set(res?.notes ?? []);
+        this.kbTotal.set(res?.total ?? 0);
+        this.kbIsLoading.set(false);
+      },
+      error: () => this.kbIsLoading.set(false),
+    });
+  }
+
+  loadMoreKBNotes(): void {
+    const current = this.kbNotes();
+    this.api.getKnowledgeNotes(this.projectId, {
+      type: this.kbFilterType() || undefined,
+      status: this.kbFilterStatus() || undefined,
+      limit: 50,
+      offset: current.length,
+    }).subscribe((res) => {
+      if (res) this.kbNotes.set([...current, ...res.notes]);
+    });
+  }
+
+  searchKB(): void {
+    const q = this.kbSearchQuery().trim();
+    if (!q) { this.loadKBNotes(); return; }
+    this.kbIsLoading.set(true);
+    this.api.searchKnowledge(this.projectId, q, 20).subscribe({
+      next: (res) => {
+        this.kbNotes.set(res?.notes ?? []);
+        this.kbTotal.set(res?.total ?? 0);
+        this.kbIsLoading.set(false);
+      },
+      error: () => this.kbIsLoading.set(false),
+    });
+  }
+
+  clearKBFilters(): void {
+    this.kbSearchQuery.set('');
+    this.kbFilterType.set('');
+    this.kbFilterStatus.set('');
+    this.loadKBNotes();
+  }
+
+  openNote(noteId: string): void {
+    this.api.getKnowledgeNote(this.projectId, noteId).subscribe((note) => {
+      if (note) this.kbSelectedNote.set(note);
+    });
+  }
+
+  updateNoteStatus(noteId: string, status: string): void {
+    this.api.updateKnowledgeNote(this.projectId, noteId, { status }).subscribe((res) => {
+      if (res) {
+        this.openNote(noteId);
+        this.loadKBSummary();
+      }
+    });
+  }
+
+  deleteNote(noteId: string): void {
+    if (!confirm(`Delete note "${noteId}" permanently? This cannot be undone.`)) return;
+    this.api.deleteKnowledgeNote(this.projectId, noteId).subscribe((res) => {
+      if (res) {
+        this.kbSelectedNote.set(null);
+        this.loadKBNotes();
+        this.loadKBSummary();
+      }
+    });
+  }
+
+  exportKB(): void {
+    this.api.exportKnowledge(this.projectId).subscribe((res) => {
+      if (res) alert(`Exported ${res.note_count} notes to:\n${res.path}`);
+    });
+  }
+
+  kbTypeEntries(summary: KnowledgeSummary): [string, number][] {
+    return Object.entries(summary.by_type).slice(0, 6);
   }
 
   // Helpers
