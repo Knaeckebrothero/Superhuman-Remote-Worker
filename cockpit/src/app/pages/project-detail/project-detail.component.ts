@@ -147,7 +147,6 @@ type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
                       <th>Config</th>
                       <th>Branch</th>
                       <th>Merge</th>
-                      <th>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -166,43 +165,8 @@ type Tab = 'overview' | 'jobs' | 'repos' | 'experts' | 'members' | 'settings';
                             <span class="merge-badge" [class]="'merge-' + job.merge_status">
                               {{ job.merge_status }}
                             </span>
-                          } @else if (job.status === 'completed') {
-                            <span class="merge-badge merge-pending">pending</span>
                           } @else {
                             <span class="text-muted">-</span>
-                          }
-                        </td>
-                        <td class="actions-cell">
-                          @if (job.status === 'completed' && !job.merge_status) {
-                            @if (!isMerging().has(job.id)) {
-                              <div class="merge-actions">
-                                <select
-                                  class="inline-select"
-                                  [value]="mergeStrategy()"
-                                  (change)="mergeStrategy.set(asSelectValue($event))"
-                                >
-                                  <option value="merge">Merge</option>
-                                  <option value="rebase">Rebase</option>
-                                  <option value="squash">Squash</option>
-                                </select>
-                                <label class="inline-checkbox">
-                                  <input
-                                    type="checkbox"
-                                    [checked]="deleteBranch()"
-                                    (change)="deleteBranch.set(asChecked($event))"
-                                  />
-                                  Del branch
-                                </label>
-                                <button class="action-btn merge" (click)="mergeJob(job.id)">
-                                  Merge
-                                </button>
-                                <button class="action-btn skip" (click)="skipMergeJob(job.id)">
-                                  Skip
-                                </button>
-                              </div>
-                            } @else {
-                              <span class="text-muted">Merging...</span>
-                            }
                           }
                         </td>
                       </tr>
@@ -1064,11 +1028,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly editDescription = signal('');
   readonly editGoal = signal('');
 
-  // Jobs tab
-  readonly isMerging = signal<Set<string>>(new Set());
-  readonly mergeStrategy = signal('merge');
-  readonly deleteBranch = signal(false);
-
   // Repos tab
   readonly repoName = signal('');
   readonly repoUrl = signal('');
@@ -1194,29 +1153,6 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         this.isEditingOverview.set(false);
         this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
       }
-    });
-  }
-
-  // Jobs
-  mergeJob(jobId: string): void {
-    const s = new Set(this.isMerging());
-    s.add(jobId);
-    this.isMerging.set(s);
-
-    this.api.mergeProjectJob(this.projectId, jobId, {
-      merge_strategy: this.mergeStrategy(),
-      delete_branch: this.deleteBranch(),
-    }).subscribe(() => {
-      const s2 = new Set(this.isMerging());
-      s2.delete(jobId);
-      this.isMerging.set(s2);
-      this.loadJobs();
-    });
-  }
-
-  skipMergeJob(jobId: string): void {
-    this.api.skipMergeProjectJob(this.projectId, jobId).subscribe(() => {
-      this.loadJobs();
     });
   }
 

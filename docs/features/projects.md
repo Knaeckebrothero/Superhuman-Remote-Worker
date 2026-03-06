@@ -18,6 +18,16 @@ related:
 
 > **Note:** For the unified design of what projects share between jobs (the knowledge base), see [[project_knowledge_base]]. This document covers the project infrastructure (database schema, API, merge flow, workspace layout, cockpit UI).
 
+> **⚠️ Partially Superseded:** The shared "jobs repo" model described in this document (one jobs repo per project, job branches merged to `main`) has been replaced by the **per-job repo model** documented in [[repo_resolution]]. Key changes:
+> - Each root job gets its own Gitea repo (`job-<short-id>`), not a branch on a shared project jobs repo.
+> - Subjobs work on branches (`subjob/<short-id>/<type>`) within the root job's repo.
+> - Squash merge on subjob completion replaces the manual merge endpoint.
+> - `PROJECT_JOB_IGNORE_PATTERNS` and `_setup_project_gitignore()` have been removed; pre-merge cleanup handles this.
+> - The `merge` and `skip-merge` endpoints have been removed.
+> - Projects remain as database grouping entities for jobs, datasources, and members.
+>
+> Sections about database schema, project members, datasources, experts, and cockpit UI remain valid. Sections about the jobs repo, branch model, merge flow, and workspace layout are superseded.
+
 # Projects — Multi-Job Resource Hub
 
 Jobs today are isolated. Each gets its own workspace, its own Gitea repo, its own datasources. There's no way for job B to build on job A's output, run multiple jobs in parallel against a shared codebase, or chain a sequence of tasks into a larger effort.
