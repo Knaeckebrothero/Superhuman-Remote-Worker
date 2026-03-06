@@ -126,7 +126,7 @@ class PostgresDB:
 
         self._connection_string = connection_string or os.getenv(
             "DATABASE_URL",
-            "postgresql://graphrag:graphrag_password@localhost:5432/graphrag",
+            "postgresql://srw:srw_password@localhost:5432/srw",
         )
 
         self._min_connections = min_connections or int(os.getenv("POSTGRES_MIN_CONNECTIONS", "2"))

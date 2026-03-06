@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Application initialization script for the Graph-RAG system.
+Application initialization script for the SRW system.
 
 DEPRECATED: This script is deprecated. Use 'python init.py' instead.
 
@@ -71,7 +71,7 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Initialize the Graph-RAG application databases.",
+        description="Initialize the SRW application databases.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -527,7 +527,7 @@ def main() -> int:
     if args.create_backup is not None:
         logger.info("")
         logger.info("=" * 60)
-        logger.info("Graph-RAG Application Backup")
+        logger.info("SRW Application Backup")
         logger.info("=" * 60)
         logger.info("")
 
@@ -547,7 +547,7 @@ def main() -> int:
     if args.restore_backup:
         logger.info("")
         logger.info("=" * 60)
-        logger.info("Graph-RAG Application Restore")
+        logger.info("SRW Application Restore")
         logger.info("=" * 60)
         logger.info("")
 
@@ -570,7 +570,7 @@ def main() -> int:
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("Graph-RAG Application Initialization")
+    logger.info("SRW Application Initialization")
     logger.info("=" * 60)
     if args.force_reset:
         logger.warning("WARNING: Force reset mode - all data will be deleted!")

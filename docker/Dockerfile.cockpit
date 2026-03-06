@@ -5,12 +5,12 @@
 # Angular SSR application for the Cockpit UI.
 #
 # Build:
-#   docker build -t graphrag-cockpit -f docker/Dockerfile.cockpit .
+#   docker build -t srw-cockpit -f docker/Dockerfile.cockpit .
 #
 # Run:
 #   docker run -p 4000:4000 \
 #     -e PORT=4000 \
-#     graphrag-cockpit
+#     srw-cockpit
 # =============================================================================
 
 FROM node:22-alpine AS builder
@@ -34,7 +34,7 @@ RUN npm run build
 # Production image
 FROM node:22-alpine
 
-LABEL maintainer="Graph-RAG Team"
+LABEL maintainer="SRW Team"
 LABEL description="Cockpit Angular SSR Frontend"
 
 ENV NODE_ENV=production \
@@ -46,11 +46,11 @@ WORKDIR /app
 COPY --from=builder /app/dist/cockpit ./dist/cockpit
 
 # Create non-root user
-RUN addgroup -g 1001 -S graphrag && \
-    adduser -u 1001 -S graphrag -G graphrag && \
-    chown -R graphrag:graphrag /app
+RUN addgroup -g 1001 -S srw && \
+    adduser -u 1001 -S srw -G srw && \
+    chown -R srw:srw /app
 
-USER graphrag
+USER srw
 
 EXPOSE 4000
 

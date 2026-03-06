@@ -1,4 +1,12 @@
 # Scholar expert prompt matrix
 # Only list entries that differ from the base matrix.
+# These files exist in config/experts/scholar/ and are found by file search.
 
-default: {}
+default:
+  strategic: strategic.txt
+  tactical: tactical.txt
+
+minimax:
+  persona: persona_minimax.txt
+  strategic: strategic_minimax.txt
+  tactical: tactical_minimax.txt

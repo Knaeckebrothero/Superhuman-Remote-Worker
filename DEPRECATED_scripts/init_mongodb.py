@@ -20,7 +20,7 @@ Usage:
 
 Environment Variables (from .env):
     MONGODB_URL - MongoDB connection string (optional)
-                  Default: mongodb://localhost:27017/graphrag_logs
+                  Default: mongodb://localhost:27017/srw_logs
 """
 import logging
 import argparse
@@ -61,7 +61,7 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 def get_connection_params() -> dict:
     """Get MongoDB connection parameters from environment."""
-    url = os.getenv("MONGODB_URL", "mongodb://localhost:27017/graphrag_logs")
+    url = os.getenv("MONGODB_URL", "mongodb://localhost:27017/srw_logs")
     return {"url": url}
 
 
@@ -234,7 +234,7 @@ def initialize_mongodb(logger: logging.Logger, force_reset: bool = False) -> boo
         # Parse database name from URL
         db_name = params['url'].split('/')[-1].split('?')[0]
         if not db_name:
-            db_name = "graphrag_logs"
+            db_name = "srw_logs"
 
         # Show current state
         stats = get_stats(client, db_name)
@@ -270,7 +270,7 @@ def _parse_mongodb_url(url: str) -> dict:
     return {
         "host": parsed.hostname or "localhost",
         "port": str(parsed.port or 27017),
-        "database": parsed.path.lstrip('/').split('?')[0] or "graphrag_logs",
+        "database": parsed.path.lstrip('/').split('?')[0] or "srw_logs",
         "username": parsed.username,
         "password": parsed.password,
     }

@@ -4,3 +4,6 @@
 
 default:
   instructions: instructions.md
+  strategic_todos_initial: strategic_todos_initial.yaml
+  todo_guide: todo_guide.md
+  workspace_template: workspace_template.md

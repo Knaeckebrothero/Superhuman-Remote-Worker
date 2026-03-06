@@ -1,1 +1,1 @@
-"""Tests for the Graph-RAG system."""
+"""Tests for the Superhuman Remote Worker system."""

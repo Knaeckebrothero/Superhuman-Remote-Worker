@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Root initialization script for the Graph-RAG system.
+"""Root initialization script for the Superhuman Remote Worker system.
 
 This script orchestrates initialization of all components:
 - Orchestrator: PostgreSQL and MongoDB databases
@@ -417,7 +417,7 @@ def restore_backup(backup_path: str) -> bool:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Initialize the Graph-RAG application.",
+        description="Initialize the Superhuman Remote Worker application.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -484,7 +484,7 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.create_backup is not None:
         logger.info("")
         logger.info("=" * 60)
-        logger.info("Graph-RAG Application Backup")
+        logger.info("SRW Application Backup")
         logger.info("=" * 60)
         logger.info("")
 
@@ -504,7 +504,7 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.restore_backup:
         logger.info("")
         logger.info("=" * 60)
-        logger.info("Graph-RAG Application Restore")
+        logger.info("SRW Application Restore")
         logger.info("=" * 60)
         logger.info("")
 
@@ -527,7 +527,7 @@ async def main_async(args: argparse.Namespace) -> int:
     # Initialize mode
     logger.info("")
     logger.info("=" * 60)
-    logger.info("Graph-RAG Application Initialization")
+    logger.info("SRW Application Initialization")
     logger.info("=" * 60)
 
     if args.force_reset:

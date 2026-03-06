@@ -457,7 +457,7 @@ Add your public key to RunPod account settings, or set `SSH_PASSWORD`:
 
 **Use llama.cpp when:** Need GBNF grammar constraints, AMD GPUs, homelab deployments.
 
-## Integration with Graph-RAG Agent
+## Integration with SRW Agent
 
 Start the SGLang server (locally or on a cloud GPU):
 

@@ -136,9 +136,9 @@ class MongoDB:
             self._client = AsyncIOMotorClient(self._url, serverSelectionTimeoutMS=5000)
             # Test the connection
             await self._client.admin.command("ping")
-            self._db = self._client.get_database("graphrag_logs")
+            self._db = self._client.get_database("srw_logs")
             self._available = True
-            logger.info("MongoDB connected: graphrag_logs")
+            logger.info("MongoDB connected: srw_logs")
         except Exception as e:
             logger.warning(f"MongoDB connection failed: {e}")
             self._available = False

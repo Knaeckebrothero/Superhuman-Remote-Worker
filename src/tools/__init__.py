@@ -46,6 +46,7 @@ from .citation import create_citation_tools, get_citation_metadata
 from .graph import create_graph_tools, get_graph_metadata
 from .sql import create_sql_tools, get_sql_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
+from .knowledge import create_knowledge_tools, get_knowledge_metadata
 
 # Core toolkit exports (todo + job tools)
 from .core import create_core_tools, get_core_metadata
@@ -103,6 +104,8 @@ __all__ = [
     "get_sql_metadata",
     "create_mongodb_tools",
     "get_mongodb_metadata",
+    "create_knowledge_tools",
+    "get_knowledge_metadata",
     # Registry
     "TOOL_REGISTRY",
     "load_tools",

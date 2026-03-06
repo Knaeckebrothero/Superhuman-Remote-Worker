@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=../../schema.json
+# Curator - Knowledge extraction specialist for project knowledge base
+$extends: defaults
+
+agent_id: curator
+display_name: Curator
+description: |
+  Knowledge extraction specialist. Runs as a persistent subjob in parallel
+  with working agents, extracting structured knowledge notes from job artifacts
+  (workspace.md, plan.md, archive/, memories). Writes to the project knowledge
+  base via kb_write/kb_update. See docs/features/project_knowledge_base.md.
+icon: book-open
+color: "#a6e3a1"
+tags:
+  - knowledge
+  - curation
+  - project
+
+workspace:
+  structure:
+    - archive/
+    - documents/
+    - output/
+    - notes/
+  git_versioning: true
+
+tools:
+  workspace:
+    - read_file
+    - write_file
+    - list_files
+    - search_files
+    - file_exists
+    - get_workspace_summary
+    - get_document_info
+  core:
+    - next_phase_todos
+    - todo_complete
+    - todo_list
+    - todo_rewind
+    - mark_complete
+    - job_complete
+  knowledge:
+    - kb_write
+    - kb_update
+    - kb_read
+    - kb_search
+    - kb_list
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+  git:
+    - git_log
+    - git_show
+    - git_diff
+    - git_status
+    - git_tags
+  # Not needed
+  coding: []
+  document: []
+  research: []
+  citation: []
+  graph: []
+  sql: []
+  mongodb: []
+  evaluation: []

@@ -536,6 +536,10 @@ def create_execute_node(
         if recall_store:
             injection_overhead_tokens += config.memory.budget_tokens
 
+        # Add knowledge injection budget overhead (~2500 tokens for 5 notes)
+        if tool_context and tool_context.has_knowledge() and tool_context.project_id:
+            injection_overhead_tokens += 2500
+
         # Temporarily lower compaction thresholds to account for injection overhead
         # Floor at 50% of original to avoid over-triggering
         original_compaction_threshold = context_mgr.config.compaction_threshold_tokens
@@ -641,6 +645,36 @@ def create_execute_node(
             except Exception as e:
                 logger.warning(f"[{job_id}] Memory retrieval failed (non-fatal): {e}")
 
+        # Knowledge Base: retrieve relevant project knowledge for injection
+        _knowledge_block = [""]  # mutable container for closure access
+        knowledge_store = tool_context.knowledge_store if tool_context and tool_context.has_knowledge() else None
+        if knowledge_store and tool_context.project_id:
+            try:
+                import uuid as _uuid
+                project_uuid = _uuid.UUID(tool_context.project_id) if isinstance(tool_context.project_id, str) else tool_context.project_id
+
+                # Build retrieval context from current todo + phase info
+                pending_todos = todo_manager.list_pending()
+                kb_context_parts = []
+                if pending_todos:
+                    kb_context_parts.append(pending_todos[0].content)
+                kb_context_parts.append(f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}")
+                kb_context_text = " ".join(kb_context_parts)
+
+                from src.services.knowledge_store import KnowledgeStore as _KS
+                kb_notes = await knowledge_store.hybrid_search(
+                    project_id=project_uuid,
+                    query=kb_context_text,
+                    match_count=5,
+                )
+                if kb_notes:
+                    _knowledge_block[0] = _KS.assemble_knowledge_block(kb_notes)
+                    logger.debug(
+                        f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
+                    )
+            except Exception as e:
+                logger.warning(f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}")
+
         def _inject_transient_messages(target_messages: list) -> None:
             """Append transient injection messages (todos, workspace.md, memories, instruction files)."""
             # Todo list as transient HumanMessage
@@ -659,6 +693,13 @@ def create_execute_node(
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
                 target_messages.append(mem_ai)
                 target_messages.append(mem_tool)
+
+            # Knowledge Base: inject relevant project knowledge after memories
+            if _knowledge_block[0]:
+                from src.core.knowledge_injection import create_knowledge_injection_messages
+                kb_ai, kb_tool = create_knowledge_injection_messages(_knowledge_block[0])
+                target_messages.append(kb_ai)
+                target_messages.append(kb_tool)
 
             # Phase-triggered instruction files (active injection)
             if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
@@ -1324,12 +1365,17 @@ def create_archive_phase_node(
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     recall_store=None,
     memory_observer=None,
+    curation_callback=None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
     This node archives completed todos and marks phase complete.
     Also performs context compaction if configured.
     Creates phase snapshots for recovery if snapshot_manager is provided.
+
+    Args:
+        curation_callback: Optional async callback(job_id, phase_number, phase_data)
+            for triggering curator subjob spawn/resume on each archive phase.
     """
 
     async def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
@@ -1343,9 +1389,10 @@ def create_archive_phase_node(
         current_phase = plan_manager.get_current_phase()
         logger.info(f"[{job_id}] Archiving phase: {current_phase}")
 
+        import asyncio
+
         # Memory Light Phase 3: trigger observer at phase boundary (async, non-blocking)
         if memory_observer:
-            import asyncio
             asyncio.create_task(
                 memory_observer.observe_phase_boundary(
                     messages=messages,
@@ -1390,6 +1437,16 @@ def create_archive_phase_node(
             except Exception as e:
                 logger.warning(f"[{job_id}] Failed to create phase snapshot: {e}")
 
+        # Collect completed todo summaries BEFORE archiving (archive clears them)
+        phase_str = "strategic" if is_strategic else "tactical"
+        curation_todo_summaries = []
+        if curation_callback:
+            for todo in todo_manager.list_all():
+                if todo.status == TodoStatus.COMPLETED and todo.notes:
+                    curation_todo_summaries.append(
+                        f"- {todo.content}: {'; '.join(todo.notes)}"
+                    )
+
         # Archive todos
         archive_path = todo_manager.archive(current_phase or "phase")
 
@@ -1398,7 +1455,6 @@ def create_archive_phase_node(
             plan_manager.mark_phase_complete(current_phase)
 
         # Audit phase completion
-        phase_str = "strategic" if is_strategic else "tactical"
         auditor = get_archiver()
         if auditor:
             auditor.audit_step(
@@ -1417,6 +1473,20 @@ def create_archive_phase_node(
                 phase=phase_str,
                 phase_number=phase_number,
             )
+
+        # Trigger curator subjob spawn/resume (async, non-blocking)
+        if curation_callback:
+            try:
+                phase_context_parts = [f"Phase {phase_number} ({phase_str}) archived."]
+                if archive_path:
+                    phase_context_parts.append(f"Archive: {archive_path}")
+                phase_context_parts.extend(curation_todo_summaries)
+                curation_phase_data = "\n".join(phase_context_parts)
+                asyncio.create_task(
+                    curation_callback(job_id, phase_number, curation_phase_data)
+                )
+            except Exception as e:
+                logger.warning(f"[{job_id}] Curation trigger failed (non-fatal): {e}")
 
         message = AIMessage(
             content=f"Phase complete. Archived todos to {archive_path}. Moving to next phase."
@@ -2270,6 +2340,7 @@ def build_phase_alternation_graph(
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     tool_context: Optional[ToolContext] = None,
     postgres_db: Optional[Any] = None,
+    curation_callback=None,
     # Backwards compatibility
     llm_with_tools: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
@@ -2391,6 +2462,7 @@ def build_phase_alternation_graph(
         snapshot_manager=snapshot_manager,
         recall_store=recall_store,
         memory_observer=memory_observer,
+        curation_callback=curation_callback,
     )
 
     handle_transition = create_handle_transition_node(

@@ -29,8 +29,8 @@ class GiteaClient:
 
     def __init__(self) -> None:
         self._url = os.environ.get("GITEA_URL", "").rstrip("/")
-        self._user = os.environ.get("GITEA_ADMIN_USER", "graphrag")
-        self._password = os.environ.get("GITEA_ADMIN_PASSWORD", "graphrag_gitea")
+        self._user = os.environ.get("GITEA_ADMIN_USER", "srw")
+        self._password = os.environ.get("GITEA_ADMIN_PASSWORD", "srw_gitea")
         self._initialized = False
         self._client: Optional[httpx.AsyncClient] = None
 
@@ -93,7 +93,7 @@ class GiteaClient:
         try:
             signup_data = {
                 "username": self._user,
-                "email": f"{self._user}@graphrag.local",
+                "email": f"{self._user}@srw.local",
                 "password": self._password,
                 "must_change_password": False,
                 "send_notify": False,
@@ -118,7 +118,7 @@ class GiteaClient:
                         f"{self._url}/user/sign_up",
                         data={
                             "user_name": self._user,
-                            "email": f"{self._user}@graphrag.local",
+                            "email": f"{self._user}@srw.local",
                             "password": self._password,
                             "retype": self._password,
                         },

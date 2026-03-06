@@ -136,7 +136,7 @@ class LLMArchiver:
     def __init__(
         self,
         mongodb_url: str,
-        database_name: str = "graphrag_logs",
+        database_name: str = "srw_logs",
         collection_name: str = "llm_requests",
         audit_collection_name: str = "agent_audit",
     ):
@@ -177,13 +177,13 @@ class LLMArchiver:
 
         # Extract database name from URL if present
         # Format: mongodb://host:port/database_name
-        db_name = "graphrag_logs"
+        db_name = "srw_logs"
         if "/" in mongodb_url:
             url_path = mongodb_url.split("/")[-1]
             if url_path and "?" not in url_path:
                 db_name = url_path
             elif "?" in url_path:
-                db_name = url_path.split("?")[0] or "graphrag_logs"
+                db_name = url_path.split("?")[0] or "srw_logs"
 
         return cls(mongodb_url=mongodb_url, database_name=db_name)
 
