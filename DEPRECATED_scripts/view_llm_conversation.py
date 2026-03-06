@@ -58,11 +58,11 @@ def get_mongodb_client():
     """Get MongoDB client."""
     from pymongo import MongoClient
 
-    url = os.getenv("MONGODB_URL", "mongodb://localhost:27017/graphrag_logs")
+    url = os.getenv("MONGODB_URL", "mongodb://localhost:27017/srw_logs")
     client = MongoClient(url, serverSelectionTimeoutMS=5000)
 
     # Extract database name
-    db_name = url.split("/")[-1].split("?")[0] or "graphrag_logs"
+    db_name = url.split("/")[-1].split("?")[0] or "srw_logs"
 
     return client, db_name
 

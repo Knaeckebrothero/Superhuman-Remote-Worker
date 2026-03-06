@@ -5,13 +5,13 @@
 # FastAPI backend for agent orchestration and cockpit API.
 #
 # Build:
-#   docker build -t graphrag-orchestrator -f docker/Dockerfile.orchestrator .
+#   docker build -t srw-orchestrator -f docker/Dockerfile.orchestrator .
 #
 # Run:
 #   docker run -p 8085:8085 \
 #     -e DATABASE_URL=postgresql://... \
 #     -e MONGODB_URL=mongodb://... \
-#     graphrag-orchestrator
+#     srw-orchestrator
 # =============================================================================
 
 FROM python:3.11-slim AS builder
@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Production image
 FROM python:3.11-slim
 
-LABEL maintainer="Graph-RAG Team"
+LABEL maintainer="SRW Team"
 LABEL description="Orchestrator API for agent management and cockpit backend"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -40,7 +40,7 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8085
 
 # Create non-root user early so COPY --chown can reference it
-RUN groupadd -r graphrag && useradd -r -g graphrag graphrag
+RUN groupadd -r srw && useradd -r -g srw srw
 
 WORKDIR /app
 
@@ -55,12 +55,12 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy orchestrator source code with correct ownership
-COPY --chown=graphrag:graphrag orchestrator/ ./
+COPY --chown=srw:srw orchestrator/ ./
 
 # Copy agent config directory (expert definitions, defaults, prompts, templates)
-COPY --chown=graphrag:graphrag config/ ./config/
+COPY --chown=srw:srw config/ ./config/
 
-USER graphrag
+USER srw
 
 EXPOSE 8085
 

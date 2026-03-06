@@ -67,9 +67,9 @@ def get_postgres_connection_string() -> str:
     if not connection_string:
         host = os.getenv("POSTGRES_HOST", "localhost")
         port = os.getenv("POSTGRES_PORT", "5432")
-        user = os.getenv("POSTGRES_USER", "graphrag")
-        password = os.getenv("POSTGRES_PASSWORD", "graphrag_password")
-        database = os.getenv("POSTGRES_DB", "graphrag")
+        user = os.getenv("POSTGRES_USER", "srw")
+        password = os.getenv("POSTGRES_PASSWORD", "srw_password")
+        database = os.getenv("POSTGRES_DB", "srw")
         connection_string = f"postgresql://{user}:{password}@{host}:{port}/{database}"
     return connection_string
 
@@ -80,9 +80,9 @@ def _parse_connection_string(connection_string: str) -> dict:
     return {
         "host": parsed.hostname or "localhost",
         "port": str(parsed.port or 5432),
-        "user": parsed.username or "graphrag",
+        "user": parsed.username or "srw",
         "password": parsed.password or "",
-        "database": parsed.path.lstrip('/').split('?')[0] or "graphrag",
+        "database": parsed.path.lstrip('/').split('?')[0] or "srw",
     }
 
 
@@ -467,6 +467,127 @@ async def _migrate_orphan_jobs(db) -> None:
 
 
 # =============================================================================
+# Neo4j Initialization (System Knowledge Base)
+# =============================================================================
+
+NEO4J_SCHEMA_QUERIES = [
+    # Unique constraint: note slug per project
+    "CREATE CONSTRAINT note_id_unique IF NOT EXISTS FOR (n:Note) REQUIRE (n.project_id, n.id) IS UNIQUE",
+    # Indexes for common lookups
+    "CREATE INDEX note_project IF NOT EXISTS FOR (n:Note) ON (n.project_id)",
+    "CREATE INDEX note_type IF NOT EXISTS FOR (n:Note) ON (n.project_id, n.type)",
+    "CREATE INDEX note_status IF NOT EXISTS FOR (n:Note) ON (n.project_id, n.status)",
+    "CREATE INDEX tag_project IF NOT EXISTS FOR (t:Tag) ON (t.project_id)",
+    "CREATE INDEX keyword_project IF NOT EXISTS FOR (k:Keyword) ON (k.project_id)",
+]
+
+
+def get_neo4j_config() -> Optional[dict]:
+    """Get system Neo4j connection config from environment.
+
+    Returns:
+        Dict with uri, username, password if configured, else None.
+    """
+    uri = os.getenv("NEO4J_URL")
+    if not uri:
+        return None
+    return {
+        "uri": uri,
+        "username": os.getenv("NEO4J_USERNAME", "neo4j"),
+        "password": os.getenv("NEO4J_PASSWORD", ""),
+    }
+
+
+def init_neo4j(force_reset: bool = False) -> bool:
+    """Initialize Neo4j schema for the knowledge base.
+
+    Creates constraints and indexes for Note, Tag, and Keyword nodes.
+    Idempotent — all statements use IF NOT EXISTS.
+
+    Args:
+        force_reset: If True, delete all knowledge nodes before recreating schema.
+
+    Returns:
+        True if successful or Neo4j not configured, False on error.
+    """
+    config = get_neo4j_config()
+    if not config:
+        logger.info("  Neo4j not configured (NEO4J_URL not set)")
+        logger.info("  Skipping Neo4j initialization (optional for knowledge base)")
+        return True
+
+    try:
+        from src.database.neo4j_db import Neo4jDB
+    except ImportError as e:
+        logger.warning(f"  Could not import Neo4jDB: {e}")
+        return True  # Non-fatal — KB is optional
+
+    db = Neo4jDB(**config)
+    if not db.connect():
+        logger.warning("  Could not connect to Neo4j — knowledge base unavailable")
+        return True  # Non-fatal
+
+    try:
+        if force_reset:
+            logger.info("  Resetting Neo4j knowledge data...")
+            db.execute_write("MATCH (n:Note) DETACH DELETE n")
+            db.execute_write("MATCH (t:Tag) DETACH DELETE t")
+            db.execute_write("MATCH (k:Keyword) DETACH DELETE k")
+            logger.info("  Cleared all knowledge nodes")
+
+        logger.info("  Applying Neo4j schema (constraints + indexes)...")
+        for query in NEO4J_SCHEMA_QUERIES:
+            try:
+                db.execute_write(query)
+            except Exception as e:
+                # Some Neo4j versions handle IF NOT EXISTS differently
+                logger.debug(f"  Schema query note: {e}")
+
+        logger.info("  Neo4j schema applied successfully")
+        return True
+
+    except Exception as e:
+        logger.warning(f"  Neo4j initialization error: {e}")
+        return True  # Non-fatal
+
+    finally:
+        db.close()
+
+
+def verify_neo4j() -> dict:
+    """Verify Neo4j connectivity and schema.
+
+    Returns:
+        Dict with connection status and schema info.
+    """
+    config = get_neo4j_config()
+    if not config:
+        return {"connected": False, "configured": False}
+
+    try:
+        from src.database.neo4j_db import Neo4jDB
+    except ImportError:
+        return {"connected": False, "configured": True, "error": "neo4j driver not installed"}
+
+    db = Neo4jDB(**config)
+    if not db.connect():
+        return {"connected": False, "configured": True, "error": "connection failed"}
+
+    try:
+        schema = db.get_schema()
+        return {
+            "connected": True,
+            "configured": True,
+            "node_labels": schema.get("node_labels", []),
+            "relationship_types": schema.get("relationship_types", []),
+        }
+    except Exception as e:
+        return {"connected": False, "configured": True, "error": str(e)}
+    finally:
+        db.close()
+
+
+# =============================================================================
 # MongoDB Initialization
 # =============================================================================
 
@@ -481,7 +602,7 @@ def _parse_mongodb_url(url: str) -> dict:
     return {
         "host": parsed.hostname or "localhost",
         "port": str(parsed.port or 27017),
-        "database": parsed.path.lstrip('/').split('?')[0] or "graphrag_logs",
+        "database": parsed.path.lstrip('/').split('?')[0] or "srw_logs",
         "username": parsed.username,
         "password": parsed.password,
     }
@@ -523,7 +644,7 @@ async def init_mongodb(force_reset: bool = False) -> bool:
         # Parse database name from URL
         db_name = mongo_url.split('/')[-1].split('?')[0]
         if not db_name:
-            db_name = "graphrag_logs"
+            db_name = "srw_logs"
 
         db = client[db_name]
 
@@ -649,7 +770,7 @@ async def verify_mongodb() -> dict:
         client = MongoClient(mongo_url, serverSelectionTimeoutMS=2000)
         client.server_info()
 
-        db_name = mongo_url.split('/')[-1].split('?')[0] or "graphrag_logs"
+        db_name = mongo_url.split('/')[-1].split('?')[0] or "srw_logs"
         db = client[db_name]
         collections = db.list_collection_names()
 
@@ -917,6 +1038,11 @@ async def init_databases(
             # MongoDB failures are non-fatal
             logger.warning("MongoDB initialization had issues")
 
+    # Neo4j (system knowledge base) — non-fatal if not configured
+    logger.info("")
+    logger.info("Initializing Neo4j (knowledge base)...")
+    init_neo4j(force_reset)
+
     return success
 
 
@@ -940,6 +1066,8 @@ async def verify_databases(
 
     if not skip_mongodb:
         result["mongodb"] = await verify_mongodb()
+
+    result["neo4j"] = verify_neo4j()
 
     return result
 

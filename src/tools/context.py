@@ -71,6 +71,9 @@ class ToolContext:
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     memory_observer: Optional[Any] = None  # MemoryObserver instance (Memory Light Phase 3)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
+    knowledge_graph: Optional[Any] = None  # KnowledgeGraphDB (system Neo4j for knowledge base)
+    knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)
+    _project_id: Optional[str] = None  # Project UUID for knowledge scoping
     _pending_memories: List[Dict[str, Any]] = field(default_factory=list)  # Sync-safe memory queue
 
     def __post_init__(self):
@@ -147,6 +150,20 @@ class ToolContext:
     def has_shell(self) -> bool:
         """Check if ShellManager is available for persistent terminal sessions."""
         return self.shell_manager is not None
+
+    def has_knowledge(self) -> bool:
+        """Check if knowledge base (Neo4j + pgvector) is available."""
+        return self.knowledge_graph is not None and self.knowledge_store is not None
+
+    @property
+    def project_id(self) -> Optional[str]:
+        """Get the project ID for knowledge scoping."""
+        return self._project_id
+
+    @project_id.setter
+    def project_id(self, value: Optional[str]) -> None:
+        """Set the project ID."""
+        self._project_id = value
 
     @property
     def db(self) -> Optional["PostgresDB"]:

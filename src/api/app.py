@@ -103,6 +103,11 @@ async def lifespan(app: FastAPI):
 
     # Register with orchestrator and start heartbeat
     _orchestrator_client = create_orchestrator_client_from_env(_agent.config.agent_id)
+
+    # Set curation callback on the agent (used by archive_phase to spawn/resume curator)
+    if _is_curation_enabled():
+        _agent.curation_callback = _maybe_trigger_curation
+
     logger.info("Registering with orchestrator...")
     await _orchestrator_client.connect()
 
@@ -366,6 +371,23 @@ def _is_verification_enabled() -> bool:
     return bool(_get_verification_config().get("enabled", False))
 
 
+def _get_curation_config() -> Dict[str, Any]:
+    """Get curation config from config.extra (same pattern as verification)."""
+    if _agent is None:
+        return {}
+    config = _agent.config
+    if hasattr(config, "extra") and isinstance(config.extra, dict):
+        cc = config.extra.get("curator")
+        if isinstance(cc, dict):
+            return cc
+    return {}
+
+
+def _is_curation_enabled() -> bool:
+    """Check if curation is enabled in the current agent config."""
+    return bool(_get_curation_config().get("enabled", False))
+
+
 def _is_job_completion_freeze(row) -> bool:
     """Check if a job's freeze_data indicates a job completion (not phase boundary).
 
@@ -546,6 +568,187 @@ async def _maybe_trigger_verification(
         # Verification trigger failures should never crash the agent
         logger.error(
             f"Error triggering verification for job {job_id}: {e}",
+            exc_info=True,
+        )
+
+
+async def _maybe_trigger_curation(
+    job_id: str,
+    phase_number: int,
+    phase_data: str,
+) -> None:
+    """Spawn or resume the curator subjob after an archive phase.
+
+    Called from the archive_phase node in graph.py. On the first archive phase,
+    creates a new curator subjob. On subsequent phases, resumes the existing
+    curator with new phase data.
+
+    Guards:
+    1. Agent config has curator.enabled = true
+    2. The job has a project_id (curation requires a project knowledge base)
+    3. The job has no parent_job_id (prevents recursive curation)
+
+    Args:
+        job_id: The job's UUID
+        phase_number: Phase that was just archived
+        phase_data: Formatted phase context (retrospective, workspace summary)
+    """
+    if not _is_curation_enabled():
+        return
+
+    if _agent is None or _agent.postgres_conn is None or _orchestrator_client is None:
+        return
+
+    try:
+        import json as _json
+
+        row = await _agent.postgres_conn.fetchrow(
+            "SELECT parent_job_id, project_id, description, config_name FROM jobs WHERE id = $1::uuid",
+            job_id,
+        )
+        if not row:
+            return
+
+        # Guard: prevent curation for subjobs
+        if row.get("parent_job_id") is not None:
+            logger.debug(
+                f"Skipping curation for job {job_id} — it is a sub-job"
+            )
+            return
+
+        project_id = str(row["project_id"]) if row.get("project_id") else None
+        if not project_id:
+            logger.debug(f"Skipping curation for job {job_id} — no project_id")
+            return
+
+        description = row.get("description", "")
+        config_name = row.get("config_name", "unknown")
+
+        # Check for an existing curator subjob (spawn once, resume after)
+        curator_row = await _agent.postgres_conn.fetchrow(
+            """
+            SELECT id, status, context FROM jobs
+            WHERE parent_job_id = $1::uuid
+              AND config_name = $2
+              AND status IN ('waiting', 'processing')
+            """,
+            job_id,
+            _get_curation_config().get("curator_config", "curator"),
+        )
+
+        if curator_row:
+            # Resume existing curator with new phase data
+            curator_id = str(curator_row["id"])
+            logger.info(
+                f"Resuming curator {curator_id} for job {job_id} "
+                f"(phase {phase_number})"
+            )
+            await _orchestrator_client.resume_job(
+                curator_id,
+                feedback=(
+                    f"Phase {phase_number} archived. Process the new phase artifacts.\n\n"
+                    f"{phase_data}"
+                ),
+            )
+        else:
+            # First archive phase: spawn new curator
+            curation_config = _get_curation_config()
+            curator_config = curation_config.get("curator_config", "curator")
+
+            logger.info(
+                f"Spawning curator for job {job_id} "
+                f"(curator_config={curator_config}, phase {phase_number})"
+            )
+
+            create_result = await _orchestrator_client.create_curation_job(
+                job_id=job_id,
+                description=description,
+                config_name=config_name,
+                phase_data=phase_data,
+                project_id=project_id,
+                curator_config=curator_config,
+            )
+
+            if create_result:
+                curator_job_id = create_result.get("id", "unknown")
+                logger.info(
+                    f"Curation job {curator_job_id} created for job {job_id}"
+                )
+            else:
+                logger.error(f"Failed to create curation job for {job_id}")
+
+    except Exception as e:
+        # Curation trigger failures should never crash the agent
+        logger.error(
+            f"Error triggering curation for job {job_id}: {e}",
+            exc_info=True,
+        )
+
+
+async def _maybe_trigger_curation_final_pass(
+    target_job_id: str,
+) -> None:
+    """Send final curation signal to the curator after critic approval.
+
+    Called from _handle_critic_verdict when a critic approves the target job.
+    Resumes the waiting curator with a "final" signal so it can do a comprehensive
+    last pass (memories, output/, freeze_data).
+
+    Args:
+        target_job_id: The approved job's UUID
+    """
+    if not _is_curation_enabled():
+        return
+
+    if _agent is None or _agent.postgres_conn is None or _orchestrator_client is None:
+        return
+
+    try:
+        curator_config_name = _get_curation_config().get("curator_config", "curator")
+
+        curator_row = await _agent.postgres_conn.fetchrow(
+            """
+            SELECT id, status FROM jobs
+            WHERE parent_job_id = $1::uuid
+              AND config_name = $2
+              AND status IN ('waiting', 'completed')
+            """,
+            target_job_id,
+            curator_config_name,
+        )
+
+        if not curator_row:
+            logger.debug(
+                f"No curator found for job {target_job_id} — skipping final pass"
+            )
+            return
+
+        if curator_row["status"] == "completed":
+            logger.debug(
+                f"Curator {curator_row['id']} already completed for {target_job_id}"
+            )
+            return
+
+        curator_id = str(curator_row["id"])
+        logger.info(
+            f"Sending final curation signal to curator {curator_id} "
+            f"for approved job {target_job_id}"
+        )
+
+        await _orchestrator_client.resume_job(
+            curator_id,
+            feedback=(
+                "FINAL CURATION PASS. The target job has been approved by the critic. "
+                "Do a comprehensive final sweep: read memories, output/, and the final "
+                "workspace.md. Promote valuable memories to knowledge notes. Write a "
+                "`state` note summarizing what changed. Check for open questions. "
+                "Link all notes. Then call job_complete."
+            ),
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Error triggering final curation pass for {target_job_id}: {e}",
             exc_info=True,
         )
 
@@ -731,6 +934,8 @@ async def _handle_critic_verdict(job_id: str, result: Dict[str, Any]) -> None:
         if verdict == "approved":
             logger.info(f"Critic {job_id} approved target {target_job_id}")
             await _set_target_to_autonomy_status(target_job_id)
+            # Trigger curator final pass if curation is enabled
+            await _maybe_trigger_curation_final_pass(target_job_id)
 
         elif verdict == "returned":
             current_round = critic_context.get("verification_round", 0)
@@ -748,6 +953,8 @@ async def _handle_critic_verdict(job_id: str, result: Dict[str, Any]) -> None:
                     error_message=f"Verification limit reached ({max_rounds} rounds)",
                 )
                 await _set_target_to_autonomy_status(target_job_id)
+                # Trigger curator final pass even on auto-accept
+                await _maybe_trigger_curation_final_pass(target_job_id)
             else:
                 # Resume target with feedback
                 feedback = freeze_data.get("feedback", "")
@@ -896,6 +1103,15 @@ async def _process_orchestrator_job(
 
         # Check if we should spawn a verification (critic) job
         await _maybe_trigger_verification(job_id, result, context, description)
+
+        # If verification is NOT enabled but curation IS, trigger final pass on job completion
+        if (
+            not _is_verification_enabled()
+            and _is_curation_enabled()
+            and result.get("should_stop")
+            and result.get("goal_achieved")
+        ):
+            await _maybe_trigger_curation_final_pass(job_id)
 
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")

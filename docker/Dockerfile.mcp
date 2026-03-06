@@ -6,33 +6,33 @@
 # Uses FastMCP 2.0 with dual transport support (stdio/HTTP).
 #
 # Build:
-#   docker build -t graphrag-mcp -f docker/Dockerfile.mcp .
+#   docker build -t srw-mcp -f docker/Dockerfile.mcp .
 #
 # Run (HTTP transport - default for container):
 #   docker run -d --name mcp \
 #     -p 8000:8000 \
 #     -e COCKPIT_API_URL=http://orchestrator:8085 \
-#     graphrag-mcp
+#     srw-mcp
 #
 # Run (stdio transport - for docker exec):
 #   docker run -d --name mcp \
 #     -e MCP_TRANSPORT=stdio \
 #     -e COCKPIT_API_URL=http://orchestrator:8085 \
-#     graphrag-mcp sleep infinity
+#     srw-mcp sleep infinity
 #   docker exec -i mcp python run.py
 # =============================================================================
 
 FROM python:3.11-slim
 
-LABEL maintainer="Graph-RAG Team"
+LABEL maintainer="SRW Team"
 LABEL description="MCP Server for Claude Code integration (FastMCP 2.0)"
-LABEL org.opencontainers.image.source="https://github.com/knaeckebrothero/Uni-Projekt-Graph-RAG"
+LABEL org.opencontainers.image.source="https://github.com/knaeckebrothero/Superhuman-Remote-Worker"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 # Create non-root user early so COPY --chown can reference it
-RUN groupadd -r graphrag && useradd -r -g graphrag graphrag
+RUN groupadd -r srw && useradd -r -g srw srw
 
 WORKDIR /app
 
@@ -45,12 +45,12 @@ COPY orchestrator/mcp/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy MCP server source code with correct ownership
-COPY --chown=graphrag:graphrag orchestrator/mcp/ ./
+COPY --chown=srw:srw orchestrator/mcp/ ./
 # formatters module imported by server.py
-COPY --chown=graphrag:graphrag orchestrator/services/formatters.py ./services/formatters.py
-COPY --chown=graphrag:graphrag orchestrator/services/__init__.py ./services/__init__.py
+COPY --chown=srw:srw orchestrator/services/formatters.py ./services/formatters.py
+COPY --chown=srw:srw orchestrator/services/__init__.py ./services/__init__.py
 
-USER graphrag
+USER srw
 
 # Default to HTTP for container deployment
 ENV MCP_TRANSPORT=http \

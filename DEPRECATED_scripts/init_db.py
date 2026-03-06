@@ -48,9 +48,9 @@ def get_connection_string() -> str:
     if not connection_string:
         host = os.getenv("POSTGRES_HOST", "localhost")
         port = os.getenv("POSTGRES_PORT", "5432")
-        user = os.getenv("POSTGRES_USER", "graphrag")
-        password = os.getenv("POSTGRES_PASSWORD", "graphrag_password")
-        database = os.getenv("POSTGRES_DB", "graphrag")
+        user = os.getenv("POSTGRES_USER", "srw")
+        password = os.getenv("POSTGRES_PASSWORD", "srw_password")
+        database = os.getenv("POSTGRES_DB", "srw")
         connection_string = f"postgresql://{user}:{password}@{host}:{port}/{database}"
     return connection_string
 
@@ -179,9 +179,9 @@ def _parse_connection_string(connection_string: str) -> dict:
     return {
         "host": parsed.hostname or "localhost",
         "port": str(parsed.port or 5432),
-        "user": parsed.username or "graphrag",
+        "user": parsed.username or "srw",
         "password": parsed.password or "",
-        "database": parsed.path.lstrip('/').split('?')[0] or "graphrag",
+        "database": parsed.path.lstrip('/').split('?')[0] or "srw",
     }
 
 
@@ -296,7 +296,7 @@ def restore_postgres(backup_file: Path, logger: logging.Logger) -> bool:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Initialize Graph-RAG PostgreSQL database")
+    parser = argparse.ArgumentParser(description="Initialize SRW PostgreSQL database")
     parser.add_argument("--force-reset", action="store_true", help="Drop all tables and recreate")
     args = parser.parse_args()
 
@@ -304,7 +304,7 @@ async def main():
     load_dotenv()
 
     print("=" * 50)
-    print("Graph-RAG Database Initialization")
+    print("SRW Database Initialization")
     print("=" * 50)
 
     if args.force_reset:

@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.source="https://github.com/knaeckebrothero/Uni-Projekt-Graph-RAG"
+LABEL org.opencontainers.image.source="https://github.com/Knaeckebrothero/Superhuman-Remote-Worker"
 LABEL org.opencontainers.image.description="Debug Cockpit MCP Server"
 
 WORKDIR /app

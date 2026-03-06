@@ -6,20 +6,20 @@
 # The agent behavior is determined by the AGENT_CONFIG environment variable.
 #
 # Build:
-#   docker build -t graphrag-agent -f docker/Dockerfile.agent .
+#   docker build -t srw-agent -f docker/Dockerfile.agent .
 #
 # Run with defaults:
 #   docker run -p 8001:8001 \
 #     -e DATABASE_URL=postgresql://... \
 #     -e OPENAI_API_KEY=... \
-#     graphrag-agent
+#     srw-agent
 #
 # Run with custom config:
 #   docker run -p 8001:8001 \
 #     -e AGENT_CONFIG=my_agent \
 #     -e DATABASE_URL=postgresql://... \
 #     -e OPENAI_API_KEY=... \
-#     graphrag-agent
+#     srw-agent
 #
 # Entry point: agent.py (Universal Agent CLI)
 # =============================================================================
@@ -59,11 +59,11 @@ RUN if [ -n "$CITATION_ENGINE_PATH" ]; then \
 # Production image
 FROM python:3.11-slim
 
-LABEL maintainer="Graph-RAG Team"
+LABEL maintainer="SRW Team"
 LABEL description="Universal Agent for document processing and requirement validation"
 
 # Create non-root user early so COPY --chown can reference it
-RUN groupadd -r graphrag && useradd -r -g graphrag -m graphrag
+RUN groupadd -r srw && useradd -r -g srw -m srw
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -109,9 +109,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux \
     && rm -rf /var/lib/apt/lists/*
 
-# Allow graphrag to sudo without password (private project, no security concern)
-RUN echo "graphrag ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/graphrag \
-    && chmod 0440 /etc/sudoers.d/graphrag
+# Allow srw to sudo without password (private project, no security concern)
+RUN echo "srw ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/srw \
+    && chmod 0440 /etc/sudoers.d/srw
 
 # Copy installed packages from builder (system-owned, read-only is fine)
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
@@ -121,18 +121,18 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 RUN playwright install --with-deps chromium
 
 # Copy source code LAST (changes most frequently, avoids busting playwright cache)
-COPY --chown=graphrag:graphrag src/ ./src/
-COPY --chown=graphrag:graphrag config/ ./config/
-COPY --chown=graphrag:graphrag agent.py ./
+COPY --chown=srw:srw src/ ./src/
+COPY --chown=srw:srw config/ ./config/
+COPY --chown=srw:srw agent.py ./
 
 # Marker so get_project_root() finds /app (no .git in container)
-RUN touch /app/pyproject.toml && chown graphrag:graphrag /app/pyproject.toml
+RUN touch /app/pyproject.toml && chown srw:srw /app/pyproject.toml
 
 # Create runtime directories with correct ownership
 RUN mkdir -p /app/workspace /app/logs && \
-    chown -R graphrag:graphrag /app/workspace /app/logs
+    chown -R srw:srw /app/workspace /app/logs
 
-USER graphrag
+USER srw
 
 # Expose default port (can be overridden)
 EXPOSE 8001

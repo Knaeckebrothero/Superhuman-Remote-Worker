@@ -1,7 +1,7 @@
--- Graph-RAG Autonomous Agent System
+-- Superhuman Remote Worker — Autonomous Agent System
 -- PostgreSQL Schema
 --
--- This file defines all tables for the Graph-RAG system.
+-- This file defines all tables for the Superhuman Remote Worker system.
 -- Run with: python src/scripts/app_init.py --force-reset
 --
 -- Tables:
@@ -600,9 +600,13 @@ CREATE TABLE IF NOT EXISTS source_embeddings (
 CREATE INDEX IF NOT EXISTS idx_source_embeddings_source ON source_embeddings(source_id);
 CREATE INDEX IF NOT EXISTS idx_source_embeddings_job ON source_embeddings(job_id);
 
--- HNSW index for cosine similarity search
-CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector ON source_embeddings
-    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+-- HNSW index for cosine similarity search (skipped if column dimension > 2000, e.g. text-embedding-3-large)
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_source_embeddings_vector ON source_embeddings
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'Skipping HNSW index on source_embeddings (dimension > 2000 or other error): %', SQLERRM;
+END $$;
 
 INSERT INTO schema_migrations (version, description)
 VALUES (3, 'Vector search with source embeddings')
@@ -742,8 +746,12 @@ CREATE INDEX IF NOT EXISTS idx_memories_job_accessed ON memories(job_id, last_ac
 CREATE INDEX IF NOT EXISTS idx_memories_job_type ON memories(job_id, memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_keywords ON memories USING GIN(keywords);
 CREATE INDEX IF NOT EXISTS idx_memories_sparse ON memories USING GIN(sparse_keywords);
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories
-    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'Skipping HNSW index on memories (dimension > 2000 or other error): %', SQLERRM;
+END $$;
 
 -- Hybrid search function: RRF-based fusion of dense, sparse, and recency channels
 CREATE OR REPLACE FUNCTION memory_hybrid_search(
@@ -786,7 +794,100 @@ LIMIT match_count
 $$;
 
 -- ============================================================================
--- 8. HELPER FUNCTIONS
+-- 8. KNOWLEDGE INDEX (Project Knowledge Base — Search Index)
+-- Derived search index for project knowledge notes stored in Neo4j.
+-- Updated via write-through on every kb_write/kb_update.
+-- See docs/features/project_knowledge_base.md for full architecture.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS knowledge_index (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    note_id VARCHAR(100) NOT NULL,           -- Neo4j note id / slug (e.g. "chose-jwt-over-oauth")
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    note_type VARCHAR(50) NOT NULL,           -- goal, plan, decision, learning, code, source, question, state, retrospective
+    status VARCHAR(50) DEFAULT 'active',
+    confidence VARCHAR(20),
+    tags TEXT[] DEFAULT '{}',
+    keywords TEXT[] DEFAULT '{}',
+    job_id UUID,                              -- which job created this note
+    phase INT,
+    content TEXT NOT NULL,                    -- full note body (for search result display)
+    retrieval_messages TEXT[] DEFAULT '{}',   -- curator-generated queries for when this note should surface
+    embedding vector(1536),                    -- dense embedding (default 1536 for text-embedding-3-small; change via EMBEDDING_DIMENSIONS env var + rebuild)
+    search_doc tsvector,                     -- full-text search document
+    created_at TIMESTAMPTZ,
+    modified_at TIMESTAMPTZ,
+    indexed_at TIMESTAMPTZ DEFAULT NOW(),    -- when this row was last written
+    content_hash VARCHAR(64),                -- sha256 of content (skip re-embedding on metadata-only updates)
+
+    CONSTRAINT uq_knowledge_project_note UNIQUE (project_id, note_id),
+    CONSTRAINT valid_note_type CHECK (note_type IN (
+        'goal', 'plan', 'decision', 'learning', 'code',
+        'source', 'question', 'state', 'retrospective'
+    )),
+    CONSTRAINT valid_note_status CHECK (status IN ('active', 'resolved', 'superseded', 'archived'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge_index(project_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_project_type ON knowledge_index(project_id, note_type);
+CREATE INDEX IF NOT EXISTS idx_knowledge_project_status ON knowledge_index(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_knowledge_tags ON knowledge_index USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_knowledge_search ON knowledge_index USING GIN(search_doc);
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_knowledge_embedding ON knowledge_index
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'Skipping HNSW index on knowledge_index (dimension > 2000 or other error): %', SQLERRM;
+END $$;
+
+-- Hybrid search function: RRF-based fusion of dense, sparse, and recency channels
+-- Same pattern as memory_hybrid_search but scoped by project_id instead of job_id
+CREATE OR REPLACE FUNCTION knowledge_hybrid_search(
+    query_text text,
+    query_embedding vector,
+    project_id_param uuid,
+    match_count int DEFAULT 10,
+    dense_weight float DEFAULT 0.6,
+    sparse_weight float DEFAULT 0.3,
+    recency_weight float DEFAULT 0.1,
+    rrf_k int DEFAULT 50
+) RETURNS SETOF knowledge_index LANGUAGE sql AS $$
+WITH dense AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
+    FROM knowledge_index
+    WHERE project_id = project_id_param AND status = 'active' AND embedding IS NOT NULL
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+sparse AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
+    FROM knowledge_index
+    WHERE project_id = project_id_param AND status = 'active'
+      AND search_doc @@ websearch_to_tsquery('english', query_text)
+    ORDER BY rank_ix LIMIT match_count * 2
+),
+recent AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY modified_at DESC) AS rank_ix
+    FROM knowledge_index
+    WHERE project_id = project_id_param AND status = 'active'
+    ORDER BY rank_ix LIMIT match_count
+)
+SELECT ki.* FROM (
+    SELECT COALESCE(d.id, s.id, r.id) AS mid,
+        COALESCE(1.0 / (rrf_k + d.rank_ix), 0.0) * dense_weight +
+        COALESCE(1.0 / (rrf_k + s.rank_ix), 0.0) * sparse_weight +
+        COALESCE(1.0 / (rrf_k + r.rank_ix), 0.0) * recency_weight AS rrf_score
+    FROM dense d
+    FULL OUTER JOIN sparse s ON d.id = s.id
+    FULL OUTER JOIN recent r ON COALESCE(d.id, s.id) = r.id
+) ranked
+JOIN knowledge_index ki ON ranked.mid = ki.id
+ORDER BY ranked.rrf_score DESC
+LIMIT match_count
+$$;
+
+-- ============================================================================
+-- 9. HELPER FUNCTIONS
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -798,7 +899,7 @@ END;
 $$ language 'plpgsql';
 
 -- ============================================================================
--- 9. TRIGGERS
+-- 10. TRIGGERS
 -- ============================================================================
 
 DROP TRIGGER IF EXISTS update_jobs_updated_at ON jobs;
@@ -832,7 +933,7 @@ CREATE TRIGGER update_project_repositories_updated_at
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
--- 10. VIEWS
+-- 11. VIEWS
 -- ============================================================================
 
 -- Drop and recreate: adding project columns requires view recreation

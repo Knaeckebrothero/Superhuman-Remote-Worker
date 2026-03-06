@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cancel a job in the Graph-RAG system.
+"""Cancel a job in the SRW system.
 
 Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 
@@ -76,7 +76,7 @@ def cancel_job(job_id: str) -> bool:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cancel a job in the Graph-RAG system",
+        description="Cancel a job in the SRW system",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

@@ -163,7 +163,7 @@ async def main():
     # Check prerequisites
     if not os.getenv("DATABASE_URL"):
         print("\nERROR: DATABASE_URL not set. Run:")
-        print("  export DATABASE_URL=postgresql://graphrag:graphrag_password@localhost:5432/graphrag")
+        print("  export DATABASE_URL=postgresql://srw:srw_password@localhost:5432/srw")
         sys.exit(1)
 
     if not (os.getenv("OPENAI_API_KEY") or os.getenv("EMBEDDING_API_KEY")):

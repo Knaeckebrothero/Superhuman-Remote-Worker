@@ -178,6 +178,15 @@ verification:
   critic_config: critic  # Which expert config to use for the reviewer
   max_rounds: 3          # Max feedback round-trips before auto-accepting
 
+# Curation — auto-spawn a curator job to extract knowledge from job artifacts.
+# The curator runs in parallel, triggered on archive phases, extracting knowledge
+# notes into the project knowledge base (Neo4j + pgvector).
+# See docs/features/project_knowledge_base.md for full design.
+curator:
+  enabled: false         # Opt-in per config or per project
+  curator_config: curator  # Which expert config to use
+  autonomy: full         # No human review of curated notes
+
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent
 autonomy: review

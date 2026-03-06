@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check status of a job in the Graph-RAG system.
+"""Check status of a job in the SRW system.
 
 Migrated to use PostgresDB with sync wrappers (Phase 3 of database refactoring).
 

@@ -32,6 +32,10 @@ import {
   ProjectRepositoryCreateRequest,
   ProjectRepositoryUpdateRequest,
   PromoteRequest,
+  KnowledgeSummary,
+  KnowledgeListResponse,
+  KnowledgeNoteDetail,
+  KnowledgeSearchResponse,
 } from '../models/api.model';
 import { UploadResponse, UploadInfo } from '../models/file.model';
 import {
@@ -1101,6 +1105,64 @@ export class ApiService {
   promoteJob(jobId: string, body: PromoteRequest): Observable<{ status: string; project_id?: string } | null> {
     return this.http.post<{ status: string; project_id?: string }>(
       `${this.baseUrl}/jobs/${jobId}/promote`, body,
+    ).pipe(catchError(() => of(null)));
+  }
+
+  // ===== Knowledge Base Endpoints =====
+
+  getKnowledgeSummary(projectId: string): Observable<KnowledgeSummary | null> {
+    return this.http.get<KnowledgeSummary>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/summary`,
+    ).pipe(catchError(() => of(null)));
+  }
+
+  getKnowledgeNotes(
+    projectId: string,
+    filters?: { type?: string; status?: string; tag?: string; job_id?: string; limit?: number; offset?: number },
+  ): Observable<KnowledgeListResponse | null> {
+    let params = new HttpParams();
+    if (filters?.type) params = params.set('type', filters.type);
+    if (filters?.status) params = params.set('status', filters.status);
+    if (filters?.tag) params = params.set('tag', filters.tag);
+    if (filters?.job_id) params = params.set('job_id', filters.job_id);
+    if (filters?.limit) params = params.set('limit', filters.limit.toString());
+    if (filters?.offset) params = params.set('offset', filters.offset.toString());
+    return this.http.get<KnowledgeListResponse>(
+      `${this.baseUrl}/projects/${projectId}/knowledge`, { params },
+    ).pipe(catchError(() => of(null)));
+  }
+
+  getKnowledgeNote(projectId: string, noteId: string): Observable<KnowledgeNoteDetail | null> {
+    return this.http.get<KnowledgeNoteDetail>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/${noteId}`,
+    ).pipe(catchError(() => of(null)));
+  }
+
+  searchKnowledge(projectId: string, query: string, limit: number = 10): Observable<KnowledgeSearchResponse | null> {
+    return this.http.post<KnowledgeSearchResponse>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/search`,
+      { query, limit },
+    ).pipe(catchError(() => of(null)));
+  }
+
+  updateKnowledgeNote(
+    projectId: string, noteId: string,
+    body: { status?: string; add_tags?: string[]; remove_tags?: string[] },
+  ): Observable<{ status: string } | null> {
+    return this.http.patch<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/${noteId}`, body,
+    ).pipe(catchError(() => of(null)));
+  }
+
+  deleteKnowledgeNote(projectId: string, noteId: string): Observable<{ status: string } | null> {
+    return this.http.delete<{ status: string }>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/${noteId}`,
+    ).pipe(catchError(() => of(null)));
+  }
+
+  exportKnowledge(projectId: string): Observable<{ status: string; path: string; note_count: number } | null> {
+    return this.http.post<{ status: string; path: string; note_count: number }>(
+      `${this.baseUrl}/projects/${projectId}/knowledge/export`, {},
     ).pipe(catchError(() => of(null)));
   }
 }

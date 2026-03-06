@@ -819,6 +819,21 @@ class PromoteRequest(BaseModel):
     user_id: str = Field(..., description="User UUID who owns the new project")
 
 
+class KnowledgeSearchRequest(BaseModel):
+    """Request body for hybrid knowledge search."""
+
+    query: str = Field(..., description="Search query text")
+    limit: int = Field(10, ge=1, le=50, description="Max results to return")
+
+
+class KnowledgeNoteUpdate(BaseModel):
+    """Request body for updating a knowledge note."""
+
+    status: str | None = Field(None, description="New status: active, resolved, superseded, archived")
+    add_tags: list[str] | None = Field(None, description="Tags to add")
+    remove_tags: list[str] | None = Field(None, description="Tags to remove")
+
+
 class BuilderMessageRequest(BaseModel):
     """Request body for sending a message to the builder."""
 
@@ -905,7 +920,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Debug Cockpit API",
-    description="Backend API for the Graph-RAG Debug Cockpit",
+    description="Backend API for the Superhuman Remote Worker Cockpit",
     version="0.1.0",
     lifespan=lifespan,
     default_response_class=CustomJSONResponse,
@@ -4544,6 +4559,426 @@ async def promote_job(job_id: str, request: PromoteRequest) -> dict[str, Any]:
         raise
     except Exception as e:
         logger.error(f"Promote failed for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Project Knowledge Base Endpoints
+# =============================================================================
+
+# Lazy-loaded singleton for Neo4j knowledge operations
+_knowledge_graph_db = None
+
+
+def _get_knowledge_graph():
+    """Lazily initialise and return the KnowledgeGraphDB singleton."""
+    global _knowledge_graph_db
+    if _knowledge_graph_db is not None:
+        return _knowledge_graph_db
+    try:
+        import sys
+        project_root = str(Path(__file__).parent.parent)
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from src.services.knowledge_graph import KnowledgeGraphDB
+        _knowledge_graph_db = KnowledgeGraphDB()
+        if not _knowledge_graph_db.connect():
+            logger.warning("Could not connect to Neo4j for knowledge base")
+            _knowledge_graph_db = None
+    except Exception as e:
+        logger.warning(f"KnowledgeGraphDB not available: {e}")
+        _knowledge_graph_db = None
+    return _knowledge_graph_db
+
+
+@app.get("/api/projects/{project_id}/knowledge/summary")
+async def get_knowledge_summary(project_id: str) -> dict[str, Any]:
+    """Get knowledge base summary statistics for a project."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    try:
+        async with postgres_db.acquire() as conn:
+            # Counts by type
+            type_rows = await conn.fetch(
+                "SELECT note_type, COUNT(*) as cnt FROM knowledge_index "
+                "WHERE project_id = $1 GROUP BY note_type ORDER BY cnt DESC",
+                project_id,
+            )
+            by_type = {r["note_type"]: r["cnt"] for r in type_rows}
+
+            # Counts by status
+            status_rows = await conn.fetch(
+                "SELECT status, COUNT(*) as cnt FROM knowledge_index "
+                "WHERE project_id = $1 GROUP BY status ORDER BY cnt DESC",
+                project_id,
+            )
+            by_status = {r["status"]: r["cnt"] for r in status_rows}
+
+            # Total
+            total = sum(by_type.values())
+
+            # Recent notes (last 5)
+            recent_rows = await conn.fetch(
+                "SELECT note_id, title, note_type, status, modified_at "
+                "FROM knowledge_index WHERE project_id = $1 "
+                "ORDER BY modified_at DESC LIMIT 5",
+                project_id,
+            )
+            recent = [dict(r) for r in recent_rows]
+
+        return {
+            "total": total,
+            "by_type": by_type,
+            "by_status": by_status,
+            "recent": recent,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/knowledge")
+async def list_knowledge_notes(
+    project_id: str,
+    note_type: str | None = Query(default=None, alias="type"),
+    status: str | None = Query(default=None),
+    tag: str | None = Query(default=None),
+    job_id: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List knowledge notes for a project with optional filters."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    try:
+        async with postgres_db.acquire() as conn:
+            conditions = ["project_id = $1"]
+            params: list[Any] = [project_id]
+            idx = 2
+
+            if note_type:
+                conditions.append(f"note_type = ${idx}")
+                params.append(note_type)
+                idx += 1
+            if status:
+                conditions.append(f"status = ${idx}")
+                params.append(status)
+                idx += 1
+            if tag:
+                conditions.append(f"${idx} = ANY(tags)")
+                params.append(tag)
+                idx += 1
+            if job_id:
+                conditions.append(f"job_id = ${idx}::uuid")
+                params.append(job_id)
+                idx += 1
+
+            where = " AND ".join(conditions)
+
+            # Count total
+            count_row = await conn.fetchrow(
+                f"SELECT COUNT(*) as cnt FROM knowledge_index WHERE {where}",
+                *params,
+            )
+            total = count_row["cnt"] if count_row else 0
+
+            # Fetch page
+            params.extend([limit, offset])
+            rows = await conn.fetch(
+                f"SELECT id, note_id, title, note_type, status, confidence, "
+                f"tags, keywords, job_id, phase, "
+                f"LEFT(content, 300) as content_preview, "
+                f"created_at, modified_at "
+                f"FROM knowledge_index WHERE {where} "
+                f"ORDER BY modified_at DESC "
+                f"LIMIT ${idx} OFFSET ${idx + 1}",
+                *params,
+            )
+            notes = [dict(r) for r in rows]
+
+        return {"notes": notes, "total": total, "limit": limit, "offset": offset}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/knowledge/{note_id}")
+async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
+    """Get a single knowledge note with full content."""
+    try:
+        async with postgres_db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2",
+                project_id, note_id,
+            )
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Note '{note_id}' not found in project '{project_id}'",
+            )
+        result = dict(row)
+        # Remove binary/vector fields from response
+        result.pop("embedding", None)
+        result.pop("search_doc", None)
+
+        # Fetch relationships from Neo4j if available
+        kg = _get_knowledge_graph()
+        if kg:
+            try:
+                neo4j_note = kg.read_note(project_id, note_id)
+                if neo4j_note:
+                    result["relationships"] = neo4j_note.get("relationships", [])
+            except Exception:
+                result["relationships"] = []
+        else:
+            result["relationships"] = []
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/knowledge/search")
+async def search_knowledge(
+    project_id: str, body: KnowledgeSearchRequest,
+) -> dict[str, Any]:
+    """Hybrid search over project knowledge base."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    try:
+        async with postgres_db.acquire() as conn:
+            # Try dense+sparse search if embedding service available
+            embedding = None
+            try:
+                import sys
+                project_root = str(Path(__file__).parent.parent)
+                if project_root not in sys.path:
+                    sys.path.insert(0, project_root)
+                from src.services.embedding_service import get_embedding_service
+                svc = get_embedding_service()
+                embedding = await svc.embed(body.query)
+            except Exception:
+                pass  # Fall back to sparse-only search
+
+            if embedding:
+                rows = await conn.fetch(
+                    "SELECT * FROM knowledge_hybrid_search($1, $2::vector, $3, $4)",
+                    body.query, str(embedding), project_id, body.limit,
+                )
+            else:
+                # Sparse-only fallback: tsvector keyword search
+                rows = await conn.fetch(
+                    "SELECT * FROM knowledge_index "
+                    "WHERE project_id = $1 AND search_doc @@ websearch_to_tsquery($2) "
+                    "ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery($2)) DESC "
+                    "LIMIT $3",
+                    project_id, body.query, body.limit,
+                )
+
+            notes = []
+            for r in rows:
+                d = dict(r)
+                d.pop("embedding", None)
+                d.pop("search_doc", None)
+                notes.append(d)
+
+        return {"notes": notes, "query": body.query, "total": len(notes)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/projects/{project_id}/knowledge/{note_id}")
+async def update_knowledge_note(
+    project_id: str, note_id: str, body: KnowledgeNoteUpdate,
+) -> dict[str, str]:
+    """Update a knowledge note's status or tags."""
+    valid_statuses = {"active", "resolved", "superseded", "archived"}
+    if body.status and body.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status '{body.status}'. Must be one of: {valid_statuses}",
+        )
+
+    try:
+        # Update PostgreSQL search index
+        async with postgres_db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT note_id FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2",
+                project_id, note_id,
+            )
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Note '{note_id}' not found in project '{project_id}'",
+                )
+
+            updates = []
+            params: list[Any] = [project_id, note_id]
+            idx = 3
+
+            if body.status:
+                updates.append(f"status = ${idx}")
+                params.append(body.status)
+                idx += 1
+
+            if body.add_tags:
+                updates.append(f"tags = array_cat(tags, ${idx}::text[])")
+                params.append(body.add_tags)
+                idx += 1
+
+            if body.remove_tags:
+                for rm_tag in body.remove_tags:
+                    updates.append(f"tags = array_remove(tags, ${idx})")
+                    params.append(rm_tag)
+                    idx += 1
+
+            if not updates:
+                return {"status": "no_changes"}
+
+            updates.append("modified_at = NOW()")
+            set_clause = ", ".join(updates)
+            await conn.execute(
+                f"UPDATE knowledge_index SET {set_clause} "
+                f"WHERE project_id = $1 AND note_id = $2",
+                *params,
+            )
+
+        # Update Neo4j if available
+        kg = _get_knowledge_graph()
+        if kg:
+            try:
+                update_kwargs: dict[str, Any] = {}
+                if body.status:
+                    update_kwargs["status"] = body.status
+                if body.add_tags:
+                    update_kwargs["add_tags"] = body.add_tags
+                if update_kwargs:
+                    kg.update_note(project_id, note_id, **update_kwargs)
+            except Exception as e:
+                logger.warning(f"Neo4j update failed for {note_id}: {e}")
+
+        return {"status": "updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/projects/{project_id}/knowledge/{note_id}")
+async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]:
+    """Hard delete a knowledge note from both stores."""
+    try:
+        # Delete from PostgreSQL
+        async with postgres_db.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM knowledge_index "
+                "WHERE project_id = $1 AND note_id = $2",
+                project_id, note_id,
+            )
+            if result == "DELETE 0":
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Note '{note_id}' not found in project '{project_id}'",
+                )
+
+        # Delete from Neo4j if available
+        kg = _get_knowledge_graph()
+        if kg:
+            try:
+                kg._db.execute_write(
+                    "MATCH (n:Note {project_id: $pid, id: $nid}) DETACH DELETE n",
+                    {"pid": project_id, "nid": note_id},
+                )
+            except Exception as e:
+                logger.warning(f"Neo4j delete failed for {note_id}: {e}")
+
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/projects/{project_id}/knowledge/export")
+async def export_knowledge(project_id: str) -> dict[str, Any]:
+    """Export project knowledge base as Obsidian-compatible markdown files."""
+    project = await postgres_db.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
+
+    kg = _get_knowledge_graph()
+    if not kg:
+        raise HTTPException(
+            status_code=503,
+            detail="Neo4j not available — cannot export knowledge base",
+        )
+
+    try:
+        import tempfile
+        export_dir = Path(tempfile.mkdtemp(prefix="kb_export_"))
+        notes = kg.get_all_notes_for_export(project_id)
+
+        for note in notes:
+            # Build frontmatter
+            fm_lines = ["---"]
+            fm_lines.append(f"id: {note['id']}")
+            fm_lines.append(f"type: {note['type']}")
+            if note.get("tags"):
+                fm_lines.append(f"tags: [{', '.join(note['tags'])}]")
+            if note.get("keywords"):
+                fm_lines.append(f"keywords: [{', '.join(note['keywords'])}]")
+            if note.get("confidence"):
+                fm_lines.append(f"confidence: {note['confidence']}")
+            fm_lines.append(f"status: {note.get('status', 'active')}")
+            if note.get("job_id"):
+                fm_lines.append(f"job_id: {note['job_id']}")
+            if note.get("phase"):
+                fm_lines.append(f"phase: {note['phase']}")
+            if note.get("created"):
+                fm_lines.append(f"created: {note['created']}")
+            if note.get("modified"):
+                fm_lines.append(f"modified: {note['modified']}")
+            fm_lines.append("---")
+            fm_lines.append("")
+
+            # Title and content
+            fm_lines.append(f"# {note.get('title', note['id'])}")
+            fm_lines.append("")
+            if note.get("content"):
+                fm_lines.append(note["content"])
+                fm_lines.append("")
+
+            # Relationships as wikilinks
+            if note.get("relationships"):
+                by_type: dict[str, list[str]] = {}
+                for rel in note["relationships"]:
+                    rtype = rel.get("type", "REFERENCES")
+                    target = rel.get("target", "")
+                    by_type.setdefault(rtype, []).append(target)
+                for rtype, targets in by_type.items():
+                    links = ", ".join(f"[[{t}]]" for t in targets)
+                    fm_lines.append(f"**{rtype}:** {links}")
+
+            file_name = f"{note['id']}.md"
+            (export_dir / file_name).write_text("\n".join(fm_lines), encoding="utf-8")
+
+        return {
+            "status": "exported",
+            "path": str(export_dir),
+            "note_count": len(notes),
+            "project_name": project.get("name", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

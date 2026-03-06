@@ -4,7 +4,7 @@ Optimized vLLM image for OpenAI gpt-oss models (120b and 20b) with automatic GPU
 
 ## Quick Start
 
-**Container Image:** `ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-vllm:latest`
+**Container Image:** `ghcr.io/your-org/superhuman-remote-worker-gpt-oss-vllm:latest`
 
 ### GPU Requirements
 

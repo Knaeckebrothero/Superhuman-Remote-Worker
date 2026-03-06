@@ -42,7 +42,7 @@ docker run --gpus all -p 8000:8000 --ipc=host \
     -e MAX_MODEL_LEN=131072 \
     -e GPU_MEMORY_UTILIZATION=0.95 \
     -e SHOW_LOADING_PROGRESS=true \
-    ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-vllm:latest
+    ghcr.io/your-org/superhuman-remote-worker-gpt-oss-vllm:latest
 
 # gpt-oss-20b on L40S/RTX 4090 (128K context)
 docker run --gpus all -p 8000:8000 --ipc=host \
@@ -51,7 +51,7 @@ docker run --gpus all -p 8000:8000 --ipc=host \
     -e MAX_MODEL_LEN=131072 \
     -e GPU_MEMORY_UTILIZATION=0.95 \
     -e SHOW_LOADING_PROGRESS=true \
-    ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-vllm:latest
+    ghcr.io/your-org/superhuman-remote-worker-gpt-oss-vllm:latest
 ```
 
 ### Build locally
@@ -258,7 +258,7 @@ docker run --gpus all -p 8000:8000 --ipc=host \
 ### Option 1: Use pre-built image from GitHub Container Registry (recommended)
 
 1. Create new Pod with **H100 80GB** or **A100 80GB** for 120b, **L40S** for 20b
-2. Container Image: `ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-vllm:latest`
+2. Container Image: `ghcr.io/your-org/superhuman-remote-worker-gpt-oss-vllm:latest`
 3. Volume: **100GB** (model weights ~63GB for 120b, ~16GB for 20b)
 4. Expose ports:
    - **8000** as **TCP** (not HTTP - avoids Cloudflare 30s timeout)
@@ -422,7 +422,7 @@ export AMD_VULKAN_ICD=RADV
 
 Note: Use `--no-mmap` on Strix Halo to avoid ROCm slowdowns. Vulkan (RADV) achieves ~48 tok/s vs ~30 tok/s with HIP.
 
-## Integration with Graph-RAG Agent
+## Integration with SRW Agent
 
 Start the vLLM server (locally or on a cloud GPU):
 
@@ -434,7 +434,7 @@ docker run --gpus all -p 8000:8000 --ipc=host \
     -e MAX_MODEL_LEN=131072 \
     -e GPU_MEMORY_UTILIZATION=0.95 \
     -e SHOW_LOADING_PROGRESS=true \
-    ghcr.io/your-org/uni-projekt-graph-rag-gpt-oss-vllm:latest
+    ghcr.io/your-org/superhuman-remote-worker-gpt-oss-vllm:latest
 ```
 
 Update your `.env`:

@@ -1,6 +1,6 @@
 # Orchestrator
 
-Backend API for the Graph-RAG system. Provides:
+Backend API for the Superhuman Remote Worker system. Provides:
 - Monitoring data to the Cockpit (Angular frontend)
 - Agent registration and orchestration (planned)
 - MCP server for Claude Code integration
@@ -60,10 +60,10 @@ See `docs/angular_migration_plan.md` for the full orchestration architecture.
 
 ```bash
 # PostgreSQL (required)
-DATABASE_URL=postgresql://user:pass@localhost:5432/graphrag
+DATABASE_URL=postgresql://user:pass@localhost:5432/srw
 
 # MongoDB (optional - for audit trail)
-MONGODB_URL=mongodb://localhost:27017/graphrag_logs
+MONGODB_URL=mongodb://localhost:27017/srw_logs
 
 # Neo4j (optional - for graph visualization)
 NEO4J_URI=bolt://localhost:7687

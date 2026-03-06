@@ -33,14 +33,14 @@ services:
     image: docker.io/pgvector/pgvector:pg15
     container_name: srw-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-graphrag}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-graphrag_password}
-      POSTGRES_DB: ${POSTGRES_DB:-graphrag}
+      POSTGRES_USER: ${POSTGRES_USER:-srw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-srw_password}
+      POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-graphrag}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -50,7 +50,7 @@ services:
     image: docker.io/library/mongo:7
     container_name: srw-mongodb
     environment:
-      MONGO_INITDB_DATABASE: graphrag_logs
+      MONGO_INITDB_DATABASE: srw_logs
     volumes:
       - mongodb_data:/data/db
     healthcheck:
@@ -182,12 +182,12 @@ services:
     container_name: srw-orchestrator
     environment:
       PORT: 8085
-      DATABASE_URL: postgresql://${POSTGRES_USER:-graphrag}:${POSTGRES_PASSWORD:-graphrag_password}@postgres:5432/${POSTGRES_DB:-graphrag}
-      MONGODB_URL: mongodb://mongodb:27017/graphrag_logs
+      DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
+      MONGODB_URL: mongodb://mongodb:27017/srw_logs
       WORKSPACE_PATH: /workspace
       GITEA_URL: http://gitea:3000
-      GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-graphrag}
-      GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-graphrag_gitea}
+      GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
+      GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
     volumes:
       - workspace_data:/workspace:z
     ports:
@@ -211,8 +211,8 @@ services:
     environment:
       AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
       AGENT_PORT: 8001
-      DATABASE_URL: postgresql://${POSTGRES_USER:-graphrag}:${POSTGRES_PASSWORD:-graphrag_password}@postgres:5432/${POSTGRES_DB:-graphrag}
-      MONGODB_URL: mongodb://mongodb:27017/graphrag_logs
+      DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
+      MONGODB_URL: mongodb://mongodb:27017/srw_logs
       ORCHESTRATOR_URL: http://orchestrator:8085
       WORKSPACE_PATH: /workspace
       # LLM provider keys — set in .env

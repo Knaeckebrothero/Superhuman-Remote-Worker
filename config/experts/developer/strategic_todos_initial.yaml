@@ -1,0 +1,169 @@
+# Strategic todos for developer job initialization (first strategic phase)
+# These todos guide the developer agent through repo exploration,
+# codebase understanding, plan creation, and first phase todo generation.
+#
+# Developer-specific: Focuses on repo/ exploration, conventions discovery,
+# test framework identification, and delegation-ready planning.
+todos:
+  - id: 1
+    content: >-
+      EXPLORE: Understand the task and the repository before doing anything else.
+
+      Steps:
+      (1) Use read_file to read task_brief.md — this is the task description and opening message.
+      (2) Use read_file to read instructions.md in full. Do NOT skim — read every line.
+          Pay attention to: required deliverables, coding conventions, test expectations,
+          and any constraints on how to implement.
+      (3) Use list_files on the tools/ directory to understand your available capabilities.
+      (4) Use list_files on documents/ to inventory all input materials.
+      (5) Use list_files on reference/ to check for domain-specific reference material.
+
+      Then PIN critical rules to workspace.md under a "## Pinned Instructions" section.
+      Extract and write down:
+      - Required deliverables (exact output paths and formats from instructions.md)
+      - Coding conventions and constraints (style, patterns, frameworks)
+      - Test requirements (what tests to run, what coverage is expected)
+      - Hard rules (things explicitly forbidden or required)
+      - Delivery expectations (PRs, branches, commit conventions)
+
+      These pinned instructions survive context compaction; the original instructions.md
+      and task_brief.md content will NOT. If you don't pin it now, you may forget it later.
+
+      COMPLETION CRITERIA: workspace.md exists and contains a "## Pinned Instructions"
+      section with the categories above populated from instructions.md and task_brief.md.
+
+      INSTEAD OF: Starting to write code or call claude_code — this phase is read-only.
+      Instead of skimming instructions.md — read every line, since every task failure
+      starts with skipping this step.
+
+  - id: 2
+    content: >-
+      EXPLORE REPOSITORY: Map the codebase structure, conventions, and test framework.
+
+      Steps:
+      (1) Use list_files on repo/ to see the top-level structure.
+      (2) Read repo/README.md (or equivalent) for project overview.
+      (3) Read repo/package.json, repo/requirements.txt, repo/pyproject.toml, or
+          equivalent dependency file to understand the tech stack.
+      (4) Use list_files on the main source directory (repo/src/, repo/app/, repo/lib/,
+          or whatever the convention is) to map the module structure.
+      (5) Read 2-3 key source files to understand coding conventions:
+          - An entry point (main.py, index.ts, app.py)
+          - A representative module that's similar to what you'll be building
+          - A test file to understand the test framework and patterns
+      (6) Check for CI config (repo/.github/workflows/, repo/.gitlab-ci.yml, etc.)
+          to understand the build/test/lint pipeline.
+
+      Update workspace.md with a "## Repository" section containing:
+      - Framework and language version
+      - Project structure (key directories and their purposes)
+      - Naming conventions observed (file naming, function naming, class naming)
+      - Test framework and test command (e.g., "pytest tests/ -v", "npm test")
+      - Linter/formatter config (e.g., ruff, eslint, prettier)
+      - Entry points and key modules relevant to the task
+      - Branch and commit conventions (if discoverable from git_log)
+
+      COMPLETION CRITERIA: workspace.md has a "## Repository" section with the items above.
+      You can describe the project structure and conventions from memory.
+
+      INSTEAD OF: Trying to read the entire codebase — focus on structure, conventions,
+      and the specific area you'll be working in. Instead of guessing conventions —
+      read actual code to discover them.
+
+  - id: 3
+    content: >-
+      PLAN: Create plan.md with a phased delegation strategy.
+
+      Start with a "## Deliverables" section listing every required output:
+      - Exact output description (feature, bug fix, PR, etc.)
+      - Files that will be created or modified
+      - Quality criteria (what "done" looks like — tests pass, linter clean, etc.)
+
+      Then structure the rest of the plan as a phase table where each phase has:
+      - Phase name and description
+      - Phase type: exploration, implementation, testing, refactoring, pr, or bug-fix
+      - Expected outcome: which deliverable(s) this phase advances
+      - Estimated delegation count: how many claude_code calls this phase needs
+
+      PHASE SIZING: Target 5-10 delegation-ready todos per tactical phase. Prefer
+      many short phases over few long ones. Each phase should be one coherent unit
+      of work (e.g., "implement the auth module," "add user API tests," "fix login bug").
+
+      PHASE ORDERING:
+      1. Exploration first (if codebase is unfamiliar — already done in todo 2)
+      2. Implementation phases (build the feature, module by module)
+      3. Testing phases (add/verify tests for each module)
+      4. Integration/PR phase (clean up, commit, push)
+
+      Focus on the first 2-3 phases in detail. Later phases can be sketches — they
+      WILL be adapted as you learn from Claude Code's actual output. Every phase must
+      map to a concrete deliverable from instructions.md.
+
+      PLAN VERIFICATION: After creating the plan, cross-check it against instructions.md.
+      For each requirement, confirm at least one phase addresses it.
+
+      COMPLETION CRITERIA: plan.md exists with at least 2 phases defined, each with
+      expected deliverables that trace back to instructions.md.
+
+      INSTEAD OF: Planning "cleanup", "archiving", or "final packaging" phases —
+      git versioning handles history and Gitea handles delivery. Instead of creating
+      phases that produce nothing listed in instructions.md. Instead of over-planning —
+      you will adapt the plan after every tactical phase based on what Claude Code
+      actually produces.
+
+  - id: 4
+    content: >-
+      INITIALIZE workspace.md: Complete the long-term memory structure.
+
+      workspace.md is injected into EVERY LLM call as your persistent memory.
+      It must be compact and high-value. By now it should already have:
+      - "## Pinned Instructions" (from todo 1)
+      - "## Repository" (from todo 2)
+
+      Add these remaining sections:
+      - "## Deliverables" — table tracking each expected output from plan.md
+        with columns: Deliverable | Status | Verified By
+      - "## Session IDs" — initially empty, will track active claude_code sessions
+        for potential follow-ups (format: "todo_N: session_abc123")
+      - "## Key Decisions" — record significant architectural choices with reasoning
+      - "## Status" — current phase and active blockers
+      - "## Failed Approaches" — initially empty, populated when delegations fail
+
+      COMPLETION CRITERIA: workspace.md has all sections above and is under 60 lines.
+      The Deliverables table matches the deliverables defined in plan.md.
+
+      INSTEAD OF: Dumping full file listings or codebase analysis — use compact
+      references. Instead of exceeding 60 lines — every line costs tokens on
+      every LLM call. Instead of including phase status — that belongs in plan.md.
+
+  - id: 5
+    content: >-
+      CREATE first phase todos using the next_phase_todos tool.
+
+      IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
+      The tool will reject your call if you haven't read the guide. The guide contains
+      critical rules on delegation-ready todo specificity, phase design patterns for
+      code work, and verification discipline.
+
+      After reading the guide, create 5-10 todos for the first tactical phase.
+      Each todo must be:
+      - A concrete delegation completable in one claude_code call
+      - Specific: names exact files, the change to make, the pattern to follow,
+        and the verification command
+      - Directly advancing a deliverable from instructions.md
+      - Clear on what "done" looks like (test passes, file exists, etc.)
+
+      For the FIRST tactical phase, choose based on your plan:
+      - If the task is a new feature: start with the core module implementation
+      - If the task is a bug fix: start with reproducing the bug and diagnosing the root cause
+      - If the task is a refactoring: start with running the full test suite as a baseline
+
+      Include at least one verification todo at the end (e.g., "Run full test suite
+      and verify no regressions: pytest tests/ -v").
+
+      COMPLETION CRITERIA: next_phase_todos called successfully with 5-10 todos.
+
+      INSTEAD OF: Skipping reading todo_guide.md — the tool enforces this. Instead
+      of vague todos like "implement the feature" — name exact files, patterns, and
+      test commands. Instead of meta-todos about workspace management or status
+      updates — every todo must advance the actual implementation.

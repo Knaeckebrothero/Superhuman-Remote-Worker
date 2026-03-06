@@ -95,7 +95,7 @@ class MongoDB:
             self._client.admin.command('ping')
 
             # Extract database name from URL
-            db_name = self._url.split('/')[-1].split('?')[0] or 'graphrag_logs'
+            db_name = self._url.split('/')[-1].split('?')[0] or 'srw_logs'
             self._db = self._client[db_name]
 
             self._connected = True
