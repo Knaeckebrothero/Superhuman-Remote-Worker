@@ -46,6 +46,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy MCP server source code with correct ownership
 COPY --chown=graphrag:graphrag orchestrator/mcp/ ./
+# formatters module imported by server.py
+COPY --chown=graphrag:graphrag orchestrator/services/formatters.py ./services/formatters.py
+COPY --chown=graphrag:graphrag orchestrator/services/__init__.py ./services/__init__.py
 
 USER graphrag
 

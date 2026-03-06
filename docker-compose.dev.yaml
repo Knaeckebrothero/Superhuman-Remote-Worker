@@ -137,7 +137,10 @@ services:
       retries: 5
 
   mcp:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-mcp:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mcp
+    image: srw-mcp:dev
     container_name: srw-mcp
     network_mode: host
     environment:
@@ -151,7 +154,10 @@ services:
       retries: 5
 
   vpn-cluster:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
+    build:
+      context: docker/vpn
+      dockerfile: Dockerfile
+    image: srw-vpn:dev
     container_name: srw-vpn-cluster
     cap_add:
       - NET_ADMIN
@@ -181,7 +187,10 @@ services:
     restart: unless-stopped
 
   vpn-research:
-    image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:${IMAGE_TAG:-latest}
+    build:
+      context: docker/vpn
+      dockerfile: Dockerfile
+    image: srw-vpn:dev
     container_name: srw-vpn-research
     cap_add:
       - NET_ADMIN

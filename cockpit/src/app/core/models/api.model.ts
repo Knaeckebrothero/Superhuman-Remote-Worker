@@ -271,14 +271,6 @@ export interface ProjectRepositoryUpdateRequest {
 }
 
 /**
- * Request body for merging a completed job's branch.
- */
-export interface MergeRequest {
-  merge_strategy?: string;
-  delete_branch?: boolean;
-}
-
-/**
  * Request body for promoting a default-project job into a named project.
  */
 export interface PromoteRequest {

@@ -11,6 +11,7 @@ aliases:
   - project memory
 related:
   - "[[projects]]"
+  - "[[repo_resolution]]"
   - "[[memory_light]]"
   - "[[memories_mechanism]]"
   - "[[obsidian]]"
@@ -18,6 +19,8 @@ related:
 ---
 
 # Project Knowledge Base — What Jobs Share
+
+> **⚠️ Architecture Decision (2026-03-06):** This document originally assumed `knowledge/` lives as markdown files in a shared project repo, with databases as derived indexes. That model is superseded. Per [[repo_resolution]], projects no longer have a shared repo — jobs get per-job repos. The new decision: **Neo4j is the source of truth** for the project knowledge base. pgvector serves as a derived search index (write-through on every `kb_write`). Obsidian-compatible markdown files can be exported on demand but are not the canonical store. See the "Architecture" section for the full rationale.
 
 This document is the single authoritative reference for how projects share state between jobs. It unifies concepts previously scattered across [[projects]] (merge flow, what reaches `main`), [[obsidian]] (note schema, dual representation, sync flow), and [[memory_light]] (retrieval, injection, observer). Those documents remain valid for their respective implementation details; this one captures the overarching design.
 
@@ -27,19 +30,19 @@ The project system (Phase 1–4: completed) gives us the infrastructure — repo
 
 **What is the shared artifact that accumulates across jobs?**
 
-For code projects the answer is obvious — jobs merge code changes to a shared repo. But even then, the code repo isn't the jobs repo. And for non-code projects (research, writing, analysis), there's no code to merge. So what's the thing that makes Job N+1 smarter than Job 1?
+For code projects the answer is obvious — jobs push code changes to source repos. But the code repo doesn't capture *why* decisions were made, what didn't work, or what patterns to follow. And for non-code projects (research, writing, analysis), there's no code at all. So what's the thing that makes Job N+1 smarter than Job 1?
 
 ## The Answer: Knowledge
 
-The shared artifact is **knowledge**. Every job produces knowledge — decisions made, things learned, patterns discovered, questions raised, state recorded. Today this knowledge lives in `workspace.md` (a monolithic blob rewritten each strategic phase) and dies when the job ends. What survives the merge to `main` is just the final `workspace.md` and whatever's in `output/`.
+The shared artifact is **knowledge**. Every job produces knowledge — decisions made, things learned, patterns discovered, questions raised, state recorded. Today this knowledge lives in `workspace.md` (a monolithic blob rewritten each strategic phase) and dies when the job ends.
 
-The project knowledge base changes this. Jobs push structured, interlinked **knowledge notes** to the project's jobs repo. These notes are:
+The project knowledge base changes this. Jobs push structured, interlinked **knowledge notes** to a Neo4j knowledge graph shared across the project. These notes are:
 
-1. **Obsidian-compatible markdown files** — human-readable, git-versioned, browsable in Obsidian or the cockpit
-2. **Vector-encoded** — embedded for semantic search via pgvector
-3. **Graph-synced** — mirrored to Neo4j for relationship traversal and rich queries
+1. **Graph-native** — stored in Neo4j with first-class relationships (REFERENCES, CONTRADICTS, SUPERSEDES, etc.)
+2. **Vector-indexed** — embedded in pgvector for semantic hybrid search (RRF over dense + sparse + recency)
+3. **Exportable** — dumpable as Obsidian-compatible markdown files for human browsing
 
-This gives us three retrieval channels (files, vectors, graph) that feed into the existing memory injection system. When a new job starts, it inherits the full knowledge base from `main` and can query it through all three channels. The project gets smarter with every job.
+This gives us two retrieval channels (graph traversal via Neo4j, ranked search via pgvector) that feed into the existing memory injection system. When a new job starts, the full knowledge base is immediately available. The project gets smarter with every job.
 
 ## How It Works — The Curator Subjob
 
@@ -54,10 +57,10 @@ Phase 1 (tactical) → archive phase
   ↓
 Curator subjob spawned (ONE persistent subjob)
   → reads the job's branch: workspace.md, plan.md, archive/
-  → reads the project's existing knowledge base on main
+  → queries existing knowledge base (kb_search, kb_list)
   → extracts knowledge notes from phase 1
   → generates retrieval messages for each note (see below)
-  → commits curated changes to branch
+  → kb_write → Neo4j + pgvector (write-through, immediately available)
   ↓
 Phase 2 (tactical) → archive phase
   ↓
@@ -65,7 +68,7 @@ Curator receives update (same subjob, new phase data)
   → reads new archive/phase_2_retrospective.md
   → reads updated workspace.md, plan.md
   → extracts incremental knowledge
-  → updates/creates notes in knowledge/
+  → kb_write / kb_update → Neo4j + pgvector
   ↓
 ... (repeats on every archive phase) ...
   ↓
@@ -77,15 +80,9 @@ Critic subjob (existing)
   ↓
 Curator receives final signal
   → final pass: reads memories, output/, freeze_data
-  → organizes deliverables in output/
-  → cleans up the branch for merge
-  → commits final curated changes → branch is now PR-ready
+  → kb_write for remaining knowledge (memories promotion, final state)
   ↓
-PR created → human reviews → merge to main
-  ↓
-Post-merge sync: knowledge/*.md → Neo4j + vector embeddings
-  ↓
-Next job starts → clones main → full knowledge base available
+Next job starts → full knowledge base already available in Neo4j
 ```
 
 ### Retrieval Messages
@@ -131,30 +128,29 @@ The curator runs as a normal job on the same branch, so it has the full executio
 | `archive/` | Phase retrospectives, archived todos with completion notes | Source for `retrospective` notes, phase-level learnings |
 | `output/` | Deliverables produced by the job | Curator organizes, validates, decides what merges |
 | `memories` table | Observer + free source memories (PostgreSQL) | Pre-extracted insights — curator queries via orchestrator API (`GET /api/jobs/{id}/memories`) |
-| `knowledge/` (from main) | Existing project knowledge base | Context: what's already known, what to update vs. create new |
+| Neo4j knowledge graph | Existing project knowledge base (via `kb_search`, `kb_list`, `kb_related`) | Context: what's already known, what to update vs. create new |
 | Job metadata | Description, config, freeze_data, confidence | Context for framing the job's contributions |
 
 ### What the Curator Produces
 
-The curator writes to the branch and commits. The result is a clean, reviewable diff:
+The curator writes knowledge to Neo4j (via `kb_write` / `kb_update`):
 
-1. **Knowledge notes** in `knowledge/` — structured markdown with frontmatter, wikilinks to existing notes, proper type/tag classification, and retrieval messages
-2. **Updated existing notes** — if the job contradicts or supersedes existing knowledge, the curator updates those notes (status → `superseded`, adds `[[new-note]]` link)
-3. **Organized deliverables** in `output/` — curator can rename, restructure, add README files (final pass only)
-4. **Cleaned branch** — removes job artifacts that shouldn't be reviewed (tool docs, intermediate files) (final pass only)
+1. **Knowledge notes** — Neo4j Note nodes with typed relationships to existing notes, proper type/tag classification, and retrieval messages
+2. **Updated existing notes** — if the job contradicts or supersedes existing knowledge, the curator updates those notes (status → `superseded`, adds `SUPERSEDES` / `CONTRADICTS` relationships)
+3. **Organized deliverables** in `output/` — curator can rename, restructure, add README files on the job branch (final pass only)
 
-Note: items 1–2 happen incrementally during the job (per archive phase). Items 3–4 happen during the final pass after critic approval.
+Note: items 1–2 happen incrementally during the job (per archive phase). Item 3 happens during the final pass after critic approval.
 
 ### The Curator as Editorial Filter
 
-Not everything a job produces should reach `main`. The curator makes editorial decisions:
+Not everything a job produces should become project knowledge. The curator makes editorial decisions:
 
 - A research job that went nowhere → curator writes a "we tried X and it didn't work" learning note, doesn't carry forward failed deliverables
 - A coding job that built a feature → curator writes `code` and `decision` notes explaining the architecture, links to relevant existing notes
 - A job that discovered a contradiction with existing knowledge → curator writes a `learning` note with `CONTRADICTS` relationship, updates the contradicted note's status
 - A job with low confidence → curator writes `question` notes instead of `decision` notes
 
-### Chaining: Archive → Curator → Critic → Final Pass → Merge
+### Chaining: Archive → Curator → Critic → Final Pass
 
 The natural flow for project jobs:
 
@@ -166,21 +162,19 @@ Phase 1 → archive phase
 curator.enabled: true → Curator subjob spawned (runs in parallel)
     ↓                          ↓
 Phase 2... N (job continues)   Curator processes phases incrementally
-    ↓                          ↓
+    ↓                          ↓ (kb_write → Neo4j + pgvector, write-through)
 Job completes                  Curator has processed most phases
     ↓
 verification.enabled: true → Critic subjob
     ↓ (approved)
-Curator receives final signal → final pass (memories, output, cleanup)
-    ↓ (branch prepared)
-Auto-create PR (or manual trigger)
+Curator receives final signal → final pass (memories, output)
     ↓
-Human reviews PR in Gitea/Cockpit
-    ↓
-Merge → post-merge sync to Neo4j + pgvector
+Knowledge is already in Neo4j — immediately available to next job
 ```
 
 If the critic returns the job with feedback, the job resumes — the curator continues processing new archive phases as they come. The curator's final pass only triggers after critic approval.
+
+Note: since knowledge writes go directly to Neo4j (not to files on a branch), there is no merge step for knowledge. The knowledge is available to other jobs immediately after `kb_write`. The job's branch/PR flow only applies to deliverables in `output/`.
 
 Config extension in `defaults.yaml`:
 
@@ -188,21 +182,21 @@ Config extension in `defaults.yaml`:
 curator:
   enabled: false                # Opt-in per config (or per project)
   curator_config: curator       # Which expert config to use
-  auto_pr: true                 # Auto-create PR after curation
-  autonomy: full                # No human review of curated notes (PR is the quality gate)
+  autonomy: full                # No human review of curated notes
 ```
 
 ### For Code Projects
 
-The same model, with an additional repo. The project has:
-- **Jobs repo** — knowledge lives here (`knowledge/` directory on `main`)
+The project has:
+- **Neo4j knowledge graph** — knowledge lives here (decisions, patterns, learnings)
 - **Source repos** — code lives there (agents push code changes)
+- **Per-job repos** — workspace and deliverables for individual jobs
 
-Jobs push code to source repos AND knowledge to the jobs repo. Both accumulate on `main`. The knowledge base records what was built, why, what patterns were followed, what didn't work — context that code alone doesn't capture. The curator handles the jobs repo side; source repo merges are separate (existing merge flow).
+Jobs push code to source repos AND knowledge to Neo4j. The knowledge base records what was built, why, what patterns were followed, what didn't work — context that code alone doesn't capture.
 
 ### For Non-Code Projects
 
-The jobs repo IS the content. Research notes, document analysis, writing drafts, data findings — all structured as knowledge notes. The knowledge base is the project's primary deliverable.
+The knowledge base IS the primary artifact. Research notes, document analysis, findings, decisions — all structured as knowledge notes in Neo4j. Per-job repos hold working files; the knowledge graph holds the accumulated output.
 
 ## What Goes in the Knowledge Base
 
@@ -229,52 +223,65 @@ Everything. The knowledge base is the canonical record of a project's life:
 | `archive/phase_N_retrospective.md` — linear phase history | Still created by agents; curator extracts retrospective notes linked to decisions |
 | Memory Light `memories` table — parallel memory system | Kept as staging area during execution; curator promotes valuable entries to knowledge notes |
 | Context lost on compaction | Query knowledge_index (pgvector + tsvector) to retrieve relevant project context |
-| Per-job isolation (unless merged) | Project-wide knowledge base that accumulates across jobs via curator + merge |
+| Per-job isolation (unless merged) | Project-wide knowledge base in Neo4j that accumulates across jobs via `kb_write` |
 
 ## Architecture
 
-### Core Principle: Repository is Source of Truth, Databases are Indexes
+### Core Principle: Neo4j is Source of Truth, pgvector is a Search Index
 
-This is the foundational architectural decision. The project repository contains the canonical data. Databases are derived indexes rebuilt from the repo on demand.
+This is the foundational architectural decision. **Neo4j owns the canonical knowledge data.** PostgreSQL (pgvector + tsvector) is a derived search index updated via write-through on every `kb_write`. Obsidian-compatible markdown files are a one-way export for human browsing.
 
 ```
-knowledge/*.md  (git repo — source of truth)
-       │
-       │  sync on job init + post-merge
-       │
-       ├──────────► pgvector    (semantic search index)
-       ├──────────► Neo4j       (relationship/graph index)
-       └──────────► tsvector    (keyword search index)
+Neo4j  (source of truth — notes, relationships, tags, keywords)
+  │
+  │  write-through (on every kb_write, both stores updated)
+  │
+  ├──────────► pgvector    (semantic search index)
+  └──────────► tsvector    (keyword search index)
+
+  │  on-demand export
+  │
+  └──────────► Obsidian .md files  (human browsing, not canonical)
 ```
 
-**If you delete the databases, you rebuild them from the repo.** If you delete the repo, the data is gone. This is the same relationship as code and a build artifact — the source is canonical, the artifact is derived.
+**If you delete pgvector, you rebuild it from Neo4j.** If you delete Neo4j, the data is gone. pgvector is a search acceleration layer, not a source of truth.
 
-**Why this matters:**
+**Why Neo4j, not files:**
 
-- **Git gives you history for free.** Who added this note, when, which job — all in the commit log. No audit table needed.
-- **Humans can edit directly.** Clone the repo, open in Obsidian, add a note, push. Next sync picks it up.
-- **Portable.** Move the project to a different server — clone the repo, re-index, done. No database migration.
-- **Debuggable.** `git log knowledge/` tells you exactly what happened and when.
-- **The scattered sources problem disappears.** Today, project state lives in PostgreSQL tables, MongoDB logs, git repos, and workspace files. With this decision, there's one authoritative source: the repo. Everything else is a query layer.
-- **Recoverable.** Corrupt index? Re-sync from repo. Wrong embeddings? Re-embed from repo. The repo is always there.
+- **No project repo exists.** Per [[repo_resolution]], projects no longer have a shared repository. Jobs get per-job repos. There is no natural home for `knowledge/*.md` files. Creating a repo just for knowledge files is creating a database with extra steps.
+- **A knowledge base is a graph.** Notes reference notes, decisions contradict decisions, learnings derive from sources. Neo4j models this natively — relationships are first-class entities, not JSONB arrays or parsed wikilinks.
+- **No sync subsystem needed.** The original design required git-diff-based incremental sync (track commits, parse frontmatter, re-index changed files). With Neo4j as source of truth and write-through to pgvector, both stores are updated atomically on every write. No batch sync, no drift, no recovery logic.
+- **Graph queries are immediate.** "What depends on this decision?" is a single Cypher traversal, not a Phase 3 enhancement. Graph capabilities are available from day one.
+- **Already in the stack.** Neo4j runs in docker-compose, has a driver (`Neo4jDB` in `src/database/neo4j_db.py`), and the agent already has graph tools. Promoting it from external datasource to system database is a small step.
 
-This principle applies beyond just knowledge notes. Over time, everything project-scoped — memories, requirements, credentials, configuration — lives as files in the repo and gets indexed into databases for search. The databases serve the agents; the repo serves the project.
+**Why keep pgvector:**
 
-### Two Representations, One Knowledge Base
+- **Hybrid search is proven.** The Memory Light RRF pattern (dense + sparse + recency) works well. Replicating this in Neo4j is possible but adds complexity.
+- **Embedding infrastructure exists.** `EmbeddingService`, `knowledge_hybrid_search()` SQL function, HNSW indexes — all reusable from Memory Light.
+- **Separation of concerns.** Neo4j is the source of truth for structure and relationships. pgvector is optimized for ranked retrieval. Each does what it's best at.
+
+**Human access via Obsidian export:**
+
+- A `kb_export(project_id)` function walks the Neo4j graph, writes `.md` files with frontmatter and `[[wikilinks]]` derived from graph relationships.
+- One-way, on-demand. Not bidirectional sync.
+- Users can browse in Obsidian or any markdown viewer. Edits go through agent tools, the cockpit UI, or a future API.
+- The export can also serve as a backup/portability mechanism — dump to files, import on another instance.
+
+### Two Stores, One Knowledge Base
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     Project Knowledge Base                          │
 │                                                                     │
 │   ┌──────────────────────┐          ┌──────────────────────┐       │
-│   │  Markdown Files      │  sync    │  Derived Indexes     │       │
-│   │  (jobs repo)         │ ──────►  │  (project-level)     │       │
-│   │                      │          │                      │       │
-│   │  • SOURCE OF TRUTH   │          │  • pgvector (search)  │       │
-│   │  • Git-versioned     │          │  • Neo4j (graph)      │       │
-│   │  • Human-editable    │          │  • tsvector (keywords) │       │
-│   │  • Obsidian-viewable │          │  • Rebuilt from repo   │       │
-│   │  • Diff-friendly     │          │  • Never edited directly│      │
+│   │  Neo4j               │  write-  │  pgvector + tsvector  │       │
+│   │  (source of truth)   │ through  │  (search index)       │       │
+│   │                      │ ──────►  │                       │       │
+│   │  • Canonical store   │          │  • Semantic search     │       │
+│   │  • Graph structure   │          │  • Keyword search      │       │
+│   │  • Relationships     │          │  • RRF hybrid ranking  │       │
+│   │  • Tags, keywords    │          │  • Rebuilt from Neo4j  │       │
+│   │  • Full note content │          │  • Never edited directly│      │
 │   └──────────┬───────────┘          └──────────┬───────────┘       │
 │              │                                  │                   │
 │              │         ┌──────────┐             │                   │
@@ -282,117 +289,87 @@ This principle applies beyond just knowledge notes. Over time, everything projec
 │                        │  Tools   │                                 │
 │   ┌──────────┐        │          │        ┌──────────┐             │
 │   │ Obsidian │◄───────│ kb_write │───────►│ Cockpit  │             │
-│   │ (user)   │        │ (files)  │        │ (user)   │             │
+│   │ (export) │        │ (Neo4j)  │        │ (user)   │             │
 │   └──────────┘        │ kb_search│        └──────────┘             │
-│                        │ (indexes)│                                 │
+│                        │ (pgvec) │                                  │
 │                        └──────────┘                                 │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Write path:** `kb_write` creates/updates a markdown file in `knowledge/`. That's it. No database call. The file is committed to the branch.
+**Write path:** `kb_write` creates/updates a note node in Neo4j (source of truth) AND upserts the corresponding row in `knowledge_index` (pgvector + tsvector). Both writes happen in the same tool call — write-through, not eventual sync.
 
-**Read path:** `kb_search` and `kb_query` hit the derived indexes (pgvector, Neo4j, tsvector). These are fast, ranked, and semantic. `kb_read` and `kb_list` can also read files directly for exact lookups.
+**Search path:** `kb_search` hits `knowledge_hybrid_search()` in pgvector (RRF over dense + sparse + recency). Fast, ranked, semantic. Returns note summaries with IDs.
 
-**Sync path:** On job init and post-merge, a sync function diffs the repo against the indexes and updates only what changed. Git tells us exactly which files changed (`git diff --name-only`), so re-indexing is incremental, not full-scan.
+**Graph path:** `kb_related`, `kb_contradictions`, `kb_provenance` hit Neo4j directly for relationship traversal. "What depends on this decision?" is a Cypher query, not a text search.
+
+**Read path:** `kb_read` and `kb_list` query Neo4j directly. Full note content, metadata, and relationships.
+
+**Export path:** `kb_export` walks the Neo4j graph, writes Obsidian-compatible `.md` files with frontmatter and `[[wikilinks]]`. One-way, on-demand.
 
 ### How It Fits the Project Model
 
-The knowledge base is project-level infrastructure, like the jobs repo and the todo system:
+The knowledge base is project-level infrastructure that lives in databases, not in job repos:
 
 ```
 Project "My-App"
-├── Jobs Repo (Gitea, shared across jobs)
-│   ├── knowledge/                     ← Obsidian vault (project-scoped, merges to main)
-│   │   ├── .obsidian/                 ← Obsidian settings, templates, graph config
-│   │   ├── _index.md                  ← Map of Content (auto-generated)
-│   │   ├── goals/
-│   │   │   └── project-objective.md
-│   │   ├── plans/
-│   │   │   ├── roadmap.md
-│   │   │   └── phase-3-api-design.md
-│   │   ├── decisions/
-│   │   │   └── chose-jwt-over-oauth.md
-│   │   ├── learnings/
-│   │   │   └── postgres-jsonb-perf.md
-│   │   ├── code/
-│   │   │   └── auth-middleware-pattern.md
-│   │   ├── sources/
-│   │   │   └── requirements-spec.md
-│   │   ├── questions/
-│   │   │   └── caching-strategy.md
-│   │   └── state/
-│   │       └── auth-module-status.md
-│   ├── output/                        ← Deliverables (existing)
-│   └── experts/                       ← Project agent configs (existing)
 │
-├── PostgreSQL — knowledge_index table (Phase 1, auto-provisioned)
+├── Neo4j (source of truth, auto-provisioned, project-label namespacing)
+│   ├── (:Note {id, type, title, content, job_id, confidence, project_id, ...})
+│   ├── (:Tag {name, project_id}), (:Keyword {name, project_id})
+│   └── [:REFERENCES], [:SUPPORTS], [:CONTRADICTS], [:DERIVED_FROM], ...
+│
+├── PostgreSQL — knowledge_index table (search index, auto-provisioned)
 │   ├── pgvector embeddings (semantic search)
 │   └── tsvector documents (keyword search)
 │
-├── Neo4j (Phase 3, auto-provisioned)
-│   ├── (:Note {id, type, title, job_id, confidence, ...})
-│   ├── (:Tag {name}), (:Keyword {name})
-│   └── [:REFERENCES], [:SUPPORTS], [:CONTRADICTS], [:DERIVED_FROM]
+├── Per-Job Repos (Gitea, one per root job — see repo_resolution)
+│   ├── workspace.md, plan.md, todos.yaml  ← job-scoped working memory
+│   ├── archive/                            ← phase artifacts
+│   └── output/                             ← deliverables
 │
 └── Jobs
-    ├── Job 1 → creates notes on branch → merges → syncs to Neo4j + vectors
-    ├── Job 2 → queries Neo4j + reads notes → creates more notes → merges
+    ├── Job 1 → kb_write() → Neo4j + pgvector (write-through)
+    ├── Job 2 → kb_search() + kb_related() → reads from pgvector + Neo4j
     └── ...
 ```
 
-### Workspace Layout
-
-```
-workspace/job_<uuid>/
-├── .git/                              ← jobs repo, on branch job/<short-id>/<slug>
-├── knowledge/                         ← Obsidian vault (PROJECT-SCOPED — merges to main)
-│   ├── .obsidian/                     ← Obsidian config, templates, graph settings
-│   ├── _index.md                      ← Auto-generated Map of Content
-│   ├── goals/
-│   ├── plans/
-│   ├── decisions/
-│   ├── learnings/
-│   ├── code/
-│   ├── sources/
-│   ├── questions/
-│   └── state/
-├── todos.yaml                         ← Task list (JOB-SCOPED, gitignored on main)
-├── archive/                           ← Phase artifacts (JOB-SCOPED, gitignored on main)
-├── output/                            ← Deliverables (PROJECT-SCOPED)
-├── experts/                           ← Project agent configs (PROJECT-SCOPED)
-└── repos/                             ← Source/reference repo clones (gitignored)
-```
-
-Note: Working agents still write `workspace.md` and `plan.md` during execution — these are unchanged. The curator extracts their content into structured `knowledge/` notes post-completion. Over time, `knowledge/` becomes the project's long-term memory while `workspace.md` remains the agent's working memory during a job. `_index.md` is auto-generated and injected as context alongside (or eventually replacing) workspace.md injection.
+Note: The job workspace is unchanged — agents still write `workspace.md` and `plan.md` during execution. The knowledge base lives entirely in databases (Neo4j + pgvector), not in the job repo. The curator extracts knowledge from job artifacts and writes to Neo4j via `kb_write`. Over time, the knowledge base becomes the project's long-term memory while `workspace.md` remains the agent's working memory during a single job.
 
 ## Note Schema
 
-### Frontmatter
+### Neo4j Node Model (Canonical)
 
-```yaml
----
-id: 20260201-1423-a7f3       # timestamp + 4-char random suffix to avoid collisions
-type: goal | plan | decision | learning | code | source | question | state | retrospective
-tags: [requirement, authentication]
-keywords: [OAuth, JWT, session]
-retrieval_messages:           # curator-generated: when should this note surface?
-  - "What authentication approach should I use?"
-  - "Why did we pick JWT instead of OAuth?"
-  - "Token-based auth trade-offs and session management"
-created: 2026-02-01T14:23:00Z
-modified: 2026-02-01T15:30:00Z
-job_id: abc-123
-phase: 3
-confidence: high | medium | low
-status: active | resolved | superseded | archived
----
+The canonical representation of a knowledge note is a Neo4j node. All note properties live here. The `content` property holds the full markdown body of the note.
+
+```cypher
+(:Note {
+  id: "20260201-1423-a7f3",        // timestamp + 4-char random suffix
+  type: "decision",                 // goal|plan|decision|learning|code|source|question|state|retrospective
+  title: "Chose JWT over OAuth",
+  content: "After evaluating both approaches...",  // full markdown body
+  status: "active",                 // active|resolved|superseded|archived
+  confidence: "high",               // high|medium|low
+  job_id: "abc-123",               // which job created this note
+  project_id: "proj-456",          // project scope
+  phase: 3,
+  created: datetime("2026-02-01T14:23:00Z"),
+  modified: datetime("2026-02-01T15:30:00Z"),
+  retrieval_messages: ["What auth approach?", "Why JWT over OAuth?"]
+})
+
+// Relationships — first-class edges, not parsed from text
+(:Note {title: "Chose JWT"})-[:REFERENCES]->(:Note {title: "OAuth analysis"})
+(:Note {title: "Chose JWT"})-[:ANSWERS]->(:Note {title: "Which auth method?"})
+(:Note {title: "Auth middleware"})-[:IMPLEMENTS]->(:Note {title: "Chose JWT"})
+
+// Tags and keywords as connected nodes
+(:Note)-[:TAGGED]->(:Tag {name: "authentication", project_id: "proj-456"})
+(:Note)-[:HAS_KEYWORD]->(:Keyword {name: "JWT", project_id: "proj-456"})
 ```
-
-Wikilinks (`[[note-name]]`) go in the body text, not frontmatter. This keeps frontmatter machine-parseable and lets links appear in natural context.
 
 ### Relationship Types
 
-Derived from wikilinks and explicit frontmatter:
+Relationships are first-class Neo4j edges, created explicitly by `kb_write` and `kb_update` (not parsed from wikilinks):
 
 | Relationship | Meaning | Neo4j Edge |
 |--------------|---------|------------|
@@ -405,30 +382,30 @@ Derived from wikilinks and explicit frontmatter:
 | `SUPERSEDES` | New decision replaces an old one | `[:SUPERSEDES]` |
 | `IMPLEMENTS` | Code note implements a decision or plan | `[:IMPLEMENTS]` |
 
-### Neo4j Node Model
+### Obsidian Export Format
 
-```cypher
-(:Note {
-  id: "20260201-1423-a7f3",
-  type: "decision",
-  title: "Chose JWT over OAuth",
-  status: "active",
-  confidence: "high",
-  job_id: "abc-123",
-  project_id: "proj-456",
-  phase: 3,
-  created: datetime("2026-02-01T14:23:00Z"),
-  modified: datetime("2026-02-01T15:30:00Z"),
-  content_hash: "sha256:...",
-  embedding: [0.12, -0.34, ...]
-})
+When `kb_export` dumps the knowledge base, each note becomes a `.md` file with YAML frontmatter. Relationships are rendered as `[[wikilinks]]` in the body. This format is for human browsing only — the canonical data lives in Neo4j.
 
-(:Note {title: "Chose JWT"})-[:REFERENCES]->(:Note {title: "OAuth analysis"})
-(:Note {title: "Chose JWT"})-[:ANSWERS]->(:Note {title: "Which auth method?"})
-(:Note {title: "Auth middleware"})-[:IMPLEMENTS]->(:Note {title: "Chose JWT"})
+```yaml
+---
+id: 20260201-1423-a7f3
+type: decision
+tags: [requirement, authentication]
+keywords: [OAuth, JWT, session]
+confidence: high
+status: active
+job_id: abc-123
+phase: 3
+created: 2026-02-01T14:23:00Z
+modified: 2026-02-01T15:30:00Z
+---
 
-(:Note)-[:TAGGED]->(:Tag {name: "authentication"})
-(:Note)-[:HAS_KEYWORD]->(:Keyword {name: "JWT"})
+# Chose JWT over OAuth
+
+After evaluating both approaches...
+
+**References:** [[oauth-analysis]], [[security-requirements]]
+**Answers:** [[which-auth-method]]
 ```
 
 ## Memory Integration — Two Stages, One Knowledge Base
@@ -448,16 +425,15 @@ Working Agent                          Curator Subjob
   Tool errors → memories table           Reads updated workspace.md, plan.md
                                          Extracts knowledge notes incrementally
                                          Generates retrieval messages per note
-                                         Writes structured notes to knowledge/
+                                         kb_write → Neo4j + pgvector (write-through)
                     ↓
 After approval (Curator final pass):
   Reads memories table for this job
   Reads output/, freeze_data
-  Reads existing knowledge base on main
-  → Promotes valuable memories to knowledge notes
+  Queries existing KB via kb_search, kb_list
+  → Promotes valuable memories to knowledge notes (kb_write)
   → Final extraction from output and deliverables
   → Deduplicates against existing KB
-  → Cleans branch for merge
 ```
 
 This means Memory Light keeps working exactly as implemented — no changes to the observer, free sources, or injection hook. The `memories` table is a staging area that the curator reads during its final pass. The phase-by-phase curation means most knowledge is already extracted before the job even completes.
@@ -476,18 +452,17 @@ The curator doesn't blindly promote every memory. It has the full picture (memor
 
 ### Retrieval Flow
 
-Working agents in KB-enabled projects get knowledge injected via the same transient message pattern as Memory Light. Search always hits the derived indexes (built from the repo on job init), never scans files:
+Working agents in KB-enabled projects get knowledge injected via the same transient message pattern as Memory Light. Search hits pgvector (always current via write-through):
 
 ```
 Agent execute loop
     │
     ├─ Context compaction (existing)
     ├─ Todo injection (existing)
-    ├─ _index.md injection (replaces workspace.md injection)
+    ├─ Knowledge summary injection (note counts, recent activity)
     ├─ ★ Knowledge retrieval (replaces/augments memory injection)
-    │   ├─ Dense vector search (pgvector — indexed from repo on job init)
-    │   ├─ Sparse keyword search (tsvector — indexed from repo on job init)
-    │   ├─ + Graph traversal via Neo4j (Phase 3, indexed from repo)
+    │   ├─ Dense vector search (pgvector — always current via write-through)
+    │   ├─ Sparse keyword search (tsvector — always current via write-through)
     │   └─ RRF fusion → top-K notes → inject as transient message
     │
     ├─ Memory Light injection (still runs for job-scoped memories)
@@ -523,64 +498,62 @@ max_connection_lifetime from 1h to 30min (connections go stale).
 
 ### Scoping
 
-Notes are always project-scoped. The `job_id` in frontmatter records provenance (which job created this note) but retrieval queries filter by `project_id`:
+Notes are always project-scoped. The `job_id` property on each Neo4j Note node records provenance (which job created this note) but retrieval queries filter by `project_id`:
 
-- **Job init**: clone `main` → sync `knowledge/` to indexes (pgvector, tsvector, optionally Neo4j). Indexes now contain all knowledge from all previous jobs.
-- **During the job**: working agent queries the indexes. Curator writes new notes as files on the branch.
-- **Post-merge**: re-sync indexes from the updated `main`. Incremental — only changed files.
-- **Next job**: clones `main`, syncs, has everything.
+- **During the job**: working agent queries pgvector (search) and Neo4j (graph). Curator writes new notes via `kb_write` (write-through to both stores).
+- **Next job**: immediately sees all knowledge from previous jobs — no sync step needed, both stores are already current.
 
-This replaces Memory Light's Phase 5 ("cross-job memory via project_id on the memories table") with something richer — structured, interlinked notes instead of flat text blobs.
+This replaces Memory Light's Phase 5 ("cross-job memory via project_id on the memories table") with something richer — structured, interlinked notes in a graph instead of flat text blobs.
 
-## Sync: Repository → Indexes
+## Write-Through: Neo4j → pgvector
 
-The sync function rebuilds derived indexes from the repo. It runs at two points: **job init** (ensures indexes are current before the agent starts) and **post-merge** (updates indexes after new knowledge lands on `main`).
-
-### Incremental Sync via Git
-
-Git already knows what changed. No need for content hashing:
+There is no batch sync step. Every `kb_write` and `kb_update` call writes to both stores atomically (from the agent's perspective):
 
 ```
-1. Get last-synced commit hash from index metadata table
-2. git diff --name-only <last-synced>..<current> -- knowledge/
-3. For each changed file:
-   - Parse frontmatter + body
-   - Upsert pgvector: generate embedding, store with note metadata
-   - Upsert tsvector: update full-text search index
-   - Upsert Neo4j: MERGE node, parse wikilinks → relationships (Phase 3)
-4. For each deleted file:
-   - Remove from all indexes
-5. Store current commit hash as new sync point
+kb_write("Chose JWT over OAuth", type="decision", ...)
+  │
+  ├─► Neo4j: MERGE (n:Note {id: $id, project_id: $pid}) SET n += {...}
+  │           CREATE (n)-[:TAGGED]->(:Tag {name: "auth"})
+  │           CREATE (n)-[:REFERENCES]->(m) WHERE m.id = $ref_id
+  │
+  └─► pgvector: INSERT INTO knowledge_index (...) ON CONFLICT DO UPDATE
+  │             (embedding generated via EmbeddingService)
+  │
+  Done. Both stores are consistent.
 ```
 
-**Cold start** (no sync point, or index wiped): full scan of `knowledge/`, index everything. This is the "rebuild from repo" path — always available as a recovery mechanism.
+**No sync tracking needed.** No `knowledge_sync_state` table, no commit hashing, no git diff. The write path keeps both stores in sync by construction.
 
-**User edits** follow the same path:
+**Recovery:** If pgvector gets corrupted or out of sync, a `rebuild_search_index(project_id)` function reads all notes from Neo4j and re-inserts them into `knowledge_index`. This is the cold-start / recovery path — run once, takes seconds for typical knowledge bases.
 
+### Neo4j Schema Initialization
+
+On project creation, the system ensures Neo4j constraints and indexes exist:
+
+```cypher
+// Unique constraint per project
+CREATE CONSTRAINT note_id_unique IF NOT EXISTS
+FOR (n:Note) REQUIRE (n.project_id, n.id) IS UNIQUE;
+
+// Indexes for common lookups
+CREATE INDEX note_project IF NOT EXISTS FOR (n:Note) ON (n.project_id);
+CREATE INDEX note_type IF NOT EXISTS FOR (n:Note) ON (n.project_id, n.type);
+CREATE INDEX note_status IF NOT EXISTS FOR (n:Note) ON (n.project_id, n.status);
+CREATE INDEX tag_project IF NOT EXISTS FOR (t:Tag) ON (t.project_id);
+CREATE INDEX keyword_project IF NOT EXISTS FOR (k:Keyword) ON (k.project_id);
 ```
-User edits in Obsidian → git push to jobs repo main
-                                    ↓
-                    Next job init: incremental sync catches the changes
-```
 
-### What Gets Indexed
+Project isolation uses `project_id` properties on all nodes. All queries filter by `project_id`. No multi-tenancy concerns — simple label + property filtering.
 
-| Index | What It Stores | What It Enables |
-|-------|---------------|-----------------|
-| **pgvector** | Note embedding + metadata (id, type, title, tags, project_id) | Semantic search ("find notes about authentication patterns") |
-| **tsvector** | Note content as full-text search document | Keyword search ("find notes mentioning JWT") |
-| **Neo4j** (Phase 3) | Note nodes + wikilink relationships + tag nodes | Graph traversal ("what depends on this decision?") |
+### Schema: `knowledge_index` Table (Search Index)
 
-### Schema: `knowledge_index` Table
-
-Extends the existing system PostgreSQL (same database as jobs/memories):
+Derived search index in PostgreSQL (same database as jobs/memories). Updated via write-through, never edited directly:
 
 ```sql
 CREATE TABLE IF NOT EXISTS knowledge_index (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),  -- internal PK
-    note_id VARCHAR(50) NOT NULL,            -- frontmatter id (e.g. "20260201-1423-a7f3")
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    note_id VARCHAR(50) NOT NULL,            -- Neo4j note id (e.g. "20260201-1423-a7f3")
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    file_path TEXT NOT NULL,                  -- relative path in repo (e.g. "knowledge/decisions/chose-jwt.md")
     title TEXT NOT NULL,
     note_type VARCHAR(50) NOT NULL,           -- goal, plan, decision, learning, code, source, question, state, retrospective
     status VARCHAR(50) DEFAULT 'active',
@@ -589,17 +562,16 @@ CREATE TABLE IF NOT EXISTS knowledge_index (
     keywords TEXT[] DEFAULT '{}',
     job_id UUID,                              -- which job created this note
     phase INT,
-    content TEXT NOT NULL,                    -- full note body (for display in search results)
+    content TEXT NOT NULL,                    -- full note body (for search result display)
     retrieval_messages TEXT[] DEFAULT '{}',   -- curator-generated queries for when this note should surface
     embedding vector(1536),                  -- dense embedding for semantic search
     search_doc tsvector,                     -- full-text search document
-    created_at TIMESTAMPTZ,                  -- from frontmatter
-    modified_at TIMESTAMPTZ,                 -- from frontmatter
-    indexed_at TIMESTAMPTZ DEFAULT NOW(),    -- when this row was last synced
-    content_hash VARCHAR(64),                -- sha256 of file content (skip re-embedding unchanged files)
+    created_at TIMESTAMPTZ,
+    modified_at TIMESTAMPTZ,
+    indexed_at TIMESTAMPTZ DEFAULT NOW(),    -- when this row was last written
+    content_hash VARCHAR(64),                -- sha256 of content (skip re-embedding on metadata-only updates)
 
-    CONSTRAINT uq_knowledge_project_note UNIQUE (project_id, note_id),
-    CONSTRAINT uq_knowledge_project_file UNIQUE (project_id, file_path)
+    CONSTRAINT uq_knowledge_project_note UNIQUE (project_id, note_id)
 );
 
 CREATE INDEX idx_knowledge_project ON knowledge_index(project_id);
@@ -608,21 +580,13 @@ CREATE INDEX idx_knowledge_tags ON knowledge_index USING GIN(tags);
 CREATE INDEX idx_knowledge_search ON knowledge_index USING GIN(search_doc);
 CREATE INDEX idx_knowledge_embedding ON knowledge_index
     USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
-
--- Sync tracking: which commit was last indexed per project
-CREATE TABLE IF NOT EXISTS knowledge_sync_state (
-    project_id UUID PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
-    last_synced_commit VARCHAR(40),           -- git commit hash
-    last_synced_at TIMESTAMPTZ DEFAULT NOW(),
-    note_count INT DEFAULT 0
-);
 ```
 
-This reuses the same pgvector infrastructure as Memory Light (HNSW index, cosine distance, same embedding model). The `content_hash` column lets us skip re-embedding files that haven't changed even if git reports them as modified (e.g., whitespace changes).
+This reuses the same pgvector infrastructure as Memory Light (HNSW index, cosine distance, same embedding model). The `content_hash` column lets us skip re-embedding when only metadata changes (status, tags) without content changes.
 
 ### Search Function
 
-Same RRF hybrid search pattern as Memory Light, querying the `knowledge_index` table instead of `memories`:
+Same RRF hybrid search pattern as Memory Light, querying `knowledge_index` scoped by `project_id`:
 
 ```sql
 CREATE OR REPLACE FUNCTION knowledge_hybrid_search(
@@ -673,47 +637,52 @@ Knowledge base tools are a tool category registered in `src/tools/registry.py`. 
 kb_write(
     title="Chose JWT over OAuth",
     type="decision",
-    content="After evaluating both...\n\nLinked: [[oauth-analysis]], [[security-requirements]]",
+    content="After evaluating both...",
     tags=["authentication", "security"],
     confidence="high",
+    links=[                                # explicit relationships to other notes
+        {"target": "oauth-analysis", "type": "REFERENCES"},
+        {"target": "which-auth-method", "type": "ANSWERS"},
+    ],
     retrieval_messages=[
         "What authentication approach should I use?",
         "Why did we pick JWT instead of OAuth?",
         "Token-based auth trade-offs and session management"
     ]
 )
-# → Creates knowledge/decisions/chose-jwt-over-oauth.md with frontmatter
+# → Creates Note node in Neo4j (source of truth)
+# → Upserts row in knowledge_index (pgvector + tsvector search index)
 # → Auto-sets job_id, phase, created timestamp
-# → retrieval_messages stored in frontmatter (used for search matching)
-# → File only — no database call (indexes sync later)
+# → Write-through: both stores updated in the same call
 
 kb_update(
     note="chose-jwt-over-oauth",
     append="## Update (Phase 4)\nAfter load testing, JWT validation adds 2ms p99.",
     status="active",
-    add_tags=["performance"]
+    add_tags=["performance"],
+    add_links=[{"target": "load-test-results", "type": "REFERENCES"}]
 )
+# → Updates Neo4j node + pgvector row (write-through)
 
 # === Reading (all agents in KB-enabled projects) ===
 
 kb_search(query="authentication")       # Hybrid search via knowledge_index (pgvector + tsvector + RRF)
-kb_read(note="chose-jwt-over-oauth")    # Returns full file content with frontmatter
-kb_list(type="decision")                # All decisions (queries knowledge_index)
+kb_read(note="chose-jwt-over-oauth")    # Returns full note from Neo4j (content + metadata + relationships)
+kb_list(type="decision")                # All decisions (queries Neo4j)
 kb_list(tag="authentication")           # All notes tagged authentication
 kb_list(status="question")              # All open questions
 kb_list(job_id="abc-123")              # Everything from a specific job
 
-# === Graph Querying (Phase 3, Neo4j-powered) ===
+# === Graph Querying (Neo4j-powered, available from Phase 1) ===
 
-kb_query(
-    query="MATCH (n:Note {title: 'Chose JWT'})-[*1..2]-(related) RETURN related"
-)
-
-# Convenience wrappers:
 kb_related(note="chose-jwt-over-oauth") # All notes within 2 hops
 kb_contradictions()                      # Notes connected by CONTRADICTS edges
 kb_provenance(note="auth-middleware")    # Trace back through DERIVED_FROM chains
 kb_unanswered()                          # Questions with no ANSWERS relationship
+
+# === Export (on-demand, one-way) ===
+
+kb_export(path="/tmp/obsidian-vault")    # Dumps all notes as Obsidian-compatible .md files
 ```
 
 ### When Knowledge Notes Get Written
@@ -757,13 +726,11 @@ The agent can also actively query via `kb_search`, `kb_query`, etc. — the inje
 
 The knowledge base is auto-provisioned when a project is created:
 
-1. **`knowledge/` directory** — Created in the jobs repo on project init. Includes `.obsidian/` config with templates, graph settings, and subdirectory structure. Project-scoped (merges to `main`).
-2. **`knowledge_index` + `knowledge_sync_state` tables** — Created by schema migration (shared across all projects, scoped by `project_id`). Uses existing system PostgreSQL with pgvector extension (already enabled for Memory Light).
-3. **Sync on job init** — When a project job starts, the init step syncs `knowledge/` from the cloned repo into the `knowledge_index` table. Incremental via git diff.
-4. **Sync post-merge** — After a PR merges to `main`, re-sync to pick up the curated notes.
-5. **Neo4j namespace** (Phase 3) — A project-level namespace within the shared Neo4j instance. Deferred until graph queries are needed.
+1. **Neo4j constraints and indexes** — Created on project init (see "Neo4j Schema Initialization" above). Uses the shared system Neo4j instance with `project_id` property for isolation.
+2. **`knowledge_index` table** — Created by schema migration (shared across all projects, scoped by `project_id`). Uses existing system PostgreSQL with pgvector extension (already enabled for Memory Light).
+3. **System Neo4j connection** — Environment variables `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` configure the system Neo4j instance (separate from `DEFAULT_DS_NEO4J_*` which are for agent-facing external datasources).
 
-For default (personal) projects, the knowledge base directory is still created but indexing is lazy — only runs if `knowledge/` contains files.
+For default (personal) projects, the knowledge base is created lazily — Neo4j constraints exist but no notes are written until an agent uses `kb_write`.
 
 ## Migration Path
 
@@ -777,18 +744,16 @@ An optional migration tool splits an existing `workspace.md` into atomic notes:
 
 1. Parse sections (headings become note titles)
 2. Classify by content (decisions, learnings, state, etc.)
-3. Generate frontmatter
-4. Extract and convert cross-references to wikilinks
-5. Write to `knowledge/` and sync
+3. Call `kb_write` for each extracted note (writes to Neo4j + pgvector)
+4. Relationships inferred from cross-references between sections
 
 ### Memory Light → Knowledge Base Migration
 
 For projects already using Memory Light (the `memories` PostgreSQL table):
 
-1. Export memories as markdown notes (content → body, keywords → tags, memory_type → note type)
-2. Write to `knowledge/` directory, commit to repo
-3. Run sync to rebuild `knowledge_index` (pgvector + tsvector)
-4. The `memories` table remains for job-scoped use during execution; project-scoped retrieval switches to the knowledge base
+1. Read memories for a project's jobs from the `memories` table
+2. Call `kb_write` for each valuable memory (content → body, keywords → tags, memory_type → note type)
+3. The `memories` table remains for job-scoped use during execution; project-scoped retrieval switches to the knowledge base
 
 New projects skip this — they use the knowledge base from day one.
 
@@ -797,13 +762,13 @@ New projects skip this — they use the knowledge base from day one.
 ### Resolved
 
 1. ~~**What do projects share between jobs?**~~
-   **Resolved** — The knowledge base. Structured markdown notes that accumulate on `main`, mirrored to Neo4j and pgvector for querying. This is the answer to the core project question.
+   **Resolved** — The knowledge base. Notes stored in Neo4j (source of truth), indexed in pgvector for search. No shared repo needed — the database is the shared artifact.
 
 2. ~~**Is Memory Light a separate system?**~~
    **Resolved** — It's a stage, not a separate system. Memory Light captures raw insights during execution (PostgreSQL `memories` table). The curator subjob promotes them to structured knowledge notes post-completion. Memory Light is the capture stage; the curator is the promotion stage. See "Memory Integration" section.
 
 3. ~~**Vault scope — one per job or per project?**~~
-   **Resolved** — One per project. The `knowledge/` directory lives in the project's jobs repo and merges to `main` across jobs.
+   **Resolved** — One per project. Knowledge lives in Neo4j scoped by `project_id`. No files or repos involved.
 
 4. ~~**Graph database choice?**~~
    **Resolved** — Neo4j, as core project infrastructure. Already in the stack, already has tooling. Shared instance with project-label namespacing.
@@ -811,14 +776,14 @@ New projects skip this — they use the knowledge base from day one.
 5. ~~**How do agents write good knowledge notes?**~~
    **Resolved** — They don't have to. The curator subjob is a specialist that reads the job's full output (workspace.md, archive, memories, output) and produces structured notes. Only the curator needs knowledge tools and schema understanding. Working agents are unchanged. See "The Curator Subjob" section.
 
-6. ~~**Who decides what merges to main?**~~
-   **Resolved** — The curator. It makes editorial decisions: what to promote, what to discard, what to update. Failed experiments become "we tried X" learning notes. Successful work becomes decisions, code, and state notes. The curator prepares a clean PR that humans can review.
+6. ~~**Who decides what becomes project knowledge?**~~
+   **Resolved** — The curator. It makes editorial decisions: what to promote, what to discard, what to update. Failed experiments become "we tried X" learning notes. Successful work becomes decisions, code, and state notes. The curator writes to Neo4j via `kb_write`.
 
 7. ~~**Sync-on-write vs sync-on-merge**~~
-   **Resolved** — Sync on job init + post-merge. The repo is the source of truth; databases are rebuilt from it. Sync uses `git diff` for incremental updates. No sync-on-write needed — the curator writes files, they merge to main, next job's init syncs. See "Sync: Repository → Indexes" section.
+   **Resolved** — Write-through. Every `kb_write` and `kb_update` writes to both Neo4j (source of truth) and pgvector (search index) in the same call. No batch sync, no git tracking, no drift. See "Write-Through: Neo4j → pgvector" section.
 
 8. ~~**How does search work without Neo4j/vectors in Phase 1?**~~
-   **Resolved** — pgvector + tsvector are Phase 1, not Phase 4. The `knowledge_index` table is synced from the repo on job init. `kb_search` hits `knowledge_hybrid_search()` (RRF over dense + sparse + recency). Neo4j graph queries are Phase 3 — an additional retrieval channel, not a prerequisite.
+   **Resolved** — Both Neo4j and pgvector are Phase 1. Neo4j is the source of truth; pgvector provides hybrid search via `knowledge_hybrid_search()` (RRF over dense + sparse + recency). Graph queries (`kb_related`, etc.) hit Neo4j directly. All available from day one.
 
 9. ~~**Automatic linking**~~
    **Resolved** — Curator writes explicit links based on content similarity using existing KB context + `kb_search` results. A periodic maintenance pass fills gaps. Good default — aggressive enough to be useful, not so aggressive that it creates noise.
@@ -833,96 +798,95 @@ New projects skip this — they use the knowledge base from day one.
     **Resolved** — `full` autonomy. The PR review is the quality gate for curated notes. No need for the curator to pause for human approval.
 
 13. ~~**Parallel job knowledge conflicts**~~
-    **Resolved** — Handled as git merge conflicts. Two parallel jobs producing contradictory knowledge will surface as merge conflicts when their PRs merge to `main`. These are resolved manually for now. The `CONTRADICTS` relationship type and a future "knowledge health check" job can catch semantic contradictions that slip through file-level merge, but that's a later optimization.
+    **Resolved** — With Neo4j as source of truth, there are no file-level merge conflicts. Parallel jobs write to the same Neo4j instance — last write wins for node properties. Semantic contradictions are handled via the `CONTRADICTS` relationship type: the curator (or a future "knowledge health check" job) can detect and flag contradictory notes. Since notes are append-mostly (new notes far outnumber updates to existing ones), write conflicts are rare in practice.
 
 14. ~~**Curator access to target job memories**~~
     **Resolved** — Same pattern as the critic subjob. The curator receives the target job's context (workspace.md content, memories, freeze_data) via formatted instructions, just like the critic receives freeze_data in `create_verification_job()`. The orchestrator passes this context when spawning the curator via `create_curation_job()`.
 
 15. ~~**Obsidian CLI integration**~~
-    **Resolved** — Yes, use the Obsidian CLI to enhance the agent's toolset. Agent detects CLI availability (`obsidian version` probe) and wraps CLI commands (backlinks, orphans, deadends, search) as additional tools. This is a Phase 4 enhancement on top of the file tools + database indexes that cover core functionality.
+    **Resolved** — Deferred. With Neo4j as source of truth, Obsidian CLI is less critical — backlinks, orphans, and dead ends are graph queries (`kb_related`, `kb_unanswered`). Obsidian export (`kb_export`) generates browsable files on demand. CLI integration remains a Phase 4 nice-to-have for users who prefer the Obsidian UI.
 
 16. ~~**Curator-agent branch coordination**~~
-    **Resolved** — The curator gets its own branch in the project's jobs repo (e.g., `job/<curator-id>`), branched off the working agent's branch. The curator writes `knowledge/` notes on its branch. During the final pass, the curator merges its branch into the parent job's branch (or the orchestrator does this automatically). Since the curator writes exclusively to `knowledge/` and the working agent writes to `workspace.md`, `output/`, etc., merge conflicts are extremely unlikely. This works naturally because all subjobs (including critic and curator) now create branches off their parent job's branch in the project's jobs repo — fixed in `POST /api/jobs` and `POST /api/projects/{id}/jobs` (`orchestrator/main.py`).
+    **Resolved** — With Neo4j as source of truth, branch coordination is no longer relevant for knowledge writes. The curator writes to Neo4j via `kb_write` — no files on a branch, no merge step for knowledge. The curator still runs as a subjob on its own branch (per [[repo_resolution]]) for its own workspace.md/plan.md, but its knowledge output goes directly to the database, not to files that need merging.
 
 17. ~~**Archive phase notification mechanism**~~
     **Resolved** — Same pattern as the critic's resume mechanism. The curator enters `waiting` status after processing a phase. When the working agent archives the next phase, the orchestrator calls `resume_job()` on the curator with the new phase data as feedback. This reuses the existing `waiting` → `resume_job(feedback)` infrastructure that the critic already uses for multi-round reviews. The curator processes the phase, then goes back to `waiting` until the next archive or the final signal. The curator merges the parent job's branch into its own branch before processing each phase to pick up the latest workspace.md, archive/, etc.
 
+18. ~~**Post-merge sync trigger**~~
+    **Resolved** — No longer applicable. With write-through to Neo4j + pgvector, there is no post-merge sync step. Knowledge is written directly to databases on every `kb_write`, not via file commits.
+
+19. ~~**Retrieval message storage**~~
+    **Resolved** — Retrieval messages are stored as a list property on the Neo4j Note node (`retrieval_messages`) and as a `TEXT[]` column in `knowledge_index`. For embedding, retrieval messages are concatenated with the note content before generating the embedding vector — one embedding that captures both content and retrieval intent. Upgrade to separate per-retrieval-message embeddings later if recall is insufficient.
+
+20. ~~**Source of truth: files vs database**~~
+    **Resolved (2026-03-06)** — Neo4j is the source of truth. Per [[repo_resolution]], projects no longer have a shared repository, so there is no natural home for `knowledge/*.md` files. Neo4j models the knowledge graph natively (notes as nodes, relationships as edges). pgvector serves as a derived search index updated via write-through. Obsidian-compatible files can be exported on demand via `kb_export` for human browsing. See "Architecture" section.
+
 ### Open
 
-18. **Post-merge sync trigger** — Who calls the sync after a PR merges? The orchestrator's merge endpoint (`POST /api/projects/{id}/jobs/{jid}/merge`) already handles the Gitea merge. It should call the sync service after a successful merge. Alternatively, a Gitea webhook on push to `main` could trigger it. TBD.
+21. **System Neo4j connection management** — Neo4j is currently only used as an external datasource (via `DEFAULT_DS_NEO4J_*` env vars and the datasource connector). Promoting it to a system database requires: new env vars (`NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`), a `KnowledgeGraphDB` service class, connection on orchestrator startup, and init in `orchestrator/init.py`. How much of the existing `Neo4jDB` class can be reused vs. wrapped? TBD.
 
-19. **Retrieval message storage** — Where do the curator's generated retrieval messages live? Options: (a) in the note's frontmatter as a `retrieval_messages` array, (b) as separate embeddings in `knowledge_index` linked to the same note_id, (c) concatenated with the note content before embedding. Option (a) is simplest and keeps everything in the file (repo-as-source-of-truth). Option (b) gives the best search quality but multiplies the embedding count. Option (c) is a middle ground — one embedding that captures both content and retrieval intent. Recommendation: start with (a) for storage + (c) for embedding (concatenate retrieval messages with content before embedding). This keeps the file canonical and gives decent search quality without extra rows. Upgrade to (b) later if recall is insufficient.
+22. **Neo4j availability** — Should the knowledge base gracefully degrade when Neo4j is unavailable? Options: (a) hard requirement — KB features disabled if Neo4j is down, (b) pgvector-only fallback — writes queue and sync later when Neo4j comes back. Recommendation: start with (a) for simplicity. Neo4j is already in docker-compose and is reliable. Add fallback only if operational experience demands it.
 
 ## Implementation Plan
 
-### Phase 1: Knowledge Base Infrastructure + Search
+### Phase 1: Knowledge Base Infrastructure (Neo4j + pgvector + Tools)
 
-Build the foundation: note schema, file CRUD, repo → database sync, and working search. The curator needs something to write to; working agents need something to search. Search works from day one via pgvector + tsvector (reuses Memory Light's infrastructure).
+Build the full foundation: system Neo4j connection, Neo4j schema, pgvector search index, write-through logic, agent tools, and context injection. Everything works from day one — graph queries and search are both Phase 1.
 
-**Note schema + file tools:**
-1. [ ] Finalize note schema (frontmatter fields, naming conventions, directory structure)
-2. [ ] Implement `KnowledgeManager` class (`src/managers/knowledge.py`) — file-based note CRUD (create, read, list, update notes in `knowledge/`)
-3. [ ] Implement agent tools: `kb_write` (creates file), `kb_read` (reads file), `kb_list` (lists by type/tag/status from frontmatter), `kb_update` (appends/modifies file)
-4. [ ] Register as `knowledge` tool category in `src/tools/registry.py`
-5. [ ] Add `knowledge/` directory provisioning to project creation flow (init with `.obsidian/` config, subdirectories)
+**System Neo4j setup:**
+1. [ ] Add system Neo4j env vars (`NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`) to `.env.example`
+2. [ ] Implement `KnowledgeGraphDB` service class (`src/services/knowledge_graph.py`) — wraps `Neo4jDB` for system-level knowledge operations (create note, read note, list notes, create relationship, graph traversal queries)
+3. [ ] Add Neo4j schema initialization to `orchestrator/init.py` — create constraints and indexes (see "Neo4j Schema Initialization" section)
+4. [ ] Add `knowledge_index` table + `knowledge_hybrid_search()` function to PostgreSQL schema (see "Schema" section)
 
-**Repo → database sync:**
-6. [ ] Add `knowledge_index` and `knowledge_sync_state` tables to schema (pgvector + tsvector, see "Schema" section)
-7. [ ] Add `knowledge_hybrid_search()` SQL function (RRF-based, see "Search Function" section)
-8. [ ] Implement `KnowledgeSyncService` (`src/services/knowledge_sync.py`) — parses `knowledge/*.md`, extracts frontmatter + body, generates embeddings, upserts to `knowledge_index`
-9. [ ] Incremental sync via `git diff --name-only` against `knowledge_sync_state.last_synced_commit`
-10. [ ] Cold start path: full scan of `knowledge/` when no sync point exists (also serves as "rebuild indexes" recovery)
-11. [ ] Wire sync into project job init (after clone, before agent starts)
-12. [ ] Wire sync into post-merge hook (after PR merged to main)
+**Agent tools (write-through):**
+5. [ ] Implement `kb_write` tool — creates Note node in Neo4j + upserts `knowledge_index` row (embedding via `EmbeddingService`). Creates relationship edges for `links` parameter. Creates/merges Tag and Keyword nodes.
+6. [ ] Implement `kb_update` tool — updates Neo4j node properties + pgvector row (write-through). Supports append to content, status change, add tags/links.
+7. [ ] Implement `kb_read` tool — reads full note from Neo4j (content + metadata + relationships)
+8. [ ] Implement `kb_list` tool — queries Neo4j by type, tag, status, job_id
+9. [ ] Implement `kb_search` tool — queries `knowledge_hybrid_search()` in pgvector (RRF over dense + sparse + recency)
+10. [ ] Implement graph query tools: `kb_related` (2-hop traversal), `kb_contradictions` (CONTRADICTS edges), `kb_provenance` (DERIVED_FROM chains), `kb_unanswered` (questions without ANSWERS edges)
+11. [ ] Register as `knowledge` tool category in `src/tools/registry.py`
 
-**Search + injection:**
-13. [ ] Implement `kb_search` tool — queries `knowledge_hybrid_search()`, returns ranked results with snippets
-14. [ ] Auto-generate `_index.md` (Map of Content) from `knowledge_index` table
-15. [ ] Inject `_index.md` as context for jobs in KB-enabled projects (supplements workspace.md injection)
-16. [ ] Implement knowledge retrieval injection — query `knowledge_hybrid_search()` with current task context, inject top-K as transient message (same pattern as Memory Light)
-17. [ ] Test: manually create knowledge notes in a project repo, start a job, verify sync runs and `kb_search` returns ranked results
+**Context injection:**
+12. [ ] Auto-generate knowledge summary (note counts by type, recent notes) from Neo4j — injected as context for KB-enabled projects
+13. [ ] Implement knowledge retrieval injection — query `knowledge_hybrid_search()` with current task context, inject top-K as transient message (same pattern as Memory Light)
+14. [ ] `rebuild_search_index(project_id)` — reads all notes from Neo4j, re-inserts into pgvector (cold start / recovery)
+
+**Export:**
+15. [ ] Implement `kb_export(project_id, path)` — reads all notes and relationships from Neo4j, writes Obsidian-compatible `.md` files with frontmatter and `[[wikilinks]]`
+
+**Test:**
+16. [ ] Test: use `kb_write` to create notes → verify Neo4j nodes + pgvector rows exist → `kb_search` returns ranked results → `kb_related` traverses graph → `kb_export` generates valid Obsidian files
 
 ### Phase 2: Curator Subjob
 
 With the knowledge tools and search working, build the curator that uses them. The curator is a persistent subjob that runs in parallel with the working agent, triggered on every archive phase.
 
 **Config + instructions:**
-18. [ ] Create `config/experts/curator/config.yaml` — extends defaults, has `knowledge` + `workspace` + `git` tools, `autonomy: full`
-19. [ ] Create `config/experts/curator/instructions.md` — curation guide (what to extract, how to classify, when to update vs. create, editorial judgment rules, retrieval message generation)
-20. [ ] Create `config/experts/curator/curation_instructions.md` — instruction file triggered before `kb_write` (note quality standards, linking conventions, retrieval message quality)
+17. [ ] Create `config/experts/curator/config.yaml` — extends defaults, has `knowledge` + `workspace` + `git` tools, `autonomy: full`
+18. [ ] Create `config/experts/curator/instructions.md` — curation guide (what to extract, how to classify, when to update vs. create, editorial judgment rules, retrieval message generation)
+19. [ ] Create `config/experts/curator/curation_instructions.md` — instruction file triggered before `kb_write` (note quality standards, linking conventions, retrieval message quality)
 
 **Subjob lifecycle:**
-21. [ ] Implement `create_curation_job()` in `src/api/orchestrator_client.py` — follows `create_verification_job()` pattern, passes job context via formatted instructions (same approach as critic's freeze_data)
-22. [ ] Add `curator` config section to `defaults.yaml` (`enabled`, `curator_config`, `auto_pr`, `autonomy: full`)
-23. [ ] Wire archive phase trigger — after the first archive phase, spawn curator subjob on the same branch (one subjob per job, persistent)
-24. [ ] Implement archive phase notification — on each subsequent archive phase, call `resume_job()` on the curator with new phase data as feedback (reuses existing `waiting` → resume infrastructure)
-25. [ ] Wire final pass trigger — after critic approves (or after job completion if no critic), send final signal to curator with memories + output + freeze_data
+20. [ ] Implement `create_curation_job()` in `src/api/orchestrator_client.py` — follows `create_verification_job()` pattern, passes job context via formatted instructions (same approach as critic's freeze_data)
+21. [ ] Add `curator` config section to `defaults.yaml` (`enabled`, `curator_config`, `autonomy: full`)
+22. [ ] Wire archive phase trigger — after the first archive phase, spawn curator subjob (one subjob per job, persistent)
+23. [ ] Implement archive phase notification — on each subsequent archive phase, call `resume_job()` on the curator with new phase data as feedback (reuses existing `waiting` → resume infrastructure)
+24. [ ] Wire final pass trigger — after critic approves (or after job completion if no critic), send final signal to curator with memories + output + freeze_data
 
 **Curation logic:**
-26. [ ] Curator uses `kb_search` to check existing knowledge before writing (dedup, linking)
-27. [ ] Curator generates retrieval messages for each note (synthetic queries for when the note should surface)
-28. [ ] Curator reads `memories` table for the target job during final pass and promotes valuable entries to knowledge notes
-29. [ ] Auto-create PR after curator's final pass completes (if `curator.auto_pr: true`)
-30. [ ] Test: run a project job → curator processes archive phases in parallel → critic approves → curator final pass → PR merges → next job's sync picks up notes → `kb_search` finds them
+25. [ ] Curator uses `kb_search` to check existing knowledge before writing (dedup, linking)
+26. [ ] Curator generates retrieval messages for each note (synthetic queries for when the note should surface)
+27. [ ] Curator reads `memories` table for the target job during final pass and promotes valuable entries to knowledge notes
+28. [ ] Test: run a project job → curator processes archive phases in parallel → critic approves → curator final pass → next job can `kb_search` and find the curated notes
 
-### Phase 3: Neo4j Graph Queries
+### Phase 3: Obsidian Export + Polish
 
-Add the graph layer for relationship traversal. Extends the sync function to also write Neo4j from the same repo source.
-
-31. [ ] Extend `KnowledgeSyncService` to also upsert Neo4j nodes + relationships (parse wikilinks → edges, tags → tag nodes)
-32. [ ] Add Neo4j namespace provisioning to project creation (shared instance, project labels)
-33. [ ] Implement graph query tools: `kb_query`, `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`
-34. [ ] Give curator access to graph tools for richer dedup and linking
-35. [ ] Optionally add graph traversal as a fourth channel in the RRF search function
-
-### Phase 4: Obsidian CLI + Polish
-
-36. [ ] CLI availability detection (`obsidian version` probe)
-37. [ ] Wrap CLI commands: `backlinks`, `links`, `orphans`, `deadends`, `search`
-38. [ ] `.obsidian/` config templates (graph settings, tag hierarchy, workspace layout)
-39. [ ] Cockpit UI: knowledge base viewer/browser
-40. [ ] workspace.md → knowledge notes conversion tool (for existing projects)
-41. [ ] Test with real multi-job project: verify Job N+1 benefits from Job N's knowledge
+29. [ ] Cockpit UI: knowledge base viewer/browser (reads from Neo4j via orchestrator API)
+30. [ ] workspace.md → knowledge notes conversion tool (for existing projects)
+31. [ ] Memory Light → knowledge notes migration tool
+32. [ ] Test with real multi-job project: verify Job N+1 benefits from Job N's knowledge
 
 ## What Changes and What Stays
 
@@ -936,17 +900,19 @@ The curator model is additive — it doesn't replace existing systems, it builds
 - **Critic subjob** — Continues reviewing deliverables post-completion. Curator runs in parallel from the first archive phase; its final pass triggers after critic approval.
 
 **New:**
-- **`knowledge/` directory** — Created in project jobs repos. Curated notes accumulate on `main`.
-- **`knowledge_index` table** — Derived index in PostgreSQL (pgvector + tsvector), synced from repo on job init and post-merge.
-- **`_index.md` injection** — Supplements workspace.md injection for KB-enabled projects.
+- **System Neo4j connection** — Neo4j promoted from external datasource to system database for knowledge storage. New env vars: `NEO4J_URL`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`.
+- **Neo4j knowledge graph** — Notes, tags, keywords as nodes; relationships as edges. Source of truth for all project knowledge. Scoped by `project_id`.
+- **`knowledge_index` table** — Derived search index in PostgreSQL (pgvector + tsvector), updated via write-through on every `kb_write`.
+- **Knowledge agent tools** — `kb_write`, `kb_read`, `kb_search`, `kb_list`, `kb_update`, `kb_related`, `kb_contradictions`, `kb_provenance`, `kb_unanswered`, `kb_export`.
 - **Knowledge retrieval injection** — Project-scoped context injected via hybrid search (pgvector + tsvector + RRF). Works from Phase 1.
 - **Curator subjob** (Phase 2) — New expert config, spawned after first archive phase, runs in parallel with working agent, continuously extracts knowledge. Final pass after critic approval.
-- **Neo4j sync** (Phase 3) — Post-merge hook syncs notes to graph for relationship traversal.
+- **Obsidian export** — `kb_export` dumps Neo4j graph as `.md` files with frontmatter and wikilinks. One-way, on-demand.
 
 **Related docs:**
 - [[memory_light]] — Remains valid for: observer, extraction channels, RRF hybrid search, embedding models, injection hook. Memory Light is the capture stage; the curator is the promotion stage.
-- [[obsidian]] — Remains valid for: note schema, research findings, Obsidian CLI, `.obsidian/` config.
-- [[projects]] — Remains valid for: database schema, API, merge flow, workspace layout, cockpit UI. This doc adds `knowledge/` to "what merges to main" and defines the curator subjob in the post-completion chain.
+- [[obsidian]] — Remains valid for: Obsidian export format, research findings. The note schema now lives in Neo4j; Obsidian files are an export format, not the source of truth.
+- [[projects]] — Remains valid for: database schema, API, workspace layout, cockpit UI. This doc adds Neo4j knowledge graph as project-level infrastructure.
+- [[repo_resolution]] — The decision that projects don't have shared repos is what drove the move from files-as-source-of-truth to Neo4j-as-source-of-truth.
 
 ## References
 

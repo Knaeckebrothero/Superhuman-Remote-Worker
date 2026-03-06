@@ -72,16 +72,30 @@ gitea_client = GiteaClient()
 async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
     """Resolve the Gitea repo name and branch for a job.
 
-    Project jobs use a shared project jobs repo + per-job branch.
-    Non-project jobs use a dedicated per-job repo (job-{id}).
+    Per-job repo model: root jobs own a repo (stored in repo_name column),
+    subjobs work on branches within their root job's repo.
+
+    Falls back to legacy project-jobs-repo resolution for jobs created before
+    the per-job repo migration.
 
     Returns:
-        (repo_name, job_branch) where job_branch is None for non-project jobs.
+        (repo_name, job_branch) where job_branch is None for root jobs.
     """
     job = await postgres_db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
+    # New model: repo_name stored directly on the job
+    if job.get("repo_name"):
+        return job["repo_name"], job.get("branch_name")
+
+    # Subjob without repo_name: traverse to root job
+    if job.get("parent_job_id"):
+        parent = await postgres_db.get_job(str(job["parent_job_id"]))
+        if parent and parent.get("repo_name"):
+            return parent["repo_name"], job.get("branch_name")
+
+    # Legacy fallback: project jobs repo (pre-migration jobs)
     if job.get("project_id"):
         repos = await postgres_db.get_project_repositories(
             str(job["project_id"]), role="jobs"
@@ -89,7 +103,122 @@ async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
         if repos:
             return repos[0]["name"], job.get("branch_name")
 
+    # Non-project legacy jobs: repo named job-{full-uuid}
     return f"job-{job_id}", None
+
+
+# Files to delete from subjob branch before squash merge (job-scoped working files).
+SUBJOB_CLEANUP_FILES = [
+    "workspace.md",
+    "plan.md",
+    "todos.yaml",
+    "instructions.md",
+    "task_brief.md",
+    "output/job_frozen.json",
+    "output/job_completion.json",
+]
+
+SUBJOB_CLEANUP_DIRS = [
+    "archive",
+    "tools",
+    "documents",
+    "reference",
+]
+
+
+async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
+    """Squash-merge a completed subjob's branch into its parent's branch.
+
+    Pre-merge cleanup: deletes job-scoped files from the subjob branch
+    before creating the PR, so the parent's workspace.md / plan.md are
+    not overwritten.
+
+    Returns:
+        Merge result dict, or None if merge was skipped/not applicable.
+    """
+    job = await postgres_db.get_job(job_id)
+    if not job or not job.get("parent_job_id"):
+        return None
+
+    if not job.get("branch_name") or not job.get("repo_name"):
+        logger.debug(f"Subjob {job_id} has no branch/repo — skipping squash merge")
+        return None
+
+    if not gitea_client.is_initialized:
+        logger.warning(f"Gitea not initialized — cannot squash-merge subjob {job_id}")
+        return None
+
+    repo_name = job["repo_name"]
+    subjob_branch = job["branch_name"]
+    short_id = str(job_id)[:8]
+
+    # Determine the base branch (parent's branch, or main if parent is root)
+    parent = await postgres_db.get_job(str(job["parent_job_id"]))
+    base_branch = (parent.get("branch_name") if parent else None) or "main"
+
+    # Pre-merge cleanup: delete job-scoped files from subjob branch
+    for file_path in SUBJOB_CLEANUP_FILES:
+        await gitea_client.delete_file(
+            repo_name, file_path,
+            f"Pre-merge cleanup: remove {file_path}",
+            branch=subjob_branch,
+        )
+
+    # Delete job-scoped directories (list contents then delete each file)
+    for dir_path in SUBJOB_CLEANUP_DIRS:
+        entries = await gitea_client.list_contents(repo_name, dir_path, ref=subjob_branch)
+        if entries:
+            for entry in entries:
+                if entry.get("type") == "file":
+                    await gitea_client.delete_file(
+                        repo_name, entry["path"],
+                        f"Pre-merge cleanup: remove {entry['path']}",
+                        branch=subjob_branch,
+                    )
+
+    # Create PR for squash merge
+    config_name = job.get("config_name", "subjob")
+    pr_title = f"Subjob {short_id}/{config_name}: {(job.get('description') or 'completed')[:60]}"
+    pr = await gitea_client.create_pr(
+        repo_name,
+        title=pr_title,
+        head=subjob_branch,
+        base=base_branch,
+        body=f"Squash merge subjob `{job_id}` (`{config_name}`) into parent branch.",
+    )
+
+    if pr is None:
+        logger.info(
+            f"Subjob {short_id} PR creation returned None — "
+            f"branch may have no changes vs {base_branch}"
+        )
+        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
+        return {"status": "skipped", "reason": "no changes"}
+
+    # Squash merge
+    merged = await gitea_client.merge_pr(
+        repo_name,
+        pr["number"],
+        merge_strategy="squash",
+        delete_branch_after_merge=True,
+    )
+
+    if not merged:
+        logger.warning(f"Squash merge failed for subjob {short_id} (PR #{pr['number']})")
+        await postgres_db.update_job_merge_status(job_id, merge_status="conflict")
+        return {"status": "conflict", "pr_number": pr["number"]}
+
+    await postgres_db.update_job_merge_status(job_id, merge_status="merged")
+    logger.info(
+        f"Squash-merged subjob {short_id}/{config_name} into {base_branch} "
+        f"(PR #{pr['number']})"
+    )
+
+    return {
+        "status": "merged",
+        "pr_number": pr["number"],
+        "base_branch": base_branch,
+    }
 
 
 # =============================================================================
@@ -679,17 +808,6 @@ class ProjectRepositoryUpdate(BaseModel):
     clone_path: str | None = None
 
 
-class MergeRequest(BaseModel):
-    """Request body for merging a job's branch."""
-
-    merge_strategy: str = Field(
-        default="merge",
-        description="Merge method: merge, rebase, or squash",
-    )
-    delete_branch: bool = Field(
-        default=False,
-        description="Delete the branch after successful merge",
-    )
 
 
 class PromoteRequest(BaseModel):
@@ -989,57 +1107,59 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
 
         # Create Gitea repo/branch for workspace delivery
         job_id_str = str(result["id"])
+        short_id = job_id_str[:8]
         if gitea_client.is_initialized:
-            if project_id and job.parent_job_id:
-                # Subjob of a project job: branch from parent's branch
-                repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-                if repos:
-                    jobs_repo = repos[0]
-                    from_branch = "main"
-                    parent = await postgres_db.get_job(job.parent_job_id)
-                    if parent and parent.get("branch_name"):
-                        from_branch = parent["branch_name"]
-                    else:
-                        logger.warning(
-                            f"Parent job {job.parent_job_id} has no branch_name, "
-                            f"branching subjob from 'main'"
-                        )
-                    branch_name = f"job/{job_id_str[:8]}"
+            if job.parent_job_id:
+                # Subjob: branch on parent's repo
+                parent = await postgres_db.get_job(job.parent_job_id)
+                if parent:
+                    # Resolve parent's repo name (parent may be root or itself a subjob)
+                    parent_repo_name = parent.get("repo_name")
+                    if not parent_repo_name and parent.get("parent_job_id"):
+                        root = await postgres_db.get_job(str(parent["parent_job_id"]))
+                        if root:
+                            parent_repo_name = root.get("repo_name")
+                    if not parent_repo_name:
+                        # Legacy fallback: try project jobs repo
+                        if parent.get("project_id"):
+                            repos = await postgres_db.get_project_repositories(
+                                str(parent["project_id"]), role="jobs"
+                            )
+                            if repos:
+                                parent_repo_name = repos[0]["name"]
+                        if not parent_repo_name:
+                            parent_repo_name = f"job-{str(parent['id'])}"
+
+                    from_branch = parent.get("branch_name") or "main"
+                    config_name_slug = job.config_name or "subjob"
+                    branch_name = f"subjob/{short_id}/{config_name_slug}"
                     await gitea_client.create_branch(
-                        jobs_repo["name"], branch_name, from_branch=from_branch
+                        parent_repo_name, branch_name, from_branch=from_branch
                     )
                     ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = jobs_repo["repo_url"]
+                    ctx["git_remote_url"] = parent.get("context", {}).get("git_remote_url", "")
                     await postgres_db.update_job_context(job_id_str, ctx)
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
-                            "UPDATE jobs SET branch_name = $1 WHERE id = $2",
-                            branch_name, result["id"],
+                            "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
+                            branch_name, parent_repo_name, result["id"],
                         )
                     result["branch_name"] = branch_name
-            elif project_id:
-                # Root project job via /api/jobs: branch from main
-                repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-                if repos:
-                    jobs_repo = repos[0]
-                    branch_name = f"job/{job_id_str[:8]}"
-                    await gitea_client.create_branch(jobs_repo["name"], branch_name)
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = jobs_repo["repo_url"]
-                    await postgres_db.update_job_context(job_id_str, ctx)
-                    async with postgres_db.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE jobs SET branch_name = $1 WHERE id = $2",
-                            branch_name, result["id"],
-                        )
-                    result["branch_name"] = branch_name
+                    result["repo_name"] = parent_repo_name
             else:
-                # Non-project job: standalone repo
-                git_remote_url = await gitea_client.create_repo(f"job-{job_id_str}")
+                # Root job: create standalone per-job repo
+                repo_name = f"job-{short_id}"
+                git_remote_url = await gitea_client.create_repo(repo_name)
                 if git_remote_url:
                     ctx = dict(context) if context else {}
                     ctx["git_remote_url"] = git_remote_url
                     await postgres_db.update_job_context(job_id_str, ctx)
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET repo_name = $1 WHERE id = $2",
+                            repo_name, result["id"],
+                        )
+                    result["repo_name"] = repo_name
 
         # Clone selected global datasources as job-scoped
         if job.datasource_ids:
@@ -1100,13 +1220,21 @@ async def delete_job(job_id: str) -> dict[str, str]:
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        # Clean up Gitea branch for project jobs
-        if job.get("project_id") and job.get("branch_name") and gitea_client.is_initialized:
-            repos = await postgres_db.get_project_repositories(
-                str(job["project_id"]), role="jobs"
-            )
-            if repos:
-                await gitea_client.delete_branch(repos[0]["name"], job["branch_name"])
+        # Clean up Gitea repo/branch
+        if gitea_client.is_initialized:
+            if job.get("parent_job_id") and job.get("branch_name") and job.get("repo_name"):
+                # Subjob: delete the branch (no-op if already merged and deleted)
+                await gitea_client.delete_branch(job["repo_name"], job["branch_name"])
+            elif job.get("repo_name"):
+                # Root job: delete the entire repo (also deletes subjob branches)
+                await gitea_client.delete_repo(job["repo_name"])
+            elif job.get("project_id") and job.get("branch_name"):
+                # Legacy: project jobs repo branch cleanup
+                repos = await postgres_db.get_project_repositories(
+                    str(job["project_id"]), role="jobs"
+                )
+                if repos:
+                    await gitea_client.delete_branch(repos[0]["name"], job["branch_name"])
 
         success = await postgres_db.delete_job(job_id)
         if not success:
@@ -1115,6 +1243,37 @@ async def delete_job(job_id: str) -> dict[str, str]:
     except HTTPException:
         raise
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/subjob-merge")
+async def subjob_merge(job_id: str) -> dict[str, Any]:
+    """Squash-merge a completed subjob's branch into its parent's branch.
+
+    Called by the agent after a subjob completes (autonomy=full auto-completion).
+    Performs pre-merge cleanup of job-scoped files, then squash merges.
+    """
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if not job.get("parent_job_id"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only subjobs (with parent_job_id) can be squash-merged",
+            )
+
+        result = await _squash_merge_subjob(job_id)
+        if result is None:
+            return {"status": "skipped", "reason": "no branch/repo configured"}
+
+        return {"job_id": job_id, **result}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Squash merge failed for subjob {job_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -1435,6 +1594,7 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
 
         # 2. Read freeze data — DB first, Gitea fallback, local fallback
         frozen_data = None
+        repo_name, job_branch = await resolve_job_repo(job_id)
 
         # Primary: read freeze_data from DB
         if job.get("freeze_data"):
@@ -1442,18 +1602,8 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
             if isinstance(frozen_data, str):
                 frozen_data = json.loads(frozen_data)
 
-        # Fallback: Gitea (backward compat for pre-migration jobs)
+        # Fallback: Gitea
         if frozen_data is None and gitea_client.is_initialized:
-            # Resolve correct repo name (project jobs use shared repo)
-            if job.get("project_id"):
-                repos = await postgres_db.get_project_repositories(
-                    str(job["project_id"]), role="jobs"
-                )
-                repo_name = repos[0]["name"] if repos else f"job-{job_id}"
-                job_branch = job.get("branch_name")
-            else:
-                repo_name = f"job-{job_id}"
-                job_branch = None
             frozen_data = await gitea_client.get_file(
                 repo_name, "output/job_frozen.json", ref=job_branch
             )
@@ -1547,16 +1697,24 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
 
         logger.info(f"Job {job_id} approved (gitea={wrote_to_gitea})")
 
+        # Squash-merge subjob branch into parent if applicable
+        merge_result = None
+        if job.get("parent_job_id"):
+            merge_result = await _squash_merge_subjob(job_id)
+
         # Agent is freed after completion — trigger dispatcher
         _trigger_dispatch()
 
-        return {
+        result = {
             "status": "approved",
             "job_id": job_id,
             "summary": completion_data.get("summary", ""),
             "deliverables": completion_data.get("deliverables", []),
             "approved_at": completion_data["approved_at"],
         }
+        if merge_result:
+            result["merge"] = merge_result
+        return result
 
     except HTTPException:
         raise
@@ -1584,17 +1742,9 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
             if isinstance(frozen_data, str):
                 frozen_data = json.loads(frozen_data)
 
-        # Fallback: Gitea (backward compat for pre-migration jobs)
+        # Fallback: Gitea
         if frozen_data is None and gitea_client.is_initialized:
-            if job and job.get("project_id"):
-                repos = await postgres_db.get_project_repositories(
-                    str(job["project_id"]), role="jobs"
-                )
-                repo_name = repos[0]["name"] if repos else f"job-{job_id}"
-                job_branch = job.get("branch_name") if job else None
-            else:
-                repo_name = f"job-{job_id}"
-                job_branch = None
+            repo_name, job_branch = await resolve_job_repo(job_id)
             frozen_data = await gitea_client.get_file(
                 repo_name, "output/job_frozen.json", ref=job_branch
             )
@@ -4217,167 +4367,6 @@ async def list_project_jobs(
                 job["audit_count"] = None
 
         return jobs
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.post("/api/projects/{project_id}/jobs/{job_id}/merge")
-async def merge_project_job(
-    project_id: str,
-    job_id: str,
-    request: MergeRequest | None = None,
-) -> dict[str, Any]:
-    """Merge a job's branch into the project main branch via Gitea PR."""
-    if request is None:
-        request = MergeRequest()
-
-    if not gitea_client.is_initialized:
-        raise HTTPException(
-            status_code=503,
-            detail="Gitea is not initialized — merge requires Gitea",
-        )
-
-    try:
-        # Validate job
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
-        if str(job.get("project_id", "")) != project_id:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Job '{job_id}' does not belong to project '{project_id}'",
-            )
-
-        if job["status"] != "completed":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Job must be completed to merge (status: {job['status']})",
-            )
-
-        if job.get("merge_status") == "merged":
-            raise HTTPException(
-                status_code=409,
-                detail="Job branch has already been merged",
-            )
-
-        branch_name = job.get("branch_name")
-        if not branch_name:
-            raise HTTPException(
-                status_code=400,
-                detail="Job has no branch_name — cannot merge",
-            )
-
-        # Get the jobs repo
-        repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-        if not repos:
-            raise HTTPException(
-                status_code=400,
-                detail="Project has no jobs repository configured",
-            )
-        repo_name = repos[0]["name"]
-
-        # Create PR
-        pr_title = f"Merge job {job_id[:8]}: {(job.get('description') or 'No description')[:60]}"
-        pr_body = (
-            f"**Job ID:** `{job_id}`\n"
-            f"**Branch:** `{branch_name}`\n"
-            f"**Config:** {job.get('config_name', 'default')}\n"
-            f"**Merge strategy:** {request.merge_strategy}"
-        )
-
-        pr = await gitea_client.create_pr(
-            repo_name,
-            title=pr_title,
-            head=branch_name,
-            base="main",
-            body=pr_body,
-        )
-
-        if pr is None:
-            # PR creation failed — likely no diff or branch not found
-            await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
-            return {
-                "status": "skipped",
-                "job_id": job_id,
-                "reason": "PR creation failed — branch may have no changes or not exist",
-            }
-
-        # Merge the PR
-        merged = await gitea_client.merge_pr(
-            repo_name,
-            pr["number"],
-            merge_strategy=request.merge_strategy,
-            delete_branch_after_merge=request.delete_branch,
-        )
-
-        if not merged:
-            # Merge failed — likely conflict
-            await postgres_db.update_job_merge_status(job_id, merge_status="conflict")
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "Merge conflict — resolve via Gitea PR UI then retry or skip",
-                    "pr_number": pr["number"],
-                    "pr_url": pr.get("url", ""),
-                },
-            )
-
-        # Success
-        await postgres_db.update_job_merge_status(job_id, merge_status="merged")
-
-        # If delete_branch was not handled by Gitea merge, do it explicitly
-        branch_deleted = request.delete_branch
-
-        logger.info(
-            f"Merged job {job_id[:8]} branch '{branch_name}' into main "
-            f"(PR #{pr['number']}, strategy: {request.merge_strategy})"
-        )
-
-        return {
-            "status": "merged",
-            "job_id": job_id,
-            "pr_number": pr["number"],
-            "pr_url": pr.get("url", ""),
-            "branch_deleted": branch_deleted,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Merge failed for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.post("/api/projects/{project_id}/jobs/{job_id}/skip-merge")
-async def skip_merge_project_job(
-    project_id: str,
-    job_id: str,
-) -> dict[str, Any]:
-    """Mark a job's merge as skipped (exploratory/research jobs)."""
-    try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
-        if str(job.get("project_id", "")) != project_id:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Job '{job_id}' does not belong to project '{project_id}'",
-            )
-
-        if job["status"] != "completed":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Job must be completed to skip merge (status: {job['status']})",
-            )
-
-        await postgres_db.update_job_merge_status(job_id, merge_status="skipped")
-
-        return {"status": "skipped", "job_id": job_id}
-
     except HTTPException:
         raise
     except Exception as e:

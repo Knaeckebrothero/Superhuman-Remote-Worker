@@ -257,6 +257,14 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority DESC);
 
+-- Migration: Add repo_name column to jobs table (per-job Gitea repos)
+-- Stores the Gitea repo name for root jobs (e.g. "job-ec38de5d").
+-- Subjobs inherit the root job's repo and work on branches.
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN repo_name VARCHAR(200);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- Migration: Add 'paused' to valid job statuses
 -- (CHECK constraint is defined in CREATE TABLE; this handles existing databases)
 DO $$ BEGIN
@@ -842,6 +850,7 @@ SELECT
     j.parent_job_id,
     j.priority,
     j.branch_name,
+    j.repo_name,
     j.merge_status,
     j.freeze_data,
     j.created_at,
