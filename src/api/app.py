@@ -880,6 +880,17 @@ async def _process_orchestrator_job(
         # Update job status in database based on final state
         await _update_job_status_from_result(job_id, result)
 
+        # Squash-merge subjob branch into parent (if this is a subjob)
+        if _agent and _agent.postgres_conn and _orchestrator_client:
+            try:
+                row = await _agent.postgres_conn.fetchrow(
+                    "SELECT parent_job_id FROM jobs WHERE id = $1::uuid", job_id
+                )
+                if row and row.get("parent_job_id"):
+                    await _orchestrator_client.trigger_subjob_merge(job_id)
+            except Exception as e:
+                logger.error(f"Failed to trigger subjob merge for {job_id}: {e}")
+
         # Handle deferred critic verdicts (approve/return target jobs)
         await _handle_critic_verdict(job_id, result)
 

@@ -435,6 +435,43 @@ class OrchestratorClient:
             logger.error(f"Unexpected error resuming job: {e}")
             return False
 
+    async def trigger_subjob_merge(self, job_id: str) -> bool:
+        """Trigger squash merge of a completed subjob via the orchestrator.
+
+        Args:
+            job_id: UUID of the completed subjob
+
+        Returns:
+            True if merge succeeded or was skipped, False on error
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/subjob-merge"
+
+        try:
+            response = await self._client.post(url)
+
+            if response.status_code == 200:
+                data = response.json()
+                logger.info(
+                    f"Subjob merge for {job_id}: {data.get('status', 'unknown')}"
+                )
+                return True
+            else:
+                logger.error(
+                    f"Subjob merge failed for {job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+
+        except httpx.RequestError as e:
+            logger.error(f"Failed to connect to orchestrator for subjob merge: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error triggering subjob merge: {e}")
+            return False
+
     async def create_verification_job(
         self,
         job_id: str,

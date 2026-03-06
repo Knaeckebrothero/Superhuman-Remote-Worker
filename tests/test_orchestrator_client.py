@@ -236,3 +236,87 @@ class TestCreateOrchestratorClientFromEnv:
             assert client.pod_port == 8001  # Default
             assert client.pod_ip is not None  # Auto-detected
             assert client.hostname is not None  # Auto-detected
+
+
+class TestTriggerSubjobMerge:
+    """Tests for trigger_subjob_merge method."""
+
+    @pytest.fixture
+    def client(self):
+        """Create a test client instance."""
+        return OrchestratorClient(
+            orchestrator_url="http://localhost:8085",
+            pod_ip="10.0.0.5",
+            pod_port=8001,
+            hostname="test-agent",
+            config_name="creator",
+            pid=12345,
+        )
+
+    @pytest.mark.asyncio
+    async def test_trigger_subjob_merge_success(self, client):
+        """Test successful subjob merge trigger."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": "merged", "pr_number": 42}
+
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            result = await client.trigger_subjob_merge("subjob-uuid")
+
+            assert result is True
+            mock_client.post.assert_called_once_with(
+                "http://localhost:8085/api/jobs/subjob-uuid/subjob-merge"
+            )
+
+    @pytest.mark.asyncio
+    async def test_trigger_subjob_merge_failure(self, client):
+        """Test merge trigger returns False on non-200 response."""
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(return_value=mock_response)
+
+            result = await client.trigger_subjob_merge("subjob-uuid")
+
+            assert result is False
+
+    @pytest.mark.asyncio
+    async def test_trigger_subjob_merge_connection_error(self, client):
+        """Test merge trigger handles connection errors."""
+        import httpx
+
+        with patch.object(client, "_client", AsyncMock()) as mock_client:
+            mock_client.post = AsyncMock(
+                side_effect=httpx.RequestError("Connection refused")
+            )
+
+            result = await client.trigger_subjob_merge("subjob-uuid")
+
+            assert result is False
+
+    @pytest.mark.asyncio
+    async def test_trigger_subjob_merge_connects_if_needed(self, client):
+        """Test that trigger_subjob_merge auto-connects when _client is None."""
+        client._client = None
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"status": "merged"}
+
+        with patch.object(client, "connect", AsyncMock()) as mock_connect:
+            # After connect, _client should be set
+            async def set_client():
+                mock_http = AsyncMock()
+                mock_http.post = AsyncMock(return_value=mock_response)
+                client._client = mock_http
+
+            mock_connect.side_effect = set_client
+
+            result = await client.trigger_subjob_merge("subjob-uuid")
+
+            assert result is True
+            mock_connect.assert_awaited_once()

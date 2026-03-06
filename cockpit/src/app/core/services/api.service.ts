@@ -31,7 +31,6 @@ import {
   ProjectRepository,
   ProjectRepositoryCreateRequest,
   ProjectRepositoryUpdateRequest,
-  MergeRequest,
   PromoteRequest,
 } from '../models/api.model';
 import { UploadResponse, UploadInfo } from '../models/file.model';
@@ -1097,18 +1096,6 @@ export class ApiService {
     return this.http.post<Job>(`${this.baseUrl}/projects/${id}/jobs`, body).pipe(
       catchError(() => of(null)),
     );
-  }
-
-  mergeProjectJob(projectId: string, jobId: string, body?: MergeRequest): Observable<{ status: string; merge_status?: string } | null> {
-    return this.http.post<{ status: string; merge_status?: string }>(
-      `${this.baseUrl}/projects/${projectId}/jobs/${jobId}/merge`, body ?? {},
-    ).pipe(catchError(() => of(null)));
-  }
-
-  skipMergeProjectJob(projectId: string, jobId: string): Observable<{ status: string } | null> {
-    return this.http.post<{ status: string }>(
-      `${this.baseUrl}/projects/${projectId}/jobs/${jobId}/skip-merge`, {},
-    ).pipe(catchError(() => of(null)));
   }
 
   promoteJob(jobId: string, body: PromoteRequest): Observable<{ status: string; project_id?: string } | null> {

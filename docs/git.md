@@ -13,6 +13,7 @@ related:
   - "[[deployment]]"
   - "[[debug_cockpit]]"
   - "[[interactive_planning]]"
+  - "[[repo_resolution]]"
 ---
 # Git Versioning for Agent Workspaces
 
@@ -669,6 +670,21 @@ All git tools are read-only and available in both phases:
 | `git_tags` | Yes | Yes | Check phase progression anytime |
 
 Destructive tools (reset, revert) are deferred until we design TodoManager synchronization.
+
+## Subjob Branch Model
+
+Root jobs get their own Gitea repo (`job-<short-id>`) and work on `main`. Subjobs (critic, curator, research, etc.) work on branches within the root job's repo:
+
+```
+main (root job)
+  ├── subjob/abc/critic
+  ├── subjob/def/research
+  └── subjob/ghi/coding
+```
+
+On subjob completion, a pre-merge cleanup removes job-scoped files (`workspace.md`, `plan.md`, `todos.yaml`, `archive/`, etc.), then the branch is squash-merged into the parent's branch. The root job sees subjob results as a single clean commit.
+
+See [[repo_resolution]] for the full design.
 
 ## Future Extensions
 
