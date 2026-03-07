@@ -8,6 +8,7 @@
 # VPN services publish ports to the host so locally-running agents can reach
 # the LLM cluster and research proxy. Set these in .env for local dev:
 #   LLM_BASE_URL=http://localhost:8080/v1
+#   WORKSTATION_BASE_URL=http://localhost:8090/v1  (embeddings, vision, whisper, TTS)
 #   RESEARCH_PROXY_TYPE=socks5
 #   RESEARCH_PROXY_HOST=localhost
 #   RESEARCH_PROXY_PORT=1080
@@ -35,7 +36,7 @@ name: superhuman-remote-worker
 
 services:
   postgres:
-    image: docker.io/pgvector/pgvector:pg15
+    image: docker.io/library/postgres:15
     container_name: srw-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-srw}
@@ -48,6 +49,24 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  postgres-vector:
+    image: docker.io/pgvector/pgvector:pg15
+    container_name: srw-postgres-vector
+    environment:
+      POSTGRES_USER: ${VECTOR_POSTGRES_USER:-srw}
+      POSTGRES_PASSWORD: ${VECTOR_POSTGRES_PASSWORD:-srw_password}
+      POSTGRES_DB: ${VECTOR_POSTGRES_DB:-srw_vector}
+    volumes:
+      - postgres_vector_dev_data:/var/lib/postgresql/data
+      - ./orchestrator/database/vector_schema.sql:/docker-entrypoint-initdb.d/001_vector_schema.sql:Z
+    ports:
+      - "${VECTOR_POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${VECTOR_POSTGRES_USER:-srw}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -217,6 +236,39 @@ services:
       retries: 3
     restart: unless-stopped
 
+  vpn-workstation:
+    build:
+      context: docker/vpn
+      dockerfile: Dockerfile
+    image: srw-vpn:dev
+    container_name: srw-vpn-workstation
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - label:disable
+    devices:
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - ./certs:/etc/vpn/certs:ro
+    ports:
+      - "${VPN_WORKSTATION_PORT_HOST:-8090}:8080"
+    environment:
+      SOCKS_PORT: 1080
+      FORWARD_PORT: 8080
+      FORWARD_TARGET: ${VPN_WORKSTATION_ENDPOINT:-10.18.2.105:8090}
+      VPN_HOST: ${VPN_WORKSTATION_HOST:-${VPN_RESEARCH_HOST:-}}
+      VPN_PORT: ${VPN_WORKSTATION_PORT:-443}
+      VPN_REALM: ${VPN_WORKSTATION_REALM:-${VPN_RESEARCH_REALM:-}}
+      VPN_USER: ${VPN_WORKSTATION_USER:-${VPN_RESEARCH_USER:-}}
+      VPN_PASS: ${VPN_WORKSTATION_PASS:-${VPN_RESEARCH_PASS:-}}
+      VPN_TRUSTED_CERT: ${VPN_WORKSTATION_TRUSTED_CERT:-${VPN_RESEARCH_TRUSTED_CERT:-}}
+    healthcheck:
+      test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
   # ---------------------------------------------------------------------------
   # Container log viewer (Dozzle)
   # ---------------------------------------------------------------------------
@@ -240,6 +292,8 @@ services:
 volumes:
   postgres_dev_data:
     name: srw_postgres_dev_data
+  postgres_vector_dev_data:
+    name: srw_postgres_vector_dev_data
   mongodb_dev_data:
     name: srw_mongodb_dev_data
   neo4j_dev_data:

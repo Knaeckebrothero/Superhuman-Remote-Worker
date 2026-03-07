@@ -2,7 +2,8 @@
 """Database initialization for the orchestrator.
 
 This module provides database initialization functionality for:
-- PostgreSQL (jobs, agents, requirements, citations)
+- PostgreSQL App DB (jobs, agents, requirements, datasources, builder)
+- PostgreSQL Vector DB (citations, sources, memories, knowledge_index)
 - MongoDB (LLM request archiving, optional)
 
 Can be used standalone or imported by the root init.py.
@@ -164,6 +165,239 @@ async def init_postgres(force_reset: bool = False) -> bool:
 
     finally:
         await db.close()
+
+
+# =============================================================================
+# Vector DB Initialization
+# =============================================================================
+
+def get_vector_connection_string() -> Optional[str]:
+    """Get Vector DB connection string from environment.
+
+    Returns None if VECTOR_DB_URL is not set (single-DB mode).
+    """
+    return os.getenv("VECTOR_DB_URL")
+
+
+async def init_vector_db(force_reset: bool = False) -> bool:
+    """Initialize the Vector DB (citations, memories + knowledge_index).
+
+    Requires VECTOR_DB_URL to be set.
+
+    Args:
+        force_reset: If True, drop all tables and recreate.
+
+    Returns:
+        True if successful, False on error.
+    """
+    vector_url = get_vector_connection_string()
+    if not vector_url:
+        logger.warning("  VECTOR_DB_URL not set — vector DB will not be initialized")
+        return False
+
+    try:
+        from orchestrator.database.postgres import PostgresDB, VECTOR_REQUIRED_TABLES
+    except ImportError as e:
+        logger.error(f"  Could not import PostgresDB: {e}")
+        return False
+
+    db_name = vector_url.split('/')[-1].split('?')[0]
+    logger.info(f"  Database: {db_name}")
+
+    db = PostgresDB(vector_url)
+
+    try:
+        # Create database if it doesn't exist
+        try:
+            created = await db.create_database_if_not_exists()
+            if created:
+                logger.info(f"  Created database: {db_name}")
+        except Exception as e:
+            logger.warning(f"  Could not check/create database: {e}")
+
+        await db.connect()
+
+        if force_reset:
+            logger.info("  Resetting vector schema (dropping all tables)...")
+            async with db.acquire() as conn:
+                await conn.execute("DROP TABLE IF EXISTS source_embeddings CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS source_tags CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS source_annotations CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS citations CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS job_sources CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS sources CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS memories CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS knowledge_index CASCADE")
+                await conn.execute("DROP FUNCTION IF EXISTS memory_hybrid_search CASCADE")
+                await conn.execute("DROP FUNCTION IF EXISTS knowledge_hybrid_search CASCADE")
+                await conn.execute("DROP TYPE IF EXISTS source_type CASCADE")
+                await conn.execute("DROP TYPE IF EXISTS confidence_level CASCADE")
+                await conn.execute("DROP TYPE IF EXISTS extraction_method CASCADE")
+                await conn.execute("DROP TYPE IF EXISTS verification_status CASCADE")
+
+        # Apply vector schema
+        vector_schema_file = Path(__file__).parent / "database" / "vector_schema.sql"
+        if vector_schema_file.exists():
+            schema_sql = vector_schema_file.read_text()
+            async with db.acquire() as conn:
+                await conn.execute(schema_sql)
+            logger.info("  Applied vector_schema.sql")
+        else:
+            logger.error(f"  vector_schema.sql not found at {vector_schema_file}")
+            return False
+
+        # Verify tables
+        logger.info("  Verifying vector tables:")
+        async with db.acquire() as conn:
+            for table in VECTOR_REQUIRED_TABLES:
+                exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = $1)", table,
+                )
+                status = "ok" if exists else "MISSING"
+                logger.info(f"    {table}: {status}")
+                if not exists:
+                    return False
+
+        return True
+
+    except Exception as e:
+        logger.error(f"  Vector DB initialization failed: {e}")
+        return False
+
+    finally:
+        await db.close()
+
+
+async def verify_vector_db() -> dict:
+    """Verify Vector DB connectivity and tables.
+
+    Returns:
+        Dict with 'configured', 'connected', 'tables', and any error info.
+    """
+    vector_url = get_vector_connection_string()
+    if not vector_url:
+        return {"configured": False}
+
+    try:
+        from orchestrator.database.postgres import PostgresDB, VECTOR_REQUIRED_TABLES
+    except ImportError:
+        return {"configured": True, "connected": False, "error": "asyncpg not installed"}
+
+    db = PostgresDB(vector_url)
+
+    try:
+        await db.connect()
+        tables = {}
+        async with db.acquire() as conn:
+            for table in VECTOR_REQUIRED_TABLES:
+                exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = $1)", table,
+                )
+                tables[table] = exists
+        return {
+            "configured": True,
+            "connected": True,
+            "tables": tables,
+            "all_tables_exist": all(tables.values()),
+        }
+    except Exception as e:
+        return {"configured": True, "connected": False, "error": str(e)}
+    finally:
+        if db.is_connected:
+            await db.close()
+
+
+def backup_vector_db(backup_file: Path) -> bool:
+    """Backup Vector DB using pg_dump.
+
+    Args:
+        backup_file: Path to write the backup file.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    vector_url = get_vector_connection_string()
+    if not vector_url:
+        logger.info("  Vector DB not configured (VECTOR_DB_URL not set)")
+        return False
+
+    params = _parse_connection_string(vector_url)
+
+    cmd = [
+        "pg_dump",
+        "-h", params["host"],
+        "-p", params["port"],
+        "-U", params["user"],
+        "-d", params["database"],
+        "-F", "c",  # Custom format (compressed)
+        "-f", str(backup_file),
+    ]
+
+    env = os.environ.copy()
+    env["PGPASSWORD"] = params["password"]
+
+    logger.info(f"  Running pg_dump for vector database: {params['database']}")
+
+    try:
+        subprocess.run(cmd, env=env, capture_output=True, text=True, check=True)
+        logger.info(f"  Backup created: {backup_file}")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"  pg_dump failed: {e.stderr}")
+        return False
+    except FileNotFoundError:
+        logger.error("  pg_dump not found. Is PostgreSQL client installed?")
+        return False
+
+
+def restore_vector_db(backup_file: Path) -> bool:
+    """Restore Vector DB from pg_dump backup.
+
+    Args:
+        backup_file: Path to the backup file.
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    if not backup_file.exists():
+        logger.error(f"  Backup file not found: {backup_file}")
+        return False
+
+    vector_url = get_vector_connection_string()
+    if not vector_url:
+        logger.info("  Vector DB not configured (VECTOR_DB_URL not set)")
+        return False
+
+    params = _parse_connection_string(vector_url)
+
+    env = os.environ.copy()
+    env["PGPASSWORD"] = params["password"]
+
+    cmd = [
+        "pg_restore",
+        "-h", params["host"],
+        "-p", params["port"],
+        "-U", params["user"],
+        "-d", params["database"],
+        "--clean",
+        "--if-exists",
+        str(backup_file),
+    ]
+
+    logger.info(f"  Running pg_restore for vector database: {params['database']}")
+
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if result.returncode != 0 and "error" in result.stderr.lower():
+            logger.warning(f"  pg_restore warnings: {result.stderr[:200]}")
+        logger.info(f"  Restore completed from: {backup_file}")
+        return True
+    except FileNotFoundError:
+        logger.error("  pg_restore not found. Is PostgreSQL client installed?")
+        return False
 
 
 async def verify_postgres() -> dict:
@@ -1038,6 +1272,13 @@ async def init_databases(
             # MongoDB failures are non-fatal
             logger.warning("MongoDB initialization had issues")
 
+    # Vector DB (memories + knowledge_index) — skip if not configured
+    if not skip_postgres:
+        logger.info("")
+        logger.info("Initializing Vector DB...")
+        if not await init_vector_db(force_reset):
+            logger.warning("Vector DB initialization had issues (non-fatal in single-DB mode)")
+
     # Neo4j (system knowledge base) — non-fatal if not configured
     logger.info("")
     logger.info("Initializing Neo4j (knowledge base)...")
@@ -1063,6 +1304,7 @@ async def verify_databases(
 
     if not skip_postgres:
         result["postgres"] = await verify_postgres()
+        result["vector_db"] = await verify_vector_db()
 
     if not skip_mongodb:
         result["mongodb"] = await verify_mongodb()

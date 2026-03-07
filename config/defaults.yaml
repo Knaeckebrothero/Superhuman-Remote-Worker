@@ -162,7 +162,7 @@ memory:
   observer_interval: 5             # Run observer every N turns
   observer_model: null             # null = use main LLM, or specify model
   observer_base_url: null          # null = use main LLM_BASE_URL
-  embedding_model: text-embedding-3-small
+  embedding_model: qwen3-embedding-8b
   dense_results: 5                 # Top-K for dense vector search
   sparse_results: 5                # Top-K for sparse/keyword search
   recent_results: 3                # Number of recent memories to include
@@ -208,7 +208,7 @@ shell:
   max_read_lines: 200          # Maximum lines shell_read can return
   scrollback_limit: 5000       # Tmux history-limit per pane
   default_timeout: 120         # Default timeout for shell_execute sync mode (seconds)
-  blocked_commands: [sudo, reboot, shutdown, poweroff, halt, init, systemctl]
+  blocked_commands: [reboot, shutdown, poweroff, halt, init]  # sudo/systemctl allowed for remote server management
   sandbox: true                # Restrict working directory to workspace
   auto_start_claude_code: false # Auto-open a Claude Code tab on job start (requires claude CLI)
 

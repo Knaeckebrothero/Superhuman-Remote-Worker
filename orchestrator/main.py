@@ -68,6 +68,12 @@ postgres_db = PostgresDB()
 mongodb = MongoDB()
 gitea_client = GiteaClient()
 
+# Vector DB — separate pgvector instance for citations, memories + knowledge_index.
+_vector_url = os.getenv("VECTOR_DB_URL")
+if not _vector_url:
+    raise RuntimeError("VECTOR_DB_URL environment variable is required")
+vector_db = PostgresDB(connection_string=_vector_url)
+
 
 async def resolve_job_repo(job_id: str) -> tuple[str, str | None]:
     """Resolve the Gitea repo name and branch for a job.
@@ -418,6 +424,12 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if resolved_ds:
             config_override = _build_datasource_tool_override(resolved_ds, config_override)
 
+        # Extract queued feedback (stored by resume endpoint when no agent was available)
+        job_context = job.get("context") or {}
+        if isinstance(job_context, str):
+            job_context = json.loads(job_context)
+        queued_feedback = job_context.pop("queued_feedback", None)
+
         resume_payload = {
             "job_id": job_id,
             "config_name": job.get("config_name", "default"),
@@ -425,6 +437,13 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             "datasources": datasources_payload,
             "previous_status": job.get("status"),
         }
+        if queued_feedback:
+            resume_payload["feedback"] = queued_feedback
+            # Clean up queued_feedback from context so it's not re-injected
+            await postgres_db.pool.execute(
+                "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                json.dumps(job_context), job_id,
+            )
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -888,6 +907,7 @@ async def lifespan(app: FastAPI):
 
     # Connect to databases
     await postgres_db.connect()
+    await vector_db.connect()
     await mongodb.connect()
 
     # Share MongoDB instance with graph_routes
@@ -915,6 +935,7 @@ async def lifespan(app: FastAPI):
 
     # Disconnect from databases
     await mongodb.disconnect()
+    await vector_db.disconnect()
     await postgres_db.disconnect()
 
 
@@ -1251,6 +1272,18 @@ async def delete_job(job_id: str) -> dict[str, str]:
                 if repos:
                     await gitea_client.delete_branch(repos[0]["name"], job["branch_name"])
 
+        # Clean up vector DB tables (no FK cascade across databases)
+        try:
+            async with vector_db.acquire() as conn:
+                await conn.execute("DELETE FROM memories WHERE job_id = $1", UUID(job_id))
+                await conn.execute("DELETE FROM citations WHERE job_id = $1", UUID(job_id))
+                await conn.execute("DELETE FROM source_annotations WHERE job_id = $1", UUID(job_id))
+                await conn.execute("DELETE FROM source_tags WHERE job_id = $1", UUID(job_id))
+                await conn.execute("DELETE FROM source_embeddings WHERE job_id = $1", UUID(job_id))
+                await conn.execute("DELETE FROM job_sources WHERE job_id = $1", UUID(job_id))
+        except Exception as e:
+            logger.warning(f"Failed to clean up vector DB tables for job {job_id}: {e}")
+
         success = await postgres_db.delete_job(job_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
@@ -1463,14 +1496,46 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         if agent_id:
             agent = await postgres_db.get_agent(agent_id)
 
-        # If no agent or agent is offline/unavailable, find a ready one
-        if not agent or agent["status"] in ("offline", "failed"):
+        # If no agent or agent is unavailable, find a ready one.
+        # Includes "working" because critic verdict handlers call resume while the
+        # same agent is still finishing post-completion work (agent clears its job
+        # status after the graph loop but before the heartbeat propagates).
+        if not agent or agent["status"] in ("offline", "failed", "working"):
             ready_agents = await postgres_db.list_agents(status="ready", limit=1)
             if not ready_agents:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No ready agents available to resume job.",
+                # No agent available right now — queue job for auto-dispatch.
+                # Store feedback in context so it's available when dispatched,
+                # set status to 'paused' (dispatchable), and let the dispatcher
+                # pick it up when an agent becomes free.
+                feedback = request.feedback if request else None
+                if feedback:
+                    job_context = job.get("context") or {}
+                    if isinstance(job_context, str):
+                        try:
+                            job_context = json.loads(job_context)
+                        except json.JSONDecodeError:
+                            job_context = {}
+                    job_context["queued_feedback"] = feedback
+                    await postgres_db.pool.execute(
+                        "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                        json.dumps(job_context), job_id,
+                    )
+
+                await postgres_db.update_job_status(
+                    job_id=job_id,
+                    status="paused",
+                    assigned_agent_id=None,
                 )
+                logger.info(
+                    f"No agents available — queued job {job_id} for auto-dispatch "
+                    f"(previous status: {job['status']}, feedback: {bool(feedback)})"
+                )
+                _trigger_dispatch()
+                return {
+                    "status": "queued",
+                    "message": "No agents available, job queued for auto-dispatch",
+                    "job_id": job_id,
+                }
             agent = ready_agents[0]
             agent_id = str(agent["id"])
             logger.info(f"Auto-selected agent {agent_id} for job resume")
@@ -1494,7 +1559,6 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         # Handle context - might be dict or JSON string depending on DB driver
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
-            import json
             try:
                 job_context = json.loads(job_context)
             except json.JSONDecodeError:
@@ -1503,7 +1567,6 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         # Same for config_override
         config_override = job.get("config_override")
         if isinstance(config_override, str):
-            import json
             try:
                 config_override = json.loads(config_override)
             except json.JSONDecodeError:
@@ -2769,7 +2832,7 @@ async def list_sources(
     When omitted, returns all sources across jobs.
     """
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             conditions = []
             params: list[Any] = []
             idx = 1
@@ -2828,7 +2891,7 @@ async def get_source_detail(
 ) -> dict[str, Any]:
     """Get full detail for a single source."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             if content_limit > 0:
                 row = await conn.fetchrow(
                     """SELECT id, type::text as type, identifier, name, version,
@@ -2877,7 +2940,7 @@ async def list_job_citations(
 ) -> dict[str, Any]:
     """List citations for a job with optional filters."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             conditions = ["c.job_id = $1::uuid"]
             params: list[Any] = [job_id]
             idx = 2
@@ -2924,7 +2987,7 @@ async def list_job_citations(
 async def get_citation_detail(citation_id: int) -> dict[str, Any]:
     """Get full citation record with source info and verification details."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT c.id, c.job_id, c.claim, c.verbatim_quote, c.quote_context,
                       c.quote_language, c.relevance_reasoning,
@@ -2959,7 +3022,7 @@ async def get_source_annotations(
 ) -> list[dict[str, Any]]:
     """Get annotations for a source within a job."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             if type:
                 rows = await conn.fetch(
                     """SELECT id, annotation_type, content, page_reference, created_at, created_by
@@ -2986,7 +3049,7 @@ async def get_source_annotations(
 async def get_source_tags(job_id: str, source_id: int) -> list[str]:
     """Get tags for a source within a job."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT tag FROM source_tags WHERE source_id = $1 AND job_id = $2::uuid ORDER BY tag",
                 source_id, job_id,
@@ -3000,7 +3063,7 @@ async def get_source_tags(job_id: str, source_id: int) -> list[str]:
 async def get_citation_stats(job_id: str) -> dict[str, Any]:
     """Get citation statistics for a job."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             # Sources by type
             source_rows = await conn.fetch(
                 """SELECT s.type::text as type, COUNT(*) as count
@@ -3070,7 +3133,7 @@ async def search_job_sources(
     the CitationEngine with pgvector.
     """
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             # Build conditions for source filtering
             conditions = ["js.job_id = $1::uuid"]
             params: list[Any] = [job_id]
@@ -4091,6 +4154,13 @@ async def delete_project(project_id: str) -> dict[str, str]:
         if repo.get("is_managed") and gitea_client.is_initialized:
             await gitea_client.delete_repo(repo["name"])
 
+    # Clean up knowledge_index in vector DB (no FK cascade across databases)
+    try:
+        async with vector_db.acquire() as conn:
+            await conn.execute("DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id))
+    except Exception as e:
+        logger.warning(f"Failed to clean up knowledge_index for project {project_id}: {e}")
+
     success = await postgres_db.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete project")
@@ -4599,7 +4669,7 @@ async def get_knowledge_summary(project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
 
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             # Counts by type
             type_rows = await conn.fetch(
                 "SELECT note_type, COUNT(*) as cnt FROM knowledge_index "
@@ -4654,7 +4724,7 @@ async def list_knowledge_notes(
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
 
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             conditions = ["project_id = $1"]
             params: list[Any] = [project_id]
             idx = 2
@@ -4708,7 +4778,7 @@ async def list_knowledge_notes(
 async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
     """Get a single knowledge note with full content."""
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM knowledge_index "
                 "WHERE project_id = $1 AND note_id = $2",
@@ -4753,7 +4823,7 @@ async def search_knowledge(
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
 
     try:
-        async with postgres_db.acquire() as conn:
+        async with vector_db.acquire() as conn:
             # Try dense+sparse search if embedding service available
             embedding = None
             try:
@@ -4807,8 +4877,8 @@ async def update_knowledge_note(
         )
 
     try:
-        # Update PostgreSQL search index
-        async with postgres_db.acquire() as conn:
+        # Update PostgreSQL search index (vector DB)
+        async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT note_id FROM knowledge_index "
                 "WHERE project_id = $1 AND note_id = $2",
@@ -4876,8 +4946,8 @@ async def update_knowledge_note(
 async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]:
     """Hard delete a knowledge note from both stores."""
     try:
-        # Delete from PostgreSQL
-        async with postgres_db.acquire() as conn:
+        # Delete from vector DB
+        async with vector_db.acquire() as conn:
             result = await conn.execute(
                 "DELETE FROM knowledge_index "
                 "WHERE project_id = $1 AND note_id = $2",

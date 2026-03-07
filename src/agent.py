@@ -276,6 +276,18 @@ class UniversalAgent:
             else:
                 logger.warning("DATABASE_URL not set, PostgreSQL unavailable")
 
+        # Vector DB connection (for citations, memories + knowledge index)
+        vector_url = os.getenv("VECTOR_DB_URL")
+        if vector_url:
+            from src.database.postgres_db import PostgresDB as _VectorDB
+
+            self.vector_conn = _VectorDB(connection_string=vector_url)
+            await self.vector_conn.connect()
+            logger.info("Vector DB connection established (separate instance)")
+        else:
+            logger.warning("VECTOR_DB_URL not set, vector features unavailable")
+            self.vector_conn = None
+
     async def process_job(
         self,
         job_id: str,
@@ -1257,7 +1269,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
                 embedding_service = get_embedding_service()
                 recall_store = RecallStore(
-                    db=self.postgres_conn,
+                    db=self.vector_conn,
                     embedding_service=embedding_service,
                     job_id=_uuid.UUID(self._current_job_id),
                     config=self.config.memory,
@@ -2105,6 +2117,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._shutdown_requested = True
 
         # Close database connections
+        if hasattr(self, 'vector_conn') and self.vector_conn and self.vector_conn is not self.postgres_conn:
+            try:
+                await self.vector_conn.close()
+            except Exception as e:
+                logger.warning(f"Error closing Vector DB: {e}")
+
         if self.postgres_conn:
             try:
                 # PostgresDB uses close() not disconnect()

@@ -741,7 +741,7 @@ class MemoryConfig:
     observer_interval: int = 5
     observer_model: Optional[str] = None
     observer_base_url: Optional[str] = None
-    embedding_model: str = "text-embedding-3-small"
+    embedding_model: str = "qwen3-embedding-8b"
     dense_results: int = 5
     sparse_results: int = 5
     recent_results: int = 3
@@ -860,7 +860,7 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         observer_interval=data.get("observer_interval", 5),
         observer_model=data.get("observer_model"),
         observer_base_url=data.get("observer_base_url"),
-        embedding_model=data.get("embedding_model", "text-embedding-3-small"),
+        embedding_model=data.get("embedding_model", "qwen3-embedding-8b"),
         dense_results=data.get("dense_results", 5),
         sparse_results=data.get("sparse_results", 5),
         recent_results=data.get("recent_results", 3),
@@ -1778,11 +1778,16 @@ def _create_openrouter_llm(
 
     # OpenRouter uses nested reasoning object format.
     # OpenRouter supports all levels (none, minimal, low, medium, high, xhigh) — no clamping needed.
+    # Pass as first-class parameter (not model_kwargs) to avoid LangChain warning.
+    reasoning_kwargs = {}
     if config.reasoning_level and config.reasoning_level != "none":
-        model_kwargs["reasoning"] = {"effort": config.reasoning_level}
+        reasoning_kwargs["reasoning"] = {"effort": config.reasoning_level}
 
+    # top_k must go in extra_body, not model_kwargs — the Responses API
+    # (triggered by reasoning) rejects unknown keyword arguments.
+    extra_body = {}
     if config.top_k is not None:
-        model_kwargs["top_k"] = config.top_k
+        extra_body["top_k"] = config.top_k
 
     # Build kwargs for ReasoningChatOpenAI
     llm_kwargs = {
@@ -1811,6 +1816,11 @@ def _create_openrouter_llm(
 
     if model_kwargs:
         llm_kwargs["model_kwargs"] = model_kwargs
+
+    # Merge reasoning as first-class kwarg and extra_body for provider-specific params
+    llm_kwargs.update(reasoning_kwargs)
+    if extra_body:
+        llm_kwargs["extra_body"] = extra_body
 
     if config.max_output_tokens is not None:
         llm_kwargs["max_tokens"] = config.max_output_tokens
