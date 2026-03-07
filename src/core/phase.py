@@ -789,13 +789,25 @@ def finalize_job(
 
     # Edge case: critic job reached finalize_job without verdict data.
     # This means the critic called job_complete instead of an evaluation tool.
+    # Treat as implicit approval so the target job doesn't get stuck in "reviewing".
     metadata = state.get("metadata") or {}
     if metadata.get("verification_target"):
+        target_job_id = metadata["verification_target"]
         logger.warning(
             f"[{job_id}] Critic job finalizing WITHOUT verdict data. "
-            f"The critic likely called job_complete instead of approve_job/return_job_with_feedback. "
-            f"Target job {metadata['verification_target']} will remain in 'reviewing' status."
+            f"The critic called job_complete instead of approve_job/return_job_with_feedback. "
+            f"Synthesizing implicit approval for target job {target_job_id}."
         )
+        final_data = get_final_phase_data(job_id)
+        clear_final_phase_data(job_id)
+        implicit_verdict = {
+            "_verdict": "approved",
+            "_target_job_id": target_job_id,
+            "report": (final_data or {}).get("summary", "Critic completed without explicit verdict — implicit approval."),
+            "strengths": [],
+            "minor_notes": ["Critic used job_complete instead of approve_job — treated as implicit approval."],
+        }
+        return _finalize_with_verdict(state, workspace, todo_manager, implicit_verdict, job_id)
 
     # Get the final phase data (set by job_complete tool)
     final_data = get_final_phase_data(job_id)

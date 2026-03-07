@@ -503,6 +503,7 @@ class PostgresDB:
                        assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
                        branch_name, repo_name, merge_status, repo_merge_statuses,
+                       freeze_data,
                        created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1
