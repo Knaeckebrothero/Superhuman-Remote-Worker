@@ -740,6 +740,14 @@ class JobStartRequest(BaseModel):
     )
 
 
+class JobCompleteRequest(BaseModel):
+    """Result payload sent by the agent after a job finishes processing."""
+
+    should_stop: bool = Field(False, description="Whether the graph stopped")
+    goal_achieved: bool = Field(False, description="Whether the goal was achieved")
+    error: dict[str, Any] | None = Field(None, description="Error dict if job failed")
+
+
 class BuilderSessionCreate(BaseModel):
     """Request body for creating a builder session."""
 
@@ -1798,6 +1806,512 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
         raise
     except Exception as e:
         logger.exception(f"Failed to approve job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Job Completion Handling (orchestrator-side)
+# =============================================================================
+
+async def _internal_resume_job(job_id: str, feedback: str) -> None:
+    """Queue a job for resume via the auto-dispatcher.
+
+    Stores feedback in the job's context as ``queued_feedback``, sets status
+    to ``paused`` (dispatchable), and triggers the dispatcher.  Avoids HTTP
+    self-calls — the dispatcher will pick it up and send it to an agent.
+    """
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        logger.warning(f"_internal_resume_job: job {job_id} not found")
+        return
+
+    # Store feedback in context
+    job_context = job.get("context") or {}
+    if isinstance(job_context, str):
+        try:
+            job_context = json.loads(job_context)
+        except json.JSONDecodeError:
+            job_context = {}
+    job_context["queued_feedback"] = feedback
+    await postgres_db.pool.execute(
+        "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+        json.dumps(job_context), job_id,
+    )
+
+    await postgres_db.update_job_status(
+        job_id=job_id,
+        status="paused",
+        assigned_agent_id=None,
+    )
+    logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
+    _trigger_dispatch()
+
+
+async def _set_target_to_autonomy_status(target_job_id: str) -> str:
+    """Set a target job's status based on its autonomy level.
+
+    Reads ``resolved_config`` from the target job to determine autonomy:
+      - ``full`` -> ``completed``
+      - anything else -> ``pending_review``
+
+    Returns:
+        The new status string.
+    """
+    from orchestrator.services.completion import get_autonomy_level
+
+    job = await postgres_db.get_job(target_job_id)
+    if not job:
+        logger.warning(f"_set_target_to_autonomy_status: job {target_job_id} not found")
+        return "unknown"
+
+    autonomy = get_autonomy_level(job)
+
+    if autonomy == "full":
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1::uuid",
+                target_job_id,
+            )
+        logger.info(f"Set target job {target_job_id} to 'completed' (autonomy=full)")
+        return "completed"
+    else:
+        await postgres_db.update_job_status(target_job_id, status="pending_review")
+        logger.info(f"Set target job {target_job_id} to 'pending_review' (autonomy={autonomy})")
+        return "pending_review"
+
+
+async def _handle_critic_verdict_on_complete(
+    job: dict[str, Any],
+    actions: list[str],
+) -> None:
+    """Handle deferred critic verdict after a critic job completes.
+
+    If this job has a parent_job_id and freeze_data with a verdict,
+    process the approve/return logic.
+    """
+    from orchestrator.services.completion import (
+        _parse_freeze_data,
+        get_curation_config,
+        is_curation_enabled,
+    )
+
+    parent_job_id = job.get("parent_job_id")
+    if parent_job_id is None:
+        return  # Not a critic job
+
+    job_id = str(job["id"])
+    target_job_id = str(parent_job_id)
+
+    freeze_data = _parse_freeze_data(job)
+    if not freeze_data:
+        logger.debug(f"No freeze_data for critic job {job_id} — no verdict to process")
+        return
+
+    verdict = freeze_data.get("verdict")
+    if not verdict:
+        # Critic completed without using approve_job/return_job_with_feedback.
+        # If the job completed normally (not failed), treat as implicit approval
+        # so the target job doesn't get stuck in "reviewing".
+        if job.get("status") == "completed":
+            logger.warning(
+                f"Critic job {job_id} completed without verdict — "
+                f"treating as implicit approval for target {target_job_id}"
+            )
+            verdict = "approved"
+        else:
+            logger.debug(f"No verdict in freeze_data for critic job {job_id}")
+            return
+
+    # Parse critic context for round tracking
+    ctx_raw = job.get("context")
+    if isinstance(ctx_raw, str):
+        try:
+            critic_context = json.loads(ctx_raw)
+        except (json.JSONDecodeError, ValueError):
+            critic_context = {}
+    else:
+        critic_context = ctx_raw or {}
+
+    if verdict == "approved":
+        logger.info(f"Critic {job_id} approved target {target_job_id}")
+        new_status = await _set_target_to_autonomy_status(target_job_id)
+        actions.append(f"target {target_job_id} set to '{new_status}' (approved)")
+
+        # Trigger curator final pass if curation is enabled on the TARGET job
+        target_job = await postgres_db.get_job(target_job_id)
+        if target_job and is_curation_enabled(target_job):
+            await _trigger_curation_final_pass(target_job_id, target_job)
+            actions.append(f"curation final pass triggered for {target_job_id}")
+
+    elif verdict == "returned":
+        current_round = critic_context.get("verification_round", 0)
+        max_rounds = critic_context.get("max_verification_rounds", 3)
+
+        if current_round >= max_rounds:
+            # Round limit reached — auto-accept
+            logger.warning(
+                f"Critic {job_id} returned feedback but round limit reached "
+                f"({current_round}/{max_rounds}). Auto-accepting target {target_job_id}."
+            )
+            await postgres_db.update_job_status(
+                job_id,
+                status="failed",
+                error_message=f"Verification limit reached ({max_rounds} rounds)",
+            )
+            new_status = await _set_target_to_autonomy_status(target_job_id)
+            actions.append(
+                f"critic {job_id} failed (round limit), "
+                f"target {target_job_id} auto-accepted to '{new_status}'"
+            )
+            # Trigger curation even on auto-accept
+            target_job = await postgres_db.get_job(target_job_id)
+            if target_job and is_curation_enabled(target_job):
+                await _trigger_curation_final_pass(target_job_id, target_job)
+                actions.append(f"curation final pass triggered for {target_job_id}")
+        else:
+            # Resume target with feedback
+            feedback = freeze_data.get("feedback", "")
+            logger.info(
+                f"Critic {job_id} returned feedback for target {target_job_id} "
+                f"(round {current_round}/{max_rounds})"
+            )
+            await _internal_resume_job(target_job_id, feedback=feedback)
+            actions.append(f"target {target_job_id} resumed with feedback (round {current_round})")
+    else:
+        logger.warning(f"Unknown verdict '{verdict}' for critic job {job_id}")
+
+
+async def _trigger_verification_on_complete(
+    job: dict[str, Any],
+    result: dict[str, Any],
+    actions: list[str],
+) -> None:
+    """Spawn or resume a critic verification job after a main job completes.
+
+    Guards:
+    1. No error, should_stop is True
+    2. Not a subjob (no parent_job_id)
+    3. freeze_data indicates job completion (not phase boundary)
+    4. Verification enabled in resolved_config
+    """
+    from orchestrator.services.completion import (
+        _parse_freeze_data,
+        format_verification_instructions,
+        get_verification_config,
+        is_job_completion_freeze,
+        is_verification_enabled,
+    )
+
+    job_id = str(job["id"])
+
+    # Guards
+    if result.get("error"):
+        return
+    if not result.get("should_stop", False):
+        return
+    if job.get("parent_job_id") is not None:
+        logger.debug(f"Skipping verification for {job_id} — it is a sub-job")
+        return
+    if not is_verification_enabled(job):
+        logger.debug(f"Verification not enabled for job {job_id}")
+        return
+    if not is_job_completion_freeze(job):
+        logger.debug(f"Skipping verification for {job_id} — not a job completion freeze")
+        return
+
+    verification_config = get_verification_config(job)
+    freeze_data = _parse_freeze_data(job) or {}
+
+    # Check for an existing waiting critic job (subsequent rounds)
+    async with postgres_db.acquire() as conn:
+        critic_row = await conn.fetchrow(
+            "SELECT id, status, context FROM jobs "
+            "WHERE parent_job_id = $1::uuid AND status = 'waiting'",
+            job_id,
+        )
+
+    if critic_row:
+        # Subsequent round: resume existing critic
+        critic_id = str(critic_row["id"])
+        ctx_raw = critic_row.get("context")
+        if isinstance(ctx_raw, str):
+            try:
+                critic_context = json.loads(ctx_raw)
+            except (json.JSONDecodeError, ValueError):
+                critic_context = {}
+        else:
+            critic_context = ctx_raw or {}
+
+        new_round = critic_context.get("verification_round", 0) + 1
+        critic_context["verification_round"] = new_round
+        critic_context["deliverables"] = freeze_data.get("deliverables", [])
+        critic_context["summary"] = freeze_data.get("summary", "")
+        critic_context["confidence"] = freeze_data.get("confidence", 0)
+
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                json.dumps(critic_context), critic_id,
+            )
+
+        logger.info(f"Resuming existing critic {critic_id} for job {job_id} (round {new_round})")
+        await _internal_resume_job(
+            critic_id,
+            feedback=(
+                f"Target job addressed your feedback (round {new_round}). "
+                f"Review the updated deliverables and either approve or return with new feedback."
+            ),
+        )
+        actions.append(f"critic {critic_id} resumed (round {new_round})")
+    else:
+        # First round: create new critic job
+        critic_config = verification_config.get("critic_config", "critic")
+        max_rounds = verification_config.get("max_rounds", 3)
+        config_name = job.get("config_name", "unknown")
+
+        # Format instructions
+        instructions = format_verification_instructions(
+            job_id=job_id,
+            description=job.get("description", ""),
+            freeze_data=freeze_data,
+            config_name=config_name,
+        )
+        if not instructions:
+            logger.error(f"Failed to format verification instructions for job {job_id}")
+            return
+
+        verification_description = (
+            f"Verify deliverables of job {job_id} ({config_name}). "
+            f"Review output against original requirements and either approve or return with feedback."
+        )
+
+        context = {
+            "verification_target": job_id,
+            "original_description": job.get("description", ""),
+            "original_config": config_name,
+            "deliverables": freeze_data.get("deliverables", []),
+            "summary": freeze_data.get("summary", ""),
+            "confidence": freeze_data.get("confidence", 0),
+            "verification_round": 0,
+            "max_verification_rounds": max_rounds,
+        }
+
+        config_override = {
+            "autonomy": "full",
+            "tools": {
+                "evaluation": ["approve_job", "return_job_with_feedback"],
+            },
+            "llm": {
+                "model": "openrouter/minimax/minimax-m2.5",
+                "reasoning_level": "xhigh",
+                "strategic": {
+                    "model": "openrouter/minimax/minimax-m2.5",
+                    "reasoning_level": "xhigh",
+                },
+                "tactical": {
+                    "model": "openrouter/minimax/minimax-m2.5",
+                    "reasoning_level": "xhigh",
+                },
+            },
+        }
+
+        project_id = str(job["project_id"]) if job.get("project_id") else None
+
+        logger.info(
+            f"Creating verification job for {job_id} "
+            f"(critic_config={critic_config}, max_rounds={max_rounds})"
+        )
+
+        critic_job = await postgres_db.create_job(
+            description=verification_description,
+            config_name=critic_config,
+            config_override=config_override,
+            context=context,
+            parent_job_id=job_id,
+            project_id=project_id,
+            priority=10,
+        )
+
+        critic_job_id = str(critic_job["id"])
+        short_id = critic_job_id[:8]
+
+        # Set up Gitea branch for the subjob (same logic as create_job endpoint)
+        if gitea_client.is_initialized:
+            parent_repo_name = job.get("repo_name")
+            if not parent_repo_name:
+                parent_repo_name = f"job-{str(job['id'])[:8]}"
+
+            from_branch = job.get("branch_name") or "main"
+            branch_name = f"subjob/{short_id}/{critic_config}"
+            try:
+                await gitea_client.create_branch(
+                    parent_repo_name, branch_name, from_branch=from_branch
+                )
+                # Propagate git remote URL and update branch/repo on the critic job
+                parent_context = job.get("context") or {}
+                if isinstance(parent_context, str):
+                    try:
+                        parent_context = json.loads(parent_context)
+                    except (json.JSONDecodeError, ValueError):
+                        parent_context = {}
+                git_remote_url = parent_context.get("git_remote_url", "")
+
+                critic_ctx = dict(context)
+                critic_ctx["git_remote_url"] = git_remote_url
+                await postgres_db.update_job_context(critic_job_id, critic_ctx)
+
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3::uuid",
+                        branch_name, parent_repo_name, critic_job_id,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to create Gitea branch for critic {critic_job_id}: {e}")
+
+        _trigger_dispatch()
+        actions.append(f"critic job {critic_job_id} created")
+        logger.info(f"Verification job {critic_job_id} created for job {job_id}")
+
+
+async def _trigger_curation_final_pass(
+    target_job_id: str,
+    target_job: dict[str, Any] | None = None,
+) -> None:
+    """Resume the waiting curator with a final-pass signal.
+
+    Called after critic approval (or auto-accept) when curation is enabled.
+    """
+    from orchestrator.services.completion import get_curation_config, is_curation_enabled
+
+    if target_job is None:
+        target_job = await postgres_db.get_job(target_job_id)
+    if not target_job:
+        return
+    if not is_curation_enabled(target_job):
+        return
+
+    curator_config_name = get_curation_config(target_job).get("curator_config", "curator")
+
+    # Find a waiting curator for this target job
+    async with postgres_db.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, status FROM jobs
+               WHERE parent_job_id = $1::uuid AND config_name = $2
+               AND status IN ('waiting', 'paused')
+               ORDER BY created_at DESC LIMIT 1""",
+            target_job_id, curator_config_name,
+        )
+
+    if not row:
+        logger.debug(f"No waiting curator found for job {target_job_id}")
+        return
+
+    if row["status"] == "completed":
+        return
+
+    curator_id = str(row["id"])
+    logger.info(f"Triggering curation final pass via curator {curator_id} for {target_job_id}")
+    await _internal_resume_job(
+        curator_id,
+        feedback=(
+            "FINAL CURATION PASS. The target job has been approved by the critic. "
+            "Do a comprehensive final sweep: read memories, output/, and the final "
+            "workspace.md. Promote valuable memories to knowledge notes. Write a "
+            "`state` note summarizing what changed. Check for open questions. "
+            "Link all notes. Then call job_complete."
+        ),
+    )
+
+
+@app.post("/api/jobs/{job_id}/complete")
+async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, Any]:
+    """Handle job completion reported by the agent.
+
+    The agent calls this after the graph finishes. The orchestrator handles
+    all post-completion logic: status determination, critic verdict handling,
+    verification job spawning, curation final pass, and dispatch.
+
+    This replaces the agent-side ``_update_job_status_from_result``,
+    ``_handle_critic_verdict``, and ``_maybe_trigger_verification`` functions.
+    """
+    from orchestrator.services.completion import (
+        determine_job_status,
+        is_curation_enabled,
+        is_verification_enabled,
+    )
+
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job["status"] not in ("processing", "reviewing"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job cannot be completed (status: {job['status']})",
+            )
+
+        result = request.model_dump()
+        actions: list[str] = []
+
+        # 1. Determine and set the new job status
+        new_status, error_message = determine_job_status(job, result)
+        if new_status:
+            kwargs: dict[str, Any] = {"status": new_status}
+            if error_message:
+                kwargs["error_message"] = error_message
+            await postgres_db.update_job_status(job_id, **kwargs)
+            actions.append(f"status -> {new_status}")
+            logger.info(f"Job {job_id} status set to '{new_status}'")
+
+            # Update job dict with new status for downstream checks
+            job["status"] = new_status
+
+        # 2. Subjob merge (if this is a subjob with a branch)
+        if job.get("parent_job_id"):
+            merge_result = await _squash_merge_subjob(job_id)
+            if merge_result:
+                actions.append("subjob branch merged")
+
+        # 3. Handle critic verdict (if this is a critic job)
+        try:
+            await _handle_critic_verdict_on_complete(job, actions)
+        except Exception as e:
+            logger.error(f"Error handling critic verdict for {job_id}: {e}", exc_info=True)
+
+        # 4. Trigger verification (if this is a main job that completed)
+        try:
+            await _trigger_verification_on_complete(job, result, actions)
+        except Exception as e:
+            logger.error(f"Error triggering verification for {job_id}: {e}", exc_info=True)
+
+        # 5. Curation final pass (if no verification but curation enabled, and goal achieved)
+        if (
+            not is_verification_enabled(job)
+            and is_curation_enabled(job)
+            and result.get("should_stop")
+            and result.get("goal_achieved")
+        ):
+            try:
+                await _trigger_curation_final_pass(job_id, job)
+                actions.append("curation final pass triggered (no verification)")
+            except Exception as e:
+                logger.error(f"Error triggering curation for {job_id}: {e}", exc_info=True)
+
+        # 6. Trigger dispatch (freed agent can pick up queued work)
+        _trigger_dispatch()
+
+        return {
+            "status": "handled",
+            "job_id": job_id,
+            "new_status": new_status or job["status"],
+            "actions": actions,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to handle completion for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

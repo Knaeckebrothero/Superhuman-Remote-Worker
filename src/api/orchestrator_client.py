@@ -480,6 +480,66 @@ class OrchestratorClient:
             logger.error(f"Unexpected error triggering subjob merge: {e}")
             return False
 
+    async def report_completion(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+    ) -> bool:
+        """Report job completion to the orchestrator.
+
+        The orchestrator handles all post-completion logic: status
+        determination, critic verdict handling, verification job spawning,
+        curation final pass, and dispatch.
+
+        Args:
+            job_id: UUID of the completed job
+            result: Final graph state (should_stop, goal_achieved, error)
+
+        Returns:
+            True if the orchestrator handled completion successfully.
+            False on 404 (old orchestrator without endpoint) or failure,
+            signalling the agent should fall back to local handling.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/complete"
+        payload = {
+            "should_stop": result.get("should_stop", False),
+            "goal_achieved": result.get("goal_achieved", False),
+            "error": result.get("error"),
+        }
+
+        try:
+            response = await self._client.post(url, json=payload, timeout=60.0)
+            if response.status_code == 200:
+                resp_data = response.json()
+                actions = resp_data.get("actions", [])
+                logger.info(
+                    f"Orchestrator handled completion for job {job_id}: "
+                    f"status={resp_data.get('new_status')}, actions={actions}"
+                )
+                return True
+            elif response.status_code == 404:
+                logger.info(
+                    "Orchestrator does not support /complete endpoint — "
+                    "falling back to local handling"
+                )
+                return False
+            else:
+                logger.warning(
+                    f"Completion report failed for job {job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+
+        except httpx.RequestError as e:
+            logger.warning(f"Failed to report completion for job {job_id}: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"Unexpected error reporting completion for job {job_id}: {e}")
+            return False
+
     async def create_verification_job(
         self,
         job_id: str,
