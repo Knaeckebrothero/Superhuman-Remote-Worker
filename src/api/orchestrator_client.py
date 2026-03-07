@@ -401,12 +401,15 @@ class OrchestratorClient:
         Used to resume the target job with critic feedback, or to resume
         a waiting critic job for another review round.
 
+        If no agent is available, the orchestrator queues the job for
+        auto-dispatch (returns 200 with status "queued").
+
         Args:
             job_id: UUID of the job to resume
             feedback: Optional feedback to inject before resuming
 
         Returns:
-            True if resume succeeded, False otherwise
+            True if resume succeeded or queued, False otherwise
         """
         if not self._client:
             await self.connect()
@@ -420,7 +423,12 @@ class OrchestratorClient:
             response = await self._client.post(url, json=payload)
 
             if response.status_code in (200, 202):
-                logger.info(f"Resumed job {job_id} via orchestrator")
+                data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+                status = data.get("status", "resumed")
+                if status == "queued":
+                    logger.info(f"Job {job_id} queued for auto-dispatch (no agents available)")
+                else:
+                    logger.info(f"Resumed job {job_id} via orchestrator")
                 return True
             else:
                 logger.error(

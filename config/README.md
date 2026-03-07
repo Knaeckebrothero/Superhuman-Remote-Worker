@@ -379,7 +379,7 @@ memory:
   budget_tokens: 10000
   max_memories_per_injection: 25
   observer_interval: 5
-  embedding_model: text-embedding-3-small
+  embedding_model: qwen3-embedding-8b
 ```
 
 ## Inheritance

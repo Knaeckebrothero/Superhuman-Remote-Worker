@@ -34,10 +34,13 @@ QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 
 # Tables exposed to the cockpit
-ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "sources", "citations", "users", "projects", "project_members", "project_repositories"})
+ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "users", "projects", "project_members", "project_repositories"})
 
 # Required tables that must exist for the orchestrator to function
-REQUIRED_TABLES = ["users", "sessions", "projects", "project_members", "project_repositories", "jobs", "agents", "requirements", "datasources", "sources", "citations", "builder_sessions", "builder_messages", "memories"]
+REQUIRED_TABLES = ["users", "sessions", "projects", "project_members", "project_repositories", "jobs", "agents", "requirements", "datasources", "builder_sessions", "builder_messages"]
+
+# Tables in the vector DB (verified separately when VECTOR_DB_URL is set)
+VECTOR_REQUIRED_TABLES = ["memories", "knowledge_index", "sources", "citations", "job_sources", "source_annotations", "source_tags", "source_embeddings", "schema_migrations"]
 
 # Column type mapping from PostgreSQL types to frontend-friendly types
 PG_TYPE_MAP = {

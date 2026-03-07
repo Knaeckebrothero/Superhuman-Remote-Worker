@@ -60,6 +60,77 @@ The system adapts to your data as-is, rather than requiring your data to fit a p
 
 ---
 
+## The Workflow
+
+Every job follows the same human-in-the-loop cycle — from creation through review to completion. The agent works autonomously, but the user stays in control.
+
+```
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │                          COCKPIT                            │
+                    │              Create job, define goal, attach                │
+                    │              documents & data sources                       │
+                    └────────────────────────────┬────────────────────────────────┘
+                                                 │
+                                                 ▼
+┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+│                         VIRTUAL MACHINE                                         │
+│                                                                                 │
+│   ┌──────────────────────────────────────────────────────────────────────┐      │
+│   │                          AI AGENT                                    │      │
+│   │                                                                      │      │
+│   │  Plans phases, executes tasks, handles ambiguity autonomously        │      │
+│   │                                                                      │      │
+│   │          reads & writes                        reads & writes        │      │
+│   └──────────┬──────────────────────────────────────────┬────────────────┘      │
+│              │                                          │                       │
+│              ▼                                          ▼                       │
+│   ┌─────────────────────────┐            ┌─────────────────────────┐            │
+│   │     DATA SOURCES        │            │      DOCUMENTS          │            │
+│   │                         │            │                         │            │
+│   │  PostgreSQL  ·  Neo4j   │            │  PDF  · DOCX · PPTX     │            │
+│   │  MongoDB  ·  Vector DB  │            │  Images · Web pages     │            │
+│   └─────────────────────────┘            └─────────────────────────┘            │
+│                                                                                 │
+│   ┌──────────────────────────────────────────────────────────────────────┐      │
+│   │  AUDIT TRAIL — every action, decision, and source logged             │      │
+│   └──────────────────────────────────────────────────────────────────────┘      │
+│                                                                                 │
+└ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+                                                 │
+                                                 │  submits result
+                                                 ▼
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │                        REVIEW                               │
+                    │                                                             │
+                    │    Inspect result, trace citations back to sources,         │
+                    │    see exactly what was done, when, and why                 │
+                    │                                                             │
+                    │    ┌──────────────┐            ┌───────────────────┐        │
+                    │    │   APPROVE    │            │  PROVIDE FEEDBACK │        │
+                    │    │              │            │                   │        │
+                    │    │  Goal met —  │            │  Agent resumes    │        │
+                    │    │  job done    │            │  with feedback ───┼──┐     │
+                    │    └──────────────┘            └───────────────────┘  │     │
+                    └───────────────────────────────────────────────────────┼─────┘
+                                                                            │
+                                                         ┌──────────────────┘
+                                                         │  feedback cycle
+                                                         │  repeats until
+                                                         │  goal is reached
+                                                         │
+                                                         └──────► back to agent
+```
+
+| Step | What happens |
+|------|-------------|
+| **Create** | The user defines a goal, attaches documents and connects data sources through the cockpit. No data migration required — the agent connects to databases and file stores as they are. |
+| **Process** | The agent works autonomously on a dedicated VM, reading and writing across the connected data sources. It plans its own phases, executes domain-specific tasks, and handles ambiguity without manual intervention. |
+| **Review** | Once the agent considers the goal reached, the job freezes and the user is notified. The result — along with a full audit trail — is available for inspection. |
+| **Feedback or approve** | If the result meets expectations, the user approves. If not, they provide targeted feedback and the agent resumes — incorporating the feedback and continuing from where it left off. This cycle repeats until the job is done. |
+| **Audit trail** | Every action the agent takes, every decision it makes, and every source it references is logged. Citations trace back to the original data, so you can see exactly what was done, when, and why. |
+
+---
+
 ## Why Us
 
 **Works with what you already have** — no data migration, no new platforms. We connect to your existing landscape and build on top of it.

@@ -298,8 +298,11 @@ Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph
 
 | Database | Purpose | Connection |
 |----------|---------|------------|
-| PostgreSQL | Jobs, agents, requirements, citations, datasources | Async with asyncpg, namespace pattern: `db.jobs.create()`, queries in `src/database/queries/postgres/*.sql` |
+| PostgreSQL (App DB) | Jobs, agents, requirements, datasources, builder | `DATABASE_URL`, standard postgres:15 |
+| PostgreSQL (Vector DB) | Citations, sources, source_embeddings, memories, knowledge_index | `VECTOR_DB_URL`, pgvector/pgvector:pg15 |
 | MongoDB | LLM request logging (optional) | Audit trail and token tracking |
+
+The App DB uses standard PostgreSQL (no pgvector). All tables requiring vector operations live in the Vector DB (`VECTOR_DB_URL`, required). Schema: `orchestrator/database/vector_schema.sql`.
 
 **External datasources** (user-configured, attached to jobs via the cockpit UI or `DEFAULT_DS_*` env vars):
 
@@ -425,6 +428,7 @@ Required in `.env`:
 - `OPENROUTER_REFERER` - Optional: your site URL for OpenRouter leaderboard
 - `OPENROUTER_TITLE` - Optional: your app name for OpenRouter leaderboard
 - `TAVILY_API_KEY` - Web search
+- `VECTOR_DB_URL` - Vector DB connection (required, pgvector instance for citations + memories + knowledge)
 - `MONGODB_URL` - LLM request archiving (audit trail)
 - `DEFAULT_DS_*` - Default datasources (see `docs/datasources.md`)
 
@@ -445,9 +449,11 @@ Required in `.env`:
 | Cockpit Frontend (npm start) | 4200 |
 | Gitea | 3000 |
 | pgAdmin | 5050 |
-| PostgreSQL | 5432 |
+| PostgreSQL (App DB) | 5432 |
+| PostgreSQL (Vector DB) | 5433 |
 | Mongo Express | 8081 |
 | MongoDB | 27017 |
+| VPN Workstation forward | 8090 (host) → 8080 (container) |
 | Dozzle (container logs) | 9999 |
 
 ## Debugging

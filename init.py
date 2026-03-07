@@ -135,9 +135,10 @@ async def init_all(
     # Calculate total steps
     if not only_agent:
         if not skip_postgres:
-            total_steps += 1
+            total_steps += 2  # PostgreSQL + Vector DB
         if not skip_mongodb:
             total_steps += 1
+        total_steps += 1  # Neo4j
         total_steps += 1  # Uploads step
     if not only_orchestrator:
         total_steps += 1
@@ -145,7 +146,7 @@ async def init_all(
 
     # Initialize orchestrator (databases)
     if not only_agent:
-        from orchestrator.init import init_postgres, init_mongodb
+        from orchestrator.init import init_postgres, init_mongodb, init_vector_db
 
         if not skip_postgres:
             step += 1
@@ -155,6 +156,12 @@ async def init_all(
                 return False
             logger.info("")
 
+            step += 1
+            logger.info(f"[{step}/{total_steps}] Initializing Vector DB...")
+            if not await init_vector_db(force_reset):
+                logger.warning("  Vector DB initialization had issues (continuing...)")
+            logger.info("")
+
         if not skip_mongodb:
             step += 1
             logger.info(f"[{step}/{total_steps}] Initializing MongoDB...")
@@ -162,6 +169,13 @@ async def init_all(
                 # MongoDB failures are non-fatal
                 logger.warning("  MongoDB initialization had issues (continuing...)")
             logger.info("")
+
+        from orchestrator.init import init_neo4j
+
+        step += 1
+        logger.info(f"[{step}/{total_steps}] Initializing Neo4j (knowledge base)...")
+        init_neo4j(force_reset)
+        logger.info("")
 
     # Initialize agent (workspace)
     if not only_orchestrator:
@@ -217,7 +231,7 @@ async def verify_all(
 ) -> None:
     """Verify all components are properly initialized."""
     if not skip_orchestrator:
-        from orchestrator.init import verify_postgres, verify_mongodb
+        from orchestrator.init import verify_postgres, verify_mongodb, verify_vector_db
 
         if not skip_postgres:
             pg_result = await verify_postgres()
@@ -225,6 +239,24 @@ async def verify_all(
                 logger.info("  PostgreSQL: connected")
             else:
                 logger.warning(f"  PostgreSQL: not connected ({pg_result.get('error', 'unknown')})")
+
+            vec_result = await verify_vector_db()
+            if not vec_result.get("configured"):
+                logger.info("  Vector DB: not configured (using app DB)")
+            elif vec_result.get("connected"):
+                logger.info("  Vector DB: connected")
+            else:
+                logger.warning(f"  Vector DB: not connected ({vec_result.get('error', 'unknown')})")
+
+        from orchestrator.init import verify_neo4j
+
+        neo4j_result = verify_neo4j()
+        if not neo4j_result.get("configured"):
+            logger.info("  Neo4j: not configured (optional)")
+        elif neo4j_result.get("connected"):
+            logger.info("  Neo4j: connected")
+        else:
+            logger.warning(f"  Neo4j: not connected ({neo4j_result.get('error', 'unknown')})")
 
         if not skip_mongodb:
             mg_result = await verify_mongodb()
@@ -267,7 +299,7 @@ def create_backup(name: str | None = None) -> bool:
     Returns:
         True if successful, False otherwise.
     """
-    from orchestrator.init import backup_postgres, backup_mongodb
+    from orchestrator.init import backup_postgres, backup_vector_db, backup_mongodb
     from src.init import backup_workspace
 
     backup_dir = generate_backup_dir_name(name)
@@ -284,7 +316,7 @@ def create_backup(name: str | None = None) -> bool:
     }
 
     # 1. Backup PostgreSQL
-    logger.info("[1/4] Backing up PostgreSQL...")
+    logger.info("[1/5] Backing up PostgreSQL...")
     postgres_file = backup_dir / "postgres.dump"
     if backup_postgres(postgres_file):
         backup_info["components"]["postgres"] = {"file": "postgres.dump", "success": True}
@@ -293,8 +325,17 @@ def create_backup(name: str | None = None) -> bool:
         success = False
     logger.info("")
 
-    # 2. Backup MongoDB
-    logger.info("[2/4] Backing up MongoDB...")
+    # 2. Backup Vector DB
+    logger.info("[2/5] Backing up Vector DB...")
+    vector_file = backup_dir / "vector.dump"
+    if backup_vector_db(vector_file):
+        backup_info["components"]["vector_db"] = {"file": "vector.dump", "success": True}
+    else:
+        backup_info["components"]["vector_db"] = {"success": False}
+    logger.info("")
+
+    # 3. Backup MongoDB
+    logger.info("[3/5] Backing up MongoDB...")
     mongodb_dir = backup_dir / "mongodb"
     mongodb_dir.mkdir(exist_ok=True)
     if backup_mongodb(mongodb_dir):
@@ -303,8 +344,8 @@ def create_backup(name: str | None = None) -> bool:
         backup_info["components"]["mongodb"] = {"success": False}
     logger.info("")
 
-    # 3. Backup workspace
-    logger.info("[3/4] Backing up workspace...")
+    # 4. Backup workspace
+    logger.info("[4/5] Backing up workspace...")
     if backup_workspace(backup_dir):
         from src.init import verify_workspace
         ws = verify_workspace()
@@ -318,8 +359,8 @@ def create_backup(name: str | None = None) -> bool:
         backup_info["components"]["workspace"] = {"success": False}
     logger.info("")
 
-    # 4. Backup uploads
-    logger.info("[4/4] Backing up uploads...")
+    # 5. Backup uploads
+    logger.info("[5/5] Backing up uploads...")
     from orchestrator.init import backup_uploads, verify_uploads
     if backup_uploads(backup_dir):
         uploads_info = verify_uploads()
@@ -350,7 +391,7 @@ def restore_backup(backup_path: str) -> bool:
     Returns:
         True if successful, False otherwise.
     """
-    from orchestrator.init import restore_postgres, restore_mongodb
+    from orchestrator.init import restore_postgres, restore_vector_db, restore_mongodb
     from src.init import restore_workspace
 
     backup_dir = Path(backup_path)
@@ -375,7 +416,7 @@ def restore_backup(backup_path: str) -> bool:
     success = True
 
     # 1. Restore PostgreSQL
-    logger.info("[1/4] Restoring PostgreSQL...")
+    logger.info("[1/5] Restoring PostgreSQL...")
     postgres_file = backup_dir / "postgres.dump"
     if postgres_file.exists():
         if not restore_postgres(postgres_file):
@@ -384,8 +425,18 @@ def restore_backup(backup_path: str) -> bool:
         logger.info("  No PostgreSQL backup found")
     logger.info("")
 
-    # 2. Restore MongoDB
-    logger.info("[2/4] Restoring MongoDB...")
+    # 2. Restore Vector DB
+    logger.info("[2/5] Restoring Vector DB...")
+    vector_file = backup_dir / "vector.dump"
+    if vector_file.exists():
+        if not restore_vector_db(vector_file):
+            logger.warning("  Vector DB restore had issues")
+    else:
+        logger.info("  No Vector DB backup found")
+    logger.info("")
+
+    # 3. Restore MongoDB
+    logger.info("[3/5] Restoring MongoDB...")
     mongodb_dir = backup_dir / "mongodb"
     if mongodb_dir.exists() and any(mongodb_dir.iterdir()):
         if not restore_mongodb(mongodb_dir):
@@ -394,14 +445,14 @@ def restore_backup(backup_path: str) -> bool:
         logger.info("  No MongoDB backup found")
     logger.info("")
 
-    # 3. Restore workspace
-    logger.info("[3/4] Restoring workspace...")
+    # 4. Restore workspace
+    logger.info("[4/5] Restoring workspace...")
     if not restore_workspace(backup_dir):
         logger.warning("  Workspace restore had issues")
     logger.info("")
 
-    # 4. Restore uploads
-    logger.info("[4/4] Restoring uploads...")
+    # 5. Restore uploads
+    logger.info("[5/5] Restoring uploads...")
     from orchestrator.init import restore_uploads
     if not restore_uploads(backup_dir):
         logger.warning("  Uploads restore had issues")

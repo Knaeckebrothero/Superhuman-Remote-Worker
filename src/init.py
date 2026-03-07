@@ -100,7 +100,7 @@ def init_workspace() -> bool:
         logger.info("  Created/verified workspace directory")
 
         # Create standard subdirectories
-        subdirs = ["checkpoints", "logs"]
+        subdirs = ["checkpoints", "logs", "phase_snapshots"]
         for subdir in subdirs:
             (base_path / subdir).mkdir(parents=True, exist_ok=True)
             logger.debug(f"    Created/verified: {subdir}/")
@@ -177,7 +177,7 @@ def verify_workspace() -> dict:
         return result
 
     # Check standard directories
-    for subdir in ["checkpoints", "logs"]:
+    for subdir in ["checkpoints", "logs", "phase_snapshots"]:
         dir_path = base_path / subdir
         result["directories"][subdir] = dir_path.exists()
 
@@ -194,6 +194,11 @@ def verify_workspace() -> dict:
     logs_dir = base_path / "logs"
     if logs_dir.exists():
         result["log_count"] = len(list(logs_dir.glob("*.log")))
+
+    # Count phase snapshots
+    snapshots_dir = base_path / "phase_snapshots"
+    if snapshots_dir.exists():
+        result["snapshot_count"] = len(list(snapshots_dir.glob("job_*")))
 
     # Calculate total size
     total_size = 0

@@ -30,7 +30,7 @@ class TestEmbeddingServiceInit:
 
         service = EmbeddingService()
         assert service.api_key == "test-key-123"
-        assert service.model == "text-embedding-3-small"
+        assert service.model == "qwen3-embedding-8b"
         assert service.base_url == "https://api.openai.com/v1"
 
     def test_init_with_embedding_key(self, monkeypatch, mock_openai_client):
@@ -102,7 +102,7 @@ class TestEmbeddingServiceEmbed:
         assert result == [0.1, 0.2, 0.3]
         mock_client.embeddings.create.assert_awaited_once_with(
             input="test text",
-            model="text-embedding-3-small",
+            model="qwen3-embedding-8b",
         )
 
     @pytest.mark.asyncio
