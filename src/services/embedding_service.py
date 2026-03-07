@@ -6,7 +6,7 @@ Follows the same singleton pattern as VisionHelper.
 Configuration via environment variables:
 - EMBEDDING_API_KEY: API key (falls back to OPENAI_API_KEY)
 - EMBEDDING_BASE_URL: API endpoint (defaults to OpenAI)
-- EMBEDDING_MODEL: Model name (default: text-embedding-3-small)
+- EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
 """
 
 import logging
@@ -40,7 +40,7 @@ class EmbeddingService:
 
         self.api_key = os.getenv("EMBEDDING_API_KEY", primary_key)
         self.base_url = os.getenv("EMBEDDING_BASE_URL", self.OPENAI_API_URL)
-        self.model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.model = os.getenv("EMBEDDING_MODEL", "qwen3-embedding-8b")
 
         if not self.api_key:
             logger.warning(

@@ -431,6 +431,8 @@ async def _maybe_trigger_verification(
         context: Job context dict (from job creation). Queried from DB if None.
         description: Original job description. Queried from DB if None.
     """
+    logger.info(f"Checking verification trigger for job {job_id} (should_stop={result.get('should_stop')}, error={result.get('error') is not None})")
+
     # Guard: only trigger on jobs that stopped
     if not result.get("should_stop", False):
         return
@@ -439,8 +441,16 @@ async def _maybe_trigger_verification(
 
     # Guard: check agent config
     if not _is_verification_enabled():
+        logger.warning(
+            f"Verification not enabled for job {job_id} — "
+            f"agent={_agent is not None}, "
+            f"has_extra={hasattr(_agent.config, 'extra') and isinstance(getattr(_agent.config, 'extra', None), dict) if _agent else False}, "
+            f"extra_keys={sorted(_agent.config.extra.keys()) if _agent and hasattr(_agent.config, 'extra') and isinstance(_agent.config.extra, dict) else 'N/A'}, "
+            f"verification={_agent.config.extra.get('verification') if _agent and hasattr(_agent.config, 'extra') and isinstance(_agent.config.extra, dict) else 'N/A'}"
+        )
         return
     verification_config = _get_verification_config()
+    logger.info(f"Verification enabled for job {job_id}: {verification_config}")
 
     # Read freeze_data (and optionally description/context) from DB
     try:
@@ -806,6 +816,11 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
             elif goal_achieved or _is_job_completion_freeze(row):
                 # Job completion (any autonomy level). If verification is
                 # enabled, override to 'reviewing' so the critic handles it.
+                logger.debug(
+                    f"Job {job_id} completion check: goal_achieved={goal_achieved}, "
+                    f"is_job_completion_freeze={_is_job_completion_freeze(row)}, "
+                    f"verification_enabled={_is_verification_enabled()}"
+                )
                 if _is_verification_enabled():
                     await _agent.postgres_conn.jobs.update_status(
                         job_id, status="reviewing"
@@ -829,7 +844,12 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
                 await _agent.postgres_conn.jobs.update_status(
                     job_id, status="pending_review"
                 )
-                logger.info(f"Updated job {job_id} status to 'pending_review'")
+                logger.info(
+                    f"Updated job {job_id} status to 'pending_review' "
+                    f"(not job completion: goal_achieved={goal_achieved}, "
+                    f"freeze_check={_is_job_completion_freeze(row)}, "
+                    f"has_freeze_data={bool(row.get('freeze_data') if row else False)})"
+                )
         else:
             logger.warning(
                 f"Job {job_id} ended without should_stop or error — "
@@ -1086,6 +1106,17 @@ async def _process_orchestrator_job(
 
         # Update job status in database based on final state
         await _update_job_status_from_result(job_id, result)
+
+        # Mark agent as available BEFORE post-completion handlers.
+        # Critic verdict handling calls orchestrator resume, which checks
+        # agent status — if _current_job_id is still set, the agent reports
+        # "working" and the resume is rejected (race condition).
+        _current_job_id = None
+        if _orchestrator_client and _orchestrator_client.agent_id:
+            await _orchestrator_client.heartbeat(
+                status="ready", job_id=None,
+                metrics=_get_agent_metrics(),
+            )
 
         # Squash-merge subjob branch into parent (if this is a subjob)
         if _agent and _agent.postgres_conn and _orchestrator_client:
@@ -1604,6 +1635,18 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
                 # Update job status in database based on final state
                 await _update_job_status_from_result(request.job_id, result or {})
+
+                # Mark agent as available BEFORE post-completion handlers
+                # (same fix as _process_orchestrator_job — see comment there)
+                _current_job_id = None
+                if _orchestrator_client and _orchestrator_client.agent_id:
+                    await _orchestrator_client.heartbeat(
+                        status="ready", job_id=None,
+                        metrics=_get_agent_metrics(),
+                    )
+
+                # Handle deferred critic verdicts (approve/return target jobs)
+                await _handle_critic_verdict(request.job_id, result or {})
                 # Check if we should spawn a verification (critic) job
                 # Context and description are fetched from DB inside the function
                 await _maybe_trigger_verification(request.job_id, result or {})

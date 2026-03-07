@@ -48,7 +48,7 @@ def get_citation_engine_config() -> Dict[str, Any]:
         llm_url = os.getenv("LLM_BASE_URL")
 
     return {
-        "db_url": os.getenv("CITATION_DB_URL", os.getenv("DATABASE_URL")),
+        "db_url": os.getenv("CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))),
         "llm_url": llm_url,
         "llm_model": llm_model,
         "reasoning_required": os.getenv("CITATION_REASONING_REQUIRED", "low"),

@@ -104,11 +104,23 @@ class MongoDB:
         self._client: Optional[AsyncIOMotorClient] = None
         self._db: Optional[AsyncIOMotorDatabase] = None
         self._available: bool = False
+        self._db_name = self._parse_db_name(self._url) if self._url else "srw_logs"
 
         if not self._url:
             logger.info("MongoDB URL not configured. Logging features disabled.")
 
         logger.info("MongoDB initialized (not connected yet)")
+
+    @staticmethod
+    def _parse_db_name(url: str) -> str:
+        """Extract database name from MongoDB URL, defaulting to srw_logs."""
+        if "/" in url:
+            path = url.split("/")[-1]
+            if "?" in path:
+                path = path.split("?")[0]
+            if path:
+                return path
+        return "srw_logs"
 
     @property
     def is_available(self) -> bool:
@@ -136,9 +148,9 @@ class MongoDB:
             self._client = AsyncIOMotorClient(self._url, serverSelectionTimeoutMS=5000)
             # Test the connection
             await self._client.admin.command("ping")
-            self._db = self._client.get_database("srw_logs")
+            self._db = self._client.get_database(self._db_name)
             self._available = True
-            logger.info("MongoDB connected: srw_logs")
+            logger.info(f"MongoDB connected: {self._db_name}")
         except Exception as e:
             logger.warning(f"MongoDB connection failed: {e}")
             self._available = False
