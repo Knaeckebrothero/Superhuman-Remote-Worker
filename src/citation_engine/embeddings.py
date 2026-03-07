@@ -6,7 +6,7 @@ OpenAI-compatible embedding API client for vector search.
 Supports any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, LiteLLM).
 
 Environment Variables:
-    CITATION_EMBEDDING_MODEL: Model name (default: text-embedding-3-small)
+    CITATION_EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
     CITATION_EMBEDDING_URL: API base URL (default: https://api.openai.com/v1)
     CITATION_EMBEDDING_KEY: API key (defaults to OPENAI_API_KEY)
 """
@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 
 # Known dimensions for common models (avoids a probe call)
 _KNOWN_DIMENSIONS: dict[str, int] = {
+    "qwen3-embedding-8b": 4096,
+    "qwen3-embedding-0.6b": 1024,
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,
     "text-embedding-ada-002": 1536,
@@ -50,7 +52,7 @@ class EmbeddingService:
         vectors = service.embed_batch(["Hello", "World"])
 
     Environment Variables:
-        CITATION_EMBEDDING_MODEL: Model name (default: text-embedding-3-small)
+        CITATION_EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
         CITATION_EMBEDDING_URL: Base URL (default: https://api.openai.com/v1)
         CITATION_EMBEDDING_KEY: API key (defaults to OPENAI_API_KEY)
     """
@@ -66,7 +68,7 @@ class EmbeddingService:
         timeout: float = 60.0,
     ):
         self.model = model or os.getenv(
-            "CITATION_EMBEDDING_MODEL", "text-embedding-3-small"
+            "CITATION_EMBEDDING_MODEL", "qwen3-embedding-8b"
         )
         self.api_url = (
             api_url
