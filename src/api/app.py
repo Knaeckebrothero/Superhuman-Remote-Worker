@@ -944,8 +944,13 @@ async def _handle_critic_verdict(job_id: str, result: Dict[str, Any]) -> None:
         verdict = freeze_data.get("verdict")
 
         if not verdict:
-            logger.debug(f"No verdict in freeze_data for critic job {job_id}")
-            return
+            # Critic completed without using approve_job/return_job_with_feedback.
+            # Treat as implicit approval so the target job doesn't get stuck.
+            logger.warning(
+                f"Critic job {job_id} completed without verdict — "
+                f"treating as implicit approval for target {target_job_id}"
+            )
+            verdict = "approved"
 
         # Parse critic context for round tracking
         ctx = row.get("context")
@@ -1104,9 +1109,6 @@ async def _process_orchestrator_job(
         result = final_state or {}
         logger.info(f"Orchestrator job {job_id} completed: {result.get('should_stop')}")
 
-        # Update job status in database based on final state
-        await _update_job_status_from_result(job_id, result)
-
         # Mark agent as available BEFORE post-completion handlers.
         # Critic verdict handling calls orchestrator resume, which checks
         # agent status — if _current_job_id is still set, the agent reports
@@ -1118,41 +1120,70 @@ async def _process_orchestrator_job(
                 metrics=_get_agent_metrics(),
             )
 
-        # Squash-merge subjob branch into parent (if this is a subjob)
-        if _agent and _agent.postgres_conn and _orchestrator_client:
+        # Report completion to orchestrator — it handles status, verification,
+        # critic verdicts, curation, and dispatch.
+        orchestrator_handled = False
+        if _orchestrator_client:
             try:
-                row = await _agent.postgres_conn.fetchrow(
-                    "SELECT parent_job_id FROM jobs WHERE id = $1::uuid", job_id
+                orchestrator_handled = await _orchestrator_client.report_completion(
+                    job_id, result
                 )
-                if row and row.get("parent_job_id"):
-                    await _orchestrator_client.trigger_subjob_merge(job_id)
             except Exception as e:
-                logger.error(f"Failed to trigger subjob merge for {job_id}: {e}")
+                logger.warning(f"Orchestrator completion report failed, falling back: {e}")
 
-        # Handle deferred critic verdicts (approve/return target jobs)
-        await _handle_critic_verdict(job_id, result)
+        if not orchestrator_handled:
+            # Legacy fallback — handle post-completion locally
+            logger.info(f"Using legacy post-completion handling for job {job_id}")
+            await _update_job_status_from_result(job_id, result)
 
-        # Check if we should spawn a verification (critic) job
-        await _maybe_trigger_verification(job_id, result, context, description)
+            # Squash-merge subjob branch into parent (if this is a subjob)
+            if _agent and _agent.postgres_conn and _orchestrator_client:
+                try:
+                    row = await _agent.postgres_conn.fetchrow(
+                        "SELECT parent_job_id FROM jobs WHERE id = $1::uuid", job_id
+                    )
+                    if row and row.get("parent_job_id"):
+                        await _orchestrator_client.trigger_subjob_merge(job_id)
+                except Exception as e:
+                    logger.error(f"Failed to trigger subjob merge for {job_id}: {e}")
 
-        # If verification is NOT enabled but curation IS, trigger final pass on job completion
-        if (
-            not _is_verification_enabled()
-            and _is_curation_enabled()
-            and result.get("should_stop")
-            and result.get("goal_achieved")
-        ):
-            await _maybe_trigger_curation_final_pass(job_id)
+            # Handle deferred critic verdicts (approve/return target jobs)
+            await _handle_critic_verdict(job_id, result)
+
+            # Check if we should spawn a verification (critic) job
+            await _maybe_trigger_verification(job_id, result, context, description)
+
+            # If verification is NOT enabled but curation IS, trigger final pass
+            if (
+                not _is_verification_enabled()
+                and _is_curation_enabled()
+                and result.get("should_stop")
+                and result.get("goal_achieved")
+            ):
+                await _maybe_trigger_curation_final_pass(job_id)
 
     except asyncio.CancelledError:
         logger.info(f"Orchestrator job {job_id} was cancelled")
         raise
     except Exception as e:
         logger.error(f"Orchestrator job {job_id} failed: {e}", exc_info=True)
-        # Mark job as failed in database
-        await _update_job_status_from_result(job_id, {"error": {"message": str(e)}})
+        # Report error to orchestrator, or fall back to local handling
+        error_result = {"error": {"message": str(e)}}
+        error_handled = False
+        if _orchestrator_client:
+            try:
+                error_handled = await _orchestrator_client.report_completion(
+                    job_id, error_result
+                )
+            except Exception:
+                pass
+        if not error_handled:
+            await _update_job_status_from_result(job_id, error_result)
     finally:
-        _current_job_id = None
+        # Only clear if this job still owns the slot — a new job may
+        # have been dispatched while post-completion handlers were running.
+        if _current_job_id == job_id:
+            _current_job_id = None
         _cleanup_job_file_handler(job_id)
 
 
@@ -1633,8 +1664,6 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
                 result = final_state or {}
                 logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
-                # Update job status in database based on final state
-                await _update_job_status_from_result(request.job_id, result or {})
 
                 # Mark agent as available BEFORE post-completion handlers
                 # (same fix as _process_orchestrator_job — see comment there)
@@ -1645,19 +1674,43 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                         metrics=_get_agent_metrics(),
                     )
 
-                # Handle deferred critic verdicts (approve/return target jobs)
-                await _handle_critic_verdict(request.job_id, result or {})
-                # Check if we should spawn a verification (critic) job
-                # Context and description are fetched from DB inside the function
-                await _maybe_trigger_verification(request.job_id, result or {})
+                # Report completion to orchestrator
+                orchestrator_handled = False
+                if _orchestrator_client:
+                    try:
+                        orchestrator_handled = await _orchestrator_client.report_completion(
+                            request.job_id, result
+                        )
+                    except Exception as e:
+                        logger.warning(f"Orchestrator completion report failed, falling back: {e}")
+
+                if not orchestrator_handled:
+                    # Legacy fallback
+                    logger.info(f"Using legacy post-completion handling for resumed job {request.job_id}")
+                    await _update_job_status_from_result(request.job_id, result or {})
+                    await _handle_critic_verdict(request.job_id, result or {})
+                    await _maybe_trigger_verification(request.job_id, result or {})
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
                 raise
             except Exception as e:
                 logger.error(f"Resumed job {request.job_id} failed: {e}", exc_info=True)
-                await _update_job_status_from_result(request.job_id, {"error": {"message": str(e)}})
+                error_result = {"error": {"message": str(e)}}
+                error_handled = False
+                if _orchestrator_client:
+                    try:
+                        error_handled = await _orchestrator_client.report_completion(
+                            request.job_id, error_result
+                        )
+                    except Exception:
+                        pass
+                if not error_handled:
+                    await _update_job_status_from_result(request.job_id, error_result)
             finally:
-                _current_job_id = None
+                # Only clear if this job still owns the slot — a new job may
+                # have been dispatched while post-completion handlers were running.
+                if _current_job_id == request.job_id:
+                    _current_job_id = None
                 _cleanup_job_file_handler(request.job_id)
 
         _current_job_task = asyncio.create_task(_resume_job())
