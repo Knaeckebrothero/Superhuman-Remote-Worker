@@ -1,7 +1,7 @@
-"""Unit tests for curator subjob infrastructure (Phase 2 of project knowledge base).
+"""Unit tests for inline knowledge curation via AuxiliaryLLM.
 
-Tests the curation trigger functions, config helpers, instruction formatting,
-and the curation callback wiring in the archive_phase node.
+Tests the curate_and_store_knowledge helper, curation config,
+inline curation wiring in archive_phase, and CurateKnowledgeTask.
 """
 
 import asyncio
@@ -16,8 +16,14 @@ src_path = project_root / "src"
 if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
-from src.api.orchestrator_client import OrchestratorClient  # noqa: E402
 from src.core.loader import load_agent_config, resolve_config_path  # noqa: E402
+from src.services.auxiliary import (  # noqa: E402
+    AuxiliaryLLM,
+    CurateKnowledgeTask,
+    CurationResult,
+    curate_and_store_knowledge,
+)
+from src.tools.context import ToolContext  # noqa: E402
 
 
 def _load_config(name: str):
@@ -27,141 +33,161 @@ def _load_config(name: str):
 
 
 # =========================================================================
-# OrchestratorClient.create_curation_job
+# curate_and_store_knowledge helper
 # =========================================================================
 
-class TestCreateCurationJob:
-    """Tests for OrchestratorClient.create_curation_job."""
-
-    @pytest.fixture
-    def client(self):
-        c = OrchestratorClient(
-            orchestrator_url="http://localhost:8085",
-            pod_ip="127.0.0.1",
-            pod_port=8001,
-            hostname="test",
-            config_name="test",
-        )
-        c._client = AsyncMock()
-        return c
+class TestCurateAndStoreKnowledge:
+    """Tests for the curate_and_store_knowledge helper function."""
 
     @pytest.mark.asyncio
-    async def test_create_curation_job_success(self, client):
-        """Verify create_curation_job sends correct payload to orchestrator."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {"id": "curator-job-123"}
-        client._client.post = AsyncMock(return_value=mock_response)
+    async def test_returns_none_when_no_knowledge_graph(self):
+        """Should return None if tool_context has no knowledge_graph."""
+        ctx = ToolContext(workspace_manager=None, config={})
+        mock_llm = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
 
-        result = await client.create_curation_job(
-            job_id="target-job-456",
-            description="Build feature X",
-            config_name="developer",
-            phase_data="Phase 1 (tactical) archived.\n- Built X: done",
-            project_id="proj-789",
-            curator_config="curator",
-        )
-
-        assert result is not None
-        assert result["id"] == "curator-job-123"
-
-        # Verify the POST payload
-        call_args = client._client.post.call_args
-        url = call_args[0][0]
-        assert url.endswith("/api/jobs")
-
-        payload = call_args[1]["json"]
-        assert payload["config_name"] == "curator"
-        assert payload["parent_job_id"] == "target-job-456"
-        assert payload["project_id"] == "proj-789"
-        assert payload["priority"] == 5
-        assert payload["config_override"]["autonomy"] == "full"
-        assert payload["context"]["curation_target"] == "target-job-456"
-        assert payload["context"]["original_config"] == "developer"
-
-    @pytest.mark.asyncio
-    async def test_create_curation_job_no_project_id(self, client):
-        """Verify create_curation_job fails gracefully without project_id."""
-        result = await client.create_curation_job(
-            job_id="target-job-456",
-            description="Build feature X",
-            config_name="developer",
+        result = await curate_and_store_knowledge(
+            auxiliary_llm=aux,
+            tool_context=ctx,
             phase_data="Phase 1 archived.",
-            project_id=None,
+            workspace_md="# Workspace",
+            plan_md="# Plan",
         )
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_create_curation_job_api_failure(self, client):
-        """Verify create_curation_job handles API errors gracefully."""
-        mock_response = MagicMock()
-        mock_response.status_code = 500
-        mock_response.text = "Internal Server Error"
-        client._client.post = AsyncMock(return_value=mock_response)
+    async def test_returns_none_when_no_project_id(self):
+        """Should return None if tool_context has no project_id."""
+        ctx = ToolContext(workspace_manager=None, config={})
+        ctx.knowledge_graph = MagicMock()
+        ctx.knowledge_store = MagicMock()
+        # No project_id set
 
-        result = await client.create_curation_job(
-            job_id="target-job-456",
-            description="Build feature X",
-            config_name="developer",
+        mock_llm = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+
+        result = await curate_and_store_knowledge(
+            auxiliary_llm=aux,
+            tool_context=ctx,
             phase_data="Phase 1 archived.",
-            project_id="proj-789",
+            workspace_md="# Workspace",
+            plan_md="# Plan",
         )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_happy_path_calls_agent(self):
+        """Should call auxiliary_llm.agent() with CurateKnowledgeTask."""
+        ctx = ToolContext(workspace_manager=None, config={})
+        mock_kg = MagicMock()
+        mock_kg.list_notes.return_value = [
+            {"id": "note-1", "title": "Existing note", "type": "decision"}
+        ]
+        ctx.knowledge_graph = mock_kg
+        ctx.knowledge_store = MagicMock()
+        ctx.project_id = "proj-123"
+
+        curation_result = CurationResult(
+            notes_created=2, notes_updated=1, summary="Curated 3 notes"
+        )
+
+        mock_llm = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+
+        with patch.object(aux, "agent", new_callable=AsyncMock, return_value=curation_result):
+            with patch("src.tools.knowledge.knowledge_tools.create_kb_tools", return_value=[MagicMock()]):
+                result = await curate_and_store_knowledge(
+                    auxiliary_llm=aux,
+                    tool_context=ctx,
+                    phase_data="Phase 1 (tactical) archived.\n- Task: done",
+                    workspace_md="# Workspace",
+                    plan_md="# Plan",
+                )
+
+        assert result is not None
+        assert result.notes_created == 2
+        assert result.notes_updated == 1
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_none(self):
+        """LLM failure should be non-fatal and return None."""
+        ctx = ToolContext(workspace_manager=None, config={})
+        ctx.knowledge_graph = MagicMock()
+        ctx.knowledge_graph.list_notes.return_value = []
+        ctx.knowledge_store = MagicMock()
+        ctx.project_id = "proj-123"
+
+        mock_llm = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+
+        with patch.object(aux, "agent", new_callable=AsyncMock, side_effect=RuntimeError("LLM down")):
+            with patch("src.tools.knowledge.knowledge_tools.create_kb_tools", return_value=[MagicMock()]):
+                result = await curate_and_store_knowledge(
+                    auxiliary_llm=aux,
+                    tool_context=ctx,
+                    phase_data="Phase 1 archived.",
+                    workspace_md="",
+                    plan_md="",
+                )
+
         assert result is None
 
 
 # =========================================================================
-# _format_curation_instructions
+# CurateKnowledgeTask
 # =========================================================================
 
-class TestFormatCurationInstructions:
-    """Tests for OrchestratorClient._format_curation_instructions."""
+class TestCurateKnowledgeTask:
+    """Tests for the CurateKnowledgeTask class."""
 
-    def test_format_incremental_mode(self):
-        """Verify incremental mode produces instructions with correct placeholders."""
-        result = OrchestratorClient._format_curation_instructions(
-            job_id="job-123",
-            description="Build auth module",
-            config_name="developer",
-            phase_data="Phase 2 archived. Built JWT middleware.",
-            curation_mode="incremental",
-            curation_phase="phase_2",
+    def test_system_prompt_not_empty(self):
+        task = CurateKnowledgeTask(
+            phase_data="Phase 1 archived.",
+            workspace_md="# WS",
+            plan_md="# Plan",
+            existing_notes=[],
+            kb_tools=[],
         )
-        assert result is not None
-        assert "job-123" in result
-        assert "developer" in result
-        assert "Build auth module" in result
-        assert "phase_2" in result
-        assert "Phase 2 archived" in result
-        assert "kb_search" in result  # Incremental mode mentions search
+        assert len(task.system_prompt) > 100
 
-    def test_format_final_mode(self):
-        """Verify final mode produces comprehensive sweep instructions."""
-        result = OrchestratorClient._format_curation_instructions(
-            job_id="job-123",
-            description="Build auth module",
-            config_name="developer",
-            phase_data="Final pass context.",
-            curation_mode="final",
-            curation_phase="final",
+    def test_build_context_includes_phase_data(self):
+        task = CurateKnowledgeTask(
+            phase_data="Phase 1 archived. Built auth module.",
+            workspace_md="# Workspace",
+            plan_md="# Plan",
+            existing_notes=["- note-1: Decision (decision)"],
+            kb_tools=[],
         )
-        assert result is not None
-        assert "FINAL" in result
-        assert "memories" in result
+        ctx = task.build_context()
+        assert "Phase 1 archived" in ctx
+        assert "Workspace" in ctx
+        assert "Plan" in ctx
+        assert "note-1" in ctx
 
-    def test_format_missing_template(self):
-        """Verify graceful failure when template is not found."""
-        with patch("pathlib.Path.exists", return_value=False):
-            result = OrchestratorClient._format_curation_instructions(
-                job_id="job-123",
-                description="test",
-                config_name="test",
-                phase_data="test",
-            )
-            assert result is None
+    def test_output_schema_is_curation_result(self):
+        task = CurateKnowledgeTask(
+            phase_data="",
+            workspace_md="",
+            plan_md="",
+            existing_notes=[],
+            kb_tools=[],
+        )
+        assert task.output_schema is CurationResult
+
+    def test_get_tools_returns_provided_tools(self):
+        mock_tools = [MagicMock(), MagicMock()]
+        task = CurateKnowledgeTask(
+            phase_data="",
+            workspace_md="",
+            plan_md="",
+            existing_notes=[],
+            kb_tools=mock_tools,
+        )
+        assert task.get_tools() == mock_tools
 
 
 # =========================================================================
-# Curation config helpers
+# Curation config
 # =========================================================================
 
 class TestCurationConfig:
@@ -173,8 +199,6 @@ class TestCurationConfig:
         assert hasattr(config, "extra")
         curator = config.extra.get("curator", {})
         assert curator.get("enabled") is False
-        assert curator.get("curator_config") == "curator"
-        assert curator.get("autonomy") == "full"
 
     def test_curator_config_loads(self):
         """Verify the curator expert config loads without errors."""
@@ -184,11 +208,11 @@ class TestCurationConfig:
 
 
 # =========================================================================
-# Curation callback in archive_phase
+# Inline curation wiring in archive_phase
 # =========================================================================
 
-class TestCurationCallbackWiring:
-    """Tests that the curation callback is called from archive_phase."""
+class TestInlineCurationWiring:
+    """Tests that inline curation is wired into archive_phase."""
 
     @pytest.fixture
     def temp_workspace(self):
@@ -203,79 +227,17 @@ class TestCurationCallbackWiring:
         return ws
 
     @pytest.mark.asyncio
-    async def test_curation_callback_called_on_archive(self, workspace_manager):
-        """Verify the curation callback fires during archive_phase."""
-        from src.graph import create_archive_phase_node
-        from src.managers import TodoManager, PlanManager
-        from src.core.context import ContextManager
-
-        config = _load_config("defaults")
-        # Disable compaction so we don't need a real LLM
-        config.context_management.compact_on_archive = False
-
-        todo_manager = TodoManager(workspace_manager)
-        plan_manager = PlanManager(workspace_manager)
-
-        # Write a simple plan.md so get_current_phase works
-        plan_manager.write("# Plan\n## Phase 1\nTactical work.\n")
-
-        # Create and complete a todo
-        todo_manager.add("Test task")
-        for t in todo_manager.list_all():
-            todo_manager.complete(t.id, notes=["Completed successfully"])
-
-        context_mgr = ContextManager(config)
-        mock_llm = MagicMock()
-
-        # Track callback calls
-        callback_calls = []
-
-        async def mock_callback(job_id, phase_number, phase_data):
-            callback_calls.append({
-                "job_id": job_id,
-                "phase_number": phase_number,
-                "phase_data": phase_data,
-            })
-
-        archive_fn = create_archive_phase_node(
-            todo_manager=todo_manager,
-            plan_manager=plan_manager,
-            config=config,
-            context_mgr=context_mgr,
-            auxiliary_llm=mock_llm,
-            summarization_prompt="Summarize.",
-            curation_callback=mock_callback,
-        )
-
-        state = {
-            "job_id": "test-job-123",
-            "iteration": 5,
-            "phase_number": 1,
-            "is_strategic_phase": False,
-            "messages": [],
-        }
-
-        await archive_fn(state)
-
-        # Allow async tasks to complete
-        await asyncio.sleep(0.1)
-
-        assert len(callback_calls) == 1
-        assert callback_calls[0]["job_id"] == "test-job-123"
-        assert callback_calls[0]["phase_number"] == 1
-        assert "Phase 1 (tactical) archived" in callback_calls[0]["phase_data"]
-        # Should include completed todo info
-        assert "Test task" in callback_calls[0]["phase_data"]
-
-    @pytest.mark.asyncio
-    async def test_no_callback_when_none(self, workspace_manager):
-        """Verify no error when curation_callback is None."""
+    async def test_no_curation_when_no_kb(self, workspace_manager):
+        """Verify no curation when tool_context has no knowledge base."""
         from src.graph import create_archive_phase_node
         from src.managers import TodoManager, PlanManager
         from src.core.context import ContextManager
 
         config = _load_config("defaults")
         config.context_management.compact_on_archive = False
+        # Enable curator in config
+        config.extra["curator"] = {"enabled": True}
+
         todo_manager = TodoManager(workspace_manager)
         plan_manager = PlanManager(workspace_manager)
         plan_manager.write("# Plan\n## Phase 1\nTest.\n")
@@ -283,6 +245,9 @@ class TestCurationCallbackWiring:
         context_mgr = ContextManager(config)
         mock_llm = MagicMock()
 
+        # ToolContext with NO knowledge base
+        ctx = ToolContext(workspace_manager=workspace_manager, config={})
+
         archive_fn = create_archive_phase_node(
             todo_manager=todo_manager,
             plan_manager=plan_manager,
@@ -290,7 +255,8 @@ class TestCurationCallbackWiring:
             context_mgr=context_mgr,
             auxiliary_llm=mock_llm,
             summarization_prompt="Summarize.",
-            curation_callback=None,
+            tool_context=ctx,
+            workspace_manager=workspace_manager,
         )
 
         state = {
@@ -301,23 +267,139 @@ class TestCurationCallbackWiring:
             "messages": [],
         }
 
-        # Should not raise
+        # Should not raise even with no KB
         result = await archive_fn(state)
         assert "messages" in result
 
+    @pytest.mark.asyncio
+    async def test_no_curation_when_disabled(self, workspace_manager):
+        """Verify no curation when curator.enabled is False."""
+        from src.graph import create_archive_phase_node
+        from src.managers import TodoManager, PlanManager
+        from src.core.context import ContextManager
+
+        config = _load_config("defaults")
+        config.context_management.compact_on_archive = False
+        # Curator disabled (default)
+
+        todo_manager = TodoManager(workspace_manager)
+        plan_manager = PlanManager(workspace_manager)
+        plan_manager.write("# Plan\n## Phase 1\nTest.\n")
+
+        context_mgr = ContextManager(config)
+        mock_llm = MagicMock()
+
+        # ToolContext WITH knowledge base but curator disabled
+        ctx = ToolContext(workspace_manager=workspace_manager, config={})
+        ctx.knowledge_graph = MagicMock()
+        ctx.knowledge_store = MagicMock()
+
+        archive_fn = create_archive_phase_node(
+            todo_manager=todo_manager,
+            plan_manager=plan_manager,
+            config=config,
+            context_mgr=context_mgr,
+            auxiliary_llm=mock_llm,
+            summarization_prompt="Summarize.",
+            tool_context=ctx,
+            workspace_manager=workspace_manager,
+        )
+
+        state = {
+            "job_id": "test-job-123",
+            "iteration": 5,
+            "phase_number": 1,
+            "is_strategic_phase": False,
+            "messages": [],
+        }
+
+        result = await archive_fn(state)
+        assert "messages" in result
+
+    @pytest.mark.asyncio
+    async def test_curation_triggered_when_enabled(self, workspace_manager):
+        """Verify inline curation fires when KB available and curator enabled."""
+        from src.graph import create_archive_phase_node
+        from src.managers import TodoManager, PlanManager
+        from src.core.context import ContextManager
+
+        config = _load_config("defaults")
+        config.context_management.compact_on_archive = False
+        config.extra["curator"] = {"enabled": True}
+
+        todo_manager = TodoManager(workspace_manager)
+        plan_manager = PlanManager(workspace_manager)
+        plan_manager.write("# Plan\n## Phase 1\nTactical work.\n")
+
+        # Write workspace.md so read_file doesn't fail
+        workspace_manager.write_file("workspace.md", "# Workspace\nTest workspace.")
+
+        # Create and complete a todo
+        todo_manager.add("Build feature")
+        for t in todo_manager.list_all():
+            todo_manager.complete(t.id, notes=["Feature built"])
+
+        context_mgr = ContextManager(config)
+        mock_llm = MagicMock()
+
+        # ToolContext WITH knowledge base
+        ctx = ToolContext(workspace_manager=workspace_manager, config={})
+        ctx.knowledge_graph = MagicMock()
+        ctx.knowledge_store = MagicMock()
+        ctx.project_id = "proj-123"
+
+        archive_fn = create_archive_phase_node(
+            todo_manager=todo_manager,
+            plan_manager=plan_manager,
+            config=config,
+            context_mgr=context_mgr,
+            auxiliary_llm=mock_llm,
+            summarization_prompt="Summarize.",
+            tool_context=ctx,
+            workspace_manager=workspace_manager,
+        )
+
+        state = {
+            "job_id": "test-job-123",
+            "iteration": 5,
+            "phase_number": 1,
+            "is_strategic_phase": False,
+            "messages": [],
+        }
+
+        with patch("src.services.auxiliary.curate_and_store_knowledge", new_callable=AsyncMock) as mock_curate:
+            await archive_fn(state)
+            # Allow async task to run
+            await asyncio.sleep(0.1)
+
+            mock_curate.assert_called_once()
+            call_kwargs = mock_curate.call_args
+            assert call_kwargs.kwargs["auxiliary_llm"] is mock_llm
+            assert call_kwargs.kwargs["tool_context"] is ctx
+            assert "Phase 1 (tactical) archived" in call_kwargs.kwargs["phase_data"]
+            assert "Build feature" in call_kwargs.kwargs["phase_data"]
+
 
 # =========================================================================
-# Agent curation_callback attribute
+# Agent no longer has curation_callback
 # =========================================================================
 
-class TestAgentCurationCallback:
-    """Tests that the agent correctly passes curation_callback to the graph."""
+class TestAgentNoCurationCallback:
+    """Tests that the agent no longer has the curation_callback attribute."""
 
-    def test_agent_has_curation_callback_attr(self):
-        """Verify UniversalAgent has the curation_callback attribute."""
+    def test_agent_has_no_curation_callback(self):
+        """Verify curation_callback was removed from UniversalAgent."""
         from src.agent import UniversalAgent
 
         config = _load_config("defaults")
         agent = UniversalAgent(config)
-        assert hasattr(agent, "curation_callback")
-        assert agent.curation_callback is None
+        assert not hasattr(agent, "curation_callback")
+
+    def test_agent_has_knowledge_graph_attr(self):
+        """Verify UniversalAgent tracks knowledge_graph for cleanup."""
+        from src.agent import UniversalAgent
+
+        config = _load_config("defaults")
+        agent = UniversalAgent(config)
+        assert hasattr(agent, "_knowledge_graph")
+        assert agent._knowledge_graph is None

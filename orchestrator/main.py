@@ -1247,6 +1247,20 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Failed to link builder session {job.builder_session_id}: {e}")
 
+        # Spawn scholar subjob if enabled (root jobs only)
+        if not job.parent_job_id:
+            try:
+                # Re-fetch the job so _spawn_scholar_subjob has repo_name etc.
+                fresh_job = await postgres_db.get_job(str(result["id"]))
+                if fresh_job:
+                    scholar_result = await _spawn_scholar_subjob(
+                        fresh_job, job.config_name, job.config_override, context,
+                    )
+                    if scholar_result:
+                        result["scholar_job_id"] = str(scholar_result["id"])
+            except Exception as e:
+                logger.warning(f"Failed to spawn scholar for job {result['id']}: {e}")
+
         # Trigger auto-assignment dispatcher (fire-and-forget)
         _trigger_dispatch()
 
@@ -1384,6 +1398,14 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                 status_code=400,
                 detail="Job cannot be cancelled (already completed or cancelled)",
             )
+
+        # If this was a scholar, unblock the parent job
+        job["status"] = "cancelled"
+        try:
+            await _handle_scholar_completion(job, [])
+        except Exception as e:
+            logger.warning(f"Error handling scholar cancellation for {job_id}: {e}")
+
         # Agent is being freed — trigger dispatcher for queued jobs
         _trigger_dispatch()
 
@@ -1880,6 +1902,197 @@ async def _set_target_to_autonomy_status(target_job_id: str) -> str:
         return "pending_review"
 
 
+async def _spawn_scholar_subjob(
+    job: dict[str, Any],
+    config_name: str,
+    config_override: dict[str, Any] | None,
+    context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Spawn a scholar research job before the main job starts.
+
+    Called at job creation time.  Checks the scholar config from disk
+    (since resolved_config is not yet available) and, if enabled,
+    holds the parent job in 'waiting' while the scholar runs.
+
+    Returns the created scholar job dict, or None if skipped.
+    """
+    from orchestrator.services.completion import (
+        format_scholar_instructions,
+        resolve_scholar_config_from_disk,
+    )
+
+    job_id = str(job["id"])
+
+    # Guard: never spawn scholars for subjobs (no recursion)
+    if job.get("parent_job_id"):
+        return None
+
+    scholar_config = resolve_scholar_config_from_disk(config_name, config_override)
+    if not scholar_config.get("enabled", False):
+        logger.debug(f"Scholar not enabled for job {job_id} (config={config_name})")
+        return None
+
+    scholar_config_name = scholar_config.get("scholar_config", "scholar")
+    description = job.get("description", "")
+    parent_instructions = (context or {}).get("instructions")
+
+    # Format scholar instructions from template
+    instructions = format_scholar_instructions(
+        parent_job_id=job_id,
+        description=description,
+        config_name=config_name,
+        instructions=parent_instructions,
+    )
+
+    scholar_description = f"Research phase for: {description[:200]}"
+
+    scholar_context: dict[str, Any] = {
+        "scholar_target": job_id,
+        "original_description": description,
+        "instructions": instructions,
+    }
+    if parent_instructions:
+        scholar_context["parent_instructions"] = parent_instructions
+
+    # Disable nested subjob spawning on the scholar
+    scholar_override: dict[str, Any] = {
+        "scholar": {"enabled": False},
+        "verification": {"enabled": False},
+        "curator": {"enabled": False},
+        "autonomy": "full",
+    }
+
+    project_id = str(job["project_id"]) if job.get("project_id") else None
+
+    logger.info(
+        f"Creating scholar subjob for job {job_id} "
+        f"(scholar_config={scholar_config_name})"
+    )
+
+    # Hold the parent job
+    await postgres_db.update_job_status(job_id, status="waiting")
+
+    scholar_job = await postgres_db.create_job(
+        description=scholar_description,
+        config_name=scholar_config_name,
+        config_override=scholar_override,
+        context=scholar_context,
+        parent_job_id=job_id,
+        project_id=project_id,
+        priority=10,
+    )
+
+    scholar_job_id = str(scholar_job["id"])
+    short_id = scholar_job_id[:8]
+
+    # Set up Gitea branch for the scholar subjob
+    if gitea_client.is_initialized:
+        parent_repo_name = job.get("repo_name")
+        if not parent_repo_name:
+            parent_repo_name = f"job-{str(job['id'])[:8]}"
+
+        from_branch = job.get("branch_name") or "main"
+        branch_name = f"subjob/{short_id}/{scholar_config_name}"
+        try:
+            await gitea_client.create_branch(
+                parent_repo_name, branch_name, from_branch=from_branch
+            )
+            # Propagate git remote URL
+            parent_context = job.get("context") or {}
+            if isinstance(parent_context, str):
+                try:
+                    parent_context = json.loads(parent_context)
+                except (json.JSONDecodeError, ValueError):
+                    parent_context = {}
+            git_remote_url = parent_context.get("git_remote_url", "")
+
+            scholar_ctx = dict(scholar_context)
+            scholar_ctx["git_remote_url"] = git_remote_url
+            await postgres_db.update_job_context(scholar_job_id, scholar_ctx)
+
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3::uuid",
+                    branch_name, parent_repo_name, scholar_job_id,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to create Gitea branch for scholar {scholar_job_id}: {e}")
+
+    _trigger_dispatch()
+    logger.info(f"Scholar job {scholar_job_id} created for parent {job_id}")
+    return scholar_job
+
+
+async def _handle_scholar_completion(
+    job: dict[str, Any],
+    actions: list[str],
+) -> None:
+    """After a scholar subjob completes or fails, unblock its parent job.
+
+    The scholar's branch has already been merged by ``_squash_merge_subjob``
+    (called earlier in ``complete_job``).  We just need to transition the
+    parent from 'waiting' to 'created' so the dispatcher picks it up.
+    """
+    parent_job_id = job.get("parent_job_id")
+    if parent_job_id is None:
+        return
+
+    # Identify scholar jobs by context
+    ctx_raw = job.get("context")
+    if isinstance(ctx_raw, str):
+        try:
+            ctx = json.loads(ctx_raw)
+        except (json.JSONDecodeError, ValueError):
+            ctx = {}
+    else:
+        ctx = ctx_raw or {}
+
+    if not ctx.get("scholar_target"):
+        return  # Not a scholar job
+
+    job_id = str(job["id"])
+    target_id = str(parent_job_id)
+    job_status = job.get("status", "")
+    is_failure = job_status in ("failed", "cancelled")
+
+    parent = await postgres_db.get_job(target_id)
+    if not parent:
+        logger.warning(f"Scholar {job_id} parent {target_id} not found")
+        return
+
+    if parent.get("status") != "waiting":
+        logger.debug(
+            f"Scholar {job_id} parent {target_id} not in 'waiting' "
+            f"(status={parent.get('status')}) — skipping unblock"
+        )
+        return
+
+    # Inject scholar metadata into parent context
+    parent_ctx = parent.get("context") or {}
+    if isinstance(parent_ctx, str):
+        try:
+            parent_ctx = json.loads(parent_ctx)
+        except (json.JSONDecodeError, ValueError):
+            parent_ctx = {}
+    parent_ctx = dict(parent_ctx)
+
+    if is_failure:
+        parent_ctx["scholar_failed"] = True
+        logger.warning(
+            f"Scholar {job_id} {job_status} — unblocking parent {target_id} without research"
+        )
+        actions.append(f"scholar {job_id} {job_status}, parent {target_id} unblocked (no research)")
+    else:
+        parent_ctx["scholar_completed"] = True
+        parent_ctx["scholar_output_dir"] = "research"
+        logger.info(f"Scholar {job_id} completed — unblocking parent {target_id}")
+        actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
+
+    await postgres_db.update_job_context(target_id, parent_ctx)
+    await postgres_db.update_job_status(target_id, status="created")
+    _trigger_dispatch()
+
+
 async def _handle_critic_verdict_on_complete(
     job: dict[str, Any],
     actions: list[str],
@@ -2278,6 +2491,12 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
             await _handle_critic_verdict_on_complete(job, actions)
         except Exception as e:
             logger.error(f"Error handling critic verdict for {job_id}: {e}", exc_info=True)
+
+        # 3b. Handle scholar completion (unblock parent job)
+        try:
+            await _handle_scholar_completion(job, actions)
+        except Exception as e:
+            logger.error(f"Error handling scholar completion for {job_id}: {e}", exc_info=True)
 
         # 4. Trigger verification (if this is a main job that completed)
         try:
@@ -4925,6 +5144,19 @@ async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
                         )
                 except Exception as e:
                     logger.warning(f"Failed to clone datasource {ds_id}: {e}")
+
+        # Spawn scholar subjob if enabled (root jobs only)
+        if not job.parent_job_id:
+            try:
+                fresh_job = await postgres_db.get_job(str(result["id"]))
+                if fresh_job:
+                    scholar_result = await _spawn_scholar_subjob(
+                        fresh_job, config_name, job.config_override, context,
+                    )
+                    if scholar_result:
+                        result["scholar_job_id"] = str(scholar_result["id"])
+            except Exception as e:
+                logger.warning(f"Failed to spawn scholar for job {result['id']}: {e}")
 
         return result
     except HTTPException:

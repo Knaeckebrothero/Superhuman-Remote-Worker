@@ -511,6 +511,169 @@ class AuxiliaryLLM:
 
 
 # =============================================================================
+# Memory extraction helper (replaces MemoryObserver.observe / observe_phase_boundary)
+# =============================================================================
+
+# Max messages to include in a single observation window
+_MAX_OBSERVATION_WINDOW = 40
+
+
+async def extract_and_store_memories(
+    auxiliary_llm: "AuxiliaryLLM",
+    recall_store,
+    messages: List[BaseMessage],
+    phase: int = 0,
+    source_turn_start: Optional[int] = None,
+    source_turn_end: Optional[int] = None,
+) -> int:
+    """Extract memories via AuxiliaryLLM and store them in RecallStore.
+
+    Replaces MemoryObserver.observe() and observe_phase_boundary().
+    Runs the ExtractMemoriesTask in chain mode and stores each result.
+
+    Args:
+        auxiliary_llm: AuxiliaryLLM instance for extraction
+        recall_store: RecallStore instance for storage
+        messages: Conversation messages to extract from
+        phase: Current phase number
+        source_turn_start: Start turn for windowed extraction (optional)
+        source_turn_end: End turn for windowed extraction (optional)
+
+    Returns:
+        Number of memories successfully stored
+    """
+    try:
+        # Cap the message window
+        if len(messages) > _MAX_OBSERVATION_WINDOW:
+            messages = messages[-_MAX_OBSERVATION_WINDOW:]
+
+        if not messages:
+            return 0
+
+        task = ExtractMemoriesTask(messages=messages, phase=phase)
+        result = await auxiliary_llm.chain(task)
+
+        stored_count = 0
+        for mem in result.memories:
+            try:
+                mem_id = await recall_store.store(
+                    content=mem.content,
+                    summary=mem.summary,
+                    keywords=mem.keywords,
+                    importance=mem.importance,
+                    memory_type=mem.type,
+                    source="observer",
+                    source_turn_start=source_turn_start,
+                    source_turn_end=source_turn_end,
+                    source_phase=phase,
+                )
+                if mem_id:
+                    stored_count += 1
+            except Exception as e:
+                logger.warning(f"Memory extraction: failed to store memory: {e}")
+
+        logger.info(
+            f"Memory extraction: extracted {len(result.memories)}, "
+            f"stored {stored_count} (phase {phase})"
+        )
+        return stored_count
+
+    except Exception as e:
+        logger.warning(f"Memory extraction failed (non-fatal): {e}")
+        return 0
+
+
+async def curate_and_store_knowledge(
+    auxiliary_llm: "AuxiliaryLLM",
+    tool_context: Any,
+    phase_data: str,
+    workspace_md: str,
+    plan_md: str,
+) -> Optional["CurationResult"]:
+    """Run inline knowledge curation via AuxiliaryLLM agent mode.
+
+    Replaces the curator subjob. Extracts knowledge notes from phase artifacts
+    and writes them to the project knowledge base (Neo4j + pgvector).
+
+    Args:
+        auxiliary_llm: AuxiliaryLLM instance
+        tool_context: ToolContext with knowledge_graph and knowledge_store
+        phase_data: Formatted phase context (archive path, completed todos)
+        workspace_md: Current workspace.md content
+        plan_md: Current plan.md content
+
+    Returns:
+        CurationResult on success, None on failure or if KB not available
+    """
+    try:
+        kg = tool_context.knowledge_graph
+        ks = tool_context.knowledge_store
+        project_id = tool_context.project_id
+
+        if not kg or not ks or not project_id:
+            return None
+
+        # Get existing notes for duplicate-aware context
+        existing_notes = []
+        try:
+            notes = kg.list_notes(project_id=project_id, limit=50)
+            existing_notes = [
+                f"- {n.get('id', '?')}: {n.get('title', '?')} ({n.get('type', '?')})"
+                for n in notes
+            ]
+        except Exception as e:
+            logger.debug(f"Could not fetch existing notes: {e}")
+
+        # Create KB tools for the curation agent
+        from src.tools.knowledge.knowledge_tools import create_kb_tools
+        kb_tools = create_kb_tools(tool_context)
+
+        task = CurateKnowledgeTask(
+            phase_data=phase_data,
+            workspace_md=workspace_md,
+            plan_md=plan_md,
+            existing_notes=existing_notes,
+            kb_tools=kb_tools,
+        )
+
+        result = await auxiliary_llm.agent(task)
+
+        logger.info(
+            f"Inline curation complete: {result.notes_created} created, "
+            f"{result.notes_updated} updated — {result.summary}"
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(f"Inline curation failed (non-fatal): {e}")
+        return None
+
+
+def _should_extract_memories(
+    turn_count: int,
+    interval: int,
+    last_observed_turn: int,
+) -> bool:
+    """Check if memory extraction should run on this turn.
+
+    Equivalent to MemoryObserver.should_observe().
+
+    Args:
+        turn_count: Current turn count
+        interval: Extraction interval (every N turns)
+        last_observed_turn: Last turn when extraction ran
+
+    Returns:
+        True if extraction should run
+    """
+    if turn_count <= 0:
+        return False
+    if turn_count <= last_observed_turn:
+        return False
+    return turn_count % interval == 0
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 

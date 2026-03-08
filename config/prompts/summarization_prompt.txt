@@ -5,6 +5,11 @@ EXCLUSIONS: Do NOT summarize the content of workspace.md or plan.md.
 These files are persistent and will be re-injected. Only note ACTIONS TAKEN
 on these files (e.g., "Updated workspace.md with new blockers").
 
+PRIOR SUMMARIES: If the conversation below contains a "[Summary of prior work]" message,
+it represents a previous compaction. Do NOT repeat facts from it verbatim — they are already
+preserved. Only reference prior summary content when it remains actively relevant to the
+current state. Focus your token budget on NEW information from the conversation that followed.
+
 Before generating the summary, analyze the conversation:
 1. What was the user's original request? What are the success criteria?
 2. What actions succeeded? What failed and why (exact error messages)?

@@ -16,27 +16,29 @@ related:
 
 # Auxiliary LLM — Unified Support Task System
 
-## The Problem
+## The Problem (pre-migration)
 
-The agent system has several "support" LLM tasks scattered across different components, each with its own invocation pattern, error handling, and configuration:
+The agent system had several "support" LLM tasks scattered across different components, each with its own invocation pattern, error handling, and configuration:
 
-| Task | Current Location | How It Runs |
-|------|-----------------|-------------|
+| Task | Old Location | How It Ran |
+|------|-------------|------------|
 | Conversation summarization | `ContextManager.summarize_and_compact()` | Inline LLM call with main/strategic LLM |
 | Memory extraction | `MemoryObserver.extract_memories()` | Async background task, configurable model |
 | Knowledge curation | Curator subjob (`config/experts/curator/`) | Full agent job with phases, todos, workspace |
 | Memory injection assembly | `RecallStore.retrieve()` | No LLM — vector search + ranking |
 | Knowledge injection | `KnowledgeStore.hybrid_search()` | No LLM — vector search + ranking |
 
-Problems with the status quo:
+Problems:
 
-1. **The curator subjob is overkill.** It runs the full agent loop — strategic/tactical phases, todo management, workspace.md, plan.md, git branching — just to read artifacts and call `kb_write` a few times. That's massive overhead for a structured extraction task.
+1. **The curator subjob was overkill.** It ran the full agent loop — strategic/tactical phases, todo management, workspace.md, plan.md, git branching — just to read artifacts and call `kb_write` a few times. Massive overhead for a structured extraction task.
 
-2. **Scattered configuration.** Summarization uses the main LLM. The memory observer has `observer_model` / `observer_base_url`. The curator has its own expert config. Three different ways to configure what is conceptually the same thing: "use a support model for a background task."
+2. **Scattered configuration.** Summarization used the main LLM. The memory observer had `observer_model` / `observer_base_url`. The curator had its own expert config. Three different ways to configure what is conceptually the same thing: "use a support model for a background task."
 
-3. **No reuse.** The observer's extraction prompt, the summarization call, and the curator's curation logic all follow the same pattern (system prompt + context → structured output) but share no infrastructure.
+3. **No reuse.** The observer's extraction prompt, the summarization call, and the curator's curation logic all followed the same pattern (system prompt + context → structured output) but shared no infrastructure.
 
-4. **Wasted model capability.** The free `gpt-oss-120b` on the university servers has good reasoning capabilities but isn't great at long-running agent jobs. The current system either uses it as a full agent (where it struggles) or doesn't use it at all. What it's good at — structured reasoning over provided context — is exactly what support tasks need.
+4. **Wasted model capability.** The free `gpt-oss-120b` on the university servers has good reasoning capabilities but isn't great at long-running agent jobs. The old system either used it as a full agent (where it struggles) or didn't use it at all. What it's good at — structured reasoning over provided context — is exactly what support tasks need.
+
+**All three LLM support tasks are now unified through `AuxiliaryLLM`.** Summarization, memory extraction, and knowledge curation all use the same class, same model config, and same error handling pattern.
 
 ## The Solution: AuxiliaryLLM
 
@@ -62,7 +64,7 @@ system_prompt + context  →  LLM  →  tool_call  →  result
                               → structured result (JSON)
 ```
 
-The critical difference from the current curator subjob: no job creation, no workspace setup, no phase alternation, no git branching, no todo management. Just a prompt, optional tools, a tight loop with a hard cap, and a structured result.
+The critical difference from the old curator subjob: no job creation, no workspace setup, no phase alternation, no git branching, no todo management. Just a prompt, optional tools, a tight loop with a hard cap, and a structured result.
 
 ## Task Mapping
 
@@ -87,7 +89,13 @@ These need a few tool calls to interact with the knowledge base or filesystem:
 | **Migrate Memories** | `memory_migrator.py` | `kb_search`, `kb_write` | 5–10 |
 | **Convert Workspace** | `workspace_converter.py` | `kb_search`, `kb_write`, `read_file` | 5–10 |
 
-## Interface
+## Interface (as implemented)
+
+All code lives in `src/services/auxiliary.py`.
+
+### AuxiliaryLLM
+
+Both modes use `with_structured_output()` for reliable Pydantic model returns — no manual JSON parsing.
 
 ```python
 class AuxiliaryLLM:
@@ -95,59 +103,19 @@ class AuxiliaryLLM:
 
     def __init__(
         self,
-        llm: BaseChatModel,          # The support model (e.g. gpt-oss-120b)
-        config: Optional[dict] = None,
-    ):
-        self.llm = llm
-        self.max_agent_iterations = config.get("max_iterations", 15) if config else 15
-        self.timeout = config.get("timeout", 120) if config else 120
+        llm: BaseChatModel,
+        max_iterations: int = 15,
+        timeout: float = 120.0,
+    ): ...
 
-    async def chain(self, task: AuxTask) -> dict:
-        """Single LLM call: system prompt + context → structured JSON.
+    async def chain(self, task: AuxTask) -> BaseModel:
+        """Single LLM call: system prompt + context → Pydantic model.
+        Uses with_structured_output(task.output_schema)."""
 
-        For tasks that need reasoning but no tool access.
-        """
-        messages = [
-            SystemMessage(content=task.system_prompt),
-            HumanMessage(content=task.build_context()),
-        ]
-        response = await asyncio.wait_for(
-            self.llm.ainvoke(messages),
-            timeout=self.timeout,
-        )
-        return task.parse_response(response.content)
-
-    async def agent(self, task: AuxAgentTask) -> dict:
-        """Short-lived agent loop: system prompt + tools → structured result.
-
-        For tasks that need a few tool calls before producing output.
-        Capped at max_iterations to prevent runaway.
-        """
-        tools = task.get_tools()
-        llm_with_tools = self.llm.bind_tools(tools)
-        messages = [
-            SystemMessage(content=task.system_prompt),
-            HumanMessage(content=task.build_context()),
-        ]
-
-        for _ in range(self.max_agent_iterations):
-            response = await llm_with_tools.ainvoke(messages)
-            messages.append(response)
-
-            if not response.tool_calls:
-                # LLM is done — parse final response
-                return task.parse_response(response.content)
-
-            # Execute tool calls
-            for tool_call in response.tool_calls:
-                result = await execute_tool(tools, tool_call)
-                messages.append(ToolMessage(
-                    content=result,
-                    tool_call_id=tool_call["id"],
-                ))
-
-        # Hit iteration cap — parse whatever we have
-        return task.parse_response(messages[-1].content)
+    async def agent(self, task: AuxAgentTask) -> BaseModel:
+        """Tool loop → final structured-output call → Pydantic model.
+        Runs tool loop with bind_tools(), then one final
+        with_structured_output() call to produce the result."""
 ```
 
 ### Task Base Classes
@@ -163,8 +131,9 @@ class AuxTask(ABC):
     @abstractmethod
     def build_context(self) -> str: ...
 
+    @property
     @abstractmethod
-    def parse_response(self, raw: str) -> dict: ...
+    def output_schema(self) -> Type[BaseModel]: ...
 
 
 class AuxAgentTask(AuxTask):
@@ -174,86 +143,146 @@ class AuxAgentTask(AuxTask):
     def get_tools(self) -> list: ...
 ```
 
-### Example: ExtractMemoriesTask (Chain Mode)
+Key difference from original design: tasks define `output_schema` (a Pydantic model class) instead of `parse_response()`. The `AuxiliaryLLM` handles structured output via `with_structured_output()` — no manual JSON parsing, no markdown fence stripping, no fallback extraction.
 
-Replaces `MemoryObserver.extract_memories()`:
+### Implemented Tasks
+
+#### ExtractMemoriesTask (Chain Mode) ✅ Wired
+
+Replaces `MemoryObserver.extract_memories()`. Uses `with_structured_output(ExtractedMemories)` instead of the old free-form JSON + manual parsing approach.
 
 ```python
+class ExtractedMemory(BaseModel):
+    content: str      # The insight (1-3 sentences)
+    summary: str      # One-line summary
+    keywords: List[str]
+    importance: float  # 0.0-1.0
+    type: str          # factual, procedural, error_solution, vocabulary, relational
+
+class ExtractedMemories(BaseModel):
+    memories: List[ExtractedMemory]
+
 class ExtractMemoriesTask(AuxTask):
-    """Extract memories from a conversation segment."""
-
-    def __init__(self, messages: list[BaseMessage], phase: int = 0):
-        self.messages = messages
-        self.phase = phase
-
-    @property
-    def system_prompt(self) -> str:
-        return EXTRACTION_PROMPT  # Same prompt as current MemoryObserver
-
-    def build_context(self) -> str:
-        return format_messages_for_extraction(self.messages)
-
-    def parse_response(self, raw: str) -> dict:
-        memories = parse_json_array(raw)  # Reuse MemoryObserver._parse_extraction_response
-        return {"memories": memories, "phase": self.phase}
+    output_schema = ExtractedMemories
 ```
 
-### Example: CurateKnowledgeTask (Agent Mode)
+**vs. old MemoryObserver:**
 
-Replaces the curator subjob:
+| Aspect | Old (MemoryObserver) | New (ExtractMemoriesTask) |
+|--------|---------------------|--------------------------|
+| LLM call | `self.llm.ainvoke([HumanMessage])` — prompt + context in one message | `with_structured_output()` — SystemMessage + HumanMessage |
+| Output parsing | Free-form text → `_parse_extraction_response()` (JSON extraction, markdown fence strip, field validation, type/importance clamping) | `with_structured_output(ExtractedMemories)` → Pydantic model directly |
+| Prompt | Includes JSON example (needed for free-form parsing) | No example needed — schema drives the output |
+| Message windowing | `_get_message_segment()`: `min(window_size * 2, 40)` based on turn range since last observation | Caps at `_MAX_OBSERVATION_WINDOW = 40` from the end of the full message list |
+| Message formatting | `_format_messages_for_extraction()` (identical in both) | Same function, copied to `auxiliary.py` |
+| Interval tracking | `_last_observed_turn` instance variable on `MemoryObserver` | `last_observed_turn` field on `UniversalAgentState` |
+| Store loop | Iterates `List[Dict]`, uses `.get()` with defaults | Iterates `List[ExtractedMemory]`, uses typed attributes |
+
+**Known difference — message windowing:** The old observer sliced to roughly the messages *since last observation* (`window_size * 2`). The new code always sends the last 40 messages regardless of when extraction last ran. This means the new code may re-analyze previously extracted messages. This is acceptable because `RecallStore` deduplicates via `find_similar()`, but it does mean slightly more tokens per extraction call.
+
+#### SummarizeTask (Chain Mode) ✅ Wired
+
+Replaces inline summarization in `ContextManager._single_pass_summarize()`.
 
 ```python
-class CurateKnowledgeTask(AuxAgentTask):
-    """Extract knowledge notes from phase artifacts."""
+# Output schema lives in src/core/context.py (tightly coupled with compaction formatting)
+class ConversationSummary(BaseModel):
+    completed_work: str
+    key_decisions: str
+    discovered_info: str
+    current_state: str
+    errors_blockers: str
+    failed_approaches: str
 
-    def __init__(
-        self,
-        phase_data: str,            # Retrospective content, todo summaries
-        workspace_md: str,          # Current workspace.md content
-        plan_md: str,               # Current plan.md content
-        existing_notes: list[str],  # Pre-fetched KB note summaries for dedup context
-        kb_tools: list,             # kb_search, kb_write, kb_update, kb_read
-    ):
-        self.phase_data = phase_data
-        self.workspace_md = workspace_md
-        self.plan_md = plan_md
-        self.existing_notes = existing_notes
-        self._kb_tools = kb_tools
-
-    @property
-    def system_prompt(self) -> str:
-        return CURATION_SYSTEM_PROMPT  # Derived from curator/instructions.md
-
-    def build_context(self) -> str:
-        parts = [
-            "## Phase Artifacts",
-            self.phase_data,
-            "",
-            "## Current Workspace",
-            self.workspace_md,
-            "",
-            "## Current Plan",
-            self.plan_md,
-        ]
-        if self.existing_notes:
-            parts.extend([
-                "",
-                "## Existing Knowledge (check before writing duplicates)",
-                "\n".join(self.existing_notes),
-            ])
-        return "\n".join(parts)
-
-    def get_tools(self) -> list:
-        return self._kb_tools
-
-    def parse_response(self, raw: str) -> dict:
-        return {"status": "completed", "summary": raw}
+class SummarizeTask(AuxTask):
+    output_schema = ConversationSummary
 ```
 
-## Configuration
+Accepts an optional `summarization_prompt` override (rendered from the config's prompt matrix). Falls back to `_DEFAULT_SUMMARIZATION_PROMPT` if none provided.
+
+#### CurateKnowledgeTask (Agent Mode) ✅ Wired
+
+Replaces the curator subjob. Runs inline via `curate_and_store_knowledge()` in `archive_phase`.
+
+```python
+class CurationResult(BaseModel):
+    notes_created: int
+    notes_updated: int
+    summary: str
+
+class CurateKnowledgeTask(AuxAgentTask):
+    output_schema = CurationResult
+    # get_tools() returns all kb_* tools from create_kb_tools()
+```
+
+**vs. old Curator Subjob:**
+
+| Aspect | Old (Curator Subjob) | New (CurateKnowledgeTask) |
+|--------|---------------------|--------------------------|
+| Execution | Full agent job: workspace, todos, phases, git | Inline `AuxiliaryLLM.agent()` call, ~5-15 iterations |
+| Trigger | `curation_callback` → `_maybe_trigger_curation()` → POST to orchestrator API | `curate_and_store_knowledge()` called directly in `archive_phase` |
+| Lifecycle | Spawned once, resumed on each phase via orchestrator | Stateless — runs fresh on each archive phase |
+| Config | `curator.curator_config` → separate expert config dir | `curator.enabled` + `auxiliary.enabled` in main config |
+| Infrastructure | `OrchestratorClient.create_curation_job()`, `_format_curation_instructions()`, callback wiring in `app.py` | `curate_and_store_knowledge()` helper (~60 lines in `auxiliary.py`) |
+| Final pass | `_maybe_trigger_curation_final_pass()` after critic approval | Removed — incremental per-phase only |
+| KB initialization | Curator was a separate job that initialized its own Neo4j/pgvector connections | Main agent initializes `KnowledgeGraphDB` + `KnowledgeStore` in `_setup_job_tools()` |
+| Tools | Same `kb_*` tools, loaded by curator's own tool loading | Same `kb_*` tools via `create_kb_tools(tool_context)` |
+| Output | Job completion with freeze_data | `CurationResult` Pydantic model (notes_created, notes_updated, summary) |
+| Error handling | Job failure (visible in orchestrator) | Non-fatal — logged and swallowed, never blocks the main agent |
+
+**Knowledge infrastructure wiring:** The main agent now initializes `KnowledgeGraphDB` (Neo4j) and `KnowledgeStore` (pgvector) on `ToolContext` when `curator.enabled` is true and the job has a `project_id`. Connection is cleaned up in `_close_datasource_connections()`. Previously these fields existed on `ToolContext` but were never populated — the old curator was a separate job that created its own connections.
+
+### Knowledge Curation Helper
+
+`curate_and_store_knowledge()` replaces the curator subjob infrastructure:
+
+```python
+async def curate_and_store_knowledge(
+    auxiliary_llm: AuxiliaryLLM,
+    tool_context: ToolContext,
+    phase_data: str,
+    workspace_md: str,
+    plan_md: str,
+) -> Optional[CurationResult]:
+    """Run inline knowledge curation via AuxiliaryLLM agent mode."""
+```
+
+Called from `archive_phase` in `src/graph.py` as `asyncio.create_task()` (non-blocking). Guards:
+- `tool_context.has_knowledge()` (Neo4j + pgvector available)
+- `config.extra.curator.enabled` is true
+- `config.auxiliary.enabled` is true
+
+The helper fetches existing notes from Neo4j (for duplicate awareness), creates KB tools via `create_kb_tools()`, and runs `CurateKnowledgeTask` in agent mode.
+
+### Memory Extraction Helper
+
+`extract_and_store_memories()` replaces both `MemoryObserver.observe()` and `observe_phase_boundary()`:
+
+```python
+async def extract_and_store_memories(
+    auxiliary_llm: AuxiliaryLLM,
+    recall_store,
+    messages: List[BaseMessage],
+    phase: int = 0,
+    source_turn_start: Optional[int] = None,
+    source_turn_end: Optional[int] = None,
+) -> int:
+    """Extract memories via chain() and store in RecallStore. Returns stored count."""
+```
+
+Called from two places in `src/graph.py`:
+1. **Execute node** — every N turns (interval from `config.memory.observer_interval`)
+2. **Archive phase node** — at every phase boundary
+
+Both fire as `asyncio.create_task()` (non-blocking), same as the old observer.
+
+`_should_extract_memories(turn_count, interval, last_observed_turn)` is the pure-function replacement for `MemoryObserver.should_observe()`.
+
+## Configuration (as implemented)
 
 ```yaml
 # config/defaults.yaml
+
 auxiliary:
   enabled: true
   model: null              # null = use main LLM; or "gpt-oss-120b"
@@ -261,87 +290,73 @@ auxiliary:
   temperature: 0.0
   max_iterations: 15       # Cap for agent mode loops
   timeout: 120             # Seconds per LLM call
-
-  # Task-specific overrides
   tasks:
-    summarize:
-      enabled: true
     extract_memories:
       enabled: true
-      interval: 5          # Every N turns (replaces memory.observer_interval)
     curate_knowledge:
-      enabled: true        # Replaces curator.enabled
+      enabled: true
+
+# Inline knowledge curation (requires Neo4j + project_id in job metadata)
+curator:
+  enabled: false           # Opt-in per config or per project
 ```
 
-This replaces:
-- `memory.observer_model` / `memory.observer_base_url` → `auxiliary.model` / `auxiliary.base_url`
-- `curator.enabled` / `curator.curator_config` → `auxiliary.tasks.curate_knowledge.enabled`
+**Two flags gate curation:** `curator.enabled` (feature gate — is curation desired for this config?) and `auxiliary.enabled` (is the auxiliary LLM available?). Both must be true, plus the job must have a `project_id` and Neo4j must be reachable.
 
-One model config, one class, all support tasks.
+**Note:** The extraction interval is still read from `config.memory.observer_interval` (default: 5), not from `auxiliary.tasks.extract_memories`. The `memory.observer_model` / `memory.observer_base_url` keys are still in `defaults.yaml` but no longer used — the auxiliary model/base_url settings take precedence.
 
-## Integration Points
+## What Changed and What Stays
 
-### Archive Phase (replaces curator subjob spawn)
-
-```python
-# In archive_phase node (src/graph.py), replaces curation_callback:
-if auxiliary_llm and config.auxiliary.tasks.curate_knowledge.enabled:
-    # Pre-fetch existing KB context (so the LLM can dedup)
-    existing = await knowledge_store.hybrid_search(project_id, phase_summary, match_count=20)
-    existing_summaries = [f"- {n.note_id}: {n.title} ({n.note_type})" for n in existing]
-
-    task = CurateKnowledgeTask(
-        phase_data=curation_phase_data,
-        workspace_md=workspace_content,
-        plan_md=plan_content,
-        existing_notes=existing_summaries,
-        kb_tools=kb_tool_instances,
-    )
-    asyncio.create_task(auxiliary_llm.agent(task))
-```
-
-### Execute Node (replaces MemoryObserver trigger)
-
-```python
-# In execute node (src/graph.py), replaces memory_observer.observe():
-if auxiliary_llm and should_extract_memories(state["turn_count"]):
-    task = ExtractMemoriesTask(
-        messages=state["messages"],
-        phase=state.get("phase_number", 0),
-    )
-    result = await auxiliary_llm.chain(task)
-    for mem in result["memories"]:
-        await recall_store.store(**mem)
-```
-
-### Context Compaction (replaces inline summarization LLM call)
-
-```python
-# In ContextManager.summarize_and_compact(), optionally:
-if auxiliary_llm:
-    task = SummarizeTask(messages=chunk, max_length=max_summary_length)
-    result = await auxiliary_llm.chain(task)
-    summary = result["summary"]
-```
-
-## What Changes and What Stays
+### Memory Observer → ExtractMemoriesTask (chain mode)
 
 **Replaced:**
-- `MemoryObserver` class → `ExtractMemoriesTask` (chain mode)
-- Curator subjob (`config/experts/curator/`, `create_curation_job()`, `curation_callback`) → `CurateKnowledgeTask` (agent mode)
-- `memory.observer_model` / `memory.observer_base_url` config → `auxiliary.model` / `auxiliary.base_url`
-- `curator.enabled` / `curator.curator_config` config → `auxiliary.tasks.curate_knowledge.enabled`
+- `MemoryObserver.observe()` / `observe_phase_boundary()` → `extract_and_store_memories()` + `ExtractMemoriesTask`
+- `MemoryObserver.should_observe()` → `_should_extract_memories()` (pure function)
+- `MemoryObserver._last_observed_turn` (instance variable) → `last_observed_turn` (state field on `UniversalAgentState`)
+- `MemoryObserver._format_messages_for_extraction()` → `_format_messages_for_extraction()` in `auxiliary.py` (identical copy)
+- `MemoryObserver._parse_extraction_response()` (manual JSON parsing) → `with_structured_output(ExtractedMemories)` (eliminated entirely)
+- `MemoryObserver` initialization in `src/agent.py` (30 lines of LLM creation + observer setup) → removed, `AuxiliaryLLM` handles it
+- `memory_observer` field on `ToolContext` → removed
 
-**Stays the same:**
-- `RecallStore` — storage and retrieval unchanged, just called by the task runner instead of the observer
-- `KnowledgeGraphDB` / `KnowledgeStore` — unchanged, called by `CurateKnowledgeTask` via tools
-- Knowledge tools (`kb_write`, `kb_search`, etc.) — unchanged, passed to agent-mode tasks
-- Memory injection (`memory_injection.py`) — unchanged
-- Knowledge injection (`knowledge_injection.py`) — unchanged
-- Free memory sources (todo completion, compaction, phase archive, tool errors) — unchanged, these are programmatic, not LLM tasks
+### Summarization → SummarizeTask (chain mode)
 
-**Optional migration:**
-- Summarization in `ContextManager` could use `auxiliary_llm.chain(SummarizeTask(...))` instead of calling the main LLM directly. Not required — the current inline approach works fine. But it would centralize all support LLM usage and let the free model handle compaction too.
+**Replaced:**
+- Inline summarization LLM call in `ContextManager._single_pass_summarize()` → `SummarizeTask` via `auxiliary_llm.chain()`
+
+### Curator Subjob → CurateKnowledgeTask (agent mode)
+
+**Replaced:**
+- `curation_callback` parameter on `create_archive_phase_node()` and `build_phase_alternation_graph()` → `tool_context` + `workspace_manager` parameters
+- `_maybe_trigger_curation()` in `src/api/app.py` (spawns/resumes curator via orchestrator API) → `curate_and_store_knowledge()` inline call in `archive_phase`
+- `_maybe_trigger_curation_final_pass()` in `src/api/app.py` (final curation after critic approval) → removed entirely (incremental-only)
+- `OrchestratorClient.create_curation_job()` + `_format_curation_instructions()` → removed (~170 lines)
+- `_get_curation_config()` + `_is_curation_enabled()` in `src/api/app.py` → removed
+- `self.curation_callback` attribute on `UniversalAgent` → removed
+- Callback assignment in `app.py` startup (`_agent.curation_callback = _maybe_trigger_curation`) → removed
+
+**Added:**
+- `curate_and_store_knowledge()` in `src/services/auxiliary.py` — helper that runs `CurateKnowledgeTask` via `AuxiliaryLLM.agent()`
+- `KnowledgeGraphDB` + `KnowledgeStore` initialization in `src/agent.py` `_setup_job_tools()` — populates `ToolContext.knowledge_graph`, `ToolContext.knowledge_store`, and `ToolContext.project_id`
+- `self._knowledge_graph` on `UniversalAgent` — tracks Neo4j connection for cleanup in `_close_datasource_connections()`
+
+**Kept as-is:**
+- `config/experts/curator/` — still a valid agent config for manual curator runs, just no longer auto-spawned
+- `curator.enabled` flag in `config/defaults.yaml` — still gates the feature, now controls inline curation instead of subjob spawning
+
+### Dead code (not yet removed)
+
+- `src/services/memory_observer.py` — no longer imported or called from the graph
+- `tests/test_memory_observer.py` — tests the dead code
+- `MemoryObserver` export from `src/services/__init__.py` — removed
+- `memory.observer_model` / `memory.observer_base_url` config keys — still in `defaults.yaml`, unused
+
+### Stays the same
+
+- `RecallStore` — storage and retrieval unchanged, called by `extract_and_store_memories()` instead of the observer
+- Free memory sources (todo completion, compaction, phase archive, tool errors) — unchanged, these are programmatic
+- Memory injection / Knowledge injection — unchanged
+- KB tools (`kb_write`, `kb_search`, etc.) — unchanged, now also used by the auxiliary curation agent
+- `KnowledgeGraphDB` / `KnowledgeStore` services — unchanged, just now initialized by the main agent
 
 ## Why Two Modes
 
@@ -353,44 +368,65 @@ The free `gpt-oss-120b` has good reasoning capabilities but isn't great at long-
 
 The key insight: the distinction between "reasoning" and "agent" is about **loop length**, not capability. A model that fails at a 100-turn job with phase management can succeed at a 10-turn loop with 4 tools.
 
-## Implementation Plan
+## LLM Call Audit — What's Unified, What's Not
 
-### Phase 1: Core Class + Memory Extraction
+### Through AuxiliaryLLM
 
-1. Implement `AuxiliaryLLM` with `chain()` method
-2. Implement `AuxTask` base class and `ExtractMemoriesTask`
-3. Wire into execute node (replace `MemoryObserver.observe()` call)
-4. Add `auxiliary` config section to `defaults.yaml`
-5. Test: verify memory extraction produces same quality as current observer
+| Task | Mode | Wired In | Replaces |
+|------|------|----------|----------|
+| **Summarization** | `chain()` → `SummarizeTask` | `src/core/context.py` | Inline summarization LLM call |
+| **Memory extraction** | `chain()` → `ExtractMemoriesTask` | `src/graph.py` (execute + archive_phase) | `MemoryObserver.observe()` |
+| **Knowledge curation** | `agent()` → `CurateKnowledgeTask` | `src/graph.py` (archive_phase) | Curator subjob |
 
-### Phase 2: Agent Mode + Knowledge Curation
+### Intentionally Outside AuxiliaryLLM
 
-6. Implement `agent()` method with tool loop
-7. Implement `AuxAgentTask` base class and `CurateKnowledgeTask`
-8. Wire into `archive_phase` (replace `curation_callback` / curator subjob)
-9. Remove curator subjob infrastructure (`create_curation_job`, `curation_callback`, curator config section)
-10. Test: verify knowledge notes are created correctly after archive phases
+These are **not** "support reasoning tasks" — they are specialized services with their own model configs and are out of scope for unification:
 
-### Phase 3: Summarization + Cleanup
+| Service | File | LLM Config | Why It's Separate |
+|---------|------|-----------|-------------------|
+| **Vision Helper** | `src/services/vision_helper.py:136,211` | `VISION_API_KEY`, `VISION_BASE_URL`, `VISION_MODEL` | Multimodal image→text service using the OpenAI API directly (not LangChain). Requires a vision-capable model, different from the support model. |
+| **Browser Agent** | `src/tools/research/browser.py:175,244` | `BROWSER_LLM_MODEL`, `BROWSER_LLM_API_KEY`, `BROWSER_LLM_BASE_URL` | `browser-use` library with its own agent loop. This is a tool, not a support task — it runs when the agent explicitly calls `browse_website`. |
 
-11. Optionally migrate summarization to `SummarizeTask` (chain mode)
-12. Remove `MemoryObserver` class (fully replaced by `ExtractMemoriesTask`)
-13. Remove `memory.observer_model` / `memory.observer_base_url` config (replaced by `auxiliary.*`)
-14. Remove `curator.*` config section (replaced by `auxiliary.tasks.curate_knowledge.*`)
-15. Deprecate curator expert config (`config/experts/curator/`)
+### Minor Loose End
+
+| Item | File | Notes |
+|------|------|-------|
+| **Context compaction fallback** | `src/core/context.py` | When `SummarizeTask` structured output fails, falls back to `auxiliary.llm.ainvoke()` directly — bypasses the `chain()` API. Acceptable as an error-recovery path. |
+
+## Remaining Work
+
+### Dead Code Cleanup ❌
+
+- `src/services/memory_observer.py` — no longer imported or called from the graph
+- `tests/test_memory_observer.py` — tests the dead code
+- `memory.observer_model` / `memory.observer_base_url` in `defaults.yaml` — unused
+- Steps: delete `memory_observer.py` + its tests, remove unused config keys
+
+### Config Consolidation (optional)
+
+- Move extraction interval from `config.memory.observer_interval` to `auxiliary.tasks.extract_memories.interval`
+- Remove `memory.observer_model` / `memory.observer_base_url` (superseded by `auxiliary.model` / `auxiliary.base_url`)
+
+## Resolved Questions
+
+1. ~~**Summarization migration**~~ — Resolved: summarization now uses `SummarizeTask` via `auxiliary_llm.chain()`.
+
+2. ~~**Agent mode error handling**~~ — Resolved: skip the failed tool call (append error as ToolMessage), let the LLM decide how to proceed. Abort only on iteration cap. Implemented in `AuxiliaryLLM.agent()`.
+
+3. ~~**Structured output vs. free-form**~~ — Resolved: all tasks use `with_structured_output()` via Pydantic models. The context compaction fallback uses free-form as an error-recovery path.
+
+4. ~~**Curation scope**~~ — Resolved: incremental per-phase only. No final curation pass after critic approval. The old final pass (`_maybe_trigger_curation_final_pass`) was removed entirely.
 
 ## Open Questions
 
-1. **Summarization migration** — should `ContextManager.summarize_and_compact()` use the auxiliary LLM, or keep using the main LLM? Using the auxiliary model saves cost but may reduce summary quality. The main LLM is already "paid for" in the conversation. Recommendation: make it optional, default to main LLM, allow `auxiliary.tasks.summarize.use_auxiliary: true` override.
+1. **Concurrency** — memory extraction and curation both run as `asyncio.create_task()` (non-blocking). If both fire at the same time (e.g., on archive phase), they'll compete for the same LLM endpoint. Current implementation: both fire independently as async tasks.
 
-2. **Agent mode error handling** — if a tool call fails mid-loop (e.g., `kb_write` hits a Neo4j error), should the loop retry, skip, or abort? Recommendation: skip the failed call (append error as ToolMessage), let the LLM decide how to proceed. Abort only on iteration cap.
+2. **Message windowing regression** — The old `MemoryObserver` sliced messages to the range since last observation (`window_size * 2`, capped at 40). The new `extract_and_store_memories()` always sends the last 40 messages. This may re-analyze previously extracted messages. Acceptable because `RecallStore` deduplicates, but costs extra tokens. Consider restoring windowed slicing if token cost becomes an issue.
 
-3. **Concurrency** — the current memory observer and curation callback both run as `asyncio.create_task()` (non-blocking). The auxiliary LLM should maintain this pattern. But if both a memory extraction and a knowledge curation task fire at the same time (e.g., on archive phase), they'll compete for the same LLM endpoint. Recommendation: sequential execution with a simple queue, or accept the concurrency if the model endpoint can handle it.
-
-4. **Structured output vs. free-form** — should chain mode use the LLM's structured output / JSON mode if available? This would eliminate parsing failures but not all models support it. Recommendation: use JSON mode when available (`response_format: {type: "json_object"}`), fall back to prompt-based JSON extraction.
+3. **Curation without Neo4j** — The inline curation requires a running Neo4j instance (`NEO4J_URL` env var). If Neo4j isn't available, `KnowledgeGraphDB.connect()` fails and curation is silently disabled. This is the same behavior as the old curator subjob (it also needed Neo4j), but now the failure is at the main agent level rather than the subjob level.
 
 ## References
 
-- [[memory_light]] — Current memory extraction architecture (observer, free sources, RRF search)
-- [[project_knowledge_base]] — Knowledge base architecture (Neo4j, pgvector, curator subjob, tools)
+- [[memory_light]] — Memory extraction architecture (recall store, free sources, RRF search)
+- [[project_knowledge_base]] — Knowledge base architecture (Neo4j, pgvector, KB tools)
 - [[context_management]] — Summarization and compaction

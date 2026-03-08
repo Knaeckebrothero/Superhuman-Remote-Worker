@@ -1033,18 +1033,45 @@ def create_execute_node(
                             "Do NOT respond with text. Your next action must be a tool call."
                         ))
 
-                # Memory Light Phase 3: fire observer async (non-blocking)
+                # Memory Light: extract memories via AuxiliaryLLM (async, non-blocking)
                 new_turn_count = state.get("turn_count", 0) + 1
-                memory_observer = tool_context.memory_observer if tool_context else None
-                if memory_observer and memory_observer.should_observe(new_turn_count):
-                    import asyncio
-                    asyncio.create_task(
-                        memory_observer.observe(
-                            messages=messages,
-                            current_turn=new_turn_count,
-                            phase=phase_number,
-                        )
+                extraction_triggered = False
+                recall_store_exec = tool_context.recall_store if tool_context else None
+                if (recall_store_exec
+                    and config.auxiliary.enabled
+                    and config.auxiliary.tasks.get("extract_memories", None)
+                    and config.auxiliary.tasks["extract_memories"].enabled):
+                    from src.services.auxiliary import (
+                        _should_extract_memories,
+                        extract_and_store_memories,
                     )
+                    last_observed = state.get("last_observed_turn", 0)
+                    if _should_extract_memories(
+                        new_turn_count,
+                        config.memory.observer_interval,
+                        last_observed,
+                    ):
+                        import asyncio
+                        extraction_triggered = True
+                        asyncio.create_task(
+                            extract_and_store_memories(
+                                auxiliary_llm=auxiliary_llm,
+                                recall_store=recall_store_exec,
+                                messages=messages,
+                                phase=phase_number,
+                                source_turn_start=last_observed,
+                                source_turn_end=new_turn_count,
+                            )
+                        )
+
+                # Build result dict
+                result_update = {
+                    "iteration": iteration + 1,
+                    "turn_count": new_turn_count,
+                    "error": None,
+                }
+                if extraction_triggered:
+                    result_update["last_observed_turn"] = new_turn_count
 
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
@@ -1053,21 +1080,11 @@ def create_execute_node(
                     result_messages = remove_markers + messages + [response]
                     if injected_reminder:
                         result_messages.append(injected_reminder)
-                    return {
-                        "messages": result_messages,
-                        "iteration": iteration + 1,
-                        "turn_count": new_turn_count,
-                        "error": None,
-                    }
+                    return {"messages": result_messages, **result_update}
                 result_messages = [response]
                 if injected_reminder:
                     result_messages.append(injected_reminder)
-                return {
-                    "messages": result_messages,
-                    "iteration": iteration + 1,
-                    "turn_count": new_turn_count,
-                    "error": None,
-                }
+                return {"messages": result_messages, **result_update}
 
             except ContextOverflowError as e:
                 # Layer 0 (HTTP layer) caught context overflow
@@ -1364,18 +1381,15 @@ def create_archive_phase_node(
     summarization_prompt: str,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     recall_store=None,
-    memory_observer=None,
-    curation_callback=None,
+    tool_context: Optional[ToolContext] = None,
+    workspace_manager: Optional[WorkspaceManager] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
     This node archives completed todos and marks phase complete.
     Also performs context compaction if configured.
     Creates phase snapshots for recovery if snapshot_manager is provided.
-
-    Args:
-        curation_callback: Optional async callback(job_id, phase_number, phase_data)
-            for triggering curator subjob spawn/resume on each archive phase.
+    Runs inline knowledge curation if knowledge base is available.
     """
 
     async def archive_phase(state: UniversalAgentState) -> Dict[str, Any]:
@@ -1391,10 +1405,16 @@ def create_archive_phase_node(
 
         import asyncio
 
-        # Memory Light Phase 3: trigger observer at phase boundary (async, non-blocking)
-        if memory_observer:
+        # Memory Light: extract memories at phase boundary via AuxiliaryLLM (async, non-blocking)
+        if (recall_store
+            and config.auxiliary.enabled
+            and config.auxiliary.tasks.get("extract_memories", None)
+            and config.auxiliary.tasks["extract_memories"].enabled):
+            from src.services.auxiliary import extract_and_store_memories
             asyncio.create_task(
-                memory_observer.observe_phase_boundary(
+                extract_and_store_memories(
+                    auxiliary_llm=auxiliary_llm,
+                    recall_store=recall_store,
                     messages=messages,
                     phase=phase_number,
                 )
@@ -1440,7 +1460,8 @@ def create_archive_phase_node(
         # Collect completed todo summaries BEFORE archiving (archive clears them)
         phase_str = "strategic" if is_strategic else "tactical"
         curation_todo_summaries = []
-        if curation_callback:
+        if (tool_context and tool_context.has_knowledge()
+                and config.extra.get("curator", {}).get("enabled", False)):
             for todo in todo_manager.list_all():
                 if todo.status == TodoStatus.COMPLETED and todo.notes:
                     curation_todo_summaries.append(
@@ -1474,19 +1495,34 @@ def create_archive_phase_node(
                 phase_number=phase_number,
             )
 
-        # Trigger curator subjob spawn/resume (async, non-blocking)
-        if curation_callback:
+        # Inline curation via AuxiliaryLLM (async, non-blocking)
+        if (tool_context and tool_context.has_knowledge()
+                and config.extra.get("curator", {}).get("enabled", False)
+                and config.auxiliary.enabled):
             try:
+                from src.services.auxiliary import curate_and_store_knowledge
+                try:
+                    ws_md = workspace_manager.read_file("workspace.md") if workspace_manager else ""
+                except (FileNotFoundError, ValueError):
+                    ws_md = ""
+                try:
+                    plan_md_content = workspace_manager.read_file("plan.md") if workspace_manager else ""
+                except (FileNotFoundError, ValueError):
+                    plan_md_content = ""
                 phase_context_parts = [f"Phase {phase_number} ({phase_str}) archived."]
                 if archive_path:
                     phase_context_parts.append(f"Archive: {archive_path}")
                 phase_context_parts.extend(curation_todo_summaries)
                 curation_phase_data = "\n".join(phase_context_parts)
-                asyncio.create_task(
-                    curation_callback(job_id, phase_number, curation_phase_data)
-                )
+                asyncio.create_task(curate_and_store_knowledge(
+                    auxiliary_llm=auxiliary_llm,
+                    tool_context=tool_context,
+                    phase_data=curation_phase_data,
+                    workspace_md=ws_md or "",
+                    plan_md=plan_md_content or "",
+                ))
             except Exception as e:
-                logger.warning(f"[{job_id}] Curation trigger failed (non-fatal): {e}")
+                logger.warning(f"[{job_id}] Inline curation failed (non-fatal): {e}")
 
         message = AIMessage(
             content=f"Phase complete. Archived todos to {archive_path}. Moving to next phase."
@@ -2340,7 +2376,6 @@ def build_phase_alternation_graph(
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     tool_context: Optional[ToolContext] = None,
     postgres_db: Optional[Any] = None,
-    curation_callback=None,
     # Backwards compatibility
     llm_with_tools: Optional[BaseChatModel] = None,
     summarization_llm: Optional[BaseChatModel] = None,
@@ -2369,6 +2404,7 @@ def build_phase_alternation_graph(
         auxiliary_llm: AuxiliaryLLM instance for summarization and support tasks.
         snapshot_manager: Optional PhaseSnapshotManager for creating phase snapshots.
             When provided, enables recovery to previous phases after corruption.
+        tool_context: Optional ToolContext for inline curation and memory flush.
         summarization_llm: Deprecated - use auxiliary_llm instead.
         llm_with_tools: Deprecated - use strategic_llm_with_tools instead.
 
@@ -2430,9 +2466,8 @@ def build_phase_alternation_graph(
         raw_llm = summarization_llm or strategic_llm_with_tools
         auxiliary_llm = AuxiliaryLLM(llm=raw_llm)
 
-    # Extract RecallStore and MemoryObserver for memory injection and free sources
+    # Extract RecallStore for memory injection and free sources
     recall_store = tool_context.recall_store if tool_context else None
-    memory_observer = tool_context.memory_observer if tool_context else None
 
     # Create graph
     workflow = StateGraph(UniversalAgentState)
@@ -2465,8 +2500,8 @@ def build_phase_alternation_graph(
         context_mgr, auxiliary_llm, summarization_prompt,
         snapshot_manager=snapshot_manager,
         recall_store=recall_store,
-        memory_observer=memory_observer,
-        curation_callback=curation_callback,
+        tool_context=tool_context,
+        workspace_manager=workspace,
     )
 
     handle_transition = create_handle_transition_node(

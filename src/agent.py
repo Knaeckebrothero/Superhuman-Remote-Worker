@@ -133,8 +133,8 @@ class UniversalAgent:
         # Background document registration task
         self._doc_registration_task: Optional[asyncio.Task] = None
 
-        # Curation callback (set by app.py for curator subjob spawning)
-        self.curation_callback = None
+        # Knowledge base connection (for inline curation)
+        self._knowledge_graph = None
 
         # Control flags
         self._initialized = False
@@ -438,7 +438,6 @@ class UniversalAgent:
                 snapshot_manager=snapshot_manager,
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,
-                curation_callback=self.curation_callback,
             )
 
             # Execute graph
@@ -1320,42 +1319,37 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 )
                 context.recall_store = recall_store
                 logger.info(f"RecallStore initialized for job {self._current_job_id}")
-
-                # Initialize MemoryObserver (Phase 3) if recall_store succeeded
-                try:
-                    from src.services.memory_observer import MemoryObserver
-                    from src.core.loader import create_llm, LLMConfig
-
-                    # Create observer LLM (can be a separate model/endpoint)
-                    observer_model = self.config.memory.observer_model
-                    observer_base_url = self.config.memory.observer_base_url
-                    if observer_model:
-                        observer_llm_config = LLMConfig(
-                            model=observer_model,
-                            base_url=observer_base_url,
-                            temperature=0.0,
-                            max_retries=1,
-                        )
-                        observer_llm = create_llm(observer_llm_config)
-                    else:
-                        # Reuse main LLM (strategic phase LLM)
-                        observer_llm = self._strategic_llm
-
-                    observer = MemoryObserver(
-                        recall_store=recall_store,
-                        llm=observer_llm,
-                        observer_interval=self.config.memory.observer_interval,
-                    )
-                    context.memory_observer = observer
-                    logger.info(
-                        f"MemoryObserver initialized (interval={self.config.memory.observer_interval}, "
-                        f"model={observer_model or 'main'})"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to initialize MemoryObserver (non-fatal): {e}")
+                # Memory extraction is now handled by AuxiliaryLLM in the graph
+                # (see extract_and_store_memories in src/services/auxiliary.py)
 
             except Exception as e:
                 logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
+
+        # Initialize KnowledgeGraphDB + KnowledgeStore for inline curation (if enabled)
+        curator_config = self.config.extra.get("curator", {})
+        project_id = self._job_metadata.get("project_id") if self._job_metadata else None
+        if curator_config.get("enabled", False) and project_id:
+            try:
+                from src.services.knowledge_graph import KnowledgeGraphDB
+                from src.services.knowledge_store import KnowledgeStore
+                from src.services.embedding_service import get_embedding_service
+
+                kg = KnowledgeGraphDB()
+                if kg.connect():
+                    embedding_service = get_embedding_service()
+                    ks = KnowledgeStore(
+                        db=self.vector_conn,
+                        embedding_service=embedding_service,
+                    )
+                    context.knowledge_graph = kg
+                    context.knowledge_store = ks
+                    context.project_id = str(project_id)
+                    self._knowledge_graph = kg  # Track for cleanup
+                    logger.info(f"Knowledge base initialized for project {project_id}")
+                else:
+                    logger.warning("Failed to connect to Neo4j — inline curation disabled")
+            except Exception as e:
+                logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
 
         # Load tools from registry
         tool_names = get_all_tool_names(self.config)
@@ -1603,6 +1597,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
     def _close_datasource_connections(self) -> None:
         """Close all datasource connections opened for the current job."""
+        # Close knowledge graph connection (inline curation)
+        if self._knowledge_graph:
+            try:
+                self._knowledge_graph.close()
+                logger.debug("Closed knowledge graph connection")
+            except Exception as e:
+                logger.warning(f"Error closing knowledge graph: {e}")
+            self._knowledge_graph = None
+
         for ds_type, conn in self._datasource_connections.items():
             try:
                 if hasattr(conn, 'close'):

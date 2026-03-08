@@ -36,8 +36,9 @@ During summarization formatting (`_format_messages_for_summary`):
 - Workspace injection messages: skipped entirely (re-injected fresh)
 - Prior summary SystemMessages: included so context rolls forward
 - HumanMessages: truncated to 500 chars
-- AIMessages with tool_calls: show tool names only
-- AIMessages with content: truncated to 300 chars
+- AIMessages with tool_calls and content: show reasoning (800 chars) + tool names
+- AIMessages with tool_calls only: show tool names only
+- AIMessages with content only: truncated to 800 chars (ACON: reasoning traces > tool output)
 
 ### Summarization Prompt
 
@@ -153,10 +154,10 @@ For inputs exceeding `summarization_safe_limit` tokens:
 **Solution:** Group ToolMessages by their parent AIMessage's tool_call IDs. Apply the recency window to groups, not individual messages. If any result in a group is recent, include all results in that group.
 **Effort:** Medium. Requires building a tool-call-ID → group mapping in `_format_messages_for_summary`.
 
-#### 4. Increase Assistant Reasoning Truncation Limit
-**Problem:** AIMessage content is truncated to 300 chars. The ACON framework finding: "reasoning traces matter more than raw tool output data." The agent's reasoning about *what to do and why* is often the most valuable part of the conversation for summarization. 300 chars frequently cuts off mid-thought.
-**Solution:** Increase AIMessage content truncation from 300 to 800 chars. This is a one-line change.
-**Effort:** Tiny.
+#### 4. ~~Increase Assistant Reasoning Truncation Limit~~ (DONE)
+**Problem:** AIMessage content was truncated to 300 chars. The ACON framework finding: "reasoning traces matter more than raw tool output data." The agent's reasoning about *what to do and why* is often the most valuable part of the conversation for summarization. 300 chars frequently cuts off mid-thought.
+**Solution:** Increased AIMessage content truncation from 300 to 800 chars. Also: when an AIMessage has both content and tool_calls (reasoning models), the reasoning is now preserved (up to 800 chars) alongside tool names, instead of being discarded entirely.
+**Status:** Implemented.
 
 #### 5. Flatten identity_anchor Schema
 **Problem:** The `identity_anchor` field is a nested dict (`{agent_role, current_task, active_constraints}`). Some models struggle with nested JSON in structured output, producing malformed dicts or stringified JSON. The formatting code in `_single_pass_summarize` already has to handle both dict and string cases with fallback logic.
@@ -177,13 +178,13 @@ For inputs exceeding `summarization_safe_limit` tokens:
 
 | # | Improvement | Impact | Effort | Risk |
 |---|-------------|--------|--------|------|
-| 1 | Recency markers | High | Small | None |
+| 1 | ~~Recency markers~~ | ~~High~~ | ~~Small~~ | Done |
 | 2 | Archive pre-compaction | High | Small | Disk usage |
-| 3 | Atomic tool-call grouping | Medium | Medium | Edge cases in group boundary |
-| 4 | Increase reasoning truncation | Medium | Tiny | Slightly larger summaries |
+| 3 | ~~Atomic tool-call grouping~~ | ~~Medium~~ | ~~Medium~~ | Done |
+| 4 | ~~Increase reasoning truncation~~ | ~~Medium~~ | ~~Tiny~~ | Done |
 | 5 | Flatten identity_anchor | Medium | Small | Schema migration (no prod) |
 | 6 | Extract key facts from masked results | Medium | Medium | Regex reliability |
-| 7 | Prior summary dedup instruction | Low | Tiny | None |
+| 7 | ~~Prior summary dedup instruction~~ | ~~Low~~ | ~~Tiny~~ | Done |
 
 ## References
 
