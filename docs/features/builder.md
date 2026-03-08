@@ -43,7 +43,7 @@ Tool calls execute in an agentic loop (max 50 iterations per turn).
 
 - Sessions stored in PostgreSQL (`builder_sessions`, `builder_messages` tables)
 - Current artifact state (instructions, config, description) is injected fresh into the system prompt on every turn — never stored in message history and never summarized
-- Active job context (`active_job_id`) is also injected into the system prompt, guiding the LLM to use that job by default for inspection tools
+- Active job context (`active_job_id`) and active project context (`active_project_id`) are injected into the system prompt, guiding the LLM to use them by default for inspection and project-scoped tools
 
 **Session summarization:** When total message tokens exceed the context budget (6000 tokens), older messages are trimmed and the builder LLM summarizes all but the last 4 messages into a compact summary (max 1024 tokens). Summarization requires at least 6 messages. The summary is stored on the session record and prepended to future turns as context.
 
@@ -115,7 +115,10 @@ Dispatched via `builder_dispatch.py` → `AsyncCockpitClient` (loopback to orche
 - `get_workspace_file` — Read workspace files (workspace.md, plan.md, etc.)
 - `get_workspace_overview` — High-level workspace summary
 - `get_frozen_job` — Completion summary for pending_review jobs
-- `get_todos` — Current and archived task lists
+- `get_todos` — Current and archived task lists (full)
+- `get_current_todos` — Active todos only (lightweight)
+- `list_todo_archives` — List archived todo files by phase
+- `get_todo_archive` — Read a specific phase's archived todos
 - `get_chat_history` — Agent conversation history
 - `get_job_summary` — Composite overview (job + progress + todos + audit in one call)
 
@@ -129,11 +132,17 @@ Dispatched via `builder_dispatch.py` → `AsyncCockpitClient` (loopback to orche
 #### Monitoring & System
 - `get_job_stats` — Job queue counts by status
 - `get_agent_stats` — Agent workforce summary
+- `get_daily_stats` — Daily job statistics (created/completed/failed/cancelled) over N days
 - `get_stuck_jobs` — Jobs stuck beyond a time threshold
 - `list_agents` — Registered agents with status
+- `deregister_agent` — Remove an offline or unneeded agent
 - `list_experts` — Available expert configurations
 - `get_expert` — Full expert config detail
-- `list_datasources` — Configured datasources (read-only)
+- `reload_experts` — Hot-reload expert configs from disk
+- `list_datasources` — Configured datasources
+- `create_datasource` — Create a new datasource (PostgreSQL, Neo4j, MongoDB)
+- `update_datasource` — Modify connection details, credentials, read-only flag
+- `delete_datasource` — Remove a datasource
 - `get_agent_system_info` — Container resource usage (CPU, memory, disk)
 
 #### Database Inspection
@@ -144,6 +153,7 @@ Dispatched via `builder_dispatch.py` → `AsyncCockpitClient` (loopback to orche
 #### Execution Debug
 - `get_audit_trail` — Paginated LLM messages, tool calls, errors
 - `get_audit_bulk` — Bulk audit entries (offset/limit)
+- `get_audit_timerange` — Quick first/last timestamps for audit entries
 - `get_chat_bulk` — Bulk chat entries
 - `get_graph_changes` — Neo4j graph mutation timeline
 - `get_llm_request` — Full LLM request/response by MongoDB doc ID
@@ -162,6 +172,30 @@ Dispatched via `builder_dispatch.py` → `AsyncCockpitClient` (loopback to orche
 - `get_source_tags` — Tags assigned to a source
 - `get_citation_stats` — Citation statistics by status, type, confidence
 
+#### Knowledge Base (project-scoped)
+- `get_knowledge_summary` — Stats and recent notes for a project
+- `list_knowledge_notes` — Browse notes with type/status/tag/job filters
+- `get_knowledge_note` — Full note content with Neo4j relationships
+- `search_knowledge` — Hybrid search (dense + sparse) over notes
+- `update_knowledge_note` — Change note status/tags
+- `delete_knowledge_note` — Remove a note
+- `export_knowledge` — Export as Obsidian-compatible markdown
+
+#### Project Management
+- `list_projects` — List projects, optionally filtered by user
+- `get_project` — Full project details (name, description, goal, config)
+- `create_project` — Create a new project
+- `update_project` — Update name, description, goal, status, default config
+- `delete_project` — Permanently delete a project (not default projects)
+- `list_project_jobs` — List jobs within a project
+- `create_project_job` — Create a job scoped to a project
+- `list_project_members` — List members with roles (owner, editor, viewer)
+- `add_project_member` — Add a user to a project with a role
+- `update_project_member` — Change a member's role
+- `remove_project_member` — Remove a member (not the last owner)
+- `list_project_experts` — List project-specific expert configurations
+- `get_project_expert` — Detailed expert config with merged settings and instructions
+
 #### Actions (Mutations)
 - `approve_job` — Approve a pending_review job
 - `resume_job_with_feedback` — Resume a frozen/failed job with feedback
@@ -169,7 +203,9 @@ Dispatched via `builder_dispatch.py` → `AsyncCockpitClient` (loopback to orche
 - `pause_job` — Cooperative pause at next safe point
 - `delete_job` — Permanently delete a job
 - `assign_job` — Assign a created job to a ready agent
-- `create_job` / `create_follow_up_job` — Create a new job
+- `create_job` / `create_follow_up_job` — Create a new job (standalone)
+- `create_project_job` — Create a job within a project
+- `promote_job` — Promote a completed job into a dedicated project
 - `test_datasource` — Test datasource connectivity
 
 #### Research
@@ -186,74 +222,36 @@ The system prompt (`builder_prompt.py`) defines a 4-phase instruction-writing pr
 
 The builder also serves as a **job assistant**: when a job is selected as "active context," it defaults to inspecting/managing that job. It can check progress, read workspace files, browse git history, debug execution, review citations, and take actions.
 
-## Gap Analysis (as of 2026-03-08)
+## Gap Analysis
 
-### Missing: Project Management
+### Resolved (Phases 1–7, implemented 2026-03-08)
 
-The builder has no concept of projects. The orchestrator API exposes full project CRUD, member management, repository management, and project-scoped job creation, but none of this is available through the builder.
+All planned gaps have been closed. All tools are available in both the builder and MCP server.
 
-**Missing tools:**
-- `list_projects` / `get_project` / `create_project` / `update_project` / `delete_project`
-- `list_project_members` / `add_project_member` / `update_project_member` / `remove_project_member`
-- `list_project_repositories` / `add_project_repository` / `remove_project_repository`
-- `create_project_job` / `list_project_jobs`
-- `get_project_experts` / `get_project_expert_detail`
-- `promote_job` — promote a completed job to its own project
+- **Project Management (Full)** — `list_projects`, `get_project`, `create_project`, `update_project`, `delete_project`, `list_project_jobs`, `create_project_job`, `list_project_members`, `add_project_member`, `update_project_member`, `remove_project_member`, `list_project_experts`, `get_project_expert`. Full project lifecycle including member management and project-scoped expert configs.
+- **Knowledge Base (Full)** — `get_knowledge_summary`, `list_knowledge_notes`, `get_knowledge_note`, `search_knowledge`, `update_knowledge_note`, `delete_knowledge_note`, `export_knowledge`. Full read/write access to project knowledge bases.
+- **Datasource CRUD** — `create_datasource`, `update_datasource`, `delete_datasource`. Connection URLs are masked in responses (passwords replaced with `***`).
+- **Job Promotion** — `promote_job`. Completed jobs can be promoted into dedicated projects.
+- **Todo Archives** — `get_current_todos`, `list_todo_archives`, `get_todo_archive`. Lightweight todo access and phase history browsing.
+- **Audit Time Range** — `get_audit_timerange`. Quick first/last timestamps for job audit entries.
+- **Minor Tools** — `get_daily_stats` (daily job statistics), `reload_experts` (hot-reload expert configs), `deregister_agent` (remove offline agents).
+- **Prompt Improvements** — Active project context injection alongside active job context, knowledge search vs web search guidance, improved tool grouping.
 
-**Impact:** Users cannot organize work into projects, manage team access, or create project-scoped jobs through the builder. They must switch to other cockpit panels.
+### Remaining: Minor Gaps
 
-### Missing: Knowledge Base
-
-The project knowledge base (notes accumulated from completed jobs) is inaccessible from the builder.
-
-**Missing tools:**
-- `get_knowledge_summary` — stats and recent notes for a project
-- `list_knowledge_notes` — browse notes with type/status/tag filters
-- `get_knowledge_note` — full note content with Neo4j relationships
-- `search_knowledge` — hybrid search (dense + sparse) over notes
-- `update_knowledge_note` — change note status/tags
-- `delete_knowledge_note` — remove a note
-- `export_knowledge` — export as Obsidian-compatible markdown
-
-**Impact:** The builder can't help users leverage accumulated knowledge when writing instructions or reviewing job outputs. This is a significant gap for iterative refinement workflows.
-
-### Missing: Datasource CRUD
-
-The builder can `list_datasources` and `test_datasource`, but cannot create, update, or delete datasources.
-
-**Missing tools:**
-- `create_datasource` — create PostgreSQL/Neo4j/MongoDB datasource
-- `update_datasource` — modify connection details, credentials, read-only flag
-- `delete_datasource` — remove a datasource
-
-**Impact:** Users must switch to the datasource panel to set up a new datasource, then return to the builder to attach it to a job.
-
-### Missing: Minor Inspection Tools
-
-Lower-priority tools that exist in the API but aren't exposed:
-
-| Tool | API Endpoint | Purpose | Client method exists? |
-|------|-------------|---------|----------------------|
-| `get_daily_stats` | `GET /api/stats/daily` | Time-series job statistics | No |
-| `list_todo_archives` | `GET /api/jobs/{id}/todos/archives` | Browse archived todos by phase | Yes (`list_archived_todos`) |
-| `get_todo_archive` | `GET /api/jobs/{id}/todos/archives/{file}` | Read specific phase's archived todos | Yes (`get_archived_todos`) |
-| `get_current_todos` | `GET /api/jobs/{id}/todos/current` | Active todos only (lightweight) | Yes (`get_current_todos`) |
-| `get_audit_timerange` | `GET /api/jobs/{id}/audit/timerange` | First/last audit timestamps | Yes (`get_audit_time_range`) |
-| `get_graph_bulk` | `GET /api/jobs/{id}/graph/bulk` | Bulk Neo4j mutation history | No |
-| `reload_experts` | `POST /api/experts/reload` | Hot-reload expert configs from disk | No |
-| `deregister_agent` | `DELETE /api/agents/{id}` | Remove an agent | No |
-
-Note: 4 of these already have `AsyncCockpitClient` methods implemented but unused — they only need tool schemas and dispatch wiring.
-
-### Missing: Document Upload
-
-The cockpit UI supports drag-and-drop file upload during job creation. The builder can `create_job` but cannot attach documents. This is inherently limited by the chat interface but could potentially be addressed with a file-picker integration.
+| Gap | Notes |
+|-----|-------|
+| `get_graph_bulk` | Bulk Neo4j mutation history — low priority, `get_graph_changes` covers most use cases |
+| Document upload | Builder can `create_job` but cannot attach documents — inherent chat interface limitation, would need file-picker UI integration |
+| Model selector dropdown | UI-only change in the cockpit Angular frontend, not a backend tool |
 
 ### Parity with MCP
 
-The builder and MCP server (`orchestrator/mcp/server.py`) are at feature parity for inspection and action tools — both are missing the same categories (projects, knowledge, datasource CRUD). The builder additionally has artifact mutation tools, workspace edit proposals, and web search that the MCP does not.
+The builder and MCP server (`orchestrator/mcp/server.py`) are at full feature parity for all implemented tool categories. Both share the same `AsyncCockpitClient` methods and `formatters.py` output functions. The builder additionally has artifact mutation tools, workspace edit proposals, and web search that the MCP does not.
 
 ## Implementation Roadmap
+
+**Status overview (as of 2026-03-08):** All 7 phases complete (31 new tools added, 91 total builder tools, 83 dispatch entries). Builder and MCP server are at full parity.
 
 Each phase adds a self-contained set of tools. Phases are ordered by user impact and implementation ease. Within each phase, the work follows the same pattern:
 
@@ -267,8 +265,9 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 7. Update system prompt in `builder_prompt.py` to document the new tool
 8. Test via builder chat and MCP
 
-### Phase 1: Wire Up Existing Unused Client Methods
+### Phase 1: Wire Up Existing Unused Client Methods ✅
 
+**Status:** Implemented (2026-03-08)
 **Effort:** Low — client methods already exist, only need schemas + dispatch + MCP wiring.
 
 | Tool | Client Method | Notes |
@@ -284,8 +283,9 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 - `mcp/server.py` — 4 `@mcp.tool` functions
 - `builder_prompt.py` — add to "Execution debug" or "Job inspection" sections
 
-### Phase 2: Knowledge Base (Read-Only)
+### Phase 2: Knowledge Base (Read-Only) ✅
 
+**Status:** Implemented (2026-03-08)
 **Effort:** Medium — need new client methods + formatters. Read-only avoids mutation complexity.
 
 | Tool | API Endpoint | Notes |
@@ -305,8 +305,9 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 
 **Design consideration:** These tools require a `project_id` parameter. The builder could resolve this from the active job's `project_id` (already available via `get_job`), or accept it explicitly. Consider adding a `active_project_id` to the system prompt injection alongside `active_job_id`.
 
-### Phase 3: Project Management (Core)
+### Phase 3: Project Management (Core) ✅
 
+**Status:** Implemented (2026-03-08)
 **Effort:** Medium — new client methods + formatters. Start with read + create, defer member/repo management.
 
 | Tool | API Endpoint | Notes |
@@ -327,8 +328,9 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 
 **Design consideration:** `create_project_job` should accept the same parameters as `create_job` plus a `project_id`. Consider reusing the existing `_create_job` handler with an optional `project_id` parameter rather than duplicating logic.
 
-### Phase 4: Datasource CRUD
+### Phase 4: Datasource CRUD ✅
 
+**Status:** Implemented (2026-03-08)
 **Effort:** Medium — new client methods. Connection URLs contain credentials so formatters must mask sensitive data.
 
 | Tool | API Endpoint | Notes |
@@ -347,8 +349,9 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 
 **Security note:** The builder LLM sees tool results. Connection URLs should be masked in responses (password replaced with `***`). The existing `datasource-list.component.ts` already does this client-side — apply the same masking in `formatters.py`.
 
-### Phase 5: Knowledge Base (Mutations) + Job Promotion
+### Phase 5: Knowledge Base (Mutations) + Job Promotion ✅
 
+**Status:** Implemented (2026-03-08)
 **Effort:** Medium — builds on Phase 2 client methods. Mutations need careful prompt guidance.
 
 | Tool | API Endpoint | Notes |
@@ -366,9 +369,10 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 - `mcp/server.py` — 4 `@mcp.tool` functions
 - `builder_prompt.py` — expand knowledge + add promotion section
 
-### Phase 6: Project Management (Extended)
+### Phase 6: Project Management (Extended) ✅
 
-**Effort:** Medium-high — many tools but each is straightforward CRUD.
+**Status:** Implemented (2026-03-08)
+**Effort:** Medium-high — 8 tools (7 planned + `get_project_expert` added).
 
 | Tool | API Endpoint | Notes |
 |------|-------------|-------|
@@ -378,13 +382,13 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 | `add_project_member` | `POST /api/projects/{id}/members` | Add user by ID + role |
 | `update_project_member` | `PATCH /api/projects/{id}/members/{user_id}` | Change role |
 | `remove_project_member` | `DELETE /api/projects/{id}/members/{user_id}` | Remove member |
-| `get_project_experts` | `GET /api/projects/{id}/experts` | Project-specific experts |
+| `list_project_experts` | `GET /api/projects/{id}/experts` | Project-specific experts |
+| `get_project_expert` | `GET /api/projects/{id}/experts/{name}` | Detailed expert config + instructions |
 
-**Files to change:** Same pattern as prior phases across all 6 files.
+### Phase 7: Minor Tools & Polish ✅
 
-### Phase 7: Minor Tools & Polish
-
-**Effort:** Low-medium — fill remaining gaps, improve prompt quality.
+**Status:** Implemented (2026-03-08)
+**Effort:** Low-medium — 3 tools + prompt improvements.
 
 | Tool | Notes |
 |------|-------|
@@ -393,10 +397,10 @@ Each phase adds a self-contained set of tools. Phases are ordered by user impact
 | `deregister_agent` | New client method, admin-only |
 
 **Prompt improvements:**
-- Add active project context injection alongside active job context
-- Improve tool grouping in the system prompt (projects, knowledge, datasources as top-level sections)
-- Add guidance for when to use knowledge search vs web search
-- Add a model selector dropdown to the builder UI
+- ~~Improve tool grouping in the system prompt~~ ✅ Done
+- ~~Add active project context injection alongside active job context~~ ✅ Done — `active_project_id` param added to `build_system_prompt` and `BuilderMessage` body, threaded through `main.py`
+- ~~Add guidance for when to use knowledge search vs web search~~ ✅ Done — added to system prompt after knowledge base section
+- Add a model selector dropdown to the builder UI — deferred (frontend-only change)
 
 ## Key Files
 

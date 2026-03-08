@@ -1128,6 +1128,46 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
+    @_create_retry_decorator()
+    async def get_daily_stats(self, days: int = 7) -> list[dict[str, Any]]:
+        """Get daily job statistics for the past N days.
+
+        Args:
+            days: Number of days to look back (1-90, default 7)
+
+        Returns:
+            List of daily stats with date, jobs_created, jobs_completed,
+            jobs_failed, jobs_cancelled
+        """
+        resp = await self._client.get(
+            "/api/stats/daily", params={"days": days}
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def reload_experts(self) -> dict[str, Any]:
+        """Force reload of expert configurations from disk.
+
+        Returns:
+            Dict with status and count of loaded experts
+        """
+        resp = await self._client.post("/api/experts/reload")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def deregister_agent(self, agent_id: str) -> dict[str, str]:
+        """Deregister (delete) an agent.
+
+        Args:
+            agent_id: Agent UUID
+
+        Returns:
+            Status dict
+        """
+        resp = await self._client.delete(f"/api/agents/{agent_id}")
+        resp.raise_for_status()
+        return resp.json()
+
     # =========================================================================
     # Tables (for debugging)
     # =========================================================================
@@ -1460,5 +1500,639 @@ class AsyncCockpitClient:
             network_connections, and agent info
         """
         resp = await self._client.get(f"/api/agents/{agent_id}/system-info")
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Knowledge Base
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def get_knowledge_summary(self, project_id: str) -> dict[str, Any]:
+        """Get knowledge base summary statistics for a project.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            Dict with total, by_type, by_status, and recent notes
+        """
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/knowledge/summary"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_knowledge_notes(
+        self,
+        project_id: str,
+        note_type: str | None = None,
+        status: str | None = None,
+        tag: str | None = None,
+        job_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List knowledge notes for a project with optional filters.
+
+        Args:
+            project_id: Project UUID
+            note_type: Filter by type (insight, decision, pattern, issue, etc.)
+            status: Filter by status (active, resolved, superseded, archived)
+            tag: Filter by tag
+            job_id: Filter by originating job
+            limit: Max results (1-200)
+            offset: Pagination offset
+
+        Returns:
+            Dict with notes list, total, limit, offset
+        """
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if note_type:
+            params["type"] = note_type
+        if status:
+            params["status"] = status
+        if tag:
+            params["tag"] = tag
+        if job_id:
+            params["job_id"] = job_id
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/knowledge", params=params
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_knowledge_note(
+        self, project_id: str, note_id: str
+    ) -> dict[str, Any]:
+        """Get a single knowledge note with full content and relationships.
+
+        Args:
+            project_id: Project UUID
+            note_id: Note ID
+
+        Returns:
+            Full note record with content, metadata, and Neo4j relationships
+        """
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/knowledge/{note_id}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def search_knowledge(
+        self,
+        project_id: str,
+        query: str,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """Hybrid search over project knowledge base.
+
+        Uses dense vector + sparse keyword search when embeddings are
+        available, falls back to keyword-only search otherwise.
+
+        Args:
+            project_id: Project UUID
+            query: Search query text
+            limit: Max results (1-50)
+
+        Returns:
+            Dict with notes list, query, and total count
+        """
+        resp = await self._client.post(
+            f"/api/projects/{project_id}/knowledge/search",
+            json={"query": query, "limit": limit},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Projects
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def list_projects(
+        self, user_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List projects, optionally filtered by user membership.
+
+        Args:
+            user_id: Filter to projects this user belongs to
+
+        Returns:
+            List of project dicts
+        """
+        params: dict[str, Any] = {}
+        if user_id:
+            params["user_id"] = user_id
+        resp = await self._client.get("/api/projects", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_project(self, project_id: str) -> dict[str, Any]:
+        """Get a single project by ID.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            Project dict with name, description, goal, config, timestamps
+        """
+        resp = await self._client.get(f"/api/projects/{project_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def create_project(
+        self,
+        name: str,
+        user_id: str,
+        description: str | None = None,
+        goal: str | None = None,
+        default_config_name: str | None = None,
+        default_config_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a new project.
+
+        Args:
+            name: Project name
+            user_id: Owner user UUID
+            description: Project description
+            goal: Project goal statement
+            default_config_name: Default agent config for new jobs
+            default_config_override: Default config overrides for new jobs
+
+        Returns:
+            Created project record with ID
+        """
+        body: dict[str, Any] = {"name": name, "user_id": user_id}
+        if description:
+            body["description"] = description
+        if goal:
+            body["goal"] = goal
+        if default_config_name:
+            body["default_config_name"] = default_config_name
+        if default_config_override:
+            body["default_config_override"] = default_config_override
+        resp = await self._client.post("/api/projects", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_project_jobs(
+        self,
+        project_id: str,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List jobs belonging to a project.
+
+        Args:
+            project_id: Project UUID
+            status: Optional status filter
+            limit: Max results (1-500)
+
+        Returns:
+            List of job dicts
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if status:
+            params["status"] = status
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/jobs", params=params
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def create_project_job(
+        self,
+        project_id: str,
+        description: str,
+        config_name: str = "default",
+        datasource_ids: list[str] | None = None,
+        instructions: str | None = None,
+        config_override: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create a job within a project context.
+
+        Args:
+            project_id: Project UUID
+            description: Task description
+            config_name: Expert/agent config to use
+            datasource_ids: Global datasource IDs to clone
+            instructions: Additional inline instructions
+            config_override: Per-job config overrides
+            context: Additional context dictionary
+
+        Returns:
+            Created job record with ID
+        """
+        body: dict[str, Any] = {
+            "description": description,
+            "config_name": config_name,
+        }
+        if datasource_ids:
+            body["datasource_ids"] = datasource_ids
+        if instructions:
+            body["instructions"] = instructions
+        if config_override:
+            body["config_override"] = config_override
+        if context:
+            body["context"] = context
+        resp = await self._client.post(
+            f"/api/projects/{project_id}/jobs", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Project Management (Extended)
+    # =========================================================================
+
+    async def update_project(
+        self,
+        project_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        goal: str | None = None,
+        status: str | None = None,
+        default_config_name: str | None = None,
+        default_config_override: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        """Update a project's metadata or defaults.
+
+        Args:
+            project_id: Project UUID
+            name: New name
+            description: New description
+            goal: New goal statement
+            status: New status
+            default_config_name: New default agent config
+            default_config_override: New default config overrides
+
+        Returns:
+            Status dict
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if goal is not None:
+            body["goal"] = goal
+        if status is not None:
+            body["status"] = status
+        if default_config_name is not None:
+            body["default_config_name"] = default_config_name
+        if default_config_override is not None:
+            body["default_config_override"] = default_config_override
+        resp = await self._client.patch(
+            f"/api/projects/{project_id}", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def delete_project(self, project_id: str) -> dict[str, str]:
+        """Delete a project and its associated data.
+
+        Cannot delete default projects.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            Status dict
+        """
+        resp = await self._client.delete(f"/api/projects/{project_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_project_members(
+        self, project_id: str
+    ) -> list[dict[str, Any]]:
+        """List members of a project with their roles.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            List of member dicts with user_id, role, display_name, etc.
+        """
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/members"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def add_project_member(
+        self,
+        project_id: str,
+        user_id: str,
+        role: str = "editor",
+    ) -> dict[str, Any]:
+        """Add a member to a project.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID to add
+            role: Member role (owner, editor, viewer)
+
+        Returns:
+            Created member record
+        """
+        body = {"user_id": user_id, "role": role}
+        resp = await self._client.post(
+            f"/api/projects/{project_id}/members", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def update_project_member(
+        self,
+        project_id: str,
+        user_id: str,
+        role: str,
+    ) -> dict[str, str]:
+        """Update a project member's role.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID
+            role: New role (owner, editor, viewer)
+
+        Returns:
+            Status dict
+        """
+        resp = await self._client.patch(
+            f"/api/projects/{project_id}/members/{user_id}",
+            json={"role": role},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def remove_project_member(
+        self,
+        project_id: str,
+        user_id: str,
+    ) -> dict[str, str]:
+        """Remove a member from a project.
+
+        Cannot remove the last owner.
+
+        Args:
+            project_id: Project UUID
+            user_id: User UUID to remove
+
+        Returns:
+            Status dict
+        """
+        resp = await self._client.delete(
+            f"/api/projects/{project_id}/members/{user_id}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def list_project_experts(
+        self, project_id: str
+    ) -> list[dict[str, Any]]:
+        """List project-specific expert configurations.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            List of ExpertInfo dicts
+        """
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/experts"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_project_expert(
+        self, project_id: str, expert_name: str
+    ) -> dict[str, Any]:
+        """Get detailed expert configuration for a project.
+
+        Args:
+            project_id: Project UUID
+            expert_name: Expert config name
+
+        Returns:
+            ExpertInfo with merged config and instructions
+        """
+        resp = await self._client.get(
+            f"/api/projects/{project_id}/experts/{expert_name}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Datasource CRUD
+    # =========================================================================
+
+    async def create_datasource(
+        self,
+        name: str,
+        ds_type: str,
+        connection_url: str,
+        description: str | None = None,
+        credentials: dict[str, Any] | None = None,
+        read_only: bool = True,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a new datasource.
+
+        Args:
+            name: User-provided label
+            ds_type: Type (postgresql, neo4j, mongodb)
+            connection_url: Full connection string
+            description: What this datasource contains
+            credentials: Additional auth details (e.g. username/password for Neo4j)
+            read_only: Whether the agent is allowed to write
+            job_id: Job UUID for job-scoped, None for global
+
+        Returns:
+            Created datasource record with ID
+        """
+        body: dict[str, Any] = {
+            "name": name,
+            "type": ds_type,
+            "connection_url": connection_url,
+            "read_only": read_only,
+        }
+        if description:
+            body["description"] = description
+        if credentials:
+            body["credentials"] = credentials
+        if job_id:
+            body["job_id"] = job_id
+        resp = await self._client.post("/api/datasources", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def update_datasource(
+        self,
+        datasource_id: str,
+        name: str | None = None,
+        description: str | None = None,
+        connection_url: str | None = None,
+        credentials: dict[str, Any] | None = None,
+        read_only: bool | None = None,
+    ) -> dict[str, str]:
+        """Update a datasource.
+
+        Args:
+            datasource_id: Datasource UUID
+            name: New label
+            description: New description
+            connection_url: New connection string
+            credentials: New auth details
+            read_only: New read-only flag
+
+        Returns:
+            Status dict
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            body["description"] = description
+        if connection_url is not None:
+            body["connection_url"] = connection_url
+        if credentials is not None:
+            body["credentials"] = credentials
+        if read_only is not None:
+            body["read_only"] = read_only
+        resp = await self._client.put(
+            f"/api/datasources/{datasource_id}", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def delete_datasource(self, datasource_id: str) -> dict[str, str]:
+        """Delete a datasource.
+
+        Args:
+            datasource_id: Datasource UUID
+
+        Returns:
+            Status dict
+        """
+        resp = await self._client.delete(f"/api/datasources/{datasource_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Knowledge Base Mutations
+    # =========================================================================
+
+    async def update_knowledge_note(
+        self,
+        project_id: str,
+        note_id: str,
+        status: str | None = None,
+        add_tags: list[str] | None = None,
+        remove_tags: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Update a knowledge note's status or tags.
+
+        Args:
+            project_id: Project UUID
+            note_id: Note ID
+            status: New status (active, resolved, superseded, archived)
+            add_tags: Tags to add
+            remove_tags: Tags to remove
+
+        Returns:
+            Status dict
+        """
+        body: dict[str, Any] = {}
+        if status:
+            body["status"] = status
+        if add_tags:
+            body["add_tags"] = add_tags
+        if remove_tags:
+            body["remove_tags"] = remove_tags
+        resp = await self._client.patch(
+            f"/api/projects/{project_id}/knowledge/{note_id}", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def delete_knowledge_note(
+        self, project_id: str, note_id: str
+    ) -> dict[str, str]:
+        """Hard delete a knowledge note from both stores.
+
+        Args:
+            project_id: Project UUID
+            note_id: Note ID
+
+        Returns:
+            Status dict
+        """
+        resp = await self._client.delete(
+            f"/api/projects/{project_id}/knowledge/{note_id}"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def export_knowledge(self, project_id: str) -> dict[str, Any]:
+        """Export project knowledge base as Obsidian-compatible markdown.
+
+        Args:
+            project_id: Project UUID
+
+        Returns:
+            Dict with status, path, note_count, project_name
+        """
+        resp = await self._client.post(
+            f"/api/projects/{project_id}/knowledge/export"
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # =========================================================================
+    # Job Promotion
+    # =========================================================================
+
+    async def promote_job(
+        self,
+        job_id: str,
+        name: str,
+        user_id: str,
+        description: str | None = None,
+        goal: str | None = None,
+    ) -> dict[str, Any]:
+        """Promote a completed job into a dedicated project.
+
+        Creates a new project, seeds its repo from the job's branch,
+        and moves the job to the new project.
+
+        Args:
+            job_id: Job UUID (must be completed)
+            name: Name for the new project
+            user_id: Owner user UUID
+            description: Project description
+            goal: Project goal
+
+        Returns:
+            Dict with status, project_id, project_name, job_id
+        """
+        body: dict[str, Any] = {"name": name, "user_id": user_id}
+        if description:
+            body["description"] = description
+        if goal:
+            body["goal"] = goal
+        resp = await self._client.post(
+            f"/api/jobs/{job_id}/promote", json=body
+        )
         resp.raise_for_status()
         return resp.json()

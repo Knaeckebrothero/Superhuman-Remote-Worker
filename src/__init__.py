@@ -45,6 +45,7 @@ from .graph import (
 # Loader exports
 from .core.loader import (
     load_summarization_prompt,
+    load_auxiliary_prompt,
     get_all_tool_names,
     AgentConfig,
 )
@@ -77,6 +78,7 @@ __all__ = [
     'get_managers_from_workspace',
     # Loader
     'load_summarization_prompt',
+    'load_auxiliary_prompt',
     'get_all_tool_names',
     'AgentConfig',
 ]

@@ -41,6 +41,7 @@ from .core.loader import (
     load_instructions,
     get_all_tool_names,
     resolve_config_path,
+    resolve_model_settings,
 )
 from .tools.description_manager import generate_workspace_tool_docs, apply_description_overrides
 from .graph import build_phase_alternation_graph, run_graph_with_streaming
@@ -280,15 +281,28 @@ class UniversalAgent:
             return
 
         if aux_config.model:
-            # Dedicated auxiliary model configured
+            # Dedicated auxiliary model — resolve settings matrix for its family
+            model_settings = resolve_model_settings(
+                aux_config.model, self.config._deployment_dir
+            )
+            # AuxiliaryConfig fields (temperature) take precedence;
+            # settings matrix provides top_p, top_k, model_max_context_tokens
             aux_llm_config = LLMConfig(
                 model=aux_config.model,
                 base_url=aux_config.base_url,
                 temperature=aux_config.temperature,
+                top_p=model_settings.get("top_p"),
+                top_k=model_settings.get("top_k"),
+                model_max_context_tokens=model_settings.get("model_max_context_tokens"),
                 max_retries=1,
             )
             aux_llm = create_llm(aux_llm_config, limits=limits)
-            logger.info(f"Created auxiliary LLM: {aux_config.model}")
+            logger.info(
+                f"Created auxiliary LLM: {aux_config.model}"
+                f" (settings matrix: top_p={aux_llm_config.top_p},"
+                f" top_k={aux_llm_config.top_k},"
+                f" max_ctx={aux_llm_config.model_max_context_tokens})"
+            )
         else:
             # Reuse summarization LLM (which is already the best fallback chain)
             aux_llm = self._summarization_llm

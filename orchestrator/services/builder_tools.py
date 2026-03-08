@@ -62,6 +62,11 @@ SERVER_SIDE_TOOLS = {
     "get_job_log",
     "get_job_summary",
     "get_shell_state",
+    "get_audit_timerange",
+    # Todo archives
+    "get_current_todos",
+    "list_todo_archives",
+    "get_todo_archive",
     # Citation & source library
     "list_job_sources",
     "get_source_detail",
@@ -82,6 +87,40 @@ SERVER_SIDE_TOOLS = {
     "create_follow_up_job",
     "test_datasource",
     "get_agent_system_info",
+    # Knowledge base
+    "get_knowledge_summary",
+    "list_knowledge_notes",
+    "get_knowledge_note",
+    "search_knowledge",
+    # Projects
+    "list_projects",
+    "get_project",
+    "create_project",
+    "list_project_jobs",
+    "create_project_job",
+    # Datasource CRUD
+    "create_datasource",
+    "update_datasource",
+    "delete_datasource",
+    # Knowledge mutations
+    "update_knowledge_note",
+    "delete_knowledge_note",
+    "export_knowledge",
+    # Job promotion
+    "promote_job",
+    # Minor tools
+    "get_daily_stats",
+    "reload_experts",
+    "deregister_agent",
+    # Project management (extended)
+    "update_project",
+    "delete_project",
+    "list_project_members",
+    "add_project_member",
+    "update_project_member",
+    "remove_project_member",
+    "list_project_experts",
+    "get_project_expert",
 }
 
 BUILDER_TOOLS = [
@@ -1549,6 +1588,865 @@ BUILDER_TOOLS = [
                     },
                 },
                 "required": ["job_id"],
+            },
+        },
+    },
+    # ---- Todo Archives & Current Todos ----
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_todos",
+            "description": (
+                "Get only the current active todos from todos.yaml. "
+                "Lighter than get_todos which includes all archives."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_todo_archives",
+            "description": (
+                "List all archived todo files for a job. "
+                "Returns metadata for each phase archive (filename, phase name, timestamp). "
+                "Use get_todo_archive to read the full content of a specific archive."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_todo_archive",
+            "description": (
+                "Get the full content of an archived todo file for a specific phase. "
+                "Use list_todo_archives first to get available filenames."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Archive filename from list_todo_archives (e.g. 'todos_phase1_20260124_183618.md')",
+                    },
+                },
+                "required": ["job_id", "filename"],
+            },
+        },
+    },
+    # ---- Audit Time Range ----
+    {
+        "type": "function",
+        "function": {
+            "name": "get_audit_timerange",
+            "description": (
+                "Get the first and last timestamps for a job's audit entries. "
+                "Quick way to see when a job started and last had activity. "
+                "Requires MongoDB to be available."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    # ---- Knowledge Base ----
+    {
+        "type": "function",
+        "function": {
+            "name": "get_knowledge_summary",
+            "description": (
+                "Get knowledge base summary statistics for a project. "
+                "Shows total notes, counts by type and status, and recent notes."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_knowledge_notes",
+            "description": (
+                "List knowledge notes for a project with optional filters. "
+                "Shows note previews with type, status, tags, and confidence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "note_type": {
+                        "type": "string",
+                        "description": "Filter by note type (insight, decision, pattern, issue, etc.)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status (active, resolved, superseded, archived)",
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Filter by tag",
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Filter by originating job UUID",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (1-200, default 50)",
+                        "default": 50,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Pagination offset (default 0)",
+                        "default": 0,
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_knowledge_note",
+            "description": (
+                "Get a single knowledge note with full content and Neo4j relationships. "
+                "Use list_knowledge_notes or search_knowledge to find note IDs first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "note_id": {
+                        "type": "string",
+                        "description": "Note ID",
+                    },
+                },
+                "required": ["project_id", "note_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_knowledge",
+            "description": (
+                "Search the project knowledge base using hybrid search "
+                "(dense vector + sparse keyword). Falls back to keyword-only "
+                "when embeddings are unavailable. Use this to find relevant "
+                "knowledge from previous jobs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query text",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (1-50, default 10)",
+                        "default": 10,
+                    },
+                },
+                "required": ["project_id", "query"],
+            },
+        },
+    },
+    # ---- Projects ----
+    {
+        "type": "function",
+        "function": {
+            "name": "list_projects",
+            "description": (
+                "List projects. Optionally filter by user membership. "
+                "Shows project name, status, goal, and last update."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "Filter to projects this user belongs to (optional)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project",
+            "description": (
+                "Get full details for a specific project including "
+                "name, description, goal, and default config."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_project",
+            "description": (
+                "Create a new project. Projects organize related jobs, "
+                "accumulate knowledge, and can have team members."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Project name",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Owner user UUID",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Project description (optional)",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Project goal statement (optional)",
+                    },
+                    "default_config_name": {
+                        "type": "string",
+                        "description": "Default expert config for new jobs (optional)",
+                    },
+                },
+                "required": ["name", "user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_project_jobs",
+            "description": (
+                "List jobs belonging to a project. "
+                "Optionally filter by status."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filter by status (created, processing, completed, failed, etc.)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results (1-500, default 100)",
+                        "default": 100,
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_project_job",
+            "description": (
+                "Create a job within a project context. Uses the project's "
+                "default config if not overridden. The job is automatically "
+                "linked to the project and gets a Gitea branch."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Task description",
+                    },
+                    "config_name": {
+                        "type": "string",
+                        "description": "Expert/agent config (default: uses project default or 'default')",
+                        "default": "default",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Additional inline instructions (optional)",
+                    },
+                    "config_override": {
+                        "type": "object",
+                        "description": "Per-job config overrides (optional)",
+                    },
+                    "datasource_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Global datasource IDs to clone (optional)",
+                    },
+                },
+                "required": ["project_id", "description"],
+            },
+        },
+    },
+    # ---- Datasource CRUD ----
+    {
+        "type": "function",
+        "function": {
+            "name": "create_datasource",
+            "description": (
+                "Create a new datasource (PostgreSQL, Neo4j, or MongoDB). "
+                "Use job_id=null for global datasources available to all jobs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "User-provided label for the datasource",
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["postgresql", "neo4j", "mongodb"],
+                        "description": "Datasource type",
+                    },
+                    "connection_url": {
+                        "type": "string",
+                        "description": "Full connection string (e.g. postgresql://user:pass@host:5432/db)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What this datasource contains (optional)",
+                    },
+                    "credentials": {
+                        "type": "object",
+                        "description": "Additional auth details, e.g. {\"username\": \"neo4j\", \"password\": \"...\"} (optional)",
+                    },
+                    "read_only": {
+                        "type": "boolean",
+                        "description": "Whether the agent is restricted to read-only access (default true)",
+                        "default": True,
+                    },
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID for job-scoped datasource (omit for global)",
+                    },
+                },
+                "required": ["name", "type", "connection_url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_datasource",
+            "description": (
+                "Update an existing datasource's connection details, "
+                "name, description, or read-only flag."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "datasource_id": {
+                        "type": "string",
+                        "description": "Datasource UUID",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New label (optional)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description (optional)",
+                    },
+                    "connection_url": {
+                        "type": "string",
+                        "description": "New connection string (optional)",
+                    },
+                    "credentials": {
+                        "type": "object",
+                        "description": "New auth details (optional)",
+                    },
+                    "read_only": {
+                        "type": "boolean",
+                        "description": "New read-only flag (optional)",
+                    },
+                },
+                "required": ["datasource_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_datasource",
+            "description": (
+                "Permanently delete a datasource. This does not affect "
+                "jobs that have already cloned it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "datasource_id": {
+                        "type": "string",
+                        "description": "Datasource UUID",
+                    },
+                },
+                "required": ["datasource_id"],
+            },
+        },
+    },
+    # ---- Knowledge Mutations ----
+    {
+        "type": "function",
+        "function": {
+            "name": "update_knowledge_note",
+            "description": (
+                "Update a knowledge note's status or tags. "
+                "Use to mark notes as resolved, superseded, or archived, "
+                "or to organize notes with tags."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "note_id": {
+                        "type": "string",
+                        "description": "Note ID",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "resolved", "superseded", "archived"],
+                        "description": "New status (optional)",
+                    },
+                    "add_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags to add (optional)",
+                    },
+                    "remove_tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags to remove (optional)",
+                    },
+                },
+                "required": ["project_id", "note_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_knowledge_note",
+            "description": (
+                "Permanently delete a knowledge note from both PostgreSQL "
+                "and Neo4j. This is irreversible."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "note_id": {
+                        "type": "string",
+                        "description": "Note ID",
+                    },
+                },
+                "required": ["project_id", "note_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "export_knowledge",
+            "description": (
+                "Export a project's knowledge base as Obsidian-compatible "
+                "markdown files. Each note becomes a .md file with YAML "
+                "frontmatter and wikilink relationships."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    # ---- Job Promotion ----
+    {
+        "type": "function",
+        "function": {
+            "name": "promote_job",
+            "description": (
+                "Promote a completed job into a dedicated project. "
+                "Creates a new project, seeds its repo from the job's "
+                "branch (preserving git history), and moves the job. "
+                "The job must be completed and in a default project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Job UUID (must be completed)",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name for the new project",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "Owner user UUID",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Project description (optional)",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "Project goal (optional)",
+                    },
+                },
+                "required": ["job_id", "name", "user_id"],
+            },
+        },
+    },
+    # ---- Project Management (Extended) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "update_project",
+            "description": (
+                "Update a project's name, description, goal, status, "
+                "or default config settings. Only provided fields are changed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New project name (optional)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description (optional)",
+                    },
+                    "goal": {
+                        "type": "string",
+                        "description": "New goal statement (optional)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "New status (optional)",
+                    },
+                    "default_config_name": {
+                        "type": "string",
+                        "description": "Default agent config for new jobs (optional)",
+                    },
+                    "default_config_override": {
+                        "type": "object",
+                        "description": "Default config overrides for new jobs (optional)",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_project",
+            "description": (
+                "Permanently delete a project and its associated data. "
+                "Cannot delete default projects. This is irreversible."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID to delete",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_project_members",
+            "description": (
+                "List all members of a project with their roles "
+                "(owner, editor, viewer) and profile info."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_project_member",
+            "description": (
+                "Add a user to a project with a specified role. "
+                "Returns 409 if the user is already a member."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User UUID to add",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Member role: owner, editor, or viewer (default: editor)",
+                        "default": "editor",
+                    },
+                },
+                "required": ["project_id", "user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_project_member",
+            "description": (
+                "Change a project member's role. "
+                "Valid roles: owner, editor, viewer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User UUID of the member to update",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "New role: owner, editor, or viewer",
+                    },
+                },
+                "required": ["project_id", "user_id", "role"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_project_member",
+            "description": (
+                "Remove a member from a project. "
+                "Cannot remove the last owner of a project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "User UUID to remove",
+                    },
+                },
+                "required": ["project_id", "user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_project_experts",
+            "description": (
+                "List project-specific expert configurations stored "
+                "in the project's Gitea repository."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_project_expert",
+            "description": (
+                "Get detailed configuration for a project-specific expert, "
+                "including merged config and instructions content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project UUID",
+                    },
+                    "expert_name": {
+                        "type": "string",
+                        "description": "Expert config name (e.g. 'scholar', 'developer')",
+                    },
+                },
+                "required": ["project_id", "expert_name"],
+            },
+        },
+    },
+    # ---- Minor Tools ----
+    {
+        "type": "function",
+        "function": {
+            "name": "get_daily_stats",
+            "description": (
+                "Get daily job statistics (created, completed, failed, cancelled) "
+                "for the past N days. Useful for tracking system activity trends."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "type": "integer",
+                        "description": "Number of days to look back (1-90, default 7)",
+                        "default": 7,
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reload_experts",
+            "description": (
+                "Force reload of expert configurations from disk. "
+                "Use after modifying expert YAML files to pick up changes "
+                "without restarting the orchestrator."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deregister_agent",
+            "description": (
+                "Remove an agent from the system. "
+                "Use for cleaning up agents that are offline or no longer needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Agent UUID to deregister",
+                    },
+                },
+                "required": ["agent_id"],
             },
         },
     },

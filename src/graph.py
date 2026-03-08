@@ -66,6 +66,7 @@ from .core.state import UniversalAgentState
 from .core.loader import (
     AgentConfig,
     load_summarization_prompt,
+    load_auxiliary_prompt,
     get_phase_system_prompt,
 )
 from .core.workspace import WorkspaceManager
@@ -425,6 +426,7 @@ def create_execute_node(
     retry_manager: ToolRetryManager,
     auxiliary_llm,
     summarization_prompt: str,
+    memory_extraction_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
@@ -443,6 +445,7 @@ def create_execute_node(
         retry_manager: ToolRetryManager for LLM call retry logic
         auxiliary_llm: AuxiliaryLLM instance for summarization
         summarization_prompt: Prompt template for summarization
+        memory_extraction_prompt: Prompt for memory extraction task
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
@@ -1058,6 +1061,7 @@ def create_execute_node(
                                 auxiliary_llm=auxiliary_llm,
                                 recall_store=recall_store_exec,
                                 messages=messages,
+                                memory_extraction_prompt=memory_extraction_prompt,
                                 phase=phase_number,
                                 source_turn_start=last_observed,
                                 source_turn_end=new_turn_count,
@@ -1383,6 +1387,8 @@ def create_archive_phase_node(
     recall_store=None,
     tool_context: Optional[ToolContext] = None,
     workspace_manager: Optional[WorkspaceManager] = None,
+    memory_extraction_prompt: str = "",
+    curation_prompt: str = "",
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the archive_phase node.
 
@@ -1416,6 +1422,7 @@ def create_archive_phase_node(
                     auxiliary_llm=auxiliary_llm,
                     recall_store=recall_store,
                     messages=messages,
+                    memory_extraction_prompt=memory_extraction_prompt,
                     phase=phase_number,
                 )
             )
@@ -1520,6 +1527,7 @@ def create_archive_phase_node(
                     phase_data=curation_phase_data,
                     workspace_md=ws_md or "",
                     plan_md=plan_md_content or "",
+                    curation_prompt=curation_prompt,
                 ))
             except Exception as e:
                 logger.warning(f"[{job_id}] Inline curation failed (non-fatal): {e}")
@@ -2457,6 +2465,11 @@ def build_phase_alternation_graph(
     summarization_config = config.llm.get_phase_config("summarization")
     summarization_prompt = load_summarization_prompt(config, model=summarization_config.model)
 
+    # Load auxiliary task prompts (use auxiliary model for matrix resolution)
+    aux_model = config.auxiliary.model or summarization_config.model or config.llm.model
+    memory_extraction_prompt = load_auxiliary_prompt(config, "memory_extraction", model=aux_model)
+    curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
+
     if not workspace_template:
         raise ValueError("workspace_template is required")
 
@@ -2492,6 +2505,7 @@ def build_phase_alternation_graph(
         retry_manager=retry_manager,
         auxiliary_llm=auxiliary_llm,
         summarization_prompt=summarization_prompt,
+        memory_extraction_prompt=memory_extraction_prompt,
         tool_context=tool_context,
     )
     check_todos = create_check_todos_node(todo_manager, config)
@@ -2502,6 +2516,8 @@ def build_phase_alternation_graph(
         recall_store=recall_store,
         tool_context=tool_context,
         workspace_manager=workspace,
+        memory_extraction_prompt=memory_extraction_prompt,
+        curation_prompt=curation_prompt,
     )
 
     handle_transition = create_handle_transition_node(

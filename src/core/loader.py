@@ -190,6 +190,31 @@ def _load_settings_matrix(deployment_dir: str = None) -> Dict[str, Dict[str, Any
     return deep_merge(base, expert)
 
 
+def resolve_model_settings(model: str, deployment_dir: str = None) -> Dict[str, Any]:
+    """Resolve settings matrix values for a given model.
+
+    Returns the merged default + family-specific settings (flat LLM keys only,
+    no 'limits' block). Useful for configuring auxiliary or secondary LLMs
+    with the correct inference parameters for their model family.
+
+    Args:
+        model: Model name (e.g., "openai/gpt-oss-120b", "gpt-4o")
+        deployment_dir: Optional expert directory for per-expert matrix override
+
+    Returns:
+        Dict of inference params (temperature, top_p, top_k, model_max_context_tokens, etc.)
+    """
+    family = detect_model_family(model)
+    matrix = _load_settings_matrix(deployment_dir)
+    default_settings = matrix.get("default", {})
+    family_settings = matrix.get(family, {}) if family != "default" else {}
+    settings = deep_merge(default_settings, family_settings)
+
+    # Strip 'limits' — callers want LLM inference params only
+    settings.pop("limits", None)
+    return settings
+
+
 def _apply_settings_matrix(
     data: Dict[str, Any],
     expert_llm_keys: set,
@@ -468,6 +493,8 @@ class PromptMatrixResolver(MatrixResolver):
         "strategic": "strategic.txt",
         "tactical": "tactical.txt",
         "summarization": "summarization_prompt.txt",
+        "memory_extraction": "memory_extraction_prompt.txt",
+        "curation": "curation_prompt.txt",
     }
 
     # Backward compatibility: expose _prompt_resolver as alias for _file_resolver
@@ -2145,6 +2172,41 @@ Conversation:
     )
     if method == "prompt":
         level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+        template = f"Reasoning: {level}\n\n{template}"
+
+    return template
+
+
+def load_auxiliary_prompt(config: AgentConfig, prompt_type: str, model: str = "") -> str:
+    """Load an auxiliary task prompt via the prompt matrix.
+
+    Uses PromptMatrixResolver for model-aware prompt resolution.
+    Supports "memory_extraction" and "curation" prompt types.
+
+    Args:
+        config: Agent configuration
+        prompt_type: Prompt type key (e.g., "memory_extraction", "curation")
+        model: Model name for prompt matrix resolution.
+
+    Returns:
+        Prompt content as string
+
+    Raises:
+        FileNotFoundError: If the prompt file is not found in the matrix
+    """
+    # Check for pre-resolved content (from resolved_config JSONB)
+    resolved = config.extra.get("_resolved_prompts", {})
+    template = resolved.get(prompt_type) or ""
+
+    if not template:
+        model_family = detect_model_family(model) if model else "default"
+        resolver = PromptMatrixResolver(config._deployment_dir, model_family)
+        template = resolver.load(prompt_type)
+
+    # Prepend reasoning directive for models that need it as prompt text (e.g. gpt-oss)
+    method = detect_reasoning_method(model or config.llm.model, config.llm.reasoning_method)
+    if method == "prompt":
+        level = config.llm.reasoning_level or "high"
         template = f"Reasoning: {level}\n\n{template}"
 
     return template

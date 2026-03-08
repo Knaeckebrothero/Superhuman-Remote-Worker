@@ -20,8 +20,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Default cache directory (global, shared across all jobs)
-DEFAULT_CACHE_DIR = Path("workspace/.vision_cache")
+def _get_default_cache_dir() -> Path:
+    """Resolve default cache directory using workspace base path."""
+    from src.core.workspace import get_workspace_base_path
+    return get_workspace_base_path() / ".vision_cache"
 
 
 class DescriptionCache:
@@ -63,7 +65,7 @@ class DescriptionCache:
             cache_dir: Directory for cache files. Defaults to `workspace/.vision_cache/`.
                       Created automatically if it doesn't exist.
         """
-        self.cache_dir = Path(cache_dir) if cache_dir else DEFAULT_CACHE_DIR
+        self.cache_dir = Path(cache_dir) if cache_dir else _get_default_cache_dir()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         logger.debug(f"DescriptionCache initialized: {self.cache_dir}")
 

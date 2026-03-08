@@ -52,6 +52,7 @@ class TestCurateAndStoreKnowledge:
             phase_data="Phase 1 archived.",
             workspace_md="# Workspace",
             plan_md="# Plan",
+            curation_prompt="You are a curator.",
         )
         assert result is None
 
@@ -72,6 +73,7 @@ class TestCurateAndStoreKnowledge:
             phase_data="Phase 1 archived.",
             workspace_md="# Workspace",
             plan_md="# Plan",
+            curation_prompt="You are a curator.",
         )
         assert result is None
 
@@ -102,6 +104,7 @@ class TestCurateAndStoreKnowledge:
                     phase_data="Phase 1 (tactical) archived.\n- Task: done",
                     workspace_md="# Workspace",
                     plan_md="# Plan",
+                    curation_prompt="You are a curator.",
                 )
 
         assert result is not None
@@ -128,6 +131,7 @@ class TestCurateAndStoreKnowledge:
                     phase_data="Phase 1 archived.",
                     workspace_md="",
                     plan_md="",
+                    curation_prompt="You are a curator.",
                 )
 
         assert result is None
@@ -140,15 +144,16 @@ class TestCurateAndStoreKnowledge:
 class TestCurateKnowledgeTask:
     """Tests for the CurateKnowledgeTask class."""
 
-    def test_system_prompt_not_empty(self):
+    def test_system_prompt_uses_provided_prompt(self):
         task = CurateKnowledgeTask(
             phase_data="Phase 1 archived.",
             workspace_md="# WS",
             plan_md="# Plan",
             existing_notes=[],
             kb_tools=[],
+            prompt="You are the knowledge curator for a project.",
         )
-        assert len(task.system_prompt) > 100
+        assert task.system_prompt == "You are the knowledge curator for a project."
 
     def test_build_context_includes_phase_data(self):
         task = CurateKnowledgeTask(
@@ -157,6 +162,7 @@ class TestCurateKnowledgeTask:
             plan_md="# Plan",
             existing_notes=["- note-1: Decision (decision)"],
             kb_tools=[],
+            prompt="You are a curator.",
         )
         ctx = task.build_context()
         assert "Phase 1 archived" in ctx
@@ -171,6 +177,7 @@ class TestCurateKnowledgeTask:
             plan_md="",
             existing_notes=[],
             kb_tools=[],
+            prompt="You are a curator.",
         )
         assert task.output_schema is CurationResult
 
@@ -182,6 +189,7 @@ class TestCurateKnowledgeTask:
             plan_md="",
             existing_notes=[],
             kb_tools=mock_tools,
+            prompt="You are a curator.",
         )
         assert task.get_tools() == mock_tools
 
@@ -257,6 +265,7 @@ class TestInlineCurationWiring:
             summarization_prompt="Summarize.",
             tool_context=ctx,
             workspace_manager=workspace_manager,
+            curation_prompt="You are a curator.",
         )
 
         state = {
@@ -303,6 +312,7 @@ class TestInlineCurationWiring:
             summarization_prompt="Summarize.",
             tool_context=ctx,
             workspace_manager=workspace_manager,
+            curation_prompt="You are a curator.",
         )
 
         state = {
@@ -357,6 +367,7 @@ class TestInlineCurationWiring:
             summarization_prompt="Summarize.",
             tool_context=ctx,
             workspace_manager=workspace_manager,
+            curation_prompt="You are a curator.",
         )
 
         state = {
