@@ -599,6 +599,356 @@ async def _get_shell_state(args: dict) -> tuple[str, str | None]:
     return formatted, formatted
 
 
+# ---- Todo Archives & Current Todos ----
+
+
+async def _get_current_todos(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_current_todos(args["job_id"])
+    if data is None:
+        return f"No current todos found for job {args['job_id']}.", None
+    formatted = fmt.format_current_todos(data)
+    return formatted, formatted
+
+
+async def _list_todo_archives(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    archives = await client.list_archived_todos(args["job_id"])
+    formatted = fmt.format_todo_archives(args["job_id"], archives)
+    return formatted, formatted
+
+
+async def _get_todo_archive(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_archived_todos(args["job_id"], args["filename"])
+    if data is None:
+        return f"Archive '{args['filename']}' not found for job {args['job_id']}.", None
+    formatted = fmt.format_todo_archive_detail(args["job_id"], args["filename"], data)
+    return formatted, formatted
+
+
+# ---- Audit Time Range ----
+
+
+async def _get_audit_timerange(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_audit_time_range(args["job_id"])
+    if data is None:
+        return f"No audit time range available for job {args['job_id']} (MongoDB may be unavailable).", None
+    start = data.get("start", "unknown")
+    end = data.get("end", "unknown")
+    formatted = f"Audit time range for job {args['job_id']}:\n  Start: {start}\n  End:   {end}"
+    return formatted, formatted
+
+
+# ---- Knowledge Base ----
+
+
+async def _get_knowledge_summary(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_knowledge_summary(args["project_id"])
+    formatted = fmt.format_knowledge_summary(args["project_id"], data)
+    return formatted, formatted
+
+
+async def _list_knowledge_notes(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.list_knowledge_notes(
+        project_id=args["project_id"],
+        note_type=args.get("note_type"),
+        status=args.get("status"),
+        tag=args.get("tag"),
+        job_id=args.get("job_id"),
+        limit=args.get("limit", 50),
+        offset=args.get("offset", 0),
+    )
+    formatted = fmt.format_knowledge_notes(data)
+    return formatted, formatted
+
+
+async def _get_knowledge_note(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_knowledge_note(args["project_id"], args["note_id"])
+    formatted = fmt.format_knowledge_note_detail(data)
+    return formatted, formatted
+
+
+async def _search_knowledge(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.search_knowledge(
+        project_id=args["project_id"],
+        query=args["query"],
+        limit=args.get("limit", 10),
+    )
+    formatted = fmt.format_knowledge_search(data)
+    return formatted, formatted
+
+
+# ---- Projects ----
+
+
+async def _list_projects(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    projects = await client.list_projects(user_id=args.get("user_id"))
+    formatted = fmt.format_projects(projects)
+    return formatted, formatted
+
+
+async def _get_project(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    project = await client.get_project(args["project_id"])
+    formatted = fmt.format_project_detail(project)
+    return formatted, formatted
+
+
+async def _create_project(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.create_project(
+        name=args["name"],
+        user_id=args["user_id"],
+        description=args.get("description"),
+        goal=args.get("goal"),
+        default_config_name=args.get("default_config_name"),
+        default_config_override=args.get("default_config_override"),
+    )
+    return fmt.format_created_project(result), None
+
+
+async def _list_project_jobs(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    jobs = await client.list_project_jobs(
+        project_id=args["project_id"],
+        status=args.get("status"),
+        limit=args.get("limit", 100),
+    )
+    formatted = fmt.format_jobs(jobs)
+    return formatted, formatted
+
+
+async def _create_project_job(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.create_project_job(
+        project_id=args["project_id"],
+        description=args["description"],
+        config_name=args.get("config_name", "default"),
+        datasource_ids=args.get("datasource_ids"),
+        instructions=args.get("instructions"),
+        config_override=args.get("config_override"),
+        context=args.get("context"),
+    )
+    return fmt.format_created_job(result, args.get("config_name", "default")), None
+
+
+# ---- Datasource CRUD ----
+
+
+async def _create_datasource(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.create_datasource(
+        name=args["name"],
+        ds_type=args["type"],
+        connection_url=args["connection_url"],
+        description=args.get("description"),
+        credentials=args.get("credentials"),
+        read_only=args.get("read_only", True),
+        job_id=args.get("job_id"),
+    )
+    return fmt.format_created_datasource(result), None
+
+
+async def _update_datasource(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.update_datasource(
+        datasource_id=args["datasource_id"],
+        name=args.get("name"),
+        description=args.get("description"),
+        connection_url=args.get("connection_url"),
+        credentials=args.get("credentials"),
+        read_only=args.get("read_only"),
+    )
+    status = result.get("status", "unknown")
+    return f"Datasource {args['datasource_id']} updated ({status}).", None
+
+
+async def _delete_datasource(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.delete_datasource(args["datasource_id"])
+    status = result.get("status", "unknown")
+    return f"Datasource {args['datasource_id']} deleted ({status}).", None
+
+
+# ---- Knowledge Mutations ----
+
+
+async def _update_knowledge_note(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.update_knowledge_note(
+        project_id=args["project_id"],
+        note_id=args["note_id"],
+        status=args.get("status"),
+        add_tags=args.get("add_tags"),
+        remove_tags=args.get("remove_tags"),
+    )
+    status = result.get("status", "unknown")
+    return f"Knowledge note {args['note_id']} updated ({status}).", None
+
+
+async def _delete_knowledge_note(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.delete_knowledge_note(args["project_id"], args["note_id"])
+    status = result.get("status", "unknown")
+    return f"Knowledge note {args['note_id']} deleted ({status}).", None
+
+
+async def _export_knowledge(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.export_knowledge(args["project_id"])
+    path = result.get("path", "unknown")
+    count = result.get("note_count", 0)
+    name = result.get("project_name", "")
+    formatted = (
+        f"Knowledge base exported for project '{name}'.\n"
+        f"  Notes exported: {count}\n"
+        f"  Export path: {path}\n"
+        f"  Format: Obsidian-compatible markdown with YAML frontmatter"
+    )
+    return formatted, None
+
+
+# ---- Job Promotion ----
+
+
+async def _promote_job(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.promote_job(
+        job_id=args["job_id"],
+        name=args["name"],
+        user_id=args["user_id"],
+        description=args.get("description"),
+        goal=args.get("goal"),
+    )
+    project_id = result.get("project_id", "unknown")
+    project_name = result.get("project_name", args["name"])
+    formatted = (
+        f"Job {args['job_id']} promoted to project '{project_name}'.\n"
+        f"  New project ID: {project_id}\n"
+        f"  Git history preserved from job branch."
+    )
+    return formatted, None
+
+
+# ---- Minor Tools ----
+
+
+async def _get_daily_stats(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    days = args.get("days", 7)
+    data = await client.get_daily_stats(days=days)
+    formatted = fmt.format_daily_stats(data, days)
+    return formatted, formatted
+
+
+async def _reload_experts(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.reload_experts()
+    count = result.get("count", 0)
+    return f"Expert configurations reloaded ({count} experts loaded).", None
+
+
+async def _deregister_agent(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.deregister_agent(args["agent_id"])
+    status = result.get("status", "unknown")
+    return f"Agent {args['agent_id']} deregistered ({status}).", None
+
+
+# ---- Project Management (Extended) ----
+
+
+async def _update_project(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.update_project(
+        project_id=args["project_id"],
+        name=args.get("name"),
+        description=args.get("description"),
+        goal=args.get("goal"),
+        status=args.get("status"),
+        default_config_name=args.get("default_config_name"),
+        default_config_override=args.get("default_config_override"),
+    )
+    status = result.get("status", "unknown")
+    return f"Project {args['project_id']} updated ({status}).", None
+
+
+async def _delete_project(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.delete_project(args["project_id"])
+    status = result.get("status", "unknown")
+    return f"Project {args['project_id']} deleted ({status}).", None
+
+
+async def _list_project_members(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    members = await client.list_project_members(args["project_id"])
+    formatted = fmt.format_project_members(args["project_id"], members)
+    return formatted, formatted
+
+
+async def _add_project_member(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.add_project_member(
+        project_id=args["project_id"],
+        user_id=args["user_id"],
+        role=args.get("role", "editor"),
+    )
+    name = result.get("display_name", args["user_id"])
+    role = result.get("role", args.get("role", "editor"))
+    return f"Added {name} to project {args['project_id']} as {role}.", None
+
+
+async def _update_project_member(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.update_project_member(
+        project_id=args["project_id"],
+        user_id=args["user_id"],
+        role=args["role"],
+    )
+    status = result.get("status", "unknown")
+    return (
+        f"Updated member {args['user_id']} role to {args['role']} "
+        f"in project {args['project_id']} ({status})."
+    ), None
+
+
+async def _remove_project_member(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    result = await client.remove_project_member(
+        project_id=args["project_id"],
+        user_id=args["user_id"],
+    )
+    status = result.get("status", "unknown")
+    return (
+        f"Removed member {args['user_id']} from project "
+        f"{args['project_id']} ({status})."
+    ), None
+
+
+async def _list_project_experts(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    experts = await client.list_project_experts(args["project_id"])
+    formatted = fmt.format_project_experts(args["project_id"], experts)
+    return formatted, formatted
+
+
+async def _get_project_expert(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_project_expert(
+        args["project_id"], args["expert_name"]
+    )
+    formatted = fmt.format_project_expert_detail(args["project_id"], data)
+    return formatted, formatted
+
+
 # =============================================================================
 # Dispatch Table
 # =============================================================================
@@ -643,6 +993,45 @@ _DISPATCH: dict[str, Any] = {
     "get_job_log": _get_job_log,
     "get_job_summary": _get_job_summary,
     "get_shell_state": _get_shell_state,
+    "get_audit_timerange": _get_audit_timerange,
+    # Todo archives
+    "get_current_todos": _get_current_todos,
+    "list_todo_archives": _list_todo_archives,
+    "get_todo_archive": _get_todo_archive,
+    # Knowledge base
+    "get_knowledge_summary": _get_knowledge_summary,
+    "list_knowledge_notes": _list_knowledge_notes,
+    "get_knowledge_note": _get_knowledge_note,
+    "search_knowledge": _search_knowledge,
+    # Projects
+    "list_projects": _list_projects,
+    "get_project": _get_project,
+    "create_project": _create_project,
+    "list_project_jobs": _list_project_jobs,
+    "create_project_job": _create_project_job,
+    # Minor tools
+    "get_daily_stats": _get_daily_stats,
+    "reload_experts": _reload_experts,
+    "deregister_agent": _deregister_agent,
+    # Project management (extended)
+    "update_project": _update_project,
+    "delete_project": _delete_project,
+    "list_project_members": _list_project_members,
+    "add_project_member": _add_project_member,
+    "update_project_member": _update_project_member,
+    "remove_project_member": _remove_project_member,
+    "list_project_experts": _list_project_experts,
+    "get_project_expert": _get_project_expert,
+    # Datasource CRUD
+    "create_datasource": _create_datasource,
+    "update_datasource": _update_datasource,
+    "delete_datasource": _delete_datasource,
+    # Knowledge mutations
+    "update_knowledge_note": _update_knowledge_note,
+    "delete_knowledge_note": _delete_knowledge_note,
+    "export_knowledge": _export_knowledge,
+    # Job promotion
+    "promote_job": _promote_job,
     # Citation & source library
     "list_job_sources": _list_job_sources,
     "get_source_detail": _get_source_detail,

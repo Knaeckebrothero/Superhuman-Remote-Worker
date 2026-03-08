@@ -1305,6 +1305,58 @@ async def get_agent_system_info(agent_id: str) -> str:
         return f"Failed to get system info for agent {agent_id}:\n{error_msg}"
 
 
+@mcp.tool
+async def get_daily_stats(days: int = 7) -> str:
+    """Get daily job statistics for the past N days.
+
+    Shows jobs created, completed, failed, and cancelled per day.
+    Useful for tracking system activity trends.
+
+    Args:
+        days: Number of days to look back (1-90, default 7)
+
+    Returns:
+        Daily statistics table
+    """
+    client = _get_client()
+    data = await client.get_daily_stats(days=days)
+    return fmt.format_daily_stats(data, days)
+
+
+@mcp.tool
+async def reload_experts() -> str:
+    """Force reload of expert configurations from disk.
+
+    Use after modifying expert YAML files to pick up changes
+    without restarting the orchestrator.
+
+    Returns:
+        Reload confirmation with expert count
+    """
+    client = _get_client()
+    result = await client.reload_experts()
+    count = result.get("count", 0)
+    return f"Expert configurations reloaded ({count} experts loaded)."
+
+
+@mcp.tool
+async def deregister_agent(agent_id: str) -> str:
+    """Remove an agent from the system.
+
+    Use for cleaning up agents that are offline or no longer needed.
+    Returns 404 if the agent doesn't exist.
+
+    Args:
+        agent_id: Agent UUID to deregister
+
+    Returns:
+        Deregistration confirmation
+    """
+    client = _get_client()
+    result = await client.deregister_agent(agent_id)
+    s = result.get("status", "unknown")
+    return f"Agent {agent_id} deregistered ({s})."
+
 
 # =============================================================================
 # Logs, LLM Requests & Shell State Tools
@@ -1409,6 +1461,771 @@ async def get_shell_state(job_id: str) -> str:
             except Exception:
                 error_msg = f"HTTP {e.response.status_code}: {error_msg}"
         return f"Failed to get shell state for job {job_id}:\n{error_msg}"
+
+
+# =============================================================================
+# Todo Archives & Current Todos
+# =============================================================================
+
+
+@mcp.tool
+async def get_current_todos(job_id: str) -> str:
+    """Get only the current active todos from todos.yaml.
+
+    Lighter than get_todos which includes all archives. Shows pending,
+    in-progress, and completed items with a progress summary.
+
+    Args:
+        job_id: Job UUID to get current todos for
+
+    Returns:
+        Formatted current todos with progress count
+    """
+    client = _get_client()
+    data = await client.get_current_todos(job_id)
+    if data is None:
+        return f"No current todos found for job {job_id}."
+    return fmt.format_current_todos(data)
+
+
+@mcp.tool
+async def list_todo_archives(job_id: str) -> str:
+    """List all archived todo files for a job.
+
+    Returns metadata for each phase archive (filename, phase name, timestamp).
+    Use get_todo_archive to read the full content of a specific archive.
+
+    Args:
+        job_id: Job UUID to list archives for
+
+    Returns:
+        List of archived todo files with metadata
+    """
+    client = _get_client()
+    archives = await client.list_archived_todos(job_id)
+    return fmt.format_todo_archives(job_id, archives)
+
+
+@mcp.tool
+async def get_todo_archive(job_id: str, filename: str) -> str:
+    """Get the full content of an archived todo file for a specific phase.
+
+    Use list_todo_archives first to get available filenames.
+
+    Args:
+        job_id: Job UUID
+        filename: Archive filename (e.g. 'todos_phase1_20260124_183618.md')
+
+    Returns:
+        Full archived todos with status and notes
+    """
+    client = _get_client()
+    data = await client.get_archived_todos(job_id, filename)
+    if data is None:
+        return f"Archive '{filename}' not found for job {job_id}."
+    return fmt.format_todo_archive_detail(job_id, filename, data)
+
+
+@mcp.tool
+async def get_audit_timerange(job_id: str) -> str:
+    """Get the first and last timestamps for a job's audit entries.
+
+    Quick way to see when a job started and when it last had activity.
+    Requires MongoDB to be available.
+
+    Args:
+        job_id: Job UUID to get time range for
+
+    Returns:
+        Start and end timestamps, or error if MongoDB unavailable
+    """
+    client = _get_client()
+    data = await client.get_audit_time_range(job_id)
+    if data is None:
+        return f"No audit time range available for job {job_id} (MongoDB may be unavailable)."
+    start = data.get("start", "unknown")
+    end = data.get("end", "unknown")
+    return f"Audit time range for job {job_id}:\n  Start: {start}\n  End:   {end}"
+
+
+# =============================================================================
+# Knowledge Base
+# =============================================================================
+
+
+@mcp.tool
+async def get_knowledge_summary(project_id: str) -> str:
+    """Get knowledge base summary statistics for a project.
+
+    Shows total notes, counts by type and status, and the 5 most
+    recently modified notes.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Formatted knowledge base summary
+    """
+    client = _get_client()
+    data = await client.get_knowledge_summary(project_id)
+    return fmt.format_knowledge_summary(project_id, data)
+
+
+@mcp.tool
+async def list_knowledge_notes(
+    project_id: str,
+    note_type: str | None = None,
+    status: str | None = None,
+    tag: str | None = None,
+    job_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """List knowledge notes for a project with optional filters.
+
+    Shows note previews with type, status, tags, and confidence scores.
+    Use get_knowledge_note to read full content of a specific note.
+
+    Args:
+        project_id: Project UUID
+        note_type: Filter by type (insight, decision, pattern, issue, etc.)
+        status: Filter by status (active, resolved, superseded, archived)
+        tag: Filter by tag
+        job_id: Filter by originating job UUID
+        limit: Max results (1-200, default 50)
+        offset: Pagination offset (default 0)
+
+    Returns:
+        Formatted note list with previews
+    """
+    client = _get_client()
+    data = await client.list_knowledge_notes(
+        project_id=project_id,
+        note_type=note_type,
+        status=status,
+        tag=tag,
+        job_id=job_id,
+        limit=limit,
+        offset=offset,
+    )
+    return fmt.format_knowledge_notes(data)
+
+
+@mcp.tool
+async def get_knowledge_note(project_id: str, note_id: str) -> str:
+    """Get a single knowledge note with full content and relationships.
+
+    Returns the complete note including content, metadata, tags, keywords,
+    confidence score, and Neo4j graph relationships.
+
+    Args:
+        project_id: Project UUID
+        note_id: Note ID
+
+    Returns:
+        Full note detail with content and relationships
+    """
+    client = _get_client()
+    data = await client.get_knowledge_note(project_id, note_id)
+    return fmt.format_knowledge_note_detail(data)
+
+
+@mcp.tool
+async def search_knowledge(
+    project_id: str,
+    query: str,
+    limit: int = 10,
+) -> str:
+    """Search the project knowledge base using hybrid search.
+
+    Uses dense vector + sparse keyword search when embeddings are
+    available, falls back to keyword-only search otherwise. Use this
+    to find relevant knowledge from previous jobs.
+
+    Args:
+        project_id: Project UUID
+        query: Search query text
+        limit: Max results (1-50, default 10)
+
+    Returns:
+        Ranked search results with note previews
+    """
+    client = _get_client()
+    data = await client.search_knowledge(
+        project_id=project_id,
+        query=query,
+        limit=limit,
+    )
+    return fmt.format_knowledge_search(data)
+
+
+# =============================================================================
+# Projects
+# =============================================================================
+
+
+@mcp.tool
+async def list_projects(user_id: str | None = None) -> str:
+    """List projects, optionally filtered by user membership.
+
+    Shows project name, status, goal, and last update time.
+
+    Args:
+        user_id: Filter to projects this user belongs to (optional)
+
+    Returns:
+        Formatted list of projects
+    """
+    client = _get_client()
+    projects = await client.list_projects(user_id=user_id)
+    return fmt.format_projects(projects)
+
+
+@mcp.tool
+async def get_project(project_id: str) -> str:
+    """Get full details for a specific project.
+
+    Returns name, description, goal, default config, and timestamps.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Formatted project details
+    """
+    client = _get_client()
+    project = await client.get_project(project_id)
+    return fmt.format_project_detail(project)
+
+
+@mcp.tool
+async def create_project(
+    name: str,
+    user_id: str,
+    description: str | None = None,
+    goal: str | None = None,
+    default_config_name: str | None = None,
+) -> str:
+    """Create a new project.
+
+    Projects organize related jobs, accumulate knowledge across jobs,
+    and can have team members with different roles.
+
+    Args:
+        name: Project name
+        user_id: Owner user UUID
+        description: Project description (optional)
+        goal: Project goal statement (optional)
+        default_config_name: Default agent config for new jobs (optional)
+
+    Returns:
+        Created project summary with ID
+    """
+    client = _get_client()
+    result = await client.create_project(
+        name=name,
+        user_id=user_id,
+        description=description,
+        goal=goal,
+        default_config_name=default_config_name,
+    )
+    return fmt.format_created_project(result)
+
+
+@mcp.tool
+async def list_project_jobs(
+    project_id: str,
+    status: str | None = None,
+    limit: int = 100,
+) -> str:
+    """List jobs belonging to a project.
+
+    Shows job status, config, timestamps, and audit entry counts.
+
+    Args:
+        project_id: Project UUID
+        status: Filter by status (created, processing, completed, failed, etc.)
+        limit: Max results (1-500, default 100)
+
+    Returns:
+        Formatted job list
+    """
+    client = _get_client()
+    jobs = await client.list_project_jobs(
+        project_id=project_id,
+        status=status,
+        limit=limit,
+    )
+    return fmt.format_jobs(jobs)
+
+
+@mcp.tool
+async def create_project_job(
+    project_id: str,
+    description: str,
+    config_name: str = "default",
+    instructions: str | None = None,
+    config_override: dict[str, Any] | None = None,
+    datasource_ids: list[str] | None = None,
+) -> str:
+    """Create a job within a project context.
+
+    Uses the project's default config if not overridden. The job is
+    automatically linked to the project and gets a Gitea branch.
+
+    Args:
+        project_id: Project UUID
+        description: Task description
+        config_name: Expert/agent config (default: uses project default)
+        instructions: Additional inline instructions (optional)
+        config_override: Per-job config overrides (optional)
+        datasource_ids: Global datasource IDs to clone (optional)
+
+    Returns:
+        Created job summary with ID
+    """
+    client = _get_client()
+    result = await client.create_project_job(
+        project_id=project_id,
+        description=description,
+        config_name=config_name,
+        instructions=instructions,
+        config_override=config_override,
+        datasource_ids=datasource_ids,
+    )
+    return fmt.format_created_job(result, config_name)
+
+
+# =============================================================================
+# Project Management (Extended)
+# =============================================================================
+
+
+@mcp.tool
+async def update_project(
+    project_id: str,
+    name: str | None = None,
+    description: str | None = None,
+    goal: str | None = None,
+    status: str | None = None,
+    default_config_name: str | None = None,
+) -> str:
+    """Update a project's metadata or default config.
+
+    Only provided fields are updated; others remain unchanged.
+
+    Args:
+        project_id: Project UUID
+        name: New project name (optional)
+        description: New description (optional)
+        goal: New goal statement (optional)
+        status: New status (optional)
+        default_config_name: Default agent config for new jobs (optional)
+
+    Returns:
+        Update confirmation
+    """
+    client = _get_client()
+    result = await client.update_project(
+        project_id=project_id,
+        name=name,
+        description=description,
+        goal=goal,
+        status=status,
+        default_config_name=default_config_name,
+    )
+    s = result.get("status", "unknown")
+    return f"Project {project_id} updated ({s})."
+
+
+@mcp.tool
+async def delete_project(project_id: str) -> str:
+    """Permanently delete a project and its associated data.
+
+    Cannot delete default projects. This is irreversible — all project
+    data including repos and knowledge base entries will be removed.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Deletion confirmation
+    """
+    client = _get_client()
+    result = await client.delete_project(project_id)
+    s = result.get("status", "unknown")
+    return f"Project {project_id} deleted ({s})."
+
+
+@mcp.tool
+async def list_project_members(project_id: str) -> str:
+    """List all members of a project with their roles.
+
+    Shows display name, email, role (owner/editor/viewer), and
+    when they were added.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Formatted member list with roles
+    """
+    client = _get_client()
+    members = await client.list_project_members(project_id)
+    return fmt.format_project_members(project_id, members)
+
+
+@mcp.tool
+async def add_project_member(
+    project_id: str,
+    user_id: str,
+    role: str = "editor",
+) -> str:
+    """Add a user to a project with a specified role.
+
+    Returns 409 if the user is already a member.
+
+    Args:
+        project_id: Project UUID
+        user_id: User UUID to add
+        role: Member role — owner, editor, or viewer (default: editor)
+
+    Returns:
+        Confirmation with member name and role
+    """
+    client = _get_client()
+    result = await client.add_project_member(
+        project_id=project_id,
+        user_id=user_id,
+        role=role,
+    )
+    name = result.get("display_name", user_id)
+    actual_role = result.get("role", role)
+    return f"Added {name} to project {project_id} as {actual_role}."
+
+
+@mcp.tool
+async def update_project_member(
+    project_id: str,
+    user_id: str,
+    role: str,
+) -> str:
+    """Change a project member's role.
+
+    Valid roles: owner, editor, viewer.
+
+    Args:
+        project_id: Project UUID
+        user_id: User UUID of the member to update
+        role: New role — owner, editor, or viewer
+
+    Returns:
+        Update confirmation
+    """
+    client = _get_client()
+    result = await client.update_project_member(
+        project_id=project_id,
+        user_id=user_id,
+        role=role,
+    )
+    s = result.get("status", "unknown")
+    return f"Updated member {user_id} role to {role} in project {project_id} ({s})."
+
+
+@mcp.tool
+async def remove_project_member(
+    project_id: str,
+    user_id: str,
+) -> str:
+    """Remove a member from a project.
+
+    Cannot remove the last owner of a project.
+
+    Args:
+        project_id: Project UUID
+        user_id: User UUID to remove
+
+    Returns:
+        Removal confirmation
+    """
+    client = _get_client()
+    result = await client.remove_project_member(
+        project_id=project_id,
+        user_id=user_id,
+    )
+    s = result.get("status", "unknown")
+    return f"Removed member {user_id} from project {project_id} ({s})."
+
+
+@mcp.tool
+async def list_project_experts(project_id: str) -> str:
+    """List project-specific expert configurations.
+
+    These are experts stored in the project's Gitea repository
+    under the experts/ directory, separate from global experts.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Formatted list of project experts with descriptions and tags
+    """
+    client = _get_client()
+    experts = await client.list_project_experts(project_id)
+    return fmt.format_project_experts(project_id, experts)
+
+
+@mcp.tool
+async def get_project_expert(
+    project_id: str,
+    expert_name: str,
+) -> str:
+    """Get detailed configuration for a project-specific expert.
+
+    Returns the expert's merged config (defaults + overrides)
+    and the full instructions.md content.
+
+    Args:
+        project_id: Project UUID
+        expert_name: Expert config name (e.g. 'scholar', 'developer')
+
+    Returns:
+        Expert detail with config and instructions
+    """
+    client = _get_client()
+    data = await client.get_project_expert(project_id, expert_name)
+    return fmt.format_project_expert_detail(project_id, data)
+
+
+# =============================================================================
+# Datasource CRUD
+# =============================================================================
+
+
+@mcp.tool
+async def create_datasource(
+    name: str,
+    type: str,
+    connection_url: str,
+    description: str | None = None,
+    credentials: dict[str, Any] | None = None,
+    read_only: bool = True,
+    job_id: str | None = None,
+) -> str:
+    """Create a new datasource (PostgreSQL, Neo4j, or MongoDB).
+
+    Use job_id=null for global datasources available to all jobs.
+    Connection URLs are masked in the response for security.
+
+    Args:
+        name: User-provided label
+        type: Datasource type (postgresql, neo4j, mongodb)
+        connection_url: Full connection string
+        description: What this datasource contains (optional)
+        credentials: Additional auth details (optional)
+        read_only: Restrict agent to read-only access (default true)
+        job_id: Job UUID for job-scoped datasource (omit for global)
+
+    Returns:
+        Created datasource summary with masked URL
+    """
+    client = _get_client()
+    result = await client.create_datasource(
+        name=name,
+        ds_type=type,
+        connection_url=connection_url,
+        description=description,
+        credentials=credentials,
+        read_only=read_only,
+        job_id=job_id,
+    )
+    return fmt.format_created_datasource(result)
+
+
+@mcp.tool
+async def update_datasource(
+    datasource_id: str,
+    name: str | None = None,
+    description: str | None = None,
+    connection_url: str | None = None,
+    credentials: dict[str, Any] | None = None,
+    read_only: bool | None = None,
+) -> str:
+    """Update an existing datasource's connection details or metadata.
+
+    Only provided fields are updated; others remain unchanged.
+
+    Args:
+        datasource_id: Datasource UUID
+        name: New label (optional)
+        description: New description (optional)
+        connection_url: New connection string (optional)
+        credentials: New auth details (optional)
+        read_only: New read-only flag (optional)
+
+    Returns:
+        Update confirmation
+    """
+    client = _get_client()
+    result = await client.update_datasource(
+        datasource_id=datasource_id,
+        name=name,
+        description=description,
+        connection_url=connection_url,
+        credentials=credentials,
+        read_only=read_only,
+    )
+    status = result.get("status", "unknown")
+    return f"Datasource {datasource_id} updated ({status})."
+
+
+@mcp.tool
+async def delete_datasource(datasource_id: str) -> str:
+    """Permanently delete a datasource.
+
+    This does not affect jobs that have already cloned it.
+
+    Args:
+        datasource_id: Datasource UUID
+
+    Returns:
+        Deletion confirmation
+    """
+    client = _get_client()
+    result = await client.delete_datasource(datasource_id)
+    status = result.get("status", "unknown")
+    return f"Datasource {datasource_id} deleted ({status})."
+
+
+# =============================================================================
+# Knowledge Mutations
+# =============================================================================
+
+
+@mcp.tool
+async def update_knowledge_note(
+    project_id: str,
+    note_id: str,
+    status: str | None = None,
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+) -> str:
+    """Update a knowledge note's status or tags.
+
+    Use to mark notes as resolved, superseded, or archived,
+    or to organize notes with tags.
+
+    Args:
+        project_id: Project UUID
+        note_id: Note ID
+        status: New status (active, resolved, superseded, archived)
+        add_tags: Tags to add (optional)
+        remove_tags: Tags to remove (optional)
+
+    Returns:
+        Update confirmation
+    """
+    client = _get_client()
+    result = await client.update_knowledge_note(
+        project_id=project_id,
+        note_id=note_id,
+        status=status,
+        add_tags=add_tags,
+        remove_tags=remove_tags,
+    )
+    s = result.get("status", "unknown")
+    return f"Knowledge note {note_id} updated ({s})."
+
+
+@mcp.tool
+async def delete_knowledge_note(project_id: str, note_id: str) -> str:
+    """Permanently delete a knowledge note from both PostgreSQL and Neo4j.
+
+    This is irreversible.
+
+    Args:
+        project_id: Project UUID
+        note_id: Note ID
+
+    Returns:
+        Deletion confirmation
+    """
+    client = _get_client()
+    result = await client.delete_knowledge_note(project_id, note_id)
+    s = result.get("status", "unknown")
+    return f"Knowledge note {note_id} deleted ({s})."
+
+
+@mcp.tool
+async def export_knowledge(project_id: str) -> str:
+    """Export a project's knowledge base as Obsidian-compatible markdown.
+
+    Each note becomes a .md file with YAML frontmatter and wikilink
+    relationships. Requires Neo4j to be available.
+
+    Args:
+        project_id: Project UUID
+
+    Returns:
+        Export summary with path and note count
+    """
+    client = _get_client()
+    result = await client.export_knowledge(project_id)
+    path = result.get("path", "unknown")
+    count = result.get("note_count", 0)
+    name = result.get("project_name", "")
+    return (
+        f"Knowledge base exported for project '{name}'.\n"
+        f"  Notes exported: {count}\n"
+        f"  Export path: {path}\n"
+        f"  Format: Obsidian-compatible markdown with YAML frontmatter"
+    )
+
+
+# =============================================================================
+# Job Promotion
+# =============================================================================
+
+
+@mcp.tool
+async def promote_job(
+    job_id: str,
+    name: str,
+    user_id: str,
+    description: str | None = None,
+    goal: str | None = None,
+) -> str:
+    """Promote a completed job into a dedicated project.
+
+    Creates a new project, seeds its repo from the job's branch
+    (preserving git history), and moves the job. The job must be
+    completed and in a default project.
+
+    Args:
+        job_id: Job UUID (must be completed)
+        name: Name for the new project
+        user_id: Owner user UUID
+        description: Project description (optional)
+        goal: Project goal (optional)
+
+    Returns:
+        Promotion summary with new project ID
+    """
+    client = _get_client()
+    result = await client.promote_job(
+        job_id=job_id,
+        name=name,
+        user_id=user_id,
+        description=description,
+        goal=goal,
+    )
+    project_id = result.get("project_id", "unknown")
+    project_name = result.get("project_name", name)
+    return (
+        f"Job {job_id} promoted to project '{project_name}'.\n"
+        f"  New project ID: {project_id}\n"
+        f"  Git history preserved from job branch."
+    )
 
 
 # =============================================================================

@@ -134,7 +134,7 @@ class TestAuxiliaryConfigParsing:
         from src.core.loader import load_agent_config
         config = load_agent_config("config/defaults.yaml")
         assert config.auxiliary.enabled is True
-        assert config.auxiliary.model is None
+        assert config.auxiliary.model == "openai/gpt-oss-120b"
         assert config.auxiliary.tasks["extract_memories"].enabled is True
         assert config.auxiliary.tasks["curate_knowledge"].enabled is True
 
@@ -144,15 +144,18 @@ class TestAuxiliaryConfigParsing:
 # =============================================================================
 
 
+_TEST_MEMORY_PROMPT = "You are a memory extraction system. Extract noteworthy info."
+
+
 class TestExtractMemoriesTask:
     """Test the ExtractMemoriesTask chain-mode task."""
 
-    def test_system_prompt_not_empty(self):
-        task = ExtractMemoriesTask(messages=[], phase=0)
-        assert len(task.system_prompt) > 100
+    def test_system_prompt_uses_provided_prompt(self):
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
+        assert task.system_prompt == _TEST_MEMORY_PROMPT
 
     def test_output_schema(self):
-        task = ExtractMemoriesTask(messages=[], phase=0)
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
         assert task.output_schema is ExtractedMemories
 
     def test_build_context_formats_messages(self):
@@ -160,13 +163,13 @@ class TestExtractMemoriesTask:
             HumanMessage(content="What's the database schema?"),
             AIMessage(content="The users table has columns: id, name, email."),
         ]
-        task = ExtractMemoriesTask(messages=messages, phase=1)
+        task = ExtractMemoriesTask(messages=messages, prompt=_TEST_MEMORY_PROMPT, phase=1)
         context = task.build_context()
         assert "database schema" in context
         assert "users table" in context
 
     def test_build_context_empty_messages(self):
-        task = ExtractMemoriesTask(messages=[], phase=0)
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
         context = task.build_context()
         assert context == ""
 
@@ -176,7 +179,7 @@ class TestExtractMemoriesTask:
             HumanMessage(content="This is an injection"),
             HumanMessage(content="This is real"),
         ]
-        task = ExtractMemoriesTask(messages=messages, phase=0)
+        task = ExtractMemoriesTask(messages=messages, prompt=_TEST_MEMORY_PROMPT, phase=0)
         # All messages will be skipped because mock returns True for all
         context = task.build_context()
         assert context == ""
@@ -187,23 +190,28 @@ class TestExtractMemoriesTask:
 # =============================================================================
 
 
+_TEST_CURATION_PROMPT = "You are the knowledge curator for a project."
+
+
 class TestCurateKnowledgeTask:
     """Test the CurateKnowledgeTask agent-mode task."""
 
-    def test_system_prompt_not_empty(self):
+    def test_system_prompt_uses_provided_prompt(self):
         task = CurateKnowledgeTask(
             phase_data="Phase 1 done.",
             workspace_md="# Workspace",
             plan_md="# Plan",
             existing_notes=[],
             kb_tools=[],
+            prompt=_TEST_CURATION_PROMPT,
         )
-        assert len(task.system_prompt) > 100
+        assert task.system_prompt == _TEST_CURATION_PROMPT
 
     def test_output_schema(self):
         task = CurateKnowledgeTask(
             phase_data="", workspace_md="", plan_md="",
             existing_notes=[], kb_tools=[],
+            prompt=_TEST_CURATION_PROMPT,
         )
         assert task.output_schema is CurationResult
 
@@ -214,6 +222,7 @@ class TestCurateKnowledgeTask:
             plan_md="# Plan\nPhase 1: API design",
             existing_notes=["- note-1: JWT Auth (decision)"],
             kb_tools=[],
+            prompt=_TEST_CURATION_PROMPT,
         )
         context = task.build_context()
         assert "API design" in context
@@ -228,6 +237,7 @@ class TestCurateKnowledgeTask:
             plan_md="# Plan",
             existing_notes=[],
             kb_tools=[],
+            prompt=_TEST_CURATION_PROMPT,
         )
         context = task.build_context()
         assert "Existing Knowledge" not in context
@@ -237,6 +247,7 @@ class TestCurateKnowledgeTask:
         task = CurateKnowledgeTask(
             phase_data="", workspace_md="", plan_md="",
             existing_notes=[], kb_tools=mock_tools,
+            prompt=_TEST_CURATION_PROMPT,
         )
         assert task.get_tools() is mock_tools
 
@@ -257,6 +268,7 @@ class TestAuxiliaryLLMChain:
         aux = AuxiliaryLLM(llm=mock_llm, max_iterations=15, timeout=30.0)
         task = ExtractMemoriesTask(
             messages=[HumanMessage(content="test")],
+            prompt=_TEST_MEMORY_PROMPT,
             phase=0,
         )
 
@@ -275,6 +287,7 @@ class TestAuxiliaryLLMChain:
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
         task = ExtractMemoriesTask(
             messages=[HumanMessage(content="Hello world")],
+            prompt=_TEST_MEMORY_PROMPT,
             phase=0,
         )
 
@@ -299,7 +312,7 @@ class TestAuxiliaryLLMChain:
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=0.1)
-        task = ExtractMemoriesTask(messages=[], phase=0)
+        task = ExtractMemoriesTask(messages=[], prompt=_TEST_MEMORY_PROMPT, phase=0)
 
         with pytest.raises(asyncio.TimeoutError):
             await aux.chain(task)
@@ -340,6 +353,7 @@ class TestAuxiliaryLLMAgent:
             plan_md="# Plan",
             existing_notes=[],
             kb_tools=[],
+            prompt=_TEST_CURATION_PROMPT,
         )
 
         result = await aux.agent(task)
@@ -385,6 +399,7 @@ class TestAuxiliaryLLMAgent:
             plan_md="# Plan",
             existing_notes=[],
             kb_tools=[mock_kb_search],
+            prompt=_TEST_CURATION_PROMPT,
         )
 
         aux = AuxiliaryLLM(llm=mock_llm, max_iterations=5, timeout=30.0)
@@ -422,6 +437,7 @@ class TestAuxiliaryLLMAgent:
         task = CurateKnowledgeTask(
             phase_data="", workspace_md="", plan_md="",
             existing_notes=[], kb_tools=[mock_tool],
+            prompt=_TEST_CURATION_PROMPT,
         )
 
         aux = AuxiliaryLLM(llm=mock_llm, max_iterations=3, timeout=30.0)
@@ -465,6 +481,7 @@ class TestAuxiliaryLLMAgent:
         task = CurateKnowledgeTask(
             phase_data="", workspace_md="", plan_md="",
             existing_notes=[], kb_tools=[mock_tool],
+            prompt=_TEST_CURATION_PROMPT,
         )
 
         aux = AuxiliaryLLM(llm=mock_llm, max_iterations=5, timeout=30.0)

@@ -1,0 +1,61 @@
+You are compressing a conversation for handoff to your future self. After this summary, the raw history will be gone — this is your ONLY context to continue working.
+
+Do NOT summarize workspace.md or plan.md content (they are re-injected). Only note actions taken on them.
+
+If the conversation contains a "[Summary of prior work]" message, do NOT repeat its facts — they are already preserved. Focus your token budget on NEW information from the conversation that followed.
+
+Before generating output, analyze:
+1. What was the user's original request and success criteria?
+2. What succeeded? What failed (exact error messages)?
+3. Did the user correct or redirect? Quote corrections verbatim.
+4. What was actively being worked on at the end?
+5. What specific details (IDs, paths, values) must survive?
+6. What approaches failed and should NOT be retried?
+
+Preservation priority (highest first):
+  User corrections/constraints > Errors and failed approaches > Active work state > Completed work
+
+Preserve:
+- Completed work (what was done, not planned)
+- Decisions and WHY
+- Discovered information: IDs, paths, versions, exact error messages
+- Current state: position in plan, what comes next
+- Errors: exact text, what was tried, what remains blocked
+- Failed approaches and why (prevents retries)
+- Deliverable status: verified vs. only claimed
+- Shell state: open tabs, SSH connections
+- User corrections: verbatim quotes
+
+Omit:
+- Routine successful tool calls
+- Verbose outputs saved in files (reference path instead)
+- Debugging steps that led to a solution (note solution only)
+- Planning captured in plan file
+- Filler text
+
+You MUST populate every field in the schema below with concrete details from the conversation. Do not leave fields empty or use placeholder text.
+
+Required JSON schema:
+{{
+  "summary": "Concise narrative of what happened (max 3 sentences)",
+  "tasks_completed": ["List of tasks finished with outcomes"],
+  "tasks_in_progress": ["Tasks started but not finished, with current state"],
+  "key_decisions": ["Choices made with reasoning"],
+  "current_state": "One sentence: where the agent is right now and what comes next",
+  "blockers": ["Active blockers with exact error messages"],
+  "critical_facts": ["Exact IDs, file paths, URLs, version numbers, config values, credentials (redacted) that must survive verbatim"],
+  "state_changes": ["Files created, modified, or deleted"],
+  "pinned_instructions": ["Active constraints from instructions that must persist"],
+  "identity_anchor": {{
+    "agent_role": "Current role/persona",
+    "current_task": "What the agent is working on right now",
+    "active_constraints": ["Top 3-5 constraints that must survive compaction"]
+  }}
+}}
+
+Conversation:
+
+{conversation}
+
+Keep each field concise. Total summary under {max_summary_length} tokens.
+Weight recent messages more heavily — the end of the transcript is the active context.
