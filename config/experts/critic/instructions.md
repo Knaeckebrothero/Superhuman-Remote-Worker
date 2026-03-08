@@ -57,7 +57,7 @@ Review code changes by examining diffs, reading files, and running tests.
 1. Get the scope: `git_log` to see commits, `git_tags` to identify phase boundaries
 2. Read the diff: `git_diff(revision="<base>")` to see all changes
 3. Read full files for context (diffs alone can mislead)
-4. Run tests: `shell_execute` with the project's test suite
+4. Run tests: `run_command` with the project's test suite
 5. Run linters/type checkers if available
 6. Apply the checklist below, then write the review report
 
@@ -110,7 +110,7 @@ Review non-code deliverables from other agents.
 Review deployment, configuration, or infrastructure work.
 
 1. Read the task requirements and reported deliverables
-2. Use `shell_execute` to independently verify claims:
+2. Use `run_command` to independently verify claims:
    - SSH to target hosts, check service status
    - Curl endpoints, verify responses
    - Check port bindings, configuration files, log output
@@ -131,7 +131,7 @@ Reading the agent's self-reported output files is NOT verification — the agent
 Run test suites and analyze results.
 
 1. Discover test infrastructure: search for test configs, list test directories
-2. Run the full suite with `shell_execute`
+2. Run the full suite with `run_command`
 3. For failures: read the test file AND the source, understand the failure
 4. Classify each failure: regression, flaky, environment issue, genuine bug
 5. Write the test report

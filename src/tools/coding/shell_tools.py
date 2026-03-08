@@ -1,8 +1,14 @@
-"""Persistent shell session tools for the Universal Agent.
+"""Shell tools for the Universal Agent.
 
-Provides 2 tools for managing tmux-backed terminal sessions:
-- shell_execute: Execute commands, send keystrokes, or run async commands
-- shell_read: Read output from a terminal tab with offset support
+Provides tools for command execution in two modes (configured via shell.mode):
+
+Stateless mode (default):
+- run_command: Simple command→output execution (hidden persistent tab underneath)
+- shell_read: Read more output from scrollback when needed
+
+Persistent mode (opt-in):
+- shell_execute: Full tab management, keystrokes, async commands
+- shell_read: Read output from any named terminal tab
 
 Available in both strategic and tactical phases.
 """
@@ -63,6 +69,14 @@ TMUX_SPECIAL_KEYS = frozenset({
 
 # Tool metadata for registry
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
+    "run_command": {
+        "module": "coding.shell_tools",
+        "function": "run_command",
+        "description": "Execute a shell command and return its output",
+        "category": "coding",
+        "short_description": "Run a shell command and get output.",
+        "phases": ["strategic", "tactical"],
+    },
     "shell_execute": {
         "module": "coding.shell_tools",
         "function": "shell_execute",
@@ -126,6 +140,10 @@ def _apply_tail(output: str, tail: int) -> str:
 def create_shell_tools(context: ToolContext) -> List[Any]:
     """Create shell tools with injected context.
 
+    Returns different tool sets based on shell.mode config:
+    - "stateless" (default): [run_command, shell_read]
+    - "persistent": [shell_execute, shell_read]
+
     Args:
         context: ToolContext with shell_manager
 
@@ -141,6 +159,74 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
     max_output_chars = context.get_config("max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
     max_read_lines = context.get_config("shell_max_read_lines", DEFAULT_MAX_READ_LINES)
+
+    # Determine shell mode from config
+    shell_config = context.get_config("shell", {})
+    mode = shell_config.get("mode", "stateless") if isinstance(shell_config, dict) else "stateless"
+
+    @tool
+    def run_command(
+        command: str,
+        timeout: int = 120,
+        tail: int = 30,
+    ) -> str:
+        """Execute a shell command and return its output.
+
+        Runs the command to completion and returns the exit code + stdout.
+        Commands run in the workspace directory. Use for: running tests,
+        building projects, git operations, file system commands, deploying,
+        checking logs, SSH via sshpass, and any other shell task.
+
+        If the command requires interactive input (password prompt, y/n
+        confirmation), it will return an error. Use non-interactive
+        alternatives instead:
+          - SSH: sshpass -p 'pass' ssh -o StrictHostKeyChecking=no user@host "cmd"
+          - apt/dnf: use -y flag
+          - git: configure credential helper
+          - sudo: echo 'pass' | sudo -S command
+
+        For long output, only the last `tail` lines are returned. Use
+        shell_read() to page through the full scrollback if needed.
+
+        Args:
+            command: Shell command to execute (e.g., "pytest tests/ -x",
+                "git status", "curl -s https://api.example.com/health").
+            timeout: Maximum seconds to wait (default 120, max 600).
+            tail: Max stdout lines to return (default 30). Increase for
+                verbose output (test suites, builds, logs).
+
+        Returns:
+            Exit code + stdout output (last `tail` lines), or error message.
+
+        Examples:
+            run_command(command="pytest tests/ -x")
+            run_command(command="git diff HEAD~1", tail=100)
+            run_command(command="npm run build", timeout=300)
+            run_command(command="sshpass -p 'pass' ssh user@host 'systemctl status nginx'")
+        """
+        try:
+            sm.ensure_tab("default")
+
+            output = sm.run_sync(command, tab_name="default", timeout=min(timeout, 600))
+
+            # Interactive prompt → error (model should use non-interactive alternatives)
+            if "Interactive prompt detected" in output or "Command appears to be waiting for input" in output:
+                return (
+                    f"Error: Command requires interactive input.\n"
+                    f"Use non-interactive alternatives (sshpass, -y flags, etc.).\n"
+                    f"{output}"
+                )
+
+            output = _apply_tail(output, tail)
+            output = _truncate_output(output, max_output_chars, "output")
+
+            warning = _scan_for_error_patterns(output)
+            if warning:
+                return f"{warning}\n{output}"
+            return output
+
+        except (ValueError, KeyError, TimeoutError) as e:
+            return f"Error: {e}"
 
     @tool
     def shell_execute(
@@ -288,4 +374,8 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 tab_header = "[Shells: ?]"
             return f"{tab_header}\nError: {e}"
 
-    return [shell_execute, shell_read]
+    if mode == "persistent":
+        return [shell_execute, shell_read]
+    else:
+        # Stateless mode (default)
+        return [run_command, shell_read]

@@ -35,6 +35,7 @@ from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .core.state import UniversalAgentState, create_initial_state
 from .core.loader import (
     AgentConfig,
+    LLMConfig,
     load_agent_config,
     create_llm,
     load_instructions,
@@ -111,6 +112,9 @@ class UniversalAgent:
         self._summarization_llm: Optional[BaseChatModel] = None
         self._strategic_llm_with_tools: Optional[BaseChatModel] = None
         self._tactical_llm_with_tools: Optional[BaseChatModel] = None
+
+        # Auxiliary LLM for support tasks (summarization, memory extraction, curation)
+        self._auxiliary_llm = None
 
         # Tool context (for phase-aware behavior)
         self._tool_context: Optional[ToolContext] = None
@@ -257,6 +261,45 @@ class UniversalAgent:
             self._summarization_llm = self._llm
             logger.info(f"Created single LLM for all phases: {llm_config.model}")
 
+        # Create AuxiliaryLLM for support tasks (summarization, memory, curation)
+        self._initialize_auxiliary_llm(llm_config, limits)
+
+    def _initialize_auxiliary_llm(self, llm_config, limits) -> None:
+        """Create the AuxiliaryLLM instance for support tasks.
+
+        Uses auxiliary.model/base_url if configured, otherwise falls back
+        to the summarization LLM (which itself falls back to strategic LLM).
+        """
+        from src.services.auxiliary import AuxiliaryLLM
+
+        aux_config = self.config.auxiliary
+        if not aux_config.enabled:
+            # Wrap summarization LLM as fallback even when auxiliary is disabled
+            self._auxiliary_llm = AuxiliaryLLM(llm=self._summarization_llm)
+            logger.info("AuxiliaryLLM disabled, using summarization LLM as fallback")
+            return
+
+        if aux_config.model:
+            # Dedicated auxiliary model configured
+            aux_llm_config = LLMConfig(
+                model=aux_config.model,
+                base_url=aux_config.base_url,
+                temperature=aux_config.temperature,
+                max_retries=1,
+            )
+            aux_llm = create_llm(aux_llm_config, limits=limits)
+            logger.info(f"Created auxiliary LLM: {aux_config.model}")
+        else:
+            # Reuse summarization LLM (which is already the best fallback chain)
+            aux_llm = self._summarization_llm
+            logger.info("AuxiliaryLLM: reusing summarization LLM")
+
+        self._auxiliary_llm = AuxiliaryLLM(
+            llm=aux_llm,
+            max_iterations=aux_config.max_iterations,
+            timeout=aux_config.timeout,
+        )
+
     async def _setup_connections(self) -> None:
         """Set up required database connections.
 
@@ -391,7 +434,7 @@ class UniversalAgent:
                 todo_manager=self._todo_manager,
                 workspace_template=workspace_template,
                 checkpointer=self._checkpointer,
-                summarization_llm=self._summarization_llm,
+                auxiliary_llm=self._auxiliary_llm,
                 snapshot_manager=snapshot_manager,
                 tool_context=self._tool_context,
                 postgres_db=self.postgres_conn,

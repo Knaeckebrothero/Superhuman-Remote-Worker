@@ -41,7 +41,7 @@ tools:
     - mark_complete
     - job_complete
   coding:
-    - shell_execute
+    - run_command
   # evaluation: injected via config_override for verification subjobs only
   git:
     - git_log

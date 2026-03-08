@@ -242,7 +242,7 @@ class TestCurationCallbackWiring:
             plan_manager=plan_manager,
             config=config,
             context_mgr=context_mgr,
-            llm=mock_llm,
+            auxiliary_llm=mock_llm,
             summarization_prompt="Summarize.",
             curation_callback=mock_callback,
         )
@@ -288,7 +288,7 @@ class TestCurationCallbackWiring:
             plan_manager=plan_manager,
             config=config,
             context_mgr=context_mgr,
-            llm=mock_llm,
+            auxiliary_llm=mock_llm,
             summarization_prompt="Summarize.",
             curation_callback=None,
         )

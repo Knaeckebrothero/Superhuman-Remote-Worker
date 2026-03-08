@@ -751,6 +751,34 @@ class MemoryConfig:
 
 
 @dataclass
+class AuxiliaryTaskConfig:
+    """Per-task configuration overrides for auxiliary tasks."""
+
+    enabled: bool = True
+
+
+@dataclass
+class AuxiliaryConfig:
+    """Auxiliary LLM configuration for unified support tasks.
+
+    Controls the AuxiliaryLLM class that handles background tasks like
+    memory extraction and knowledge curation using structured output.
+    See docs/features/auxiliary.md for full design.
+    """
+
+    enabled: bool = True
+    model: Optional[str] = None       # null = use main LLM
+    base_url: Optional[str] = None    # null = use main LLM endpoint
+    temperature: float = 0.0
+    max_iterations: int = 15          # Cap for agent mode loops
+    timeout: float = 120.0            # Seconds per LLM call
+    tasks: Dict[str, AuxiliaryTaskConfig] = field(default_factory=lambda: {
+        "extract_memories": AuxiliaryTaskConfig(enabled=True),
+        "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
+    })
+
+
+@dataclass
 class AgentConfig:
     """Complete agent configuration.
 
@@ -770,6 +798,7 @@ class AgentConfig:
     )
     phase_settings: PhaseSettings = field(default_factory=PhaseSettings)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    auxiliary: AuxiliaryConfig = field(default_factory=AuxiliaryConfig)
     instruction_files: List[InstructionFileEntry] = field(default_factory=list)
     autonomy: str = "partial"
 
@@ -867,6 +896,41 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
         importance_threshold=data.get("importance_threshold", 0.3),
         dedup_threshold=data.get("dedup_threshold", 0.92),
         storage=data.get("storage", "postgres"),
+    )
+
+
+def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
+    """Parse auxiliary LLM configuration from dict.
+
+    Args:
+        data: Auxiliary config dictionary from YAML
+
+    Returns:
+        AuxiliaryConfig dataclass
+    """
+    tasks_data = data.get("tasks", {})
+    tasks = {}
+    for task_name, task_conf in tasks_data.items():
+        if isinstance(task_conf, dict):
+            tasks[task_name] = AuxiliaryTaskConfig(
+                enabled=task_conf.get("enabled", True),
+            )
+        else:
+            tasks[task_name] = AuxiliaryTaskConfig(enabled=bool(task_conf))
+
+    # Ensure defaults for known tasks
+    for default_task in ("extract_memories", "curate_knowledge"):
+        if default_task not in tasks:
+            tasks[default_task] = AuxiliaryTaskConfig(enabled=True)
+
+    return AuxiliaryConfig(
+        enabled=data.get("enabled", True),
+        model=data.get("model"),
+        base_url=data.get("base_url"),
+        temperature=data.get("temperature", 0.0),
+        max_iterations=data.get("max_iterations", 15),
+        timeout=data.get("timeout", 120.0),
+        tasks=tasks,
     )
 
 
@@ -1023,6 +1087,9 @@ def load_agent_config(
     memory_data = data.get("memory", {})
     memory_config = _parse_memory_config(memory_data)
 
+    auxiliary_data = data.get("auxiliary", {})
+    auxiliary_config = _parse_auxiliary_config(auxiliary_data)
+
     # Parse instruction_files entries
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
@@ -1044,7 +1111,7 @@ def load_agent_config(
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "memory", "instruction_files", "autonomy"
+        "phase_settings", "memory", "auxiliary", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1060,6 +1127,7 @@ def load_agent_config(
         context_management=context_config,
         phase_settings=phase_config,
         memory=memory_config,
+        auxiliary=auxiliary_config,
         instruction_files=instruction_files,
         autonomy=autonomy,
         extra=extra,
@@ -1166,6 +1234,9 @@ def load_agent_config_from_dict(
     memory_data = data.get("memory", {})
     memory_config = _parse_memory_config(memory_data)
 
+    auxiliary_data = data.get("auxiliary", {})
+    auxiliary_config = _parse_auxiliary_config(auxiliary_data)
+
     # Parse instruction_files entries
     instruction_files_data = data.get("instruction_files", [])
     instruction_files = [
@@ -1187,7 +1258,7 @@ def load_agent_config_from_dict(
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "memory", "instruction_files", "autonomy"
+        "phase_settings", "memory", "auxiliary", "instruction_files", "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1203,6 +1274,7 @@ def load_agent_config_from_dict(
         context_management=context_config,
         phase_settings=phase_config,
         memory=memory_config,
+        auxiliary=auxiliary_config,
         instruction_files=instruction_files,
         autonomy=autonomy,
         extra=extra,
@@ -2081,13 +2153,17 @@ Conversation:
 def get_all_tool_names(config: AgentConfig) -> List[str]:
     """Get all tool names from configuration.
 
+    Applies shell mode aliasing: when mode=stateless, shell_execute is
+    mapped to run_command (and vice versa for persistent mode). This
+    ensures backward compatibility with existing configs.
+
     Args:
         config: Agent configuration
 
     Returns:
         List of all configured tool names
     """
-    return (
+    names = (
         config.tools.workspace +
         config.tools.core +
         config.tools.document +
@@ -2100,6 +2176,16 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.coding +
         config.tools.evaluation
     )
+
+    # Shell mode aliasing for backward compatibility
+    shell_config = config.extra.get("shell", {})
+    mode = shell_config.get("mode", "stateless") if isinstance(shell_config, dict) else "stateless"
+    if mode == "stateless":
+        names = ["run_command" if n == "shell_execute" else n for n in names]
+    elif mode == "persistent":
+        names = ["shell_execute" if n == "run_command" else n for n in names]
+
+    return names
 
 
 def resolve_config_path(config_name: str) -> tuple[str, Optional[str]]:

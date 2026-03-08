@@ -41,7 +41,13 @@ def context_manager(context_config):
 
 @pytest.fixture
 def mock_llm():
-    """Create a mock LLM that returns structured summaries."""
+    """Create a mock AuxiliaryLLM that returns structured summaries.
+
+    Returns an AuxiliaryLLM-compatible object with a mock LLM that supports
+    with_structured_output() for use in ContextManager methods.
+    """
+    from src.services.auxiliary import AuxiliaryLLM
+
     llm = MagicMock()
 
     # Mock the with_structured_output method
@@ -55,7 +61,7 @@ def mock_llm():
     ))
     llm.with_structured_output = MagicMock(return_value=structured_llm)
 
-    return llm
+    return AuxiliaryLLM(llm=llm)
 
 
 def create_large_message_history(num_messages: int, chars_per_message: int = 500) -> list:
@@ -224,7 +230,7 @@ class TestSinglePassSummarize:
         """Should return properly formatted summary."""
         result = await context_manager._single_pass_summarize(
             conversation_text="User: Hello\nAssistant: Hi",
-            llm=mock_llm,
+            auxiliary=mock_llm,
             summarization_prompt=None,
 
             max_summary_length=10000,
@@ -241,26 +247,32 @@ class TestSinglePassSummarize:
 
         await context_manager._single_pass_summarize(
             conversation_text="test",
-            llm=mock_llm,
+            auxiliary=mock_llm,
             summarization_prompt=custom_prompt,
 
             max_summary_length=10000,
         )
 
-        # Verify LLM was called
-        mock_llm.with_structured_output.assert_called_once()
+        # Verify LLM was called (mock_llm is AuxiliaryLLM wrapping the mock)
+        mock_llm.llm.with_structured_output.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_handles_llm_error(self, context_manager):
         """Should return error message when LLM fails."""
+        from src.services.auxiliary import AuxiliaryLLM
+
         error_llm = MagicMock()
         structured_llm = AsyncMock()
         structured_llm.ainvoke = AsyncMock(side_effect=Exception("LLM error"))
         error_llm.with_structured_output = MagicMock(return_value=structured_llm)
+        # Also mock raw ainvoke for unstructured fallback
+        error_llm.ainvoke = AsyncMock(side_effect=Exception("Fallback also fails"))
+
+        aux = AuxiliaryLLM(llm=error_llm)
 
         result = await context_manager._single_pass_summarize(
             conversation_text="test",
-            llm=error_llm,
+            auxiliary=aux,
             summarization_prompt=None,
 
             max_summary_length=10000,
@@ -285,14 +297,14 @@ class TestRecursiveSummarize:
 
         result = await context_manager._recursive_summarize(
             formatted_parts=parts,
-            llm=mock_llm,
+            auxiliary=mock_llm,
             summarization_prompt=None,
 
             max_summary_length=5000,
         )
 
         # Should have called the LLM multiple times (once per chunk + final unification)
-        assert mock_llm.with_structured_output.call_count >= 2
+        assert mock_llm.llm.with_structured_output.call_count >= 2
         assert result  # Should return something
 
     @pytest.mark.asyncio
@@ -304,7 +316,7 @@ class TestRecursiveSummarize:
         # This should complete without infinite recursion
         result = await context_manager._recursive_summarize(
             formatted_parts=parts,
-            llm=mock_llm,
+            auxiliary=mock_llm,
             summarization_prompt=None,
 
             max_summary_length=1000,
@@ -319,7 +331,7 @@ class TestRecursiveSummarize:
 
         result = await context_manager._recursive_summarize(
             formatted_parts=parts,
-            llm=mock_llm,
+            auxiliary=mock_llm,
             summarization_prompt=None,
 
             max_summary_length=10000,
@@ -348,7 +360,7 @@ class TestSummarizeConversation:
 
         result = await context_manager.summarize_conversation(
             messages=messages,
-            llm=mock_llm,
+            auxiliary=mock_llm,
         )
 
         assert "**Summary:**" in result
@@ -362,12 +374,12 @@ class TestSummarizeConversation:
 
         result = await context_manager.summarize_conversation(
             messages=messages,
-            llm=mock_llm,
+            auxiliary=mock_llm,
         )
 
         assert result
         # Should have made multiple LLM calls for chunked summarization
-        assert mock_llm.with_structured_output.call_count > 1
+        assert mock_llm.llm.with_structured_output.call_count > 1
 
     @pytest.mark.asyncio
     async def test_tracks_summarization_state(self, context_manager, mock_llm):
@@ -376,7 +388,7 @@ class TestSummarizeConversation:
 
         await context_manager.summarize_conversation(
             messages=messages,
-            llm=mock_llm,
+            auxiliary=mock_llm,
         )
 
         assert context_manager.state.total_summarizations == 1
@@ -410,7 +422,7 @@ class TestEnsureWithinLimitsForce:
 
         await context_manager.ensure_within_limits(
             messages=messages,
-            llm=mock_llm,
+            auxiliary=mock_llm,
             force=True,
         )
 
@@ -428,7 +440,7 @@ class TestEnsureWithinLimitsForce:
 
         result = await context_manager.ensure_within_limits(
             messages=messages,
-            llm=mock_llm,
+            auxiliary=mock_llm,
             force=False,
         )
 
@@ -460,7 +472,7 @@ class TestContextSafetyIntegration:
         messages = create_large_message_history(num_messages=100, chars_per_message=1000)
 
         # Should complete without error
-        result = await mgr.summarize_conversation(messages=messages, llm=mock_llm)
+        result = await mgr.summarize_conversation(messages=messages, auxiliary=mock_llm)
 
         assert result
         assert "[Summarization failed:" not in result
