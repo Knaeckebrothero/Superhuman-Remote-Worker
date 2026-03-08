@@ -69,7 +69,7 @@ tools:
     - browse_website
     - research_topic
   coding:
-    - shell_execute
+    - run_command
   git:
     - git_log
     - git_show

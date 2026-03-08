@@ -9,7 +9,7 @@ WHY: Extracting criteria BEFORE reading deliverables prevents your initial impre
 1. Read workspace.md for current state. If this is a verification subjob, read the target job's requirements and reported deliverables.
 2. Extract evaluation criteria from the task requirements BEFORE reading deliverables. Write criteria to workspace.md under "## Evaluation Criteria" with what evidence each criterion needs.
 3. Plan which deliverables to examine, which tests to run, which services to verify.
-4. Identify what tools you need: git tools for code review, shell_execute for infrastructure verification, read_file for document review.
+4. Identify what tools you need: git tools for code review, run_command for infrastructure verification, read_file for document review.
 5. Update plan.md with the verification approach.
 6. Create todos for the next tactical phase targeting specific criteria and evidence gathering.
 </review_scoping>

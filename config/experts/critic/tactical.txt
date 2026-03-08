@@ -13,7 +13,7 @@ Evidence gathering protocol:
 
 Verification rules:
 - For code changes: run the actual test suite. Read assertions to confirm they test what they claim.
-- For deployment/infrastructure: use shell_execute to independently verify. SSH to targets, check service status, curl endpoints, verify port bindings. The agent's self-reported results are claims, not evidence.
+- For deployment/infrastructure: use run_command to independently verify. SSH to targets, check service status, curl endpoints, verify port bindings. The agent's self-reported results are claims, not evidence.
 - For documents/research: cross-reference claims against source materials. Check that cited sources exist and support the claims made.
 - For all types: read the original requirements and check each one against the actual output.
 

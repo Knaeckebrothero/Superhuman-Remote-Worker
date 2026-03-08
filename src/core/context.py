@@ -687,7 +687,7 @@ class ContextManager:
     async def ensure_within_limits(
         self,
         messages: List[BaseMessage],
-        llm: BaseChatModel,
+        auxiliary,
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
         force: bool = False,
@@ -699,7 +699,7 @@ class ContextManager:
 
         Args:
             messages: Current message history
-            llm: LLM for summarization
+            auxiliary: AuxiliaryLLM instance for summarization
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Max length for summary
             force: If True, summarize even if thresholds not exceeded
@@ -714,7 +714,7 @@ class ContextManager:
             )
             result = await self.summarize_and_compact(
                 messages,
-                llm,
+                auxiliary,
                 summarization_prompt,
                 max_summary_length,
             )
@@ -759,7 +759,7 @@ class ContextManager:
                         # Re-compact from ORIGINAL messages to avoid RemoveMessage accumulation
                         result = await self.summarize_and_compact(
                             messages,
-                            llm,
+                            auxiliary,
                             summarization_prompt,
                             max_summary_length,
                             keep_recent_override=next_keep,
@@ -867,11 +867,29 @@ class ContextManager:
         # Keep last 10 tool results with content (observation masking window)
         recent_tool_indices = set(tool_msg_indices[-10:]) if tool_msg_indices else set()
 
+        # Determine recency boundary for the visual marker.
+        # The marker is inserted before the earliest message in the recent tool window,
+        # but only if there are enough tool messages to have an "old" section.
+        recency_boundary = None
+        if len(tool_msg_indices) > 10:
+            recency_boundary = tool_msg_indices[-10]
+
         formatted_parts = []
+        marker_inserted = False
         for i, msg in enumerate(messages):
             # Skip workspace injection messages - they're re-injected fresh after summarization
             if is_workspace_injection_message(msg):
                 continue
+
+            # Insert recency marker before the first message in the recent window
+            if recency_boundary is not None and i >= recency_boundary and not marker_inserted:
+                if formatted_parts:  # Only if there are older messages to separate from
+                    formatted_parts.append(
+                        "\n════════════════════════════════════════\n"
+                        "RECENT CONTEXT — PRESERVE WITH HIGHEST PRIORITY\n"
+                        "════════════════════════════════════════"
+                    )
+                marker_inserted = True
 
             if isinstance(msg, SystemMessage):
                 # Include prior summaries in the new summarization so context is preserved
@@ -938,43 +956,34 @@ class ContextManager:
     async def _single_pass_summarize(
         self,
         conversation_text: str,
-        llm: BaseChatModel,
+        auxiliary,
         summarization_prompt: Optional[str],
         max_summary_length: int,
     ) -> str:
         """Single-pass summarization of conversation text.
 
+        Delegates to AuxiliaryLLM.chain(SummarizeTask(...)) for the actual
+        LLM call with structured output.
+
         Args:
             conversation_text: Formatted conversation as string
-            llm: LLM to use for summarization
+            auxiliary: AuxiliaryLLM instance for summarization
             summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
             max_summary_length: Maximum summary length
 
         Returns:
             Summary string
         """
-        # Build prompt from template or fallback
-        if summarization_prompt:
-            # Use format_map with defaultdict for backward compat with old
-            # resolved prompts that may still contain {oss_reasoning_level}
-            from collections import defaultdict
+        from src.services.auxiliary import SummarizeTask
 
-            prompt = summarization_prompt.format_map(
-                defaultdict(str, conversation=conversation_text, max_summary_length=str(max_summary_length))
-            )
-        else:
-            prompt = f"""Summarize this agent conversation into the required JSON fields.
-
-Conversation:
-{conversation_text}"""
+        task = SummarizeTask(
+            conversation_text=conversation_text,
+            summarization_prompt=summarization_prompt,
+            max_summary_length=max_summary_length,
+        )
 
         try:
-            structured_llm = llm.with_structured_output(ConversationSummary)
-
-            result: ConversationSummary = await asyncio.wait_for(
-                structured_llm.ainvoke([HumanMessage(content=prompt)]),
-                timeout=self._summarization_timeout,
-            )
+            result: ConversationSummary = await auxiliary.chain(task)
 
             # Format into readable text
             parts = []
@@ -1018,7 +1027,7 @@ Conversation:
         except Exception as e:
             logger.error(f"Structured summarization failed: {e}", exc_info=True)
 
-            # Fallback: unstructured summarization to avoid losing context
+            # Fallback: unstructured summarization using the raw LLM
             try:
                 logger.info("Falling back to unstructured summarization")
                 fallback_prompt = (
@@ -1027,7 +1036,7 @@ Conversation:
                     f"Conversation:\n{conversation_text}"
                 )
                 response = await asyncio.wait_for(
-                    llm.ainvoke([HumanMessage(content=fallback_prompt)]),
+                    auxiliary.llm.ainvoke([HumanMessage(content=fallback_prompt)]),
                     timeout=self._summarization_timeout,
                 )
                 fallback_summary = response.content if hasattr(response, 'content') else str(response)
@@ -1042,7 +1051,7 @@ Conversation:
     async def _recursive_summarize(
         self,
         formatted_parts: List[str],
-        llm: BaseChatModel,
+        auxiliary,
         summarization_prompt: Optional[str],
         max_summary_length: int,
         depth: int = 0,
@@ -1057,7 +1066,7 @@ Conversation:
 
         Args:
             formatted_parts: List of formatted message strings
-            llm: LLM for summarization
+            auxiliary: AuxiliaryLLM instance for summarization
             summarization_prompt: Optional custom prompt template (reasoning level pre-rendered)
             max_summary_length: Maximum final summary length
             depth: Current recursion depth (for logging)
@@ -1094,7 +1103,7 @@ Conversation:
             chunk_max_length = max(1000, max_summary_length // max(len(chunks), 1))
             summary = await self._single_pass_summarize(
                 chunk_text,
-                llm,
+                auxiliary,
                 summarization_prompt,
                 chunk_max_length,
             )
@@ -1116,7 +1125,7 @@ Conversation:
             )
             return await self._recursive_summarize(
                 [f"Previous summary section:\n{s}" for s in chunk_summaries],
-                llm,
+                auxiliary,
                 summarization_prompt,
                 max_summary_length,
                 depth + 1,
@@ -1127,7 +1136,7 @@ Conversation:
             logger.info(f"Unifying {len(chunks)} chunk summaries into final summary")
             return await self._single_pass_summarize(
                 f"Combine these section summaries into a unified summary:\n\n{combined}",
-                llm,
+                auxiliary,
                 summarization_prompt,
                 max_summary_length,
             )
@@ -1137,7 +1146,7 @@ Conversation:
     async def summarize_conversation(
         self,
         messages: List[BaseMessage],
-        llm: BaseChatModel,
+        auxiliary,
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
     ) -> str:
@@ -1149,7 +1158,7 @@ Conversation:
 
         Args:
             messages: Messages to summarize
-            llm: LLM to use for summarization
+            auxiliary: AuxiliaryLLM instance for summarization
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Maximum length for the final summary
 
@@ -1171,7 +1180,7 @@ Conversation:
             )
             summary = await self._recursive_summarize(
                 formatted_parts,
-                llm,
+                auxiliary,
                 summarization_prompt,
                 max_summary_length,
             )
@@ -1179,7 +1188,7 @@ Conversation:
             logger.info(f"Starting single-pass summarization ({input_tokens} tokens)")
             summary = await self._single_pass_summarize(
                 conversation_text,
-                llm,
+                auxiliary,
                 summarization_prompt,
                 max_summary_length,
             )
@@ -1196,7 +1205,7 @@ Conversation:
     async def summarize_and_compact(
         self,
         messages: List[BaseMessage],
-        llm: BaseChatModel,
+        auxiliary,
         summarization_prompt: Optional[str] = None,
         max_summary_length: int = 10000,
         keep_recent_override: Optional[int] = None,
@@ -1208,7 +1217,7 @@ Conversation:
 
         Args:
             messages: Full message history
-            llm: LLM for summarization
+            auxiliary: AuxiliaryLLM instance for summarization
             summarization_prompt: Optional custom prompt (reasoning level pre-rendered)
             max_summary_length: Max length for summary
             keep_recent_override: Override keep_recent_messages (for progressive compaction)
@@ -1261,7 +1270,7 @@ Conversation:
         # Generate summary
         summary = await self.summarize_conversation(
             messages_for_summarization,
-            llm,
+            auxiliary,
             summarization_prompt,
             max_summary_length,
         )

@@ -1,8 +1,14 @@
-"""Coding toolkit - persistent shell sessions.
+"""Coding toolkit - shell command execution.
 
-This toolkit provides:
-- shell_execute: Execute commands or send keystrokes in persistent tmux-backed terminal tabs
-- shell_read: Read output from persistent terminal tabs with offset support
+This toolkit provides tools in two modes (configured via shell.mode):
+
+Stateless mode (default):
+- run_command: Simple command→output execution (hidden persistent tab underneath)
+- shell_read: Read more output from scrollback when needed
+
+Persistent mode (opt-in via shell.mode: persistent):
+- shell_execute: Full tab management, keystrokes, async commands
+- shell_read: Read output from any named terminal tab
 
 Available in both strategic and tactical phases. Requires tmux + ShellManager.
 """

@@ -233,10 +233,12 @@ tools:
   sql: []        # PostgreSQL: sql_query, sql_schema, sql_execute
   mongodb: []    # MongoDB: mongo_query, mongo_aggregate, mongo_schema, mongo_insert, mongo_update
 
-  # Persistent terminal sessions (src/tools/coding/)
+  # Shell command execution (src/tools/coding/)
+  # Mode controlled by shell.mode: "stateless" (default) or "persistent"
   coding:
-    - shell_execute   # Execute commands in persistent tmux tabs
-    - shell_read      # Read output from persistent tabs
+    - run_command     # Execute commands, get output (stateless mode, default)
+    - shell_read      # Read more output from scrollback
+    # Alternative (persistent mode): shell_execute + shell_read
 
   # Evaluation tools for critic agents (src/tools/evaluation/)
   # Enable in critic config for approve/return capabilities.
