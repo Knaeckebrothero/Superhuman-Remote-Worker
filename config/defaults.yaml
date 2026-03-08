@@ -98,10 +98,10 @@ tools:
   # MongoDB tools - MongoDB operations (src/tools/mongodb/)
   # Injected automatically via datasource system
   mongodb: []
-  # Coding tools - persistent terminal sessions (src/tools/coding/)
+  # Coding tools - shell command execution (src/tools/coding/)
   coding:
-    - shell_execute   # Execute commands/keystrokes in persistent tabs (requires tmux)
-    - shell_read      # Read output history from persistent tabs
+    - run_command     # Execute commands, get output (stateless mode, default)
+    - shell_read      # Read more output from scrollback when needed
   # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
   # Enable in critic config to give reviewer agents approve/return capabilities.
   evaluation: []
@@ -170,6 +170,23 @@ memory:
   dedup_threshold: 0.92            # Cosine similarity threshold for dedup
   storage: postgres                # Only option for v1
 
+# Auxiliary LLM — unified support task system for background LLM tasks.
+# Handles memory extraction, knowledge curation, and other support tasks
+# using structured output. Two modes: chain (in→out) and agent (in→tools→out).
+# See docs/features/auxiliary.md for full design.
+auxiliary:
+  enabled: true
+  model: null              # null = use main LLM; or "gpt-oss-120b"
+  base_url: null           # null = use LLM_BASE_URL; or custom endpoint
+  temperature: 0.0
+  max_iterations: 15       # Cap for agent mode loops
+  timeout: 120             # Seconds per LLM call
+  tasks:
+    extract_memories:
+      enabled: true
+    curate_knowledge:
+      enabled: true
+
 # Verification — auto-spawn a critic job after job_complete to review deliverables.
 # The critic either approves the job or resumes it with feedback.
 # See docs/features/verification_phase.md for full design.
@@ -201,13 +218,14 @@ browser:
 claude_code:
   model: claude-opus-4-6
 
-# Persistent shell sessions (tmux-backed terminal multiplexer)
+# Shell command execution (tmux-backed terminal multiplexer)
 # Requires tmux installed.
 shell:
+  mode: stateless              # "stateless" (run_command, default) or "persistent" (shell_execute)
   max_tabs: 15                   # Maximum number of concurrent shell tabs
   max_read_lines: 200          # Maximum lines shell_read can return
   scrollback_limit: 5000       # Tmux history-limit per pane
-  default_timeout: 120         # Default timeout for shell_execute sync mode (seconds)
+  default_timeout: 120         # Default timeout for sync mode (seconds)
   blocked_commands: [reboot, shutdown, poweroff, halt, init]  # sudo/systemctl allowed for remote server management
   sandbox: true                # Restrict working directory to workspace
   auto_start_claude_code: false # Auto-open a Claude Code tab on job start (requires claude CLI)

@@ -271,8 +271,8 @@
           "items": {
             "type": "string"
           },
-          "description": "Coding/execution tools: shell commands and persistent terminal sessions (src/tools/coding/)",
-          "examples": [["shell_execute", "shell_read"]]
+          "description": "Coding/execution tools: shell commands (src/tools/coding/)",
+          "examples": [["run_command", "shell_read"], ["shell_execute", "shell_read"]]
         },
         "evaluation": {
           "type": "array",
@@ -486,8 +486,14 @@
     },
     "shell": {
       "type": "object",
-      "description": "Persistent shell session settings (tmux-backed terminal multiplexer). Requires tmux installed.",
+      "description": "Shell command execution settings (tmux-backed terminal multiplexer). Requires tmux installed.",
       "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["stateless", "persistent"],
+          "default": "stateless",
+          "description": "Shell mode: 'stateless' exposes run_command (simple command→output), 'persistent' exposes shell_execute (full tab management, keys, async)"
+        },
         "max_tabs": {
           "type": "integer",
           "minimum": 2,
@@ -511,7 +517,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 120,
-          "description": "Default timeout for shell_execute sync mode in seconds"
+          "description": "Default timeout for synchronous command execution in seconds"
         },
         "blocked_commands": {
           "type": "array",

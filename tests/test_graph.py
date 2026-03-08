@@ -1342,8 +1342,9 @@ class TestEnsureWithinLimits:
         return ContextManager(config=config)
 
     @pytest.fixture
-    def mock_llm(self):
-        """Create a mock LLM that returns a summary."""
+    def mock_auxiliary(self):
+        """Create a mock AuxiliaryLLM that returns a summary."""
+        from src.services.auxiliary import AuxiliaryLLM
         llm = MagicMock()
         # with_structured_output returns an LLM that can be awaited
         structured_llm = MagicMock()
@@ -1355,16 +1356,18 @@ class TestEnsureWithinLimits:
             blockers="",
         ))
         llm.with_structured_output = MagicMock(return_value=structured_llm)
-        return llm
+        return AuxiliaryLLM(llm=llm)
 
     @pytest.mark.asyncio
     async def test_no_compaction_when_under_threshold(self, context_mgr):
         """Test that messages are returned unchanged when under threshold."""
         from langchain_core.messages import HumanMessage
+        from src.services.auxiliary import AuxiliaryLLM
         messages = [HumanMessage(content="Hello")]
 
         mock_llm = MagicMock()
-        result = await context_mgr.ensure_within_limits(messages, mock_llm)
+        mock_aux = AuxiliaryLLM(llm=mock_llm)
+        result = await context_mgr.ensure_within_limits(messages, mock_aux)
 
         # Should return same messages unchanged
         assert result == messages
@@ -1372,7 +1375,7 @@ class TestEnsureWithinLimits:
         mock_llm.with_structured_output.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_compaction_when_over_message_threshold(self, context_mgr, mock_llm):
+    async def test_compaction_when_over_message_threshold(self, context_mgr, mock_auxiliary):
         """Test that compaction happens when message count exceeds threshold."""
         from langchain_core.messages import HumanMessage, AIMessage
 
@@ -1386,13 +1389,13 @@ class TestEnsureWithinLimits:
             AIMessage(content="Response 3 " * 20),
         ]
 
-        result = await context_mgr.ensure_within_limits(messages, mock_llm)
+        result = await context_mgr.ensure_within_limits(messages, mock_auxiliary)
 
         # Should have fewer messages (compacted)
         assert len(result) < len(messages)
 
     @pytest.mark.asyncio
-    async def test_force_compaction(self, context_mgr, mock_llm):
+    async def test_force_compaction(self, context_mgr, mock_auxiliary):
         """Test that force=True triggers compaction even under threshold."""
         from langchain_core.messages import HumanMessage, AIMessage
 
@@ -1405,20 +1408,20 @@ class TestEnsureWithinLimits:
             AIMessage(content="I am doing great, thanks! " * 50),
         ]
 
-        result = await context_mgr.ensure_within_limits(messages, mock_llm, force=True)
+        result = await context_mgr.ensure_within_limits(messages, mock_auxiliary, force=True)
 
         # With force=True, compaction should happen (summary is smaller than original)
         assert len(result) < len(messages)
 
     @pytest.mark.asyncio
-    async def test_returns_original_when_not_enough_messages(self, context_mgr, mock_llm):
+    async def test_returns_original_when_not_enough_messages(self, context_mgr, mock_auxiliary):
         """Test that messages are returned unchanged when too few to compact."""
         from langchain_core.messages import HumanMessage
 
         # Only 1 message - can't really compact
         messages = [HumanMessage(content="Hello")]
 
-        result = await context_mgr.ensure_within_limits(messages, mock_llm, force=True)
+        result = await context_mgr.ensure_within_limits(messages, mock_auxiliary, force=True)
 
         # Should return same messages since there's nothing to summarize
         assert result == messages

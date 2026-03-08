@@ -260,15 +260,17 @@ instruction_files:
     # enforce: false  # active: system injects content as transient message
 ```
 
-### Persistent Shell Sessions
+### Shell Command Execution
 
-Replaces the old synchronous `run_command` tool with persistent tmux-backed terminal tabs. Commands and output are decoupled — sending a command is one action, reading the result is another. Tabs preserve environment variables, virtualenvs, working directory, and command history across calls.
+Two modes controlled by `shell.mode` in config (default: `stateless`):
 
-**Tools:** `shell(command, tab)` (sync run), `shell_send(name, input, wait)` (interactive), `shell_read(name, lines, since_cursor, wait)` (poll output), `shell_open(name, command)` / `shell_close(name)` (tab lifecycle), `shell_list()`.
+**Stateless mode** (default): `run_command(command, timeout, tail)` — simple command→output. Runs in a hidden persistent tmux tab. Returns exit code + last 30 lines of stdout. Use `shell_read()` to page through full scrollback. Interactive prompts return an error (use sshpass, `-y` flags, etc. instead).
 
-**Implementation:** `src/tools/coding/shell_manager.py` (ShellManager, tmux control via libtmux), `src/tools/coding/shell_tools.py` (tool definitions), `src/core/shell_injection.py` (terminal state injection). Requires `tmux` installed. See `docs/persistent_shell.md` for the full design document.
+**Persistent mode** (`shell.mode: persistent`): `shell_execute(command, name, tail, is_async, keys)` — full tab management with named tabs, keystroke mode, and async execution. For interactive workflows (debugging, long-running processes).
 
-**Shell state injection** works like workspace injection — a transient `<terminal_state>` SystemMessage is injected every LLM call showing open tabs, their types (ssh, repl, claude-code), and recent output. Excluded from summarization.
+Both modes use `shell_read(name, offset, lines)` for reading scrollback history.
+
+**Implementation:** `src/tools/coding/shell_manager.py` (ShellManager, tmux control via libtmux), `src/tools/coding/shell_tools.py` (tool definitions). Requires `tmux` installed. See `docs/shell.md` for design rationale and `docs/persistent_shell.md` for the persistent mode design.
 
 ### Claude Code Delegation
 
@@ -288,7 +290,7 @@ claude_code:
 
 On first run, `serialize_resolved_config()` captures the fully resolved config (agent config + all prompt text + all instruction text) and stores it in the `resolved_config` JSONB column on the jobs table. On resume, `load_config_from_resolved()` reconstructs the config from this snapshot, bypassing disk resolution entirely. This prevents config drift when files change between runs.
 
-Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`, `evaluation`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML. The `coding` category provides persistent shell tools (see "Persistent Shell Sessions" above).
+Tool categories (`workspace`, `core`, `document`, `research`, `citation`, `graph`, `sql`, `mongodb`, `git`, `coding`, `evaluation`) map to modules under `src/tools/`. See `config/README.md` for the full tool listing per category. Database tool categories (`graph`, `sql`, `mongodb`) are injected/stripped by the orchestrator based on attached datasources, not by config YAML. The `coding` category provides shell tools (see "Shell Command Execution" above).
 
 **Phase-specific tool filtering**: Tools declare phase availability via `phases` in `TOOL_REGISTRY` (`src/tools/registry.py`). `filter_tools_by_phase()` removes unavailable tools before binding to the LLM. `job_complete` is strategic-only.
 

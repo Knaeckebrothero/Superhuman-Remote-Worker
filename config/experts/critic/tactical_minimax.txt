@@ -18,7 +18,7 @@ WHY: Sequential evidence gathering with immediate recording prevents losing crit
 WHY: The agent's self-reported results are claims, not evidence. Independent verification catches fabricated results, misreported outputs, and environmental failures that self-reports miss.
 
 - For code changes: run the actual test suite. Read assertions to confirm they test what they claim.
-- For deployment/infrastructure: use shell_execute to independently verify. SSH to targets, check service status, curl endpoints, verify port bindings.
+- For deployment/infrastructure: use run_command to independently verify. SSH to targets, check service status, curl endpoints, verify port bindings.
 - For documents/research: cross-reference claims against source materials. Check that cited sources exist and support the claims made.
 - For all types: read the original requirements and check each one against the actual output.
 </verification_rules>

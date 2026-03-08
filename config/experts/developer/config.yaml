@@ -42,7 +42,7 @@ tools:
     - get_workspace_summary
     - get_document_info
   coding:
-    - shell_execute
+    - run_command
     - shell_read
   core:
     - next_phase_todos

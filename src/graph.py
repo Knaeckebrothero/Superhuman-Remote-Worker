@@ -423,7 +423,7 @@ def create_execute_node(
     config: AgentConfig,
     context_mgr: ContextManager,
     retry_manager: ToolRetryManager,
-    summarization_llm: BaseChatModel,
+    auxiliary_llm,
     summarization_prompt: str,
     tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
@@ -441,7 +441,7 @@ def create_execute_node(
         config: Agent configuration
         context_mgr: ContextManager for context window management
         retry_manager: ToolRetryManager for LLM call retry logic
-        summarization_llm: LLM for context summarization
+        auxiliary_llm: AuxiliaryLLM instance for summarization
         summarization_prompt: Prompt template for summarization
     """
 
@@ -559,7 +559,7 @@ def create_execute_node(
         try:
             messages = await context_mgr.ensure_within_limits(
                 messages,
-                summarization_llm,
+                auxiliary_llm,
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
             )
@@ -747,7 +747,7 @@ def create_execute_node(
             # Force summarization on conversation messages (not system prompt)
             messages = await context_mgr.ensure_within_limits(
                 messages,
-                summarization_llm,
+                auxiliary_llm,
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
                 force=True,
@@ -1083,7 +1083,7 @@ def create_execute_node(
                     # Force aggressive compaction
                     messages = await context_mgr.ensure_within_limits(
                         messages,
-                        summarization_llm,
+                        auxiliary_llm,
                         summarization_prompt,
                         max_summary_length=config.context_management.max_summary_length,
                         force=True,
@@ -1360,7 +1360,7 @@ def create_archive_phase_node(
     plan_manager: PlanManager,
     config: AgentConfig,
     context_mgr: ContextManager,
-    llm: BaseChatModel,
+    auxiliary_llm,
     summarization_prompt: str,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     recall_store=None,
@@ -1503,7 +1503,7 @@ def create_archive_phase_node(
 
             compacted_messages = await context_mgr.ensure_within_limits(
                 messages,
-                llm,
+                auxiliary_llm,
                 summarization_prompt,
                 max_summary_length=config.context_management.max_summary_length,
                 force=force_summarize,
@@ -1965,7 +1965,7 @@ def create_restore_from_feedback_node(
     todo_manager: TodoManager,
     config: AgentConfig,
     context_mgr: ContextManager,
-    summarization_llm: BaseChatModel,
+    auxiliary_llm,
     summarization_prompt: str,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create node that handles resume-from-feedback flow.
@@ -1983,7 +1983,7 @@ def create_restore_from_feedback_node(
         todo_manager: TodoManager instance to load resume todos into
         config: Agent configuration
         context_mgr: ContextManager for force compaction
-        summarization_llm: LLM for context summarization
+        auxiliary_llm: AuxiliaryLLM instance for summarization
         summarization_prompt: Prompt template for summarization
 
     Returns:
@@ -2002,7 +2002,7 @@ def create_restore_from_feedback_node(
         # This gives the agent a "fresh start" with just a summary of prior work
         compacted_messages = await context_mgr.ensure_within_limits(
             messages,
-            summarization_llm,
+            auxiliary_llm,
             summarization_prompt,
             max_summary_length=config.context_management.max_summary_length,
             force=True,
@@ -2336,13 +2336,14 @@ def build_phase_alternation_graph(
     todo_manager: TodoManager,
     workspace_template: str = "",
     checkpointer: Optional[BaseCheckpointSaver] = None,
-    summarization_llm: Optional[BaseChatModel] = None,
+    auxiliary_llm=None,
     snapshot_manager: Optional[PhaseSnapshotManager] = None,
     tool_context: Optional[ToolContext] = None,
     postgres_db: Optional[Any] = None,
     curation_callback=None,
     # Backwards compatibility
     llm_with_tools: Optional[BaseChatModel] = None,
+    summarization_llm: Optional[BaseChatModel] = None,
 ) -> CompiledStateGraph:
     """Build the phase alternation graph for the Universal Agent.
 
@@ -2365,10 +2366,10 @@ def build_phase_alternation_graph(
         workspace_template: Template content for workspace.md
         checkpointer: Optional LangGraph checkpointer for state persistence.
             When provided, enables resume after crash using the same thread_id.
-        summarization_llm: Optional LLM for context summarization at phase boundaries.
-            If not provided, uses strategic_llm_with_tools for summarization.
+        auxiliary_llm: AuxiliaryLLM instance for summarization and support tasks.
         snapshot_manager: Optional PhaseSnapshotManager for creating phase snapshots.
             When provided, enables recovery to previous phases after corruption.
+        summarization_llm: Deprecated - use auxiliary_llm instead.
         llm_with_tools: Deprecated - use strategic_llm_with_tools instead.
 
     Returns:
@@ -2423,8 +2424,11 @@ def build_phase_alternation_graph(
     if not workspace_template:
         raise ValueError("workspace_template is required")
 
-    # Use provided summarization LLM or fall back to strategic LLM
-    llm_for_summarization = summarization_llm or strategic_llm_with_tools
+    # Backwards compatibility: wrap a raw LLM in AuxiliaryLLM if needed
+    if auxiliary_llm is None:
+        from src.services.auxiliary import AuxiliaryLLM
+        raw_llm = summarization_llm or strategic_llm_with_tools
+        auxiliary_llm = AuxiliaryLLM(llm=raw_llm)
 
     # Extract RecallStore and MemoryObserver for memory injection and free sources
     recall_store = tool_context.recall_store if tool_context else None
@@ -2439,7 +2443,7 @@ def build_phase_alternation_graph(
     restore_todo_state = create_restore_todo_state_node(todo_manager)
     restore_from_feedback = create_restore_from_feedback_node(
         workspace, todo_manager, config,
-        context_mgr, llm_for_summarization, summarization_prompt,
+        context_mgr, auxiliary_llm, summarization_prompt,
     )
 
     execute = create_execute_node(
@@ -2451,14 +2455,14 @@ def build_phase_alternation_graph(
         config=config,
         context_mgr=context_mgr,
         retry_manager=retry_manager,
-        summarization_llm=llm_for_summarization,
+        auxiliary_llm=auxiliary_llm,
         summarization_prompt=summarization_prompt,
         tool_context=tool_context,
     )
     check_todos = create_check_todos_node(todo_manager, config)
     archive_phase = create_archive_phase_node(
         todo_manager, plan_manager, config,
-        context_mgr, llm_for_summarization, summarization_prompt,
+        context_mgr, auxiliary_llm, summarization_prompt,
         snapshot_manager=snapshot_manager,
         recall_store=recall_store,
         memory_observer=memory_observer,
