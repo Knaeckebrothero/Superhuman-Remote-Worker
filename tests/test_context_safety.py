@@ -176,13 +176,145 @@ class TestFormatMessagesForSummary:
         ]
         parts = context_manager._format_messages_for_summary(messages)
 
-        assert len(parts) == 12
+        # 12 messages + 1 recency marker = 13 parts
+        assert len(parts) == 13
         # First 2 are beyond the recent-10 window — should be masked (placeholder only)
         assert "omitted" in parts[0]
         assert "omitted" in parts[1]
+        # Recency marker separates old from recent
+        assert "RECENT CONTEXT" in parts[2]
         # Last 10 should have content
-        assert "result_2" in parts[2]
-        assert "result_11" in parts[11]
+        assert "result_2" in parts[3]
+        assert "result_11" in parts[12]
+
+    def test_recency_marker_inserted_when_enough_tool_messages(self, context_manager):
+        """Recency marker should appear when there are >10 tool messages."""
+        messages = [
+            ToolMessage(content=f"result_{i}", tool_call_id=str(i))
+            for i in range(15)
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        marker_parts = [p for p in parts if "RECENT CONTEXT" in p]
+        assert len(marker_parts) == 1
+        assert "PRESERVE WITH HIGHEST PRIORITY" in marker_parts[0]
+
+    def test_no_recency_marker_when_few_tool_messages(self, context_manager):
+        """No recency marker when all tool messages fit in the recent window."""
+        messages = [
+            ToolMessage(content=f"result_{i}", tool_call_id=str(i))
+            for i in range(5)
+        ]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        marker_parts = [p for p in parts if "RECENT CONTEXT" in p]
+        assert len(marker_parts) == 0
+
+    def test_atomic_grouping_preserves_sibling_results(self, context_manager):
+        """When one tool result in a group is recent, all siblings should be recent too."""
+        # 9 old standalone tool messages (fill most of the window)
+        old_msgs = [
+            ToolMessage(content=f"old_{i}" * 20, tool_call_id=f"old_{i}")
+            for i in range(9)
+        ]
+
+        # 1 AIMessage calling 3 tools — will straddle the boundary
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "read_file", "id": "group_a", "args": {}},
+                {"name": "web_search", "id": "group_b", "args": {}},
+                {"name": "sql_query", "id": "group_c", "args": {}},
+            ],
+        )
+        group_results = [
+            ToolMessage(content="file content here", tool_call_id="group_a"),
+            ToolMessage(content="search results here", tool_call_id="group_b"),
+            ToolMessage(content="query output here", tool_call_id="group_c"),
+        ]
+
+        # Total: 12 tool messages. Flat last-10 keeps old_2..old_8 + all 3 grouped.
+        # All 3 grouped are in the flat window here, but atomic grouping ensures
+        # that even at different boundary positions, they stay together.
+        messages = old_msgs + [ai_msg] + group_results
+        parts = context_manager._format_messages_for_summary(messages)
+
+        # All 3 grouped results should show content, not "omitted"
+        for label in ["file content", "search results", "query output"]:
+            matching = [p for p in parts if label in p]
+            assert len(matching) == 1
+            assert "omitted" not in matching[0], f"'{label}' should not be masked"
+
+    def test_atomic_grouping_boundary_case(self, context_manager):
+        """Group straddling the flat-10 boundary: all siblings should be preserved."""
+        # 10 standalone old tool messages
+        old_msgs = [
+            ToolMessage(content=f"standalone_{i}" * 20, tool_call_id=f"s_{i}")
+            for i in range(10)
+        ]
+
+        # AIMessage with 3 tool calls — group will straddle the flat-10 boundary
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "tool_a", "id": "g_a", "args": {}},
+                {"name": "tool_b", "id": "g_b", "args": {}},
+                {"name": "tool_c", "id": "g_c", "args": {}},
+            ],
+        )
+        group_results = [
+            ToolMessage(content="result_a data", tool_call_id="g_a"),
+            ToolMessage(content="result_b data", tool_call_id="g_b"),
+            ToolMessage(content="result_c data", tool_call_id="g_c"),
+        ]
+
+        # Total: 13 tool messages. Flat last-10 = s_3..s_9 + g_a + g_b + g_c
+        # g_a is the 11th tool message — in the flat window.
+        # But with only 7 standalone old in the window, if we add more old messages
+        # to push g_a out, atomic grouping pulls it back in.
+        # Here all 3 are already in the flat window, so just verify they stay.
+        messages = old_msgs + [ai_msg] + group_results
+        parts = context_manager._format_messages_for_summary(messages)
+
+        for label in ["result_a", "result_b", "result_c"]:
+            matching = [p for p in parts if label in p]
+            assert len(matching) == 1
+            assert "omitted" not in matching[0], f"{label} should not be masked"
+
+    def test_atomic_grouping_pulls_in_old_siblings(self, context_manager):
+        """A group member outside the flat-10 window is pulled in by a recent sibling."""
+        # AIMessage with 2 tool calls — results will be split across the boundary
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "tool_x", "id": "pair_x", "args": {}},
+                {"name": "tool_y", "id": "pair_y", "args": {}},
+            ],
+        )
+
+        # Place pair_x early (outside flat window), pair_y late (inside flat window),
+        # with 10 filler tool messages in between.
+        # Total: 12 tool messages. Flat last-10 = indices 2..11.
+        # pair_x (tool index 0) is OUTSIDE flat window.
+        # pair_y (tool index 11) is INSIDE flat window.
+        # Atomic grouping should pull pair_x into the recent set.
+        messages = (
+            [ai_msg]
+            + [ToolMessage(content="x_data value", tool_call_id="pair_x")]
+            + [ToolMessage(content=f"fill_{i}" * 20, tool_call_id=f"fl_{i}") for i in range(10)]
+            + [ToolMessage(content="y_data value", tool_call_id="pair_y")]
+        )
+        parts = context_manager._format_messages_for_summary(messages)
+
+        # pair_x should show content (pulled in by pair_y), not be masked
+        x_parts = [p for p in parts if "x_data" in p]
+        assert len(x_parts) == 1
+        assert "omitted" not in x_parts[0], "pair_x should be pulled into recent by sibling pair_y"
+
+        # pair_y should also show content (it's naturally in the window)
+        y_parts = [p for p in parts if "y_data" in p]
+        assert len(y_parts) == 1
+        assert "omitted" not in y_parts[0]
 
     def test_includes_prior_summaries(self, context_manager):
         """System messages with prior summaries should be included."""
@@ -215,6 +347,51 @@ class TestFormatMessagesForSummary:
 
         # Human messages truncated to 500 chars
         assert len(parts[0]) < 600
+
+        # AI messages truncated to 800 chars
+        ai_messages = [AIMessage(content="y" * 1000)]
+        ai_parts = context_manager._format_messages_for_summary(ai_messages)
+        assert "y" * 800 in ai_parts[0]
+        assert "y" * 801 not in ai_parts[0]
+
+    def test_ai_reasoning_preserved_at_800_chars(self, context_manager):
+        """AI reasoning should be preserved up to 800 chars, not 300."""
+        # Content that's 500 chars — would be cut at 300 before, now preserved
+        content = "A" * 500
+        messages = [AIMessage(content=content)]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert len(parts) == 1
+        assert "A" * 500 in parts[0]  # Full 500 chars preserved
+
+    def test_ai_reasoning_with_tool_calls_preserved(self, context_manager):
+        """AIMessage with both reasoning content and tool_calls should show both."""
+        messages = [AIMessage(
+            content="I need to check the auth module because the JWT validation is failing",
+            tool_calls=[
+                {"name": "read_file", "id": "tc1", "args": {"path": "auth.py"}},
+                {"name": "web_search", "id": "tc2", "args": {"query": "JWT"}},
+            ],
+        )]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert len(parts) == 1
+        # Both reasoning and tool names should be present
+        assert "JWT validation" in parts[0]
+        assert "read_file" in parts[0]
+        assert "web_search" in parts[0]
+
+    def test_ai_reasoning_with_tool_calls_empty_content(self, context_manager):
+        """AIMessage with tool_calls but empty content should only show tool names."""
+        messages = [AIMessage(
+            content="",
+            tool_calls=[{"name": "read_file", "id": "tc1", "args": {}}],
+        )]
+        parts = context_manager._format_messages_for_summary(messages)
+
+        assert len(parts) == 1
+        assert "read_file" in parts[0]
+        assert parts[0] == "Assistant: [Called tools: read_file]"
 
 
 # =============================================================================

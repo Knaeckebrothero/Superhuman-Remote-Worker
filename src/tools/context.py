@@ -69,7 +69,6 @@ class ToolContext:
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
     _instruction_files: List[Any] = field(default_factory=list)  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
-    memory_observer: Optional[Any] = None  # MemoryObserver instance (Memory Light Phase 3)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
     knowledge_graph: Optional[Any] = None  # KnowledgeGraphDB (system Neo4j for knowledge base)
     knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)

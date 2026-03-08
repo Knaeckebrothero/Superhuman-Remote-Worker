@@ -557,6 +557,23 @@
       },
       "additionalProperties": false
     },
+    "scholar": {
+      "type": "object",
+      "description": "Scholar phase: auto-spawn a research job before the main job starts. The scholar gathers information, does web research, and writes findings to the research/ folder. The main job starts after the scholar completes.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Spawn a scholar research job before the main job starts"
+        },
+        "scholar_config": {
+          "type": "string",
+          "default": "scholar",
+          "description": "Expert config name to use for the research job"
+        }
+      },
+      "additionalProperties": false
+    },
     "autonomy": {
       "type": "string",
       "enum": ["full", "review", "partial", "guided", "dependent"],

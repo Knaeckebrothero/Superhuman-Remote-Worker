@@ -847,6 +847,7 @@ class ContextManager:
 
         Uses observation masking (JetBrains "Complexity Trap" pattern):
         - Recent tool results: include truncated content (first 300 chars)
+        - AI reasoning: include up to 800 chars (reasoning traces > tool output per ACON)
         - Old tool results: replace with placeholder noting tool name + size
         - Reasoning/action history: always preserved in full
 
@@ -858,21 +859,45 @@ class ContextManager:
         """
         from src.core.workspace_injection import is_workspace_injection_message
 
-        # Count tool messages to determine recency window
+        # Count tool messages and build parent mapping for atomic grouping
         tool_msg_indices = []
+        tool_call_parent = {}  # tool_call_id → parent AIMessage index
         for i, msg in enumerate(messages):
-            if isinstance(msg, ToolMessage):
+            if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        tool_call_parent[tc_id] = i
+            elif isinstance(msg, ToolMessage):
                 tool_msg_indices.append(i)
 
         # Keep last 10 tool results with content (observation masking window)
         recent_tool_indices = set(tool_msg_indices[-10:]) if tool_msg_indices else set()
 
+        # Atomic grouping: if any tool result sharing the same parent AIMessage
+        # is recent, include all sibling results in the recent set.
+        # (ForgeCode pattern: "never split tool call/result pairs")
+        if recent_tool_indices and tool_call_parent:
+            recent_parents = set()
+            for idx in recent_tool_indices:
+                tc_id = getattr(messages[idx], "tool_call_id", None)
+                parent_idx = tool_call_parent.get(tc_id)
+                if parent_idx is not None:
+                    recent_parents.add(parent_idx)
+
+            for idx in tool_msg_indices:
+                if idx not in recent_tool_indices:
+                    tc_id = getattr(messages[idx], "tool_call_id", None)
+                    parent_idx = tool_call_parent.get(tc_id)
+                    if parent_idx in recent_parents:
+                        recent_tool_indices.add(idx)
+
         # Determine recency boundary for the visual marker.
         # The marker is inserted before the earliest message in the recent tool window,
         # but only if there are enough tool messages to have an "old" section.
         recency_boundary = None
-        if len(tool_msg_indices) > 10:
-            recency_boundary = tool_msg_indices[-10]
+        if len(tool_msg_indices) > len(recent_tool_indices):
+            recency_boundary = min(recent_tool_indices)
 
         formatted_parts = []
         marker_inserted = False
@@ -903,9 +928,16 @@ class ContextManager:
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     tool_names = [tc.get("name", "unknown") for tc in msg.tool_calls]
-                    formatted_parts.append(f"Assistant: [Called tools: {', '.join(tool_names)}]")
+                    if content:
+                        # Preserve reasoning alongside tool calls
+                        # (ACON: reasoning traces > tool output)
+                        formatted_parts.append(
+                            f"Assistant: {content[:800]}... [Called tools: {', '.join(tool_names)}]"
+                        )
+                    else:
+                        formatted_parts.append(f"Assistant: [Called tools: {', '.join(tool_names)}]")
                 elif content:
-                    formatted_parts.append(f"Assistant: {content[:300]}...")
+                    formatted_parts.append(f"Assistant: {content[:800]}...")
             elif isinstance(msg, ToolMessage):
                 tool_name = getattr(msg, "name", None) or "unknown"
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)

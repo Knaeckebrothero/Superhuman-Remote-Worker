@@ -4,6 +4,10 @@ Extracted from agent-side post-completion code (src/api/app.py) so the
 orchestrator can make verification/curation decisions without depending
 on agent state.  All functions read config from the job dict's
 ``resolved_config`` JSONB — no live agent config needed.
+
+Also provides lightweight disk-based config readers for decisions that
+must be made at job *creation* time (before resolved_config exists),
+such as scholar spawning.
 """
 
 from __future__ import annotations
@@ -12,6 +16,8 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,88 @@ def get_curation_config(job: dict[str, Any]) -> dict[str, Any]:
 def is_curation_enabled(job: dict[str, Any]) -> bool:
     """Check if curation is enabled for a job."""
     return bool(get_curation_config(job).get("enabled", False))
+
+
+def get_scholar_config(job: dict[str, Any]) -> dict[str, Any]:
+    """Extract scholar config from resolved_config.
+
+    Same resolution pattern as ``get_verification_config`` but for the
+    ``scholar`` key.
+    """
+    rc = _parse_resolved_config(job)
+
+    agent_block = rc.get("agent")
+    if isinstance(agent_block, dict):
+        sc = agent_block.get("scholar")
+        if isinstance(sc, dict):
+            return sc
+
+    sc = rc.get("scholar")
+    if isinstance(sc, dict):
+        return sc
+
+    return {}
+
+
+def is_scholar_enabled(job: dict[str, Any]) -> bool:
+    """Check if scholar is enabled for a job."""
+    return bool(get_scholar_config(job).get("enabled", False))
+
+
+# ---------------------------------------------------------------------------
+# Disk-based config readers (for creation-time decisions)
+# ---------------------------------------------------------------------------
+
+def resolve_scholar_config_from_disk(
+    config_name: str,
+    config_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Lightweight YAML reader for scholar config at job creation time.
+
+    At creation time ``resolved_config`` is NULL, so we cannot use the
+    JSONB helpers.  Instead we read just the ``scholar`` section from:
+
+    1. ``config/defaults.yaml`` (base defaults)
+    2. ``config/experts/{config_name}/config.yaml`` or
+       ``config/{config_name}.yaml`` (expert override)
+    3. ``config_override["scholar"]`` (per-job override)
+
+    This avoids importing the full config loader machinery.
+    """
+    scholar: dict[str, Any] = {}
+
+    # 1. Read defaults
+    defaults_path = _REPO_ROOT / "config" / "defaults.yaml"
+    if defaults_path.exists():
+        try:
+            with open(defaults_path, encoding="utf-8") as f:
+                defaults = yaml.safe_load(f) or {}
+            if isinstance(defaults.get("scholar"), dict):
+                scholar.update(defaults["scholar"])
+        except Exception as e:
+            logger.warning("Failed to read defaults.yaml for scholar config: %s", e)
+
+    # 2. Read expert config (overrides defaults)
+    expert_paths = [
+        _REPO_ROOT / "config" / "experts" / config_name / "config.yaml",
+        _REPO_ROOT / "config" / f"{config_name}.yaml",
+    ]
+    for path in expert_paths:
+        if path.exists():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    expert = yaml.safe_load(f) or {}
+                if isinstance(expert.get("scholar"), dict):
+                    scholar.update(expert["scholar"])
+            except Exception as e:
+                logger.warning("Failed to read %s for scholar config: %s", path, e)
+            break
+
+    # 3. Apply per-job config_override
+    if config_override and isinstance(config_override.get("scholar"), dict):
+        scholar.update(config_override["scholar"])
+
+    return scholar
 
 
 def get_autonomy_level(job: dict[str, Any]) -> str:
@@ -320,4 +408,61 @@ def format_curation_instructions(
         )
     except KeyError as e:
         logger.error("Curation template has unknown placeholder: %s", e)
+        return None
+
+
+def format_scholar_instructions(
+    parent_job_id: str,
+    description: str,
+    config_name: str,
+    instructions: str | None = None,
+    output_dir: str = "research",
+) -> str | None:
+    """Load and format the scholar subjob instructions template.
+
+    Template is loaded from ``config/experts/scholar/scholar_subjob_instructions.md``
+    with fallback to ``config/templates/scholar_subjob_instructions.md``.
+    """
+    search_paths = [
+        _REPO_ROOT / "config" / "experts" / "scholar" / "scholar_subjob_instructions.md",
+        _REPO_ROOT / "config" / "templates" / "scholar_subjob_instructions.md",
+    ]
+
+    template_path = None
+    for path in search_paths:
+        if path.exists():
+            template_path = path
+            break
+
+    if not template_path:
+        logger.error(
+            "Scholar instructions template not found. Searched: %s",
+            [str(p) for p in search_paths],
+        )
+        return None
+
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.error("Failed to read scholar template %s: %s", template_path, e)
+        return None
+
+    if instructions:
+        parent_instructions_section = (
+            "## Additional Instructions\n\n"
+            f"{instructions}"
+        )
+    else:
+        parent_instructions_section = ""
+
+    try:
+        return template.format(
+            parent_job_id=parent_job_id,
+            parent_config=config_name,
+            parent_description=description,
+            parent_instructions_section=parent_instructions_section,
+            output_dir=output_dir,
+        )
+    except KeyError as e:
+        logger.error("Scholar template has unknown placeholder: %s", e)
         return None
