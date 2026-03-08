@@ -21,9 +21,13 @@ from orchestrator.services.completion import (  # noqa: E402
     is_verification_enabled,
     get_curation_config,
     is_curation_enabled,
+    get_scholar_config,
+    is_scholar_enabled,
+    resolve_scholar_config_from_disk,
     get_autonomy_level,
     is_job_completion_freeze,
     format_verification_instructions,
+    format_scholar_instructions,
 )
 
 
@@ -39,6 +43,7 @@ def make_job(
     freeze_data: dict | None = None,
     verification_enabled: bool = True,
     curation_enabled: bool = False,
+    scholar_enabled: bool = True,
     autonomy: str = "review",
     config_name: str = "defaults",
 ) -> dict:
@@ -55,6 +60,10 @@ def make_job(
             "curator": {
                 "enabled": curation_enabled,
                 "curator_config": "curator",
+            },
+            "scholar": {
+                "enabled": scholar_enabled,
+                "scholar_config": "scholar",
             },
         },
         "model_family": "openai",
@@ -318,6 +327,134 @@ class TestFormatVerificationInstructions:
                 job_id="x",
                 description="x",
                 freeze_data={},
+                config_name="x",
+            )
+            assert result is None
+
+
+# =============================================================================
+# Scholar config tests
+# =============================================================================
+
+
+class TestGetScholarConfig:
+    """Test reading scholar config from resolved_config."""
+
+    def test_standard_path(self):
+        job = make_job(scholar_enabled=True)
+        sc = get_scholar_config(job)
+        assert sc["enabled"] is True
+        assert sc["scholar_config"] == "scholar"
+
+    def test_disabled(self):
+        job = make_job(scholar_enabled=False)
+        assert is_scholar_enabled(job) is False
+
+    def test_enabled(self):
+        assert is_scholar_enabled(make_job(scholar_enabled=True)) is True
+
+    def test_missing_resolved_config(self):
+        job = {"id": "x", "resolved_config": None}
+        assert get_scholar_config(job) == {}
+        assert is_scholar_enabled(job) is False
+
+    def test_top_level_fallback(self):
+        """When scholar is at top level (not nested in agent)."""
+        job = {
+            "id": "x",
+            "resolved_config": {
+                "scholar": {"enabled": True, "scholar_config": "custom_scholar"},
+            },
+        }
+        sc = get_scholar_config(job)
+        assert sc["enabled"] is True
+        assert sc["scholar_config"] == "custom_scholar"
+
+    def test_string_resolved_config(self):
+        rc = json.dumps({
+            "agent": {"scholar": {"enabled": True, "scholar_config": "scholar"}},
+        })
+        job = {"id": "x", "resolved_config": rc}
+        sc = get_scholar_config(job)
+        assert sc["enabled"] is True
+
+
+class TestResolveScholarConfigFromDisk:
+    """Test the lightweight YAML reader for creation-time config checks."""
+
+    def test_defaults_has_scholar_enabled(self):
+        """defaults.yaml should have scholar enabled."""
+        sc = resolve_scholar_config_from_disk("default")
+        assert sc.get("enabled") is True
+
+    def test_config_override_disables(self):
+        sc = resolve_scholar_config_from_disk(
+            "default",
+            config_override={"scholar": {"enabled": False}},
+        )
+        assert sc.get("enabled") is False
+
+    def test_config_override_custom_config(self):
+        sc = resolve_scholar_config_from_disk(
+            "default",
+            config_override={"scholar": {"scholar_config": "custom_scholar"}},
+        )
+        assert sc.get("scholar_config") == "custom_scholar"
+
+    def test_nonexistent_config_falls_back_to_defaults(self):
+        sc = resolve_scholar_config_from_disk("nonexistent_config_xyz")
+        assert sc.get("enabled") is True  # From defaults.yaml
+
+    def test_scholar_config_reads_scholar_expert(self):
+        """The scholar expert config should not have its own scholar section
+        (would cause recursion), so it should just get defaults."""
+        sc = resolve_scholar_config_from_disk("scholar")
+        assert sc.get("enabled") is True
+
+
+class TestFormatScholarInstructions:
+    """Test scholar instructions template formatting."""
+
+    def test_basic_formatting(self):
+        result = format_scholar_instructions(
+            parent_job_id="test-123",
+            description="Analyze microservice patterns",
+            config_name="developer",
+        )
+        assert result is not None
+        assert "test-123" in result
+        assert "developer" in result
+        assert "Analyze microservice patterns" in result
+        assert "research/" in result
+
+    def test_with_instructions(self):
+        result = format_scholar_instructions(
+            parent_job_id="test-456",
+            description="Build REST API",
+            config_name="developer",
+            instructions="Focus on authentication patterns",
+        )
+        assert result is not None
+        assert "Focus on authentication patterns" in result
+
+    def test_custom_output_dir(self):
+        result = format_scholar_instructions(
+            parent_job_id="test-789",
+            description="Research task",
+            config_name="default",
+            output_dir="custom_research",
+        )
+        assert result is not None
+        assert "custom_research/" in result
+
+    def test_template_not_found(self):
+        with patch(
+            "orchestrator.services.completion._REPO_ROOT",
+            Path("/nonexistent"),
+        ):
+            result = format_scholar_instructions(
+                parent_job_id="x",
+                description="x",
                 config_name="x",
             )
             assert result is None

@@ -195,14 +195,20 @@ verification:
   critic_config: critic  # Which expert config to use for the reviewer
   max_rounds: 3          # Max feedback round-trips before auto-accepting
 
-# Curation — auto-spawn a curator job to extract knowledge from job artifacts.
-# The curator runs in parallel, triggered on archive phases, extracting knowledge
-# notes into the project knowledge base (Neo4j + pgvector).
+# Curation — inline knowledge extraction via AuxiliaryLLM at archive_phase.
+# Runs CurateKnowledgeTask in agent mode to extract knowledge notes
+# into the project knowledge base (Neo4j + pgvector).
+# Requires a project_id in job metadata and Neo4j connection.
 # See docs/features/project_knowledge_base.md for full design.
 curator:
   enabled: false         # Opt-in per config or per project
-  curator_config: curator  # Which expert config to use
-  autonomy: full         # No human review of curated notes
+
+# Scholar — auto-spawn a research job before the main job starts.
+# The scholar gathers information, does web research, and writes findings
+# to the research/ folder in the workspace. The main job starts after.
+scholar:
+  enabled: true            # Spawn a scholar job before main job starts
+  scholar_config: scholar   # Which expert config to use
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent

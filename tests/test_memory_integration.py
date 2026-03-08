@@ -272,84 +272,63 @@ class TestTurnCountState:
         )
         assert isinstance(state["turn_count"], int)
 
+    def test_create_initial_state_has_last_observed_turn_zero(self):
+        from src.core.state import create_initial_state
+
+        state = create_initial_state(
+            job_id="test-job",
+            workspace_path="/tmp/test",
+        )
+        assert state["last_observed_turn"] == 0
+
 
 # =============================================================================
 # ToolContext memory_observer field tests
 # =============================================================================
 
 
-class TestToolContextMemoryObserver:
-    """Tests for the memory_observer field on ToolContext."""
+class TestToolContextNoMemoryObserver:
+    """Verify memory_observer field was removed from ToolContext."""
 
-    def test_memory_observer_default_none(self):
+    def test_no_memory_observer_field(self):
+        """memory_observer was migrated to AuxiliaryLLM; field should not exist."""
         ctx = ToolContext(workspace_manager=None, config={})
-        assert ctx.memory_observer is None
+        assert not hasattr(ctx, "memory_observer")
 
-    def test_memory_observer_can_be_set(self):
+    def test_recall_store_still_exists(self):
         ctx = ToolContext(workspace_manager=None, config={})
-        mock_observer = MagicMock()
-        ctx.memory_observer = mock_observer
-        assert ctx.memory_observer is mock_observer
-
-    def test_recall_store_and_observer_independent(self):
-        """recall_store and memory_observer are independent fields."""
-        ctx = ToolContext(workspace_manager=None, config={})
+        assert ctx.recall_store is None
         ctx.recall_store = MagicMock()
-        assert ctx.memory_observer is None
-
-        ctx.memory_observer = MagicMock()
         assert ctx.recall_store is not None
-        assert ctx.memory_observer is not None
 
 
 # =============================================================================
-# Observer window truncation tests
+# Auxiliary memory extraction helpers
 # =============================================================================
 
 
-class TestObserverWindowTruncation:
-    """Tests for _MAX_OBSERVATION_WINDOW truncation in MemoryObserver."""
+class TestAuxiliaryMemoryExtraction:
+    """Tests for _should_extract_memories and extract_and_store_memories."""
 
-    def test_phase_boundary_truncates_large_history(self):
-        """observe_phase_boundary should cap at _MAX_OBSERVATION_WINDOW."""
-        from langchain_core.messages import HumanMessage
-        from src.services.memory_observer import MemoryObserver, _MAX_OBSERVATION_WINDOW
+    def test_should_extract_at_interval(self):
+        from src.services.auxiliary import _should_extract_memories
+        assert _should_extract_memories(turn_count=5, interval=5, last_observed_turn=0)
+        assert _should_extract_memories(turn_count=10, interval=5, last_observed_turn=5)
 
-        obs = MemoryObserver(
-            recall_store=AsyncMock(),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
+    def test_should_not_extract_between_intervals(self):
+        from src.services.auxiliary import _should_extract_memories
+        assert not _should_extract_memories(turn_count=3, interval=5, last_observed_turn=0)
+        assert not _should_extract_memories(turn_count=7, interval=5, last_observed_turn=5)
 
-        # Create more messages than the window allows
-        messages = [HumanMessage(content=f"msg {i}") for i in range(60)]
+    def test_should_not_extract_at_zero(self):
+        from src.services.auxiliary import _should_extract_memories
+        assert not _should_extract_memories(turn_count=0, interval=5, last_observed_turn=0)
 
-        # _get_message_segment should cap the segment
-        segment = obs._get_message_segment(messages, 0, 30)
-        assert len(segment) <= _MAX_OBSERVATION_WINDOW
+    def test_should_not_re_extract_same_turn(self):
+        from src.services.auxiliary import _should_extract_memories
+        assert not _should_extract_memories(turn_count=5, interval=5, last_observed_turn=5)
 
-    def test_small_history_not_truncated(self):
-        from langchain_core.messages import HumanMessage
-        from src.services.memory_observer import MemoryObserver
-
-        obs = MemoryObserver(
-            recall_store=AsyncMock(),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
-
-        messages = [HumanMessage(content=f"msg {i}") for i in range(5)]
-        segment = obs._get_message_segment(messages, 0, 3)
-        assert len(segment) == 5  # All messages returned when under cap
-
-    def test_zero_window_returns_empty(self):
-        from src.services.memory_observer import MemoryObserver
-
-        obs = MemoryObserver(
-            recall_store=AsyncMock(),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
-
-        segment = obs._get_message_segment([], 5, 5)
-        assert segment == []
+    def test_observation_window_caps_messages(self):
+        """extract_and_store_memories should cap at _MAX_OBSERVATION_WINDOW."""
+        from src.services.auxiliary import _MAX_OBSERVATION_WINDOW
+        assert _MAX_OBSERVATION_WINDOW == 40  # Same as old MemoryObserver

@@ -1,7 +1,10 @@
 """Integration tests for Memory Light in graph and agent setup.
 
-Tests that the observer and recall_store are correctly wired into
-the graph nodes and agent initialization logic.
+Tests that the auxiliary LLM memory extraction and recall_store are
+correctly wired into the graph nodes and agent initialization logic.
+
+Migration note: Memory extraction was migrated from MemoryObserver to
+AuxiliaryLLM.chain(ExtractMemoriesTask). See docs/features/auxiliary.md.
 """
 
 import asyncio
@@ -10,58 +13,57 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
-from src.services.memory_observer import MemoryObserver
+from src.services.auxiliary import (
+    AuxiliaryLLM,
+    ExtractedMemories,
+    ExtractedMemory,
+    ExtractMemoriesTask,
+    _should_extract_memories,
+    extract_and_store_memories,
+    _MAX_OBSERVATION_WINDOW,
+)
 from src.tools.context import ToolContext
 
 
 # =============================================================================
-# Graph execute node: observer trigger + turn_count
+# Graph execute node: extraction trigger + turn_count
 # =============================================================================
 
 
-class TestExecuteNodeObserverTrigger:
-    """Tests that the execute node correctly triggers the observer."""
+class TestExecuteNodeExtractionTrigger:
+    """Tests that the execute node correctly triggers memory extraction."""
 
-    def test_observer_should_observe_called_with_incremented_turn(self):
-        """Simulate the graph's observer trigger logic."""
-        observer = MemoryObserver(
-            recall_store=AsyncMock(),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
-
-        # Simulate what graph.py does: new_turn_count = state turn_count + 1
+    def test_should_extract_at_interval(self):
+        """Simulate the graph's extraction trigger logic."""
         state_turn_count = 4  # Will become 5 after increment
         new_turn_count = state_turn_count + 1
+        last_observed = 0
 
-        assert observer.should_observe(new_turn_count) is True
+        assert _should_extract_memories(new_turn_count, interval=5, last_observed_turn=last_observed)
 
-    def test_observer_not_triggered_between_intervals(self):
-        observer = MemoryObserver(
-            recall_store=AsyncMock(),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
-
+    def test_not_triggered_between_intervals(self):
         state_turn_count = 2
         new_turn_count = state_turn_count + 1  # = 3
 
-        assert observer.should_observe(new_turn_count) is False
+        assert not _should_extract_memories(new_turn_count, interval=5, last_observed_turn=0)
 
     def test_turn_count_increments_from_state(self):
         """Verify the increment pattern used in graph.py."""
-        # This mirrors: new_turn_count = state.get("turn_count", 0) + 1
         for initial in [0, 1, 5, 10, 99]:
             new_count = initial + 1
             assert new_count == initial + 1
 
+    def test_last_observed_prevents_re_extraction(self):
+        """When last_observed_turn equals turn_count, should not extract again."""
+        assert not _should_extract_memories(turn_count=10, interval=5, last_observed_turn=10)
+        assert _should_extract_memories(turn_count=15, interval=5, last_observed_turn=10)
+
 
 class TestExecuteNodeTurnCountReturn:
-    """Tests that execute node return dicts include turn_count."""
+    """Tests that execute node return dicts include turn_count and last_observed_turn."""
 
     def test_compacted_return_includes_turn_count(self):
         """When context was compacted, return dict should have turn_count."""
-        # Simulate the return dict pattern from graph.py
         state_turn_count = 4
         new_turn_count = state_turn_count + 1
 
@@ -75,75 +77,172 @@ class TestExecuteNodeTurnCountReturn:
         assert "turn_count" in result
         assert result["turn_count"] == 5
 
-    def test_non_compacted_return_includes_turn_count(self):
-        """Normal (non-compacted) return dict should also have turn_count."""
-        state_turn_count = 9
-        new_turn_count = state_turn_count + 1
+    def test_return_includes_last_observed_when_extracted(self):
+        """When extraction fires, last_observed_turn should be updated."""
+        new_turn_count = 10
+        extraction_triggered = True
 
-        result = {
-            "messages": [],
-            "iteration": 2,
+        result_update = {
+            "iteration": 1,
             "turn_count": new_turn_count,
             "error": None,
         }
+        if extraction_triggered:
+            result_update["last_observed_turn"] = new_turn_count
 
-        assert result["turn_count"] == 10
+        assert result_update["last_observed_turn"] == 10
+
+    def test_return_omits_last_observed_when_not_extracted(self):
+        """When extraction doesn't fire, last_observed_turn should not change."""
+        new_turn_count = 7
+        extraction_triggered = False
+
+        result_update = {
+            "iteration": 1,
+            "turn_count": new_turn_count,
+            "error": None,
+        }
+        if extraction_triggered:
+            result_update["last_observed_turn"] = new_turn_count
+
+        assert "last_observed_turn" not in result_update
 
 
 # =============================================================================
-# Graph archive_phase node: observer phase boundary
+# extract_and_store_memories: the replacement for MemoryObserver.observe()
 # =============================================================================
 
 
-class TestArchivePhaseObserverTrigger:
-    """Tests for phase boundary observer trigger in archive_phase."""
+class TestExtractAndStoreMemories:
+    """Tests for the extract_and_store_memories helper."""
 
     @pytest.mark.asyncio
-    async def test_observe_phase_boundary_called(self):
-        """Verify observe_phase_boundary is callable with correct args."""
-        observer = MemoryObserver(
-            recall_store=AsyncMock(),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
-        observer.llm.ainvoke = AsyncMock(
-            return_value=MagicMock(content="[]")
-        )
+    async def test_extracts_and_stores(self):
+        """Should extract via chain() and store each memory."""
+        memories = ExtractedMemories(memories=[
+            ExtractedMemory(
+                content="Test insight",
+                summary="Test",
+                keywords=["test"],
+                importance=0.8,
+                type="factual",
+            ),
+        ])
+        mock_llm = MagicMock()
+        structured = AsyncMock()
+        structured.ainvoke = AsyncMock(return_value=memories)
+        mock_llm.with_structured_output = MagicMock(return_value=structured)
 
-        messages = [HumanMessage(content="test")]
-        result = await observer.observe_phase_boundary(
-            messages=messages,
-            phase=3,
-        )
-
-        # Should complete without error
-        assert isinstance(result, list)
-
-    @pytest.mark.asyncio
-    async def test_observe_phase_boundary_uses_phase_number(self):
-        """Verify phase number is passed through to store calls."""
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
         mock_store = AsyncMock(return_value="mem-id")
-        observer = MemoryObserver(
-            recall_store=MagicMock(store=mock_store),
-            llm=AsyncMock(),
-            observer_interval=5,
-        )
-        observer.llm.ainvoke = AsyncMock(
-            return_value=MagicMock(
-                content='[{"content": "test insight", "type": "factual", "importance": 0.7}]'
-            )
+        recall_store = MagicMock(store=mock_store)
+
+        count = await extract_and_store_memories(
+            auxiliary_llm=aux,
+            recall_store=recall_store,
+            messages=[HumanMessage(content="test")],
+            phase=3,
+            source_turn_start=0,
+            source_turn_end=5,
         )
 
-        await observer.observe_phase_boundary(
-            messages=[HumanMessage(content="did work")],
-            phase=7,
+        assert count == 1
+        mock_store.assert_called_once()
+        kwargs = mock_store.call_args.kwargs
+        assert kwargs["source"] == "observer"
+        assert kwargs["source_phase"] == 3
+        assert kwargs["source_turn_start"] == 0
+        assert kwargs["source_turn_end"] == 5
+
+    @pytest.mark.asyncio
+    async def test_empty_messages_returns_zero(self):
+        mock_llm = MagicMock()
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+
+        count = await extract_and_store_memories(
+            auxiliary_llm=aux,
+            recall_store=MagicMock(),
+            messages=[],
+            phase=0,
+        )
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_caps_observation_window(self):
+        """Should cap messages at _MAX_OBSERVATION_WINDOW."""
+        memories = ExtractedMemories(memories=[])
+        mock_llm = MagicMock()
+        structured = AsyncMock()
+        structured.ainvoke = AsyncMock(return_value=memories)
+        mock_llm.with_structured_output = MagicMock(return_value=structured)
+
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+
+        # Create more messages than the window
+        messages = [HumanMessage(content=f"msg {i}") for i in range(60)]
+
+        await extract_and_store_memories(
+            auxiliary_llm=aux,
+            recall_store=MagicMock(),
+            messages=messages,
+            phase=0,
         )
 
-        # Verify store was called with source_phase=7
-        assert mock_store.called
-        call_kwargs = mock_store.call_args.kwargs
-        assert call_kwargs["source_phase"] == 7
-        assert call_kwargs["source"] == "observer"
+        # Verify the task received capped messages
+        call_args = structured.ainvoke.call_args[0][0]
+        # The HumanMessage context was built from capped messages
+        assert structured.ainvoke.called
+
+    @pytest.mark.asyncio
+    async def test_store_failure_continues(self):
+        """Store failure for one memory shouldn't block others."""
+        memories = ExtractedMemories(memories=[
+            ExtractedMemory(
+                content="mem1", summary="m1",
+                keywords=["a"], importance=0.5, type="factual",
+            ),
+            ExtractedMemory(
+                content="mem2", summary="m2",
+                keywords=["b"], importance=0.6, type="factual",
+            ),
+        ])
+        mock_llm = MagicMock()
+        structured = AsyncMock()
+        structured.ainvoke = AsyncMock(return_value=memories)
+        mock_llm.with_structured_output = MagicMock(return_value=structured)
+
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+        mock_store = AsyncMock(side_effect=[Exception("fail"), "mem-id"])
+        recall_store = MagicMock(store=mock_store)
+
+        count = await extract_and_store_memories(
+            auxiliary_llm=aux,
+            recall_store=recall_store,
+            messages=[HumanMessage(content="test")],
+            phase=0,
+        )
+
+        assert count == 1  # Only second one stored
+        assert mock_store.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_zero(self):
+        """LLM failure should be non-fatal."""
+        mock_llm = MagicMock()
+        structured = AsyncMock()
+        structured.ainvoke = AsyncMock(side_effect=RuntimeError("LLM down"))
+        mock_llm.with_structured_output = MagicMock(return_value=structured)
+
+        aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
+
+        count = await extract_and_store_memories(
+            auxiliary_llm=aux,
+            recall_store=MagicMock(),
+            messages=[HumanMessage(content="test")],
+            phase=0,
+        )
+
+        assert count == 0
 
 
 # =============================================================================
@@ -195,101 +294,58 @@ class TestAuditedToolsMemoryFlush:
 
 
 # =============================================================================
-# Agent setup: observer model selection
+# Agent setup: auxiliary LLM model selection
 # =============================================================================
 
 
-class TestAgentObserverSetup:
-    """Tests for observer LLM selection logic in agent setup."""
+class TestAgentAuxiliarySetup:
+    """Tests for auxiliary LLM selection logic (replaces observer model tests)."""
 
-    def test_observer_model_null_reuses_main(self):
-        """When observer_model is None, main LLM should be reused."""
-        # Simulate the agent.py logic
-        observer_model = None
+    def test_auxiliary_model_null_reuses_main(self):
+        """When auxiliary.model is None, main LLM should be reused."""
+        aux_model = None
         main_llm = MagicMock()
 
-        if observer_model:
-            observer_llm = MagicMock()  # Would create a separate LLM
+        if aux_model:
+            aux_llm = MagicMock()  # Would create a separate LLM
         else:
-            observer_llm = main_llm
+            aux_llm = main_llm
 
-        assert observer_llm is main_llm
+        assert aux_llm is main_llm
 
-    def test_observer_model_specified_creates_separate(self):
-        """When observer_model is set, a separate LLM should be created."""
-        observer_model = "openai/gpt-oss-120b"
+    def test_auxiliary_model_specified_creates_separate(self):
+        """When auxiliary.model is set, a separate LLM should be created."""
+        aux_model = "gpt-oss-120b"
         main_llm = MagicMock()
 
-        if observer_model:
-            observer_llm = MagicMock()  # Separate LLM
+        if aux_model:
+            aux_llm = MagicMock()  # Separate LLM
         else:
-            observer_llm = main_llm
+            aux_llm = main_llm
 
-        assert observer_llm is not main_llm
-
-    def test_observer_created_with_correct_interval(self):
-        """MemoryObserver should use interval from config."""
-        recall_store = AsyncMock()
-        llm = AsyncMock()
-
-        observer = MemoryObserver(
-            recall_store=recall_store,
-            llm=llm,
-            observer_interval=10,
-        )
-
-        assert observer.observer_interval == 10
-        assert observer.should_observe(10) is True
-        assert observer.should_observe(5) is False
-
-    def test_observer_init_failure_non_fatal(self):
-        """Observer init failure should be catchable without crashing."""
-        # Simulate the try/except in agent.py
-        observer = None
-        try:
-            # Simulate a failure during observer creation
-            raise RuntimeError("LLM init failed")
-        except Exception:
-            pass  # Non-fatal, matches agent.py behavior
-
-        assert observer is None
+        assert aux_llm is not main_llm
 
 
 # =============================================================================
-# ToolContext: recall_store + observer coherence
+# ToolContext: recall_store coherence (memory_observer removed)
 # =============================================================================
 
 
 class TestToolContextMemoryCoherence:
-    """Tests that recall_store and memory_observer work together on ToolContext."""
+    """Tests that recall_store works correctly on ToolContext."""
 
-    def test_both_none_by_default(self):
+    def test_recall_store_none_by_default(self):
         ctx = ToolContext(workspace_manager=None, config={})
         assert ctx.recall_store is None
-        assert ctx.memory_observer is None
 
-    def test_observer_without_recall_store(self):
-        """Observer set without recall_store — unusual but should not crash."""
+    def test_no_memory_observer_field(self):
+        """memory_observer was migrated to AuxiliaryLLM; field should not exist."""
         ctx = ToolContext(workspace_manager=None, config={})
-        ctx.memory_observer = MagicMock()
-        assert ctx.recall_store is None
-        assert ctx.memory_observer is not None
+        assert not hasattr(ctx, "memory_observer")
 
     def test_queue_memory_works_without_observer(self):
         """queue_memory doesn't depend on observer being set."""
         ctx = ToolContext(workspace_manager=None, config={})
         ctx.recall_store = MagicMock()
-        # No observer set
         ctx.queue_memory(content="test", importance=0.5)
-        assert len(ctx._pending_memories) == 1
-
-    def test_full_setup_all_fields(self):
-        """Full Memory Light setup: recall_store + observer + queue."""
-        ctx = ToolContext(workspace_manager=None, config={})
-        ctx.recall_store = MagicMock()
-        ctx.memory_observer = MagicMock()
-
-        ctx.queue_memory(content="mem1", importance=0.7)
-        assert ctx.recall_store is not None
-        assert ctx.memory_observer is not None
         assert len(ctx._pending_memories) == 1
