@@ -99,7 +99,10 @@ You are also a job assistant. When the user asks about their jobs, wants to insp
 - `get_workspace_file` — Read workspace files (workspace.md, plan.md, etc.)
 - `get_workspace_overview` — High-level workspace summary
 - `get_frozen_job` — Get completion summary for pending_review jobs
-- `get_todos` — View current and archived task lists
+- `get_todos` — View current and archived task lists (full)
+- `get_current_todos` — View only active todos (lightweight)
+- `list_todo_archives` — List archived todo files by phase
+- `get_todo_archive` — Read the full content of a specific phase's archived todos
 - `get_chat_history` — View the agent's conversation history
 
 **Git history** (browse a job's versioned workspace):
@@ -117,7 +120,13 @@ You are also a job assistant. When the user asks about their jobs, wants to insp
 - `list_experts` — Available expert/agent configurations
 - `get_expert` — Full detail for an expert config
 - `list_datasources` — Configured datasources (PostgreSQL, Neo4j, MongoDB)
+- `create_datasource` — Create a new datasource (PostgreSQL, Neo4j, or MongoDB)
+- `update_datasource` — Update datasource connection details or metadata
+- `delete_datasource` — Permanently delete a datasource
 - `get_agent_system_info` — Container resource usage (CPU, memory, disk, ports)
+- `get_daily_stats` — Daily job statistics (created/completed/failed/cancelled) for past N days
+- `reload_experts` — Hot-reload expert configs from disk without restart
+- `deregister_agent` — Remove an offline or unneeded agent
 
 **Database inspection:**
 - `list_tables` — Database tables with row counts
@@ -126,9 +135,24 @@ You are also a job assistant. When the user asks about their jobs, wants to insp
 
 **Execution debug:**
 - `get_audit_trail` — Paginated LLM messages, tool calls, and errors
+- `get_audit_timerange` — Quick first/last timestamps for a job's audit entries
 - `get_graph_changes` — Timeline of Neo4j graph mutations
 - `get_llm_request` — Full LLM request/response by MongoDB doc ID
 - `search_audit` — Search audit entries by content pattern
+
+**Knowledge base** (project-scoped, requires project_id):
+- `get_knowledge_summary` — Stats and recent notes for a project's knowledge base
+- `list_knowledge_notes` — Browse notes with type/status/tag/job filters
+- `get_knowledge_note` — Full note content with Neo4j relationships
+- `search_knowledge` — Hybrid search (dense + sparse) over project knowledge
+- `update_knowledge_note` — Change note status (active/resolved/superseded/archived) or tags
+- `delete_knowledge_note` — Permanently delete a note (irreversible)
+- `export_knowledge` — Export as Obsidian-compatible markdown files
+
+**When to use knowledge search vs web search:**
+- Use `search_knowledge` when the user asks about past work, previous findings, project-specific decisions, or accumulated insights. Knowledge search finds notes left by previous jobs within a project.
+- Use `web_search` when the user needs external information — domain best practices, current standards, methodology research, or anything not captured in prior jobs.
+- If both might be relevant (e.g. "what do we know about X?"), try knowledge search first, then supplement with web search if coverage is thin.
 
 **Citation & source library:**
 - `list_job_sources` — Sources registered by a job (documents, websites, databases)
@@ -140,13 +164,30 @@ You are also a job assistant. When the user asks about their jobs, wants to insp
 - `get_source_tags` — Tags assigned to a source
 - `get_citation_stats` — Citation statistics by status, type, and confidence
 
+**Project management:**
+- `list_projects` — List projects, optionally filtered by user
+- `get_project` — Full project details (name, description, goal, config)
+- `create_project` — Create a new project
+- `update_project` — Update project name, description, goal, status, or default config
+- `delete_project` — Permanently delete a project (cannot delete default projects)
+- `list_project_jobs` — List jobs within a project
+- `create_project_job` — Create a job scoped to a project
+- `list_project_members` — List members with roles (owner, editor, viewer)
+- `add_project_member` — Add a user to a project with a role
+- `update_project_member` — Change a member's role
+- `remove_project_member` — Remove a member (cannot remove the last owner)
+- `list_project_experts` — List project-specific expert configurations
+- `get_project_expert` — Get detailed expert config with merged settings and instructions
+
 **Action tools:**
 - `approve_job` — Approve a job pending review (marks as completed)
 - `resume_job_with_feedback` — Resume a failed/frozen job with optional feedback
 - `cancel_job` — Cancel a running job (in-progress work may be lost)
 - `delete_job` — Permanently delete a job (irreversible)
 - `assign_job` — Assign a created job to a ready agent
-- `create_job` / `create_follow_up_job` — Create a new job
+- `create_job` / `create_follow_up_job` — Create a new job (standalone)
+- `create_project_job` — Create a job within a project
+- `promote_job` — Promote a completed job into a dedicated project
 - `test_datasource` — Test connectivity to a datasource
 
 ## Response Style
@@ -163,6 +204,7 @@ def build_system_prompt(
     config_settings: dict | None = None,
     description: str | None = None,
     active_job_id: str | None = None,
+    active_project_id: str | None = None,
 ) -> str:
     """Build the full system prompt with current artifact state.
 
@@ -173,6 +215,7 @@ def build_system_prompt(
         config_settings: Current config override settings
         description: Current job description
         active_job_id: Active job context for inspection tools
+        active_project_id: Active project context for project-scoped tools
 
     Returns:
         Complete system prompt with artifact state
@@ -183,9 +226,16 @@ def build_system_prompt(
 
     # Active job context
     if active_job_id:
-        parts.append(f"### Active Job Context\n")
+        parts.append("### Active Job Context\n")
         parts.append(f"The user has selected job `{active_job_id}` as the active context. ")
-        parts.append(f"Use this job_id by default when they ask to inspect, review, or act on a job.\n\n")
+        parts.append("Use this job_id by default when they ask to inspect, review, or act on a job.\n\n")
+
+    # Active project context
+    if active_project_id:
+        parts.append("### Active Project Context\n")
+        parts.append(f"The user has selected project `{active_project_id}` as the active context. ")
+        parts.append("Use this project_id by default for knowledge base tools, project management, ")
+        parts.append("and project-scoped operations.\n\n")
 
     # Instructions
     parts.append("### Instructions\n")

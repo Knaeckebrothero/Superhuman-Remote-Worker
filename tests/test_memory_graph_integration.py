@@ -141,6 +141,7 @@ class TestExtractAndStoreMemories:
             auxiliary_llm=aux,
             recall_store=recall_store,
             messages=[HumanMessage(content="test")],
+            memory_extraction_prompt="Extract memories.",
             phase=3,
             source_turn_start=0,
             source_turn_end=5,
@@ -163,6 +164,7 @@ class TestExtractAndStoreMemories:
             auxiliary_llm=aux,
             recall_store=MagicMock(),
             messages=[],
+            memory_extraction_prompt="Extract memories.",
             phase=0,
         )
         assert count == 0
@@ -185,6 +187,7 @@ class TestExtractAndStoreMemories:
             auxiliary_llm=aux,
             recall_store=MagicMock(),
             messages=messages,
+            memory_extraction_prompt="Extract memories.",
             phase=0,
         )
 
@@ -219,6 +222,7 @@ class TestExtractAndStoreMemories:
             auxiliary_llm=aux,
             recall_store=recall_store,
             messages=[HumanMessage(content="test")],
+            memory_extraction_prompt="Extract memories.",
             phase=0,
         )
 
@@ -239,6 +243,7 @@ class TestExtractAndStoreMemories:
             auxiliary_llm=aux,
             recall_store=MagicMock(),
             messages=[HumanMessage(content="test")],
+            memory_extraction_prompt="Extract memories.",
             phase=0,
         )
 

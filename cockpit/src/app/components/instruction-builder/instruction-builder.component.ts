@@ -1,4 +1,4 @@
-import { Component, inject, signal, computed, ElementRef, ViewChild, AfterViewChecked } from '@angular/core';
+import { Component, inject, signal, computed, ElementRef, ViewChild, AfterViewChecked, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MarkdownComponent } from 'ngx-markdown';
 import { JobArtifactService, PendingWorkspaceEdit } from '../../core/services/job-artifact.service';
@@ -187,6 +187,13 @@ interface ChatMessage {
         </div>
       }
 
+      @if (isRestoringSession()) {
+        <div class="session-loading">
+          <span class="spinner-small"></span>
+          Restoring conversation...
+        </div>
+      }
+
       <div class="input-area">
         @if (error()) {
           <div class="input-error">
@@ -207,7 +214,7 @@ interface ChatMessage {
             (keydown)="onKeyDown($event)"
             (input)="autoResizeTextarea()"
             placeholder="Describe what the agent should do..."
-            [disabled]="artifacts.streaming() || isCreatingSession()"
+            [disabled]="artifacts.streaming() || isCreatingSession() || isRestoringSession()"
             rows="1"
           ></textarea>
           @if (artifacts.streaming()) {
@@ -1162,7 +1169,7 @@ interface ChatMessage {
     `,
   ],
 })
-export class InstructionBuilderComponent implements AfterViewChecked {
+export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
   readonly artifacts = inject(JobArtifactService);
   private readonly stream = inject(BuilderStreamService);
   private readonly api = inject(ApiService);
@@ -1178,6 +1185,7 @@ export class InstructionBuilderComponent implements AfterViewChecked {
   );
   readonly error = signal<string | null>(null);
   readonly isCreatingSession = signal(false);
+  readonly isRestoringSession = signal(false);
   readonly lastFailedMessage = signal<string | null>(null);
 
   inputText = '';
@@ -1190,11 +1198,40 @@ export class InstructionBuilderComponent implements AfterViewChecked {
     'get_workspace_overview', 'get_frozen_job', 'get_todos', 'get_chat_history',
   ]);
 
+  ngOnInit(): void {
+    const sessionId = this.artifacts.sessionId();
+    if (sessionId && this.messages().length === 0) {
+      this.restoreMessages(sessionId);
+    }
+  }
+
   ngAfterViewChecked(): void {
     if (this.shouldScrollToBottom) {
       this.scrollToBottom();
       this.shouldScrollToBottom = false;
     }
+  }
+
+  /** Restore message history from the server for an existing session. */
+  private restoreMessages(sessionId: string): void {
+    this.isRestoringSession.set(true);
+    this.stream.getMessages(sessionId).subscribe({
+      next: (msgs) => {
+        if (msgs.length > 0) {
+          const restored: ChatMessage[] = msgs.map((m) => ({
+            role: m.role,
+            content: m.content || '(applied changes)',
+            toolCalls: m.tool_calls?.map((tc) => ({ tool: tc.tool, args: tc.args })),
+          }));
+          this.messages.set(restored);
+          this.shouldScrollToBottom = true;
+        }
+        this.isRestoringSession.set(false);
+      },
+      error: () => {
+        this.isRestoringSession.set(false);
+      },
+    });
   }
 
   onKeyDown(event: KeyboardEvent): void {

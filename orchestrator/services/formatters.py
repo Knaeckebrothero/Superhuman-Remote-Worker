@@ -9,7 +9,13 @@ All functions are pure (dict/list in → str out) with no side effects.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+
+def _mask_url(url: str) -> str:
+    """Mask password in a connection URL for safe display."""
+    return re.sub(r"(://[^:]+:)[^@]+(@)", r"\1***\2", url)
 
 
 # =============================================================================
@@ -1113,6 +1119,25 @@ def format_job_stats(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_daily_stats(data: list[dict[str, Any]], days: int) -> str:
+    """Format daily job statistics."""
+    if not data:
+        return f"No job activity in the past {days} day(s)."
+
+    lines = [f"Daily Job Statistics (past {days} days):\n"]
+    for day in data:
+        date = str(day.get("date", "?"))[:10]
+        created = day.get("jobs_created", 0)
+        completed = day.get("jobs_completed", 0)
+        failed = day.get("jobs_failed", 0)
+        cancelled = day.get("jobs_cancelled", 0)
+        lines.append(
+            f"  {date}  created:{created}  completed:{completed}  "
+            f"failed:{failed}  cancelled:{cancelled}"
+        )
+    return "\n".join(lines)
+
+
 def format_agent_stats(data: dict[str, Any]) -> str:
     """Format agent workforce summary."""
     total = data.get("total", 0)
@@ -1730,4 +1755,466 @@ def format_system_info(agent_id: str, data: dict[str, Any]) -> str:
         if len(conns) > 10:
             lines.append(f"  ... and {len(conns) - 10} more")
 
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Todo Archives & Current Todos
+# =============================================================================
+
+
+def format_current_todos(data: dict[str, Any]) -> str:
+    """Format current active todos (lightweight, no archives)."""
+    todos = data.get("todos", [])
+    if not todos:
+        return "No active todos."
+
+    lines = ["Current active todos:\n"]
+    for todo in todos:
+        status_icon = {
+            "pending": "○",
+            "in_progress": "◐",
+            "completed": "●",
+            "skipped": "⊘",
+        }.get(todo.get("status", ""), "?")
+        lines.append(f"  {status_icon} {todo.get('subject', 'Untitled')}")
+        if todo.get("description"):
+            desc = todo["description"][:100]
+            if len(todo["description"]) > 100:
+                desc += "..."
+            lines.append(f"      {desc}")
+
+    # Summary counts
+    total = len(todos)
+    done = sum(1 for t in todos if t.get("status") in ("completed", "skipped"))
+    lines.append(f"\nProgress: {done}/{total} complete")
+    return "\n".join(lines)
+
+
+def format_todo_archives(job_id: str, archives: list[dict[str, Any]]) -> str:
+    """Format list of archived todo files."""
+    if not archives:
+        return f"No archived todos for job {job_id}."
+
+    lines = [f"Archived todo phases for job {job_id} ({len(archives)} archives):\n"]
+    for archive in archives:
+        filename = archive.get("filename", "unknown")
+        phase_name = archive.get("phase_name", "")
+        timestamp = archive.get("timestamp", "")
+        line = f"  - {filename}"
+        if phase_name:
+            line += f"  ({phase_name})"
+        if timestamp:
+            line += f"  [{timestamp}]"
+        lines.append(line)
+
+    lines.append("\nUse get_todo_archive with a filename to read the full content.")
+    return "\n".join(lines)
+
+
+def format_todo_archive_detail(
+    job_id: str, filename: str, data: dict[str, Any],
+) -> str:
+    """Format the content of a single archived todo file."""
+    lines = [f"Archived todos: {filename} (job {job_id})\n"]
+
+    if data.get("phase_name"):
+        lines.append(f"Phase: {data['phase_name']}")
+    if data.get("summary"):
+        lines.append(f"Summary: {data['summary']}")
+
+    lines.append("")
+
+    todos = data.get("todos", [])
+    if todos:
+        for todo in todos:
+            status_icon = {
+                "pending": "○",
+                "in_progress": "◐",
+                "completed": "●",
+                "skipped": "⊘",
+            }.get(todo.get("status", ""), "?")
+            lines.append(f"  {status_icon} {todo.get('subject', 'Untitled')}")
+            if todo.get("notes"):
+                lines.append(f"      Notes: {todo['notes'][:150]}")
+    else:
+        # Fallback: show raw content if structured todos aren't available
+        content = data.get("content", "")
+        if content:
+            lines.append(content[:3000])
+        else:
+            lines.append("(empty archive)")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Knowledge Base
+# =============================================================================
+
+
+def format_knowledge_summary(project_id: str, data: dict[str, Any]) -> str:
+    """Format knowledge base summary statistics."""
+    total = data.get("total", 0)
+    lines = [f"Knowledge base for project {project_id}: {total} notes\n"]
+
+    by_type = data.get("by_type", {})
+    if by_type:
+        lines.append("By type:")
+        for t, count in sorted(by_type.items(), key=lambda x: -x[1]):
+            lines.append(f"  {t}: {count}")
+        lines.append("")
+
+    by_status = data.get("by_status", {})
+    if by_status:
+        lines.append("By status:")
+        for s, count in sorted(by_status.items(), key=lambda x: -x[1]):
+            lines.append(f"  {s}: {count}")
+        lines.append("")
+
+    recent = data.get("recent", [])
+    if recent:
+        lines.append("Recent notes:")
+        for note in recent:
+            title = note.get("title", "Untitled")
+            ntype = note.get("note_type", "")
+            status = note.get("status", "")
+            modified = str(note.get("modified_at", ""))[:19]
+            lines.append(f"  [{ntype}] {title} ({status}) — {modified}")
+
+    if total == 0:
+        lines.append("No knowledge notes found.")
+
+    return "\n".join(lines)
+
+
+def format_knowledge_notes(data: dict[str, Any]) -> str:
+    """Format paginated list of knowledge notes."""
+    notes = data.get("notes", [])
+    total = data.get("total", 0)
+    offset = data.get("offset", 0)
+    limit = data.get("limit", 50)
+
+    if not notes:
+        return "No knowledge notes found matching filters."
+
+    lines = [f"Knowledge notes ({offset + 1}-{offset + len(notes)} of {total}):\n"]
+    for note in notes:
+        note_id = note.get("note_id", "?")
+        title = note.get("title", "Untitled")
+        ntype = note.get("note_type", "")
+        status = note.get("status", "")
+        confidence = note.get("confidence")
+        preview = note.get("content_preview", "")
+
+        header = f"  [{ntype}] {title}"
+        if confidence is not None:
+            header += f" (confidence: {confidence:.0%})"
+        header += f" — {status}"
+        lines.append(header)
+        lines.append(f"    ID: {note_id}")
+
+        tags = note.get("tags") or []
+        if tags:
+            lines.append(f"    Tags: {', '.join(tags)}")
+
+        if preview:
+            preview_text = preview.replace("\n", " ")[:120]
+            if len(preview) > 120:
+                preview_text += "..."
+            lines.append(f"    {preview_text}")
+        lines.append("")
+
+    if total > offset + len(notes):
+        lines.append(f"Use offset={offset + limit} to see more.")
+
+    return "\n".join(lines)
+
+
+def format_knowledge_note_detail(data: dict[str, Any]) -> str:
+    """Format a single knowledge note with full content."""
+    note_id = data.get("note_id", "?")
+    title = data.get("title", "Untitled")
+    ntype = data.get("note_type", "")
+    status = data.get("status", "")
+
+    lines = [f"Knowledge Note: {title}\n"]
+    lines.append(f"ID: {note_id}")
+    lines.append(f"Type: {ntype}")
+    lines.append(f"Status: {status}")
+
+    confidence = data.get("confidence")
+    if confidence is not None:
+        lines.append(f"Confidence: {confidence:.0%}")
+
+    phase = data.get("phase")
+    if phase:
+        lines.append(f"Phase: {phase}")
+
+    job_id = data.get("job_id")
+    if job_id:
+        lines.append(f"Source job: {job_id}")
+
+    tags = data.get("tags") or []
+    if tags:
+        lines.append(f"Tags: {', '.join(tags)}")
+
+    keywords = data.get("keywords") or []
+    if keywords:
+        lines.append(f"Keywords: {', '.join(keywords)}")
+
+    created = str(data.get("created_at", ""))[:19]
+    modified = str(data.get("modified_at", ""))[:19]
+    if created:
+        lines.append(f"Created: {created}")
+    if modified and modified != created:
+        lines.append(f"Modified: {modified}")
+
+    content = data.get("content", "")
+    if content:
+        lines.append(f"\n--- Content ---\n{content}")
+
+    relationships = data.get("relationships", [])
+    if relationships:
+        lines.append(f"\n--- Relationships ({len(relationships)}) ---")
+        for rel in relationships[:20]:
+            rel_type = rel.get("type", "RELATED_TO")
+            target = rel.get("target", {})
+            target_title = target.get("title", target.get("id", "?"))
+            lines.append(f"  —[{rel_type}]→ {target_title}")
+        if len(relationships) > 20:
+            lines.append(f"  ... and {len(relationships) - 20} more")
+
+    return "\n".join(lines)
+
+
+def format_knowledge_search(data: dict[str, Any]) -> str:
+    """Format knowledge base search results."""
+    notes = data.get("notes", [])
+    query = data.get("query", "")
+    total = data.get("total", len(notes))
+
+    if not notes:
+        return f"No knowledge notes found matching '{query}'."
+
+    lines = [f"Knowledge search results for '{query}' ({total} matches):\n"]
+    for i, note in enumerate(notes, 1):
+        note_id = note.get("note_id", "?")
+        title = note.get("title", "Untitled")
+        ntype = note.get("note_type", "")
+        status = note.get("status", "")
+        score = note.get("score") or note.get("rank")
+
+        header = f"  {i}. [{ntype}] {title} ({status})"
+        if score is not None:
+            header += f" — score: {score:.3f}"
+        lines.append(header)
+        lines.append(f"     ID: {note_id}")
+
+        content = note.get("content", "")
+        if content:
+            preview = content.replace("\n", " ")[:150]
+            if len(content) > 150:
+                preview += "..."
+            lines.append(f"     {preview}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Projects
+# =============================================================================
+
+
+def format_projects(projects: list[dict[str, Any]]) -> str:
+    """Format project list for display."""
+    if not projects:
+        return "No projects found."
+
+    lines = [f"Found {len(projects)} project(s):\n"]
+    for project in projects:
+        pid = project.get("id", "?")
+        name = project.get("name", "Untitled")
+        status = project.get("status", "active")
+        goal = project.get("goal", "")
+        updated = str(project.get("updated_at", ""))[:19]
+
+        lines.append(f"  {name} ({status})")
+        lines.append(f"    ID: {pid}")
+        if goal:
+            goal_preview = goal[:120]
+            if len(goal) > 120:
+                goal_preview += "..."
+            lines.append(f"    Goal: {goal_preview}")
+        if updated:
+            lines.append(f"    Updated: {updated}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_project_detail(project: dict[str, Any]) -> str:
+    """Format single project details."""
+    lines = [
+        f"Project: {project.get('name', 'Untitled')}",
+        f"ID: {project.get('id', '?')}",
+        f"Status: {project.get('status', 'active')}",
+        f"Created: {str(project.get('created_at', 'N/A'))[:19]}",
+        f"Updated: {str(project.get('updated_at', 'N/A'))[:19]}",
+    ]
+
+    if project.get("description"):
+        desc = project["description"]
+        if len(desc) > 500:
+            desc = desc[:500] + "..."
+        lines.append(f"\nDescription:\n{desc}")
+
+    if project.get("goal"):
+        goal = project["goal"]
+        if len(goal) > 500:
+            goal = goal[:500] + "..."
+        lines.append(f"\nGoal:\n{goal}")
+
+    if project.get("default_config_name"):
+        lines.append(f"\nDefault config: {project['default_config_name']}")
+
+    return "\n".join(lines)
+
+
+def format_created_project(result: dict[str, Any]) -> str:
+    """Format the result of creating a new project."""
+    pid = result.get("id", "unknown")
+    lines = [
+        "Project created successfully.",
+        f"Project ID: {pid}",
+        f"Name: {result.get('name', 'Untitled')}",
+        f"Status: {result.get('status', 'active')}",
+    ]
+
+    if result.get("description"):
+        desc = result["description"]
+        if len(desc) > 200:
+            desc = desc[:200] + "..."
+        lines.append(f"Description: {desc}")
+
+    lines.append(
+        "\nNext step: Use create_project_job(project_id, ...) to create jobs within this project."
+    )
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Project Members & Experts
+# =============================================================================
+
+
+def format_project_members(
+    project_id: str, members: list[dict[str, Any]]
+) -> str:
+    """Format project member list."""
+    if not members:
+        return f"No members found for project {project_id}."
+
+    lines = [f"Project {project_id} — {len(members)} member(s):\n"]
+    for m in members:
+        role = m.get("role", "unknown")
+        role_icon = {"owner": "👑", "editor": "✏️", "viewer": "👁"}.get(role, "❓")
+        name = m.get("display_name") or m.get("user_id", "?")
+        email = m.get("email", "")
+        email_part = f" ({email})" if email else ""
+        lines.append(f"  {role_icon} {name}{email_part} — {role}")
+        if m.get("added_at"):
+            lines.append(f"     Added: {str(m['added_at'])[:19]}")
+    return "\n".join(lines)
+
+
+def format_project_experts(
+    project_id: str, experts: list[dict[str, Any]]
+) -> str:
+    """Format project-specific expert list."""
+    if not experts:
+        return f"No project-specific experts found for project {project_id}."
+
+    lines = [f"Project {project_id} — {len(experts)} expert(s):\n"]
+    for e in experts:
+        icon = e.get("icon", "🧠")
+        name = e.get("display_name", e.get("id", "?"))
+        eid = e.get("id", "?")
+        desc = e.get("description", "")
+        if len(desc) > 120:
+            desc = desc[:120] + "..."
+        lines.append(f"  {icon} {name} ({eid})")
+        if desc:
+            lines.append(f"     {desc}")
+        tags = e.get("tags", [])
+        if tags:
+            lines.append(f"     Tags: {', '.join(tags)}")
+    return "\n".join(lines)
+
+
+def format_project_expert_detail(
+    project_id: str, data: dict[str, Any]
+) -> str:
+    """Format detailed project expert configuration."""
+    eid = data.get("id", "?")
+    lines = [
+        f"Expert: {data.get('display_name', eid)}",
+        f"ID: {eid}",
+        f"Project: {project_id}",
+        f"Icon: {data.get('icon', '🧠')}",
+        f"Color: {data.get('color', '#cba6f7')}",
+    ]
+
+    tags = data.get("tags", [])
+    if tags:
+        lines.append(f"Tags: {', '.join(tags)}")
+
+    desc = data.get("description", "")
+    if desc:
+        if len(desc) > 500:
+            desc = desc[:500] + "..."
+        lines.append(f"\nDescription:\n{desc}")
+
+    config = data.get("config")
+    if config:
+        lines.append(f"\nConfig:\n```json\n{json.dumps(config, indent=2)}\n```")
+
+    instructions = data.get("instructions")
+    if instructions:
+        if len(instructions) > 1000:
+            instructions = instructions[:1000] + "\n... (truncated)"
+        lines.append(f"\nInstructions:\n{instructions}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# Datasource CRUD
+# =============================================================================
+
+
+def format_created_datasource(result: dict[str, Any]) -> str:
+    """Format the result of creating a datasource, masking the connection URL."""
+    ds_id = str(result.get("id", "unknown"))
+    name = result.get("name", "unknown")
+    ds_type = result.get("type", "unknown")
+    read_only = result.get("read_only", True)
+    url = result.get("connection_url", "")
+    job_id = result.get("job_id")
+    scope = f"job-scoped ({job_id})" if job_id else "global"
+
+    lines = [
+        "Datasource created successfully.",
+        f"ID: {ds_id}",
+        f"Name: {name}",
+        f"Type: {ds_type}",
+        f"Scope: {scope}",
+        f"Read-only: {read_only}",
+        f"URL: {_mask_url(url)}",
+    ]
+
+    lines.append(
+        "\nUse test_datasource(datasource_id) to verify connectivity."
+    )
     return "\n".join(lines)

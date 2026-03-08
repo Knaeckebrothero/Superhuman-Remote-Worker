@@ -870,6 +870,7 @@ class BuilderMessageRequest(BaseModel):
     config: dict[str, Any] | None = Field(None, description="Current config override")
     description: str | None = Field(None, description="Current job description")
     active_job_id: str | None = Field(None, description="Active job context for inspection tools")
+    active_project_id: str | None = Field(None, description="Active project context for project-scoped tools")
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -5917,6 +5918,7 @@ async def send_builder_message(
         config_settings=body.config,
         description=body.description,
         active_job_id=body.active_job_id,
+        active_project_id=body.active_project_id,
     )
 
     # Build conversation context (with potential summarization)

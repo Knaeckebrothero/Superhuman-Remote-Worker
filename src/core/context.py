@@ -1010,7 +1010,7 @@ class ContextManager:
 
         task = SummarizeTask(
             conversation_text=conversation_text,
-            summarization_prompt=summarization_prompt,
+            summarization_prompt=summarization_prompt or "",
             max_summary_length=max_summary_length,
         )
 

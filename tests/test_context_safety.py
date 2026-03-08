@@ -408,7 +408,7 @@ class TestSinglePassSummarize:
         result = await context_manager._single_pass_summarize(
             conversation_text="User: Hello\nAssistant: Hi",
             auxiliary=mock_llm,
-            summarization_prompt=None,
+            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
 
             max_summary_length=10000,
         )
@@ -450,7 +450,7 @@ class TestSinglePassSummarize:
         result = await context_manager._single_pass_summarize(
             conversation_text="test",
             auxiliary=aux,
-            summarization_prompt=None,
+            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
 
             max_summary_length=10000,
         )
@@ -475,7 +475,7 @@ class TestRecursiveSummarize:
         result = await context_manager._recursive_summarize(
             formatted_parts=parts,
             auxiliary=mock_llm,
-            summarization_prompt=None,
+            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
 
             max_summary_length=5000,
         )
@@ -494,7 +494,7 @@ class TestRecursiveSummarize:
         result = await context_manager._recursive_summarize(
             formatted_parts=parts,
             auxiliary=mock_llm,
-            summarization_prompt=None,
+            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
 
             max_summary_length=1000,
         )
@@ -509,7 +509,7 @@ class TestRecursiveSummarize:
         result = await context_manager._recursive_summarize(
             formatted_parts=parts,
             auxiliary=mock_llm,
-            summarization_prompt=None,
+            summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
 
             max_summary_length=10000,
         )

@@ -124,52 +124,21 @@ class AuxAgentTask(AuxTask):
 # =============================================================================
 
 
-MEMORY_EXTRACTION_PROMPT = """\
-You are a memory extraction system. Given a segment of agent conversation, \
-extract noteworthy information that would be useful in future turns.
-
-For each memory, provide:
-- content: The insight (1-3 sentences, self-contained, no references to "the conversation")
-- summary: One-line summary (under 100 chars)
-- keywords: Relevant terms for search (3-8 keywords)
-- importance: How useful is this for future work? (0.0-1.0)
-- type: One of: factual, procedural, error_solution, vocabulary, relational
-
-Type definitions:
-- factual: A discovered fact about the codebase, data, or domain
-- procedural: A process, pattern, or sequence that works (or doesn't)
-- error_solution: A problem encountered and how it was resolved
-- vocabulary: Domain-specific terminology or naming conventions
-- relational: How things connect (A depends on B, X requires Y)
-
-Focus on:
-- Decisions made and why
-- Facts discovered about the codebase/data/domain
-- Mistakes made and corrections applied
-- Patterns that worked or failed
-- Constraints and requirements discovered
-
-Do NOT extract:
-- Routine tool calls with no insight
-- Repetitive information already captured
-- Raw data or file contents (summarize instead)
-
-If nothing noteworthy, return an empty memories list."""
-
-
 class ExtractMemoriesTask(AuxTask):
     """Extract memories from a conversation segment.
 
     Chain mode task that replaces MemoryObserver.extract_memories().
+    Prompt loaded from config/prompts/ via the prompt matrix.
     """
 
-    def __init__(self, messages: List[BaseMessage], phase: int = 0):
+    def __init__(self, messages: List[BaseMessage], prompt: str, phase: int = 0):
         self.messages = messages
+        self._prompt = prompt
         self.phase = phase
 
     @property
     def system_prompt(self) -> str:
-        return MEMORY_EXTRACTION_PROMPT
+        return self._prompt
 
     def build_context(self) -> str:
         return _format_messages_for_extraction(self.messages)
@@ -179,39 +148,12 @@ class ExtractMemoriesTask(AuxTask):
         return ExtractedMemories
 
 
-# Default summarization prompt used when no template is provided
-_DEFAULT_SUMMARIZATION_PROMPT = """\
-You are compressing a conversation for handoff to your future self. After this summary,
-the raw history will be gone — this summary is the ONLY context you will have to continue working.
-
-EXCLUSIONS: Do NOT summarize the content of workspace.md or plan.md.
-These files are persistent and will be re-injected. Only note ACTIONS TAKEN
-on these files (e.g., "Updated workspace.md with new blockers").
-
-Preservation priority (when space is limited):
-  User corrections and constraints > Errors and failed approaches > Active work > Completed work
-
-What to preserve (critical):
-- Completed work: what was actually done, not what was planned
-- Key decisions: choices made and WHY (the reasoning matters)
-- Discovered information: entity IDs, file paths, version numbers, exact error messages
-- Current state: where the agent is in the plan, what comes next
-- Errors and blockers: exact error text, what was tried, what is still blocked
-- Failed approaches: what did NOT work, so the agent does not retry
-
-What to omit:
-- Routine tool calls that succeeded without notable results
-- Verbose outputs saved in files (just reference the file path)
-- Debugging back-and-forth that led to a solution (just note the solution)
-- Planning discussions captured in the plan file
-- Pleasantries, acknowledgments, filler"""
-
-
 class SummarizeTask(AuxTask):
     """Summarize a conversation segment into structured fields.
 
     Chain mode task that replaces the inline LLM call in
     ContextManager._single_pass_summarize().
+    Prompt loaded from config/prompts/ via the prompt matrix.
 
     The output schema is ConversationSummary from src/core/context.py.
     """
@@ -219,7 +161,7 @@ class SummarizeTask(AuxTask):
     def __init__(
         self,
         conversation_text: str,
-        summarization_prompt: Optional[str] = None,
+        summarization_prompt: str,
         max_summary_length: int = 10000,
     ):
         self.conversation_text = conversation_text
@@ -228,23 +170,21 @@ class SummarizeTask(AuxTask):
 
     @property
     def system_prompt(self) -> str:
-        if self._summarization_prompt:
-            # The template has {conversation} and {max_summary_length} placeholders.
-            # Strip the conversation placeholder — it goes in build_context().
-            # Render max_summary_length into the instructions.
-            from collections import defaultdict
+        # The template has {conversation} and {max_summary_length} placeholders.
+        # Strip the conversation placeholder — it goes in build_context().
+        # Render max_summary_length into the instructions.
+        from collections import defaultdict
 
-            rendered = self._summarization_prompt.format_map(
-                defaultdict(
-                    str,
-                    conversation="",  # Will be sent as HumanMessage
-                    max_summary_length=str(self.max_summary_length),
-                )
+        rendered = self._summarization_prompt.format_map(
+            defaultdict(
+                str,
+                conversation="",  # Will be sent as HumanMessage
+                max_summary_length=str(self.max_summary_length),
             )
-            # Clean up the empty "Conversation:" section left by the placeholder
-            rendered = rendered.replace("\nConversation:\n\n\n", "\n")
-            return rendered.strip()
-        return _DEFAULT_SUMMARIZATION_PROMPT
+        )
+        # Clean up the empty "Conversation:" section left by the placeholder
+        rendered = rendered.replace("\nConversation:\n\n\n", "\n")
+        return rendered.strip()
 
     def build_context(self) -> str:
         return (
@@ -262,69 +202,11 @@ class SummarizeTask(AuxTask):
         return ConversationSummary
 
 
-CURATION_SYSTEM_PROMPT = """\
-You are the knowledge curator for a project. Your job is to read an agent's \
-work artifacts and extract structured, reusable knowledge notes into the \
-project knowledge base. You do NOT do the work yourself — you read what was \
-done and distill it into knowledge that future jobs can use.
-
-## What You Extract
-
-Every job produces knowledge. Find it and write it as typed notes:
-
-| Note Type | What to Look For |
-|-----------|-----------------|
-| decision | Architecture choices, technology picks, trade-off analysis |
-| learning | What worked, what didn't, debugging insights, error-solution pairs |
-| code | Key patterns, conventions, API designs, module responsibilities |
-| goal | Project objectives, success criteria, definition of done |
-| plan | Roadmap items, milestones, priorities |
-| state | Current project status, what's done/in-progress/blocked |
-| question | Open items, unresolved decisions, things to investigate |
-| source | Documents, URLs, conversations that informed decisions |
-| retrospective | Phase reviews, what went well vs. poorly |
-
-## Editorial Judgment
-
-DO extract:
-- Decisions with reasoning (even small ones)
-- Error-solution pairs (debugging gold for future jobs)
-- Architecture patterns and conventions
-- Things that didn't work and why
-- Open questions and uncertainties
-
-DO NOT extract:
-- Implementation details obvious from reading code
-- Temporary state only relevant to this job's execution
-- Redundant information already in the knowledge base (check with kb_search first)
-- Trivial observations ("we created a file called X")
-
-## Retrieval Messages
-
-For every note you write, generate 2-4 retrieval messages — synthetic queries \
-describing when this note should surface. Think: "What question would someone \
-ask when they need this knowledge?"
-
-## Linking
-
-Use the links parameter on kb_write to create relationships between notes. \
-Always search for related existing notes with kb_search before writing. \
-Link types: REFERENCES, DERIVED_FROM, SUPPORTS, CONTRADICTS, ANSWERS, \
-DEPENDS_ON, SUPERSEDES, IMPLEMENTS.
-
-## Confidence
-
-- high: explicit decision with documented reasoning, verified result
-- medium: reasonable inference, partially verified
-- low: uncertain, limited evidence, needs verification
-
-When you are done curating, report how many notes you created and updated."""
-
-
 class CurateKnowledgeTask(AuxAgentTask):
     """Extract knowledge notes from phase artifacts.
 
     Agent mode task that replaces the curator subjob.
+    Prompt loaded from config/prompts/ via the prompt matrix.
     Uses kb_search, kb_write, kb_update, kb_read tools.
     """
 
@@ -335,16 +217,18 @@ class CurateKnowledgeTask(AuxAgentTask):
         plan_md: str,
         existing_notes: List[str],
         kb_tools: list,
+        prompt: str,
     ):
         self.phase_data = phase_data
         self.workspace_md = workspace_md
         self.plan_md = plan_md
         self.existing_notes = existing_notes
         self._kb_tools = kb_tools
+        self._prompt = prompt
 
     @property
     def system_prompt(self) -> str:
-        return CURATION_SYSTEM_PROMPT
+        return self._prompt
 
     def build_context(self) -> str:
         parts = [
@@ -522,6 +406,7 @@ async def extract_and_store_memories(
     auxiliary_llm: "AuxiliaryLLM",
     recall_store,
     messages: List[BaseMessage],
+    memory_extraction_prompt: str,
     phase: int = 0,
     source_turn_start: Optional[int] = None,
     source_turn_end: Optional[int] = None,
@@ -535,6 +420,7 @@ async def extract_and_store_memories(
         auxiliary_llm: AuxiliaryLLM instance for extraction
         recall_store: RecallStore instance for storage
         messages: Conversation messages to extract from
+        memory_extraction_prompt: System prompt for memory extraction
         phase: Current phase number
         source_turn_start: Start turn for windowed extraction (optional)
         source_turn_end: End turn for windowed extraction (optional)
@@ -550,7 +436,7 @@ async def extract_and_store_memories(
         if not messages:
             return 0
 
-        task = ExtractMemoriesTask(messages=messages, phase=phase)
+        task = ExtractMemoriesTask(messages=messages, prompt=memory_extraction_prompt, phase=phase)
         result = await auxiliary_llm.chain(task)
 
         stored_count = 0
@@ -589,6 +475,7 @@ async def curate_and_store_knowledge(
     phase_data: str,
     workspace_md: str,
     plan_md: str,
+    curation_prompt: str,
 ) -> Optional["CurationResult"]:
     """Run inline knowledge curation via AuxiliaryLLM agent mode.
 
@@ -601,6 +488,7 @@ async def curate_and_store_knowledge(
         phase_data: Formatted phase context (archive path, completed todos)
         workspace_md: Current workspace.md content
         plan_md: Current plan.md content
+        curation_prompt: System prompt for knowledge curation
 
     Returns:
         CurationResult on success, None on failure or if KB not available
@@ -634,6 +522,7 @@ async def curate_and_store_knowledge(
             plan_md=plan_md,
             existing_notes=existing_notes,
             kb_tools=kb_tools,
+            prompt=curation_prompt,
         )
 
         result = await auxiliary_llm.agent(task)
