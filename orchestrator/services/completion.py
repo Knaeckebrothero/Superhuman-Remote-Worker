@@ -44,54 +44,67 @@ def _parse_resolved_config(job: dict[str, Any]) -> dict[str, Any]:
     return rc if isinstance(rc, dict) else {}
 
 
-def get_verification_config(job: dict[str, Any]) -> dict[str, Any]:
-    """Extract verification config from resolved_config.
+def _get_subjob_config(job: dict[str, Any], key: str) -> dict[str, Any]:
+    """Extract a subjob config section (verification/curator/scholar) from resolved_config.
 
-    Checks ``resolved_config.agent.verification`` first (standard path after
-    ``serialize_resolved_config`` flattens ``extra`` into the agent dict),
-    then falls back to ``resolved_config.verification`` (direct path).
+    Resolution order:
+    1. ``resolved_config.agent.{key}`` — standard path after flatten
+    2. ``resolved_config.agent.extra.{key}`` — fallback if extra wasn't flattened
+    3. ``resolved_config.{key}`` — direct top-level path
     """
     rc = _parse_resolved_config(job)
 
-    # Primary path: resolved_config -> agent -> verification
     agent_block = rc.get("agent")
     if isinstance(agent_block, dict):
-        vc = agent_block.get("verification")
-        if isinstance(vc, dict):
-            return vc
+        # Primary: flattened into agent dict
+        val = agent_block.get(key)
+        if isinstance(val, dict):
+            return val
+        # Fallback: still nested in extra
+        extra = agent_block.get("extra")
+        if isinstance(extra, dict):
+            val = extra.get(key)
+            if isinstance(val, dict):
+                return val
 
-    # Fallback: top-level verification key
-    vc = rc.get("verification")
-    if isinstance(vc, dict):
-        return vc
+    # Top-level fallback
+    val = rc.get(key)
+    if isinstance(val, dict):
+        return val
 
     return {}
+
+
+def get_verification_config(job: dict[str, Any]) -> dict[str, Any]:
+    """Extract verification config from resolved_config."""
+    return _get_subjob_config(job, "verification")
 
 
 def is_verification_enabled(job: dict[str, Any]) -> bool:
-    """Check if verification is enabled for a job."""
-    return bool(get_verification_config(job).get("enabled", False))
+    """Check if verification is enabled for a job.
+
+    Falls back to reading from disk if resolved_config is NULL.
+    """
+    cfg = get_verification_config(job)
+    if cfg:
+        return bool(cfg.get("enabled", False))
+    # Disk fallback when resolved_config is missing
+    config_name = job.get("config_name", "default")
+    config_override = job.get("config_override")
+    if isinstance(config_override, str):
+        try:
+            config_override = json.loads(config_override)
+        except (json.JSONDecodeError, ValueError):
+            config_override = None
+    return bool(
+        _resolve_config_section_from_disk("verification", config_name, config_override)
+        .get("enabled", False)
+    )
 
 
 def get_curation_config(job: dict[str, Any]) -> dict[str, Any]:
-    """Extract curation config from resolved_config.
-
-    Same resolution pattern as ``get_verification_config`` but for the
-    ``curator`` key.
-    """
-    rc = _parse_resolved_config(job)
-
-    agent_block = rc.get("agent")
-    if isinstance(agent_block, dict):
-        cc = agent_block.get("curator")
-        if isinstance(cc, dict):
-            return cc
-
-    cc = rc.get("curator")
-    if isinstance(cc, dict):
-        return cc
-
-    return {}
+    """Extract curation config from resolved_config."""
+    return _get_subjob_config(job, "curator")
 
 
 def is_curation_enabled(job: dict[str, Any]) -> bool:
@@ -100,24 +113,8 @@ def is_curation_enabled(job: dict[str, Any]) -> bool:
 
 
 def get_scholar_config(job: dict[str, Any]) -> dict[str, Any]:
-    """Extract scholar config from resolved_config.
-
-    Same resolution pattern as ``get_verification_config`` but for the
-    ``scholar`` key.
-    """
-    rc = _parse_resolved_config(job)
-
-    agent_block = rc.get("agent")
-    if isinstance(agent_block, dict):
-        sc = agent_block.get("scholar")
-        if isinstance(sc, dict):
-            return sc
-
-    sc = rc.get("scholar")
-    if isinstance(sc, dict):
-        return sc
-
-    return {}
+    """Extract scholar config from resolved_config."""
+    return _get_subjob_config(job, "scholar")
 
 
 def is_scholar_enabled(job: dict[str, Any]) -> bool:
@@ -129,23 +126,23 @@ def is_scholar_enabled(job: dict[str, Any]) -> bool:
 # Disk-based config readers (for creation-time decisions)
 # ---------------------------------------------------------------------------
 
-def resolve_scholar_config_from_disk(
+def _resolve_config_section_from_disk(
+    section: str,
     config_name: str,
     config_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Lightweight YAML reader for scholar config at job creation time.
+    """Lightweight YAML reader for a config section at creation/completion time.
 
-    At creation time ``resolved_config`` is NULL, so we cannot use the
-    JSONB helpers.  Instead we read just the ``scholar`` section from:
+    Reads just the ``section`` key from:
 
     1. ``config/defaults.yaml`` (base defaults)
     2. ``config/experts/{config_name}/config.yaml`` or
        ``config/{config_name}.yaml`` (expert override)
-    3. ``config_override["scholar"]`` (per-job override)
+    3. ``config_override[section]`` (per-job override)
 
     This avoids importing the full config loader machinery.
     """
-    scholar: dict[str, Any] = {}
+    result: dict[str, Any] = {}
 
     # 1. Read defaults
     defaults_path = _REPO_ROOT / "config" / "defaults.yaml"
@@ -153,10 +150,10 @@ def resolve_scholar_config_from_disk(
         try:
             with open(defaults_path, encoding="utf-8") as f:
                 defaults = yaml.safe_load(f) or {}
-            if isinstance(defaults.get("scholar"), dict):
-                scholar.update(defaults["scholar"])
+            if isinstance(defaults.get(section), dict):
+                result.update(defaults[section])
         except Exception as e:
-            logger.warning("Failed to read defaults.yaml for scholar config: %s", e)
+            logger.warning("Failed to read defaults.yaml for %s config: %s", section, e)
 
     # 2. Read expert config (overrides defaults)
     expert_paths = [
@@ -168,17 +165,25 @@ def resolve_scholar_config_from_disk(
             try:
                 with open(path, encoding="utf-8") as f:
                     expert = yaml.safe_load(f) or {}
-                if isinstance(expert.get("scholar"), dict):
-                    scholar.update(expert["scholar"])
+                if isinstance(expert.get(section), dict):
+                    result.update(expert[section])
             except Exception as e:
-                logger.warning("Failed to read %s for scholar config: %s", path, e)
+                logger.warning("Failed to read %s for %s config: %s", path, section, e)
             break
 
     # 3. Apply per-job config_override
-    if config_override and isinstance(config_override.get("scholar"), dict):
-        scholar.update(config_override["scholar"])
+    if config_override and isinstance(config_override.get(section), dict):
+        result.update(config_override[section])
 
-    return scholar
+    return result
+
+
+def resolve_scholar_config_from_disk(
+    config_name: str,
+    config_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Lightweight YAML reader for scholar config at job creation time."""
+    return _resolve_config_section_from_disk("scholar", config_name, config_override)
 
 
 def get_autonomy_level(job: dict[str, Any]) -> str:
@@ -265,8 +270,21 @@ def determine_job_status(
         )
         return (None, None)
 
+    # Check if this is a job completion.
+    # freeze_data may come from the DB (job dict) or from the request (result).
+    is_completion = goal_achieved or is_job_completion_freeze(job)
+    if not is_completion:
+        # Check freeze_data sent in the result (backfill from request body)
+        fd = result.get("freeze_data")
+        if isinstance(fd, dict):
+            ft = fd.get("freeze_type")
+            is_completion = (
+                ft == "job_complete"
+                or fd.get("status") == "job_completed"
+            )
+
     # Job completion (any autonomy level)
-    if goal_achieved or is_job_completion_freeze(job):
+    if is_completion:
         if is_verification_enabled(job):
             return ("reviewing", None)
         elif goal_achieved:

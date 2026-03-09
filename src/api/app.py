@@ -729,7 +729,15 @@ async def _handle_critic_verdict(job_id: str, result: Dict[str, Any]) -> None:
             job_id,
         )
         if not row or not row.get("parent_job_id"):
-            return  # Not a critic job
+            return  # Not a subjob
+
+        # Skip scholar jobs — they are not critics
+        ctx = row.get("context")
+        if ctx:
+            ctx_dict = _json.loads(ctx) if isinstance(ctx, str) else ctx
+            if isinstance(ctx_dict, dict) and ctx_dict.get("scholar_target"):
+                logger.debug(f"Job {job_id} is a scholar — skipping critic verdict handling")
+                return
 
         target_job_id = str(row["parent_job_id"])
 

@@ -78,13 +78,12 @@ echo "Detected GPU architecture: ${GPU_ARCH}"
 # Auto-configure attention backend and KV cache based on GPU
 # gpt-oss models require attention sinks, which have different support per GPU:
 #   - Hopper (H100/H200): FlashAttention 3 supports sinks
-#   - Ampere (A100): Requires TRITON_ATTN_VLLM_V1 backend (vLLM #22290)
+#   - Ampere (A100): Requires TRITON_ATTN backend (vLLM #22290)
 #   - Ada (L40S): Limited support, use Triton backend
 #
-# FP8 KV cache is incompatible with sinks on most backends:
-#   - FlashAttention falls back to XFormers when FP8 KV is enabled
-#   - XFormers doesn't support sinks -> crash
-#   - Solution: Disable FP8 KV cache on Ampere, use auto elsewhere
+# FP8 KV cache + sinks crash was fixed in v0.14.1 (PR #23613), but we default
+# to bfloat16 KV cache to avoid quantization artifacts that cause Harmony parser
+# state desynchronization (see prefix cache corruption investigation).
 
 # Check if user explicitly wants to override backend (via VLLM_ATTENTION_BACKEND_OVERRIDE)
 USER_BACKEND_OVERRIDE="${VLLM_ATTENTION_BACKEND_OVERRIDE:-}"
@@ -96,15 +95,12 @@ case "${GPU_ARCH}" in
             export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
             echo "Note: Using user-specified backend ${USER_BACKEND_OVERRIDE} for Ampere GPU (WARNING: may crash)"
         else
-            export VLLM_ATTENTION_BACKEND="TRITON_ATTN_VLLM_V1"
-            echo "Note: Using TRITON_ATTN_VLLM_V1 backend for Ampere GPU (required for gpt-oss sinks)"
+            export VLLM_ATTENTION_BACKEND="TRITON_ATTN"
+            echo "Note: Using TRITON_ATTN backend for Ampere GPU (required for gpt-oss sinks)"
         fi
-        # Force auto KV cache - FP8 causes XFormers fallback which doesn't support sinks
-        if [ "${KV_CACHE_DTYPE}" = "fp8" ]; then
-            echo "Warning: FP8 KV cache not supported on Ampere with gpt-oss (sinks incompatible)"
-            echo "         Overriding KV_CACHE_DTYPE to 'auto'"
-            export KV_CACHE_DTYPE="auto"
-        fi
+        # TRITON_ATTN doesn't support explicit kv_cache_dtype - must use auto
+        KV_CACHE_DTYPE="auto"
+        echo "Note: Forcing KV cache dtype to 'auto' (TRITON_ATTN limitation)"
         ;;
     "ada")
         # Ada REQUIRES TRITON_ATTN - FlashAttention doesn't support sinks on sm_89
@@ -112,14 +108,12 @@ case "${GPU_ARCH}" in
             export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
             echo "Note: Using user-specified backend ${USER_BACKEND_OVERRIDE} for Ada GPU (WARNING: may crash)"
         else
-            export VLLM_ATTENTION_BACKEND="TRITON_ATTN_VLLM_V1"
-            echo "Note: Using TRITON_ATTN_VLLM_V1 backend for Ada GPU (required for gpt-oss sinks)"
+            export VLLM_ATTENTION_BACKEND="TRITON_ATTN"
+            echo "Note: Using TRITON_ATTN backend for Ada GPU (required for gpt-oss sinks)"
         fi
-        if [ "${KV_CACHE_DTYPE}" = "fp8" ]; then
-            echo "Warning: FP8 KV cache not supported on Ada with gpt-oss (sinks incompatible)"
-            echo "         Overriding KV_CACHE_DTYPE to 'auto'"
-            export KV_CACHE_DTYPE="auto"
-        fi
+        # TRITON_ATTN doesn't support explicit kv_cache_dtype - must use auto
+        KV_CACHE_DTYPE="auto"
+        echo "Note: Forcing KV cache dtype to 'auto' (TRITON_ATTN limitation)"
         ;;
     "hopper")
         # Hopper supports FlashAttention 3 with sinks
@@ -144,9 +138,11 @@ case "${GPU_ARCH}" in
         if [ -n "${USER_BACKEND_OVERRIDE}" ]; then
             export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
         else
-            export VLLM_ATTENTION_BACKEND="TRITON_ATTN_VLLM_V1"
+            export VLLM_ATTENTION_BACKEND="TRITON_ATTN"
         fi
-        echo "Warning: Unknown GPU architecture, using ${VLLM_ATTENTION_BACKEND} backend"
+        # TRITON_ATTN doesn't support explicit kv_cache_dtype - must use auto
+        KV_CACHE_DTYPE="auto"
+        echo "Warning: Unknown GPU architecture, using ${VLLM_ATTENTION_BACKEND} backend (KV cache: auto)"
         ;;
 esac
 
@@ -165,10 +161,11 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 
 # Quantization and KV cache
 # - "auto" for quantization lets vLLM use model's native MXFP4
-# - "auto" for KV cache dtype - FP8 is incompatible with gpt-oss attention sinks
-#   on most backends (only works on Hopper with FlashAttention 3 in newer vLLM)
+# - "bfloat16" for KV cache dtype to avoid FP8 quantization artifacts that cause
+#   Harmony parser desync and token leakage (see "vLLM Prefix Cache Corruption Issue.pdf")
+#   FP8 KV cache on Hopper GPUs was "exceptionally bad" for accuracy per research.
 QUANTIZATION="${QUANTIZATION:-auto}"
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
 
 # Batching settings - conservative for agent workloads (sequential requests)
 # Lower MAX_NUM_BATCHED_TOKENS = better inter-token latency (ITL)
@@ -177,8 +174,8 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 
 # Performance flags
-# Note: ASYNC_SCHEDULING disabled by default - causes gibberish in vLLM v0.11.0
-# Safe to enable on v0.10.2, but test thoroughly before production use
+# Note: ASYNC_SCHEDULING had bugs in v0.11.0 causing gibberish output.
+# May be fixed in v0.14.1 but kept disabled until verified.
 ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-false}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
 # IMPORTANT: Chunked prefill is INCOMPATIBLE with prefix caching
@@ -222,7 +219,7 @@ if [ "${QUANTIZATION}" != "auto" ] && [ -n "${QUANTIZATION}" ]; then
     CMD="${CMD} --quantization ${QUANTIZATION}"
 fi
 
-if [ "${KV_CACHE_DTYPE}" != "auto" ] && [ -n "${KV_CACHE_DTYPE}" ]; then
+if [ -n "${KV_CACHE_DTYPE}" ]; then
     CMD="${CMD} --kv-cache-dtype ${KV_CACHE_DTYPE}"
     # Enable KV scale calculation for fp8 KV cache (ensures proper scaling)
     if [ "${KV_CACHE_DTYPE}" = "fp8" ]; then
@@ -259,6 +256,10 @@ fi
 
 # Trust remote code (required for gpt-oss)
 CMD="${CMD} --trust-remote-code"
+
+# Enable prompt token details so API responses show prefix cache hits
+# (usage.prompt_tokens_details.cached_tokens)
+CMD="${CMD} --enable-prompt-tokens-details"
 
 # Logging
 CMD="${CMD} --uvicorn-log-level ${LOG_LEVEL}"

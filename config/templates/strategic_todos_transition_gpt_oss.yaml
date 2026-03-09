@@ -1,0 +1,129 @@
+# Strategic todos for phase transitions (gpt-oss optimized)
+# Addresses known gpt-oss failure modes: skeleton trap, strategic loops,
+# false confidence, and todo_complete omission.
+#
+# IMPORTANT: The PLAN todo (id 4) starts with the stop condition.
+# If all deliverables are done, call job_complete. Do NOT invent new work.
+todos:
+  - id: 1
+    content: >-
+      REVIEW: Examine what the previous phase accomplished using git evidence.
+
+      Steps:
+      (1) Use git_tags() to confirm phase boundary tags exist.
+      (2) Use git_log(max_count=15) to see commits from the previous phase.
+      (3) Use git_diff with the phase start tag to see all file changes.
+      (4) CONTENT CHECK: For every file in output/ that was created or modified,
+          use read_file to examine its actual content. Check specifically:
+          - Does it contain substantive prose/content, or just headings and placeholders?
+          - Is the file size reasonable for the deliverable? (A chapter should be 2000+ bytes,
+            a section 500+ bytes. A file under 200 bytes is almost certainly empty scaffolding.)
+          - Does it contain any "*Placeholder:*" text or "[TODO:" markers?
+
+      Then write archive/phase_N_retrospective.md with these sections:
+      1. **Accomplished**: What was completed, with file paths and CONTENT ASSESSMENT
+         (e.g., "output/chapter3.md: 1,847 words of prose on market analysis" NOT just
+         "output/chapter3.md: created").
+      2. **Incomplete**: What was attempted but didn't succeed, and why.
+      3. **Discoveries**: Unexpected findings or blockers.
+      4. **Failed Approaches**: What was tried and did NOT work, with the reason.
+      5. **Todo Stats**: Completed vs planned (e.g., "4/5 completed").
+      6. **Deliverable Quality**: For each deliverable from plan.md, report:
+         file path, byte count, content assessment (substantive/skeleton/placeholder/missing).
+
+      COMPLETION CRITERIA: Retrospective written with all 6 sections. Section 6 must
+      include byte counts and content assessments for every output file, not just "exists."
+
+  - id: 2
+    content: >-
+      REFLECT: Read workspace.md fully, then REWRITE it.
+
+      workspace.md is injected into every LLM call. Stale or bloated content wastes
+      tokens. After rewriting, it should contain ONLY:
+
+      PROTECTED sections (preserve unless provably wrong):
+      - "## Pinned Instructions" — re-read instructions.md if unsure
+      - "## Facts" — durable knowledge: IDs, paths, configurations
+      - "## Failed Approaches" — approaches that didn't work
+
+      REWRITABLE sections (update freely):
+      - "## Deliverables" — update status based on retrospective's Deliverable Quality
+        section. Mark items "done" ONLY if content assessment is "substantive."
+        Items assessed as "skeleton" or "placeholder" remain "in progress."
+      - "## Key Decisions" — significant choices with brief reasoning
+      - "## Status" — current phase, active blockers
+
+      Remove: progress percentages, phase status, todo summaries,
+      document inventories, anything already in plan.md.
+
+      COMPLETION CRITERIA: workspace.md rewritten, under 60 lines. Deliverable
+      statuses reflect actual content quality, not just file existence.
+
+  - id: 3
+    content: >-
+      ADAPT plan.md: Read it, then REWRITE the entire file (do NOT append).
+
+      (1) Mark completed phases with actual outcomes — not just "done" but what
+          was produced (e.g., "Phase 2: Completed. output/analysis.md contains
+          1,500 words of analysis covering 8 requirements.").
+      (2) If a phase produced only skeletons or placeholders instead of real content,
+          mark it as INCOMPLETE and create a continuation phase for the real content.
+      (3) Evaluate phase sizing: too many todos completed → plan bigger.
+          Many incomplete → plan smaller.
+      (4) Remove phases that are no longer needed.
+      (5) Cross-check remaining phases against deliverables — are all required
+          outputs still covered by upcoming phases?
+
+      REWRITE the whole file with write_file. Do NOT append a second copy.
+
+      COMPLETION CRITERIA: plan.md rewritten (not appended to) with accurate
+      outcomes on completed phases and remaining phases verified against requirements.
+
+  - id: 4
+    content: >-
+      PLAN OR COMPLETE — The stop condition comes FIRST.
+
+      === STOP CONDITION (check FIRST) ===
+
+      Check the "## Deliverables" table in workspace.md. For each deliverable marked
+      "done," verify it is genuinely complete:
+      (1) Use list_files('output/') to confirm files exist.
+      (2) Use read_file on EACH output file. Read the actual content.
+      (3) For each file, confirm:
+          - Contains substantive prose/content (not just headings or placeholders)
+          - File size is appropriate for the deliverable type
+          - No "*Placeholder:*" text or "[TODO:" markers remain
+          - Content matches what was required in instructions.md
+
+      If ALL deliverables pass these checks, call job_complete with:
+      - summary: What was accomplished across all phases
+      - deliverables: List of output file paths
+      - confidence: Honest quality assessment. Set confidence based on content quality:
+        * 0.8-1.0: All deliverables complete with substantive, verified content
+        * 0.5-0.7: Most deliverables complete, some gaps or quality concerns
+        * 0.2-0.4: Significant gaps, incomplete deliverables
+        * 0.0-0.2: Skeleton/placeholder output, major requirements unmet
+      - notes: Any caveats or areas a reviewer should check
+
+      If ANY deliverable is a skeleton, placeholder, or missing, DO NOT call
+      job_complete. Proceed to the CONTINUE CONDITION.
+
+      === CONTINUE CONDITION ===
+
+      If deliverables are still missing or incomplete:
+
+      (1) Read todo_guide.md (next_phase_todos will reject if you haven't).
+      (2) Call next_phase_todos with 3-5 todos for the next tactical phase.
+
+      Each todo MUST:
+      - Produce substantive content (NEVER "create skeleton" or "add headings")
+      - Name exact files, sections, tools, and expected word counts
+      - Be completable in 1-3 tool calls
+      - Include a verification todo that checks CONTENT QUALITY, not just file existence
+
+      COMPLETION CRITERIA: Either job_complete called (all deliverables verified
+      as substantive) OR next_phase_todos called (work remains).
+
+      INSTEAD OF: Calling job_complete when output files contain only headings.
+      Instead of creating todos for archiving, cleanup, or packaging.
+      Instead of inventing deliverables not in instructions.md.

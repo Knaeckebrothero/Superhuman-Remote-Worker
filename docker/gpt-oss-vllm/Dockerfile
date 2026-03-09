@@ -4,8 +4,10 @@
 # Build: docker build -t gpt-oss-vllm:latest .
 # Run:   docker run --gpus all -p 8000:8000 --ipc=host gpt-oss-vllm:latest
 #
-# Note: v0.10.2 is used because v0.11.0 has critical tool calling bugs (#26480)
-#       that cause ~50% of queries to hang indefinitely.
+# v0.14.1 is the version validated by the official vLLM GPT-OSS recipe.
+# Includes fixes for: prefix cache hash collisions (#30931, PR #27987),
+# FP8 KV cache + gpt-oss sinks (#23832, PR #23613), and tool_choice
+# handling (PR #30867). Previous version (v0.10.2) lacked these fixes.
 #
 # Model memory requirements (MXFP4 native):
 #   - gpt-oss-120b: ~63GB weights (fits on A100-80GB, H100-80GB, H200)
@@ -16,8 +18,8 @@
 #   - H100/H200: Use FLASH_ATTN with FA3 for optimal performance
 #   - L40S/A100: No native MXFP4 - uses software emulation via Triton kernels
 
-# Use vLLM v0.10.2 (stable for tool calling)
-FROM vllm/vllm-openai:v0.10.2
+# Use vLLM v0.14.1 (official GPT-OSS recipe version, prefix cache fixes)
+FROM vllm/vllm-openai:v0.14.1
 
 ENV PYTHONUNBUFFERED=1
 ENV DEBIAN_FRONTEND=noninteractive
@@ -45,15 +47,9 @@ WORKDIR /app
 # Pin version for reproducibility
 RUN pip install --no-cache-dir openai-harmony==0.0.8
 
-# Triton 3.4.0 required for gpt-oss on Ampere GPUs (A100)
-# - Enables TRITON_ATTN_VLLM_V1 backend which supports attention sinks
-# - v3.5.0+ deprecated `routing` module which breaks vLLM's MoE kernels
-RUN pip install --no-cache-dir triton==3.4.0
-
 # Verify installation
 RUN python3 -c "import vllm; print(f'vLLM version: {vllm.__version__}')" \
-    && python3 -c "import openai_harmony; print('openai-harmony installed')" \
-    && python3 -c "import triton; print(f'Triton version: {triton.__version__}')"
+    && python3 -c "import openai_harmony; print('openai-harmony installed')"
 
 # Copy entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh

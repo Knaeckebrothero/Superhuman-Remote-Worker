@@ -106,6 +106,8 @@ export interface JobSummary {
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;
+  repo_name?: string | null;
+  branch_name?: string | null;
   priority?: number;
   created_at: string;
   audit_count?: number | null;

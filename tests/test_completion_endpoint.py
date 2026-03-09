@@ -127,10 +127,41 @@ class TestGetVerificationConfig:
         job = {"id": "x", "resolved_config": {"agent": {}}}
         assert get_verification_config(job) == {}
 
+    def test_extra_fallback(self):
+        """When verification is nested inside agent.extra (un-flattened)."""
+        job = {
+            "id": "x",
+            "resolved_config": {
+                "agent": {
+                    "extra": {
+                        "verification": {
+                            "enabled": True,
+                            "critic_config": "critic",
+                            "max_rounds": 3,
+                        },
+                    },
+                },
+            },
+        }
+        vc = get_verification_config(job)
+        assert vc["enabled"] is True
+        assert vc["critic_config"] == "critic"
+
     def test_is_verification_enabled(self):
         assert is_verification_enabled(make_job(verification_enabled=True)) is True
         assert is_verification_enabled(make_job(verification_enabled=False)) is False
-        assert is_verification_enabled({"id": "x", "resolved_config": None}) is False
+        # When resolved_config is NULL, falls back to disk — defaults.yaml has enabled=true
+        assert is_verification_enabled({"id": "x", "resolved_config": None}) is True
+
+    def test_is_verification_disabled_by_override(self):
+        """Config override disables verification even without resolved_config."""
+        job = {
+            "id": "x",
+            "resolved_config": None,
+            "config_name": "default",
+            "config_override": {"verification": {"enabled": False}},
+        }
+        assert is_verification_enabled(job) is False
 
 
 class TestGetCurationConfig:

@@ -470,7 +470,7 @@ class PostgresDB:
                 SELECT id, description, status, creator_status, validator_status,
                        config_name, assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
-                       branch_name, merge_status, created_at
+                       repo_name, branch_name, merge_status, created_at
                 FROM jobs
                 {where_clause}
                 ORDER BY created_at DESC

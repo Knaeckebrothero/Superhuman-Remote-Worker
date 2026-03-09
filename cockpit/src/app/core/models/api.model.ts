@@ -420,6 +420,7 @@ export interface Job {
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;
+  repo_name?: string | null;
   branch_name?: string | null;
   merge_status?: string | null;
   priority?: number;

@@ -13,6 +13,11 @@ default:
 minimax:
   instructions: instructions_minimax.md
 
+gpt-oss:
+  instructions: instructions_gpt_oss.md
+  todo_guide: todo_guide_gpt_oss.md
+  strategic_todos_transition: strategic_todos_transition_gpt_oss.yaml
+
 # Model-specific overrides — add as needed:
 # claude-opus:
 #   instructions: instructions_claude_opus.md
