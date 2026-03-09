@@ -592,10 +592,14 @@ export class JobReviewComponent {
   }
 
   getWorkspaceUrl(): string | null {
-    const jobId = this.currentJobId();
+    const currentJob = this.job();
     const giteaUrl = environment.giteaUrl;
-    if (!giteaUrl || !jobId) return null;
-    return `${giteaUrl}/job-${jobId}`;
+    if (!giteaUrl || !currentJob) return null;
+    const repoName = currentJob.repo_name || `job-${currentJob.id}`;
+    if (currentJob.branch_name) {
+      return `${giteaUrl}/${repoName}/src/branch/${currentJob.branch_name}`;
+    }
+    return `${giteaUrl}/${repoName}`;
   }
 
   approveJob(): void {

@@ -508,6 +508,7 @@ class OrchestratorClient:
             "should_stop": result.get("should_stop", False),
             "goal_achieved": result.get("goal_achieved", False),
             "error": result.get("error"),
+            "freeze_data": result.get("freeze_data"),
         }
 
         try:

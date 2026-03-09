@@ -59,10 +59,14 @@ gemini:
     message_count_min_tokens: 100000
 
 gpt-oss:
-  model_max_context_tokens: 100000
+  temperature: 1.0  # OpenAI official: use 1.0 for full reasoning capability
+  top_p: 1.0        # OpenAI official: do not restrict vocabulary distribution
+  # top_k: DO NOT SET — HuggingFace defaults to 50 if present; must stay disabled
+  # repetition_penalty: DO NOT SET — some clients enable by default; OpenAI says disable
+  model_max_context_tokens: 131072  # True 128K context (MoE: 117B total, 5.1B active)
   limits:
-    model_max_context_tokens: 85000
-    context_threshold_tokens: 60000
-    summarization_safe_limit: 75000
-    summarization_chunk_size: 55000
-    message_count_min_tokens: 40000
+    model_max_context_tokens: 110000
+    context_threshold_tokens: 85000
+    summarization_safe_limit: 100000
+    summarization_chunk_size: 75000
+    message_count_min_tokens: 60000

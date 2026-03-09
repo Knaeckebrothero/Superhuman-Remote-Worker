@@ -139,10 +139,10 @@ interface JobRow {
                     >
                       View
                     </button>
-                    @if (getWorkspaceUrl(row.job.id)) {
+                    @if (getWorkspaceUrl(row.job)) {
                       <a
                         class="action-btn workspace"
-                        [href]="getWorkspaceUrl(row.job.id)"
+                        [href]="getWorkspaceUrl(row.job)"
                         target="_blank"
                         (click)="$event.stopPropagation()"
                         title="Browse workspace in Gitea"
@@ -151,20 +151,31 @@ interface JobRow {
                       </a>
                     }
                     @if (row.job.status === 'processing') {
-                      <button
-                        class="action-btn pause"
-                        (click)="pauseJob(row.job.id); $event.stopPropagation()"
-                        title="Pause job"
-                      >
-                        Pause
-                      </button>
-                      <button
-                        class="action-btn cancel"
-                        (click)="cancelJob(row.job.id); $event.stopPropagation()"
-                        title="Cancel job"
-                      >
-                        Cancel
-                      </button>
+                      @if (cancelingJobIds().has(row.job.id)) {
+                        <button
+                          class="action-btn canceling"
+                          disabled
+                          title="Canceling job..."
+                        >
+                          <span class="btn-spinner"></span>
+                          Canceling
+                        </button>
+                      } @else {
+                        <button
+                          class="action-btn pause"
+                          (click)="pauseJob(row.job.id); $event.stopPropagation()"
+                          title="Pause job"
+                        >
+                          Pause
+                        </button>
+                        <button
+                          class="action-btn cancel"
+                          (click)="cancelJob(row.job.id); $event.stopPropagation()"
+                          title="Cancel job"
+                        >
+                          Cancel
+                        </button>
+                      }
                     }
                     @if (row.job.status === 'pending_review') {
                       <button
@@ -632,6 +643,26 @@ interface JobRow {
         border-color: #f9e2af;
       }
 
+      .action-btn.canceling {
+        color: #6c7086;
+        border-color: #6c7086;
+        cursor: not-allowed;
+        opacity: 0.7;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .btn-spinner {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border: 1.5px solid #6c7086;
+        border-top-color: #f9e2af;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
       .action-btn.delete {
         color: #f38ba8;
         border-color: #f38ba8;
@@ -740,6 +771,9 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   // Expand/collapse state for parent jobs
   readonly expandedJobIds = signal<Set<string>>(new Set());
+
+  // In-flight action tracking
+  readonly cancelingJobIds = signal<Set<string>>(new Set());
 
   // Promote form state
   readonly promoteJobId = signal<string | null>(null);
@@ -891,10 +925,14 @@ export class JobListComponent implements OnInit, OnDestroy {
     return this.expandedJobIds().has(jobId);
   }
 
-  getWorkspaceUrl(jobId: string): string | null {
+  getWorkspaceUrl(job: JobSummary): string | null {
     const giteaUrl = environment.giteaUrl;
     if (!giteaUrl) return null;
-    return `${giteaUrl}/job-${jobId}`;
+    const repoName = job.repo_name || `job-${job.id}`;
+    if (job.branch_name) {
+      return `${giteaUrl}/${repoName}/src/branch/${job.branch_name}`;
+    }
+    return `${giteaUrl}/${repoName}`;
   }
 
   viewJob(jobId: string): void {
@@ -918,11 +956,23 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   cancelJob(jobId: string): void {
-    this.api.cancelJob(jobId).subscribe((result) => {
-      if (result) {
-        this.refresh();
-      }
+    const next = new Set(this.cancelingJobIds());
+    next.add(jobId);
+    this.cancelingJobIds.set(next);
+
+    this.api.cancelJob(jobId).subscribe({
+      next: (result) => {
+        this.removeCanceling(jobId);
+        if (result) this.refresh();
+      },
+      error: () => this.removeCanceling(jobId),
     });
+  }
+
+  private removeCanceling(jobId: string): void {
+    const next = new Set(this.cancelingJobIds());
+    next.delete(jobId);
+    this.cancelingJobIds.set(next);
   }
 
   resumeJob(jobId: string): void {
