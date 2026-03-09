@@ -36,7 +36,7 @@ name: superhuman-remote-worker
 
 services:
   postgres:
-    image: docker.io/library/postgres:15
+    image: docker.io/pgvector/pgvector:pg15
     container_name: srw-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-srw}
@@ -256,12 +256,12 @@ services:
       SOCKS_PORT: 1080
       FORWARD_PORT: 8080
       FORWARD_TARGET: ${VPN_WORKSTATION_ENDPOINT:-10.18.2.105:8090}
-      VPN_HOST: ${VPN_WORKSTATION_HOST:-${VPN_RESEARCH_HOST:-}}
+      VPN_HOST: ${VPN_WORKSTATION_HOST:-}
       VPN_PORT: ${VPN_WORKSTATION_PORT:-443}
-      VPN_REALM: ${VPN_WORKSTATION_REALM:-${VPN_RESEARCH_REALM:-}}
-      VPN_USER: ${VPN_WORKSTATION_USER:-${VPN_RESEARCH_USER:-}}
-      VPN_PASS: ${VPN_WORKSTATION_PASS:-${VPN_RESEARCH_PASS:-}}
-      VPN_TRUSTED_CERT: ${VPN_WORKSTATION_TRUSTED_CERT:-${VPN_RESEARCH_TRUSTED_CERT:-}}
+      VPN_REALM: ${VPN_WORKSTATION_REALM:-}
+      VPN_USER: ${VPN_WORKSTATION_USER:-}
+      VPN_PASS: ${VPN_WORKSTATION_PASS:-}
+      VPN_TRUSTED_CERT: ${VPN_WORKSTATION_TRUSTED_CERT:-}
     healthcheck:
       test: ps aux | grep -q '[o]penfortivpn' && ps aux | grep -q '[m]icrosocks'
       interval: 30s

@@ -50,6 +50,8 @@ from services.builder_tools import (  # noqa: E402
     get_builder_base_url,
     get_builder_model,
     get_builder_provider,
+    is_auth_or_quota_error,
+    rotate_builder_key,
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
@@ -746,6 +748,7 @@ class JobCompleteRequest(BaseModel):
     should_stop: bool = Field(False, description="Whether the graph stopped")
     goal_achieved: bool = Field(False, description="Whether the goal was achieved")
     error: dict[str, Any] | None = Field(None, description="Error dict if job failed")
+    freeze_data: dict[str, Any] | None = Field(None, description="Freeze data from the graph state")
 
 
 class BuilderSessionCreate(BaseModel):
@@ -1112,6 +1115,12 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
 
     Creates a job with status 'created'. The job must be assigned to an agent
     to start processing.
+
+    If ``project_id`` is set (directly or via the user's default project),
+    the job is created within that project context: the project's default
+    config and config_override are used as fallbacks, and the workspace is
+    branched from the project's shared jobs repo instead of getting its own
+    per-job repo.
     """
     try:
         # Merge upload IDs into context
@@ -1137,12 +1146,27 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             except Exception as e:
                 logger.warning(f"Failed to resolve default project for user {job.user_id}: {e}")
 
+        # Resolve project defaults (config name, config override)
+        project = None
+        config_name = job.config_name
+        config_override = job.config_override
+        if project_id:
+            project = await postgres_db.get_project(project_id)
+            if not project:
+                raise HTTPException(
+                    status_code=404, detail=f"Project '{project_id}' not found"
+                )
+            if config_name == "default" and project.get("default_config_name"):
+                config_name = project["default_config_name"]
+            if not config_override and project.get("default_config_override"):
+                config_override = project["default_config_override"]
+
         result = await postgres_db.create_job(
             description=job.description,
             document_path=job.document_path,
             document_dir=job.document_dir,
-            config_name=job.config_name,
-            config_override=job.config_override,
+            config_name=config_name,
+            config_override=config_override,
             context=context if context else None,
             user_id=job.user_id,
             project_id=project_id,
@@ -1176,11 +1200,16 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             parent_repo_name = f"job-{str(parent['id'])}"
 
                     from_branch = parent.get("branch_name") or "main"
-                    config_name_slug = job.config_name or "subjob"
+                    config_name_slug = config_name or "subjob"
                     branch_name = f"subjob/{short_id}/{config_name_slug}"
-                    await gitea_client.create_branch(
+                    branch_ok = await gitea_client.create_branch(
                         parent_repo_name, branch_name, from_branch=from_branch
                     )
+                    if not branch_ok:
+                        logger.error(
+                            f"Failed to create branch '{branch_name}' from '{from_branch}' "
+                            f"in '{parent_repo_name}' for subjob {job_id_str}"
+                        )
                     ctx = dict(context) if context else {}
                     ctx["git_remote_url"] = parent.get("context", {}).get("git_remote_url", "")
                     await postgres_db.update_job_context(job_id_str, ctx)
@@ -1191,8 +1220,48 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                         )
                     result["branch_name"] = branch_name
                     result["repo_name"] = parent_repo_name
+            elif project_id:
+                # Project job: branch in project's shared jobs repo
+                repos = await postgres_db.get_project_repositories(
+                    project_id, role="jobs"
+                )
+                if repos:
+                    jobs_repo = repos[0]
+                    branch_name = f"job/{short_id}"
+                    branch_ok = await gitea_client.create_branch(
+                        jobs_repo["name"], branch_name, from_branch="main"
+                    )
+                    if not branch_ok:
+                        logger.error(
+                            f"Failed to create branch '{branch_name}' in "
+                            f"'{jobs_repo['name']}' — main branch may not exist"
+                        )
+                    ctx = dict(context) if context else {}
+                    ctx["git_remote_url"] = jobs_repo["repo_url"]
+                    await postgres_db.update_job_context(job_id_str, ctx)
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
+                            branch_name, jobs_repo["name"], result["id"],
+                        )
+                    result["branch_name"] = branch_name
+                    result["repo_name"] = jobs_repo["name"]
+                else:
+                    # Project has no jobs repo — fall back to per-job repo
+                    repo_name = f"job-{short_id}"
+                    git_remote_url = await gitea_client.create_repo(repo_name)
+                    if git_remote_url:
+                        ctx = dict(context) if context else {}
+                        ctx["git_remote_url"] = git_remote_url
+                        await postgres_db.update_job_context(job_id_str, ctx)
+                        async with postgres_db.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE jobs SET repo_name = $1 WHERE id = $2",
+                                repo_name, result["id"],
+                            )
+                        result["repo_name"] = repo_name
             else:
-                # Root job: create standalone per-job repo
+                # Root job without project: create standalone per-job repo
                 repo_name = f"job-{short_id}"
                 git_remote_url = await gitea_client.create_repo(repo_name)
                 if git_remote_url:
@@ -1255,7 +1324,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 fresh_job = await postgres_db.get_job(str(result["id"]))
                 if fresh_job:
                     scholar_result = await _spawn_scholar_subjob(
-                        fresh_job, job.config_name, job.config_override, context,
+                        fresh_job, config_name, config_override, context,
                     )
                     if scholar_result:
                         result["scholar_job_id"] = str(scholar_result["id"])
@@ -1266,6 +1335,8 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
         _trigger_dispatch()
 
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -1880,7 +1951,7 @@ async def _set_target_to_autonomy_status(target_job_id: str) -> str:
     Returns:
         The new status string.
     """
-    from orchestrator.services.completion import get_autonomy_level
+    from services.completion import get_autonomy_level
 
     job = await postgres_db.get_job(target_job_id)
     if not job:
@@ -1917,7 +1988,7 @@ async def _spawn_scholar_subjob(
 
     Returns the created scholar job dict, or None if skipped.
     """
-    from orchestrator.services.completion import (
+    from services.completion import (
         format_scholar_instructions,
         resolve_scholar_config_from_disk,
     )
@@ -1995,9 +2066,14 @@ async def _spawn_scholar_subjob(
         from_branch = job.get("branch_name") or "main"
         branch_name = f"subjob/{short_id}/{scholar_config_name}"
         try:
-            await gitea_client.create_branch(
+            branch_ok = await gitea_client.create_branch(
                 parent_repo_name, branch_name, from_branch=from_branch
             )
+            if not branch_ok:
+                logger.error(
+                    f"Failed to create branch '{branch_name}' from '{from_branch}' "
+                    f"in '{parent_repo_name}' for scholar {scholar_job_id}"
+                )
             # Propagate git remote URL
             parent_context = job.get("context") or {}
             if isinstance(parent_context, str):
@@ -2103,7 +2179,7 @@ async def _handle_critic_verdict_on_complete(
     If this job has a parent_job_id and freeze_data with a verdict,
     process the approve/return logic.
     """
-    from orchestrator.services.completion import (
+    from services.completion import (
         _parse_freeze_data,
         get_curation_config,
         is_curation_enabled,
@@ -2111,9 +2187,23 @@ async def _handle_critic_verdict_on_complete(
 
     parent_job_id = job.get("parent_job_id")
     if parent_job_id is None:
-        return  # Not a critic job
+        return  # Not a subjob
 
     job_id = str(job["id"])
+
+    # Skip scholar jobs — they are not critics
+    ctx_raw = job.get("context")
+    if isinstance(ctx_raw, str):
+        try:
+            ctx_dict = json.loads(ctx_raw)
+        except (json.JSONDecodeError, ValueError):
+            ctx_dict = {}
+    else:
+        ctx_dict = ctx_raw if isinstance(ctx_raw, dict) else {}
+    if ctx_dict.get("scholar_target"):
+        logger.debug(f"Job {job_id} is a scholar — skipping critic verdict handling")
+        return
+
     target_job_id = str(parent_job_id)
 
     freeze_data = _parse_freeze_data(job)
@@ -2208,7 +2298,7 @@ async def _trigger_verification_on_complete(
     3. freeze_data indicates job completion (not phase boundary)
     4. Verification enabled in resolved_config
     """
-    from orchestrator.services.completion import (
+    from services.completion import (
         _parse_freeze_data,
         format_verification_instructions,
         get_verification_config,
@@ -2229,7 +2319,10 @@ async def _trigger_verification_on_complete(
     if not is_verification_enabled(job):
         logger.debug(f"Verification not enabled for job {job_id}")
         return
-    if not is_job_completion_freeze(job):
+    # Check if this is a job completion (not a phase boundary).
+    # Accept freeze_data OR status=reviewing (set by determine_job_status when
+    # goal_achieved is True) OR freeze_data sent in the request body.
+    if not is_job_completion_freeze(job) and job.get("status") != "reviewing":
         logger.debug(f"Skipping verification for {job_id} — not a job completion freeze")
         return
 
@@ -2358,9 +2451,14 @@ async def _trigger_verification_on_complete(
             from_branch = job.get("branch_name") or "main"
             branch_name = f"subjob/{short_id}/{critic_config}"
             try:
-                await gitea_client.create_branch(
+                branch_ok = await gitea_client.create_branch(
                     parent_repo_name, branch_name, from_branch=from_branch
                 )
+                if not branch_ok:
+                    logger.error(
+                        f"Failed to create branch '{branch_name}' from '{from_branch}' "
+                        f"in '{parent_repo_name}' for critic {critic_job_id}"
+                    )
                 # Propagate git remote URL and update branch/repo on the critic job
                 parent_context = job.get("context") or {}
                 if isinstance(parent_context, str):
@@ -2395,7 +2493,7 @@ async def _trigger_curation_final_pass(
 
     Called after critic approval (or auto-accept) when curation is enabled.
     """
-    from orchestrator.services.completion import get_curation_config, is_curation_enabled
+    from services.completion import get_curation_config, is_curation_enabled
 
     if target_job is None:
         target_job = await postgres_db.get_job(target_job_id)
@@ -2448,7 +2546,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
     This replaces the agent-side ``_update_job_status_from_result``,
     ``_handle_critic_verdict``, and ``_maybe_trigger_verification`` functions.
     """
-    from orchestrator.services.completion import (
+    from services.completion import (
         determine_job_status,
         is_curation_enabled,
         is_verification_enabled,
@@ -2459,7 +2557,7 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        if job["status"] not in ("processing", "reviewing"):
+        if job["status"] not in ("processing", "reviewing", "pending_review", "completed"):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be completed (status: {job['status']})",
@@ -2467,6 +2565,19 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
         result = request.model_dump()
         actions: list[str] = []
+
+        # Backfill freeze_data from the request if the DB doesn't have it
+        if not job.get("freeze_data") and result.get("freeze_data"):
+            job["freeze_data"] = result["freeze_data"]
+            try:
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid AND freeze_data IS NULL",
+                        json.dumps(result["freeze_data"]),
+                        job_id,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to backfill freeze_data for {job_id}: {e}")
 
         # 1. Determine and set the new job status
         new_status, error_message = determine_job_status(job, result)
@@ -4895,6 +5006,13 @@ async def delete_project(project_id: str) -> dict[str, str]:
     except Exception as e:
         logger.warning(f"Failed to clean up knowledge_index for project {project_id}: {e}")
 
+    # Detach referencing rows that lack ON DELETE CASCADE/SET NULL
+    uuid_val = UUID(project_id)
+    async with postgres_db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val)
+        await conn.execute("UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val)
+        await conn.execute("UPDATE users SET default_project_id = NULL WHERE default_project_id = $1", uuid_val)
+
     success = await postgres_db.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete project")
@@ -5046,124 +5164,9 @@ async def remove_project_repository(project_id: str, repo_id: str) -> dict[str, 
 
 @app.post("/api/projects/{project_id}/jobs")
 async def create_project_job(project_id: str, job: JobCreate) -> dict[str, Any]:
-    """Create a job within a project context.
-
-    Automatically sets project_id and creates a Gitea branch for the job.
-    """
-    project = await postgres_db.get_project(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
-
-    try:
-        # Build context
-        context = dict(job.context) if job.context else {}
-        if job.upload_id:
-            context["upload_id"] = job.upload_id
-        if job.config_upload_id:
-            context["config_upload_id"] = job.config_upload_id
-        if job.instructions_upload_id:
-            context["instructions_upload_id"] = job.instructions_upload_id
-        if job.instructions:
-            context["instructions"] = job.instructions
-        if job.kickoff_message:
-            context["kickoff_message"] = job.kickoff_message
-
-        # Use project's default config if not specified
-        config_name = job.config_name
-        if config_name == "default" and project.get("default_config_name"):
-            config_name = project["default_config_name"]
-
-        result = await postgres_db.create_job(
-            description=job.description,
-            document_path=job.document_path,
-            document_dir=job.document_dir,
-            config_name=config_name,
-            config_override=job.config_override or project.get("default_config_override"),
-            context=context if context else None,
-            user_id=job.user_id,
-            project_id=project_id,
-            parent_job_id=job.parent_job_id,
-            priority=job.priority,
-        )
-
-        job_id_str = str(result["id"])
-
-        # Create branch in the jobs repo and set git_remote_url
-        branch_name = f"job/{job_id_str[:8]}"
-        repos = await postgres_db.get_project_repositories(project_id, role="jobs")
-
-        if gitea_client.is_initialized and repos:
-            jobs_repo = repos[0]
-            from_branch = "main"
-            if job.parent_job_id:
-                parent = await postgres_db.get_job(job.parent_job_id)
-                if parent and parent.get("branch_name"):
-                    from_branch = parent["branch_name"]
-                else:
-                    logger.warning(
-                        f"Parent job {job.parent_job_id} has no branch_name, "
-                        f"branching subjob from 'main'"
-                    )
-            await gitea_client.create_branch(
-                jobs_repo["name"], branch_name, from_branch=from_branch
-            )
-
-            # Use the project's jobs repo URL directly (no separate job repo needed)
-            ctx = dict(context) if context else {}
-            ctx["git_remote_url"] = jobs_repo["repo_url"]
-            await postgres_db.update_job_context(job_id_str, ctx)
-
-        # Update job with branch name
-        async with postgres_db.acquire() as conn:
-            await conn.execute(
-                "UPDATE jobs SET branch_name = $1 WHERE id = $2",
-                branch_name, result["id"],
-            )
-
-        result["branch_name"] = branch_name
-
-        # Clone selected global datasources as job-scoped
-        if job.datasource_ids:
-            for ds_id in job.datasource_ids:
-                try:
-                    ds = await postgres_db.get_datasource(ds_id)
-                    if ds and ds.get("job_id") is None:
-                        creds = ds.get("credentials") or {}
-                        if isinstance(creds, str):
-                            try:
-                                creds = json.loads(creds)
-                            except (json.JSONDecodeError, ValueError):
-                                creds = {}
-                        await postgres_db.create_datasource(
-                            name=ds["name"],
-                            ds_type=ds["type"],
-                            connection_url=ds["connection_url"],
-                            description=ds.get("description"),
-                            credentials=creds if creds else None,
-                            read_only=ds.get("read_only", True),
-                            job_id=job_id_str,
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to clone datasource {ds_id}: {e}")
-
-        # Spawn scholar subjob if enabled (root jobs only)
-        if not job.parent_job_id:
-            try:
-                fresh_job = await postgres_db.get_job(str(result["id"]))
-                if fresh_job:
-                    scholar_result = await _spawn_scholar_subjob(
-                        fresh_job, config_name, job.config_override, context,
-                    )
-                    if scholar_result:
-                        result["scholar_job_id"] = str(scholar_result["id"])
-            except Exception as e:
-                logger.warning(f"Failed to spawn scholar for job {result['id']}: {e}")
-
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+    """Create a job within a project — delegates to create_job."""
+    job.project_id = project_id
+    return await create_job(job)
 
 
 @app.get("/api/projects/{project_id}/jobs")
@@ -6175,6 +6178,7 @@ async def _stream_openai_responses(
     input_items: list[dict],
     model: str,
     api_key: str | None = None,
+    _retried: bool = False,
 ):
     """Stream from OpenAI Responses API, yielding structured events.
 
@@ -6263,6 +6267,15 @@ async def _stream_openai_responses(
                         pass
 
     except Exception as e:
+        if not _retried and is_auth_or_quota_error(e):
+            new_key = rotate_builder_key(str(e))
+            if new_key:
+                logger.info("Builder: retrying OpenAI Responses API with rotated key")
+                async for event in _stream_openai_responses(
+                    system_prompt, input_items, model, api_key=new_key, _retried=True
+                ):
+                    yield event
+                return
         yield ("error", {"message": str(e)})
 
 
@@ -6271,6 +6284,7 @@ async def _stream_openai(
     context_messages: list[dict],
     model: str,
     api_key: str | None = None,
+    _retried: bool = False,
 ):
     """Stream from OpenAI Chat Completions API, yielding structured events.
 
@@ -6335,6 +6349,15 @@ async def _stream_openai(
                 logger.warning(f"Failed to parse tool call args: {tc_buf['arguments'][:100]}")
 
     except Exception as e:
+        if not _retried and is_auth_or_quota_error(e):
+            new_key = rotate_builder_key(str(e))
+            if new_key:
+                logger.info("Builder: retrying OpenAI Chat API with rotated key")
+                async for event in _stream_openai(
+                    system_prompt, context_messages, model, api_key=new_key, _retried=True
+                ):
+                    yield event
+                return
         yield ("error", {"message": str(e)})
 
 
@@ -6343,6 +6366,7 @@ async def _stream_anthropic(
     context_messages: list[dict],
     model: str,
     api_key: str | None = None,
+    _retried: bool = False,
 ):
     """Stream from Anthropic API, yielding structured events.
 
@@ -6415,6 +6439,15 @@ async def _stream_anthropic(
                         current_tool_args = ""
 
     except Exception as e:
+        if not _retried and is_auth_or_quota_error(e):
+            new_key = rotate_builder_key(str(e))
+            if new_key:
+                logger.info("Builder: retrying Anthropic API with rotated key")
+                async for event in _stream_anthropic(
+                    system_prompt, context_messages, model, api_key=new_key, _retried=True
+                ):
+                    yield event
+                return
         yield ("error", {"message": str(e)})
 
 
@@ -6452,8 +6485,27 @@ async def _summarize_builder_session(
             )
             summary_text = response.content[0].text
         except Exception as e:
-            logger.warning(f"Anthropic summarization failed: {e}")
-            return
+            if is_auth_or_quota_error(e):
+                new_key = rotate_builder_key(str(e))
+                if new_key:
+                    try:
+                        client = AsyncAnthropic(api_key=new_key)
+                        response = await client.messages.create(
+                            model=model,
+                            system=summary_prompt[0]["content"],
+                            messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
+                            max_tokens=1024,
+                        )
+                        summary_text = response.content[0].text
+                    except Exception as e2:
+                        logger.warning(f"Anthropic summarization failed after key rotation: {e2}")
+                        return
+                else:
+                    logger.warning(f"Anthropic summarization failed (no alt keys): {e}")
+                    return
+            else:
+                logger.warning(f"Anthropic summarization failed: {e}")
+                return
     else:
         try:
             from openai import AsyncOpenAI
@@ -6468,8 +6520,29 @@ async def _summarize_builder_session(
             )
             summary_text = response.choices[0].message.content or ""
         except Exception as e:
-            logger.warning(f"OpenAI summarization failed: {e}")
-            return
+            if is_auth_or_quota_error(e):
+                new_key = rotate_builder_key(str(e))
+                if new_key:
+                    try:
+                        client = AsyncOpenAI(
+                            api_key=new_key,
+                            base_url=get_builder_base_url(),
+                        )
+                        response = await client.chat.completions.create(
+                            model=model,
+                            messages=summary_prompt,
+                            max_tokens=1024,
+                        )
+                        summary_text = response.choices[0].message.content or ""
+                    except Exception as e2:
+                        logger.warning(f"OpenAI summarization failed after key rotation: {e2}")
+                        return
+                else:
+                    logger.warning(f"OpenAI summarization failed (no alt keys): {e}")
+                    return
+            else:
+                logger.warning(f"OpenAI summarization failed: {e}")
+                return
 
     if summary_text:
         await postgres_db.update_builder_session_summary(session_id, summary_text)

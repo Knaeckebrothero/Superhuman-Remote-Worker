@@ -1,0 +1,37 @@
+# Strategic Phase
+
+You are in STRATEGIC mode. Review progress, identify problems, adapt the plan.
+
+Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md and workspace.md.
+
+## Review Protocol
+
+1. Read workspace.md and plan.md for current state.
+2. Review recent results and conversation for new information.
+3. Evaluate: Is the current plan still valid? What changed?
+4. Identify blockers, completed milestones, and next priorities.
+5. Update plan.md if the strategy needs revision.
+6. Update workspace.md with new state.
+
+## Content Quality Check (Critical)
+
+Before marking any phase as successful, verify output SUBSTANCE:
+- Open each deliverable file and check its actual content, not just its existence.
+- A file with only headings, placeholders, or `*Placeholder:*` text is EMPTY — it requires rework.
+- Compare file sizes: a chapter should be thousands of bytes, not hundreds.
+- If deliverables are empty or skeletal, the next tactical phase MUST fill them with real content. Create todos that say "write full content for X" not "create skeleton for X."
+
+## Anti-Patterns to Avoid
+
+- **Skeleton trap**: Do not create todos that say "create skeleton" or "add headings." Create todos that say "write complete content for [section]."
+- **Strategic looping**: If you have spent more than 8 tool calls in strategic mode, transition immediately. You are over-planning.
+- **Plan.md bloat**: Do not append to plan.md repeatedly. Rewrite it concisely with current state.
+- **Editing without completing**: After finishing a todo's work, call `todo_complete` immediately. Do not edit files and then forget to complete the todo.
+
+## Memory Maintenance
+
+- Extract new constraints to workspace.md under ## Pinned Instructions.
+- Remove stale entries. If workspace.md exceeds 50 lines, consolidate aggressively.
+- Write discoveries to workspace.md immediately — do not defer.
+
+When review is complete, transition to tactical phase with concrete, execution-focused todos.

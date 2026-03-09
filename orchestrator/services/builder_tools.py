@@ -2567,18 +2567,84 @@ def get_builder_model() -> str:
     return os.getenv("BUILDER_MODEL", "gpt-5.2-pro")
 
 
-def get_builder_api_key() -> str | None:
-    """Get the API key for the builder LLM.
+_builder_key_ring = None
+_builder_key_ring_lock = __import__("threading").Lock()
 
+
+def get_builder_key_ring():
+    """Get or create a shared KeyRing for the builder LLM.
+
+    Parses comma-separated keys from BUILDER_API_KEY (or provider fallback)
+    and creates a KeyRing with cooldown-based rotation.
+    """
+    global _builder_key_ring
+    with _builder_key_ring_lock:
+        if _builder_key_ring is not None:
+            return _builder_key_ring
+
+        import sys
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from src.llm.key_ring import KeyRing, parse_key_string
+
+        provider = get_builder_provider()
+        explicit = os.getenv("BUILDER_API_KEY")
+        if explicit:
+            raw = explicit
+        elif provider == "anthropic":
+            raw = os.getenv("ANTHROPIC_API_KEY")
+        else:
+            raw = os.getenv("OPENAI_API_KEY")
+
+        keys = parse_key_string(raw)
+        if not keys:
+            return None
+
+        cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
+        _builder_key_ring = KeyRing(
+            keys, cooldown_seconds=cooldown, provider=f"builder-{provider}"
+        )
+        return _builder_key_ring
+
+
+def get_builder_api_key() -> str | None:
+    """Get the current API key for the builder LLM.
+
+    Uses KeyRing for automatic rotation across comma-separated keys.
     Falls back to OPENAI_API_KEY or ANTHROPIC_API_KEY based on provider.
     """
-    explicit = os.getenv("BUILDER_API_KEY")
-    if explicit:
-        return explicit
-    provider = get_builder_provider()
-    if provider == "anthropic":
-        return os.getenv("ANTHROPIC_API_KEY")
-    return os.getenv("OPENAI_API_KEY")
+    ring = get_builder_key_ring()
+    if ring is None:
+        return None
+    try:
+        return ring.current_key
+    except RuntimeError:
+        return None
+
+
+def rotate_builder_key(reason: str) -> str | None:
+    """Rotate the builder API key after a failure. Returns new key or None."""
+    ring = get_builder_key_ring()
+    if ring is None or not ring.has_alternatives:
+        return None
+    return ring.rotate(reason)
+
+
+def is_auth_or_quota_error(error: Exception) -> bool:
+    """Check if an exception is an auth (401/403) or quota (429) error."""
+    error_str = str(error)
+    # Check for HTTP status codes in error messages
+    for code in ("401", "403", "429", "Incorrect API key", "invalid_api_key",
+                 "quota", "rate_limit"):
+        if code.lower() in error_str.lower():
+            return True
+    # Check for typed SDK exceptions
+    type_name = type(error).__name__
+    if type_name in ("AuthenticationError", "PermissionDeniedError",
+                     "RateLimitError"):
+        return True
+    return False
 
 
 def get_builder_base_url() -> str | None:

@@ -171,7 +171,7 @@ class GiteaClient:
                 json={
                     "name": name,
                     "private": True,
-                    "auto_init": False,
+                    "auto_init": True,
                     "description": f"Workspace for {name}",
                 },
             )

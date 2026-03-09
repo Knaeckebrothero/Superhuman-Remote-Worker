@@ -19,6 +19,10 @@ minimax:
   summarization: summarization_prompt_minimax.txt
 
 gpt-oss:
+  systemprompt: systemprompt_gpt_oss.txt
+  persona: persona_gpt_oss.txt
+  strategic: strategic_gpt_oss.txt
+  tactical: tactical_gpt_oss.txt
   summarization: summarization_prompt_gpt_oss.txt
   memory_extraction: memory_extraction_prompt_gpt_oss.txt
   curation: curation_prompt_gpt_oss.txt
