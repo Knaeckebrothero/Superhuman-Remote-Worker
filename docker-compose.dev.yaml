@@ -130,6 +130,22 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  nats:
+    image: docker.io/nats:2.10-alpine
+    container_name: srw-nats
+    command: ["--jetstream", "--store_dir", "/data"]
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats_dev_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   gitea:
     image: docker.io/gitea/gitea:1.22-rootless
     container_name: srw-gitea
@@ -298,5 +314,7 @@ volumes:
     name: srw_mongodb_dev_data
   neo4j_dev_data:
     name: srw_neo4j_dev_data
+  nats_dev_data:
+    name: srw_nats_dev_data
   gitea_dev_data:
     name: srw_gitea_dev_data

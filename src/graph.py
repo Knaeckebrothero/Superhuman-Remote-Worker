@@ -2301,6 +2301,19 @@ def create_audited_tool_node(
         result = await tool_node.ainvoke(state)
         execution_time_ms = int((time.time() - start_time) * 1000)
 
+        # Check for workspace unavailable errors (VM connection lost).
+        # ToolNode catches all exceptions and turns them into error messages,
+        # but WorkspaceUnavailableError should propagate for VM recovery.
+        if "messages" in result:
+            for msg in result["messages"]:
+                if isinstance(msg, ToolMessage) and msg.content:
+                    if "WorkspaceUnavailableError" in msg.content:
+                        from .core.workspace_backend import WorkspaceUnavailableError
+                        raise WorkspaceUnavailableError(
+                            f"VM workspace connection lost during tool execution: "
+                            f"{msg.content[:300]}"
+                        )
+
         # Update tool audit documents with results
         if auditor and "messages" in result:
             for msg in result["messages"]:

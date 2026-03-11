@@ -103,6 +103,10 @@ class ShellManager:
     Creates a detached tmux session with a default shell and provides
     methods for command execution, keystroke sending, and output reading.
     New shells are auto-created on first use via ensure_tab().
+
+    When a workspace backend with shell support is provided (e.g. RemoteBackend),
+    all shell operations are delegated to the backend. Otherwise, local libtmux
+    is used directly (current behavior).
     """
 
     # Compiled patterns for ANSI escape filtering
@@ -118,6 +122,7 @@ class ShellManager:
         sandbox_cwd: Optional[str] = None,
         auto_start_claude_code: bool = False,
         claude_code_model: str = "claude-opus-4-6",
+        backend: Optional[Any] = None,
     ):
         """Initialize ShellManager with a new tmux session.
 
@@ -130,6 +135,10 @@ class ShellManager:
             sandbox_cwd: Working directory to restrict commands to (None = no restriction)
             auto_start_claude_code: Whether to auto-open a claude-code tab
             claude_code_model: Model for Claude Code session
+            backend: Optional workspace backend with shell support. When provided
+                     and backend.supports_shell is True, all shell operations delegate
+                     to the backend (for remote execution). When None, local libtmux
+                     is used.
         """
         self.job_id = job_id
         self.max_tabs = max_tabs
@@ -137,11 +146,31 @@ class ShellManager:
         self.default_timeout = default_timeout
         self.sandbox_cwd = sandbox_cwd
         self._claude_code_model = claude_code_model
+        self._backend = backend
 
         if blocked_commands is None:
             self.blocked_commands = DEFAULT_BLOCKED_COMMANDS
         else:
             self.blocked_commands = frozenset(blocked_commands)
+
+        # Check if we should delegate to the backend
+        self._use_backend = (
+            backend is not None
+            and getattr(backend, "supports_shell", False)
+        )
+
+        if self._use_backend:
+            # Backend handles all shell state — no local tmux needed
+            self._sync_lock = threading.Lock()
+            self._tabs = OrderedDict()
+            self._session_name = f"agent_{job_id[:12]}"
+            logger.info(
+                f"ShellManager initialized with backend delegation: "
+                f"session={self._session_name}"
+            )
+            return
+
+        # --- Local libtmux initialization (existing behavior) ---
 
         # Thread lock for synchronous command execution
         self._sync_lock = threading.Lock()
@@ -213,6 +242,8 @@ class ShellManager:
 
     def _ensure_session_alive(self) -> None:
         """Recreate the tmux session if it has died externally."""
+        if self._use_backend:
+            return  # Backend manages its own session
         if self.is_alive():
             return
 
@@ -255,6 +286,14 @@ class ShellManager:
         Raises:
             ValueError: If name is invalid
         """
+        if self._use_backend:
+            self._backend.shell_ensure_tab(name)
+            # Return a stub ShellTab for compatibility
+            if name not in self._tabs:
+                self._tabs[name] = ShellTab(
+                    name=name, tab_type="shell", window=None, pane=None,
+                )
+            return self._tabs[name]
         self._ensure_session_alive()
         if name in self._tabs:
             return self._tabs[name]
@@ -281,6 +320,16 @@ class ShellManager:
         Raises:
             ValueError: If name is invalid or duplicate
         """
+        if self._use_backend:
+            metadata = self._backend.shell_open_tab(name, command=command, tab_type=tab_type)
+            # Create stub ShellTab for local tracking
+            self._tabs[name] = ShellTab(
+                name=name,
+                tab_type=metadata.get("type", "shell"),
+                window=None,
+                pane=None,
+            )
+            return metadata
         # Validate name
         if not TAB_NAME_PATTERN.match(name):
             raise ValueError(
@@ -349,6 +398,8 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
+        if self._use_backend:
+            return self._backend.shell_send(name, text, enter=enter)
         # Check blocked commands when actually executing (enter=True)
         if enter:
             blocked = self._check_blocked(text)
@@ -378,6 +429,8 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
+        if self._use_backend:
+            return self._backend.shell_read(name, lines=lines, since_cursor=since_cursor)
         tab = self._get_tab(name)
         all_lines = self._capture_lines(tab)
         total_lines = len(all_lines)
@@ -421,6 +474,10 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
+        if self._use_backend:
+            result = self._backend.shell_close_tab(name)
+            self._tabs.pop(name, None)
+            return result
         tab = self._get_tab(name)
         tab.window.kill()
         del self._tabs[name]
@@ -451,6 +508,8 @@ class ShellManager:
         Raises:
             KeyError: If tab doesn't exist
         """
+        if self._use_backend:
+            return self._backend.shell_read_with_offset(name, lines=lines, offset=offset)
         tab = self._get_tab(name)
         all_lines = self._capture_lines(tab)
         total_lines = len(all_lines)
@@ -491,6 +550,8 @@ class ShellManager:
         Returns:
             Header string
         """
+        if self._use_backend:
+            return self._backend.shell_format_tab_header()
         self._prune_dead_tabs()
         names = list(self._tabs.keys())
         return f"[Shells: {' | '.join(names)}]"
@@ -501,6 +562,8 @@ class ShellManager:
         Returns:
             List of tab metadata dicts
         """
+        if self._use_backend:
+            return self._backend.shell_list_tabs()
         self._prune_dead_tabs()
         return [tab.to_metadata() for tab in self._tabs.values()]
 
@@ -531,6 +594,15 @@ class ShellManager:
             KeyError: If tab does not exist
             TimeoutError: If command exceeds timeout
         """
+        if self._use_backend:
+            if timeout is None:
+                timeout = self.default_timeout
+            return self._backend.shell_run(
+                command,
+                timeout=timeout,
+                tab_name=tab_name,
+                working_dir=working_dir,
+            )
         # Safety check
         blocked = self._check_blocked(command)
         if blocked:
@@ -738,6 +810,10 @@ class ShellManager:
 
     def cleanup(self) -> None:
         """Kill the entire tmux session and clean up."""
+        if self._use_backend:
+            self._backend.shell_cleanup()
+            self._tabs.clear()
+            return
         try:
             self._session.kill()
             logger.info(f"Cleaned up tmux session '{self._session_name}'")
@@ -747,6 +823,8 @@ class ShellManager:
 
     def is_alive(self) -> bool:
         """Check if the tmux session still exists."""
+        if self._use_backend:
+            return self._backend.shell_is_alive()
         try:
             sessions = self._server.sessions.filter(session_name=self._session_name)
             return len(sessions) > 0

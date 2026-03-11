@@ -678,6 +678,8 @@ class WorkspaceConfig:
     initial_files: Dict[str, str] = field(default_factory=dict)
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
+    backend: str = "local"  # "local" or "remote"
+    remote: Optional[Dict[str, Any]] = None  # {host, port, username, key_path, workspace_path}
 
 
 @dataclass
@@ -1058,6 +1060,8 @@ def load_agent_config(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
+        backend=workspace_data.get("backend", "local"),
+        remote=workspace_data.get("remote"),
     )
 
     tools_data = data.get("tools", {})
@@ -1205,6 +1209,8 @@ def load_agent_config_from_dict(
         initial_files=workspace_data.get("initial_files", {}),
         max_read_words=max_read_words,
         git_versioning=workspace_data.get("git_versioning", True),
+        backend=workspace_data.get("backend", "local"),
+        remote=workspace_data.get("remote"),
     )
 
     tools_data = data.get("tools", {})
