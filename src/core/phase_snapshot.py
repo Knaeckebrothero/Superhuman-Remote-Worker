@@ -125,6 +125,11 @@ class PhaseSnapshotManager:
     Creates snapshots at phase boundaries that can be used to recover
     from corrupted states without losing all progress.
 
+    When a workspace_backend is provided (remote VM), snapshot creation
+    pulls workspace files from the VM to pod-local storage, and recovery
+    pushes snapshot files back to the VM. This ensures snapshots survive
+    VM destruction.
+
     Example:
         ```python
         manager = PhaseSnapshotManager(job_id="abc123")
@@ -153,12 +158,20 @@ class PhaseSnapshotManager:
         ```
     """
 
-    def __init__(self, job_id: str, base_path: Optional[Path] = None):
+    def __init__(
+        self,
+        job_id: str,
+        base_path: Optional[Path] = None,
+        workspace_backend=None,
+    ):
         """Initialize snapshot manager.
 
         Args:
             job_id: Unique job identifier
             base_path: Override base path (for testing)
+            workspace_backend: Optional WorkspaceBackend for remote file access.
+                When set and supports_shell, workspace files are pulled from
+                the remote VM instead of copied from the local filesystem.
         """
         self.job_id = job_id
 
@@ -171,6 +184,7 @@ class PhaseSnapshotManager:
         self._snapshots_dir = get_phase_snapshots_path() / f"job_{job_id}"
         self._workspace_path = base_path / f"job_{job_id}"
         self._checkpoint_path = base_path / "checkpoints" / f"job_{job_id}.db"
+        self._backend = workspace_backend
 
     @property
     def snapshots_dir(self) -> Path:
@@ -223,26 +237,53 @@ class PhaseSnapshotManager:
                     f"[{self.job_id}] Snapshot: checkpoint.db not found at {checkpoint_path}"
                 )
 
-            # 2. Copy workspace files
+            # 2. Copy workspace files (remote: pull from VM; local: copy from disk)
             workspace_path = self._workspace_path
             if workspace_manager:
                 workspace_path = workspace_manager.path
 
             files_to_copy = ["workspace.md", "plan.md", "todos.yaml"]
-            for filename in files_to_copy:
-                src = workspace_path / filename
-                if src.exists():
-                    shutil.copy2(src, snapshot_dir / filename)
-                    logger.debug(f"[{self.job_id}] Snapshot: copied {filename}")
+            if self._backend and self._backend.supports_shell:
+                # Remote backend: read files over SSH/SFTP and save locally
+                for filename in files_to_copy:
+                    try:
+                        content = self._backend.read_file(filename)
+                        (snapshot_dir / filename).write_text(content, encoding="utf-8")
+                        logger.debug(f"[{self.job_id}] Snapshot: pulled {filename} from VM")
+                    except Exception as e:
+                        logger.debug(f"[{self.job_id}] Snapshot: {filename} not on VM: {e}")
+            else:
+                for filename in files_to_copy:
+                    src = workspace_path / filename
+                    if src.exists():
+                        shutil.copy2(src, snapshot_dir / filename)
+                        logger.debug(f"[{self.job_id}] Snapshot: copied {filename}")
 
             # 3. Copy archive directory
-            archive_src = workspace_path / "archive"
             archive_dst = snapshot_dir / "archive"
-            if archive_src.exists() and any(archive_src.iterdir()):
-                if archive_dst.exists():
-                    shutil.rmtree(archive_dst)
-                shutil.copytree(archive_src, archive_dst)
-                logger.debug(f"[{self.job_id}] Snapshot: copied archive/")
+            if self._backend and self._backend.supports_shell:
+                # Remote: pull archive files from VM
+                try:
+                    archive_files = self._backend.list_dir("archive")
+                    if archive_files:
+                        archive_dst.mkdir(parents=True, exist_ok=True)
+                        for af in archive_files:
+                            remote_path = f"archive/{af}"
+                            try:
+                                content = self._backend.read_file(remote_path)
+                                (archive_dst / af).write_text(content, encoding="utf-8")
+                            except Exception:
+                                pass  # Skip binary or unreadable files
+                        logger.debug(f"[{self.job_id}] Snapshot: pulled archive/ from VM")
+                except Exception as e:
+                    logger.debug(f"[{self.job_id}] Snapshot: archive/ not on VM: {e}")
+            else:
+                archive_src = workspace_path / "archive"
+                if archive_src.exists() and any(archive_src.iterdir()):
+                    if archive_dst.exists():
+                        shutil.rmtree(archive_dst)
+                    shutil.copytree(archive_src, archive_dst)
+                    logger.debug(f"[{self.job_id}] Snapshot: copied archive/")
 
             # 4. Write metadata
             snapshot = PhaseSnapshot(
@@ -373,32 +414,59 @@ class PhaseSnapshotManager:
                     f"[{self.job_id}] No checkpoint.db in phase {phase_number} snapshot"
                 )
 
-            # 2. Restore workspace files
+            # 2. Restore workspace files (remote: push to VM; local: copy to disk)
             files_to_restore = ["workspace.md", "plan.md", "todos.yaml"]
-            for filename in files_to_restore:
-                src = snapshot_dir / filename
-                dst = workspace_path / filename
-                if src.exists():
-                    shutil.copy2(src, dst)
-                    logger.debug(f"[{self.job_id}] Restored {filename}")
-                elif dst.exists():
-                    # File doesn't exist in snapshot but exists now - keep it
-                    # (might be instructions.md or other files we don't snapshot)
-                    pass
+            if self._backend and self._backend.supports_shell:
+                # Remote backend: push snapshot files to VM
+                for filename in files_to_restore:
+                    src = snapshot_dir / filename
+                    if src.exists():
+                        content = src.read_text(encoding="utf-8")
+                        try:
+                            self._backend.write_file(filename, content)
+                            logger.debug(f"[{self.job_id}] Pushed {filename} to VM")
+                        except Exception as e:
+                            logger.warning(f"[{self.job_id}] Failed to push {filename} to VM: {e}")
+            else:
+                for filename in files_to_restore:
+                    src = snapshot_dir / filename
+                    dst = workspace_path / filename
+                    if src.exists():
+                        shutil.copy2(src, dst)
+                        logger.debug(f"[{self.job_id}] Restored {filename}")
+                    elif dst.exists():
+                        # File doesn't exist in snapshot but exists now - keep it
+                        pass
 
             # 3. Restore archive directory
             archive_src = snapshot_dir / "archive"
-            archive_dst = workspace_path / "archive"
-            if archive_src.exists():
-                if archive_dst.exists():
+            if self._backend and self._backend.supports_shell:
+                # Remote: push archive files to VM
+                if archive_src.exists():
+                    try:
+                        self._backend.mkdir("archive")
+                    except Exception:
+                        pass
+                    for af in archive_src.iterdir():
+                        if af.is_file():
+                            content = af.read_text(encoding="utf-8")
+                            try:
+                                self._backend.write_file(f"archive/{af.name}", content)
+                            except Exception:
+                                pass
+                    logger.debug(f"[{self.job_id}] Pushed archive/ to VM")
+            else:
+                archive_dst = workspace_path / "archive"
+                if archive_src.exists():
+                    if archive_dst.exists():
+                        shutil.rmtree(archive_dst)
+                    shutil.copytree(archive_src, archive_dst)
+                    logger.debug(f"[{self.job_id}] Restored archive/")
+                elif archive_dst.exists():
+                    # Clear archive if snapshot has no archive
                     shutil.rmtree(archive_dst)
-                shutil.copytree(archive_src, archive_dst)
-                logger.debug(f"[{self.job_id}] Restored archive/")
-            elif archive_dst.exists():
-                # Clear archive if snapshot has no archive
-                shutil.rmtree(archive_dst)
-                archive_dst.mkdir()
-                logger.debug(f"[{self.job_id}] Cleared archive/ (empty in snapshot)")
+                    archive_dst.mkdir()
+                    logger.debug(f"[{self.job_id}] Cleared archive/ (empty in snapshot)")
 
             logger.info(
                 f"[{self.job_id}] Successfully recovered to phase {phase_number} "

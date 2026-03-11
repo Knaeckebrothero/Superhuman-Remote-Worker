@@ -258,37 +258,51 @@ The current HTTP communication doesn't need to be ripped out immediately. NATS c
 
 **Deliverables:** Helm values in `deployment/nats/`, stream setup script, NATS running on both clusters, local dev NATS in docker-compose, verified cross-cluster messaging.
 
-### Phase 2: VM Management Daemon over NATS
+### Phase 2: VM Management Daemon over NATS — DONE
 
 **Goal:** Management daemon communicates with orchestrator exclusively via NATS. No HTTP changes to the agent↔orchestrator path.
 
-**Status:** The daemon stub (`deployment/harvester/packer/files/management-daemon/daemon.py`) already implements NATS pub/sub for register, heartbeat, status, and control commands.
+**Status:** Fully implemented. The daemon stub implements NATS pub/sub for register, heartbeat, status, and control commands. The orchestrator-side NATS bridge subscribes to all four subject patterns and publishes control commands.
 
-**Steps:**
+**What was implemented:**
 
-1. **Add orchestrator-side NATS subscriber**
-   - New module: `orchestrator/services/nats_bridge.py`
-   - On startup, connect to NATS hub and subscribe to `agent.vm.>` (wildcard)
-   - Route incoming messages to existing orchestrator logic:
-     - `agent.vm.{job_id}.register` → log VM registration, update job metadata
-     - `agent.vm.{job_id}.heartbeat` → store VM health metrics (new `vm_heartbeats` table or append to existing metrics)
-     - `agent.vm.{job_id}.status` → update job status on completion/failure
-   - Wire into FastAPI lifespan (`app.on_event("startup")` / `asynccontextmanager`)
+1. **Orchestrator-side NATS bridge** — `orchestrator/services/nats_bridge.py`
+   - Module-level `try/except` import for `nats-py` (graceful degradation like MongoDB)
+   - `NatsBridge` singleton class with `connect()` / `disconnect()` lifecycle
+   - 4 specific subscriptions (not `agent.vm.>` wildcard, to avoid catching control messages the bridge itself publishes):
+     - `vm.lifecycle.status` → merge VM controller status into job context
+     - `agent.vm.*.register` → update context with `status: "ready"`, call `on_vm_ready` callback
+     - `agent.vm.*.heartbeat` → update `last_heartbeat` timestamp (debug log only)
+     - `agent.vm.*.status` → log agent exit (informational — HTTP `/job/complete` is authoritative)
+   - 4 publishers: `request_vm_create`, `request_vm_delete`, `query_vm_status` (request/reply), `send_control`
+   - `_set_vm_context()` helper for read-modify-write on job context JSONB `"vm"` key
+   - Wired into FastAPI lifespan (connect after Gitea init, disconnect before MongoDB)
 
-2. **Add orchestrator-side NATS publisher for control commands**
-   - Extend `nats_bridge.py` with `publish_control(job_id, action)` method
-   - Wire into existing freeze/resume/cancel endpoints — when a job is VM-based, publish to `agent.vm.{job_id}.control` instead of HTTP
+2. **Unified VM provisioner** — `orchestrator/services/vm_provisioner.py`
+   - Wraps the NATS bridge with a direct K8s API fallback for same-cluster provisioning
+   - Auto-selects backend: NATS when `NATS_URL` is set, direct K8s otherwise
+   - Direct mode renders the `vm-template.yaml` and calls KubeVirt API via `kubernetes` Python client
+   - Same-cluster provisioning works without NATS at all
 
-3. **Test the full VM lifecycle**
-   - `register` → `heartbeat` (periodic) → `control: freeze` → `control: resume` → `status: completed`
-   - Verify the orchestrator processes each message correctly
-   - Use the local dev NATS from Phase 1 for integration testing
+3. **REST endpoints + lifecycle hooks** in `orchestrator/main.py`
+   - `POST/GET /api/vms`, `GET/DELETE /api/vms/{job_id}`
+   - `cancel_job` → terminate + delete VM, `pause_job` → freeze, `complete_job` → auto-delete VM
+   - `VMCreateRequest` Pydantic model
+
+4. **Local dev NATS** in `docker-compose.dev.yaml`
+   - `nats:2.10-alpine` with JetStream, ports 4222 + 8222
+
+5. **Infrastructure**
+   - `nats-py>=2.9.0` + `kubernetes>=28.0.0` in `orchestrator/requirements.txt`
+   - `NATS_URL`, `VM_TEMPLATE_PATH`, `VM_NAMESPACE` env vars in K8s deployment manifest (all `optional: true`)
+   - `.env.example` updated with VM lifecycle configuration section
 
 **Files touched:**
-- New: `orchestrator/services/nats_bridge.py`
-- Modified: `orchestrator/main.py` (lifespan, inject NATS bridge into control endpoints)
+- New: `orchestrator/services/nats_bridge.py`, `orchestrator/services/vm_provisioner.py`
+- Modified: `orchestrator/main.py` (import, lifespan, VMCreateRequest model, 4 VM endpoints, cancel/pause/complete hooks)
+- Modified: `orchestrator/requirements.txt`, `requirements.txt`, `docker-compose.dev.yaml`, `deployment/20-orchestrator.yaml`, `.env.example`
 
-**Deliverables:** Orchestrator subscribes to VM events over NATS, can send control commands over NATS, local dev NATS available.
+**Deliverables:** Orchestrator subscribes to VM events over NATS, can send control commands, can provision VMs directly (same-cluster) or via NATS (cross-cluster), local dev NATS available.
 
 ### Phase 3: Agent Heartbeats over NATS (optional)
 
@@ -359,12 +373,12 @@ The current HTTP communication doesn't need to be ripped out immediately. NATS c
 
 ### Phase Summary
 
-| Phase | Depends On | Scope | Risk |
-|-------|-----------|-------|------|
-| 1 — NATS infrastructure | Nothing | Infra only, no code changes | Low — additive, nothing breaks |
-| 2 — VM daemon over NATS | Phase 1 | New module in orchestrator | Low — VM path is new, no existing behavior changes |
-| 3 — Agent heartbeats | Phase 1 | Modify heartbeat loop | Low — HTTP fallback preserved, env-gated |
-| 4 — Job dispatch | Phase 1 | Modify job assignment flow | Medium — core dispatch path, needs careful testing |
+| Phase | Depends On | Scope | Risk | Status |
+|-------|-----------|-------|------|--------|
+| 1 — NATS infrastructure | Nothing | Infra only, no code changes | Low — additive, nothing breaks | **Helm values DONE**, needs deployment |
+| 2 — VM daemon over NATS | Phase 1 | New module in orchestrator | Low — VM path is new, no existing behavior changes | **DONE** |
+| 3 — Agent heartbeats | Phase 1 | Modify heartbeat loop | Low — HTTP fallback preserved, env-gated | Not started |
+| 4 — Job dispatch | Phase 1 | Modify job assignment flow | Medium — core dispatch path, needs careful testing | Not started |
 
 Each phase can be merged and deployed independently. Phases 3 and 4 are optional and can be deferred indefinitely — HTTP coexists with NATS at every stage.
 

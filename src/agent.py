@@ -434,7 +434,12 @@ class UniversalAgent:
             logger.info(f"Checkpointer initialized at {checkpoint_path}")
 
             # Create snapshot manager for phase recovery
-            snapshot_manager = PhaseSnapshotManager(job_id)
+            # Pass workspace backend so snapshots are extracted from VM to pod-local storage
+            ws_backend = self._workspace_manager.backend if self._workspace_manager else None
+            snapshot_manager = PhaseSnapshotManager(
+                job_id,
+                workspace_backend=ws_backend,
+            )
 
             # Build graph for this job
             workspace_template = self._load_workspace_template()
@@ -540,7 +545,17 @@ class UniversalAgent:
                     await self._cleanup_checkpointer()
 
         except Exception as e:
-            logger.error(f"Job {job_id} failed: {e}", exc_info=True)
+            # Detect workspace unavailable errors (VM connection lost)
+            from .core.workspace_backend import WorkspaceUnavailableError
+            is_vm_error = isinstance(e, WorkspaceUnavailableError)
+
+            if is_vm_error:
+                logger.error(
+                    f"Job {job_id}: VM workspace unavailable — will request recovery: {e}"
+                )
+            else:
+                logger.error(f"Job {job_id} failed: {e}", exc_info=True)
+
             self._cleanup_shell_manager()
             self._close_datasource_connections()
             await self._cleanup_checkpointer()
@@ -549,8 +564,8 @@ class UniversalAgent:
                 "job_id": job_id,
                 "error": {
                     "message": str(e),
-                    "type": "job_error",
-                    "recoverable": False,
+                    "type": "workspace_unavailable" if is_vm_error else "job_error",
+                    "recoverable": is_vm_error,
                 },
                 "should_stop": True,
             }
@@ -827,8 +842,31 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to freeze resolved config: {e}")
 
+        # Create workspace backend based on config
+        workspace_backend = None
+        if self.config.workspace.backend == "remote" and self.config.workspace.remote:
+            try:
+                from .core.backends.remote import RemoteBackend
+                remote_cfg = self.config.workspace.remote
+                workspace_backend = RemoteBackend(
+                    host=remote_cfg["host"],
+                    port=remote_cfg.get("port", 22),
+                    username=remote_cfg.get("username", "agent-host"),
+                    key_path=remote_cfg.get("key_path"),
+                    workspace_path=remote_cfg.get("workspace_path", "/home/agent-worker/workspace"),
+                    job_id=job_id,
+                    scrollback_limit=self.config.extra.get("shell", {}).get("scrollback_limit", 5000),
+                    default_timeout=self.config.extra.get("shell", {}).get("default_timeout", 120),
+                    max_tabs=self.config.extra.get("shell", {}).get("max_tabs", 15),
+                    blocked_commands=self.config.extra.get("shell", {}).get("blocked_commands"),
+                )
+                workspace_backend.connect()
+                logger.info(f"Remote workspace backend connected to {remote_cfg['host']}")
+            except Exception as e:
+                logger.error(f"Failed to create remote backend: {e}")
+                raise
+
         # Create workspace manager
-        # base_path is None - let WorkspaceManager use get_workspace_base_path()
         self._workspace_manager = WorkspaceManager(
             job_id=job_id,
             config=WorkspaceManagerConfig(
@@ -837,8 +875,39 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 git_remote_url=metadata.get("git_remote_url"),
                 branch_name=metadata.get("branch_name"),
                 repositories=metadata.get("repositories"),
-            )
+            ),
+            backend=workspace_backend,
         )
+
+        # VM recovery: seed fresh VM workspace from last snapshot if needed
+        if resume and workspace_backend and workspace_backend.supports_shell:
+            try:
+                if not workspace_backend.exists("workspace.md"):
+                    logger.info(f"VM workspace is fresh — seeding from last snapshot for job {job_id}")
+                    from .core.phase_snapshot import PhaseSnapshotManager
+                    recovery_mgr = PhaseSnapshotManager(
+                        job_id, workspace_backend=workspace_backend
+                    )
+                    latest = recovery_mgr.get_latest_snapshot()
+                    if latest:
+                        # Ensure base directories exist on VM
+                        for subdir in self.config.workspace.structure:
+                            try:
+                                workspace_backend.mkdir(subdir.rstrip("/"))
+                            except Exception:
+                                pass
+                        # Push snapshot files to VM
+                        recovery_mgr.recover_to_phase(
+                            latest.phase_number,
+                            workspace_manager=self._workspace_manager,
+                        )
+                        logger.info(
+                            f"Seeded VM workspace from phase {latest.phase_number} snapshot"
+                        )
+                    else:
+                        logger.warning("No snapshots available to seed VM workspace")
+            except Exception as e:
+                logger.warning(f"VM workspace seeding failed: {e}")
 
         # Pod handoff: clone workspace from Gitea if resuming on a new pod
         if resume and not self._workspace_manager.path.exists() and metadata.get("git_remote_url"):
@@ -1291,8 +1360,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         )
         self._tool_context = context
 
-        # Initialize ShellManager for persistent terminal sessions (if tmux available)
-        if shutil.which("tmux"):
+        # Initialize ShellManager for persistent terminal sessions
+        ws_backend = self._workspace_manager.backend
+        use_remote_shell = getattr(ws_backend, "supports_shell", False)
+
+        if use_remote_shell or shutil.which("tmux"):
             try:
                 from src.tools.coding.shell_manager import ShellManager
 
@@ -1305,8 +1377,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     default_timeout=shell_config.get("default_timeout", 120),
                     blocked_commands=shell_config.get("blocked_commands"),
                     sandbox_cwd=str(self._workspace_manager.path) if shell_config.get("sandbox", True) else None,
-                    auto_start_claude_code=shell_config.get("auto_start_claude_code", False),
+                    auto_start_claude_code=shell_config.get("auto_start_claude_code", False) if not use_remote_shell else False,
                     claude_code_model=cc_config.get("model", "claude-opus-4-6"),
+                    backend=ws_backend if use_remote_shell else None,
                 )
                 context.shell_manager = shell_manager
                 self._shell_manager = shell_manager

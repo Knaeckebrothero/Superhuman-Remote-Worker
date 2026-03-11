@@ -92,10 +92,10 @@ case "${GPU_ARCH}" in
     "ampere")
         # Ampere REQUIRES TRITON_ATTN - FlashAttention doesn't support sinks on sm_80
         if [ -n "${USER_BACKEND_OVERRIDE}" ]; then
-            export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
+            ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
             echo "Note: Using user-specified backend ${USER_BACKEND_OVERRIDE} for Ampere GPU (WARNING: may crash)"
         else
-            export VLLM_ATTENTION_BACKEND="TRITON_ATTN"
+            ATTENTION_BACKEND="TRITON_ATTN"
             echo "Note: Using TRITON_ATTN backend for Ampere GPU (required for gpt-oss sinks)"
         fi
         # TRITON_ATTN doesn't support explicit kv_cache_dtype - must use auto
@@ -105,10 +105,10 @@ case "${GPU_ARCH}" in
     "ada")
         # Ada REQUIRES TRITON_ATTN - FlashAttention doesn't support sinks on sm_89
         if [ -n "${USER_BACKEND_OVERRIDE}" ]; then
-            export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
+            ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
             echo "Note: Using user-specified backend ${USER_BACKEND_OVERRIDE} for Ada GPU (WARNING: may crash)"
         else
-            export VLLM_ATTENTION_BACKEND="TRITON_ATTN"
+            ATTENTION_BACKEND="TRITON_ATTN"
             echo "Note: Using TRITON_ATTN backend for Ada GPU (required for gpt-oss sinks)"
         fi
         # TRITON_ATTN doesn't support explicit kv_cache_dtype - must use auto
@@ -118,31 +118,31 @@ case "${GPU_ARCH}" in
     "hopper")
         # Hopper supports FlashAttention 3 with sinks
         if [ -n "${USER_BACKEND_OVERRIDE}" ]; then
-            export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
+            ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
         else
-            export VLLM_ATTENTION_BACKEND="FLASH_ATTN"
+            ATTENTION_BACKEND="FLASH_ATTN"
         fi
-        echo "Note: Using ${VLLM_ATTENTION_BACKEND} backend with FlashAttention 3 for Hopper GPU"
+        echo "Note: Using ${ATTENTION_BACKEND} backend with FlashAttention 3 for Hopper GPU"
         ;;
     "blackwell")
         # Blackwell has native MXFP4 tensor cores
         if [ -n "${USER_BACKEND_OVERRIDE}" ]; then
-            export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
+            ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
         else
-            export VLLM_ATTENTION_BACKEND="FLASHINFER"
+            ATTENTION_BACKEND="FLASHINFER"
         fi
-        echo "Note: Using ${VLLM_ATTENTION_BACKEND} backend with native MXFP4 for Blackwell GPU"
+        echo "Note: Using ${ATTENTION_BACKEND} backend with native MXFP4 for Blackwell GPU"
         ;;
     *)
         # Unknown GPU - use safe default (TRITON_ATTN supports sinks)
         if [ -n "${USER_BACKEND_OVERRIDE}" ]; then
-            export VLLM_ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
+            ATTENTION_BACKEND="${USER_BACKEND_OVERRIDE}"
         else
-            export VLLM_ATTENTION_BACKEND="TRITON_ATTN"
+            ATTENTION_BACKEND="TRITON_ATTN"
         fi
         # TRITON_ATTN doesn't support explicit kv_cache_dtype - must use auto
         KV_CACHE_DTYPE="auto"
-        echo "Warning: Unknown GPU architecture, using ${VLLM_ATTENTION_BACKEND} backend (KV cache: auto)"
+        echo "Warning: Unknown GPU architecture, using ${ATTENTION_BACKEND} backend (KV cache: auto)"
         ;;
 esac
 
@@ -168,10 +168,10 @@ QUANTIZATION="${QUANTIZATION:-auto}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
 
 # Batching settings - conservative for agent workloads (sequential requests)
-# Lower MAX_NUM_BATCHED_TOKENS = better inter-token latency (ITL)
-# Higher MAX_NUM_BATCHED_TOKENS = better time-to-first-token (TTFT)
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+# v0.14.1 requires max_num_batched_tokens >= max_model_len when chunked prefill
+# is disabled. Default to max_model_len to allow full context sequences.
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-${MAX_MODEL_LEN}}"
 
 # Performance flags
 # Note: ASYNC_SCHEDULING had bugs in v0.11.0 causing gibberish output.
@@ -227,9 +227,16 @@ if [ -n "${KV_CACHE_DTYPE}" ]; then
     fi
 fi
 
+# Attention backend (v0.14.1 uses CLI arg with JSON instead of env var)
+CMD="${CMD} --attention-config {\"backend\":\"${ATTENTION_BACKEND}\"}"
+
 # Performance optimizations
+# v0.14.1 auto-enables async scheduling and chunked prefill by default,
+# so we must explicitly disable them when not wanted
 if [ "${ASYNC_SCHEDULING}" = "true" ]; then
     CMD="${CMD} --async-scheduling"
+else
+    CMD="${CMD} --no-async-scheduling"
 fi
 
 if [ "${ENABLE_PREFIX_CACHING}" = "true" ]; then
@@ -238,6 +245,8 @@ fi
 
 if [ "${ENABLE_CHUNKED_PREFILL}" = "true" ]; then
     CMD="${CMD} --enable-chunked-prefill"
+else
+    CMD="${CMD} --no-enable-chunked-prefill"
 fi
 
 # Tool calling (CRITICAL for gpt-oss harmony format)
@@ -279,7 +288,7 @@ echo "  gpt-oss-vllm (vLLM ${VLLM_VERSION})"
 echo "=============================================="
 echo ""
 echo "GPU Architecture:   ${GPU_ARCH}"
-echo "Attention Backend:  ${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
+echo "Attention Backend:  ${ATTENTION_BACKEND}"
 echo ""
 echo "Model:              ${MODEL}"
 echo "Max context:        ${MAX_MODEL_LEN}"
