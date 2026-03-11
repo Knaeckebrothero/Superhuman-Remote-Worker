@@ -31,6 +31,9 @@ podman-compose -f docker-compose.dev.yaml up -d
 # Start only databases
 podman-compose -f docker-compose.dev.yaml up -d postgres mongodb neo4j
 
+# Start databases + NATS (for VM lifecycle testing)
+podman-compose -f docker-compose.dev.yaml up -d postgres mongodb neo4j nats
+
 # Start databases + MCP for Claude Code
 podman-compose -f docker-compose.dev.yaml up -d postgres mongodb neo4j mcp
 
@@ -361,6 +364,37 @@ This separation means workspace.md survives context compaction while the convers
 
 When `memory.enabled: true` in config, agents get a PostgreSQL-backed memory system (pgvector hybrid search) that stores and retrieves insights across context compactions. Memories are extracted from 5 channels (observer, todo completion, compaction, phase archive, tool errors) and injected as transient messages like workspace.md. Disabled by default. See `docs/features/memory_light.md` for full design and config keys.
 
+### VM Lifecycle Management (Optional)
+
+The orchestrator can provision KubeVirt VMs for agent jobs, with two auto-selected backends:
+
+| Mode | When | How |
+|------|------|-----|
+| **Direct** (same-cluster) | `kubernetes` client available + `VM_TEMPLATE_PATH` set | Orchestrator calls KubeVirt API directly |
+| **NATS** (cross-cluster) | `NATS_URL` configured | Orchestrator publishes to NATS, VM Controller on agent cluster handles K8s API |
+| **Disabled** | Neither configured | No VM features, system works as before |
+
+NATS takes priority when both are available. All VM features are fully optional — the system degrades gracefully when unconfigured, following the same pattern as MongoDB (`orchestrator/database/mongodb.py`).
+
+**Implementation:** `orchestrator/services/vm_provisioner.py` (unified provisioner, auto-selects backend), `orchestrator/services/nats_bridge.py` (NATS subscriptions + publishers), `vm-controller/controller.py` (agent cluster side). REST endpoints: `POST/GET /api/vms`, `GET/DELETE /api/vms/{job_id}`.
+
+**NATS subjects:**
+
+| Subject | Direction | Purpose |
+|---------|-----------|---------|
+| `vm.lifecycle.create` | Orchestrator → VM Controller | Request VM creation |
+| `vm.lifecycle.delete` | Orchestrator → VM Controller | Request VM teardown |
+| `vm.lifecycle.get` | Orchestrator ↔ VM Controller | Request/reply for live status |
+| `vm.lifecycle.status` | VM Controller → Orchestrator | Creation/deletion results |
+| `agent.vm.{job_id}.control` | Orchestrator → Daemon | Freeze/resume/terminate |
+| `agent.vm.*.register` | Daemon → Orchestrator | VM ready notification |
+| `agent.vm.*.heartbeat` | Daemon → Orchestrator | Periodic health updates |
+| `agent.vm.*.status` | Daemon → Orchestrator | Agent process exit |
+
+Control commands (freeze/resume/terminate) require NATS since they target the management daemon inside the VM. On same-cluster without NATS, `cancel_job` compensates by deleting the VM directly via K8s API.
+
+See `docs/features/vm_backend.md` for the full workspace backend design and `docs/features/nats.md` for the messaging layer architecture.
+
 ## Key Entry Points
 
 - `init.py` - Root initialization script (orchestrates database + workspace setup)
@@ -370,11 +404,13 @@ When `memory.enabled: true` in config, agents get a PostgreSQL-backed memory sys
 - `src/core/loader.py` - Config loading, LLM creation, matrix resolvers, resolved config serialization
 - `src/core/context.py` - ContextManager (token counting, compaction, three-layer safety)
 - `src/tools/registry.py` - Tool metadata registry with phase filtering
-- `orchestrator/main.py` - FastAPI orchestrator endpoints (job management, agent heartbeat)
+- `orchestrator/main.py` - FastAPI orchestrator endpoints (job management, agent heartbeat, VM lifecycle)
+- `orchestrator/services/vm_provisioner.py` - Unified VM provisioner (NATS or direct K8s)
+- `orchestrator/services/nats_bridge.py` - NATS bridge for cross-cluster VM communication
 - `orchestrator/services/builder_tools.py` - Instruction builder tool schemas (cockpit chat assistant)
 - `orchestrator/mcp/` - MCP server for Claude Code integration
 
-**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `cockpit/` (Angular frontend), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
+**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/core/backends/` (LocalBackend, RemoteBackend for VM workspaces), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `orchestrator/services/` (nats_bridge, vm_provisioner, gitea, builder, completion), `cockpit/` (Angular frontend), `vm-controller/` (KubeVirt VM lifecycle on agent cluster), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
 
 **Design documents:** `docs/` contains concept/design documents for features — `docs/persistent_shell.md`, `docs/datasources.md`, `docs/features/` (memory_light, projects, repo_datasource, prompting, summary_tool, etc.). These are architectural specs, not user-facing docs.
 
@@ -440,11 +476,19 @@ Required in `.env`:
 - `VISION_MODEL` - Model to use (default: `gpt-4o-mini`)
 - `VISION_TIMEOUT` - Request timeout in seconds (default: `120`)
 
+**VM Lifecycle** (optional):
+- `NATS_URL` - NATS server URL for cross-cluster VM communication
+- `VM_TEMPLATE_PATH` - Path to KubeVirt VM template YAML (for direct same-cluster provisioning)
+- `VM_NAMESPACE` - Target K8s namespace for VMs (default: `agent-vms`)
+- `DEFAULT_VM_IMAGE` - Default VM container disk image
+
 ## Service Ports
 
 | Service | Port |
 |---------|------|
 | Agent API | 8001 |
+| NATS (client connections) | 4222 |
+| NATS (monitoring) | 8222 |
 | MCP Server (Claude Code) | 8055 |
 | Orchestrator API | 8085 |
 | Cockpit Frontend (docker) | 4000 |

@@ -56,6 +56,8 @@ from services.builder_tools import (  # noqa: E402
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
+from services.nats_bridge import nats_bridge  # noqa: E402
+from services.vm_provisioner import vm_provisioner  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -348,6 +350,22 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         if resolved_ds:
             config_override = _build_datasource_tool_override(resolved_ds, config_override)
 
+        # Inject VM workspace config if job has a ready VM
+        vm_ctx = _get_vm_context(job)
+        if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+            config_override = config_override or {}
+            ws = config_override.setdefault("workspace", {})
+            ws["backend"] = "remote"
+            remote = ws.setdefault("remote", {})
+            remote.setdefault("host", vm_ctx["ssh_host"])
+            remote.setdefault("port", vm_ctx.get("ssh_port", 22))
+            remote.setdefault("username", "agent-host")
+            remote.setdefault("workspace_path", "/home/agent-worker/workspace")
+            logger.info(
+                f"Dispatch: injected VM workspace config for job {job_id} "
+                f"(host={vm_ctx['ssh_host']})"
+            )
+
         # Build job start request
         job_start = JobStartRequest(
             job_id=job_id,
@@ -425,6 +443,22 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             config_override = json.loads(config_override)
         if resolved_ds:
             config_override = _build_datasource_tool_override(resolved_ds, config_override)
+
+        # Inject VM workspace config if job has a ready VM
+        vm_ctx = _get_vm_context(job)
+        if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+            config_override = config_override or {}
+            ws = config_override.setdefault("workspace", {})
+            ws["backend"] = "remote"
+            remote = ws.setdefault("remote", {})
+            remote.setdefault("host", vm_ctx["ssh_host"])
+            remote.setdefault("port", vm_ctx.get("ssh_port", 22))
+            remote.setdefault("username", "agent-host")
+            remote.setdefault("workspace_path", "/home/agent-worker/workspace")
+            logger.info(
+                f"Resume dispatch: injected VM workspace config for job {job_id} "
+                f"(host={vm_ctx['ssh_host']})"
+            )
 
         # Extract queued feedback (stored by resume endpoint when no agent was available)
         job_context = job.get("context") or {}
@@ -513,11 +547,48 @@ async def _initiate_pause(job: dict) -> None:
         _pause_pending_job_ids.discard(job_id)
 
 
+def _job_needs_vm(job: dict) -> bool:
+    """Check if a job requires a VM workspace (from config_override or context)."""
+    # Explicit VM request in context
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    vm_ctx = ctx.get("vm", {})
+    if vm_ctx.get("requested"):
+        return True
+    # Config override specifies remote workspace
+    co = job.get("config_override") or {}
+    if isinstance(co, str):
+        try:
+            co = json.loads(co)
+        except (json.JSONDecodeError, TypeError):
+            co = {}
+    return co.get("workspace", {}).get("backend") == "remote"
+
+
+def _get_vm_context(job: dict) -> dict:
+    """Extract the vm sub-dict from job context."""
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    return ctx.get("vm", {})
+
+
 async def _try_dispatch_pending_jobs() -> None:
     """Core dispatcher: match pending jobs to available agents.
 
     Phase 1: Direct assignment (free agents → highest priority pending jobs)
     Phase 2: Preemption (remaining high-priority jobs → lowest-priority running jobs)
+
+    VM-aware: jobs needing a VM are auto-provisioned and held until the VM
+    registers as ready. Jobs with a ready VM get workspace config injected
+    into config_override before dispatch.
     """
     if not AUTO_ASSIGN_ENABLED:
         return
@@ -529,6 +600,41 @@ async def _try_dispatch_pending_jobs() -> None:
             if not pending_jobs:
                 return
 
+            # Pre-filter: auto-provision VMs for jobs that need one
+            dispatchable_jobs = []
+            for job in pending_jobs:
+                job_id = str(job["id"])
+                if _job_needs_vm(job):
+                    vm_ctx = _get_vm_context(job)
+                    if not vm_ctx.get("status"):
+                        # VM needed but not provisioned yet — provision now
+                        if vm_provisioner.is_available:
+                            config_override = job.get("config_override") or {}
+                            if isinstance(config_override, str):
+                                config_override = json.loads(config_override)
+                            vm_cfg = config_override.get("workspace", {}).get("vm", {})
+                            ok = await vm_provisioner.create_vm(
+                                job_id=job_id,
+                                agent_config=job.get("config_name", "defaults"),
+                                vm_image=vm_cfg.get("image"),
+                                cpu_cores=vm_cfg.get("cpu_cores", 2),
+                                memory=vm_cfg.get("memory", "4Gi"),
+                                description=job.get("description", ""),
+                            )
+                            if ok:
+                                logger.info(f"Dispatcher: auto-provisioned VM for job {job_id}")
+                            else:
+                                logger.warning(f"Dispatcher: VM provisioning failed for job {job_id}")
+                        continue  # Skip this job — wait for VM to register
+                    elif vm_ctx.get("status") not in ("ready",):
+                        # VM is provisioning/creating — skip, wait
+                        continue
+                    # else: VM is ready, proceed with dispatch
+                dispatchable_jobs.append(job)
+
+            if not dispatchable_jobs:
+                return
+
             # Get available agents (ready, cooldown passed)
             available_agents = await postgres_db.get_available_agents(limit=50)
 
@@ -537,7 +643,7 @@ async def _try_dispatch_pending_jobs() -> None:
             matched_agent_ids = set()
 
             agents_iter = iter(available_agents)
-            for job in pending_jobs:
+            for job in dispatchable_jobs:
                 agent = next(agents_iter, None)
                 if agent is None:
                     break  # No more free agents
@@ -758,6 +864,17 @@ class BuilderSessionCreate(BaseModel):
     user_id: str | None = Field(None, description="User UUID who created this session")
 
 
+class VMCreateRequest(BaseModel):
+    """Request body for creating a VM for a job."""
+
+    job_id: str
+    agent_config: str = "defaults"
+    vm_image: str | None = None
+    cpu_cores: int = Field(2, ge=1, le=16)
+    memory: str = "4Gi"
+    description: str = ""
+
+
 class UserCreate(BaseModel):
     """Request body for creating a user."""
 
@@ -928,6 +1045,12 @@ async def lifespan(app: FastAPI):
     # Initialize Gitea workspace delivery (graceful if unavailable)
     await gitea_client.ensure_initialized()
 
+    # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
+    await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
+
+    # Initialize VM provisioner (uses NATS if available, else direct K8s)
+    vm_provisioner.connect(db=postgres_db)
+
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
@@ -943,6 +1066,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
 
     # Cleanup clients
+    await nats_bridge.disconnect()
     await gitea_client.close()
 
     # Disconnect from databases
@@ -1464,6 +1588,13 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                     # Agent might be unreachable — still cancel in DB
                     logger.warning(f"Could not reach agent to cancel job {job_id}: {e}")
 
+        # If job has a VM, send terminate and request deletion
+        vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
+        if vm_ctx:
+            await vm_provisioner.send_control(job_id, "terminate")
+            if vm_ctx.get("status") not in ("deleted", "deleting"):
+                await vm_provisioner.delete_vm(job_id)
+
         success = await postgres_db.cancel_job(job_id)
         if not success:
             raise HTTPException(
@@ -1533,6 +1664,11 @@ async def pause_job(job_id: str) -> dict[str, str]:
                 except Exception as e:
                     logger.warning(f"Could not reach agent to pause job {job_id}: {e}")
 
+        # If job has a VM, send freeze via NATS (requires management daemon)
+        vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
+        if vm_ctx:
+            await vm_provisioner.send_control(job_id, "freeze")
+
         # Update DB — the agent also does this, but we ensure it here as fallback
         success = await postgres_db.pause_job(job_id)
         if not success:
@@ -1545,6 +1681,121 @@ async def pause_job(job_id: str) -> dict[str, str]:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# VM Lifecycle Endpoints (optional — requires NATS)
+# =============================================================================
+
+
+@app.post("/api/vms")
+async def create_vm(request: VMCreateRequest) -> dict[str, Any]:
+    """Create a VM for a job.
+
+    Uses NATS (cross-cluster) or direct Kubernetes API (same-cluster).
+    Returns 503 if no VM provisioning backend is available.
+    """
+    if not vm_provisioner.is_available:
+        raise HTTPException(status_code=503, detail="VM provisioning not available (no NATS or K8s)")
+
+    job = await postgres_db.get_job(request.job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{request.job_id}' not found")
+
+    success = await vm_provisioner.create_vm(
+        job_id=request.job_id,
+        agent_config=request.agent_config,
+        vm_image=request.vm_image,
+        cpu_cores=request.cpu_cores,
+        memory=request.memory,
+        description=request.description,
+    )
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to create VM")
+
+    return {"status": "provisioning", "job_id": request.job_id, "mode": vm_provisioner.mode}
+
+
+@app.get("/api/vms")
+async def list_vms() -> list[dict[str, Any]]:
+    """List jobs with active VMs.
+
+    Works from the database (no NATS required) — reads the 'vm' key from
+    each job's context JSONB column.
+    """
+    try:
+        async with postgres_db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, description, status, context->'vm' as vm_context "
+                "FROM jobs WHERE context ? 'vm' "
+                "ORDER BY updated_at DESC"
+            )
+        return [
+            {
+                "job_id": str(row["id"]),
+                "description": row["description"],
+                "job_status": row["status"],
+                "vm": json.loads(row["vm_context"]) if row["vm_context"] else {},
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/vms/{job_id}")
+async def get_vm_status(
+    job_id: str,
+    live: bool = Query(False, description="Query live status via NATS request/reply"),
+) -> dict[str, Any]:
+    """Get VM status for a job.
+
+    By default reads from the database. With ?live=true, also queries the VM
+    controller via NATS request/reply for real-time status.
+    """
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    context = job.get("context") or {}
+    vm_ctx = context.get("vm") if isinstance(context, dict) else None
+    if not vm_ctx:
+        raise HTTPException(status_code=404, detail=f"No VM context for job '{job_id}'")
+
+    result: dict[str, Any] = {"job_id": job_id, "vm": vm_ctx}
+
+    if live:
+        if not vm_provisioner.is_available:
+            result["live_error"] = "VM provisioning not available"
+        else:
+            live_status = await vm_provisioner.query_status(job_id)
+            if live_status:
+                result["live"] = live_status
+            else:
+                result["live_error"] = "No response from VM controller"
+
+    return result
+
+
+@app.delete("/api/vms/{job_id}")
+async def delete_vm(job_id: str) -> dict[str, str]:
+    """Delete a VM for a job.
+
+    Uses NATS (cross-cluster) or direct Kubernetes API (same-cluster).
+    Returns 503 if no VM provisioning backend is available.
+    """
+    if not vm_provisioner.is_available:
+        raise HTTPException(status_code=503, detail="VM provisioning not available (no NATS or K8s)")
+
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+    success = await vm_provisioner.delete_vm(job_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete VM")
+
+    return {"status": "deleting", "job_id": job_id}
 
 
 class JobResumeRequest(BaseModel):
@@ -2579,6 +2830,32 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
             except Exception as e:
                 logger.warning(f"Failed to backfill freeze_data for {job_id}: {e}")
 
+        # 0. VM recovery: if workspace became unavailable, re-provision and re-queue
+        error = result.get("error") or {}
+        if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+            logger.warning(
+                f"Job {job_id}: workspace unavailable — attempting VM recovery"
+            )
+            vm_ctx = _get_vm_context(job)
+            # Delete the old (crashed) VM
+            if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
+                await vm_provisioner.delete_vm(job_id)
+            # Reset VM context to trigger auto-provisioning on next dispatch
+            ctx = job.get("context") or {}
+            if isinstance(ctx, str):
+                ctx = json.loads(ctx)
+            ctx["vm"] = {"requested": True, "previous_error": "workspace_unavailable"}
+            await postgres_db.update_job_context(job_id, ctx)
+            # Put job back in queue as paused (dispatchable, clears assigned_agent_id)
+            await postgres_db.pause_job(job_id)
+            _trigger_dispatch()
+            return {
+                "status": "handled",
+                "job_id": job_id,
+                "new_status": "paused",
+                "actions": ["vm recovery: old VM deleted, new VM will be provisioned, job re-queued"],
+            }
+
         # 1. Determine and set the new job status
         new_status, error_message = determine_job_status(job, result)
         if new_status:
@@ -2631,6 +2908,13 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
         # 6. Trigger dispatch (freed agent can pick up queued work)
         _trigger_dispatch()
+
+        # 7. If job had a VM, request teardown
+        if job.get("status") in ("completed", "failed") and vm_provisioner.is_available:
+            vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
+            if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
+                await vm_provisioner.delete_vm(job_id)
+                actions.append("vm deletion requested")
 
         return {
             "status": "handled",

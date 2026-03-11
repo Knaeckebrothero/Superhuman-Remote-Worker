@@ -186,6 +186,42 @@
           "type": "boolean",
           "default": true,
           "description": "Enable git versioning for workspace history. Creates a git repository in the workspace for automatic change tracking."
+        },
+        "backend": {
+          "type": "string",
+          "enum": ["local", "remote"],
+          "default": "local",
+          "description": "Workspace backend type. 'local' uses the local filesystem (default). 'remote' uses SSH/SFTP to a VM."
+        },
+        "remote": {
+          "type": "object",
+          "description": "Remote backend settings (only used when backend: remote)",
+          "properties": {
+            "host": {
+              "type": "string",
+              "description": "VM IP address or hostname"
+            },
+            "port": {
+              "type": "integer",
+              "default": 22,
+              "description": "SSH port"
+            },
+            "username": {
+              "type": "string",
+              "default": "agent-host",
+              "description": "SSH username"
+            },
+            "key_path": {
+              "type": "string",
+              "description": "Path to SSH private key file"
+            },
+            "workspace_path": {
+              "type": "string",
+              "default": "/home/agent-worker/workspace",
+              "description": "Workspace root path on the remote VM"
+            }
+          },
+          "required": ["host"]
         }
       }
     },

@@ -323,12 +323,20 @@ Phase 2: Base Image
   6. Push to Docker Hub as container disk image
   7. Boot agent-base VM, verify SSH + code-server access
 
-Phase 3: Orchestrator Integration
-  8. Orchestrator creates VirtualMachineInstance via KubeVirt API
-     (kubectl against the agent cluster's kubeconfig)
+Phase 3: Orchestrator Integration — DONE (code, needs deployment testing)
+  8. Orchestrator provisions VM via unified provisioner
+     - Same-cluster: direct KubeVirt API call from orchestrator
+     - Cross-cluster: publishes to NATS, VM Controller handles K8s API
+     See orchestrator/services/vm_provisioner.py, nats_bridge.py
   9. cloud-init injects job config (job ID, secrets, workspace seed)
-  10. Management daemon registers with orchestrator over NATS
-  11. Agent process starts, orchestrator tracks status
+  10. Management daemon registers with orchestrator over NATS (includes VM IP)
+  11. Auto-dispatch: orchestrator injects workspace.backend=remote + VM IP
+      into config_override, agent connects via SSH (RemoteBackend)
+  12. Phase snapshots extracted from VM to pod-local storage at each boundary
+  13. VM failure recovery: detect → delete old VM → re-provision → seed → resume
+  REST API: POST/GET /api/vms, GET/DELETE /api/vms/{job_id}
+  Lifecycle hooks: cancel→terminate+delete, pause→freeze, complete→auto-delete
+  Auto-provision: dispatcher auto-creates VMs for jobs needing workspace.backend=remote
 
 Phase 4: Remote Access
   12. code-server accessible via cockpit "Open workspace" action
@@ -353,7 +361,7 @@ See also: [Agent Cluster Setup Guide](./vm_agent_cluster_setup.md), [Packer Temp
 
 5. **Multi-agent collaboration**: Separate VMs with shared repos/databases for now. Revisit if latency between agents becomes a bottleneck.
 
-6. **Orchestrator kubeconfig management**: The orchestrator on the main cluster needs a kubeconfig for the agent cluster to create/delete VMs. Service account with limited RBAC (only `VirtualMachine`/`VirtualMachineInstance` in `agent-vms` namespace).
+6. **Orchestrator kubeconfig management**: For same-cluster deployments, the orchestrator uses in-cluster K8s config automatically (direct mode in `vm_provisioner.py`). For cross-cluster, the orchestrator doesn't need a kubeconfig at all — it publishes to NATS and the VM Controller on the agent cluster handles K8s API calls. This eliminates the need for cross-cluster kubeconfig management.
 
 ## Related Documents
 

@@ -12,6 +12,12 @@ Git versioning:
 - Optional git repository per workspace for automatic change tracking
 - Commits on todo completion for audit trail
 - Phase tags for milestone tracking
+
+Backend abstraction:
+- File I/O is delegated to a WorkspaceBackend implementation
+- LocalBackend (default): pathlib-based, current behavior
+- RemoteBackend (Phase 2): SSH/SFTP to a remote VM
+- See docs/features/vm_backend.md for the full design
 """
 
 import logging
@@ -23,6 +29,7 @@ from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
     from ..managers.git_manager import GitManager
+    from .workspace_backend import WorkspaceBackend
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +141,9 @@ class WorkspaceManager:
     The workspace provides persistent storage for plans, documents, notes,
     and intermediate work products.
 
+    File I/O is delegated to a WorkspaceBackend instance. By default, a
+    LocalBackend is created automatically (identical to previous behavior).
+
     Example:
         ```python
         # Create workspace for a job
@@ -161,6 +171,7 @@ class WorkspaceManager:
         job_id: str,
         config: Optional[WorkspaceManagerConfig] = None,
         base_path: Optional[Path] = None,
+        backend: Optional["WorkspaceBackend"] = None,
     ):
         """Initialize workspace manager.
 
@@ -168,6 +179,8 @@ class WorkspaceManager:
             job_id: Unique job identifier (usually UUID)
             config: Optional workspace configuration
             base_path: Override base path (for testing)
+            backend: Optional workspace backend. If None, a LocalBackend
+                     is created automatically (default, backward compatible).
         """
         self.job_id = job_id
         self.config = config or WorkspaceManagerConfig()
@@ -184,11 +197,26 @@ class WorkspaceManager:
         self._workspace_path = self._base_path / f"job_{job_id}"
         self._initialized = False
 
+        # Create or accept backend
+        if backend is not None:
+            self._backend = backend
+        else:
+            try:
+                from .backends.local import LocalBackend
+            except ImportError:
+                from src.core.backends.local import LocalBackend
+            self._backend = LocalBackend(self._workspace_path)
+
         # Git manager (created during initialize if git_versioning enabled)
         self._git_manager: Optional["GitManager"] = None
 
         # Source/reference repo git managers, keyed by repo name
         self._source_repos: dict[str, "GitManager"] = {}
+
+    @property
+    def backend(self) -> "WorkspaceBackend":
+        """Get the workspace backend."""
+        return self._backend
 
     @property
     def path(self) -> Path:
@@ -229,11 +257,9 @@ class WorkspaceManager:
         self._workspace_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Initialized workspace at {self._workspace_path}")
 
-        # Create subdirectories
+        # Create subdirectories via backend
         for subdir in self.config.structure:
-            dir_path = self._workspace_path / subdir
-            dir_path.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Created directory: {subdir}")
+            self._backend.mkdir(subdir)
 
         # Initialize git versioning if enabled
         if self.config.git_versioning:
@@ -318,8 +344,7 @@ class WorkspaceManager:
 
         # 3. Create subdirectories
         for subdir in self.config.structure:
-            dir_path = self._workspace_path / subdir
-            dir_path.mkdir(parents=True, exist_ok=True)
+            self._backend.mkdir(subdir)
 
         # 4. Clone source/reference repos
         self._clone_auxiliary_repos()
@@ -385,6 +410,9 @@ class WorkspaceManager:
     def get_path(self, relative_path: str = "") -> Path:
         """Get absolute path within workspace.
 
+        Delegates path validation to the backend, returns a Path object
+        for backward compatibility with callers that need filesystem paths.
+
         Args:
             relative_path: Path relative to workspace root
 
@@ -394,20 +422,7 @@ class WorkspaceManager:
         Raises:
             ValueError: If path attempts to escape workspace
         """
-        if not relative_path:
-            return self._workspace_path.resolve()
-
-        # Resolve the path and ensure it stays within workspace
-        full_path = (self._workspace_path / relative_path).resolve()
-        workspace_resolved = self._workspace_path.resolve()
-
-        # Security check: prevent path traversal
-        try:
-            full_path.relative_to(workspace_resolved)
-        except ValueError:
-            raise ValueError(f"Path '{relative_path}' escapes workspace boundary")
-
-        return full_path
+        return Path(self._backend.resolve_path(relative_path))
 
     def exists(self, relative_path: str) -> bool:
         """Check if a file or directory exists in workspace.
@@ -418,7 +433,7 @@ class WorkspaceManager:
         Returns:
             True if path exists
         """
-        return self.get_path(relative_path).exists()
+        return self._backend.exists(relative_path)
 
     def read_file(self, relative_path: str) -> str:
         """Read a file from the workspace.
@@ -433,15 +448,7 @@ class WorkspaceManager:
             FileNotFoundError: If file doesn't exist
             ValueError: If path escapes workspace
         """
-        file_path = self.get_path(relative_path)
-
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {relative_path}")
-
-        if not file_path.is_file():
-            raise ValueError(f"Not a file: {relative_path}")
-
-        return file_path.read_text(encoding="utf-8")
+        return self._backend.read_file(relative_path)
 
     def write_file(self, relative_path: str, content: str) -> Path:
         """Write content to a file in the workspace.
@@ -458,16 +465,8 @@ class WorkspaceManager:
         Raises:
             ValueError: If path escapes workspace
         """
-        file_path = self.get_path(relative_path)
-
-        # Create parent directories
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write content
-        file_path.write_text(content, encoding="utf-8")
-        logger.debug(f"Wrote file: {relative_path}")
-
-        return file_path
+        self._backend.write_file(relative_path, content)
+        return self.get_path(relative_path)
 
     def append_file(self, relative_path: str, content: str) -> Path:
         """Append content to a file in the workspace.
@@ -481,13 +480,8 @@ class WorkspaceManager:
         Returns:
             Absolute path to file
         """
-        file_path = self.get_path(relative_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(file_path, "a", encoding="utf-8") as f:
-            f.write(content)
-
-        return file_path
+        self._backend.append_file(relative_path, content)
+        return self.get_path(relative_path)
 
     def create_directory(self, relative_path: str) -> Path:
         """Create a directory (and parents) in workspace.
@@ -501,10 +495,8 @@ class WorkspaceManager:
         Raises:
             ValueError: If path escapes workspace
         """
-        dir_path = self.get_path(relative_path)
-        dir_path.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Created directory: {relative_path}")
-        return dir_path
+        self._backend.mkdir(relative_path)
+        return self.get_path(relative_path)
 
     def delete_directory(self, relative_path: str) -> bool:
         """Delete a directory and all its contents.
@@ -518,20 +510,7 @@ class WorkspaceManager:
         Raises:
             ValueError: If path escapes workspace or is the workspace root
         """
-        dir_path = self.get_path(relative_path)
-
-        if dir_path == self._workspace_path.resolve():
-            raise ValueError("Cannot delete workspace root directory")
-
-        if not dir_path.exists():
-            return False
-
-        if not dir_path.is_dir():
-            raise ValueError(f"Not a directory: {relative_path}")
-
-        shutil.rmtree(dir_path)
-        logger.debug(f"Deleted directory: {relative_path}")
-        return True
+        return self._backend.delete_directory(relative_path)
 
     def delete_file(self, relative_path: str) -> bool:
         """Delete a file or empty directory from workspace.
@@ -545,24 +524,7 @@ class WorkspaceManager:
         Raises:
             ValueError: If trying to delete non-empty directory
         """
-        file_path = self.get_path(relative_path)
-
-        if not file_path.exists():
-            return False
-
-        if file_path.is_file():
-            file_path.unlink()
-            logger.debug(f"Deleted file: {relative_path}")
-            return True
-
-        if file_path.is_dir():
-            if any(file_path.iterdir()):
-                raise ValueError(f"Cannot delete non-empty directory: {relative_path}")
-            file_path.rmdir()
-            logger.debug(f"Deleted directory: {relative_path}")
-            return True
-
-        return False
+        return self._backend.delete_file(relative_path)
 
     def move_file(self, source: str, dest: str) -> Path:
         """Move a file or directory within the workspace.
@@ -581,20 +543,8 @@ class WorkspaceManager:
             FileNotFoundError: If source doesn't exist
             ValueError: If paths escape workspace boundary
         """
-        source_path = self.get_path(source)
-        dest_path = self.get_path(dest)
-
-        if not source_path.exists():
-            raise FileNotFoundError(f"Source not found: {source}")
-
-        # Create parent directories for destination
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use shutil.move for the actual operation
-        shutil.move(str(source_path), str(dest_path))
-        logger.debug(f"Moved: {source} -> {dest}")
-
-        return dest_path
+        self._backend.move(source, dest)
+        return self.get_path(dest)
 
     def copy_file(self, source: str, dest: str) -> Path:
         """Copy a file within the workspace.
@@ -612,23 +562,8 @@ class WorkspaceManager:
             FileNotFoundError: If source doesn't exist
             ValueError: If paths escape workspace boundary or source is a directory
         """
-        source_path = self.get_path(source)
-        dest_path = self.get_path(dest)
-
-        if not source_path.exists():
-            raise FileNotFoundError(f"Source not found: {source}")
-
-        if source_path.is_dir():
-            raise ValueError(f"Cannot copy directory: {source}. Use move_file for directories.")
-
-        # Create parent directories for destination
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use shutil.copy2 to preserve metadata
-        shutil.copy2(str(source_path), str(dest_path))
-        logger.debug(f"Copied: {source} -> {dest}")
-
-        return dest_path
+        self._backend.copy(source, dest)
+        return self.get_path(dest)
 
     def list_files(self, relative_path: str = "", pattern: str = "*") -> List[str]:
         """List files in a workspace directory.
@@ -640,26 +575,7 @@ class WorkspaceManager:
         Returns:
             List of relative paths to files/directories
         """
-        dir_path = self.get_path(relative_path)
-
-        if not dir_path.exists():
-            return []
-
-        if not dir_path.is_dir():
-            return [relative_path]
-
-        results = []
-        workspace_resolved = self._workspace_path.resolve()
-        for item in dir_path.glob(pattern):
-            # Get path relative to workspace root
-            rel = item.relative_to(workspace_resolved)
-            # Add trailing slash for directories
-            if item.is_dir():
-                results.append(str(rel) + "/")
-            else:
-                results.append(str(rel))
-
-        return sorted(results)
+        return self._backend.list_dir(relative_path, pattern)
 
     def search_files(self, query: str, path: str = "", case_sensitive: bool = False) -> List[dict]:
         """Search for text in workspace files.
@@ -672,45 +588,7 @@ class WorkspaceManager:
         Returns:
             List of dicts with 'path', 'line_number', and 'line' for each match
         """
-        search_path = self.get_path(path)
-        results = []
-        workspace_resolved = self._workspace_path.resolve()
-
-        if not case_sensitive:
-            query = query.lower()
-
-        # If search_path is a file, search it directly; otherwise recurse
-        if search_path.is_file():
-            files_to_search = [search_path]
-        else:
-            files_to_search = search_path.rglob("*")
-
-        for file_path in files_to_search:
-            if not file_path.is_file():
-                continue
-
-            # Skip binary files (simple heuristic)
-            if file_path.suffix in [".pdf", ".docx", ".png", ".jpg", ".gif", ".zip"]:
-                continue
-
-            try:
-                content = file_path.read_text(encoding="utf-8")
-                lines = content.splitlines()
-
-                for i, line in enumerate(lines, 1):
-                    search_line = line if case_sensitive else line.lower()
-                    if query in search_line:
-                        rel_path = str(file_path.relative_to(workspace_resolved))
-                        results.append({
-                            "path": rel_path,
-                            "line_number": i,
-                            "line": line.strip(),
-                        })
-            except (UnicodeDecodeError, IOError):
-                # Skip files that can't be read as text
-                continue
-
-        return results
+        return self._backend.search_files(query, path, case_sensitive)
 
     def get_size(self, relative_path: str = "") -> int:
         """Get size of a file or directory in bytes.
@@ -721,21 +599,7 @@ class WorkspaceManager:
         Returns:
             Size in bytes
         """
-        target_path = self.get_path(relative_path)
-
-        if not target_path.exists():
-            return 0
-
-        if target_path.is_file():
-            return target_path.stat().st_size
-
-        # Sum up all files in directory
-        total = 0
-        for file_path in target_path.rglob("*"):
-            if file_path.is_file():
-                total += file_path.stat().st_size
-
-        return total
+        return self._backend.stat(relative_path)
 
     def cleanup(self) -> bool:
         """Remove the entire workspace directory.
@@ -771,11 +635,12 @@ class WorkspaceManager:
             return summary
 
         for subdir in self.config.structure:
-            dir_path = self._workspace_path / subdir.rstrip("/")
-            if dir_path.exists():
-                files = list(dir_path.glob("*"))
-                file_count = len([f for f in files if f.is_file()])
-                dir_size = self.get_size(subdir)
+            subdir_clean = subdir.rstrip("/")
+            if self._backend.is_dir(subdir_clean):
+                entries = self._backend.list_dir(subdir_clean)
+                # Count only files (entries without trailing /)
+                file_count = len([e for e in entries if not e.endswith("/")])
+                dir_size = self._backend.stat(subdir_clean)
 
                 summary["directories"][subdir] = {
                     "file_count": file_count,
