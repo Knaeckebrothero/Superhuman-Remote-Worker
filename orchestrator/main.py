@@ -4988,7 +4988,7 @@ async def get_project_expert(
 
 
 @app.post("/api/auth/login")
-async def auth_login(body: LoginRequest, response: Response) -> dict[str, Any]:
+async def auth_login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
     """Email-based login. Finds or creates user, issues session cookie."""
     email = body.email.strip().lower()
     if not email:
