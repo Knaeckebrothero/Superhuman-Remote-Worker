@@ -113,8 +113,8 @@ class PostgresDB:
                 try:
                     from pgvector.asyncpg import register_vector
                     await register_vector(conn)
-                except ImportError:
-                    pass  # pgvector not installed, skip registration
+                except (ImportError, ValueError):
+                    pass  # pgvector not installed or extension not on this DB
 
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
