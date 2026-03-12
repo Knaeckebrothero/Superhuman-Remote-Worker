@@ -5053,6 +5053,7 @@ async def auth_login(body: LoginRequest, request: Request, response: Response) -
             "email": user.get("email"),
             "created_at": user["created_at"],
         },
+        "csrf_token": csrf_token,
         "message": "Login successful",
     }
 
@@ -5112,6 +5113,7 @@ async def auth_me(request: Request, response: Response) -> dict[str, Any]:
             "email": user.get("email"),
             "created_at": user["created_at"],
         },
+        "csrf_token": csrf_token,
     }
 
 
