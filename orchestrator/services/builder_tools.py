@@ -2576,17 +2576,17 @@ def get_builder_key_ring():
 
     Parses comma-separated keys from BUILDER_API_KEY (or provider fallback)
     and creates a KeyRing with cooldown-based rotation.
+    Falls back to None if KeyRing is unavailable (e.g. in Docker).
     """
     global _builder_key_ring
     with _builder_key_ring_lock:
         if _builder_key_ring is not None:
             return _builder_key_ring
 
-        import sys
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        from src.llm.key_ring import KeyRing, parse_key_string
+        try:
+            from src.llm.key_ring import KeyRing, parse_key_string
+        except (ImportError, ModuleNotFoundError):
+            return None
 
         provider = get_builder_provider()
         explicit = os.getenv("BUILDER_API_KEY")
@@ -2612,15 +2612,23 @@ def get_builder_api_key() -> str | None:
     """Get the current API key for the builder LLM.
 
     Uses KeyRing for automatic rotation across comma-separated keys.
-    Falls back to OPENAI_API_KEY or ANTHROPIC_API_KEY based on provider.
+    Falls back to env vars (BUILDER_API_KEY, then provider-specific key).
     """
     ring = get_builder_key_ring()
-    if ring is None:
-        return None
-    try:
-        return ring.current_key
-    except RuntimeError:
-        return None
+    if ring is not None:
+        try:
+            return ring.current_key
+        except RuntimeError:
+            pass
+
+    # Fallback: read directly from env (no rotation)
+    explicit = os.getenv("BUILDER_API_KEY")
+    if explicit:
+        return explicit.split(",")[0].strip()
+    provider = get_builder_provider()
+    if provider == "anthropic":
+        return os.getenv("ANTHROPIC_API_KEY")
+    return os.getenv("OPENAI_API_KEY")
 
 
 def rotate_builder_key(reason: str) -> str | None:

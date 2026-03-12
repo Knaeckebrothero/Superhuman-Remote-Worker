@@ -6415,13 +6415,21 @@ def _detect_provider(model: str) -> str:
 
 
 def _get_api_key_for_provider(provider: str) -> str | None:
-    """Get API key for the given provider, with explicit override support."""
-    explicit = os.getenv("BUILDER_API_KEY")
-    if explicit:
-        return explicit
+    """Get API key for the given provider.
+
+    Checks provider-specific BUILDER key first, then falls back to the
+    standard provider key.  BUILDER_API_KEY (without provider suffix) is
+    only used when there is no provider-specific override.
+    """
     if provider == "anthropic":
-        return os.getenv("ANTHROPIC_API_KEY")
-    return os.getenv("OPENAI_API_KEY")
+        return (
+            os.getenv("BUILDER_ANTHROPIC_API_KEY")
+            or os.getenv("ANTHROPIC_API_KEY")
+        )
+    return (
+        os.getenv("BUILDER_OPENAI_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
 
 
 def _chat_messages_to_responses_input(
