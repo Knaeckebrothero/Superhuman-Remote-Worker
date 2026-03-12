@@ -1,54 +1,41 @@
-const getApiUrl = (): string => {
+const getEnv = (key: string, fallback: string): string => {
   if (typeof window !== 'undefined') {
-    return (window as any)['env']?.['apiUrl'] || 'http://localhost:8085/api';
+    return (window as any)['env']?.[key] || fallback;
   }
-  return 'http://localhost:8085/api';
+  return fallback;
 };
 
-const getGiteaUrl = (): string | null => {
+const getEnvOrNull = (key: string): string | null => {
   if (typeof window !== 'undefined') {
-    return (window as any)['env']?.['giteaUrl'] || null;
+    return (window as any)['env']?.[key] || null;
   }
   return null;
 };
 
-const getDozzleUrl = (): string | null => {
+const getEnvArray = <T>(key: string, fallback: T[] = []): T[] => {
   if (typeof window !== 'undefined') {
-    return (window as any)['env']?.['dozzleUrl'] || null;
+    const val = (window as any)['env']?.[key];
+    if (Array.isArray(val) && val.length > 0) return val;
   }
-  return null;
-};
-
-const getModels = (): { group: string; models: string[] }[] => {
-  if (typeof window !== 'undefined') {
-    return (window as any)['env']?.['models'] || [];
-  }
-  return [];
-};
-
-const getModelPresets = (): { label: string; strategic: string; tactical: string }[] => {
-  if (typeof window !== 'undefined') {
-    return (window as any)['env']?.['modelPresets'] || [];
-  }
-  return [];
-};
-
-const getBuilderModels = (): { label: string; id: string }[] => {
-  if (typeof window !== 'undefined') {
-    const models = (window as any)['env']?.['builderModels'];
-    if (Array.isArray(models) && models.length > 0) return models;
-  }
-  return [
-    { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
-    { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
-  ];
+  return fallback;
 };
 
 export const environment = {
-  apiUrl: getApiUrl(),
-  giteaUrl: getGiteaUrl(),
-  dozzleUrl: getDozzleUrl(),
-  models: getModels(),
-  modelPresets: getModelPresets(),
-  builderModels: getBuilderModels(),
+  // Core
+  apiUrl: getEnv('apiUrl', 'http://localhost:8085/api'),
+
+  // External tools
+  giteaUrl: getEnv('giteaUrl', 'http://localhost:3000/srw'),
+  dozzleUrl: getEnv('dozzleUrl', 'http://localhost:9999'),
+  neo4jUrl: getEnv('neo4jUrl', 'http://localhost:7474'),
+  pgadminUrl: getEnv('pgadminUrl', 'http://localhost:5050'),
+  mongoExpressUrl: getEnv('mongoExpressUrl', 'http://localhost:8081'),
+
+  // Model configuration
+  models: getEnvArray<{ group: string; models: string[] }>('models'),
+  modelPresets: getEnvArray<{ label: string; strategic: string; tactical: string }>('modelPresets'),
+  builderModels: getEnvArray<{ label: string; id: string }>('builderModels', [
+    { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
+    { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
+  ]),
 };
