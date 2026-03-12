@@ -41,12 +41,14 @@ export class UserService {
   /** Check if we have a valid session (called on init). */
   checkSession(): void {
     this.http
-      .get<{ user: User }>(`${this.baseUrl}/auth/me`, { withCredentials: true })
+      .get<{ user: User; csrf_token?: string }>(`${this.baseUrl}/auth/me`, { withCredentials: true })
       .pipe(catchError(() => of(null)))
       .subscribe((res) => {
         if (res?.user) {
           this.currentUser.set(res.user);
-          this.api.readCsrfTokenFromCookie();
+          if (res.csrf_token) {
+            this.api.csrfToken = res.csrf_token;
+          }
         } else {
           this.currentUser.set(null);
         }
@@ -57,7 +59,7 @@ export class UserService {
   /** Login with email address. Returns observable so callers can react to completion. */
   login(email: string): Observable<User | null> {
     return this.http
-      .post<{ user: User; message: string }>(
+      .post<{ user: User; csrf_token?: string; message: string }>(
         `${this.baseUrl}/auth/login`,
         { email },
         { withCredentials: true },
@@ -66,7 +68,9 @@ export class UserService {
         tap((res) => {
           if (res?.user) {
             this.currentUser.set(res.user);
-            this.api.readCsrfTokenFromCookie();
+            if (res.csrf_token) {
+              this.api.csrfToken = res.csrf_token;
+            }
             this.loadUsers();
           }
         }),
@@ -77,13 +81,13 @@ export class UserService {
 
   /** Logout and clear session. */
   logout(): void {
+    // Clear state immediately so auth guard redirects to login
+    this.currentUser.set(null);
+    this.api.csrfToken = null;
     this.http
       .post(`${this.baseUrl}/auth/logout`, {}, { withCredentials: true })
       .pipe(catchError(() => of(null)))
-      .subscribe(() => {
-        this.currentUser.set(null);
-        this.api.csrfToken = null;
-      });
+      .subscribe();
   }
 
   /** Fetch users from the API (for user color dots in job list etc.). */
