@@ -279,70 +279,41 @@ export class MenuComponent {
       items: [
         {
           label: 'Neo4j Browser',
-          url: 'http://localhost:7474',
+          url: environment.neo4jUrl,
           icon: '🔵',
           description: 'Knowledge graph explorer',
         },
         {
           label: 'PostgreSQL',
-          url: 'http://localhost:5050',
+          url: environment.pgadminUrl,
           icon: '🐘',
           description: 'pgAdmin database manager',
         },
         {
           label: 'MongoDB',
-          url: 'http://localhost:8081',
+          url: environment.mongoExpressUrl,
           icon: '🍃',
           description: 'Mongo Express viewer',
         },
       ],
     },
     {
-      title: 'APIs',
+      title: 'Tools',
       items: [
         {
-          label: 'Creator Agent',
-          url: 'http://localhost:8001/docs',
-          icon: '📝',
-          description: 'OpenAPI documentation',
+          label: 'Gitea',
+          url: environment.giteaUrl,
+          icon: '🍵',
+          description: 'Git repository browser',
         },
         {
-          label: 'Validator Agent',
-          url: 'http://localhost:8002/docs',
-          icon: '✅',
-          description: 'OpenAPI documentation',
+          label: 'Dozzle',
+          url: environment.dozzleUrl,
+          icon: '📋',
+          description: 'Container log viewer',
         },
       ],
     },
-    ...(environment.giteaUrl || environment.dozzleUrl
-      ? [
-          {
-            title: 'Tools',
-            items: [
-              ...(environment.giteaUrl
-                ? [
-                    {
-                      label: 'Gitea',
-                      url: environment.giteaUrl,
-                      icon: '🍵',
-                      description: 'Git repository browser',
-                    },
-                  ]
-                : []),
-              ...(environment.dozzleUrl
-                ? [
-                    {
-                      label: 'Dozzle',
-                      url: environment.dozzleUrl,
-                      icon: '📋',
-                      description: 'Container log viewer',
-                    },
-                  ]
-                : []),
-            ],
-          },
-        ]
-      : []),
   ];
 
   @HostListener('document:click', ['$event'])

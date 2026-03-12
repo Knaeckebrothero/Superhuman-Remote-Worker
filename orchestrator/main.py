@@ -1091,7 +1091,7 @@ app.add_middleware(
         "http://127.0.0.1:4200",
         "http://localhost:4000",
         "http://127.0.0.1:4000",
-    ],
+    ] + [o for o in os.environ.get("CORS_ORIGINS", "").split(",") if o],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -5017,14 +5017,20 @@ async def auth_login(body: LoginRequest, response: Response) -> dict[str, Any]:
     session_timeout_hours = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
     max_age = session_timeout_hours * 3600
 
+    # Cross-origin cookies (cockpit on different subdomain) require
+    # SameSite=None + Secure=True.  For localhost dev (same origin),
+    # these settings still work fine over http://localhost.
+    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
+    _samesite: str = "none" if _secure else "lax"
+
     # Set httpOnly session cookie
     response.set_cookie(
         key="session",
         value=session_key,
         max_age=max_age,
         httponly=True,
-        secure=False,  # False for localhost dev
-        samesite="lax",
+        secure=_secure,
+        samesite=_samesite,
         path="/",
     )
 
@@ -5034,8 +5040,8 @@ async def auth_login(body: LoginRequest, response: Response) -> dict[str, Any]:
         value=csrf_token,
         max_age=max_age,
         httponly=False,
-        secure=False,
-        samesite="lax",
+        secure=_secure,
+        samesite=_samesite,
         path="/",
     )
 
@@ -5058,8 +5064,10 @@ async def auth_logout(request: Request, response: Response) -> dict[str, str]:
     if session_key:
         await delete_session(postgres_db, session_key)
 
-    response.delete_cookie(key="session", path="/", httponly=True, samesite="lax")
-    response.delete_cookie(key="csrf_token", path="/", httponly=False, samesite="lax")
+    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
+    _samesite: str = "none" if _secure else "lax"
+    response.delete_cookie(key="session", path="/", httponly=True, secure=_secure, samesite=_samesite)
+    response.delete_cookie(key="csrf_token", path="/", httponly=False, secure=_secure, samesite=_samesite)
     return {"message": "Logged out successfully"}
 
 
@@ -5083,14 +5091,16 @@ async def auth_me(request: Request, response: Response) -> dict[str, Any]:
     csrf_cookie = request.cookies.get("csrf_token")
     csrf_token = session_info.get("csrf_token")
     if csrf_token and not csrf_cookie:
+        _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
+        _samesite: str = "none" if _secure else "lax"
         expires_in = session_info.get("expires_in", 86400)
         response.set_cookie(
             key="csrf_token",
             value=csrf_token,
             max_age=expires_in,
             httponly=False,
-            secure=False,
-            samesite="lax",
+            secure=_secure,
+            samesite=_samesite,
             path="/",
         )
 
