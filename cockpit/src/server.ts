@@ -25,6 +25,17 @@ const angularApp = new AngularNodeAppEngine();
  */
 
 /**
+ * Runtime config must not be cached — it is mounted at deploy time
+ * and may change without rebuilding the image.
+ */
+app.get('/assets/env.js', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+
+/**
  * Serve static files from /browser
  */
 app.use(

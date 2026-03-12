@@ -54,42 +54,26 @@ import { environment } from '../../core/environment';
         @if (isDebugRoute()) {
           <div class="section">
             <div class="section-title">Databases</div>
-            <a class="section-link" href="http://localhost:7474" target="_blank" rel="noopener">
+            <a class="section-link" [href]="neo4jUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F535;</span>Neo4j Browser
             </a>
-            <a class="section-link" href="http://localhost:5050" target="_blank" rel="noopener">
+            <a class="section-link" [href]="pgadminUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F418;</span>PostgreSQL
             </a>
-            <a class="section-link" href="http://localhost:8081" target="_blank" rel="noopener">
+            <a class="section-link" [href]="mongoExpressUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F343;</span>MongoDB
             </a>
           </div>
 
           <div class="section">
-            <div class="section-title">APIs</div>
-            <a class="section-link" href="http://localhost:8001/docs" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F4DD;</span>Creator Agent
+            <div class="section-title">Tools</div>
+            <a class="section-link" [href]="giteaUrl" target="_blank" rel="noopener">
+              <span class="link-icon">&#x1F375;</span>Gitea
             </a>
-            <a class="section-link" href="http://localhost:8002/docs" target="_blank" rel="noopener">
-              <span class="link-icon">&#x2705;</span>Validator Agent
+            <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
+              <span class="link-icon">&#x1F4CB;</span>Dozzle
             </a>
           </div>
-
-          @if (giteaUrl || dozzleUrl) {
-            <div class="section">
-              <div class="section-title">Tools</div>
-              @if (giteaUrl) {
-                <a class="section-link" [href]="giteaUrl" target="_blank" rel="noopener">
-                  <span class="link-icon">&#x1F375;</span>Gitea
-                </a>
-              }
-              @if (dozzleUrl) {
-                <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
-                  <span class="link-icon">&#x1F4CB;</span>Dozzle
-                </a>
-              }
-            </div>
-          }
 
           <div class="section">
             <div class="section-title">Layouts</div>
@@ -368,6 +352,9 @@ export class SidebarComponent {
 
   readonly giteaUrl = environment.giteaUrl;
   readonly dozzleUrl = environment.dozzleUrl;
+  readonly neo4jUrl = environment.neo4jUrl;
+  readonly pgadminUrl = environment.pgadminUrl;
+  readonly mongoExpressUrl = environment.mongoExpressUrl;
 
   readonly isLayoutPickerOpen = signal(false);
   readonly pickerTop = signal(0);
