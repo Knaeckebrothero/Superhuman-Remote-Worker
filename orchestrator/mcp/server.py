@@ -1277,6 +1277,24 @@ async def get_citation_stats(job_id: str) -> str:
 
 
 @mcp.tool
+async def get_memory_stats(job_id: str) -> str:
+    """Get memory statistics for a job — counts by type, source channel, tokens, and access patterns.
+
+    Args:
+        job_id: Job UUID
+
+    Returns:
+        Formatted memory statistics overview
+    """
+    client = _get_client()
+    try:
+        data = await client.get_memory_stats(job_id)
+        return fmt.format_memory_stats(job_id, data)
+    except Exception as e:
+        return fmt.format_citation_error("get memory stats", e, job_id=job_id)
+
+
+@mcp.tool
 async def get_agent_system_info(agent_id: str) -> str:
     """Get system information from an agent's container.
 

@@ -76,6 +76,7 @@ SERVER_SIDE_TOOLS = {
     "get_source_annotations",
     "get_source_tags",
     "get_citation_stats",
+    "get_memory_stats",
     # Actions
     "approve_job",
     "resume_job_with_feedback",
@@ -1255,6 +1256,23 @@ BUILDER_TOOLS = [
         "function": {
             "name": "get_citation_stats",
             "description": "Get citation statistics for a job — counts by verification status, source type, and confidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_memory_stats",
+            "description": "Get memory statistics for a job — counts by type (factual, procedural, etc.), source channel (observer, todo, etc.), tokens, accesses, and average importance.",
             "parameters": {
                 "type": "object",
                 "properties": {

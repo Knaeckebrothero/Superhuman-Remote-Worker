@@ -149,6 +149,7 @@ class RecallStore:
         config=None,
         agent_id: Optional[str] = None,
         project_id: Optional[uuid.UUID] = None,
+        archiver=None,
     ):
         """Initialize RecallStore.
 
@@ -159,12 +160,14 @@ class RecallStore:
             config: MemoryConfig dataclass (optional, uses defaults if None)
             agent_id: Optional agent identifier for cross-job memory (Phase 5)
             project_id: Optional project UUID for project-scoped memory sharing
+            archiver: Optional LLMArchiver for audit logging
         """
         self.db = db
         self.embedding_service = embedding_service
         self.job_id = job_id
         self.agent_id = agent_id
         self.project_id = project_id
+        self._archiver = archiver
         self.project_scoped = getattr(config, "project_scoped", False) if config else False
 
         # Config defaults (matches MemoryConfig dataclass)
@@ -263,6 +266,19 @@ class RecallStore:
                 importance,
                 existing.id,
             )
+            if self._archiver:
+                self._archiver.audit_step(
+                    job_id=str(self.job_id),
+                    agent_type=self.agent_id or "",
+                    step_type="memory_dedup",
+                    node_name="recall_store",
+                    iteration=0,
+                    data={
+                        "existing_id": str(existing.id),
+                        "source": source,
+                        "similarity": round(existing.similarity, 3) if hasattr(existing, "similarity") else None,
+                    },
+                )
             return existing.id
 
         # Estimate token count if not provided
@@ -310,6 +326,21 @@ class RecallStore:
             f"Stored memory {mem_id} (type={memory_type}, source={source}, "
             f"importance={importance})"
         )
+        if self._archiver:
+            self._archiver.audit_step(
+                job_id=str(self.job_id),
+                agent_type=self.agent_id or "",
+                step_type="memory_store",
+                node_name="recall_store",
+                iteration=0,
+                data={
+                    "id": str(mem_id),
+                    "type": memory_type,
+                    "source": source,
+                    "importance": importance,
+                    "tokens": token_count,
+                },
+            )
         return mem_id
 
     # =========================================================================
@@ -530,7 +561,22 @@ class RecallStore:
                 ids,
             )
 
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
+        results = [MemoryRecord.from_row(dict(row)) for row in rows]
+
+        if self._archiver and results:
+            self._archiver.audit_step(
+                job_id=str(self.job_id),
+                agent_type=self.agent_id or "",
+                step_type="memory_retrieve",
+                node_name="recall_store",
+                iteration=0,
+                data={
+                    "count": len(results),
+                    "total_tokens": sum(m.token_count for m in results),
+                },
+            )
+
+        return results
 
     async def retrieve(
         self,
