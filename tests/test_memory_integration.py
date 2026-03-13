@@ -1,7 +1,7 @@
 """Integration tests for Memory Light Phases 2-3.
 
 Tests the ToolContext memory queue, todo completion memory queueing,
-keyword extraction, tool error memory storage, and Phase 3 additions
+keyword extraction, and Phase 3 additions
 (memory_observer field, turn_count state, observer window truncation).
 """
 
@@ -209,41 +209,6 @@ class TestTodoCompletionMemory:
             ctx.queue_memory(content="should not appear", importance=0.7)
 
         assert len(ctx._pending_memories) == 0
-
-
-# =============================================================================
-# Tool error memory storage test
-# =============================================================================
-
-
-class TestToolErrorMemory:
-    """Tests that tool errors are stored as memories."""
-
-    @pytest.mark.asyncio
-    async def test_tool_error_stored_via_recall_store(self):
-        """Mock RecallStore.store() to verify tool error storage."""
-        mock_store = AsyncMock()
-        mock_recall = MagicMock()
-        mock_recall.store = mock_store
-
-        # Simulate what audited_tools does for a tool error
-        error_content = "Error: File not found: missing.txt"
-        tool_name = "read_file"
-
-        await mock_recall.store(
-            content=f"Tool '{tool_name}' failed: {error_content[:500]}",
-            keywords=[tool_name, "error"],
-            importance=0.6,
-            source="tool_error",
-            memory_type="error_solution",
-            source_phase=2,
-        )
-
-        mock_store.assert_called_once()
-        call_kwargs = mock_store.call_args
-        assert "read_file" in call_kwargs.kwargs["content"]
-        assert call_kwargs.kwargs["source"] == "tool_error"
-        assert call_kwargs.kwargs["memory_type"] == "error_solution"
 
 
 # =============================================================================

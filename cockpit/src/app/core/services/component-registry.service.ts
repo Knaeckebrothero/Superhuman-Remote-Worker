@@ -1,5 +1,5 @@
 import { Injectable, Type } from '@angular/core';
-import { ComponentMetadata, ComponentType } from '../models/layout.model';
+import { ComponentMetadata, ComponentType } from '../../debug/layout.model';
 
 /**
  * Registry for components that can be loaded into layout panels.

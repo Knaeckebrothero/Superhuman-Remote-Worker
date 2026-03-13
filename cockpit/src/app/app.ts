@@ -7,24 +7,26 @@ import { ComponentRegistryService } from './core/services/component-registry.ser
 import { ViewportService } from './core/services/viewport.service';
 import { UserService } from './core/services/user.service';
 import { SidebarService } from './core/services/sidebar.service';
-import { PlaceholderAComponent } from './components/placeholders/placeholder-a.component';
-import { PlaceholderBComponent } from './components/placeholders/placeholder-b.component';
-import { PlaceholderCComponent } from './components/placeholders/placeholder-c.component';
-import { DbTableComponent } from './components/db-table/db-table.component';
-import { AgentActivityComponent } from './components/agent-activity/agent-activity.component';
-import { RequestViewerComponent } from './components/request-viewer/request-viewer.component';
-import { GraphTimelineComponent } from './components/graph-timeline/graph-timeline.component';
-import { TodoListComponent } from './components/todo-list/todo-list.component';
-import { ChatHistoryComponent } from './components/chat-history/chat-history.component';
-import { AgentListComponent } from './components/agent-list/agent-list.component';
-import { JobListComponent } from './components/job-list/job-list.component';
-import { JobCreateComponent } from './components/job-create/job-create.component';
-import { StatisticsComponent } from './components/statistics/statistics.component';
-import { DatasourceListComponent } from './components/datasource-list/datasource-list.component';
-import { JobReviewComponent } from './components/job-review/job-review.component';
-import { WorkspaceBrowserComponent } from './components/workspace-browser/workspace-browser.component';
-import { InstructionBuilderComponent } from './components/instruction-builder/instruction-builder.component';
-import { ProjectListPageComponent } from './pages/project-list/project-list.component';
+// Debug-only components
+import { PlaceholderAComponent } from './debug/components/placeholders/placeholder-a.component';
+import { PlaceholderBComponent } from './debug/components/placeholders/placeholder-b.component';
+import { PlaceholderCComponent } from './debug/components/placeholders/placeholder-c.component';
+import { DbTableComponent } from './debug/components/db-table/db-table.component';
+import { AgentActivityComponent } from './debug/components/agent-activity/agent-activity.component';
+import { RequestViewerComponent } from './debug/components/request-viewer/request-viewer.component';
+import { GraphTimelineComponent } from './debug/components/graph-timeline/graph-timeline.component';
+// Shared components
+import { TodoListComponent } from './shared/components/todo-list/todo-list.component';
+import { ChatHistoryComponent } from './shared/components/chat-history/chat-history.component';
+import { AgentListComponent } from './shared/components/agent-list/agent-list.component';
+import { JobListComponent } from './shared/components/job-list/job-list.component';
+import { JobCreateComponent } from './shared/components/job-create/job-create.component';
+import { StatisticsComponent } from './shared/components/statistics/statistics.component';
+import { DatasourceListComponent } from './shared/components/datasource-list/datasource-list.component';
+import { JobReviewComponent } from './shared/components/job-review/job-review.component';
+import { WorkspaceBrowserComponent } from './shared/components/workspace-browser/workspace-browser.component';
+import { InstructionBuilderComponent } from './shared/components/instruction-builder/instruction-builder.component';
+import { ProjectListPageComponent } from './shared/pages/project-list.component';
 
 @Component({
   selector: 'app-root',

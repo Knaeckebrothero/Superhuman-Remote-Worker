@@ -1427,23 +1427,6 @@ def create_archive_phase_node(
                 )
             )
 
-        # Memory Light: store completed todos with notes as phase archive memories
-        if recall_store:
-            from src.services.recall_store import extract_keywords
-            for todo in todo_manager.list_all():
-                if todo.status == TodoStatus.COMPLETED and todo.notes:
-                    try:
-                        await recall_store.store(
-                            content=f"Completed: {todo.content}\nOutcome: {'; '.join(todo.notes)}",
-                            keywords=extract_keywords(todo.content),
-                            importance=0.5,
-                            source="phase_archive",
-                            memory_type="procedural",
-                            source_phase=phase_number,
-                        )
-                    except Exception:
-                        pass  # Never block archiving
-
         # Create phase snapshot BEFORE any modifications
         # This captures the clean state at end of phase for recovery
         if snapshot_manager:
@@ -2351,28 +2334,6 @@ def create_audited_tool_node(
                     await recall_store.store(**mem)
                 except Exception as e:
                     logger.warning(f"[{job_id}] Failed to store queued memory: {e}")
-
-        # Memory Light: store tool errors as memories
-        if recall_store and "messages" in result:
-            for msg in result["messages"]:
-                if isinstance(msg, ToolMessage):
-                    content = msg.content if msg.content else ""
-                    if _is_tool_error(content):
-                        tool_name = next(
-                            (tc["name"] for tc in tool_calls_info if tc["call_id"] == getattr(msg, "tool_call_id", "")),
-                            "unknown",
-                        )
-                        try:
-                            await recall_store.store(
-                                content=f"Tool '{tool_name}' failed: {content[:500]}",
-                                keywords=[tool_name, "error"],
-                                importance=0.6,
-                                source="tool_error",
-                                memory_type="error_solution",
-                                source_phase=phase_number,
-                            )
-                        except Exception:
-                            pass  # Never block tool execution
 
         return result
 

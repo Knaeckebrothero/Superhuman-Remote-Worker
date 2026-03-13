@@ -44,8 +44,8 @@ import {
   AuditResponse,
   AuditFilterCategory,
 } from '../models/audit.model';
-import { LLMRequest } from '../models/request.model';
-import { GraphChangeResponse, GraphDelta } from '../models/graph.model';
+import { LLMRequest } from '../../debug/request.model';
+import { GraphChangeResponse, GraphDelta } from '../../debug/graph.model';
 import { ChatEntry, ChatHistoryResponse } from '../models/chat.model';
 import { environment } from '../environment';
 
