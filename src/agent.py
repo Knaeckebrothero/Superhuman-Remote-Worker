@@ -1403,6 +1403,8 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     if raw_pid:
                         project_id_for_memory = _uuid.UUID(str(raw_pid))
 
+                from src.core.archiver import get_archiver as _get_archiver
+
                 embedding_service = get_embedding_service()
                 recall_store = RecallStore(
                     db=self.vector_conn,
@@ -1411,6 +1413,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     config=self.config.memory,
                     agent_id=self.config.agent_id,
                     project_id=project_id_for_memory,
+                    archiver=_get_archiver(),
                 )
                 context.recall_store = recall_store
                 scope_msg = f"project {project_id_for_memory}" if project_id_for_memory else f"job {self._current_job_id}"

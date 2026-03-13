@@ -154,8 +154,8 @@ class PostgresDB:
                 try:
                     from pgvector.asyncpg import register_vector
                     await register_vector(conn)
-                except ImportError:
-                    pass  # pgvector not installed, skip registration
+                except (ImportError, ValueError):
+                    pass  # pgvector not installed or extension not on this DB
 
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
@@ -1987,6 +1987,66 @@ class PostgresDB:
             )
 
         return dict(row)
+
+    async def create_user_with_default_project(
+        self,
+        display_name: str,
+        avatar_color: str = "#89b4fa",
+        email: str | None = None,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Create a user and their default project atomically.
+
+        Inserts both user and project in a single transaction so the
+        NOT NULL constraint on default_project_id is never violated.
+
+        Args:
+            display_name: User's display name
+            avatar_color: Hex color for avatar dot
+            email: Optional email address
+
+        Returns:
+            Tuple of (user dict, project dict)
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Create project first
+                project_row = await conn.fetchrow(
+                    """
+                    INSERT INTO projects (name, description, is_default)
+                    VALUES ($1, $2, TRUE)
+                    RETURNING id, name, description, goal, status, is_default,
+                              default_config_name, default_config_override,
+                              created_at, updated_at
+                    """,
+                    f"{display_name}'s Workspace",
+                    f"Default workspace for {display_name}",
+                )
+
+                # Create user with default_project_id set
+                user_row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (display_name, avatar_color, email, default_project_id)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id, display_name, avatar_color, email,
+                              default_project_id, created_at
+                    """,
+                    display_name,
+                    avatar_color,
+                    email,
+                    project_row["id"],
+                )
+
+                # Add user as project owner
+                await conn.execute(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, 'owner')
+                    """,
+                    project_row["id"],
+                    user_row["id"],
+                )
+
+        return dict(user_row), dict(project_row)
 
     async def update_user(
         self,

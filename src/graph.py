@@ -645,6 +645,23 @@ def create_execute_node(
                     logger.debug(
                         f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
                     )
+                    # Audit memory injection
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        inject_auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="memory_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "count": len(memories),
+                                "total_tokens": sum(m.token_count for m in memories),
+                            },
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
             except Exception as e:
                 logger.warning(f"[{job_id}] Memory retrieval failed (non-fatal): {e}")
 
