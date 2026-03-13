@@ -71,6 +71,29 @@ class CurationResult(BaseModel):
     summary: str = Field(description="Brief summary of what was curated")
 
 
+class AssemblyAction(BaseModel):
+    """A single TTL adjustment made by the assembler."""
+
+    memory_id: str = Field(description="UUID of the memory acted on")
+    action: str = Field(description="'boost' or 'deprecate'")
+    turns: int = Field(description="Number of turns to adjust TTL by")
+    reason: str = Field(description="Why this adjustment was made")
+
+
+class AssemblyResult(BaseModel):
+    """Structured output for memory assembly (agent mode)."""
+
+    actions_taken: List[AssemblyAction] = Field(
+        default_factory=list,
+        description="List of TTL adjustments made. Empty if no changes needed.",
+    )
+    gaps_identified: List[str] = Field(
+        default_factory=list,
+        description="Missing knowledge areas where no relevant memory exists",
+    )
+    summary: str = Field(description="Brief summary of assembly review")
+
+
 # NOTE: ConversationSummary (the summarization output schema) lives in
 # src/core/context.py because it's tightly coupled with the compaction
 # formatting logic there. SummarizeTask imports it from there.
@@ -255,6 +278,55 @@ class CurateKnowledgeTask(AuxAgentTask):
 
     def get_tools(self) -> list:
         return self._kb_tools
+
+
+class AssembleMemoriesTask(AuxAgentTask):
+    """Review recent conversation and curate memory TTLs.
+
+    Agent mode task (counterpart to ExtractMemoriesTask). Searches
+    the memory DB for relevant missing memories and adjusts TTLs:
+    boost relevant ones, deprecate stale ones.
+
+    Prompt loaded from config/prompts/ via the prompt matrix.
+    Uses memory_search, memory_boost, memory_deprecate tools.
+    """
+
+    def __init__(
+        self,
+        recent_context: str,
+        current_injection: str,
+        assembler_tools: list,
+        prompt: str,
+    ):
+        self.recent_context = recent_context
+        self.current_injection = current_injection
+        self._tools = assembler_tools
+        self._prompt = prompt
+
+    @property
+    def system_prompt(self) -> str:
+        return self._prompt
+
+    def build_context(self) -> str:
+        parts = [
+            "## Recent Conversation Context",
+            self.recent_context,
+            "",
+            "## Currently Injected Memories",
+            self.current_injection if self.current_injection else "(none)",
+            "",
+            "Review whether the right memories are being surfaced. "
+            "Search for missing relevant memories and boost them. "
+            "Deprecate pinned memories that are no longer relevant to the current work.",
+        ]
+        return "\n".join(parts)
+
+    @property
+    def output_schema(self) -> Type[BaseModel]:
+        return AssemblyResult
+
+    def get_tools(self) -> list:
+        return self._tools
 
 
 # =============================================================================
@@ -560,6 +632,86 @@ def _should_extract_memories(
     if turn_count <= last_observed_turn:
         return False
     return turn_count % interval == 0
+
+
+def _should_assemble_memories(
+    turn_count: int,
+    interval: int,
+    last_assembled_turn: int,
+) -> bool:
+    """Check if memory assembler should run on this turn.
+
+    Args:
+        turn_count: Current turn count
+        interval: Assembly interval (every N turns)
+        last_assembled_turn: Last turn when assembler ran
+
+    Returns:
+        True if assembler should run
+    """
+    if turn_count <= 0:
+        return False
+    if turn_count <= last_assembled_turn:
+        return False
+    return turn_count % interval == 0
+
+
+async def assemble_memories(
+    auxiliary_llm: "AuxiliaryLLM",
+    recall_store,
+    messages: List[BaseMessage],
+    current_injection_text: str,
+    memory_assembler_prompt: str,
+) -> Optional["AssemblyResult"]:
+    """Run the memory assembler to review and adjust memory TTLs.
+
+    Counterpart to extract_and_store_memories. While the extractor
+    creates new memories, the assembler curates existing ones by
+    adjusting their TTLs (boost relevant, deprecate stale).
+
+    Args:
+        auxiliary_llm: AuxiliaryLLM instance for agent-mode execution
+        recall_store: RecallStore instance (passed to assembler tools)
+        messages: Recent conversation messages for context
+        current_injection_text: Currently injected memory block text
+        memory_assembler_prompt: System prompt for memory assembly
+
+    Returns:
+        AssemblyResult on success, None on failure
+    """
+    try:
+        # Cap the message window
+        if len(messages) > _MAX_OBSERVATION_WINDOW:
+            messages = messages[-_MAX_OBSERVATION_WINDOW:]
+
+        if not messages:
+            return None
+
+        recent_context = _format_messages_for_extraction(messages)
+
+        from src.services.assembler_tools import create_assembler_tools
+        assembler_tools = create_assembler_tools(recall_store)
+
+        task = AssembleMemoriesTask(
+            recent_context=recent_context,
+            current_injection=current_injection_text,
+            assembler_tools=assembler_tools,
+            prompt=memory_assembler_prompt,
+        )
+
+        result = await auxiliary_llm.agent(task)
+
+        actions_count = len(result.actions_taken) if result.actions_taken else 0
+        gaps_count = len(result.gaps_identified) if result.gaps_identified else 0
+        logger.info(
+            f"Memory assembly: {actions_count} TTL adjustments, "
+            f"{gaps_count} gaps identified — {result.summary}"
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(f"Memory assembly failed (non-fatal): {e}")
+        return None
 
 
 # =============================================================================

@@ -2582,7 +2582,7 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
 
 def get_builder_model() -> str:
     """Get the model name for the builder LLM."""
-    return os.getenv("BUILDER_MODEL", "gpt-5.2-pro")
+    return os.getenv("BUILDER_MODEL", "openai/gpt-oss-120b")
 
 
 _builder_key_rings: dict[str, "KeyRing | None"] = {}

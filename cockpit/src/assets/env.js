@@ -28,6 +28,8 @@
 
   // Models available in the instruction builder chat.
   window['env']['builderModels'] = [
+    { label: 'GPT OSS 120B (Local)', id: 'openai/gpt-oss-120b' },
+    { label: 'MiniMax M2.5', id: 'openrouter/minimax/minimax-m2.5' },
     { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
     { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
   ];

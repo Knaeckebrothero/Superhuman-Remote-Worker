@@ -9,6 +9,7 @@ default:
   tactical: tactical.txt
   summarization: summarization_prompt.txt
   memory_extraction: memory_extraction_prompt.txt
+  memory_assembler: memory_assembler_prompt.txt
   curation: curation_prompt.txt
 
 minimax:
@@ -25,6 +26,7 @@ gpt-oss:
   tactical: tactical_gpt_oss.txt
   summarization: summarization_prompt_gpt_oss.txt
   memory_extraction: memory_extraction_prompt_gpt_oss.txt
+  memory_assembler: memory_assembler_prompt_gpt_oss.txt
   curation: curation_prompt_gpt_oss.txt
 
 # Model-specific overrides — add as needed:

@@ -87,6 +87,7 @@ class UniversalAgentState(TypedDict):
     is_final_phase: bool                 # True when job_complete called, awaiting todo completion
     turn_count: int                      # LLM call counter (for memory extraction interval)
     last_observed_turn: int              # Last turn when memory extraction ran
+    last_assembled_turn: int             # Last turn when memory assembler ran
 
     # File-based context (read from workspace into state)
     workspace_memory: str                # Contents of workspace.md
@@ -175,6 +176,7 @@ def create_initial_state(
         is_final_phase=False,
         turn_count=0,
         last_observed_turn=0,
+        last_assembled_turn=0,
 
         # File-based context
         workspace_memory="",
