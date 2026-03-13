@@ -102,7 +102,7 @@ interface JobRow {
                         <span class="child-connector">\u2514</span>
                       }
                       <span class="status-badge" [class]="'status-' + row.job.status">
-                        {{ row.job.status }}
+                        {{ formatStatus(row.job.status) }}
                       </span>
                       @if (row.isChild && row.job.config_name) {
                         <span class="config-badge">{{ row.job.config_name }}</span>
@@ -168,13 +168,23 @@ interface JobRow {
                         >
                           Pause
                         </button>
-                        <button
-                          class="action-btn cancel"
-                          (click)="cancelJob(row.job.id); $event.stopPropagation()"
-                          title="Cancel job"
-                        >
-                          Cancel
-                        </button>
+                        @if (confirmingCancelId() === row.job.id) {
+                          <button
+                            class="action-btn cancel confirming"
+                            (click)="cancelJob(row.job.id); $event.stopPropagation()"
+                            title="Click again to confirm cancellation"
+                          >
+                            Sure?
+                          </button>
+                        } @else {
+                          <button
+                            class="action-btn cancel"
+                            (click)="confirmCancel(row.job.id); $event.stopPropagation()"
+                            title="Cancel job"
+                          >
+                            Cancel
+                          </button>
+                        }
                       }
                     }
                     @if (row.job.status === 'pending_review') {
@@ -205,13 +215,23 @@ interface JobRow {
                       </button>
                     }
                     @if (row.job.status !== 'processing' && row.job.status !== 'paused' && row.job.status !== 'reviewing' && row.job.status !== 'waiting') {
-                      <button
-                        class="action-btn delete"
-                        (click)="deleteJob(row.job.id); $event.stopPropagation()"
-                        title="Delete job"
-                      >
-                        Delete
-                      </button>
+                      @if (confirmingDeleteId() === row.job.id) {
+                        <button
+                          class="action-btn delete confirming"
+                          (click)="deleteJob(row.job.id); $event.stopPropagation()"
+                          title="Click again to confirm deletion"
+                        >
+                          Confirm?
+                        </button>
+                      } @else {
+                        <button
+                          class="action-btn delete"
+                          (click)="confirmDelete(row.job.id); $event.stopPropagation()"
+                          title="Delete job"
+                        >
+                          Delete
+                        </button>
+                      }
                     }
                   </td>
                 </tr>
@@ -695,6 +715,16 @@ interface JobRow {
         cursor: not-allowed;
       }
 
+      .action-btn.confirming {
+        font-weight: 700;
+        animation: pulse-confirm 1s ease-in-out infinite;
+      }
+
+      @keyframes pulse-confirm {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+      }
+
       .action-btn:hover {
         background: rgba(255, 255, 255, 0.1);
       }
@@ -774,6 +804,11 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   // In-flight action tracking
   readonly cancelingJobIds = signal<Set<string>>(new Set());
+
+  // Inline confirmation state
+  readonly confirmingDeleteId = signal<string | null>(null);
+  readonly confirmingCancelId = signal<string | null>(null);
+  private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
 
   // Promote form state
   readonly promoteJobId = signal<string | null>(null);
@@ -956,6 +991,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   cancelJob(jobId: string): void {
+    this.clearConfirmations();
     const next = new Set(this.cancelingJobIds());
     next.add(jobId);
     this.cancelingJobIds.set(next);
@@ -983,11 +1019,32 @@ export class JobListComponent implements OnInit, OnDestroy {
     });
   }
 
+  confirmDelete(jobId: string): void {
+    this.clearConfirmations();
+    this.confirmingDeleteId.set(jobId);
+    this.confirmTimeout = setTimeout(() => this.clearConfirmations(), 3000);
+  }
+
+  confirmCancel(jobId: string): void {
+    this.clearConfirmations();
+    this.confirmingCancelId.set(jobId);
+    this.confirmTimeout = setTimeout(() => this.clearConfirmations(), 3000);
+  }
+
+  private clearConfirmations(): void {
+    this.confirmingDeleteId.set(null);
+    this.confirmingCancelId.set(null);
+    if (this.confirmTimeout) {
+      clearTimeout(this.confirmTimeout);
+      this.confirmTimeout = null;
+    }
+  }
+
   deleteJob(jobId: string): void {
+    this.clearConfirmations();
     this.api.deleteJob(jobId).subscribe((result) => {
       if (result) {
         this.refresh();
-        // Clear selection if deleted job was selected
         if (this.selectedJobId() === jobId) {
           this.selectedJobId.set(null);
         }
@@ -1049,6 +1106,13 @@ export class JobListComponent implements OnInit, OnDestroy {
       return prompt;
     }
     return prompt.slice(0, maxLength) + '...';
+  }
+
+  formatStatus(status: string): string {
+    return status
+      .split('_')
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(' ');
   }
 
   formatDate(dateString: string): string {

@@ -3,6 +3,7 @@ import { Router, RouterOutlet, NavigationEnd } from '@angular/router';
 import { toSignal } from '@angular/core/rxjs-interop';
 import { filter, map } from 'rxjs';
 import { SidebarComponent } from './layout/sidebar/sidebar.component';
+import { ToastComponent } from './core/components/toast/toast.component';
 import { ComponentRegistryService } from './core/services/component-registry.service';
 import { ViewportService } from './core/services/viewport.service';
 import { UserService } from './core/services/user.service';
@@ -30,7 +31,7 @@ import { ProjectListPageComponent } from './shared/pages/project-list.component'
 
 @Component({
   selector: 'app-root',
-  imports: [RouterOutlet, SidebarComponent],
+  imports: [RouterOutlet, SidebarComponent, ToastComponent],
   template: `
     <div class="app-container">
       @if (showSidebar()) {
@@ -40,6 +41,7 @@ import { ProjectListPageComponent } from './shared/pages/project-list.component'
         <router-outlet />
       </div>
     </div>
+    <app-toast-container />
   `,
   styles: [
     `
