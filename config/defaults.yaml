@@ -166,15 +166,17 @@ research:
 # See docs/features/memory_light.md for architecture details.
 memory:
   enabled: true                    # Opt-in per config
-  budget_tokens: 10000              # Max tokens for memory injection per LLM call
-  max_memories_per_injection: 25   # Cap on number of memories injected
+  budget_tokens: 10000             # Max tokens for memory injection per LLM call
+  max_memories_per_injection: 150  # Cap on number of memories injected
   observer_interval: 5             # Run observer every N turns
+  assembler_interval: 7            # Run assembler every N turns (TTL curation)
+  default_ttl: 10                  # Default TTL in turns for new memories (guaranteed injection)
   observer_model: null             # null = use main LLM, or specify model
   observer_base_url: null          # null = use main LLM_BASE_URL
   embedding_model: qwen3-embedding-8b
-  dense_results: 5                 # Top-K for dense vector search
-  sparse_results: 5                # Top-K for sparse/keyword search
-  recent_results: 3                # Number of recent memories to include
+  dense_results: 30                # Top-K for dense vector search
+  sparse_results: 30               # Top-K for sparse/keyword search
+  recent_results: 15               # Number of recent memories to include
   importance_threshold: 0.3        # Minimum importance to store
   dedup_threshold: 0.85            # Cosine similarity threshold for dedup
   retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
@@ -196,6 +198,8 @@ auxiliary:
     extract_memories:
       enabled: true
     curate_knowledge:
+      enabled: true
+    assemble_memories:
       enabled: true
 
 # Verification — auto-spawn a critic job after job_complete to review deliverables.

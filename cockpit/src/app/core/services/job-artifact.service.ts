@@ -33,6 +33,8 @@ function deepMerge(base: Record<string, unknown>, override: Record<string, unkno
   return result;
 }
 
+const SESSION_STORAGE_KEY = 'builder_session_id';
+
 /**
  * Shared signal service for bidirectional artifact state between the
  * instruction builder chat and the job creation form.
@@ -55,7 +57,7 @@ export class JobArtifactService {
   readonly description = signal<string | null>(null);
 
   /** Builder session ID (null if no builder session started) */
-  readonly sessionId = signal<string | null>(null);
+  readonly sessionId = signal<string | null>(this.loadSessionId());
 
   /** Active job context — delegates to JobContextService */
   readonly activeJobId = this.jobContext.activeJobId;
@@ -64,7 +66,7 @@ export class JobArtifactService {
   readonly streaming = signal<boolean>(false);
 
   /** Selected builder model */
-  readonly builderModel = signal<string>(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
+  readonly builderModel = signal<string>(environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b');
 
   /** Pending workspace edit proposals awaiting user approval */
   readonly pendingWorkspaceEdits = signal<PendingWorkspaceEdit[]>([]);
@@ -123,15 +125,38 @@ export class JobArtifactService {
     );
   }
 
+  /** Persist sessionId to localStorage so it survives page refresh. */
+  persistSessionId(id: string | null): void {
+    this.sessionId.set(id);
+    try {
+      if (id) {
+        localStorage.setItem(SESSION_STORAGE_KEY, id);
+      } else {
+        localStorage.removeItem(SESSION_STORAGE_KEY);
+      }
+    } catch {
+      // localStorage may be unavailable (e.g. private browsing)
+    }
+  }
+
   /** Reset all state for a new job creation session (preserves job selection) */
   reset(): void {
     this.instructions.set(null);
     this.config.set(null);
     this.description.set(null);
-    this.sessionId.set(null);
+    this.persistSessionId(null);
     this.streaming.set(false);
-    this.builderModel.set(environment.builderModels[0]?.id ?? 'gpt-5.2-pro');
+    this.builderModel.set(environment.builderModels[0]?.id ?? 'openai/gpt-oss-120b');
     this.pendingWorkspaceEdits.set([]);
     this.editCounter = 0;
+  }
+
+  /** Load sessionId from localStorage on service init. */
+  private loadSessionId(): string | null {
+    try {
+      return localStorage.getItem(SESSION_STORAGE_KEY);
+    } catch {
+      return null;
+    }
   }
 }

@@ -257,16 +257,19 @@ CREATE OR REPLACE FUNCTION memory_hybrid_search(
 WITH dense AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
     FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
     ORDER BY rank_ix LIMIT match_count * 2
 ),
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
     FROM memories WHERE job_id = job_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
     ORDER BY rank_ix LIMIT match_count * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
     FROM memories WHERE job_id = job_id_param AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
     ORDER BY rank_ix LIMIT match_count
 )
 SELECT memories.* FROM (
@@ -288,6 +291,11 @@ ALTER TABLE memories ADD COLUMN IF NOT EXISTS project_id UUID;
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
 CREATE INDEX IF NOT EXISTS idx_memories_project_importance ON memories(project_id, importance DESC);
 
+-- TTL system: guaranteed injection for N turns, then fade to retrieval-based
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS remaining_turns INTEGER;
+CREATE INDEX IF NOT EXISTS idx_memories_ttl_active ON memories(job_id, remaining_turns) WHERE remaining_turns > 0;
+CREATE INDEX IF NOT EXISTS idx_memories_project_ttl_active ON memories(project_id, remaining_turns) WHERE remaining_turns > 0;
+
 -- Project-scoped hybrid search: identical to memory_hybrid_search but scoped by project_id
 CREATE OR REPLACE FUNCTION memory_project_hybrid_search(
     query_text text,
@@ -303,16 +311,19 @@ CREATE OR REPLACE FUNCTION memory_project_hybrid_search(
 WITH dense AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
     FROM memories WHERE project_id = project_id_param AND embedding IS NOT NULL AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
     ORDER BY rank_ix LIMIT match_count * 2
 ),
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
     FROM memories WHERE project_id = project_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
     ORDER BY rank_ix LIMIT match_count * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
     FROM memories WHERE project_id = project_id_param AND importance >= importance_floor
+        AND (remaining_turns IS NULL OR remaining_turns <= 0)
     ORDER BY rank_ix LIMIT match_count
 )
 SELECT memories.* FROM (
