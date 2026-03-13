@@ -255,6 +255,25 @@ import { environment } from '../../../core/environment';
                 <span class="field-hint">{{ autonomyDescription() }}</span>
               </div>
 
+              <!-- Project Memory Opt-out -->
+              @if (projectHasSharedMemory()) {
+                <div class="form-group">
+                  <label class="memory-toggle">
+                    <input
+                      type="checkbox"
+                      [checked]="useProjectMemory()"
+                      (change)="onUseProjectMemoryChange($event)"
+                      [disabled]="isSubmitting()"
+                    />
+                    <span>Use project memory</span>
+                  </label>
+                  <span class="field-hint">
+                    When enabled, this job shares memories with other jobs in the project.
+                    Uncheck to isolate this job's memories.
+                  </span>
+                </div>
+              }
+
               <!-- Model Preset -->
               @if (availablePresets.length > 0) {
                 <div class="form-group">
@@ -873,6 +892,20 @@ import { environment } from '../../../core/environment';
       }
 
       .multimodal-toggle input[type="checkbox"] {
+        margin: 0;
+        accent-color: var(--accent-color, #cba6f7);
+      }
+
+      .memory-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--text, #cdd6f4);
+        cursor: pointer;
+      }
+
+      .memory-toggle input[type="checkbox"] {
         margin: 0;
         accent-color: var(--accent-color, #cba6f7);
       }
@@ -1572,6 +1605,17 @@ export class JobCreateComponent implements OnInit {
   ];
 
   readonly selectedAutonomy = signal<string | null>(null);
+  readonly useProjectMemory = signal(true);
+  readonly projectHasSharedMemory = computed(() => {
+    const pid = this.selectedProjectId();
+    if (!pid) return false;
+    const proj = this.projects().find((p) => p.id === pid);
+    if (!proj) return false;
+    // Project-scoped memory is on by default (defaults.yaml), so treat absent as true
+    const override = proj.default_config_override as Record<string, any> | null;
+    const val = override?.['memory']?.['project_scoped'];
+    return val !== false;
+  });
 
   readonly autonomyLevels = [
     { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
@@ -1822,6 +1866,10 @@ export class JobCreateComponent implements OnInit {
     });
   }
 
+  onUseProjectMemoryChange(event: Event): void {
+    this.useProjectMemory.set((event.target as HTMLInputElement).checked);
+  }
+
   /** Build config_override by diffing form values against expert defaults. */
   private buildConfigOverride(): Record<string, unknown> | undefined {
     const override: Record<string, unknown> = {};
@@ -1881,6 +1929,11 @@ export class JobCreateComponent implements OnInit {
     const autonomy = this.selectedAutonomy();
     if (autonomy !== null && autonomy !== this.getExpertDefault('autonomy')) {
       override['autonomy'] = autonomy;
+    }
+
+    // Project memory opt-out
+    if (this.projectHasSharedMemory() && !this.useProjectMemory()) {
+      override['memory'] = { project_scoped: false };
     }
 
     return Object.keys(override).length > 0 ? override : undefined;
@@ -2237,6 +2290,7 @@ export class JobCreateComponent implements OnInit {
     this.tacticalMultimodal.set(null);
     this.disabledToolCategories.set(new Set());
     this.selectedAutonomy.set(null);
+    this.useProjectMemory.set(true);
     this.selectedPriority.set(5);
     // Reset advanced options
     this.showAdvanced.set(false);

@@ -190,9 +190,9 @@ class TestStore:
             importance=0.5,
         )
 
-        # Check the token_count arg (14th positional arg)
+        # Check the token_count arg (15th positional arg, $15 with project_id added)
         call_args = mock_db.fetchval.call_args
-        token_count_arg = call_args[0][14]  # $14 = token_count
+        token_count_arg = call_args[0][15]  # $15 = token_count
         assert token_count_arg == 100  # 400 chars / 4
 
     @pytest.mark.asyncio
@@ -208,7 +208,7 @@ class TestStore:
         )
 
         call_args = mock_db.fetchval.call_args
-        summary_arg = call_args[0][4]  # $4 = summary
+        summary_arg = call_args[0][5]  # $5 = summary (shifted by project_id)
         assert len(summary_arg) == 500
 
 

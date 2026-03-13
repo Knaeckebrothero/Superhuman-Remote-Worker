@@ -136,6 +136,19 @@ SUBJOB_CLEANUP_DIRS = [
 ]
 
 
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Deep merge two dicts. Override wins for scalars/lists; dicts merge recursively."""
+    result = base.copy()
+    for key, value in override.items():
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
     """Squash-merge a completed subjob's branch into its parent's branch.
 
@@ -1282,8 +1295,13 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 )
             if config_name == "default" and project.get("default_config_name"):
                 config_name = project["default_config_name"]
-            if not config_override and project.get("default_config_override"):
-                config_override = project["default_config_override"]
+            project_default_override = project.get("default_config_override")
+            if project_default_override:
+                if config_override:
+                    # Deep merge: project defaults as base, job overrides on top
+                    config_override = _deep_merge_dicts(project_default_override, config_override)
+                else:
+                    config_override = project_default_override
 
         result = await postgres_db.create_job(
             description=job.description,
