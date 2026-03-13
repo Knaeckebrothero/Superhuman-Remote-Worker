@@ -777,6 +777,7 @@ class MemoryConfig:
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
+    project_scoped: bool = True
     storage: str = "postgres"
 
 

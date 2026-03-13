@@ -574,6 +574,22 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'repos' | 'experts' | 'members' |
                 </div>
               </div>
 
+              <!-- Memory -->
+              <div class="settings-group">
+                <h3 class="settings-heading">Memory</h3>
+                <label class="toggle-row">
+                  <input
+                    type="checkbox"
+                    [checked]="projectMemoryShared()"
+                    (change)="toggleProjectMemory($event)"
+                  />
+                  <span class="toggle-label">Share memories across jobs</span>
+                </label>
+                <p class="text-muted" style="font-size: 12px; margin-top: 4px;">
+                  When enabled, automatic memories from any job in this project are visible to all other jobs.
+                </p>
+              </div>
+
               <!-- Danger Zone -->
               <div class="settings-group danger-zone">
                 <h3 class="settings-heading danger-heading">Danger Zone</h3>
@@ -1095,6 +1111,8 @@ type Tab = 'overview' | 'jobs' | 'knowledge' | 'repos' | 'experts' | 'members' |
     }
 
     .settings-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .toggle-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .toggle-label { font-size: 13px; color: var(--text); }
 
     /* Danger Zone */
     .danger-zone { border-color: rgba(243, 139, 168, 0.3); }
@@ -1396,6 +1414,10 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly settingsName = signal('');
   readonly settingsConfigName = signal('');
   readonly isSavingSettings = signal(false);
+  readonly projectMemoryShared = computed(() => {
+    const p = this.project();
+    return !!(p?.default_config_override as any)?.memory?.project_scoped;
+  });
 
   // Knowledge tab
   readonly kbSummary = signal<KnowledgeSummary | null>(null);
@@ -1592,6 +1614,20 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
         if (res) this.api.getProject(this.projectId).subscribe((p) => this.project.set(p));
       },
       error: () => this.isSavingSettings.set(false),
+    });
+  }
+
+  toggleProjectMemory(event: Event): void {
+    const checked = (event.target as HTMLInputElement).checked;
+    const p = this.project();
+    if (!p) return;
+    const existing = (p.default_config_override ?? {}) as Record<string, any>;
+    const override = {
+      ...existing,
+      memory: { ...(existing['memory'] ?? {}), project_scoped: checked },
+    };
+    this.api.updateProject(this.projectId, { default_config_override: override }).subscribe((res) => {
+      if (res) this.api.getProject(this.projectId).subscribe((proj) => this.project.set(proj));
     });
   }
 

@@ -88,6 +88,7 @@ class MemoryRecord:
 
     id: Optional[uuid.UUID] = None
     job_id: Optional[uuid.UUID] = None
+    project_id: Optional[uuid.UUID] = None
     agent_id: Optional[str] = None
     content: str = ""
     summary: Optional[str] = None
@@ -110,6 +111,7 @@ class MemoryRecord:
         return cls(
             id=row.get("id"),
             job_id=row.get("job_id"),
+            project_id=row.get("project_id"),
             agent_id=row.get("agent_id"),
             content=row.get("content", ""),
             summary=row.get("summary"),
@@ -146,6 +148,7 @@ class RecallStore:
         job_id: uuid.UUID,
         config=None,
         agent_id: Optional[str] = None,
+        project_id: Optional[uuid.UUID] = None,
     ):
         """Initialize RecallStore.
 
@@ -155,11 +158,14 @@ class RecallStore:
             job_id: Job UUID (memories are scoped per job)
             config: MemoryConfig dataclass (optional, uses defaults if None)
             agent_id: Optional agent identifier for cross-job memory (Phase 5)
+            project_id: Optional project UUID for project-scoped memory sharing
         """
         self.db = db
         self.embedding_service = embedding_service
         self.job_id = job_id
         self.agent_id = agent_id
+        self.project_id = project_id
+        self.project_scoped = getattr(config, "project_scoped", False) if config else False
 
         # Config defaults (matches MemoryConfig dataclass)
         self.dedup_threshold = 0.85
@@ -184,6 +190,13 @@ class RecallStore:
             self.retrieval_importance_floor = getattr(
                 config, "retrieval_importance_floor", 0.4
             )
+
+    @property
+    def _scope_filter(self):
+        """Return (column, value) for scoping queries by project or job."""
+        if self.project_scoped and self.project_id:
+            return "project_id", self.project_id
+        return "job_id", self.job_id
 
     # =========================================================================
     # Storage
@@ -264,19 +277,20 @@ class RecallStore:
         mem_id = await self.db.fetchval(
             """
             INSERT INTO memories (
-                job_id, agent_id, content, summary, memory_type, source,
+                job_id, project_id, agent_id, content, summary, memory_type, source,
                 keywords, embedding, sparse_keywords,
                 importance, source_turn_start, source_turn_end, source_phase,
                 token_count
             ) VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, to_tsvector('english', $9),
-                $10, $11, $12, $13,
-                $14
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, to_tsvector('english', $10),
+                $11, $12, $13, $14,
+                $15
             )
             RETURNING id
             """,
             self.job_id,
+            self.project_id,
             self.agent_id,
             content,
             summary[:500] if summary else None,
@@ -318,18 +332,19 @@ class RecallStore:
         """
         threshold = threshold if threshold is not None else self.dedup_threshold
 
+        scope_col, scope_val = self._scope_filter
         row = await self.db.fetchrow(
-            """
+            f"""
             SELECT *, 1 - (embedding <=> $1) AS similarity
             FROM memories
-            WHERE job_id = $2
+            WHERE {scope_col} = $2
               AND embedding IS NOT NULL
               AND 1 - (embedding <=> $1) > $3
             ORDER BY similarity DESC
             LIMIT 1
             """,
             embedding,
-            self.job_id,
+            scope_val,
             threshold,
         )
 
@@ -357,15 +372,16 @@ class RecallStore:
         """
         limit = limit or self.dense_results
 
+        scope_col, scope_val = self._scope_filter
         rows = await self.db.fetch(
-            """
+            f"""
             SELECT *
             FROM memories
-            WHERE job_id = $1 AND embedding IS NOT NULL
+            WHERE {scope_col} = $1 AND embedding IS NOT NULL
             ORDER BY embedding <=> $2
             LIMIT $3
             """,
-            self.job_id,
+            scope_val,
             embedding,
             limit,
         )
@@ -401,17 +417,18 @@ class RecallStore:
         """
         limit = limit or self.sparse_results
 
+        scope_col, scope_val = self._scope_filter
         rows = await self.db.fetch(
-            """
+            f"""
             SELECT *,
                    ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $2)) AS rank
             FROM memories
-            WHERE job_id = $1
+            WHERE {scope_col} = $1
               AND sparse_keywords @@ websearch_to_tsquery('english', $2)
             ORDER BY rank DESC
             LIMIT $3
             """,
-            self.job_id,
+            scope_val,
             query_text,
             limit,
         )
@@ -432,15 +449,16 @@ class RecallStore:
         """
         limit = limit or self.recent_results
 
+        scope_col, scope_val = self._scope_filter
         rows = await self.db.fetch(
-            """
+            f"""
             SELECT *
             FROM memories
-            WHERE job_id = $1
+            WHERE {scope_col} = $1
             ORDER BY created_at DESC
             LIMIT $2
             """,
-            self.job_id,
+            scope_val,
             limit,
         )
 
@@ -476,15 +494,22 @@ class RecallStore:
         match_count = match_count or self.max_memories_per_injection
         importance_floor = importance_floor if importance_floor is not None else self.retrieval_importance_floor
 
+        if self.project_scoped and self.project_id:
+            func_name = "memory_project_hybrid_search"
+            scope_val = self.project_id
+        else:
+            func_name = "memory_hybrid_search"
+            scope_val = self.job_id
+
         rows = await self.db.fetch(
-            """
-            SELECT * FROM memory_hybrid_search(
+            f"""
+            SELECT * FROM {func_name}(
                 $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
             )
             """,
             query_text,
             query_embedding,
-            self.job_id,
+            scope_val,
             match_count,
             dense_weight,
             sparse_weight,
@@ -618,8 +643,9 @@ class RecallStore:
         Returns:
             Dict with counts by type, source, total tokens, etc.
         """
+        scope_col, scope_val = self._scope_filter
         row = await self.db.fetchrow(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total,
                 COALESCE(SUM(token_count), 0) AS total_tokens,
@@ -636,9 +662,9 @@ class RecallStore:
                 COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
                 AVG(importance) AS avg_importance
             FROM memories
-            WHERE job_id = $1
+            WHERE {scope_col} = $1
             """,
-            self.job_id,
+            scope_val,
         )
 
         if row:

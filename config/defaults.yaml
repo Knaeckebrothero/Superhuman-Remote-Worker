@@ -178,6 +178,7 @@ memory:
   importance_threshold: 0.3        # Minimum importance to store
   dedup_threshold: 0.85            # Cosine similarity threshold for dedup
   retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
+  project_scoped: true             # When true, memories are shared across all jobs in the same project
   storage: postgres                # Only option for v1
 
 # Auxiliary LLM — unified support task system for background LLM tasks.
