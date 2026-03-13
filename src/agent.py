@@ -1396,6 +1396,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 from src.services.recall_store import RecallStore
                 import uuid as _uuid
 
+                # Resolve project_id for project-scoped memory sharing
+                project_id_for_memory = None
+                if self.config.memory.project_scoped:
+                    raw_pid = self._job_metadata.get("project_id") if self._job_metadata else None
+                    if raw_pid:
+                        project_id_for_memory = _uuid.UUID(str(raw_pid))
+
                 embedding_service = get_embedding_service()
                 recall_store = RecallStore(
                     db=self.vector_conn,
@@ -1403,9 +1410,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     job_id=_uuid.UUID(self._current_job_id),
                     config=self.config.memory,
                     agent_id=self.config.agent_id,
+                    project_id=project_id_for_memory,
                 )
                 context.recall_store = recall_store
-                logger.info(f"RecallStore initialized for job {self._current_job_id}")
+                scope_msg = f"project {project_id_for_memory}" if project_id_for_memory else f"job {self._current_job_id}"
+                logger.info(f"RecallStore initialized (scope: {scope_msg})")
                 # Memory extraction is now handled by AuxiliaryLLM in the graph
                 # (see extract_and_store_memories in src/services/auxiliary.py)
 
