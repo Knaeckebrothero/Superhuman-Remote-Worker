@@ -4342,6 +4342,85 @@ async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/jobs/{job_id}/memories")
+async def list_job_memories(
+    job_id: str,
+    memory_type: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    sort_by: str = Query(default="created_at"),
+    sort_order: str = Query(default="desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List individual memories for a job with optional filters and pagination."""
+    # Validate sort parameters
+    valid_sort_fields = {"created_at", "importance", "access_count", "token_count", "last_accessed"}
+    if sort_by not in valid_sort_fields:
+        sort_by = "created_at"
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
+
+    try:
+        async with vector_db.acquire() as conn:
+            conditions = ["job_id = $1::uuid"]
+            params: list[Any] = [job_id]
+            idx = 2
+
+            if memory_type:
+                conditions.append(f"memory_type = ${idx}")
+                params.append(memory_type)
+                idx += 1
+            if source:
+                conditions.append(f"source = ${idx}")
+                params.append(source)
+                idx += 1
+            if search:
+                conditions.append(f"(content ILIKE ${idx} OR summary ILIKE ${idx})")
+                params.append(f"%{search}%")
+                idx += 1
+
+            where = " AND ".join(conditions)
+
+            # Count total
+            count_row = await conn.fetchrow(
+                f"SELECT COUNT(*) as cnt FROM memories WHERE {where}",
+                *params,
+            )
+            total = count_row["cnt"] if count_row else 0
+
+            # Fetch page
+            params.extend([limit, offset])
+            rows = await conn.fetch(
+                f"SELECT id, job_id, project_id, agent_id, "
+                f"LEFT(content, 300) as content_preview, summary, "
+                f"memory_type, source, keywords, importance, "
+                f"source_turn_start, source_turn_end, source_phase, "
+                f"token_count, access_count, created_at, last_accessed "
+                f"FROM memories WHERE {where} "
+                f"ORDER BY {sort_by} {sort_order} "
+                f"LIMIT ${idx} OFFSET ${idx + 1}",
+                *params,
+            )
+            memories = []
+            for r in rows:
+                m = dict(r)
+                # Convert UUIDs and datetimes for JSON serialization
+                for k in ("id", "job_id", "project_id"):
+                    if m.get(k) is not None:
+                        m[k] = str(m[k])
+                for k in ("created_at", "last_accessed"):
+                    if m.get(k) is not None:
+                        m[k] = m[k].isoformat()
+                if m.get("importance") is not None:
+                    m["importance"] = float(m["importance"])
+                memories.append(m)
+
+        return {"memories": memories, "total": total, "limit": limit, "offset": offset}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/jobs/{job_id}/sources/search")
 async def search_job_sources(
     job_id: str,
@@ -6521,21 +6600,12 @@ def _detect_provider(model: str) -> str:
 
 
 def _get_api_key_for_provider(provider: str) -> str | None:
-    """Get API key for the given provider.
+    """Get API key for the given provider via the KeyRing system.
 
-    Checks provider-specific BUILDER key first, then falls back to the
-    standard provider key.  BUILDER_API_KEY (without provider suffix) is
-    only used when there is no provider-specific override.
+    Routes through get_builder_api_key() which handles comma-separated keys
+    and KeyRing-based rotation.
     """
-    if provider == "anthropic":
-        return (
-            os.getenv("BUILDER_ANTHROPIC_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
-        )
-    return (
-        os.getenv("BUILDER_OPENAI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-    )
+    return get_builder_api_key(provider)
 
 
 def _chat_messages_to_responses_input(
@@ -6607,7 +6677,7 @@ async def _stream_openai_responses(
         return
 
     client = AsyncOpenAI(
-        api_key=api_key or get_builder_api_key(),
+        api_key=api_key or get_builder_api_key("openai"),
         base_url=get_builder_base_url(),
     )
 
@@ -6678,7 +6748,7 @@ async def _stream_openai_responses(
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e))
+            new_key = rotate_builder_key(str(e), provider="openai")
             if new_key:
                 logger.info("Builder: retrying OpenAI Responses API with rotated key")
                 async for event in _stream_openai_responses(
@@ -6710,7 +6780,7 @@ async def _stream_openai(
         return
 
     client = AsyncOpenAI(
-        api_key=api_key or get_builder_api_key(),
+        api_key=api_key or get_builder_api_key("openai"),
         base_url=get_builder_base_url(),
     )
 
@@ -6760,7 +6830,7 @@ async def _stream_openai(
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e))
+            new_key = rotate_builder_key(str(e), provider="openai")
             if new_key:
                 logger.info("Builder: retrying OpenAI Chat API with rotated key")
                 async for event in _stream_openai(
@@ -6791,7 +6861,7 @@ async def _stream_anthropic(
         yield ("error", {"message": "anthropic package not installed"})
         return
 
-    client = AsyncAnthropic(api_key=api_key or get_builder_api_key())
+    client = AsyncAnthropic(api_key=api_key or get_builder_api_key("anthropic"))
 
     # Convert OpenAI tool format to Anthropic format
     anthropic_tools = []
@@ -6850,7 +6920,7 @@ async def _stream_anthropic(
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e))
+            new_key = rotate_builder_key(str(e), provider="anthropic")
             if new_key:
                 logger.info("Builder: retrying Anthropic API with rotated key")
                 async for event in _stream_anthropic(
@@ -6886,7 +6956,7 @@ async def _summarize_builder_session(
     if provider == "anthropic":
         try:
             from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=get_builder_api_key())
+            client = AsyncAnthropic(api_key=get_builder_api_key(provider))
             response = await client.messages.create(
                 model=model,
                 system=summary_prompt[0]["content"],
@@ -6896,7 +6966,7 @@ async def _summarize_builder_session(
             summary_text = response.content[0].text
         except Exception as e:
             if is_auth_or_quota_error(e):
-                new_key = rotate_builder_key(str(e))
+                new_key = rotate_builder_key(str(e), provider=provider)
                 if new_key:
                     try:
                         client = AsyncAnthropic(api_key=new_key)
@@ -6920,7 +6990,7 @@ async def _summarize_builder_session(
         try:
             from openai import AsyncOpenAI
             client = AsyncOpenAI(
-                api_key=get_builder_api_key(),
+                api_key=get_builder_api_key(provider),
                 base_url=get_builder_base_url(),
             )
             response = await client.chat.completions.create(
@@ -6931,7 +7001,7 @@ async def _summarize_builder_session(
             summary_text = response.choices[0].message.content or ""
         except Exception as e:
             if is_auth_or_quota_error(e):
-                new_key = rotate_builder_key(str(e))
+                new_key = rotate_builder_key(str(e), provider=provider)
                 if new_key:
                     try:
                         client = AsyncOpenAI(
