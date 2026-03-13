@@ -5,7 +5,7 @@ import { ApiService } from './api.service';
 import { IndexedDbService } from './indexed-db.service';
 import { AuditEntry } from '../models/audit.model';
 import { ChatEntry } from '../models/chat.model';
-import { GraphDelta } from '../models/graph.model';
+import { GraphDelta } from '../../debug/graph.model';
 import { JobCacheMetadata } from '../models/cache.model';
 
 // Mock signal for testing (avoids Angular compiler issues in mocks)

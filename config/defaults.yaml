@@ -176,7 +176,8 @@ memory:
   sparse_results: 5                # Top-K for sparse/keyword search
   recent_results: 3                # Number of recent memories to include
   importance_threshold: 0.3        # Minimum importance to store
-  dedup_threshold: 0.92            # Cosine similarity threshold for dedup
+  dedup_threshold: 0.85            # Cosine similarity threshold for dedup
+  retrieval_importance_floor: 0.4  # Minimum importance for retrieval (memories below this are stored but not recalled)
   storage: postgres                # Only option for v1
 
 # Auxiliary LLM — unified support task system for background LLM tasks.

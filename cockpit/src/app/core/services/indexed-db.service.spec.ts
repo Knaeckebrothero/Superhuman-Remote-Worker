@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Dexie from 'dexie';
 import { AuditEntry, AuditStepType } from '../models/audit.model';
 import { ChatEntry, ChatInput, ChatResponse } from '../models/chat.model';
-import { GraphDelta, GraphChanges } from '../models/graph.model';
+import { GraphDelta, GraphChanges } from '../../debug/graph.model';
 
 // Since IndexedDbService uses Angular's @Injectable and signal,
 // we test the database logic directly using Dexie

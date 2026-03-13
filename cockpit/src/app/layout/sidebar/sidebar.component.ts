@@ -4,8 +4,8 @@ import { toSignal } from '@angular/core/rxjs-interop';
 import { filter, map } from 'rxjs';
 import { UserService } from '../../core/services/user.service';
 import { SidebarService } from '../../core/services/sidebar.service';
-import { LayoutService } from '../../core/services/layout.service';
-import { LayoutPickerComponent } from '../../components/layout-picker/layout-picker.component';
+import { LayoutService } from '../../debug/services/layout.service';
+import { LayoutPickerComponent } from '../../debug/components/layout-picker/layout-picker.component';
 import { environment } from '../../core/environment';
 
 @Component({

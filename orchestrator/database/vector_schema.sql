@@ -251,21 +251,22 @@ CREATE OR REPLACE FUNCTION memory_hybrid_search(
     dense_weight float DEFAULT 0.6,
     sparse_weight float DEFAULT 0.3,
     recency_weight float DEFAULT 0.1,
-    rrf_k int DEFAULT 50
+    rrf_k int DEFAULT 50,
+    importance_floor float DEFAULT 0.0
 ) RETURNS SETOF memories LANGUAGE sql AS $$
 WITH dense AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
-    FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL
+    FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL AND importance >= importance_floor
     ORDER BY rank_ix LIMIT match_count * 2
 ),
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
-    FROM memories WHERE job_id = job_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text)
+    FROM memories WHERE job_id = job_id_param AND sparse_keywords @@ websearch_to_tsquery('english', query_text) AND importance >= importance_floor
     ORDER BY rank_ix LIMIT match_count * 2
 ),
 recent AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS rank_ix
-    FROM memories WHERE job_id = job_id_param
+    FROM memories WHERE job_id = job_id_param AND importance >= importance_floor
     ORDER BY rank_ix LIMIT match_count
 )
 SELECT memories.* FROM (

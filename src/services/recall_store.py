@@ -162,16 +162,17 @@ class RecallStore:
         self.agent_id = agent_id
 
         # Config defaults (matches MemoryConfig dataclass)
-        self.dedup_threshold = 0.92
+        self.dedup_threshold = 0.85
         self.importance_threshold = 0.3
         self.dense_results = 5
         self.sparse_results = 5
         self.recent_results = 3
         self.budget_tokens = 5000
         self.max_memories_per_injection = 10
+        self.retrieval_importance_floor = 0.4
 
         if config is not None:
-            self.dedup_threshold = getattr(config, "dedup_threshold", 0.92)
+            self.dedup_threshold = getattr(config, "dedup_threshold", 0.85)
             self.importance_threshold = getattr(config, "importance_threshold", 0.3)
             self.dense_results = getattr(config, "dense_results", 5)
             self.sparse_results = getattr(config, "sparse_results", 5)
@@ -179,6 +180,9 @@ class RecallStore:
             self.budget_tokens = getattr(config, "budget_tokens", 5000)
             self.max_memories_per_injection = getattr(
                 config, "max_memories_per_injection", 10
+            )
+            self.retrieval_importance_floor = getattr(
+                config, "retrieval_importance_floor", 0.4
             )
 
     # =========================================================================
@@ -450,6 +454,7 @@ class RecallStore:
         dense_weight: float = 0.6,
         sparse_weight: float = 0.3,
         recency_weight: float = 0.1,
+        importance_floor: Optional[float] = None,
     ) -> List[MemoryRecord]:
         """Execute hybrid search using the SQL RRF function.
 
@@ -463,16 +468,18 @@ class RecallStore:
             dense_weight: Weight for dense vector channel
             sparse_weight: Weight for sparse keyword channel
             recency_weight: Weight for recency channel
+            importance_floor: Minimum importance to include (default: self.retrieval_importance_floor)
 
         Returns:
             List of MemoryRecord objects ranked by RRF score
         """
         match_count = match_count or self.max_memories_per_injection
+        importance_floor = importance_floor if importance_floor is not None else self.retrieval_importance_floor
 
         rows = await self.db.fetch(
             """
             SELECT * FROM memory_hybrid_search(
-                $1, $2, $3, $4, $5, $6, $7
+                $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
             )
             """,
             query_text,
@@ -482,6 +489,7 @@ class RecallStore:
             dense_weight,
             sparse_weight,
             recency_weight,
+            importance_floor,
         )
 
         # Update access tracking

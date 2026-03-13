@@ -1,8 +1,8 @@
 import { Routes } from '@angular/router';
 import { LoginComponent } from './pages/login/login.component';
-import { ShellPageComponent } from './pages/shell/shell.component';
-import { DebugPageComponent } from './pages/debug/debug.component';
-import { ProjectListPageComponent } from './pages/project-list/project-list.component';
+import { ShellPageComponent } from './simple/pages/shell/shell.component';
+import { DebugPageComponent } from './debug/pages/debug.component';
+import { ProjectListPageComponent } from './shared/pages/project-list.component';
 import { ProjectDetailPageComponent } from './pages/project-detail/project-detail.component';
 import { authGuard } from './core/guards/auth.guard';
 
