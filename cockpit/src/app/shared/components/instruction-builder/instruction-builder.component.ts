@@ -1225,6 +1225,18 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
           }));
           this.messages.set(restored);
           this.shouldScrollToBottom = true;
+
+          // Replay artifact mutations so the create form reflects builder changes
+          for (const msg of restored) {
+            if (msg.toolCalls) {
+              for (const tc of msg.toolCalls) {
+                this.artifacts.applyToolCall(tc.tool, tc.args);
+              }
+            }
+          }
+        } else {
+          // Session exists in localStorage but has no messages (stale) — clear it
+          this.artifacts.persistSessionId(null);
         }
         this.isRestoringSession.set(false);
       },
@@ -1480,7 +1492,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
       this.stream.createSession().subscribe({
         next: (session) => {
           if (session) {
-            this.artifacts.sessionId.set(session.id);
+            this.artifacts.persistSessionId(session.id);
             resolve(session.id);
           } else {
             this.error.set('Failed to create builder session');

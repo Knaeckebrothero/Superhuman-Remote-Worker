@@ -427,6 +427,7 @@ def create_execute_node(
     auxiliary_llm,
     summarization_prompt: str,
     memory_extraction_prompt: str = "",
+    memory_assembler_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
@@ -446,6 +447,7 @@ def create_execute_node(
         auxiliary_llm: AuxiliaryLLM instance for summarization
         summarization_prompt: Prompt template for summarization
         memory_extraction_prompt: Prompt for memory extraction task
+        memory_assembler_prompt: Prompt for memory assembler task
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
@@ -626,9 +628,14 @@ def create_execute_node(
 
         todos_injection_content = todo_manager.format_for_injection()
 
-        # Memory Light: retrieve relevant memories for injection
+        # Memory Light: decrement TTLs then retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
         if recall_store:
+            try:
+                await recall_store.decrement_ttl()
+            except Exception as e:
+                logger.warning(f"[{job_id}] TTL decrement failed (non-fatal): {e}")
+
             try:
                 # Build retrieval context from current todo + phase info
                 pending_todos = todo_manager.list_pending()
@@ -1053,9 +1060,10 @@ def create_execute_node(
                             "Do NOT respond with text. Your next action must be a tool call."
                         ))
 
-                # Memory Light: extract memories via AuxiliaryLLM (async, non-blocking)
+                # Memory Light: extract + assemble memories via AuxiliaryLLM (async, non-blocking)
                 new_turn_count = state.get("turn_count", 0) + 1
                 extraction_triggered = False
+                assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
                 if (recall_store_exec
                     and config.auxiliary.enabled
@@ -1085,6 +1093,34 @@ def create_execute_node(
                             )
                         )
 
+                # Memory assembler: review conversation and adjust memory TTLs
+                if (recall_store_exec
+                    and config.auxiliary.enabled
+                    and config.auxiliary.tasks.get("assemble_memories", None)
+                    and config.auxiliary.tasks["assemble_memories"].enabled
+                    and memory_assembler_prompt):
+                    from src.services.auxiliary import (
+                        _should_assemble_memories,
+                        assemble_memories,
+                    )
+                    last_assembled = state.get("last_assembled_turn", 0)
+                    if _should_assemble_memories(
+                        new_turn_count,
+                        config.memory.assembler_interval,
+                        last_assembled,
+                    ):
+                        import asyncio
+                        assembly_triggered = True
+                        asyncio.create_task(
+                            assemble_memories(
+                                auxiliary_llm=auxiliary_llm,
+                                recall_store=recall_store_exec,
+                                messages=messages,
+                                current_injection_text=_memory_block[0],
+                                memory_assembler_prompt=memory_assembler_prompt,
+                            )
+                        )
+
                 # Build result dict
                 result_update = {
                     "iteration": iteration + 1,
@@ -1093,6 +1129,8 @@ def create_execute_node(
                 }
                 if extraction_triggered:
                     result_update["last_observed_turn"] = new_turn_count
+                if assembly_triggered:
+                    result_update["last_assembled_turn"] = new_turn_count
 
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
@@ -2459,6 +2497,7 @@ def build_phase_alternation_graph(
     # Load auxiliary task prompts (use auxiliary model for matrix resolution)
     aux_model = config.auxiliary.model or summarization_config.model or config.llm.model
     memory_extraction_prompt = load_auxiliary_prompt(config, "memory_extraction", model=aux_model)
+    memory_assembler_prompt = load_auxiliary_prompt(config, "memory_assembler", model=aux_model)
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
 
     if not workspace_template:
@@ -2497,6 +2536,7 @@ def build_phase_alternation_graph(
         auxiliary_llm=auxiliary_llm,
         summarization_prompt=summarization_prompt,
         memory_extraction_prompt=memory_extraction_prompt,
+        memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
     )
     check_todos = create_check_todos_node(todo_manager, config)

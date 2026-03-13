@@ -49,12 +49,12 @@ from services.builder_tools import (  # noqa: E402
     get_builder_api_key,
     get_builder_base_url,
     get_builder_model,
-    get_builder_provider,
     is_auth_or_quota_error,
     rotate_builder_key,
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
+from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
@@ -6397,7 +6397,9 @@ async def send_builder_message(
 
     # Build context
     messages = await postgres_db.get_builder_messages(session_id)
+    raw_model_for_prompt = body.model or get_builder_model()
     system_prompt = build_system_prompt(
+        model=raw_model_for_prompt,
         instructions_content=body.instructions,
         config_settings=body.config,
         description=body.description,
@@ -6423,10 +6425,12 @@ async def send_builder_message(
         final_tool_calls = []
 
         try:
-            model = body.model or get_builder_model()
-            provider = _detect_provider(model)
-            api_key = _get_api_key_for_provider(provider)
-            use_responses_api = model in RESPONSES_API_MODELS
+            raw_model = body.model or get_builder_model()
+            provider = _detect_provider(raw_model)
+            model_name, base_url, resolved_key = _resolve_builder_model(raw_model)
+            api_key = resolved_key or _get_api_key_for_provider(provider)
+            use_responses_api = raw_model in RESPONSES_API_MODELS
+            builder_settings = resolve_builder_settings(raw_model)
 
             for iteration in range(MAX_ITERATIONS):
                 yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': 'Analyzing request...' if iteration == 0 else 'Processing tool results...'})}\n\n"
@@ -6436,12 +6440,12 @@ async def send_builder_message(
 
                 # Select streaming function based on provider and API type
                 if provider == "anthropic":
-                    stream_fn = _stream_anthropic(system_prompt, loop_messages, model, api_key)
+                    stream_fn = _stream_anthropic(system_prompt, loop_messages, model_name, api_key, settings=builder_settings)
                 elif use_responses_api:
                     input_items = _chat_messages_to_responses_input(loop_messages)
-                    stream_fn = _stream_openai_responses(system_prompt, input_items, model, api_key)
+                    stream_fn = _stream_openai_responses(system_prompt, input_items, model_name, api_key, base_url=base_url, settings=builder_settings)
                 else:
-                    stream_fn = _stream_openai(system_prompt, loop_messages, model, api_key)
+                    stream_fn = _stream_openai(system_prompt, loop_messages, model_name, api_key, base_url=base_url, settings=builder_settings)
 
                 async for evt_type, evt_data in stream_fn:
                     if evt_type == "token":
@@ -6608,6 +6612,29 @@ def _get_api_key_for_provider(provider: str) -> str | None:
     return get_builder_api_key(provider)
 
 
+def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]:
+    """Resolve a prefixed model ID into (model_name, base_url, api_key).
+
+    Handles model routing for different providers:
+    - ``openrouter/`` prefix → OpenRouter API
+    - ``openai/`` prefix → local vLLM at OPENAI_BASE_URL
+    - ``claude-`` prefix → Anthropic (base_url/api_key left to Anthropic client)
+    - No prefix → default OpenAI provider
+    """
+    if raw_model.startswith("openrouter/"):
+        model_name = raw_model[len("openrouter/"):]
+        base_url = "https://openrouter.ai/api/v1"
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        return model_name, base_url, api_key
+    if raw_model.startswith("openai/"):
+        model_name = raw_model[len("openai/"):]
+        base_url = os.getenv("BUILDER_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        api_key = get_builder_api_key("openai")
+        return model_name, base_url, api_key
+    # No prefix — use existing defaults
+    return raw_model, get_builder_base_url(), None
+
+
 def _chat_messages_to_responses_input(
     messages: list[dict],
 ) -> list[dict]:
@@ -6659,6 +6686,8 @@ async def _stream_openai_responses(
     model: str,
     api_key: str | None = None,
     _retried: bool = False,
+    base_url: str | None = None,
+    settings: dict[str, Any] | None = None,
 ):
     """Stream from OpenAI Responses API, yielding structured events.
 
@@ -6678,7 +6707,7 @@ async def _stream_openai_responses(
 
     client = AsyncOpenAI(
         api_key=api_key or get_builder_api_key("openai"),
-        base_url=get_builder_base_url(),
+        base_url=base_url or get_builder_base_url(),
     )
 
     # Convert BUILDER_TOOLS to Responses API function tool format
@@ -6693,14 +6722,26 @@ async def _stream_openai_responses(
         })
 
     try:
-        stream = await client.responses.create(
+        create_kwargs: dict[str, Any] = dict(
             model=model,
             instructions=system_prompt,
             input=input_items,
             tools=response_tools,
-            reasoning={"effort": "high"},
             stream=True,
         )
+        # Apply inference params from settings matrix
+        if settings:
+            reasoning_effort = settings.get("reasoning_effort")
+            if reasoning_effort:
+                create_kwargs["reasoning"] = {"effort": reasoning_effort}
+            if settings.get("temperature") is not None:
+                create_kwargs["temperature"] = settings["temperature"]
+            if settings.get("top_p") is not None:
+                create_kwargs["top_p"] = settings["top_p"]
+            if settings.get("max_tokens") is not None:
+                create_kwargs["max_tokens"] = settings["max_tokens"]
+
+        stream = await client.responses.create(**create_kwargs)
 
         # Track function call assembly
         function_calls: dict[str, dict] = {}  # call_id -> {name, arguments}
@@ -6752,7 +6793,7 @@ async def _stream_openai_responses(
             if new_key:
                 logger.info("Builder: retrying OpenAI Responses API with rotated key")
                 async for event in _stream_openai_responses(
-                    system_prompt, input_items, model, api_key=new_key, _retried=True
+                    system_prompt, input_items, model, api_key=new_key, _retried=True, base_url=base_url, settings=settings
                 ):
                     yield event
                 return
@@ -6765,6 +6806,8 @@ async def _stream_openai(
     model: str,
     api_key: str | None = None,
     _retried: bool = False,
+    base_url: str | None = None,
+    settings: dict[str, Any] | None = None,
 ):
     """Stream from OpenAI Chat Completions API, yielding structured events.
 
@@ -6781,19 +6824,37 @@ async def _stream_openai(
 
     client = AsyncOpenAI(
         api_key=api_key or get_builder_api_key("openai"),
-        base_url=get_builder_base_url(),
+        base_url=base_url or get_builder_base_url(),
     )
 
     llm_messages = [{"role": "system", "content": system_prompt}]
     llm_messages.extend(context_messages)
 
     try:
-        stream = await client.chat.completions.create(
+        create_kwargs: dict[str, Any] = dict(
             model=model,
             messages=llm_messages,
             tools=BUILDER_TOOLS,
             stream=True,
         )
+        # Apply inference params from settings matrix
+        if settings:
+            if settings.get("temperature") is not None:
+                create_kwargs["temperature"] = settings["temperature"]
+            if settings.get("top_p") is not None:
+                create_kwargs["top_p"] = settings["top_p"]
+            if settings.get("max_tokens") is not None:
+                create_kwargs["max_tokens"] = settings["max_tokens"]
+            # Provider-specific params via extra_body (top_k, min_p, etc.)
+            extra_body: dict[str, Any] = {}
+            if settings.get("top_k") is not None:
+                extra_body["top_k"] = settings["top_k"]
+            if settings.get("min_p") is not None:
+                extra_body["min_p"] = settings["min_p"]
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+
+        stream = await client.chat.completions.create(**create_kwargs)
 
         # Track tool call assembly across chunks
         tool_call_buffers: dict[int, dict] = {}
@@ -6834,7 +6895,7 @@ async def _stream_openai(
             if new_key:
                 logger.info("Builder: retrying OpenAI Chat API with rotated key")
                 async for event in _stream_openai(
-                    system_prompt, context_messages, model, api_key=new_key, _retried=True
+                    system_prompt, context_messages, model, api_key=new_key, _retried=True, base_url=base_url, settings=settings
                 ):
                     yield event
                 return
@@ -6847,6 +6908,7 @@ async def _stream_anthropic(
     model: str,
     api_key: str | None = None,
     _retried: bool = False,
+    settings: dict[str, Any] | None = None,
 ):
     """Stream from Anthropic API, yielding structured events.
 
@@ -6884,13 +6946,19 @@ async def _stream_anthropic(
         full_system += "\n\n" + extra_system
 
     try:
-        async with client.messages.stream(
+        stream_kwargs: dict[str, Any] = dict(
             model=model,
             system=full_system,
             messages=filtered_messages,
             tools=anthropic_tools,
-            max_tokens=4096,
-        ) as stream:
+            max_tokens=(settings or {}).get("max_tokens", 4096),
+        )
+        if (settings or {}).get("temperature") is not None:
+            stream_kwargs["temperature"] = settings["temperature"]
+        if (settings or {}).get("top_p") is not None:
+            stream_kwargs["top_p"] = settings["top_p"]
+
+        async with client.messages.stream(**stream_kwargs) as stream:
             current_tool_id = ""
             current_tool_name = ""
             current_tool_args = ""
@@ -6924,7 +6992,7 @@ async def _stream_anthropic(
             if new_key:
                 logger.info("Builder: retrying Anthropic API with rotated key")
                 async for event in _stream_anthropic(
-                    system_prompt, context_messages, model, api_key=new_key, _retried=True
+                    system_prompt, context_messages, model, api_key=new_key, _retried=True, settings=settings
                 ):
                     yield event
                 return
@@ -6948,20 +7016,24 @@ async def _summarize_builder_session(
     to_summarize = messages[:-4]
     summary_prompt = build_summarization_prompt(to_summarize)
 
-    provider = get_builder_provider()
-    model = get_builder_model()
+    raw_model = get_builder_model()
+    provider = _detect_provider(raw_model)
+    model_name, base_url, resolved_key = _resolve_builder_model(raw_model)
+    builder_settings = resolve_builder_settings(raw_model)
+    max_summary_tokens = builder_settings.get("max_summary_tokens", 1024)
 
     summary_text = ""
 
     if provider == "anthropic":
+        api_key = resolved_key or get_builder_api_key(provider)
         try:
             from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=get_builder_api_key(provider))
+            client = AsyncAnthropic(api_key=api_key)
             response = await client.messages.create(
-                model=model,
+                model=model_name,
                 system=summary_prompt[0]["content"],
                 messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
-                max_tokens=1024,
+                max_tokens=max_summary_tokens,
             )
             summary_text = response.content[0].text
         except Exception as e:
@@ -6971,10 +7043,10 @@ async def _summarize_builder_session(
                     try:
                         client = AsyncAnthropic(api_key=new_key)
                         response = await client.messages.create(
-                            model=model,
+                            model=model_name,
                             system=summary_prompt[0]["content"],
                             messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
-                            max_tokens=1024,
+                            max_tokens=max_summary_tokens,
                         )
                         summary_text = response.content[0].text
                     except Exception as e2:
@@ -6987,16 +7059,17 @@ async def _summarize_builder_session(
                 logger.warning(f"Anthropic summarization failed: {e}")
                 return
     else:
+        api_key = resolved_key or get_builder_api_key(provider)
         try:
             from openai import AsyncOpenAI
             client = AsyncOpenAI(
-                api_key=get_builder_api_key(provider),
-                base_url=get_builder_base_url(),
+                api_key=api_key,
+                base_url=base_url or get_builder_base_url(),
             )
             response = await client.chat.completions.create(
-                model=model,
+                model=model_name,
                 messages=summary_prompt,
-                max_tokens=1024,
+                max_tokens=max_summary_tokens,
             )
             summary_text = response.choices[0].message.content or ""
         except Exception as e:
@@ -7006,12 +7079,12 @@ async def _summarize_builder_session(
                     try:
                         client = AsyncOpenAI(
                             api_key=new_key,
-                            base_url=get_builder_base_url(),
+                            base_url=base_url or get_builder_base_url(),
                         )
                         response = await client.chat.completions.create(
-                            model=model,
+                            model=model_name,
                             messages=summary_prompt,
-                            max_tokens=1024,
+                            max_tokens=max_summary_tokens,
                         )
                         summary_text = response.choices[0].message.content or ""
                     except Exception as e2:
