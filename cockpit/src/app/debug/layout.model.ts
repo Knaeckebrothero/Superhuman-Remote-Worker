@@ -30,7 +30,8 @@ export type ComponentType =
   | 'job-review'
   | 'workspace-browser'
   | 'instruction-builder'
-  | 'project-list';
+  | 'project-list'
+  | 'memory-panel';
 
 /**
  * Layout configuration for the tiling system.

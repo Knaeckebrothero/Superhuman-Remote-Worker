@@ -373,6 +373,59 @@ export interface KnowledgeSearchResponse {
 }
 
 // =============================================================================
+// Memory Models
+// =============================================================================
+
+export type MemoryType = 'factual' | 'procedural' | 'error_solution' | 'vocabulary' | 'relational';
+export type MemorySource = 'observer' | 'todo' | 'compaction' | 'phase_archive' | 'tool_error';
+
+export interface Memory {
+  id: string;
+  job_id: string;
+  project_id?: string | null;
+  agent_id?: string | null;
+  content_preview: string;
+  summary?: string | null;
+  memory_type: MemoryType;
+  source: MemorySource;
+  keywords: string[];
+  importance: number;
+  source_turn_start?: number | null;
+  source_turn_end?: number | null;
+  source_phase?: number | null;
+  token_count: number;
+  access_count: number;
+  created_at: string;
+  last_accessed: string;
+}
+
+export interface MemoryListResponse {
+  memories: Memory[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MemoryStats {
+  total: number;
+  total_tokens: number;
+  total_accesses: number;
+  factual: number;
+  procedural: number;
+  error_solution: number;
+  vocabulary: number;
+  relational: number;
+  from_observer: number;
+  from_todo: number;
+  from_compaction: number;
+  from_phase_archive: number;
+  from_tool_error: number;
+  avg_importance: number | null;
+}
+
+export type MemorySortField = 'created_at' | 'importance' | 'access_count' | 'token_count' | 'last_accessed';
+
+// =============================================================================
 // Agent Models
 // =============================================================================
 
