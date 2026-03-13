@@ -71,7 +71,7 @@ const TABS: MobileTab[] = [
         >
           <option value="">No job context</option>
           @for (job of jobContext.jobs(); track job.id) {
-            <option [value]="job.id">{{ job.id.slice(0, 8) }}… · {{ job.status }}</option>
+            <option [value]="job.id">{{ job.description ? truncate(job.description, 30) : job.id.slice(0, 8) }} · {{ formatStatus(job.status) }}</option>
           }
         </select>
       </header>
@@ -279,5 +279,13 @@ export class MobileShellComponent {
   onJobChange(event: Event): void {
     const value = (event.target as HTMLSelectElement).value;
     this.data.setCurrentJob(value || null);
+  }
+
+  truncate(text: string, maxLength: number): string {
+    return text.length <= maxLength ? text : text.slice(0, maxLength) + '…';
+  }
+
+  formatStatus(status: string): string {
+    return status.replace(/_/g, ' ');
   }
 }

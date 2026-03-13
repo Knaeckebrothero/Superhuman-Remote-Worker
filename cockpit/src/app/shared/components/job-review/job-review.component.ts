@@ -151,17 +151,27 @@ interface FrozenJobData {
                   }
                 </button>
               } @else {
-                <button
-                  class="btn approve-btn"
-                  (click)="approveJob()"
-                  [disabled]="isApproving()"
-                >
-                  @if (isApproving()) {
-                    Approving...
-                  } @else {
-                    Approve
-                  }
-                </button>
+                @if (confirmingApprove()) {
+                  <button
+                    class="btn approve-btn confirming"
+                    (click)="approveJob()"
+                    [disabled]="isApproving()"
+                  >
+                    Confirm Approve?
+                  </button>
+                } @else {
+                  <button
+                    class="btn approve-btn"
+                    (click)="confirmApprove()"
+                    [disabled]="isApproving()"
+                  >
+                    @if (isApproving()) {
+                      Approving...
+                    } @else {
+                      Approve
+                    }
+                  </button>
+                }
               }
             </div>
 
@@ -485,6 +495,15 @@ interface FrozenJobData {
         background: rgba(166, 227, 161, 0.3);
       }
 
+      .approve-btn.confirming {
+        animation: pulse-confirm 1s ease-in-out infinite;
+      }
+
+      @keyframes pulse-confirm {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.6; }
+      }
+
       .continue-btn {
         background: rgba(250, 179, 135, 0.2);
         color: #fab387;
@@ -548,6 +567,8 @@ export class JobReviewComponent {
   readonly isResuming = signal(false);
   readonly resultMessage = signal<string | null>(null);
   readonly resultIsError = signal(false);
+  readonly confirmingApprove = signal(false);
+  private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
 
   feedbackText = '';
 
@@ -602,7 +623,19 @@ export class JobReviewComponent {
     return `${giteaUrl}/${repoName}`;
   }
 
+  confirmApprove(): void {
+    this.confirmingApprove.set(true);
+    if (this.confirmTimeout) clearTimeout(this.confirmTimeout);
+    this.confirmTimeout = setTimeout(() => this.confirmingApprove.set(false), 3000);
+  }
+
   approveJob(): void {
+    this.confirmingApprove.set(false);
+    if (this.confirmTimeout) {
+      clearTimeout(this.confirmTimeout);
+      this.confirmTimeout = null;
+    }
+
     const jobId = this.currentJobId();
     if (!jobId) return;
 

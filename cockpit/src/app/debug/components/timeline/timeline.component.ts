@@ -23,7 +23,7 @@ import { JobContextService } from '../../../core/services/job-context.service';
         <option value="">Select a job...</option>
         @for (job of jobContext.jobs(); track job.id) {
           <option [value]="job.id">
-            {{ job.id.slice(0, 8) }}... | {{ job.status }}
+            {{ job.description ? truncate(job.description, 28) : job.id.slice(0, 8) }} · {{ job.status }}
             @if (job.audit_count !== null) {
               ({{ job.audit_count }} steps)
             }
@@ -415,6 +415,10 @@ export class TimelineComponent implements OnInit, OnDestroy {
 
   toggleAutoRefresh(): void {
     this.data.toggleAutoRefresh();
+  }
+
+  truncate(text: string, maxLength: number): string {
+    return text.length <= maxLength ? text : text.slice(0, maxLength) + '…';
   }
 
   private formatTimestamp(isoString: string): string {

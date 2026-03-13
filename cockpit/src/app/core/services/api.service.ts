@@ -1,6 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpParams } from '@angular/common/http';
-import { Observable, catchError, of } from 'rxjs';
+import { Observable, catchError, of, tap } from 'rxjs';
+import { ToastService } from './toast.service';
 import {
   TableInfo,
   TableDataResponse,
@@ -99,6 +100,7 @@ export interface JobVersionInfo {
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private readonly http = inject(HttpClient);
+  private readonly toast = inject(ToastService);
   private readonly baseUrl = environment.apiUrl;
 
   /** CSRF token read from the csrf_token cookie after login. */
@@ -674,8 +676,10 @@ export class ApiService {
    */
   createJob(job: JobCreateRequest): Observable<Job | null> {
     return this.http.post<Job>(`${this.baseUrl}/jobs`, job).pipe(
+      tap(() => this.toast.success('Job created')),
       catchError((error) => {
         console.error('Failed to create job:', error);
+        this.toast.error('Failed to create job');
         return of(null);
       }),
     );
@@ -698,8 +702,10 @@ export class ApiService {
    */
   deleteJob(jobId: string): Observable<{ status: string } | null> {
     return this.http.delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}`).pipe(
+      tap(() => this.toast.success('Job deleted')),
       catchError((error) => {
         console.error(`Failed to delete job ${jobId}:`, error);
+        this.toast.error('Failed to delete job');
         return of(null);
       }),
     );
@@ -710,8 +716,10 @@ export class ApiService {
    */
   cancelJob(jobId: string): Observable<{ status: string } | null> {
     return this.http.put<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/cancel`, {}).pipe(
+      tap(() => this.toast.success('Job cancelled')),
       catchError((error) => {
         console.error(`Failed to cancel job ${jobId}:`, error);
+        this.toast.error('Failed to cancel job');
         return of(null);
       }),
     );
@@ -722,8 +730,10 @@ export class ApiService {
    */
   pauseJob(jobId: string): Observable<{ status: string } | null> {
     return this.http.put<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/pause`, {}).pipe(
+      tap(() => this.toast.success('Job paused')),
       catchError((error) => {
         console.error(`Failed to pause job ${jobId}:`, error);
+        this.toast.error('Failed to pause job');
         return of(null);
       }),
     );
@@ -750,8 +760,10 @@ export class ApiService {
         body,
       )
       .pipe(
+        tap(() => this.toast.success('Job resumed')),
         catchError((error) => {
           console.error(`Failed to resume job ${jobId}:`, error);
+          this.toast.error('Failed to resume job');
           return of(null);
         }),
       );
@@ -775,8 +787,10 @@ export class ApiService {
         body,
       )
       .pipe(
+        tap(() => this.toast.success('Job approved')),
         catchError((error) => {
           console.error(`Failed to approve job ${jobId}:`, error);
+          this.toast.error('Failed to approve job');
           return of(null);
         }),
       );
