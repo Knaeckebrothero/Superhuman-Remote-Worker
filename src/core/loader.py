@@ -775,7 +775,8 @@ class MemoryConfig:
     sparse_results: int = 5
     recent_results: int = 3
     importance_threshold: float = 0.3
-    dedup_threshold: float = 0.92
+    dedup_threshold: float = 0.85
+    retrieval_importance_floor: float = 0.4
     storage: str = "postgres"
 
 

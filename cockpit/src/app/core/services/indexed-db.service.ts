@@ -3,7 +3,7 @@ import { isPlatformBrowser } from '@angular/common';
 import Dexie, { Table } from 'dexie';
 import { AuditEntry } from '../models/audit.model';
 import { ChatEntry } from '../models/chat.model';
-import { GraphDelta } from '../models/graph.model';
+import { GraphDelta } from '../../debug/graph.model';
 import {
   CachedAuditEntry,
   CachedChatEntry,

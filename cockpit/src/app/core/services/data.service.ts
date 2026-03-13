@@ -5,7 +5,7 @@ import { IndexedDbService } from './indexed-db.service';
 import { JobContextService } from './job-context.service';
 import { AuditEntry, AuditFilterCategory, JobSummary } from '../models/audit.model';
 import { ChatEntry } from '../models/chat.model';
-import { GraphDelta } from '../models/graph.model';
+import { GraphDelta } from '../../debug/graph.model';
 import { JobCacheMetadata } from '../models/cache.model';
 
 /** Filter step types mapping */

@@ -217,16 +217,19 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                         return f"Error: Todo '{ids[0]}' not found. No todos in the list."
 
                     # Queue memory for completed todo with notes (Memory Light)
+                    # Only store if notes contain substantive content (>50 chars)
                     if context.recall_store and todo.notes:
-                        from src.services.recall_store import extract_keywords
-                        context.queue_memory(
-                            content=f"Completed: {todo.content}\nOutcome: {'; '.join(todo.notes)}",
-                            keywords=extract_keywords(todo.content),
-                            importance=0.7,
-                            source="todo",
-                            memory_type="procedural",
-                            source_phase=todo_mgr.phase_number,
-                        )
+                        combined_notes = '; '.join(todo.notes)
+                        if len(combined_notes) > 50:
+                            from src.services.recall_store import extract_keywords
+                            context.queue_memory(
+                                content=f"Completed: {todo.content}\nOutcome: {combined_notes}",
+                                keywords=extract_keywords(todo.content),
+                                importance=0.7,
+                                source="todo",
+                                memory_type="procedural",
+                                source_phase=todo_mgr.phase_number,
+                            )
 
                     # Build response message
                     remaining = todo_mgr.list_pending()

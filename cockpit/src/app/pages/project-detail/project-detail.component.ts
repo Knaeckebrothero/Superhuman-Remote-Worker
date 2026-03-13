@@ -2,7 +2,7 @@ import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular
 import { ActivatedRoute, Router } from '@angular/router';
 import { ApiService } from '../../core/services/api.service';
 import { UserService } from '../../core/services/user.service';
-import { SidebarToggleComponent } from '../../layout/sidebar-toggle/sidebar-toggle.component';
+import { SidebarToggleComponent } from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 import {
   Project,
   ProjectMember,
