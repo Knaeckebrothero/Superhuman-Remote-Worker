@@ -1407,6 +1407,20 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
+    @_create_retry_decorator()
+    async def get_memory_stats(self, job_id: str) -> dict[str, Any]:
+        """Get memory statistics for a job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Stats with counts by type, source, tokens, accesses, avg importance
+        """
+        resp = await self._client.get(f"/api/jobs/{job_id}/memory/stats")
+        resp.raise_for_status()
+        return resp.json()
+
     # =========================================================================
     # Logs & LLM Requests
     # =========================================================================

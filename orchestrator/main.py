@@ -4265,6 +4265,83 @@ async def get_citation_stats(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/jobs/{job_id}/memory/stats")
+async def get_memory_stats(job_id: str) -> dict[str, Any]:
+    """Get memory statistics for a job."""
+    try:
+        async with vector_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(token_count), 0) AS total_tokens,
+                    COALESCE(SUM(access_count), 0) AS total_accesses,
+                    COUNT(*) FILTER (WHERE memory_type = 'factual') AS factual,
+                    COUNT(*) FILTER (WHERE memory_type = 'procedural') AS procedural,
+                    COUNT(*) FILTER (WHERE memory_type = 'error_solution') AS error_solution,
+                    COUNT(*) FILTER (WHERE memory_type = 'vocabulary') AS vocabulary,
+                    COUNT(*) FILTER (WHERE memory_type = 'relational') AS relational,
+                    COUNT(*) FILTER (WHERE source = 'observer') AS from_observer,
+                    COUNT(*) FILTER (WHERE source = 'todo') AS from_todo,
+                    COUNT(*) FILTER (WHERE source = 'compaction') AS from_compaction,
+                    COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
+                    COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
+                    AVG(importance) AS avg_importance
+                FROM memories
+                WHERE job_id = $1::uuid
+                """,
+                job_id,
+            )
+            if row:
+                result = dict(row)
+                # Convert Decimal avg_importance to float for JSON serialization
+                if result.get("avg_importance") is not None:
+                    result["avg_importance"] = float(result["avg_importance"])
+                result["job_id"] = job_id
+                return result
+            return {"job_id": job_id, "total": 0, "total_tokens": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/memory/stats")
+async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
+    """Get memory statistics for a project (all memories scoped to this project)."""
+    try:
+        async with vector_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(token_count), 0) AS total_tokens,
+                    COALESCE(SUM(access_count), 0) AS total_accesses,
+                    COUNT(*) FILTER (WHERE memory_type = 'factual') AS factual,
+                    COUNT(*) FILTER (WHERE memory_type = 'procedural') AS procedural,
+                    COUNT(*) FILTER (WHERE memory_type = 'error_solution') AS error_solution,
+                    COUNT(*) FILTER (WHERE memory_type = 'vocabulary') AS vocabulary,
+                    COUNT(*) FILTER (WHERE memory_type = 'relational') AS relational,
+                    COUNT(*) FILTER (WHERE source = 'observer') AS from_observer,
+                    COUNT(*) FILTER (WHERE source = 'todo') AS from_todo,
+                    COUNT(*) FILTER (WHERE source = 'compaction') AS from_compaction,
+                    COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
+                    COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
+                    AVG(importance) AS avg_importance
+                FROM memories
+                WHERE project_id = $1::uuid
+                """,
+                project_id,
+            )
+            if row:
+                result = dict(row)
+                if result.get("avg_importance") is not None:
+                    result["avg_importance"] = float(result["avg_importance"])
+                result["project_id"] = project_id
+                return result
+            return {"project_id": project_id, "total": 0, "total_tokens": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/jobs/{job_id}/sources/search")
 async def search_job_sources(
     job_id: str,
@@ -5016,13 +5093,29 @@ async def auth_login(body: LoginRequest, request: Request, response: Response) -
     user = await postgres_db.get_user_by_email(email)
 
     if not user:
-        # Create new user from email
+        # Create new user + default project atomically
         display_name = email.split("@")[0].title()
-        user = await postgres_db.create_user(
+        user, project = await postgres_db.create_user_with_default_project(
             display_name=display_name,
             email=email,
         )
         logger.info(f"Created new user via login: {email}")
+
+        # Create Gitea jobs repo for the default project
+        try:
+            if gitea_client.is_initialized and project:
+                repo_name = f"project-{str(project['id'])[:8]}-jobs"
+                repo_url = await gitea_client.create_repo(repo_name)
+                if repo_url:
+                    await postgres_db.add_project_repository(
+                        project_id=str(project["id"]),
+                        name=repo_name,
+                        repo_url=repo_url,
+                        role="jobs",
+                        is_managed=True,
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
 
     # Create session
     session_key, csrf_token = await create_session(
@@ -5069,6 +5162,7 @@ async def auth_login(body: LoginRequest, request: Request, response: Response) -
             "display_name": user["display_name"],
             "avatar_color": user["avatar_color"],
             "email": user.get("email"),
+            "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
             "created_at": user["created_at"],
         },
         "csrf_token": csrf_token,
@@ -5162,18 +5256,14 @@ async def get_user(user_id: str) -> dict[str, Any]:
 async def create_user(body: UserCreate) -> dict[str, Any]:
     """Create a new user with a default project."""
     try:
-        user = await postgres_db.create_user(
+        user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
-            avatar_color=body.avatar_color,
+            avatar_color=body.avatar_color or "#89b4fa",
             email=body.email,
         )
 
-        # Create default project for the new user
+        # Create Gitea jobs repo for the default project
         try:
-            project = await postgres_db.create_default_project_for_user(
-                str(user["id"]), body.display_name
-            )
-            # Create Gitea jobs repo for the project
             if gitea_client.is_initialized and project:
                 repo_name = f"project-{str(project['id'])[:8]}-jobs"
                 repo_url = await gitea_client.create_repo(repo_name)
@@ -5186,10 +5276,9 @@ async def create_user(body: UserCreate) -> dict[str, Any]:
                         is_managed=True,
                     )
         except Exception as e:
-            logger.warning(f"Failed to create default project for user {user['id']}: {e}")
+            logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
 
-        # Re-fetch user to include default_project_id
-        return await postgres_db.get_user(str(user["id"])) or user
+        return user
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -5325,7 +5414,6 @@ async def delete_project(project_id: str) -> dict[str, str]:
     async with postgres_db.acquire() as conn:
         await conn.execute("UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val)
         await conn.execute("UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val)
-        await conn.execute("UPDATE users SET default_project_id = NULL WHERE default_project_id = $1", uuid_val)
 
     success = await postgres_db.delete_project(project_id)
     if not success:

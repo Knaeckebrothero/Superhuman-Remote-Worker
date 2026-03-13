@@ -138,6 +138,9 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- NOTE: The NOT NULL constraint on users.default_project_id is applied by
+-- init.py after seeding default projects, to avoid ordering issues.
+
 -- ============================================================================
 -- 1. JOBS TABLE
 -- Tracks all processing jobs submitted to the system

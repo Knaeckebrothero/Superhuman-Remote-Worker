@@ -154,6 +154,10 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # Seed default projects for users without one
         await _seed_default_projects(db)
 
+        # Enforce NOT NULL constraint on default_project_id
+        # (applied after seeding so existing users have projects first)
+        await _enforce_default_project_constraint(db)
+
         # Migrate orphan jobs to default projects
         await _migrate_orphan_jobs(db)
 
@@ -649,6 +653,27 @@ async def _seed_default_projects(db) -> None:
 
     except Exception as e:
         logger.warning(f"  Default project seeding failed: {e}")
+
+
+async def _enforce_default_project_constraint(db) -> None:
+    """Add CHECK constraint ensuring every user has a default project.
+
+    Uses ADD CONSTRAINT ... CHECK (default_project_id IS NOT NULL).
+    Idempotent — skips if the constraint already exists.
+    Must run after _seed_default_projects to avoid constraint violations.
+    """
+    try:
+        async with db.acquire() as conn:
+            await conn.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE users ADD CONSTRAINT users_default_project_required
+                        CHECK (default_project_id IS NOT NULL);
+                EXCEPTION WHEN duplicate_object THEN null;
+                END $$;
+            """)
+        logger.info("  Default project constraint enforced on users table")
+    except Exception as e:
+        logger.warning(f"  Failed to enforce default project constraint: {e}")
 
 
 async def _migrate_orphan_jobs(db) -> None:
