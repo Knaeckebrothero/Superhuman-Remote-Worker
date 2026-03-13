@@ -15,7 +15,7 @@
   /* Text */
   --text-primary: #cdd6f4;
   --text-secondary: #a6adc8;
-  --text-muted: #6c7086;
+  --text-muted: #8b92a8;
 
   /* Accent */
   --accent-color: #cba6f7;
@@ -90,6 +90,20 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--surface-2);
+}
+
+/* Focus indicators — restore visible focus for keyboard navigation */
+:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent-color) !important;
+  box-shadow: 0 0 0 1px var(--accent-color);
 }
 
 /* Selection */

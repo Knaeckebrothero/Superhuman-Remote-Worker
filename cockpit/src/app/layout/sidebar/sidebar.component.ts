@@ -30,8 +30,16 @@ import { environment } from '../../core/environment';
             routerLinkActive="active"
             [routerLinkActiveOptions]="{ exact: true }"
           >
-            <span class="nav-icon">dashboard</span>
-            Simple
+            <span class="nav-icon">construction</span>
+            Builder
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/jobs"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">work</span>
+            Jobs
           </a>
           <a
             class="nav-link"
@@ -40,6 +48,22 @@ import { environment } from '../../core/environment';
           >
             <span class="nav-icon">folder_shared</span>
             Projects
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/create"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">add_circle</span>
+            Create
+          </a>
+          <a
+            class="nav-link"
+            routerLink="/review"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">rate_review</span>
+            Review
           </a>
           <a
             class="nav-link"
