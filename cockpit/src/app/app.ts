@@ -28,6 +28,7 @@ import { JobReviewComponent } from './shared/components/job-review/job-review.co
 import { WorkspaceBrowserComponent } from './shared/components/workspace-browser/workspace-browser.component';
 import { InstructionBuilderComponent } from './shared/components/instruction-builder/instruction-builder.component';
 import { ProjectListPageComponent } from './shared/pages/project-list.component';
+import { MemoryPanelComponent } from './debug/components/memory-panel/memory-panel.component';
 
 @Component({
   selector: 'app-root',
@@ -195,6 +196,12 @@ export class App implements OnInit {
       type: 'project-list',
       displayName: 'Projects',
       component: ProjectListPageComponent,
+    });
+
+    this.registry.register({
+      type: 'memory-panel',
+      displayName: 'Memory Panel',
+      component: MemoryPanelComponent,
     });
   }
 }
