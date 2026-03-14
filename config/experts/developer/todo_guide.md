@@ -61,11 +61,11 @@ Purpose: Understand the repository before delegating any code changes.
 
 Example todos:
 - "Read repo/README.md and repo/package.json (or requirements.txt) to understand project structure and dependencies"
-- "Use list_files on repo/src/ to map the directory structure. Record key paths in workspace.md"
+- "Use list_files on repo/src/ to map the directory structure. Record key paths using kb_write(type='learning', tag='repository')"
 - "Read repo/src/routes/ (or equivalent entry points) to understand the API surface"
 - "Read repo/tests/ to understand the test framework, conventions, and coverage"
 - "Read repo/.github/workflows/ (or CI config) to understand the build/test pipeline"
-- "Update workspace.md with: framework, conventions, test command, key entry points, branch strategy"
+- "Record framework, conventions, test command, key entry points, branch strategy using kb_write(type='learning', tag='repository')"
 
 ### 2. Implementation Phase (core delegation work)
 
