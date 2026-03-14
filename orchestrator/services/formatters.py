@@ -1679,6 +1679,53 @@ def format_citation_stats(job_id: str, data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_memory_stats(job_id: str, data: dict[str, Any]) -> str:
+    """Format memory statistics for display."""
+    total = data.get("total", 0)
+    total_tokens = data.get("total_tokens", 0)
+    total_accesses = data.get("total_accesses", 0)
+    avg_importance = data.get("avg_importance")
+
+    lines = [f"Memory Statistics for job {job_id}\n"]
+    lines.append(
+        f"Memories: {total} total ({total_tokens:,} tokens, {total_accesses:,} accesses)"
+    )
+    if avg_importance is not None:
+        lines.append(f"Average importance: {avg_importance:.2f}")
+
+    # By type
+    type_keys = [
+        ("factual", "factual"),
+        ("procedural", "procedural"),
+        ("error_solution", "error_solution"),
+        ("vocabulary", "vocabulary"),
+        ("relational", "relational"),
+    ]
+    type_counts = {label: data.get(key, 0) for label, key in type_keys}
+    if any(type_counts.values()):
+        lines.append("\nBy type:")
+        for label, count in type_counts.items():
+            if count:
+                lines.append(f"  {label}: {count}")
+
+    # By source
+    source_keys = [
+        ("observer", "from_observer"),
+        ("todo", "from_todo"),
+        ("compaction", "from_compaction"),
+        ("phase_archive", "from_phase_archive"),
+        ("tool_error", "from_tool_error"),
+    ]
+    source_counts = {label: data.get(key, 0) for label, key in source_keys}
+    if any(source_counts.values()):
+        lines.append("\nBy source:")
+        for label, count in source_counts.items():
+            if count:
+                lines.append(f"  {label}: {count}")
+
+    return "\n".join(lines)
+
+
 def format_citation_error(
     operation: str, error: Exception, job_id: str | None = None
 ) -> str:

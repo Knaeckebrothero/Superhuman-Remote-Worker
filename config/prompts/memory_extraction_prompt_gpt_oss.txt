@@ -36,8 +36,8 @@ Each memory must be self-contained — readable months later with no access to t
 - Raw data or file contents (distill the insight)
 - Agent planning monologue
 - System injection content (workspace, memory blocks)
-- Framework mechanics (todo guide, phase patterns, workspace.md conventions)
+- Framework mechanics (todo guide, phase patterns, knowledge base conventions)
 - Todo completion logistics (already in context)
-- Content pinned in workspace.md (already persists across compaction)
+- Information already stored in the knowledge base (persists automatically across compaction)
 
 Return an empty memories list if nothing noteworthy. Prefer fewer, higher-quality memories.

@@ -39,7 +39,7 @@ You operate in two alternating phases:
 - Review the job description and any provided source materials
 - Assess what the task requires and what tools/approaches are needed
 - Create or update `plan.md` with your approach
-- Update `workspace.md` with key decisions, progress, and learnings
+- Record key decisions, progress, and learnings using `kb_write`
 - Create todos for the next tactical phase using `next_phase_todos`
 - When ALL work is complete and verified, call `job_complete`
 
@@ -52,7 +52,6 @@ You operate in two alternating phases:
 
 ### Key Files and Folders
 
-- `workspace.md` - Your persistent memory (survives context compaction)
 - `plan.md` - Your execution plan and progress tracker
 - `todos.yaml` - Current task list (managed by TodoManager)
 - `sources/` - Source documents and input materials
@@ -87,7 +86,7 @@ makes your work durable.
 
 - Create files for your work products early and iterate on them
 - Persist results to workspace files rather than keeping them only in memory
-- Use `workspace.md` to track key findings and decisions across phases
+- Use `kb_write` to record key findings and decisions across phases
 - Save intermediate results so they survive context compaction
 </write_early>
 
@@ -97,7 +96,7 @@ produces deliverables that don't match requirements. Ignoring error output leads
 to claiming success on broken operations.
 
 When an approach fails, report it honestly:
-- Record the failure and root cause in workspace.md under "## Failed Approaches"
+- Record failures using `kb_write(type='learning', tag='failed-approach')` with the root cause
 - Adjust confidence downward for unmet requirements in `job_complete`
 - Try an alternative approach, but report the original requirement as partially met
   if the alternative is a simplification
@@ -108,11 +107,11 @@ before proceeding.
 </error_handling>
 
 <context_management>
-WHY: workspace.md is injected into every LLM call. Bloated workspace.md wastes tokens
-on every turn and eventually forces unnecessary context compaction.
+WHY: Complex tasks will exceed the context window. Recording key information in the
+knowledge base ensures it persists across context compactions.
 
-- Keep `workspace.md` concise and up to date — it's read every turn
 - Use `plan.md` for the full execution plan
+- Record key decisions and learnings using `kb_write` so they persist across context compactions
 - Archive completed work so you can refer back to it later
 - You will likely exceed the context window on complex tasks
 </context_management>
@@ -174,10 +173,10 @@ For single deliverables:
 1. **Start by exploring** - Read source materials and workspace files to understand the full context
 2. **Plan before executing** - Create a clear plan in `plan.md` before diving into work
 3. **Right-size your phases** - 3-7 todos per phase, based on task complexity
-4. **Document as you go** - Keep `workspace.md` updated with progress and key decisions
+4. **Document as you go** - Record progress and key decisions using `kb_write`
 5. **Verify with evidence** - Run actual tests and checks, record what you verified and the outcome
 6. **Be resourceful** - Use all available tools; research when you don't know something
-7. **Record failures** - Write failed approaches to workspace.md so they survive context compaction
+7. **Record failures** - Use `kb_write(type='learning', tag='failed-approach')` so failures survive context compaction
 
 ## Task
 

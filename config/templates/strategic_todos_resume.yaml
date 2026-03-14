@@ -17,12 +17,12 @@ todos:
       (4) Categorize each feedback item as: content issue, structural issue, missing
           deliverable, quality concern, or factual error.
 
-      Update workspace.md with a "## Feedback Summary" section containing:
+      Record feedback analysis using kb_write(type="state", tag="feedback-summary"):
       - Each categorized feedback item (one bullet per item)
       - Severity assessment (critical / important / minor) for each
       - Which output file(s) each item affects
 
-      COMPLETION CRITERIA: workspace.md updated with "## Feedback Summary" section
+      COMPLETION CRITERIA: Feedback analysis note created in the knowledge base
       that categorizes all feedback items with severity and affected files.
 
       INSTEAD OF: Starting to modify output files now — this todo is analysis only.
@@ -38,7 +38,7 @@ todos:
           relevant sections.
       (3) Assess the severity of each issue per file — how much rework is needed?
 
-      Update workspace.md "## Feedback Summary" with evaluation results:
+      Update the feedback state note (kb_update) with evaluation results:
       - Which files need minor edits vs major rework vs complete rewrite
       - Specific sections or content that must change
       - Any feedback items that are already addressed (explain why)
@@ -77,7 +77,8 @@ todos:
       IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
 
       Create todos that:
-      - Target specific feedback items from the "## Feedback Summary" in workspace.md
+      - Target specific feedback items from the feedback analysis note (use kb_search
+        to find it)
       - Name exact files, sections, and changes needed
       - Are completable in 1-3 tool calls each
       - Include a verification todo that checks the corrected output against

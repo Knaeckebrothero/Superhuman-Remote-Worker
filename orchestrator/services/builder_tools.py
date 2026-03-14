@@ -76,6 +76,7 @@ SERVER_SIDE_TOOLS = {
     "get_source_annotations",
     "get_source_tags",
     "get_citation_stats",
+    "get_memory_stats",
     # Actions
     "approve_job",
     "resume_job_with_feedback",
@@ -1255,6 +1256,23 @@ BUILDER_TOOLS = [
         "function": {
             "name": "get_citation_stats",
             "description": "Get citation statistics for a job — counts by verification status, source type, and confidence.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job UUID",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_memory_stats",
+            "description": "Get memory statistics for a job — counts by type (factual, procedural, etc.), source channel (observer, todo, etc.), tokens, accesses, and average importance.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2564,76 +2582,120 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
 
 def get_builder_model() -> str:
     """Get the model name for the builder LLM."""
-    return os.getenv("BUILDER_MODEL", "gpt-5.2-pro")
+    return os.getenv("BUILDER_MODEL", "openai/gpt-oss-120b")
 
 
-_builder_key_ring = None
+_builder_key_rings: dict[str, "KeyRing | None"] = {}
 _builder_key_ring_lock = __import__("threading").Lock()
 
 
-def get_builder_key_ring():
+def _raw_key_for_provider(provider: str) -> str | None:
+    """Return the raw (possibly comma-separated) key string for a provider.
+
+    Resolution order:
+    1. BUILDER_ANTHROPIC_API_KEY / BUILDER_OPENAI_API_KEY (provider-specific builder key)
+    2. BUILDER_API_KEY (generic builder key)
+    3. ANTHROPIC_API_KEY / OPENAI_API_KEY (global provider key)
+    """
+    if provider == "anthropic":
+        return (
+            os.getenv("BUILDER_ANTHROPIC_API_KEY")
+            or os.getenv("BUILDER_API_KEY")
+            or os.getenv("ANTHROPIC_API_KEY")
+        )
+    return (
+        os.getenv("BUILDER_OPENAI_API_KEY")
+        or os.getenv("BUILDER_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+    )
+
+
+def get_builder_key_ring(provider: str | None = None):
     """Get or create a shared KeyRing for the builder LLM.
 
-    Parses comma-separated keys from BUILDER_API_KEY (or provider fallback)
-    and creates a KeyRing with cooldown-based rotation.
-    Falls back to None if KeyRing is unavailable (e.g. in Docker).
+    Creates a separate KeyRing per provider so that OpenAI and Anthropic keys
+    are rotated independently.
+
+    Args:
+        provider: "openai" or "anthropic". Defaults to get_builder_provider().
     """
-    global _builder_key_ring
+    if provider is None:
+        provider = get_builder_provider()
+
     with _builder_key_ring_lock:
-        if _builder_key_ring is not None:
-            return _builder_key_ring
+        if provider in _builder_key_rings:
+            return _builder_key_rings[provider]
 
         try:
             from src.llm.key_ring import KeyRing, parse_key_string
         except (ImportError, ModuleNotFoundError):
-            return None
+            # When running from orchestrator/ dir, resolve repo root
+            try:
+                import importlib.util
+                from pathlib import Path
+                _kr_path = Path(__file__).resolve().parent.parent.parent / "src" / "llm" / "key_ring.py"
+                spec = importlib.util.spec_from_file_location("_key_ring", str(_kr_path))
+                if spec and spec.loader:
+                    _mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(_mod)
+                    KeyRing = _mod.KeyRing
+                    parse_key_string = _mod.parse_key_string
+                else:
+                    raise ImportError("spec not found")
+            except Exception:
+                _builder_key_rings[provider] = None
+                return None
 
-        provider = get_builder_provider()
-        explicit = os.getenv("BUILDER_API_KEY")
-        if explicit:
-            raw = explicit
-        elif provider == "anthropic":
-            raw = os.getenv("ANTHROPIC_API_KEY")
-        else:
-            raw = os.getenv("OPENAI_API_KEY")
-
+        raw = _raw_key_for_provider(provider)
         keys = parse_key_string(raw)
         if not keys:
+            _builder_key_rings[provider] = None
             return None
 
         cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
-        _builder_key_ring = KeyRing(
+        ring = KeyRing(
             keys, cooldown_seconds=cooldown, provider=f"builder-{provider}"
         )
-        return _builder_key_ring
+        _builder_key_rings[provider] = ring
+        return ring
 
 
-def get_builder_api_key() -> str | None:
+def get_builder_api_key(provider: str | None = None) -> str | None:
     """Get the current API key for the builder LLM.
 
     Uses KeyRing for automatic rotation across comma-separated keys.
-    Falls back to env vars (BUILDER_API_KEY, then provider-specific key).
+    Falls back to env vars with first-key extraction.
+
+    Args:
+        provider: "openai" or "anthropic". Defaults to get_builder_provider().
     """
-    ring = get_builder_key_ring()
+    if provider is None:
+        provider = get_builder_provider()
+
+    ring = get_builder_key_ring(provider)
     if ring is not None:
         try:
             return ring.current_key
         except RuntimeError:
             pass
 
-    # Fallback: read directly from env (no rotation)
-    explicit = os.getenv("BUILDER_API_KEY")
-    if explicit:
-        return explicit.split(",")[0].strip()
-    provider = get_builder_provider()
-    if provider == "anthropic":
-        return os.getenv("ANTHROPIC_API_KEY")
-    return os.getenv("OPENAI_API_KEY")
+    # Fallback: read directly from env, taking the first comma-separated key
+    raw = _raw_key_for_provider(provider)
+    if raw:
+        return raw.split(",")[0].strip()
+    return None
 
 
-def rotate_builder_key(reason: str) -> str | None:
-    """Rotate the builder API key after a failure. Returns new key or None."""
-    ring = get_builder_key_ring()
+def rotate_builder_key(reason: str, provider: str | None = None) -> str | None:
+    """Rotate the builder API key after a failure. Returns new key or None.
+
+    Args:
+        reason: Why the key failed (for logging).
+        provider: "openai" or "anthropic". Defaults to get_builder_provider().
+    """
+    if provider is None:
+        provider = get_builder_provider()
+    ring = get_builder_key_ring(provider)
     if ring is None or not ring.has_alternatives:
         return None
     return ring.rotate(reason)

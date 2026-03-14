@@ -280,23 +280,14 @@ def create_init_workspace_node(
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the init_workspace node.
 
-    This node initializes workspace.md from template if it doesn't exist.
+    This node performs workspace initialization audit. workspace.md is no longer
+    created or injected — the project knowledge base and memory system replace it.
     """
 
     def init_workspace(state: UniversalAgentState) -> Dict[str, Any]:
-        """Initialize workspace.md from template."""
+        """Initialize workspace (audit only, workspace.md no longer used)."""
         job_id = state.get("job_id", "unknown")
         logger.info(f"[{job_id}] Initializing workspace")
-
-        workspace_created = not memory_manager.exists()
-        if workspace_created:
-            memory_manager.write(workspace_template)
-            logger.info(f"[{job_id}] Created workspace.md from template")
-        else:
-            logger.debug(f"[{job_id}] workspace.md already exists")
-
-        # Read workspace into state for system prompt injection
-        workspace_memory = memory_manager.read()
 
         # Audit workspace initialization
         auditor = get_archiver()
@@ -307,14 +298,14 @@ def create_init_workspace_node(
                 step_type="initialize",
                 node_name="init_workspace",
                 iteration=0,
-                data={"workspace": {"created": workspace_created}},
+                data={"workspace": {"created": False}},
                 metadata=state.get("metadata"),
                 phase="strategic",
                 phase_number=0,
             )
 
         return {
-            "workspace_memory": workspace_memory,
+            "workspace_memory": "",
         }
 
     return init_workspace
@@ -427,6 +418,7 @@ def create_execute_node(
     auxiliary_llm,
     summarization_prompt: str,
     memory_extraction_prompt: str = "",
+    memory_assembler_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
@@ -446,6 +438,7 @@ def create_execute_node(
         auxiliary_llm: AuxiliaryLLM instance for summarization
         summarization_prompt: Prompt template for summarization
         memory_extraction_prompt: Prompt for memory extraction task
+        memory_assembler_prompt: Prompt for memory assembler task
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
@@ -526,12 +519,9 @@ def create_execute_node(
         )
         prepared_messages.append(SystemMessage(content=full_system))
 
-        # Estimate transient injection overhead (system prompt + workspace.md + todos)
+        # Estimate transient injection overhead (system prompt + todos + memory + knowledge)
         # so compaction thresholds account for messages that will be added AFTER compaction
         injection_overhead_tokens = context_mgr.get_token_count([prepared_messages[0]])  # system prompt
-        if workspace_manager.exists("workspace.md"):
-            ws_text = workspace_manager.read_file("workspace.md")
-            injection_overhead_tokens += len(ws_text) // 4  # approximate
         injection_overhead_tokens += len(todo_manager.format_for_injection()) // 4  # approximate
 
         # Add memory injection budget overhead
@@ -616,19 +606,23 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Helper: inject all transient messages (todos, workspace.md, instruction files)
+        # Helper: inject all transient messages (todos, memories, knowledge, instruction files)
         # Used both in normal path and safety rebuild to avoid code duplication
         from src.core.workspace_injection import (
             create_todos_human_message,
-            create_workspace_tool_messages,
             create_instruction_tool_messages,
         )
 
         todos_injection_content = todo_manager.format_for_injection()
 
-        # Memory Light: retrieve relevant memories for injection
+        # Memory Light: decrement TTLs then retrieve relevant memories for injection
         _memory_block = [""]  # mutable container for closure access
         if recall_store:
+            try:
+                await recall_store.decrement_ttl()
+            except Exception as e:
+                logger.warning(f"[{job_id}] TTL decrement failed (non-fatal): {e}")
+
             try:
                 # Build retrieval context from current todo + phase info
                 pending_todos = todo_manager.list_pending()
@@ -645,6 +639,23 @@ def create_execute_node(
                     logger.debug(
                         f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
                     )
+                    # Audit memory injection
+                    inject_auditor = get_archiver()
+                    if inject_auditor:
+                        inject_auditor.audit_step(
+                            job_id=job_id,
+                            agent_type=config.agent_id,
+                            step_type="memory_inject",
+                            node_name="execute",
+                            iteration=iteration,
+                            data={
+                                "count": len(memories),
+                                "total_tokens": sum(m.token_count for m in memories),
+                            },
+                            metadata=state.get("metadata"),
+                            phase="strategic" if is_strategic else "tactical",
+                            phase_number=phase_number,
+                        )
             except Exception as e:
                 logger.warning(f"[{job_id}] Memory retrieval failed (non-fatal): {e}")
 
@@ -679,18 +690,11 @@ def create_execute_node(
                 logger.warning(f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}")
 
         def _inject_transient_messages(target_messages: list) -> None:
-            """Append transient injection messages (todos, workspace.md, memories, instruction files)."""
+            """Append transient injection messages (todos, memories, knowledge, instruction files)."""
             # Todo list as transient HumanMessage
             target_messages.append(create_todos_human_message(todos_injection_content))
 
-            # Workspace.md as fake tool call result
-            if workspace_manager.exists("workspace.md"):
-                ws_content = workspace_manager.read_file("workspace.md")
-                ws_ai, ws_tool = create_workspace_tool_messages(ws_content)
-                target_messages.append(ws_ai)
-                target_messages.append(ws_tool)
-
-            # Memory Light: inject recalled memories after workspace.md
+            # Memory Light: inject recalled memories
             if _memory_block[0]:
                 from src.core.memory_injection import create_memory_injection_messages
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
@@ -1036,9 +1040,10 @@ def create_execute_node(
                             "Do NOT respond with text. Your next action must be a tool call."
                         ))
 
-                # Memory Light: extract memories via AuxiliaryLLM (async, non-blocking)
+                # Memory Light: extract + assemble memories via AuxiliaryLLM (async, non-blocking)
                 new_turn_count = state.get("turn_count", 0) + 1
                 extraction_triggered = False
+                assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
                 if (recall_store_exec
                     and config.auxiliary.enabled
@@ -1068,6 +1073,34 @@ def create_execute_node(
                             )
                         )
 
+                # Memory assembler: review conversation and adjust memory TTLs
+                if (recall_store_exec
+                    and config.auxiliary.enabled
+                    and config.auxiliary.tasks.get("assemble_memories", None)
+                    and config.auxiliary.tasks["assemble_memories"].enabled
+                    and memory_assembler_prompt):
+                    from src.services.auxiliary import (
+                        _should_assemble_memories,
+                        assemble_memories,
+                    )
+                    last_assembled = state.get("last_assembled_turn", 0)
+                    if _should_assemble_memories(
+                        new_turn_count,
+                        config.memory.assembler_interval,
+                        last_assembled,
+                    ):
+                        import asyncio
+                        assembly_triggered = True
+                        asyncio.create_task(
+                            assemble_memories(
+                                auxiliary_llm=auxiliary_llm,
+                                recall_store=recall_store_exec,
+                                messages=messages,
+                                current_injection_text=_memory_block[0],
+                                memory_assembler_prompt=memory_assembler_prompt,
+                            )
+                        )
+
                 # Build result dict
                 result_update = {
                     "iteration": iteration + 1,
@@ -1076,6 +1109,8 @@ def create_execute_node(
                 }
                 if extraction_triggered:
                     result_update["last_observed_turn"] = new_turn_count
+                if assembly_triggered:
+                    result_update["last_assembled_turn"] = new_turn_count
 
                 # Return compacted messages + response if compaction occurred,
                 # otherwise just append the response (add_messages reducer handles this)
@@ -2442,10 +2477,11 @@ def build_phase_alternation_graph(
     # Load auxiliary task prompts (use auxiliary model for matrix resolution)
     aux_model = config.auxiliary.model or summarization_config.model or config.llm.model
     memory_extraction_prompt = load_auxiliary_prompt(config, "memory_extraction", model=aux_model)
+    memory_assembler_prompt = load_auxiliary_prompt(config, "memory_assembler", model=aux_model)
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
 
-    if not workspace_template:
-        raise ValueError("workspace_template is required")
+    # workspace_template is no longer used — workspace.md replaced by
+    # project knowledge base + memory system. Parameter kept for backward compat.
 
     # Backwards compatibility: wrap a raw LLM in AuxiliaryLLM if needed
     if auxiliary_llm is None:
@@ -2480,6 +2516,7 @@ def build_phase_alternation_graph(
         auxiliary_llm=auxiliary_llm,
         summarization_prompt=summarization_prompt,
         memory_extraction_prompt=memory_extraction_prompt,
+        memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
     )
     check_todos = create_check_todos_node(todo_manager, config)

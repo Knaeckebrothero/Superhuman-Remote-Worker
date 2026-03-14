@@ -1,6 +1,6 @@
 # Strategic todos for job initialization (first strategic phase)
-# These todos guide the agent through initial workspace setup,
-# plan creation, and first phase todo generation.
+# These todos guide the agent through initial exploration, planning,
+# knowledge base setup, and first phase todo generation.
 #
 # Each todo includes explicit completion criteria and guidance
 # to prevent scope creep and busywork phases.
@@ -16,18 +16,17 @@ todos:
       (4) Use list_files on documents/ to inventory all input materials.
       (5) Use list_files on reference/ to check for domain-specific reference material.
 
-      Then PIN critical rules to workspace.md under a "## Pinned Instructions" section.
-      Extract and write down:
-      - Required output files (exact paths and formats from instructions.md)
-      - Style/language constraints (tone, formatting, language requirements)
-      - Hard rules (things explicitly forbidden or required)
-      - Delivery expectations (what "done" looks like)
+      Then persist critical rules as knowledge notes using kb_write:
+      - Required output files (exact paths and formats) → kb_write with type="goal", tag="deliverable"
+      - Style/language constraints (tone, formatting, language) → kb_write with type="decision", tag="constraint"
+      - Hard rules (things explicitly forbidden or required) → kb_write with type="decision", tag="pinned"
+      - Delivery expectations (what "done" looks like) → kb_write with type="goal", tag="acceptance-criteria"
 
-      These pinned instructions survive context compaction; the original instructions.md
-      and task_brief.md content will NOT. If you don't pin it now, you may forget it later.
+      These knowledge notes persist across context compaction AND across future jobs
+      in the same project. Search existing notes first (kb_search) to avoid duplicates.
 
-      COMPLETION CRITERIA: workspace.md exists and contains a "## Pinned Instructions"
-      section with the four categories above populated from instructions.md and task_brief.md.
+      COMPLETION CRITERIA: Knowledge notes created for all four categories above
+      (verify with kb_list). instructions.md and task_brief.md have been read in full.
 
       INSTEAD OF: Starting to write output files now — this phase is read-only exploration.
       Instead of skimming instructions.md — read every line, since every task failure
@@ -74,26 +73,26 @@ todos:
 
   - id: 3
     content: >-
-      INITIALIZE workspace.md: Set up the long-term memory structure.
+      REVIEW PROJECT KNOWLEDGE: Check the project knowledge base for existing context.
 
-      workspace.md is injected into EVERY LLM call as your persistent memory.
-      It must be compact and high-value. Structure it with these sections:
-      - "## Pinned Instructions" (already populated from todo 1)
-      - "## Deliverables" — table tracking each expected output from plan.md
-        with columns: Deliverable | Path | Status | Verified By
-      - "## Facts" — durable knowledge discovered during exploration
-        (e.g., "12 input PDFs in documents/", key entity names/IDs)
-      - "## Key Decisions" — record significant choices with brief reasoning
-      - "## Status" — current phase and active blockers
-      - "## Failed Approaches" — initially empty, populated as you encounter failures
+      Search the knowledge base for existing notes from prior jobs in this project:
+      (1) Use kb_list to see all existing notes (filter by status="active").
+      (2) Use kb_search with key terms from the task description to find relevant prior knowledge.
+      (3) Review any existing decision notes — they may constrain your approach.
+      (4) Check for contradictions (kb_contradictions) that need resolution.
 
-      COMPLETION CRITERIA: workspace.md has the sections above and is under 60 lines.
-      The Deliverables table matches the deliverables defined in plan.md.
+      If this is the first job in the project, the knowledge base will be empty — that's fine.
+      The notes you create during this job will benefit future jobs.
 
-      INSTEAD OF: Dumping full document inventories or file listings — use compact
-      references (e.g., "12 input PDFs in documents/"). Instead of including progress
-      tracking or phase status — that belongs in plan.md. Instead of exceeding 60 lines —
-      every line costs tokens on every LLM call.
+      Create initial state notes if they don't exist:
+      - A "goal" note summarizing the current job's objective
+      - Any facts discovered during exploration (IDs, paths, configurations) as "learning" notes
+
+      COMPLETION CRITERIA: kb_list or kb_search called at least once. If prior knowledge
+      exists, it has been reviewed. Initial state notes created for this job.
+
+      INSTEAD OF: Skipping this step — prior knowledge from the same project can save
+      significant work. Instead of creating notes that duplicate existing ones — search first.
 
   - id: 4
     content: >-

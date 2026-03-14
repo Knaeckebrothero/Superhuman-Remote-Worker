@@ -33,7 +33,7 @@ Read the original job description above carefully. Identify:
 
 Use the MCP tools to access the target job's workspace:
 - Read the deliverables listed above — do they exist? Are they complete?
-- Read `workspace.md` and `plan.md` for context on what the agent intended
+- Search the knowledge base (kb_search) and read `plan.md` for context on what the agent intended
 - Check `archive/` for phase history if you need to understand the agent's process
 - Look at the actual content, not just the filenames
 - For deployment/infrastructure jobs: use `run_command` to independently verify claims (SSH to the target, check service status, verify port bindings, test endpoints with curl). Do NOT rely solely on the agent's self-reported results.

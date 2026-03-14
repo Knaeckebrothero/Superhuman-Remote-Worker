@@ -7,7 +7,7 @@ display_name: Curator
 description: |
   Knowledge extraction specialist. Runs as a persistent subjob in parallel
   with working agents, extracting structured knowledge notes from job artifacts
-  (workspace.md, plan.md, archive/, memories). Writes to the project knowledge
+  (plan.md, archive/, memories, knowledge base). Writes to the project knowledge
   base via kb_write/kb_update. See docs/features/project_knowledge_base.md.
 icon: book-open
 color: "#a6e3a1"

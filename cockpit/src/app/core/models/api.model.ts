@@ -126,6 +126,11 @@ export interface DatasourceTestResult {
 // =============================================================================
 
 /**
+ * Auth mode: 'dev' (email only) or 'production' (email + password).
+ */
+export type AuthMode = 'dev' | 'production';
+
+/**
  * User identity with optional email for session-based auth.
  */
 export interface User {
@@ -134,7 +139,42 @@ export interface User {
   avatar_color: string;
   email?: string | null;
   default_project_id?: string | null;
+  is_admin?: boolean;
   created_at: string;
+}
+
+// =============================================================================
+// MCP Token Models
+// =============================================================================
+
+/**
+ * An MCP API token (as returned by GET /api/mcp-tokens — no plaintext).
+ */
+export interface McpToken {
+  id: string;
+  name: string;
+  token_prefix: string;
+  scope: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+/**
+ * Request body for creating an MCP token.
+ */
+export interface McpTokenCreateRequest {
+  name: string;
+  scope?: string;
+  expires_in_days?: number | null;
+}
+
+/**
+ * Response from POST /api/mcp-tokens — includes plaintext token (shown once).
+ */
+export interface McpTokenCreateResponse extends McpToken {
+  token: string;
 }
 
 // =============================================================================
@@ -371,6 +411,59 @@ export interface KnowledgeSearchResponse {
   query: string;
   total: number;
 }
+
+// =============================================================================
+// Memory Models
+// =============================================================================
+
+export type MemoryType = 'factual' | 'procedural' | 'error_solution' | 'vocabulary' | 'relational';
+export type MemorySource = 'observer' | 'todo' | 'compaction' | 'phase_archive' | 'tool_error';
+
+export interface Memory {
+  id: string;
+  job_id: string;
+  project_id?: string | null;
+  agent_id?: string | null;
+  content_preview: string;
+  summary?: string | null;
+  memory_type: MemoryType;
+  source: MemorySource;
+  keywords: string[];
+  importance: number;
+  source_turn_start?: number | null;
+  source_turn_end?: number | null;
+  source_phase?: number | null;
+  token_count: number;
+  access_count: number;
+  created_at: string;
+  last_accessed: string;
+}
+
+export interface MemoryListResponse {
+  memories: Memory[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MemoryStats {
+  total: number;
+  total_tokens: number;
+  total_accesses: number;
+  factual: number;
+  procedural: number;
+  error_solution: number;
+  vocabulary: number;
+  relational: number;
+  from_observer: number;
+  from_todo: number;
+  from_compaction: number;
+  from_phase_archive: number;
+  from_tool_error: number;
+  avg_importance: number | null;
+}
+
+export type MemorySortField = 'created_at' | 'importance' | 'access_count' | 'token_count' | 'last_accessed';
 
 // =============================================================================
 // Agent Models

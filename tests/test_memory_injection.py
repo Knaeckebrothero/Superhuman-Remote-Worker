@@ -89,12 +89,6 @@ class TestSummarizationExclusion:
         ai_msg, _ = create_memory_injection_messages("content")
         assert is_workspace_injection_message(ai_msg) is True
 
-    def test_workspace_injection_still_catches_workspace_messages(self):
-        from src.core.workspace_injection import create_workspace_tool_messages
-        ai_msg, tool_msg = create_workspace_tool_messages("workspace content")
-        assert is_workspace_injection_message(ai_msg) is True
-        assert is_workspace_injection_message(tool_msg) is True
-
     def test_workspace_injection_still_catches_instruction_messages(self):
         from src.core.workspace_injection import create_instruction_tool_messages
         ai_msg, tool_msg = create_instruction_tool_messages("guide.md", "content")

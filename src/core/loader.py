@@ -697,6 +697,7 @@ class ToolsConfig:
     git: List[str] = field(default_factory=list)
     coding: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
+    knowledge: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -765,18 +766,21 @@ class MemoryConfig:
     """
 
     enabled: bool = False
-    budget_tokens: int = 5000
-    max_memories_per_injection: int = 10
+    budget_tokens: int = 10000
+    max_memories_per_injection: int = 150
     observer_interval: int = 5
+    assembler_interval: int = 7
+    default_ttl: int = 10
     observer_model: Optional[str] = None
     observer_base_url: Optional[str] = None
     embedding_model: str = "qwen3-embedding-8b"
-    dense_results: int = 5
-    sparse_results: int = 5
-    recent_results: int = 3
+    dense_results: int = 30
+    sparse_results: int = 30
+    recent_results: int = 15
     importance_threshold: float = 0.3
     dedup_threshold: float = 0.85
     retrieval_importance_floor: float = 0.4
+    project_scoped: bool = True
     storage: str = "postgres"
 
 
@@ -805,6 +809,7 @@ class AuxiliaryConfig:
     tasks: Dict[str, AuxiliaryTaskConfig] = field(default_factory=lambda: {
         "extract_memories": AuxiliaryTaskConfig(enabled=True),
         "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
+        "assemble_memories": AuxiliaryTaskConfig(enabled=True),
     })
 
 
@@ -914,17 +919,21 @@ def _parse_memory_config(data: Dict[str, Any]) -> MemoryConfig:
     """
     return MemoryConfig(
         enabled=data.get("enabled", False),
-        budget_tokens=data.get("budget_tokens", 5000),
-        max_memories_per_injection=data.get("max_memories_per_injection", 10),
+        budget_tokens=data.get("budget_tokens", 10000),
+        max_memories_per_injection=data.get("max_memories_per_injection", 150),
         observer_interval=data.get("observer_interval", 5),
+        assembler_interval=data.get("assembler_interval", 7),
+        default_ttl=data.get("default_ttl", 10),
         observer_model=data.get("observer_model"),
         observer_base_url=data.get("observer_base_url"),
         embedding_model=data.get("embedding_model", "qwen3-embedding-8b"),
-        dense_results=data.get("dense_results", 5),
-        sparse_results=data.get("sparse_results", 5),
-        recent_results=data.get("recent_results", 3),
+        dense_results=data.get("dense_results", 30),
+        sparse_results=data.get("sparse_results", 30),
+        recent_results=data.get("recent_results", 15),
         importance_threshold=data.get("importance_threshold", 0.3),
-        dedup_threshold=data.get("dedup_threshold", 0.92),
+        dedup_threshold=data.get("dedup_threshold", 0.85),
+        retrieval_importance_floor=data.get("retrieval_importance_floor", 0.4),
+        project_scoped=data.get("project_scoped", True),
         storage=data.get("storage", "postgres"),
     )
 
@@ -949,7 +958,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
             tasks[task_name] = AuxiliaryTaskConfig(enabled=bool(task_conf))
 
     # Ensure defaults for known tasks
-    for default_task in ("extract_memories", "curate_knowledge"):
+    for default_task in ("extract_memories", "curate_knowledge", "assemble_memories"):
         if default_task not in tasks:
             tasks[default_task] = AuxiliaryTaskConfig(enabled=True)
 
@@ -1078,6 +1087,7 @@ def load_agent_config(
         git=tools_data.get("git", []),
         coding=tools_data.get("coding", []),
         evaluation=tools_data.get("evaluation", []),
+        knowledge=tools_data.get("knowledge", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1227,6 +1237,7 @@ def load_agent_config_from_dict(
         git=tools_data.get("git", []),
         coding=tools_data.get("coding", []),
         evaluation=tools_data.get("evaluation", []),
+        knowledge=tools_data.get("knowledge", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2243,7 +2254,8 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.mongodb +
         config.tools.git +
         config.tools.coding +
-        config.tools.evaluation
+        config.tools.evaluation +
+        config.tools.knowledge
     )
 
     # Shell mode aliasing for backward compatibility

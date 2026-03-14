@@ -88,6 +88,7 @@ class MemoryRecord:
 
     id: Optional[uuid.UUID] = None
     job_id: Optional[uuid.UUID] = None
+    project_id: Optional[uuid.UUID] = None
     agent_id: Optional[str] = None
     content: str = ""
     summary: Optional[str] = None
@@ -101,6 +102,7 @@ class MemoryRecord:
     source_phase: Optional[int] = None
     token_count: int = 0
     access_count: int = 0
+    remaining_turns: Optional[int] = None
     created_at: Optional[datetime] = None
     last_accessed: Optional[datetime] = None
 
@@ -110,6 +112,7 @@ class MemoryRecord:
         return cls(
             id=row.get("id"),
             job_id=row.get("job_id"),
+            project_id=row.get("project_id"),
             agent_id=row.get("agent_id"),
             content=row.get("content", ""),
             summary=row.get("summary"),
@@ -122,6 +125,7 @@ class MemoryRecord:
             source_phase=row.get("source_phase"),
             token_count=row.get("token_count", 0),
             access_count=row.get("access_count", 0),
+            remaining_turns=row.get("remaining_turns"),
             created_at=row.get("created_at"),
             last_accessed=row.get("last_accessed"),
         )
@@ -146,6 +150,8 @@ class RecallStore:
         job_id: uuid.UUID,
         config=None,
         agent_id: Optional[str] = None,
+        project_id: Optional[uuid.UUID] = None,
+        archiver=None,
     ):
         """Initialize RecallStore.
 
@@ -155,11 +161,16 @@ class RecallStore:
             job_id: Job UUID (memories are scoped per job)
             config: MemoryConfig dataclass (optional, uses defaults if None)
             agent_id: Optional agent identifier for cross-job memory (Phase 5)
+            project_id: Optional project UUID for project-scoped memory sharing
+            archiver: Optional LLMArchiver for audit logging
         """
         self.db = db
         self.embedding_service = embedding_service
         self.job_id = job_id
         self.agent_id = agent_id
+        self.project_id = project_id
+        self._archiver = archiver
+        self.project_scoped = getattr(config, "project_scoped", False) if config else False
 
         # Config defaults (matches MemoryConfig dataclass)
         self.dedup_threshold = 0.85
@@ -167,9 +178,10 @@ class RecallStore:
         self.dense_results = 5
         self.sparse_results = 5
         self.recent_results = 3
-        self.budget_tokens = 5000
-        self.max_memories_per_injection = 10
+        self.budget_tokens = 10000
+        self.max_memories_per_injection = 150
         self.retrieval_importance_floor = 0.4
+        self.default_ttl = 10
 
         if config is not None:
             self.dedup_threshold = getattr(config, "dedup_threshold", 0.85)
@@ -177,13 +189,21 @@ class RecallStore:
             self.dense_results = getattr(config, "dense_results", 5)
             self.sparse_results = getattr(config, "sparse_results", 5)
             self.recent_results = getattr(config, "recent_results", 3)
-            self.budget_tokens = getattr(config, "budget_tokens", 5000)
+            self.budget_tokens = getattr(config, "budget_tokens", 10000)
             self.max_memories_per_injection = getattr(
-                config, "max_memories_per_injection", 10
+                config, "max_memories_per_injection", 150
             )
             self.retrieval_importance_floor = getattr(
                 config, "retrieval_importance_floor", 0.4
             )
+            self.default_ttl = getattr(config, "default_ttl", 10)
+
+    @property
+    def _scope_filter(self):
+        """Return (column, value) for scoping queries by project or job."""
+        if self.project_scoped and self.project_id:
+            return "project_id", self.project_id
+        return "job_id", self.job_id
 
     # =========================================================================
     # Storage
@@ -201,11 +221,12 @@ class RecallStore:
         source_turn_end: Optional[int] = None,
         source_phase: Optional[int] = None,
         token_count: Optional[int] = None,
+        remaining_turns: Optional[int] = None,
     ) -> Optional[uuid.UUID]:
         """Store a memory with automatic embedding and dedup.
 
         If a semantically similar memory already exists (cosine > dedup_threshold),
-        updates the existing memory's access_count and last_accessed instead.
+        updates the existing memory's access_count, last_accessed, and TTL instead.
 
         Args:
             content: Memory content text
@@ -218,6 +239,7 @@ class RecallStore:
             source_turn_end: End turn of source conversation
             source_phase: Phase number when extracted
             token_count: Pre-counted tokens (estimated if None)
+            remaining_turns: TTL in turns (default: self.default_ttl)
 
         Returns:
             UUID of stored/updated memory, or None if below importance threshold
@@ -239,23 +261,42 @@ class RecallStore:
                 f"Dedup: updating existing memory {existing.id} "
                 f"instead of creating new"
             )
+            ttl = remaining_turns if remaining_turns is not None else self.default_ttl
             await self.db.execute(
                 """
                 UPDATE memories
                 SET access_count = access_count + 1,
                     last_accessed = CURRENT_TIMESTAMP,
-                    importance = GREATEST(importance, $1)
+                    importance = GREATEST(importance, $1),
+                    remaining_turns = GREATEST(COALESCE(remaining_turns, 0), $3)
                 WHERE id = $2
                 """,
                 importance,
                 existing.id,
+                ttl,
             )
+            if self._archiver:
+                self._archiver.audit_step(
+                    job_id=str(self.job_id),
+                    agent_type=self.agent_id or "",
+                    step_type="memory_dedup",
+                    node_name="recall_store",
+                    iteration=0,
+                    data={
+                        "existing_id": str(existing.id),
+                        "source": source,
+                        "similarity": round(existing.similarity, 3) if hasattr(existing, "similarity") else None,
+                    },
+                )
             return existing.id
 
         # Estimate token count if not provided
         if token_count is None:
             # Rough estimate: ~4 chars per token
             token_count = len(content) // 4
+
+        # Default TTL
+        ttl = remaining_turns if remaining_turns is not None else self.default_ttl
 
         # Build tsvector for sparse search
         keywords_list = keywords or []
@@ -264,19 +305,20 @@ class RecallStore:
         mem_id = await self.db.fetchval(
             """
             INSERT INTO memories (
-                job_id, agent_id, content, summary, memory_type, source,
+                job_id, project_id, agent_id, content, summary, memory_type, source,
                 keywords, embedding, sparse_keywords,
                 importance, source_turn_start, source_turn_end, source_phase,
-                token_count
+                token_count, remaining_turns
             ) VALUES (
-                $1, $2, $3, $4, $5, $6,
-                $7, $8, to_tsvector('english', $9),
-                $10, $11, $12, $13,
-                $14
+                $1, $2, $3, $4, $5, $6, $7,
+                $8, $9, to_tsvector('english', $10),
+                $11, $12, $13, $14,
+                $15, $16
             )
             RETURNING id
             """,
             self.job_id,
+            self.project_id,
             self.agent_id,
             content,
             summary[:500] if summary else None,
@@ -290,12 +332,28 @@ class RecallStore:
             source_turn_end,
             source_phase,
             token_count,
+            ttl,
         )
 
         logger.debug(
             f"Stored memory {mem_id} (type={memory_type}, source={source}, "
             f"importance={importance})"
         )
+        if self._archiver:
+            self._archiver.audit_step(
+                job_id=str(self.job_id),
+                agent_type=self.agent_id or "",
+                step_type="memory_store",
+                node_name="recall_store",
+                iteration=0,
+                data={
+                    "id": str(mem_id),
+                    "type": memory_type,
+                    "source": source,
+                    "importance": importance,
+                    "tokens": token_count,
+                },
+            )
         return mem_id
 
     # =========================================================================
@@ -318,18 +376,19 @@ class RecallStore:
         """
         threshold = threshold if threshold is not None else self.dedup_threshold
 
+        scope_col, scope_val = self._scope_filter
         row = await self.db.fetchrow(
-            """
+            f"""
             SELECT *, 1 - (embedding <=> $1) AS similarity
             FROM memories
-            WHERE job_id = $2
+            WHERE {scope_col} = $2
               AND embedding IS NOT NULL
               AND 1 - (embedding <=> $1) > $3
             ORDER BY similarity DESC
             LIMIT 1
             """,
             embedding,
-            self.job_id,
+            scope_val,
             threshold,
         )
 
@@ -357,15 +416,16 @@ class RecallStore:
         """
         limit = limit or self.dense_results
 
+        scope_col, scope_val = self._scope_filter
         rows = await self.db.fetch(
-            """
+            f"""
             SELECT *
             FROM memories
-            WHERE job_id = $1 AND embedding IS NOT NULL
+            WHERE {scope_col} = $1 AND embedding IS NOT NULL
             ORDER BY embedding <=> $2
             LIMIT $3
             """,
-            self.job_id,
+            scope_val,
             embedding,
             limit,
         )
@@ -401,17 +461,18 @@ class RecallStore:
         """
         limit = limit or self.sparse_results
 
+        scope_col, scope_val = self._scope_filter
         rows = await self.db.fetch(
-            """
+            f"""
             SELECT *,
                    ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', $2)) AS rank
             FROM memories
-            WHERE job_id = $1
+            WHERE {scope_col} = $1
               AND sparse_keywords @@ websearch_to_tsquery('english', $2)
             ORDER BY rank DESC
             LIMIT $3
             """,
-            self.job_id,
+            scope_val,
             query_text,
             limit,
         )
@@ -432,19 +493,114 @@ class RecallStore:
         """
         limit = limit or self.recent_results
 
+        scope_col, scope_val = self._scope_filter
         rows = await self.db.fetch(
-            """
+            f"""
             SELECT *
             FROM memories
-            WHERE job_id = $1
+            WHERE {scope_col} = $1
             ORDER BY created_at DESC
             LIMIT $2
             """,
-            self.job_id,
+            scope_val,
             limit,
         )
 
         return [MemoryRecord.from_row(dict(row)) for row in rows]
+
+    # =========================================================================
+    # TTL Management
+    # =========================================================================
+
+    async def get_ttl_active(self) -> List[MemoryRecord]:
+        """Fetch all memories with remaining_turns > 0 (guaranteed injection).
+
+        These memories bypass hybrid search relevance and are always included
+        in the injection block until their TTL expires.
+
+        Returns:
+            List of TTL-active MemoryRecord objects ordered by importance
+        """
+        scope_col, scope_val = self._scope_filter
+        rows = await self.db.fetch(
+            f"""
+            SELECT *
+            FROM memories
+            WHERE {scope_col} = $1 AND remaining_turns > 0
+            ORDER BY importance DESC
+            """,
+            scope_val,
+        )
+        return [MemoryRecord.from_row(dict(row)) for row in rows]
+
+    async def decrement_ttl(self) -> int:
+        """Decrement remaining_turns for all TTL-active memories in scope.
+
+        Called once per turn in the execute node, before memory retrieval.
+
+        Returns:
+            Number of memories whose TTL was decremented
+        """
+        scope_col, scope_val = self._scope_filter
+        result = await self.db.fetchval(
+            f"""
+            WITH updated AS (
+                UPDATE memories
+                SET remaining_turns = remaining_turns - 1
+                WHERE {scope_col} = $1 AND remaining_turns > 0
+                RETURNING id
+            )
+            SELECT COUNT(*) FROM updated
+            """,
+            scope_val,
+        )
+        return result or 0
+
+    async def boost_ttl(self, memory_id: uuid.UUID, turns: int) -> bool:
+        """Increase remaining_turns for a specific memory.
+
+        Used by the assembler to pin/extend memories that are currently relevant.
+
+        Args:
+            memory_id: UUID of the memory to boost
+            turns: Number of turns to add
+
+        Returns:
+            True if the memory was found and updated
+        """
+        result = await self.db.execute(
+            """
+            UPDATE memories
+            SET remaining_turns = COALESCE(remaining_turns, 0) + $1
+            WHERE id = $2
+            """,
+            turns,
+            memory_id,
+        )
+        return result != "UPDATE 0"
+
+    async def deprecate_ttl(self, memory_id: uuid.UUID, turns: int) -> bool:
+        """Decrease remaining_turns for a specific memory (floor at 0).
+
+        Used by the assembler to fade memories that are no longer relevant.
+
+        Args:
+            memory_id: UUID of the memory to deprecate
+            turns: Number of turns to subtract
+
+        Returns:
+            True if the memory was found and updated
+        """
+        result = await self.db.execute(
+            """
+            UPDATE memories
+            SET remaining_turns = GREATEST(COALESCE(remaining_turns, 0) - $1, 0)
+            WHERE id = $2
+            """,
+            turns,
+            memory_id,
+        )
+        return result != "UPDATE 0"
 
     async def hybrid_search(
         self,
@@ -476,15 +632,22 @@ class RecallStore:
         match_count = match_count or self.max_memories_per_injection
         importance_floor = importance_floor if importance_floor is not None else self.retrieval_importance_floor
 
+        if self.project_scoped and self.project_id:
+            func_name = "memory_project_hybrid_search"
+            scope_val = self.project_id
+        else:
+            func_name = "memory_hybrid_search"
+            scope_val = self.job_id
+
         rows = await self.db.fetch(
-            """
-            SELECT * FROM memory_hybrid_search(
+            f"""
+            SELECT * FROM {func_name}(
                 $1, $2, $3, $4, $5, $6, $7, importance_floor => $8
             )
             """,
             query_text,
             query_embedding,
-            self.job_id,
+            scope_val,
             match_count,
             dense_weight,
             sparse_weight,
@@ -492,63 +655,103 @@ class RecallStore:
             importance_floor,
         )
 
-        # Update access tracking
+        # Update access tracking and reset TTL for accessed memories
         if rows:
             ids = [row["id"] for row in rows]
             await self.db.execute(
                 """
                 UPDATE memories
                 SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP
+                    last_accessed = CURRENT_TIMESTAMP,
+                    remaining_turns = GREATEST(
+                        COALESCE(remaining_turns, 0), $2
+                    )
                 WHERE id = ANY($1)
                 """,
                 ids,
+                self.default_ttl,
             )
 
-        return [MemoryRecord.from_row(dict(row)) for row in rows]
+        results = [MemoryRecord.from_row(dict(row)) for row in rows]
+
+        if self._archiver and results:
+            self._archiver.audit_step(
+                job_id=str(self.job_id),
+                agent_type=self.agent_id or "",
+                step_type="memory_retrieve",
+                node_name="recall_store",
+                iteration=0,
+                data={
+                    "count": len(results),
+                    "total_tokens": sum(m.token_count for m in results),
+                },
+            )
+
+        return results
 
     async def retrieve(
         self,
         context_text: str,
         budget_tokens: Optional[int] = None,
     ) -> List[MemoryRecord]:
-        """High-level retrieval: embed context, run hybrid search, fit to budget.
+        """High-level retrieval: two-tier (TTL-guaranteed + hybrid search), fit to budget.
 
         This is the main entry point for memory retrieval. It:
-        1. Embeds the context text
-        2. Runs hybrid search (dense + sparse + recency via RRF)
-        3. Trims results to fit within the token budget
+        1. Fetches TTL-active memories (guaranteed injection, remaining_turns > 0)
+        2. Embeds context and runs hybrid search for the remaining budget
+        3. Deduplicates and trims to fit within the token budget
 
         Args:
             context_text: Current context (e.g., current todo + recent messages)
             budget_tokens: Token budget for memory injection
 
         Returns:
-            List of MemoryRecord objects that fit within budget
+            List of MemoryRecord objects that fit within budget.
+            TTL-active (pinned) memories come first, then hybrid search results.
         """
         budget = budget_tokens or self.budget_tokens
 
-        # Embed the context for dense search
-        context_embedding = await self.embedding_service.embed(context_text)
-
-        # Run hybrid search
-        candidates = await self.hybrid_search(
-            query_text=context_text,
-            query_embedding=context_embedding,
-        )
-
-        # Trim to budget
+        # Tier 1: TTL-active memories (guaranteed injection)
+        pinned = await self.get_ttl_active()
         result = []
         tokens_used = 0
-        for memory in candidates:
+        pinned_ids = set()
+
+        for memory in pinned:
             if tokens_used + memory.token_count > budget:
+                logger.warning(
+                    f"TTL-active memories exceed budget ({tokens_used} + "
+                    f"{memory.token_count} > {budget}), truncating"
+                )
                 break
             result.append(memory)
             tokens_used += memory.token_count
+            pinned_ids.add(memory.id)
 
+        # Tier 2: Hybrid search with remaining budget
+        remaining_budget = budget - tokens_used
+        if remaining_budget > 0:
+            context_embedding = await self.embedding_service.embed(context_text)
+            candidates = await self.hybrid_search(
+                query_text=context_text,
+                query_embedding=context_embedding,
+            )
+
+            for memory in candidates:
+                # Deduplicate against pinned memories
+                if memory.id in pinned_ids:
+                    continue
+                if tokens_used + memory.token_count > budget:
+                    break
+                result.append(memory)
+                tokens_used += memory.token_count
+
+        pinned_count = len(pinned_ids & {m.id for m in result})
+        retrieved_count = len(result) - pinned_count
         logger.debug(
-            f"Retrieved {len(result)} memories ({tokens_used} tokens) "
-            f"from {len(candidates)} candidates (budget={budget})"
+            f"Retrieved {len(result)} memories ({tokens_used} tokens): "
+            f"{pinned_count} pinned + {retrieved_count} from hybrid search "
+            f"(budget={budget})"
         )
         return result
 
@@ -568,6 +771,8 @@ class RecallStore:
             Formatted memory string
         """
         meta_parts = []
+        if memory.remaining_turns is not None and memory.remaining_turns > 0:
+            meta_parts.append(f"pinned, {memory.remaining_turns} turns left")
         if memory.importance is not None:
             meta_parts.append(f"importance: {memory.importance:.1f}")
         if memory.source_phase is not None:
@@ -582,12 +787,15 @@ class RecallStore:
     def assemble_memory_block(
         cls,
         memories: List[MemoryRecord],
-        budget_tokens: int = 5000,
+        budget_tokens: int = 10000,
     ) -> str:
         """Assemble formatted memory block for injection.
 
+        Separates TTL-active (pinned) memories from retrieval-based memories
+        for clear visual distinction.
+
         Args:
-            memories: List of MemoryRecord objects
+            memories: List of MemoryRecord objects (pinned first, then retrieved)
             budget_tokens: Token budget (for display in footer)
 
         Returns:
@@ -596,15 +804,33 @@ class RecallStore:
         if not memories:
             return ""
 
-        lines = ["--- Relevant Memories ---", ""]
+        pinned = [m for m in memories if m.remaining_turns and m.remaining_turns > 0]
+        retrieved = [m for m in memories if not (m.remaining_turns and m.remaining_turns > 0)]
         tokens_used = sum(m.token_count for m in memories)
 
-        for i, memory in enumerate(memories, 1):
-            lines.append(cls.format_memory(memory, i))
+        lines = []
+        idx = 1
+
+        if pinned:
+            lines.append("--- Pinned Memories (TTL-active) ---")
             lines.append("")
+            for memory in pinned:
+                lines.append(cls.format_memory(memory, idx))
+                lines.append("")
+                idx += 1
+
+        if retrieved:
+            lines.append("--- Retrieved Memories (relevance-ranked) ---")
+            lines.append("")
+            for memory in retrieved:
+                lines.append(cls.format_memory(memory, idx))
+                lines.append("")
+                idx += 1
 
         lines.append(
-            f"--- End Memories ({len(memories)} items, ~{tokens_used:,} tokens) ---"
+            f"--- End Memories ({len(memories)} items: "
+            f"{len(pinned)} pinned + {len(retrieved)} retrieved, "
+            f"~{tokens_used:,} tokens) ---"
         )
         return "\n".join(lines)
 
@@ -618,8 +844,9 @@ class RecallStore:
         Returns:
             Dict with counts by type, source, total tokens, etc.
         """
+        scope_col, scope_val = self._scope_filter
         row = await self.db.fetchrow(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total,
                 COALESCE(SUM(token_count), 0) AS total_tokens,
@@ -634,11 +861,12 @@ class RecallStore:
                 COUNT(*) FILTER (WHERE source = 'compaction') AS from_compaction,
                 COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
                 COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
-                AVG(importance) AS avg_importance
+                AVG(importance) AS avg_importance,
+                COUNT(*) FILTER (WHERE remaining_turns > 0) AS ttl_active
             FROM memories
-            WHERE job_id = $1
+            WHERE {scope_col} = $1
             """,
-            self.job_id,
+            scope_val,
         )
 
         if row:
