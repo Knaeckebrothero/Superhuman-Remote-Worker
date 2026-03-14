@@ -8,9 +8,11 @@ Or from orchestrator directory:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,9 +37,13 @@ from security.auth import (  # noqa: E402
     create_session,
     validate_session,
     delete_session,
+    get_current_user,
     cleanup_expired_sessions,
 )
+from security.auth_mode import get_auth_mode  # noqa: E402
 from security.csrf import validate_csrf_token  # noqa: E402
+from security.password import hash_password, verify_password, validate_password_strength  # noqa: E402
+from services.email import email_service  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.builder_tools import (  # noqa: E402
@@ -905,9 +911,53 @@ class UserUpdate(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    """Request body for email login."""
+    """Request body for login. Password is optional (not required in dev mode)."""
 
     email: str = Field(..., description="Email address")
+    password: str | None = Field(None, description="Password (required in production mode)")
+
+
+class RegisterRequest(BaseModel):
+    """Request body for user registration (production mode)."""
+
+    email: str = Field(..., description="Email address")
+    password: str = Field(..., description="Password (min 8 chars)")
+    display_name: str = Field(..., description="Display name")
+
+
+class VerifyEmailRequest(BaseModel):
+    """Request body for email verification."""
+
+    email: str = Field(..., description="Email address")
+    code: str = Field(..., description="6-digit verification code")
+
+
+class PasswordResetRequest(BaseModel):
+    """Request body for requesting password reset."""
+
+    email: str = Field(..., description="Email address")
+
+
+class PasswordResetConfirm(BaseModel):
+    """Request body for confirming password reset."""
+
+    email: str = Field(..., description="Email address")
+    code: str = Field(..., description="6-digit reset code")
+    new_password: str = Field(..., description="New password (min 8 chars)")
+
+
+class McpTokenCreate(BaseModel):
+    """Request body for creating an MCP API token."""
+
+    name: str = Field(..., min_length=1, max_length=100, description="Token label")
+    scope: str = Field(default="user", description="'user', 'project:<uuid>', or 'all'")
+    expires_in_days: int | None = Field(None, description="Days until expiry (null = never)")
+
+
+class McpTokenVerifyRequest(BaseModel):
+    """Internal request from MCP server to verify a token hash."""
+
+    token_hash: str
 
 
 class ProjectCreate(BaseModel):
@@ -1198,8 +1248,26 @@ async def workspace_status() -> dict[str, Any]:
     }
 
 
+def _get_mcp_scope(request: Request) -> tuple[str | None, str | None]:
+    """Extract MCP scope from request headers (set by the MCP server).
+
+    Returns (user_id, scope) if the request comes from an authenticated
+    MCP client, otherwise (None, None). Headers are only trusted when
+    the X-Internal-Key matches MCP_INTERNAL_KEY.
+    """
+    mcp_user = request.headers.get("X-MCP-User-Id")
+    mcp_scope = request.headers.get("X-MCP-Scope")
+    if mcp_user and mcp_scope:
+        key = request.headers.get("X-Internal-Key", "")
+        expected = os.environ.get("MCP_INTERNAL_KEY", "")
+        if expected and key == expected:
+            return mcp_user, mcp_scope
+    return None, None
+
+
 @app.get("/api/jobs")
 async def list_jobs(
+    request: Request,
     status: str | None = Query(default=None),
     user_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -1207,9 +1275,23 @@ async def list_jobs(
     """List jobs with optional status and user filter.
 
     Returns jobs enriched with audit_count from MongoDB if available.
+    MCP scope filtering is applied when the request comes from an
+    authenticated MCP client.
     """
+    # Apply MCP scope filtering
+    mcp_user, mcp_scope = _get_mcp_scope(request)
+    if mcp_scope == "user":
+        user_id = mcp_user  # Override to show only the token owner's jobs
+    elif mcp_scope and mcp_scope.startswith("project:"):
+        pass  # project filtering applied below after fetching
+
     try:
         jobs = await postgres_db.get_jobs(status=status, user_id=user_id, limit=limit)
+
+        # Filter by project if MCP scope is project-scoped
+        if mcp_scope and mcp_scope.startswith("project:"):
+            project_id = mcp_scope.split(":", 1)[1]
+            jobs = [j for j in jobs if str(j.get("project_id", "")) == project_id]
 
         # Enrich with audit counts if MongoDB is available
         if mongodb.is_available:
@@ -1226,12 +1308,21 @@ async def list_jobs(
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str) -> dict[str, Any]:
+async def get_job(request: Request, job_id: str) -> dict[str, Any]:
     """Get a single job by ID."""
     try:
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        # MCP scope check
+        mcp_user, mcp_scope = _get_mcp_scope(request)
+        if mcp_scope == "user" and str(job.get("user_id", "")) != mcp_user:
+            raise HTTPException(status_code=403, detail="Access denied by token scope")
+        elif mcp_scope and mcp_scope.startswith("project:"):
+            project_id = mcp_scope.split(":", 1)[1]
+            if str(job.get("project_id", "")) != project_id:
+                raise HTTPException(status_code=403, detail="Access denied by token scope")
 
         # Enrich with audit count if MongoDB is available
         if mongodb.is_available:
@@ -2520,7 +2611,7 @@ async def _handle_critic_verdict_on_complete(
         current_round = critic_context.get("verification_round", 0)
         max_rounds = critic_context.get("max_verification_rounds", 3)
 
-        if current_round >= max_rounds:
+        if max_rounds > 0 and current_round >= max_rounds:
             # Round limit reached — auto-accept
             logger.warning(
                 f"Critic {job_id} returned feedback but round limit reached "
@@ -5161,92 +5252,271 @@ async def get_project_expert(
 # =============================================================================
 
 
+def _cookie_params(request: Request) -> tuple[bool, str]:
+    """Compute Secure and SameSite cookie flags from the request."""
+    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
+    _samesite: str = "none" if _secure else "lax"
+    return _secure, _samesite
+
+
+def _set_session_cookies(
+    response: Response, session_key: str, csrf_token: str,
+    secure: bool, samesite: str, max_age: int,
+) -> None:
+    """Set the httpOnly session cookie and the JS-readable CSRF cookie."""
+    response.set_cookie(
+        key="session", value=session_key, max_age=max_age,
+        httponly=True, secure=secure, samesite=samesite, path="/",
+    )
+    response.set_cookie(
+        key="csrf_token", value=csrf_token, max_age=max_age,
+        httponly=False, secure=secure, samesite=samesite, path="/",
+    )
+
+
+def _user_dict(user: dict) -> dict:
+    """Build the public user dict for API responses."""
+    return {
+        "id": str(user["id"]),
+        "display_name": user["display_name"],
+        "avatar_color": user["avatar_color"],
+        "email": user.get("email"),
+        "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
+        "created_at": user["created_at"],
+    }
+
+
+async def _create_gitea_repo_for_project(user: dict, project: dict) -> None:
+    """Create a Gitea jobs repo for a user's default project (best-effort)."""
+    try:
+        if gitea_client.is_initialized and project:
+            repo_name = f"project-{str(project['id'])[:8]}-jobs"
+            repo_url = await gitea_client.create_repo(repo_name)
+            if repo_url:
+                await postgres_db.add_project_repository(
+                    project_id=str(project["id"]),
+                    name=repo_name,
+                    repo_url=repo_url,
+                    role="jobs",
+                    is_managed=True,
+                )
+    except Exception as e:
+        logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
+
+
+def _generate_verification_code() -> str:
+    """Generate a 6-digit verification code."""
+    import secrets
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+@app.get("/api/auth/mode")
+async def auth_mode_endpoint() -> dict[str, str]:
+    """Return the current auth mode so the frontend knows which UI to show."""
+    return {"mode": get_auth_mode()}
+
+
 @app.post("/api/auth/login")
 async def auth_login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
-    """Email-based login. Finds or creates user, issues session cookie."""
+    """Login with email (dev mode) or email + password (production mode)."""
     email = body.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email is required")
 
-    # Find existing user by email
-    user = await postgres_db.get_user_by_email(email)
+    mode = get_auth_mode()
 
-    if not user:
-        # Create new user + default project atomically
-        display_name = email.split("@")[0].title()
-        user, project = await postgres_db.create_user_with_default_project(
-            display_name=display_name,
-            email=email,
-        )
-        logger.info(f"Created new user via login: {email}")
+    if mode == "dev":
+        # Dev mode: find or create user by email (no password)
+        user = await postgres_db.get_user_by_email(email)
+        if not user:
+            display_name = email.split("@")[0].title()
+            user, project = await postgres_db.create_user_with_default_project(
+                display_name=display_name, email=email,
+            )
+            logger.info(f"Created new user via dev login: {email}")
+            await _create_gitea_repo_for_project(user, project)
+    else:
+        # Production mode: require password
+        if not body.password:
+            raise HTTPException(status_code=400, detail="Password is required")
 
-        # Create Gitea jobs repo for the default project
-        try:
-            if gitea_client.is_initialized and project:
-                repo_name = f"project-{str(project['id'])[:8]}-jobs"
-                repo_url = await gitea_client.create_repo(repo_name)
-                if repo_url:
-                    await postgres_db.add_project_repository(
-                        project_id=str(project["id"]),
-                        name=repo_name,
-                        repo_url=repo_url,
-                        role="jobs",
-                        is_managed=True,
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
+        user_auth = await postgres_db.get_user_by_email_with_auth(email)
+        if not user_auth:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    # Create session
+        if not user_auth.get("email_verified"):
+            raise HTTPException(status_code=403, detail="Email not verified. Check your inbox.")
+
+        if not user_auth.get("password_hash") or not verify_password(body.password, user_auth["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user = user_auth
+
+    # Create session (shared between dev and production)
     session_key, csrf_token = await create_session(
-        postgres_db,
-        user_id=str(user["id"]),
-        user_email=email,
+        postgres_db, user_id=str(user["id"]), user_email=email,
     )
-
-    # Session timeout from env or default 24h
     session_timeout_hours = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
     max_age = session_timeout_hours * 3600
+    _secure, _samesite = _cookie_params(request)
+    _set_session_cookies(response, session_key, csrf_token, _secure, _samesite, max_age)
 
-    # Cross-origin cookies (cockpit on different subdomain) require
-    # SameSite=None + Secure=True.  For localhost dev (same origin),
-    # these settings still work fine over http://localhost.
-    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-    _samesite: str = "none" if _secure else "lax"
+    return {"user": _user_dict(user), "csrf_token": csrf_token, "message": "Login successful"}
 
-    # Set httpOnly session cookie
-    response.set_cookie(
-        key="session",
-        value=session_key,
-        max_age=max_age,
-        httponly=True,
-        secure=_secure,
-        samesite=_samesite,
-        path="/",
+
+@app.post("/api/auth/register")
+async def auth_register(body: RegisterRequest) -> dict[str, str]:
+    """Register a new account (production mode only).
+
+    Creates an unverified user and sends a verification email.
+    """
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    # Validate password strength
+    is_valid, error_msg = validate_password_strength(body.password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    # Check if email already exists
+    existing = await postgres_db.get_user_by_email(email)
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    # Create user with password (unverified)
+    pw_hash = hash_password(body.password)
+    user, project = await postgres_db.create_user_with_password(
+        display_name=body.display_name.strip(),
+        email=email,
+        password_hash=pw_hash,
+    )
+    await _create_gitea_repo_for_project(user, project)
+
+    # Generate and send verification code
+    code = _generate_verification_code()
+    await postgres_db.delete_auth_tokens_by_email(email, "verification")
+    await postgres_db.create_auth_token(
+        email=email, token=code, token_type="verification",
+        user_id=str(user["id"]),
     )
 
-    # Set CSRF token cookie (readable by JS for double-submit pattern)
-    response.set_cookie(
-        key="csrf_token",
-        value=csrf_token,
-        max_age=max_age,
-        httponly=False,
-        secure=_secure,
-        samesite=_samesite,
-        path="/",
+    sent = await email_service.send_verification_email(
+        to=email, code=code, display_name=body.display_name.strip(),
+    )
+    if not sent:
+        logger.warning(f"Failed to send verification email to {email}")
+
+    return {"message": "Verification email sent. Check your inbox."}
+
+
+@app.post("/api/auth/verify")
+async def auth_verify(body: VerifyEmailRequest) -> dict[str, str]:
+    """Verify an email address with a 6-digit code."""
+    email = body.email.strip().lower()
+    code = body.code.strip()
+
+    token = await postgres_db.get_auth_token(code, "verification")
+    if not token or token["email"].lower() != email:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    # Mark token used and verify user
+    await postgres_db.mark_auth_token_used(code)
+    if token.get("user_id"):
+        await postgres_db.set_email_verified(str(token["user_id"]))
+
+    return {"message": "Email verified successfully. You can now log in."}
+
+
+@app.post("/api/auth/resend-verification")
+async def auth_resend_verification(body: PasswordResetRequest) -> dict[str, str]:
+    """Resend verification code (rate-limited: 60s cooldown)."""
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    user = await postgres_db.get_user_by_email_with_auth(email)
+    if not user:
+        return {"message": "If that email is registered, a new code was sent."}
+
+    if user.get("email_verified"):
+        return {"message": "Email is already verified."}
+
+    # Rate limit: check if last token was created within 60 seconds
+    from datetime import datetime, timezone
+    last_time = await postgres_db.get_latest_auth_token_time(email, "verification")
+    if last_time:
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
+        if elapsed < 60:
+            raise HTTPException(status_code=429, detail="Please wait before requesting a new code")
+
+    code = _generate_verification_code()
+    await postgres_db.delete_auth_tokens_by_email(email, "verification")
+    await postgres_db.create_auth_token(
+        email=email, token=code, token_type="verification",
+        user_id=str(user["id"]),
+    )
+    await email_service.send_verification_email(
+        to=email, code=code, display_name=user["display_name"],
     )
 
-    return {
-        "user": {
-            "id": str(user["id"]),
-            "display_name": user["display_name"],
-            "avatar_color": user["avatar_color"],
-            "email": user.get("email"),
-            "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
-            "created_at": user["created_at"],
-        },
-        "csrf_token": csrf_token,
-        "message": "Login successful",
-    }
+    return {"message": "If that email is registered, a new code was sent."}
+
+
+@app.post("/api/auth/forgot-password")
+async def auth_forgot_password(body: PasswordResetRequest) -> dict[str, str]:
+    """Request a password reset code. Always returns 200 (don't leak email existence)."""
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    user = await postgres_db.get_user_by_email_with_auth(email)
+
+    if user and user.get("email_verified"):
+        code = _generate_verification_code()
+        await postgres_db.delete_auth_tokens_by_email(email, "password_reset")
+        await postgres_db.create_auth_token(
+            email=email, token=code, token_type="password_reset",
+            user_id=str(user["id"]),
+        )
+        await email_service.send_password_reset_email(
+            to=email, code=code, display_name=user["display_name"],
+        )
+
+    return {"message": "If that email exists, a reset code was sent."}
+
+
+@app.post("/api/auth/reset-password")
+async def auth_reset_password(body: PasswordResetConfirm) -> dict[str, str]:
+    """Reset password using a verification code."""
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    code = body.code.strip()
+
+    # Validate password strength
+    is_valid, error_msg = validate_password_strength(body.new_password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    token = await postgres_db.get_auth_token(code, "password_reset")
+    if not token or token["email"].lower() != email:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
+    # Set new password and invalidate all sessions
+    pw_hash = hash_password(body.new_password)
+    user_id = str(token["user_id"])
+    await postgres_db.set_user_password(user_id, pw_hash)
+    await postgres_db.mark_auth_token_used(code)
+    await postgres_db.delete_sessions_by_user(user_id)
+
+    return {"message": "Password updated. Please log in with your new password."}
 
 
 @app.post("/api/auth/logout")
@@ -5256,8 +5526,7 @@ async def auth_logout(request: Request, response: Response) -> dict[str, str]:
     if session_key:
         await delete_session(postgres_db, session_key)
 
-    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-    _samesite: str = "none" if _secure else "lax"
+    _secure, _samesite = _cookie_params(request)
     response.delete_cookie(key="session", path="/", httponly=True, secure=_secure, samesite=_samesite)
     response.delete_cookie(key="csrf_token", path="/", httponly=False, secure=_secure, samesite=_samesite)
     return {"message": "Logged out successfully"}
@@ -5283,28 +5552,105 @@ async def auth_me(request: Request, response: Response) -> dict[str, Any]:
     csrf_cookie = request.cookies.get("csrf_token")
     csrf_token = session_info.get("csrf_token")
     if csrf_token and not csrf_cookie:
-        _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-        _samesite: str = "none" if _secure else "lax"
+        _secure, _samesite = _cookie_params(request)
         expires_in = session_info.get("expires_in", 86400)
         response.set_cookie(
-            key="csrf_token",
-            value=csrf_token,
-            max_age=expires_in,
-            httponly=False,
-            secure=_secure,
-            samesite=_samesite,
-            path="/",
+            key="csrf_token", value=csrf_token, max_age=expires_in,
+            httponly=False, secure=_secure, samesite=_samesite, path="/",
         )
 
+    return {"user": _user_dict(user), "csrf_token": csrf_token}
+
+
+# =============================================================================
+# MCP Token Endpoints
+# =============================================================================
+
+_MCP_INTERNAL_KEY = os.environ.get("MCP_INTERNAL_KEY", "")
+
+
+@app.post("/api/mcp-tokens")
+async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, Any]:
+    """Generate a new MCP API token. Returns the plaintext token once."""
+    user = await get_current_user(request, postgres_db)
+
+    # Validate scope
+    scope = body.scope.strip()
+    if scope not in ("user", "all") and not scope.startswith("project:"):
+        raise HTTPException(status_code=400, detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'")
+    if scope.startswith("project:"):
+        project_id = scope.split(":", 1)[1]
+        members = await postgres_db.get_project_members(project_id)
+        if not any(str(m["user_id"]) == str(user["id"]) for m in members):
+            raise HTTPException(status_code=403, detail="Not a member of this project")
+
+    # Generate token
+    token = "srw_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_prefix = token[:12]
+
+    # Expiration
+    expires_at = None
+    if body.expires_in_days:
+        from datetime import timedelta
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+
+    row = await postgres_db.create_mcp_token(
+        user_id=str(user["id"]),
+        name=body.name,
+        token_hash=token_hash,
+        token_prefix=token_prefix,
+        scope=scope,
+        expires_at=expires_at,
+    )
+
+    result = {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+    result["token"] = token  # Plaintext returned once only
+    return result
+
+
+@app.get("/api/mcp-tokens")
+async def list_mcp_tokens(request: Request) -> list[dict[str, Any]]:
+    """List the current user's MCP tokens (no plaintext or hashes)."""
+    user = await get_current_user(request, postgres_db)
+    rows = await postgres_db.list_mcp_tokens(str(user["id"]))
+    return [
+        {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in r.items()}
+        for r in rows
+    ]
+
+
+@app.delete("/api/mcp-tokens/{token_id}")
+async def revoke_mcp_token(request: Request, token_id: str) -> dict[str, str]:
+    """Revoke an MCP token (soft delete)."""
+    user = await get_current_user(request, postgres_db)
+    revoked = await postgres_db.revoke_mcp_token(token_id, str(user["id"]))
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Token not found or already revoked")
+    return {"status": "revoked"}
+
+
+@app.post("/api/internal/mcp-token-verify")
+async def internal_mcp_token_verify(request: Request, body: McpTokenVerifyRequest) -> dict[str, Any]:
+    """Internal endpoint for MCP server to verify a token hash.
+
+    Protected by X-Internal-Key header (shared secret).
+    """
+    internal_key = request.headers.get("X-Internal-Key", "")
+    if not _MCP_INTERNAL_KEY or internal_key != _MCP_INTERNAL_KEY:
+        raise HTTPException(status_code=401, detail="Invalid internal key")
+
+    token_data = await postgres_db.get_mcp_token_by_hash(body.token_hash)
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # Update last used
+    await postgres_db.update_mcp_token_last_used(body.token_hash)
+
     return {
-        "user": {
-            "id": str(user["id"]),
-            "display_name": user["display_name"],
-            "avatar_color": user["avatar_color"],
-            "email": user.get("email"),
-            "created_at": user["created_at"],
-        },
-        "csrf_token": csrf_token,
+        "user_id": str(token_data["user_id"]),
+        "scope": token_data["scope"],
+        "display_name": token_data["display_name"],
     }
 
 
@@ -5314,8 +5660,9 @@ async def auth_me(request: Request, response: Response) -> dict[str, Any]:
 
 
 @app.get("/api/users")
-async def list_users() -> list[dict[str, Any]]:
-    """List all users."""
+async def list_users(request: Request) -> list[dict[str, Any]]:
+    """List all users (requires authentication)."""
+    await get_current_user(request, postgres_db)
     try:
         return await postgres_db.list_users()
     except Exception as e:
@@ -5323,8 +5670,9 @@ async def list_users() -> list[dict[str, Any]]:
 
 
 @app.get("/api/users/{user_id}")
-async def get_user(user_id: str) -> dict[str, Any]:
-    """Get a single user by ID."""
+async def get_user(user_id: str, request: Request) -> dict[str, Any]:
+    """Get a single user by ID (requires authentication)."""
+    await get_current_user(request, postgres_db)
     user = await postgres_db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -5332,39 +5680,25 @@ async def get_user(user_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/users")
-async def create_user(body: UserCreate) -> dict[str, Any]:
-    """Create a new user with a default project."""
+async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
+    """Create a new user with a default project (requires authentication)."""
+    await get_current_user(request, postgres_db)
     try:
         user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
             avatar_color=body.avatar_color or "#89b4fa",
             email=body.email,
         )
-
-        # Create Gitea jobs repo for the default project
-        try:
-            if gitea_client.is_initialized and project:
-                repo_name = f"project-{str(project['id'])[:8]}-jobs"
-                repo_url = await gitea_client.create_repo(repo_name)
-                if repo_url:
-                    await postgres_db.add_project_repository(
-                        project_id=str(project["id"]),
-                        name=repo_name,
-                        repo_url=repo_url,
-                        role="jobs",
-                        is_managed=True,
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
-
+        await _create_gitea_repo_for_project(user, project)
         return user
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.put("/api/users/{user_id}")
-async def update_user(user_id: str, body: UserUpdate) -> dict[str, str]:
-    """Update a user."""
+async def update_user(user_id: str, body: UserUpdate, request: Request) -> dict[str, str]:
+    """Update a user (requires authentication)."""
+    await get_current_user(request, postgres_db)
     success = await postgres_db.update_user(
         user_id=user_id,
         display_name=body.display_name,
@@ -5377,8 +5711,9 @@ async def update_user(user_id: str, body: UserUpdate) -> dict[str, str]:
 
 
 @app.delete("/api/users/{user_id}")
-async def delete_user(user_id: str) -> dict[str, str]:
-    """Delete a user."""
+async def delete_user(user_id: str, request: Request) -> dict[str, str]:
+    """Delete a user (requires authentication)."""
+    await get_current_user(request, postgres_db)
     success = await postgres_db.delete_user(user_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")

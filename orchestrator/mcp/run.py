@@ -40,7 +40,7 @@ def main():
         print(f"Starting MCP server on http://{host}:{port}")
         print(f"Health check: http://{host}:{port}/health")
         print(f"MCP endpoint: http://{host}:{port}/mcp/")
-        mcp.run(transport="streamable-http", host=host, port=port)
+        mcp.run(transport="streamable-http", host=host, port=port, stateless_http=True)
     else:
         # Local development (Claude Code via stdio)
         mcp.run(transport="stdio", log_level="ERROR", show_banner=False)

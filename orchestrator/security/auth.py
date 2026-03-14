@@ -128,9 +128,11 @@ async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
         try:
             await db.delete_expired_sessions()
-            logger.debug("Expired sessions cleanup completed")
+            await db.delete_expired_auth_tokens()
+            await db.cleanup_expired_mcp_tokens()
+            logger.debug("Expired sessions, auth tokens, and MCP tokens cleanup completed")
         except Exception as e:
-            logger.error(f"Error cleaning up sessions: {e}")
+            logger.error(f"Error cleaning up sessions/tokens: {e}")
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=3600.0)

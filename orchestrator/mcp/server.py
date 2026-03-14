@@ -1,12 +1,13 @@
 """MCP server exposing debug cockpit tools.
 
 Provides tools to inspect agent jobs, audit trails, todos, and graph changes
-via the Model Context Protocol using FastMCP 2.0.
+via the Model Context Protocol using FastMCP.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Literal
 
 from fastmcp import FastMCP
@@ -26,19 +27,48 @@ except ImportError:
         import importlib
         fmt = importlib.import_module("orchestrator.services.formatters")  # type: ignore[assignment]
 
+# Conditional auth: HTTP transport uses token verification, stdio skips it
+_transport = os.environ.get("MCP_TRANSPORT", "http").lower()
+_auth = None
+if _transport == "http":
+    try:
+        from .auth import McpTokenVerifier
+    except ImportError:
+        from auth import McpTokenVerifier  # type: ignore[no-redef]
+    _auth = McpTokenVerifier()
 
 # Create the MCP server instance
-mcp = FastMCP("cockpit-debug", stateless_http=True)
+mcp = FastMCP("cockpit-debug", auth=_auth)
 
 # Global client instance (initialized lazily)
 _client: AsyncCockpitClient | None = None
 
 
 def _get_client() -> AsyncCockpitClient:
-    """Get or create the async client instance."""
+    """Get or create the async client instance.
+
+    When running with auth, injects scope headers from the authenticated token
+    so the orchestrator can apply per-user filtering.
+    """
     global _client
     if _client is None:
         _client = AsyncCockpitClient()
+
+    # Inject scope headers from authenticated MCP token (if present)
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+
+        token = get_access_token()
+        if token:
+            _client.set_scope_headers(
+                user_id=token.client_id,
+                scope=token.scopes[0] if token.scopes else "user",
+            )
+        else:
+            _client.clear_scope_headers()
+    except Exception:
+        _client.clear_scope_headers()
+
     return _client
 
 
