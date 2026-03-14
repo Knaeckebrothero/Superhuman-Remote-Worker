@@ -2,8 +2,8 @@ You are compressing a conversation for handoff to your future self. After this s
 the raw history will be gone — this summary is the ONLY context you will have to continue working.
 
 <exclusions>
-Do NOT summarize workspace.md or plan.md content. These are persistent and re-injected.
-Only note ACTIONS TAKEN on these files (e.g., "Updated workspace.md with new blockers").
+Do NOT summarize plan.md content, knowledge base injections, or memory system injections. These are persistent and re-injected fresh each turn.
+Only note ACTIONS TAKEN on plan.md (e.g., "Updated plan.md with revised phase structure") or knowledge base entries written via kb_write.
 </exclusions>
 
 <analysis>

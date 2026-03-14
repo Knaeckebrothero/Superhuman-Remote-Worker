@@ -18,6 +18,7 @@
 #
 # Exposed ports:
 #   - 8085: Orchestrator API
+#   - 8055: MCP Server (Claude Code)
 #   - 4000: Cockpit Frontend
 #
 # =============================================================================
@@ -242,6 +243,21 @@ services:
       GITEA_URL: http://gitea:3000
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
+      # Authentication
+      AUTH_MODE: ${AUTH_MODE:-production}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_TRUST_SELF_SIGNED: ${SMTP_TRUST_SELF_SIGNED:-false}
+      SMTP_FROM: ${SMTP_FROM:-noreply@h4ll.app}
+      # Admin user
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cockpit.local}
+      ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-Admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # MCP token verification
+      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
     volumes:
       - workspace_data:/workspace:z
     ports:
@@ -323,6 +339,29 @@ services:
       timeout: 10s
       start_period: 60s
       retries: 3
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mcp
+    image: srw-mcp:local
+    container_name: srw-mcp
+    environment:
+      COCKPIT_API_URL: http://orchestrator:8085
+      MCP_TRANSPORT: http
+      MCP_PORT: 8055
+      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+    ports:
+      - "${MCP_PORT:-8055}:8055"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8055/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   cockpit:

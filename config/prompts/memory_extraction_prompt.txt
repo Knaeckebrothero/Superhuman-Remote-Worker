@@ -50,8 +50,8 @@ For each memory, provide:
 - Raw data or file contents — distill the insight instead
 - The agent's internal planning monologue ("I will now..." or "Let me think...")
 - Information from system injection messages (workspace content, memory blocks)
-- Framework mechanics or system-enforced rules (todo guide enforcement, phase transition patterns, workspace.md structure conventions)
+- Framework mechanics or system-enforced rules (todo guide enforcement, phase transition patterns, knowledge base conventions)
 - Todo completion logistics — the agent already has the todo list in context; don't re-store what was completed
-- Information already pinned in workspace.md — it survives context compaction and doesn't need memory recall
+- Information already stored in the knowledge base — it persists automatically and doesn't need memory recall
 
 If nothing noteworthy happened in this segment, return an empty memories list. Quality over quantity — 2 strong memories beat 6 weak ones.

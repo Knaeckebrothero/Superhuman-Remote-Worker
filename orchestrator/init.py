@@ -28,8 +28,10 @@ Usage:
 """
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -154,8 +156,15 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # Seed default projects for users without one
         await _seed_default_projects(db)
 
+        # Enforce NOT NULL constraint on default_project_id
+        # (applied after seeding so existing users have projects first)
+        await _enforce_default_project_constraint(db)
+
         # Migrate orphan jobs to default projects
         await _migrate_orphan_jobs(db)
+
+        # Seed admin MCP token (after users and projects are set up)
+        await _seed_admin_mcp_token(db)
 
         return all_exist
 
@@ -599,11 +608,29 @@ async def _seed_default_datasources(db) -> None:
 # =============================================================================
 
 async def _seed_default_users(db) -> None:
-    """Seed a default user so the system has at least one user identity.
+    """Seed default users including an admin so the system is usable on first deploy.
 
     Creates only if no user with the same display_name exists (idempotent).
+    Admin credentials come from env vars with sensible defaults.
     """
+    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@cockpit.local")
+    ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+    ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Admin")
+
+    # Admin user (always seeded)
+    admin_kwargs = {
+        "display_name": ADMIN_DISPLAY_NAME,
+        "avatar_color": "#f38ba8",
+        "email": ADMIN_EMAIL,
+        "is_admin": True,
+    }
+    if ADMIN_PASSWORD:
+        from security.password import hash_password
+        admin_kwargs["password_hash"] = hash_password(ADMIN_PASSWORD)
+        admin_kwargs["email_verified"] = True
+
     default_users = [
+        admin_kwargs,
         {"display_name": "Default", "avatar_color": "#89b4fa", "email": "default@cockpit.local"},
     ]
     for user in default_users:
@@ -649,6 +676,66 @@ async def _seed_default_projects(db) -> None:
 
     except Exception as e:
         logger.warning(f"  Default project seeding failed: {e}")
+
+
+async def _enforce_default_project_constraint(db) -> None:
+    """Add CHECK constraint ensuring every user has a default project.
+
+    Uses ADD CONSTRAINT ... CHECK (default_project_id IS NOT NULL).
+    Idempotent — skips if the constraint already exists.
+    Must run after _seed_default_projects to avoid constraint violations.
+    """
+    try:
+        async with db.acquire() as conn:
+            await conn.execute("""
+                DO $$ BEGIN
+                    ALTER TABLE users ADD CONSTRAINT users_default_project_required
+                        CHECK (default_project_id IS NOT NULL);
+                EXCEPTION WHEN duplicate_object THEN null;
+                END $$;
+            """)
+        logger.info("  Default project constraint enforced on users table")
+    except Exception as e:
+        logger.warning(f"  Failed to enforce default project constraint: {e}")
+
+
+async def _seed_admin_mcp_token(db) -> None:
+    """Generate a root MCP token for the admin user if none exists.
+
+    Prints the plaintext token to stdout so the operator can configure
+    .mcp.json immediately without logging into the cockpit.
+    """
+    try:
+        admin = await db.get_admin_user()
+        if not admin:
+            return
+
+        # Check if admin already has an MCP token
+        existing = await db.list_mcp_tokens(str(admin["id"]))
+        if existing:
+            logger.info("  Admin MCP token already exists")
+            return
+
+        # Generate token
+        token = "srw_" + secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        token_prefix = token[:12]
+
+        await db.create_mcp_token(
+            user_id=str(admin["id"]),
+            name="Root (auto-generated)",
+            token_hash=token_hash,
+            token_prefix=token_prefix,
+            scope="all",
+        )
+
+        logger.info("  ============================================")
+        logger.info("  Admin MCP Token (scope: all):")
+        logger.info(f"  {token}")
+        logger.info("  Save this token — it will not be shown again.")
+        logger.info("  ============================================")
+    except Exception as e:
+        logger.warning(f"  Admin MCP token seeding failed: {e}")
 
 
 async def _migrate_orphan_jobs(db) -> None:

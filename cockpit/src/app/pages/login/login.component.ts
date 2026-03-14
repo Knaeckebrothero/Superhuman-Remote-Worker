@@ -1,12 +1,13 @@
 import { Component, inject, signal, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
+import { Router, RouterLink } from '@angular/router';
+import { HttpErrorResponse } from '@angular/common/http';
 import { UserService } from '../../core/services/user.service';
 
 @Component({
   selector: 'app-login',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, RouterLink],
   template: `
     <div class="login-page">
       <div class="login-card">
@@ -18,7 +19,7 @@ import { UserService } from '../../core/services/user.service';
         <div class="login-form">
           <input
             type="email"
-            class="email-input"
+            class="form-input"
             placeholder="Email address"
             [(ngModel)]="email"
             (keyup.enter)="login()"
@@ -26,10 +27,21 @@ import { UserService } from '../../core/services/user.service';
             autofocus
           />
 
+          @if (userService.authMode() === 'production') {
+            <input
+              type="password"
+              class="form-input"
+              placeholder="Password"
+              [(ngModel)]="password"
+              (keyup.enter)="login()"
+              [disabled]="loading()"
+            />
+          }
+
           <button
             class="login-button"
             (click)="login()"
-            [disabled]="!email.trim() || loading()"
+            [disabled]="!canSubmit() || loading()"
           >
             @if (loading()) {
               <span class="spinner"></span>
@@ -39,6 +51,13 @@ import { UserService } from '../../core/services/user.service';
 
           @if (error()) {
             <p class="error-message">{{ error() }}</p>
+          }
+
+          @if (userService.authMode() === 'production') {
+            <div class="auth-links">
+              <a routerLink="/register">Create Account</a>
+              <a routerLink="/forgot-password">Forgot Password?</a>
+            </div>
           }
         </div>
       </div>
@@ -88,7 +107,7 @@ import { UserService } from '../../core/services/user.service';
         gap: 12px;
       }
 
-      .email-input {
+      .form-input {
         width: 100%;
         padding: 10px 14px;
         background: var(--surface-0, #313244);
@@ -101,15 +120,15 @@ import { UserService } from '../../core/services/user.service';
         transition: border-color 0.15s ease;
       }
 
-      .email-input:focus {
+      .form-input:focus {
         border-color: var(--accent-color, #cba6f7);
       }
 
-      .email-input::placeholder {
+      .form-input::placeholder {
         color: var(--text-muted, #6c7086);
       }
 
-      .email-input:disabled {
+      .form-input:disabled {
         opacity: 0.6;
       }
 
@@ -160,14 +179,32 @@ import { UserService } from '../../core/services/user.service';
         font-size: 13px;
         text-align: center;
       }
+
+      .auth-links {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 4px;
+      }
+
+      .auth-links a {
+        color: var(--text-muted, #6c7086);
+        font-size: 13px;
+        text-decoration: none;
+        transition: color 0.15s ease;
+      }
+
+      .auth-links a:hover {
+        color: var(--accent-color, #cba6f7);
+      }
     `,
   ],
 })
 export class LoginComponent implements OnInit {
-  private readonly userService = inject(UserService);
+  readonly userService = inject(UserService);
   private readonly router = inject(Router);
 
   email = '';
+  password = '';
   readonly loading = signal(false);
   readonly error = signal('');
 
@@ -177,20 +214,38 @@ export class LoginComponent implements OnInit {
     }
   }
 
+  canSubmit(): boolean {
+    if (!this.email.trim()) return false;
+    if (this.userService.authMode() === 'production' && !this.password) return false;
+    return true;
+  }
+
   login(): void {
-    const trimmed = this.email.trim();
-    if (!trimmed || this.loading()) return;
+    if (!this.canSubmit() || this.loading()) return;
 
     this.loading.set(true);
     this.error.set('');
 
-    this.userService.login(trimmed).subscribe((user) => {
-      this.loading.set(false);
-      if (user) {
-        this.router.navigate(['/']);
-      } else {
-        this.error.set('Login failed. Please try again.');
-      }
+    const pw = this.userService.authMode() === 'production' ? this.password : undefined;
+
+    this.userService.login(this.email.trim(), pw).subscribe({
+      next: (user) => {
+        this.loading.set(false);
+        if (user) {
+          this.router.navigate(['/']);
+        } else {
+          this.error.set('Login failed. Please try again.');
+        }
+      },
+      error: (err: HttpErrorResponse) => {
+        this.loading.set(false);
+        const detail = err.error?.detail;
+        if (err.status === 403 && detail?.includes('not verified')) {
+          this.error.set('Email not verified. Check your inbox.');
+        } else {
+          this.error.set(detail || 'Login failed. Please try again.');
+        }
+      },
     });
   }
 }

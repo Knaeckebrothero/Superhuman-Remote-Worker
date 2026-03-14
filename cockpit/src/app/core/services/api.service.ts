@@ -37,6 +37,8 @@ import {
   KnowledgeListResponse,
   KnowledgeNoteDetail,
   KnowledgeSearchResponse,
+  MemoryStats,
+  MemoryListResponse,
 } from '../models/api.model';
 import { UploadResponse, UploadInfo } from '../models/file.model';
 import {
@@ -1177,6 +1179,40 @@ export class ApiService {
   exportKnowledge(projectId: string): Observable<{ status: string; path: string; note_count: number } | null> {
     return this.http.post<{ status: string; path: string; note_count: number }>(
       `${this.baseUrl}/projects/${projectId}/knowledge/export`, {},
+    ).pipe(catchError(() => of(null)));
+  }
+
+  // ===== Memory Endpoints =====
+
+  getMemoryStats(jobId: string): Observable<MemoryStats | null> {
+    return this.http.get<MemoryStats>(`${this.baseUrl}/jobs/${jobId}/memory/stats`).pipe(
+      catchError(() => of(null)),
+    );
+  }
+
+  getMemories(
+    jobId: string,
+    filters?: {
+      memory_type?: string;
+      source?: string;
+      search?: string;
+      sort_by?: string;
+      sort_order?: string;
+      limit?: number;
+      offset?: number;
+    },
+  ): Observable<MemoryListResponse | null> {
+    let params = new HttpParams();
+    if (filters?.memory_type) params = params.set('memory_type', filters.memory_type);
+    if (filters?.source) params = params.set('source', filters.source);
+    if (filters?.search) params = params.set('search', filters.search);
+    if (filters?.sort_by) params = params.set('sort_by', filters.sort_by);
+    if (filters?.sort_order) params = params.set('sort_order', filters.sort_order);
+    if (filters?.limit) params = params.set('limit', filters.limit.toString());
+    if (filters?.offset) params = params.set('offset', filters.offset.toString());
+
+    return this.http.get<MemoryListResponse>(
+      `${this.baseUrl}/jobs/${jobId}/memories`, { params },
     ).pipe(catchError(() => of(null)));
   }
 }

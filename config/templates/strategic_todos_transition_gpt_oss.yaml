@@ -36,28 +36,23 @@ todos:
 
   - id: 2
     content: >-
-      REFLECT: Read workspace.md fully, then REWRITE it.
+      REFLECT on project knowledge: Review and update the knowledge base.
 
-      workspace.md is injected into every LLM call. Stale or bloated content wastes
-      tokens. After rewriting, it should contain ONLY:
+      After the retrospective, update the project knowledge base:
+      (1) Search for existing notes related to this phase's work (kb_search).
+      (2) Record new decisions with reasoning using kb_write(type="decision").
+      (3) Record discovered facts (IDs, paths, configurations) using kb_write(type="learning").
+      (4) Record failed approaches using kb_write(type="learning", tag="failed-approach")
+          with the reason they failed — this prevents retrying the same strategy.
+      (5) If any existing notes are now outdated, update them:
+          kb_update(note_id, status="superseded") or kb_update with corrected content.
+      (6) Link related notes using kb_update(note_id, links=["references:other-note"]).
 
-      PROTECTED sections (preserve unless provably wrong):
-      - "## Pinned Instructions" — re-read instructions.md if unsure
-      - "## Facts" — durable knowledge: IDs, paths, configurations
-      - "## Failed Approaches" — approaches that didn't work
+      COMPLETION CRITERIA: Knowledge base updated with decisions, facts, and failed
+      approaches from the completed phase. No duplicate notes created.
 
-      REWRITABLE sections (update freely):
-      - "## Deliverables" — update status based on retrospective's Deliverable Quality
-        section. Mark items "done" ONLY if content assessment is "substantive."
-        Items assessed as "skeleton" or "placeholder" remain "in progress."
-      - "## Key Decisions" — significant choices with brief reasoning
-      - "## Status" — current phase, active blockers
-
-      Remove: progress percentages, phase status, todo summaries,
-      document inventories, anything already in plan.md.
-
-      COMPLETION CRITERIA: workspace.md rewritten, under 60 lines. Deliverable
-      statuses reflect actual content quality, not just file existence.
+      INSTEAD OF: Creating notes for information already captured — search first.
+      Instead of skipping failed approaches — they are critical for preventing loops.
 
   - id: 3
     content: >-
@@ -85,8 +80,8 @@ todos:
 
       === STOP CONDITION (check FIRST) ===
 
-      Check the "## Deliverables" table in workspace.md. For each deliverable marked
-      "done," verify it is genuinely complete:
+      Check plan.md's "## Deliverables" section. Then verify which outputs actually
+      exist in output/ using list_files. For each deliverable, verify it is genuinely complete:
       (1) Use list_files('output/') to confirm files exist.
       (2) Use read_file on EACH output file. Read the actual content.
       (3) For each file, confirm:

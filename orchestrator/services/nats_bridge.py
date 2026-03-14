@@ -371,29 +371,12 @@ class NatsBridge:
     # =========================================================================
 
     async def _set_vm_context(self, job_id: str, updates: dict) -> None:
-        """Merge updates into the job's context under the 'vm' key.
-
-        Performs a read-modify-write since update_job_context() does a full
-        JSONB replace.
-        """
+        """Atomically merge updates into the job's context.vm key."""
         if not self._db:
             return
 
         try:
-            job = await self._db.get_job(job_id)
-            if not job:
-                logger.warning("Cannot update VM context: job %s not found", job_id)
-                return
-
-            context = job.get("context") or {}
-            if not isinstance(context, dict):
-                context = {}
-
-            vm = context.get("vm", {})
-            vm.update(updates)
-            context["vm"] = vm
-
-            await self._db.update_job_context(job_id, context)
+            await self._db.merge_vm_context(job_id, updates)
         except Exception:
             logger.exception("Failed to update VM context for job %s", job_id)
 

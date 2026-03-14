@@ -12,6 +12,7 @@ export interface BuilderMessage {
   role: 'user' | 'assistant';
   content: string | null;
   tool_calls: { tool: string; args: Record<string, unknown> }[] | null;
+  steps: { type: string; title: string; content?: string }[] | null;
   created_at: string;
 }
 

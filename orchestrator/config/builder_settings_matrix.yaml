@@ -1,0 +1,30 @@
+# Builder Settings Matrix — model-family-specific inference params for the builder agent.
+# Resolution: default → family-specific (deep merge).
+# Keys match detect_model_family() output in orchestrator/services/builder_config.py.
+#
+# Keys with null values are not passed to the API (use provider defaults).
+# Absent keys inherit from "default".
+
+default:
+  max_tokens: 4096          # Streaming response max tokens
+  max_summary_tokens: 1024  # Summarization max tokens
+
+gpt-oss:
+  max_tokens: 128000    # 131K context window — allow full CoT reasoning space
+  temperature: 1.0      # OpenAI official: use 1.0 for full reasoning capability
+  top_p: 1.0            # OpenAI official: do not restrict vocabulary distribution
+  # top_k: DO NOT SET — HuggingFace defaults to 50 if present; degrades quality
+  # repetition_penalty: DO NOT SET — must remain disabled
+
+minimax:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 40
+  min_p: 0.01           # MiniMax official recommendation for M2.5
+
+gpt-5:
+  reasoning_effort: high  # Responses API reasoning parameter
+
+o-series:
+  temperature: 1.0
+  reasoning_effort: high
