@@ -1,20 +1,15 @@
 import { Component, inject, signal, computed, ElementRef, ViewChild, AfterViewChecked, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MarkdownComponent } from 'ngx-markdown';
+import { AgentStepsComponent, IAgentStep, AgentStepType } from '../agent-steps/agent-steps.component';
 import { JobArtifactService, PendingWorkspaceEdit } from '../../../core/services/job-artifact.service';
 import { BuilderStreamService, BuilderMessage, WorkspaceProposal } from '../../../core/services/builder-stream.service';
 import { ApiService } from '../../../core/services/api.service';
 
-type BuilderStepType = 'thought' | 'tool_call' | 'tool_result' | 'inspection_result' | 'workspace_proposal';
 type BuilderStepStatus = 'active' | 'complete';
 
-interface BuilderStep {
-  id: string;
-  type: BuilderStepType;
-  title: string;
-  content: string;
+interface BuilderStep extends IAgentStep {
   status: BuilderStepStatus;
-  timestamp: number;
 }
 
 /** Local chat message for display purposes. */
@@ -28,7 +23,7 @@ interface ChatMessage {
 @Component({
   selector: 'app-instruction-builder',
   standalone: true,
-  imports: [FormsModule, MarkdownComponent],
+  imports: [FormsModule, MarkdownComponent, AgentStepsComponent],
   template: `
     <div class="builder-container">
       @if (!artifacts.sessionId()) {
@@ -52,29 +47,10 @@ interface ChatMessage {
               </div>
               <div class="message-body">
                 @if (msg.steps && msg.steps.length > 0) {
-                  <details class="thought-process-panel">
-                    <summary class="thought-process-summary">
-                      <span class="thought-process-icon complete-icon">check_circle</span>
-                      <span class="thought-header-text">Thought process</span>
-                      <span class="thought-step-count">({{ msg.steps.length }})</span>
-                      <span class="chevron-icon">expand_more</span>
-                    </summary>
-                    <div class="thought-process-steps">
-                      @for (step of msg.steps; track step.id) {
-                        <details class="step-item">
-                          <summary class="step-header" [class]="'step-header--' + step.type">
-                            <span class="step-icon" [class]="'step-icon--' + step.type">
-                              {{ getStepIcon(step.type) }}
-                            </span>
-                            <span class="step-title">{{ step.title }}</span>
-                          </summary>
-                          @if (step.content) {
-                            <div class="step-content" [class.inspection-content]="step.type === 'inspection_result'">{{ step.content }}</div>
-                          }
-                        </details>
-                      }
-                    </div>
-                  </details>
+                  <app-agent-steps
+                    [steps]="toAgentSteps(msg.steps)"
+                    [status]="'complete'"
+                  ></app-agent-steps>
                 }
                 @if (msg.role === 'user') {
                   <div class="message-content">{{ msg.content }}</div>
@@ -100,27 +76,10 @@ interface ChatMessage {
               <div class="message-avatar">smart_toy</div>
               <div class="message-body">
                 @if (streamingSteps().length > 0) {
-                  <details class="thought-process-panel">
-                    <summary class="thought-process-summary">
-                      <span class="thought-process-icon">psychology</span>
-                      <span class="thought-header-text">{{ currentStepTitle() }}</span>
-                      <span class="thought-step-count">({{ streamingSteps().length }})</span>
-                      <span class="spinner-small"></span>
-                    </summary>
-                    <div class="thought-process-steps">
-                      @for (step of streamingSteps(); track step.id) {
-                        <div class="step-item-flat" [class]="'step-flat--' + step.type">
-                          <span class="step-icon" [class]="'step-icon--' + step.type">
-                            {{ getStepIcon(step.type) }}
-                          </span>
-                          <span class="step-title">{{ step.title }}</span>
-                          @if (step.status === 'active') {
-                            <span class="spinner-tiny"></span>
-                          }
-                        </div>
-                      }
-                    </div>
-                  </details>
+                  <app-agent-steps
+                    [steps]="toAgentSteps(streamingSteps())"
+                    [status]="'thinking'"
+                  ></app-agent-steps>
                 }
                 @if (streamingText()) {
                   <div class="message-content streaming">
@@ -418,169 +377,7 @@ interface ChatMessage {
         padding: 8px 8px 8px 12px;
       }
 
-      .step-icon--inspection_result {
-        color: #94e2d5;
-      }
-
-      /* Thought Process Panel */
-      .thought-process-panel {
-        border-radius: 8px;
-        background: rgba(139, 92, 246, 0.06);
-        border: 1px solid rgba(139, 92, 246, 0.15);
-        overflow: hidden;
-      }
-
-      .thought-process-panel[open] > .thought-process-summary .chevron-icon {
-        transform: rotate(180deg);
-      }
-
-      .thought-process-summary {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 8px 10px;
-        font-size: 11px;
-        font-weight: 600;
-        color: #a78bfa;
-        cursor: pointer;
-        user-select: none;
-        list-style: none;
-      }
-
-      .thought-process-summary::-webkit-details-marker {
-        display: none;
-      }
-
-      .thought-process-summary:hover {
-        background: rgba(139, 92, 246, 0.08);
-      }
-
-      .thought-process-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-        flex-shrink: 0;
-      }
-
-      .thought-process-icon.complete-icon {
-        color: #a6e3a1;
-      }
-
-      .thought-header-text {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-
-      .thought-step-count {
-        flex-shrink: 0;
-        opacity: 0.6;
-        font-weight: 400;
-      }
-
-      .chevron-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 16px;
-        margin-left: auto;
-        transition: transform 0.2s ease;
-      }
-
-      .thought-process-steps {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        padding: 0 6px 6px;
-        max-height: 250px;
-        overflow-y: auto;
-      }
-
-      /* Individual step (collapsible, for finalized messages) */
-      .step-item {
-        border-radius: 6px;
-        overflow: hidden;
-      }
-
-      .step-header {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 8px;
-        font-size: 11px;
-        cursor: pointer;
-        user-select: none;
-        list-style: none;
-        border-radius: 6px;
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      .step-header::-webkit-details-marker {
-        display: none;
-      }
-
-      .step-header:hover {
-        background: rgba(255, 255, 255, 0.04);
-      }
-
-      .step-content {
-        padding: 6px 8px 8px 36px;
-        font-size: 11px;
-        line-height: 1.4;
-        color: var(--text-muted, #6c7086);
-        white-space: pre-wrap;
-        word-break: break-word;
-        max-height: 200px;
-        overflow-y: auto;
-      }
-
-      /* Individual step (flat, non-collapsible, for streaming) */
-      .step-item-flat {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 5px 8px;
-        font-size: 11px;
-        border-radius: 6px;
-        color: var(--text-primary, #cdd6f4);
-      }
-
-      /* Step icons with gradient backgrounds */
-      .step-icon {
-        font-family: 'Material Symbols Outlined';
-        font-size: 14px;
-        width: 22px;
-        height: 22px;
-        border-radius: 6px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
-        color: #fff;
-      }
-
-      .step-icon--thought {
-        background: linear-gradient(135deg, #8b5cf6, #a78bfa);
-      }
-
-      .step-icon--tool_call {
-        background: linear-gradient(135deg, #f59e0b, #fbbf24);
-      }
-
-      .step-icon--tool_result {
-        background: linear-gradient(135deg, #10b981, #34d399);
-      }
-
-      .step-icon--workspace_proposal {
-        background: linear-gradient(135deg, #f97316, #fab387);
-      }
-
-      .step-title {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
+      /* Inspection result rendering (used inside library's step content) */
 
       /* Session loading */
       .session-loading {
@@ -749,17 +546,6 @@ interface ChatMessage {
         border-radius: 50%;
         animation: spin 0.6s linear infinite;
         flex-shrink: 0;
-      }
-
-      .spinner-tiny {
-        width: 12px;
-        height: 12px;
-        border: 1.5px solid rgba(255, 255, 255, 0.15);
-        border-top-color: currentColor;
-        border-radius: 50%;
-        animation: spin 0.6s linear infinite;
-        flex-shrink: 0;
-        margin-left: auto;
       }
 
       @keyframes spin {
@@ -1296,7 +1082,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
       onStep: (type, title) => {
         // Complete any previously active steps
         this.completeActiveSteps();
-        this.addStep(type as BuilderStepType, title, '', 'active');
+        this.addStep(type as AgentStepType, title, '', 'active');
         this.shouldScrollToBottom = true;
       },
       onToolCall: (tool, args) => {
@@ -1437,24 +1223,12 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
     return tool.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
-  /** Returns the title of the most recent streaming step for the collapsed header. */
-  currentStepTitle(): string {
-    const steps = this.streamingSteps();
-    if (steps.length === 0) return 'Thinking...';
-    return steps[steps.length - 1].title;
+  /** Convert BuilderStep[] to IAgentStep[] for the library component. */
+  toAgentSteps(steps: BuilderStep[]): IAgentStep[] {
+    return steps;
   }
 
-  getStepIcon(type: BuilderStepType): string {
-    switch (type) {
-      case 'thought': return 'psychology';
-      case 'tool_call': return 'build';
-      case 'tool_result': return 'check_circle';
-      case 'inspection_result': return 'visibility';
-      case 'workspace_proposal': return 'edit_note';
-    }
-  }
-
-  private addStep(type: BuilderStepType, title: string, content: string, status: BuilderStepStatus): void {
+  private addStep(type: AgentStepType, title: string, content: string, status: BuilderStepStatus): void {
     const step: BuilderStep = {
       id: `step-${++this.stepCounter}`,
       type,
@@ -1466,7 +1240,7 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
     this.streamingSteps.update((steps) => [...steps, step]);
   }
 
-  private completeActiveSteps(typeFilter?: BuilderStepType): void {
+  private completeActiveSteps(typeFilter?: AgentStepType): void {
     this.streamingSteps.update((steps) => {
       let changed = false;
       const updated = steps.map((s) => {

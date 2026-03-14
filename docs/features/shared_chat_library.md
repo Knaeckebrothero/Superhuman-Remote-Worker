@@ -38,13 +38,27 @@ The library is a **display layer**. It receives messages from an Observable (or 
 
 ## Distribution
 
-**Separate repo, installed via git URL** — same pattern as CitationEngine.
+**Side package inside the Advanced-LLM-Chat repo** — keeps things simple, one repo to maintain.
 
-```bash
-npm install git+https://github.com/<org>/ngx-agent-chat.git#v1.0.0
+```
+Advanced-LLM-Chat/
+├── src/app/                  # The app (imports library directly)
+├── projects/
+│   └── ngx-agent-chat/       # The shared library
+│       ├── src/
+│       │   ├── public-api.ts
+│       │   └── lib/
+│       │       ├── models/
+│       │       └── components/
+│       ├── package.json
+│       └── ng-package.json
+├── package.json
+└── angular.json
 ```
 
-Angular library (`ng generate library ngx-agent-chat`), built with `ng-packagr`.
+- **Advanced-LLM-Chat** imports it as a workspace library (`import { ... } from 'ngx-agent-chat'` — Angular CLI resolves it via `tsconfig.json` paths).
+- **SRW cockpit** installs it via git URL with a build step, or copies the built dist.
+- Generated with `ng generate library ngx-agent-chat`, built with `ng-packagr`.
 
 ---
 
@@ -331,7 +345,7 @@ export class InteractiveAgentComponent {
 ## Extraction Plan
 
 ### Phase 1: Scaffold + models
-- Create repo, `ng generate library ngx-agent-chat`
+- `cd Advanced-LLM-Chat && ng generate library ngx-agent-chat`
 - Copy models (`message.model.ts`, `file.model.ts`) with new step types
 - Copy `Message` class
 - Unit tests
