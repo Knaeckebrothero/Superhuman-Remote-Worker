@@ -23,4 +23,4 @@ Use `kb_search` and `kb_list` to check what's already in the knowledge base befo
 
 ## Output
 
-Write all knowledge notes via `kb_write` / `kb_update`. Keep a summary of notes written in your `workspace.md`. When done, call `job_complete` with a summary of what you curated.
+Write all knowledge notes via `kb_write` / `kb_update`. Track your progress via `kb_list`. When done, call `job_complete` with a summary of what you curated.

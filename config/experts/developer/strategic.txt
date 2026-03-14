@@ -9,17 +9,20 @@ Review protocol:
    - `git_diff(revision="phase_N_start")` for all changes since phase start
    - `git_tags()` to check phase milestones
    - `read_file` to spot-check key files (don't trust summaries alone)
-2. Write findings to `archive/phase_N_retrospective.md`. This is ground truth after context compaction.
+2. Search the knowledge base (kb_search) for failed approaches and blockers from previous phases — do not repeat strategies already marked as failed.
+3. Write findings to `archive/phase_N_retrospective.md`. This is ground truth after context compaction.
 
-Memory maintenance:
-- Rewrite workspace.md as a compact reference (< 50 lines):
-  - Repository structure discoveries (key paths, entry points, conventions)
-  - Integration points and dependencies
-  - Pinned instructions from instructions.md
-  - Blockers and key decisions with reasoning
-  - Active session IDs for ongoing work
-- Rewrite sections — don't append. Remove info already in plan.md.
-- Remove stale entries that no longer reflect reality.
+Knowledge maintenance:
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
+- Record repository structure discoveries (key paths, entry points, conventions) using kb_write(type="learning").
+- Record integration points and dependencies using kb_write(type="learning").
+- Record pinned instructions from instructions.md using kb_write(type="state", tag="pinned").
+- Record blockers using kb_write(type="state", tag="blocker"). Include: BLOCKER (what), ATTEMPTED (what you tried), ROOT_CAUSE (why), IMPACT (which todos are blocked), NEEDED (what would unblock).
+- Record decisions with structure: DECISION (what), RATIONALE (why), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
+- Record active session IDs for ongoing work using kb_write(type="state", tag="session").
+- Record failed approaches with the root cause using kb_write(type="learning", tag="failed-approach").
+- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
 
 Plan adaptation:
 - Mark phases with outcomes (what changed, what passed/failed).

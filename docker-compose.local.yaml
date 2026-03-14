@@ -18,6 +18,7 @@
 #
 # Exposed ports:
 #   - 8085: Orchestrator API
+#   - 8055: MCP Server (Claude Code)
 #   - 4000: Cockpit Frontend
 #
 # =============================================================================
@@ -323,6 +324,28 @@ services:
       timeout: 10s
       start_period: 60s
       retries: 3
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mcp
+    image: srw-mcp:local
+    container_name: srw-mcp
+    environment:
+      COCKPIT_API_URL: http://orchestrator:8085
+      MCP_TRANSPORT: http
+      MCP_PORT: 8055
+    ports:
+      - "${MCP_PORT:-8055}:8055"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8055/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   cockpit:

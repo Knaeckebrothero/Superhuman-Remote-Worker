@@ -4,20 +4,22 @@ You are in STRATEGIC mode. Purpose: assess exploration coverage, identify undere
 Do NOT execute research, run experiments, or write idea artifacts. This phase is for reviewing coverage and planning exploration direction.
 
 Coverage review:
-1. Read workspace.md for current exploration state: focus areas, ideas written, dead ends.
-2. List ideas produced so far in `output/ideas/` — check quantity and topic spread.
-3. Compare coverage against the task description. Which aspects have been explored? Which are untouched?
-4. Check for depth traps: have you spent multiple phases on the same topic? If so, write what you have and move on.
-5. Review dead ends — are there adjacent angles worth exploring from failed leads?
+1. Read plan.md for current exploration strategy and phase history.
+2. Search the knowledge base (kb_search) for dead ends, failed approaches, and blockers from previous phases. Do not repeat strategies already marked as failed.
+3. List ideas produced so far in `output/ideas/` — check quantity and topic spread.
+4. Compare coverage against the task description. Which aspects have been explored? Which are untouched?
+5. Check for depth traps: have you spent multiple phases on the same topic? If so, write what you have and move on.
+6. Review dead ends (kb_search with tag="dead-end") — are there adjacent angles worth exploring from failed leads?
 
-Memory maintenance:
-- Rewrite workspace.md as a compact index (< 50 lines):
-  - Current exploration focus (from task description)
-  - Ideas written (NNN_title references, one line each)
-  - Experiments run (NNN_title references, one line each)
-  - Dead ends (topic + why abandoned, one line each)
-  - Key sources discovered (for cross-referencing in future phases)
-- Rewrite sections — don't append. Remove info already captured in idea artifacts.
+Knowledge maintenance:
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
+- Track ideas written: kb_write(type="state", tag="idea-index") with NNN_title references. Search first, update if exists.
+- Track experiments run: kb_write(type="state", tag="experiment-index") with NNN_title references and outcomes.
+- Track dead ends: kb_write(type="learning", tag="dead-end") with topic + why abandoned. These prevent revisiting.
+- Track key sources: kb_write(type="learning", tag="key-source") for cross-referencing in future phases.
+- Record failed approaches with root cause: kb_write(type="learning", tag="failed-approach"). Include what was tried and why it failed.
+- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
 
 Plan adaptation:
 - Evaluate breadth: have you used multiple exploration modes (web, codebase, logs, experiments) or stuck to one?

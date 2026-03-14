@@ -6314,6 +6314,18 @@ async def get_builder_session(session_id: str) -> dict[str, Any]:
     return session
 
 
+# Tools whose results are displayed as rich inspection panels in the frontend
+_INSPECTION_TOOLS = {
+    "list_jobs", "get_job", "get_job_progress", "get_workspace_file",
+    "get_workspace_overview", "get_frozen_job", "get_todos", "get_chat_history",
+}
+
+
+def _format_tool_name(name: str) -> str:
+    """Format a tool name for display: 'list_jobs' → 'List Jobs'."""
+    return name.replace("_", " ").title()
+
+
 def _build_workspace_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Build a workspace edit proposal for the frontend, or return an error.
 
@@ -6458,16 +6470,22 @@ async def send_builder_message(
                         turn_tool_calls.append(evt_data)
                         if evt_data["name"] in SERVER_SIDE_TOOLS:
                             yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
-                            final_steps.append({"type": "tool_call", "title": f"Running: {evt_data['name']}", "content": json.dumps(evt_data['args'])})
+                            tool_display = _format_tool_name(evt_data["name"])
+                            if evt_data["name"] == "web_search":
+                                step_title = f"Searching: {evt_data['args'].get('query', tool_display)}"
+                            else:
+                                step_title = f"Running: {tool_display}"
+                            final_steps.append({"type": "tool_call", "title": step_title, "content": json.dumps(evt_data['args'])})
                         elif evt_data["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(evt_data["name"], evt_data["args"])
                             if not proposal.get("error"):
                                 yield f"event: workspace_proposal\ndata: {json.dumps(proposal)}\n\n"
-                                final_steps.append({"type": "workspace_proposal", "title": evt_data["args"].get("path", "file"), "content": ""})
+                                ws_label = "Write" if evt_data["name"] == "write_workspace_file" else "Edit"
+                                final_steps.append({"type": "workspace_proposal", "title": f"{ws_label}: {evt_data['args'].get('path', 'file')}", "content": ""})
                         else:
                             yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
                             final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
-                            final_steps.append({"type": "tool_call", "title": evt_data["name"], "content": json.dumps(evt_data['args'])})
+                            final_steps.append({"type": "tool_call", "title": _format_tool_name(evt_data["name"]), "content": json.dumps(evt_data['args'])})
                     elif evt_type == "error":
                         yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
                         error_occurred = True
@@ -6505,7 +6523,11 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
-                            final_steps.append({"type": "tool_result", "title": tc["name"], "content": full_content or result[:200]})
+                            formatted = _format_tool_name(tc["name"])
+                            if full_content and tc["name"] in _INSPECTION_TOOLS:
+                                final_steps.append({"type": "inspection_result", "title": formatted, "content": full_content})
+                            else:
+                                final_steps.append({"type": "tool_result", "title": f"Result: {formatted}", "content": ""})
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -6542,7 +6564,11 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data_oai["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
-                            final_steps.append({"type": "tool_result", "title": tc["name"], "content": full_content or result[:200]})
+                            formatted = _format_tool_name(tc["name"])
+                            if full_content and tc["name"] in _INSPECTION_TOOLS:
+                                final_steps.append({"type": "inspection_result", "title": formatted, "content": full_content})
+                            else:
+                                final_steps.append({"type": "tool_result", "title": f"Result: {formatted}", "content": ""})
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):

@@ -4,28 +4,30 @@ You are in STRATEGIC mode. Purpose: assess exploration coverage, identify undere
 Do NOT execute research, run experiments, or write idea artifacts. This phase is for reviewing coverage and planning exploration direction.
 
 <coverage_review>
-WHY: After context compaction, your memory of what you explored is unreliable. The workspace files and idea artifacts are the only source of truth about what you actually produced. Reviewing from memory causes you to re-explore dead ends and miss coverage gaps.
+WHY: After context compaction, your memory of what you explored is unreliable. The knowledge base and idea artifacts are the only source of truth about what you actually produced. Reviewing from memory causes you to re-explore dead ends and miss coverage gaps.
 
-1. Read workspace.md for current exploration state: focus areas, ideas written, dead ends.
-2. Use list_files on output/ideas/ to count and list ideas produced — check quantity and topic spread.
-3. Use list_files on output/experiments/ to review experiments run.
-4. Compare coverage against the task description. Which aspects have been explored? Which are untouched?
-5. Check for depth traps: have you spent multiple phases on the same topic? If so, write what you have and move on.
-6. Review dead ends — are there adjacent angles worth exploring from failed leads?
+1. Read plan.md for current exploration strategy and phase history.
+2. Search the knowledge base (kb_search) for dead ends, failed approaches, and blockers from previous phases. Do not repeat strategies already marked as failed.
+3. Use list_files on output/ideas/ to count and list ideas produced — check quantity and topic spread.
+4. Use list_files on output/experiments/ to review experiments run.
+5. Compare coverage against the task description. Which aspects have been explored? Which are untouched?
+6. Check for depth traps: have you spent multiple phases on the same topic? If so, write what you have and move on.
+7. Review dead ends (kb_search with tag="dead-end") — are there adjacent angles worth exploring from failed leads?
 </coverage_review>
 
-<memory_maintenance>
-WHY: workspace.md is your only memory that survives context compaction. If you do not maintain it, you will lose track of which ideas were written, which sources were discovered, and which directions were dead ends. You will re-explore topics you already covered.
+<knowledge_maintenance>
+WHY: The knowledge base is your persistent memory that survives context compaction. If you do not maintain it, you will lose track of which ideas were written, which sources were discovered, and which directions were dead ends. You will re-explore topics you already covered.
 
-- Rewrite workspace.md as a compact index (< 50 lines):
-  - Current exploration focus (from task description)
-  - Ideas written (NNN_title references, one line each)
-  - Experiments run (NNN_title references, one line each)
-  - Dead ends (topic + why abandoned, one line each)
-  - Key sources discovered (for cross-referencing in future phases)
-- Rewrite sections — don't append. Remove info already captured in idea artifacts.
-- After any significant discovery or finding, write it to workspace.md immediately. Do not defer.
-</memory_maintenance>
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
+- Track ideas written: kb_write(type="state", tag="idea-index") with NNN_title references. Search first, update if exists.
+- Track experiments run: kb_write(type="state", tag="experiment-index") with NNN_title references and outcomes.
+- Track dead ends: kb_write(type="learning", tag="dead-end") with topic + why abandoned. These prevent revisiting.
+- Track key sources: kb_write(type="learning", tag="key-source") for cross-referencing in future phases.
+- Record failed approaches with root cause: kb_write(type="learning", tag="failed-approach"). Include what was tried and why it failed.
+- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- Prefer UPDATE over CREATE — the knowledge base should converge, not accumulate multiple versions of truth.
+- After any significant discovery or finding, write it to the knowledge base immediately. Do not defer.
+</knowledge_maintenance>
 
 <plan_adaptation>
 WHY: Plans that are not updated after each phase accumulate drift. If you don't evaluate breadth explicitly, you will default to depth on whichever topic you explored last.

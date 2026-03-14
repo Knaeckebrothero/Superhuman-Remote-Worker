@@ -32,7 +32,7 @@ Every todo must be specific enough that you know *exactly* when it's done.
 |---|---|
 | "Check all citations" | "Verify citations 1-10 against source documents in documents/" |
 | "Write the analysis" | "Write section 2.1: Market Overview using findings from phase 2 research" |
-| "Research the topic" | "Web search for 'renewable energy policy EU 2025', summarize top 5 results to workspace.md" |
+| "Research the topic" | "Web search for 'renewable energy policy EU 2025', record key findings using kb_write" |
 | "Process the documents" | "Extract text from documents/report.pdf pages 1-15 using read_file" |
 | "Review the output" | "Compare output/chapter3.md against requirements 4.1-4.3 from instructions.md" |
 | "Improve the quality" | "Add 3 supporting citations to section 2 from the sources identified in phase 3" |
@@ -62,11 +62,11 @@ Use specialized phase types rather than jumping straight to producing deliverabl
 Purpose: Understand the domain before committing to an approach.
 
 Example todos:
-- "Web search for 'topic X state of the art 2025' and save top 5 results to workspace.md"
-- "Read documents/brief.pdf pages 1-10 and list key themes in workspace.md"
+- "Web search for 'topic X state of the art 2025' and record key findings using kb_write(type='learning')"
+- "Read documents/brief.pdf pages 1-10 and record key themes using kb_write(type='learning')"
 - "Web search for 'best practices for Y' and note common approaches"
 - "Read documents/example_output.pdf to understand expected format and style"
-- "Summarize research findings in workspace.md under '## Facts'"
+- "Record research findings as knowledge notes using kb_write"
 
 ### 2. Elaboration Phase (plan the details before executing)
 
@@ -96,7 +96,7 @@ Purpose: Process N similar items efficiently without strategic review between ea
 
 Example todos:
 - "Process documents/input_01.pdf through documents/input_05.pdf: extract key findings to output/findings.md"
-- "Tag documents 1-10 using the classification schema defined in workspace.md"
+- "Tag documents 1-10 using the classification schema from knowledge base (kb_search)"
 - "Run web search for each of the 5 case study cities and save notes to output/case_studies/"
 - "Apply formatting template to output/chapter_01.md through output/chapter_05.md"
 - "Verify all 5 processed items: check output files exist and contain expected content"
@@ -175,7 +175,7 @@ Case Studies (3 cities), Recommendations, Conclusion."
 2. Web search "urban transport policy frameworks" — save top 5 results
 3. Web search "sustainable transport case studies cities" — identify 5 candidate cities
 4. Read all saved research and create research_summary.md with key themes, data points, sources
-5. Update workspace.md with research findings and candidate cities for case studies
+5. Record research findings using kb_write
 
 **Strategic Phase 2** — Review research, elaborate plan with specific sections
 
@@ -184,7 +184,7 @@ Case Studies (3 cities), Recommendations, Conclusion."
 2. Web search "[City B] public transit transformation" — save results
 3. Web search "[City C] cycling infrastructure policy" — save results
 4. For each city, create case_study_notes_[city].md with key facts and sources
-5. Update workspace.md with case study status
+5. Record case study findings using kb_write
 
 **Strategic Phase 3** — Review notes, plan writing phases
 
