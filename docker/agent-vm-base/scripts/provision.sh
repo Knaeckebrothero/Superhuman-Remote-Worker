@@ -5,7 +5,7 @@
 #
 # Installs everything an agent needs to work inside the VM:
 #   - System packages (dev tools, build essentials, networking)
-#   - Python 3.12 + pip
+#   - Python 3 + pip (Ubuntu 24.04 ships 3.12 natively)
 #   - Node.js 22 + npm + Angular CLI + TypeScript
 #   - Management daemon (NATS bridge to orchestrator)
 #   - SSH server configured for RemoteBackend
@@ -14,7 +14,7 @@
 # Run by Packer as a shell provisioner.
 # =============================================================================
 
-set -euo pipefail
+set -euxo pipefail
 
 echo "=== Agent VM Base Image Provisioning ==="
 
@@ -23,8 +23,8 @@ echo "=== Agent VM Base Image Provisioning ==="
 # -----------------------------------------------------------------------------
 
 echo "--- Installing system packages ---"
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
+sudo apt-get update -y
+sudo apt-get install -y \
     openssh-server \
     tmux \
     git \
@@ -43,15 +43,10 @@ sudo apt-get install -y --no-install-recommends \
     iputils-ping \
     zip \
     unzip \
-    tar \
-    gzip \
-    bzip2 \
-    xz-utils \
     sudo \
     ca-certificates \
     gnupg \
     lsb-release \
-    software-properties-common \
     build-essential \
     cmake \
     pkg-config \
@@ -66,30 +61,25 @@ sudo apt-get install -y --no-install-recommends \
     fd-find \
     poppler-utils \
     pandoc \
-    man-db
-
-# -----------------------------------------------------------------------------
-# 2. Python 3.12
-# -----------------------------------------------------------------------------
-
-echo "--- Installing Python 3.12 ---"
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
-    python3.12 \
-    python3.12-venv \
-    python3.12-dev \
+    python3 \
+    python3-venv \
+    python3-dev \
     python3-pip
 
-# Set python3.12 as default python3
-sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+# -----------------------------------------------------------------------------
+# 2. Python setup (Ubuntu 24.04 ships Python 3.12)
+# -----------------------------------------------------------------------------
+
+echo "--- Configuring Python ---"
+
+# Ensure python/python3 point to the system python
+sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
 
 # Upgrade pip
-python3.12 -m pip install --break-system-packages --upgrade pip setuptools wheel
+python3 -m pip install --break-system-packages --upgrade pip setuptools wheel
 
 # Management daemon dependencies (system-wide, needed at boot before any venv)
-python3.12 -m pip install --break-system-packages nats-py psutil
+python3 -m pip install --break-system-packages nats-py psutil
 
 # -----------------------------------------------------------------------------
 # 3. Node.js 22 + npm + global packages
