@@ -280,23 +280,14 @@ def create_init_workspace_node(
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the init_workspace node.
 
-    This node initializes workspace.md from template if it doesn't exist.
+    This node performs workspace initialization audit. workspace.md is no longer
+    created or injected — the project knowledge base and memory system replace it.
     """
 
     def init_workspace(state: UniversalAgentState) -> Dict[str, Any]:
-        """Initialize workspace.md from template."""
+        """Initialize workspace (audit only, workspace.md no longer used)."""
         job_id = state.get("job_id", "unknown")
         logger.info(f"[{job_id}] Initializing workspace")
-
-        workspace_created = not memory_manager.exists()
-        if workspace_created:
-            memory_manager.write(workspace_template)
-            logger.info(f"[{job_id}] Created workspace.md from template")
-        else:
-            logger.debug(f"[{job_id}] workspace.md already exists")
-
-        # Read workspace into state for system prompt injection
-        workspace_memory = memory_manager.read()
 
         # Audit workspace initialization
         auditor = get_archiver()
@@ -307,14 +298,14 @@ def create_init_workspace_node(
                 step_type="initialize",
                 node_name="init_workspace",
                 iteration=0,
-                data={"workspace": {"created": workspace_created}},
+                data={"workspace": {"created": False}},
                 metadata=state.get("metadata"),
                 phase="strategic",
                 phase_number=0,
             )
 
         return {
-            "workspace_memory": workspace_memory,
+            "workspace_memory": "",
         }
 
     return init_workspace
@@ -528,12 +519,9 @@ def create_execute_node(
         )
         prepared_messages.append(SystemMessage(content=full_system))
 
-        # Estimate transient injection overhead (system prompt + workspace.md + todos)
+        # Estimate transient injection overhead (system prompt + todos + memory + knowledge)
         # so compaction thresholds account for messages that will be added AFTER compaction
         injection_overhead_tokens = context_mgr.get_token_count([prepared_messages[0]])  # system prompt
-        if workspace_manager.exists("workspace.md"):
-            ws_text = workspace_manager.read_file("workspace.md")
-            injection_overhead_tokens += len(ws_text) // 4  # approximate
         injection_overhead_tokens += len(todo_manager.format_for_injection()) // 4  # approximate
 
         # Add memory injection budget overhead
@@ -618,11 +606,10 @@ def create_execute_node(
                 if "[Summary of prior work]" in msg.content:
                     prepared_messages.append(msg)
 
-        # Helper: inject all transient messages (todos, workspace.md, instruction files)
+        # Helper: inject all transient messages (todos, memories, knowledge, instruction files)
         # Used both in normal path and safety rebuild to avoid code duplication
         from src.core.workspace_injection import (
             create_todos_human_message,
-            create_workspace_tool_messages,
             create_instruction_tool_messages,
         )
 
@@ -703,18 +690,11 @@ def create_execute_node(
                 logger.warning(f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}")
 
         def _inject_transient_messages(target_messages: list) -> None:
-            """Append transient injection messages (todos, workspace.md, memories, instruction files)."""
+            """Append transient injection messages (todos, memories, knowledge, instruction files)."""
             # Todo list as transient HumanMessage
             target_messages.append(create_todos_human_message(todos_injection_content))
 
-            # Workspace.md as fake tool call result
-            if workspace_manager.exists("workspace.md"):
-                ws_content = workspace_manager.read_file("workspace.md")
-                ws_ai, ws_tool = create_workspace_tool_messages(ws_content)
-                target_messages.append(ws_ai)
-                target_messages.append(ws_tool)
-
-            # Memory Light: inject recalled memories after workspace.md
+            # Memory Light: inject recalled memories
             if _memory_block[0]:
                 from src.core.memory_injection import create_memory_injection_messages
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
@@ -2500,8 +2480,8 @@ def build_phase_alternation_graph(
     memory_assembler_prompt = load_auxiliary_prompt(config, "memory_assembler", model=aux_model)
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
 
-    if not workspace_template:
-        raise ValueError("workspace_template is required")
+    # workspace_template is no longer used — workspace.md replaced by
+    # project knowledge base + memory system. Parameter kept for backward compat.
 
     # Backwards compatibility: wrap a raw LLM in AuxiliaryLLM if needed
     if auxiliary_llm is None:

@@ -442,8 +442,6 @@ class UniversalAgent:
             )
 
             # Build graph for this job
-            workspace_template = self._load_workspace_template()
-
             self._graph = build_phase_alternation_graph(
                 strategic_llm_with_tools=self._strategic_llm_with_tools,
                 tactical_llm_with_tools=self._tactical_llm_with_tools,
@@ -451,7 +449,7 @@ class UniversalAgent:
                 config=self.config,
                 workspace=self._workspace_manager,
                 todo_manager=self._todo_manager,
-                workspace_template=workspace_template,
+                workspace_template="",
                 checkpointer=self._checkpointer,
                 auxiliary_llm=self._auxiliary_llm,
                 snapshot_manager=snapshot_manager,
@@ -1424,10 +1422,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             except Exception as e:
                 logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
 
-        # Initialize KnowledgeGraphDB + KnowledgeStore for inline curation (if enabled)
-        curator_config = self.config.extra.get("curator", {})
+        # Initialize KnowledgeGraphDB + KnowledgeStore for project knowledge base
         project_id = self._job_metadata.get("project_id") if self._job_metadata else None
-        if curator_config.get("enabled", False) and project_id:
+        if project_id:
             try:
                 from src.services.knowledge_graph import KnowledgeGraphDB
                 from src.services.knowledge_store import KnowledgeStore

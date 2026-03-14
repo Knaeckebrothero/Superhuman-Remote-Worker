@@ -1,15 +1,15 @@
-"""Helper functions for workspace.md injection as synthetic tool calls.
+"""Helper functions for transient injection as synthetic tool calls.
 
-This module provides utilities to inject workspace.md content as a fake tool call
-result, making it appear as if the agent already read the file at the start of
-each conversation turn. This approach:
+This module provides utilities to inject content as fake tool call results,
+making it appear as if the agent already read certain files. This approach:
 
-1. Avoids duplication (agent won't redundantly call read_file("workspace.md"))
-2. Removes workspace content from system prompt (cleaner separation)
-3. Ensures workspace isn't included in summarization (re-injected fresh each turn)
+1. Avoids duplication (agent won't redundantly call read_file)
+2. Ensures injected content isn't included in summarization (re-injected fresh each turn)
 
-Also handles injection of instruction files triggered by phase transitions
-(active injection for enforce=false entries with phase triggers).
+Handles injection of:
+- Todo lists (as transient HumanMessage)
+- Instruction files triggered by phase transitions (active injection for enforce=false)
+- Memory and knowledge injection use their own modules (memory_injection.py, knowledge_injection.py)
 """
 
 import uuid
@@ -17,56 +17,19 @@ from typing import List, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-# Prefix for identifying synthetic workspace tool calls
+# Prefix for identifying synthetic instruction tool calls
 # Used to exclude these messages from summarization
-WORKSPACE_TOOL_CALL_ID_PREFIX = "workspace_init_"
 INSTRUCTION_TOOL_CALL_ID_PREFIX = "instruction_inject_"
 
 # Prefix for identifying transient todo injection messages
 TODOS_INJECTION_CONTENT_PREFIX = "<active_tasks>\n"
 
 
-def create_workspace_tool_messages(workspace_content: str) -> Tuple[AIMessage, ToolMessage]:
-    """Create synthetic AIMessage + ToolMessage pair for workspace injection.
-
-    Creates a fake tool call that makes it appear as if the agent already
-    called read_file("workspace.md") and received the content.
-
-    Args:
-        workspace_content: Content of workspace.md file
-
-    Returns:
-        Tuple of (AIMessage with tool_call, ToolMessage with workspace content)
-    """
-    # Generate unique tool_call_id with identifiable prefix
-    tool_call_id = f"{WORKSPACE_TOOL_CALL_ID_PREFIX}{uuid.uuid4().hex[:8]}"
-
-    # Create AIMessage with tool_calls
-    ai_message = AIMessage(
-        content="",  # Empty content - just a tool call
-        tool_calls=[
-            {
-                "name": "read_file",
-                "args": {"path": "workspace.md"},
-                "id": tool_call_id,
-            }
-        ],
-    )
-
-    # Create matching ToolMessage
-    tool_message = ToolMessage(
-        content=workspace_content,
-        tool_call_id=tool_call_id,
-    )
-
-    return ai_message, tool_message
-
-
 def create_todos_human_message(todos_content: str) -> HumanMessage:
     """Create a transient HumanMessage for todo list injection.
 
-    The message is placed after summary SystemMessages and before the
-    workspace.md fake tool call, giving the agent an up-to-date view of
+    The message is placed after summary SystemMessages and before other
+    transient injections, giving the agent an up-to-date view of
     all todos (including completed items) every turn.
 
     Args:
@@ -119,8 +82,9 @@ def create_instruction_tool_messages(
 def is_workspace_injection_message(message: BaseMessage) -> bool:
     """Check if a message is part of a transient injection pair.
 
-    Used to identify and exclude workspace/instruction/todo injection messages
-    from summarization, since they will be re-injected fresh after summarization.
+    Used to identify and exclude instruction/todo/memory/knowledge injection
+    messages from summarization, since they will be re-injected fresh after
+    summarization.
 
     Args:
         message: A LangChain message object
@@ -137,7 +101,7 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
 
     from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
     from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
-    prefixes = (WORKSPACE_TOOL_CALL_ID_PREFIX, INSTRUCTION_TOOL_CALL_ID_PREFIX, MEMORY_TOOL_CALL_ID_PREFIX, KNOWLEDGE_TOOL_CALL_ID_PREFIX)
+    prefixes = (INSTRUCTION_TOOL_CALL_ID_PREFIX, MEMORY_TOOL_CALL_ID_PREFIX, KNOWLEDGE_TOOL_CALL_ID_PREFIX)
 
     if isinstance(message, ToolMessage):
         tool_call_id = getattr(message, "tool_call_id", "")

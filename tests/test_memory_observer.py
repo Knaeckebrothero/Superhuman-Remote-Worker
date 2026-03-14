@@ -252,16 +252,16 @@ class TestFormatMessages:
         # Content should be roughly 1000 chars + truncation marker
         assert len(result) < 1100
 
-    def test_skips_workspace_injection_messages(self):
-        from src.core.workspace_injection import create_workspace_tool_messages
-        ai_msg, tool_msg = create_workspace_tool_messages("workspace content")
+    def test_skips_instruction_injection_messages(self):
+        from src.core.workspace_injection import create_instruction_tool_messages
+        ai_msg, tool_msg = create_instruction_tool_messages("guide.md", "instruction content")
         messages = [
             HumanMessage(content="real message"),
             ai_msg,
             tool_msg,
         ]
         result = MemoryObserver._format_messages_for_extraction(messages)
-        assert "workspace content" not in result
+        assert "instruction content" not in result
         assert "[User] real message" in result
 
     def test_skips_memory_injection_messages(self):

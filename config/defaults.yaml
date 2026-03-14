@@ -27,8 +27,7 @@ workspace:
     - reference/
     - tools/
   instructions_template: instructions.md
-  initial_files:
-    workspace.md: prompts/workspace_template.md
+  initial_files: {}
   max_read_words: 25000
   max_write_words: 10000
   # Git versioning for workspace history
@@ -114,6 +113,19 @@ tools:
   # Evaluation tools - verdict tools for critic agents (src/tools/evaluation/)
   # Enable in critic config to give reviewer agents approve/return capabilities.
   evaluation: []
+  # Knowledge tools — project knowledge base CRUD + search (src/tools/knowledge/)
+  # Available when Neo4j + pgvector are connected; silently skipped otherwise.
+  knowledge:
+    - kb_write
+    - kb_update
+    - kb_read
+    - kb_list
+    - kb_search
+    - kb_related
+    - kb_contradictions
+    - kb_provenance
+    - kb_unanswered
+    - kb_export
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log

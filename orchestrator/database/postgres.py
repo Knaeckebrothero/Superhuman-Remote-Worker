@@ -2920,6 +2920,7 @@ class PostgresDB:
         role: str,
         content: str | None = None,
         tool_calls: List[Dict[str, Any]] | None = None,
+        steps: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         """Create a new message in a builder session.
 
@@ -2928,6 +2929,7 @@ class PostgresDB:
             role: Message role ('user' or 'assistant')
             content: Conversational text content
             tool_calls: List of artifact mutations (assistant only)
+            steps: Agent reasoning steps (assistant only)
 
         Returns:
             Created message dict
@@ -2937,14 +2939,15 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO builder_messages (session_id, role, content, tool_calls)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id, session_id, role, content, tool_calls, created_at
+                INSERT INTO builder_messages (session_id, role, content, tool_calls, steps)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, session_id, role, content, tool_calls, steps, created_at
                 """,
                 session_uuid,
                 role,
                 content,
                 json.dumps(tool_calls) if tool_calls else None,
+                json.dumps(steps) if steps else None,
             )
 
         return dict(row)
@@ -2971,7 +2974,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, session_id, role, content, tool_calls, created_at
+                SELECT id, session_id, role, content, tool_calls, steps, created_at
                 FROM builder_messages
                 WHERE session_id = $1
                 ORDER BY created_at ASC

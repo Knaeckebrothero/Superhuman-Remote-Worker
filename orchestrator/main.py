@@ -6423,6 +6423,7 @@ async def send_builder_message(
         loop_messages = list(context_messages)
         final_text = ""
         final_tool_calls = []
+        final_steps = []
 
         try:
             raw_model = body.model or get_builder_model()
@@ -6433,7 +6434,9 @@ async def send_builder_message(
             builder_settings = resolve_builder_settings(raw_model)
 
             for iteration in range(MAX_ITERATIONS):
-                yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': 'Analyzing request...' if iteration == 0 else 'Processing tool results...'})}\n\n"
+                step_title = 'Analyzing request...' if iteration == 0 else 'Processing tool results...'
+                yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': step_title})}\n\n"
+                final_steps.append({"type": "thought", "title": step_title})
                 turn_text = ""
                 turn_tool_calls = []  # {"name", "args", "id"} dicts
                 error_occurred = False
@@ -6455,13 +6458,16 @@ async def send_builder_message(
                         turn_tool_calls.append(evt_data)
                         if evt_data["name"] in SERVER_SIDE_TOOLS:
                             yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                            final_steps.append({"type": "tool_call", "title": f"Running: {evt_data['name']}", "content": json.dumps(evt_data['args'])})
                         elif evt_data["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(evt_data["name"], evt_data["args"])
                             if not proposal.get("error"):
                                 yield f"event: workspace_proposal\ndata: {json.dumps(proposal)}\n\n"
+                                final_steps.append({"type": "workspace_proposal", "title": evt_data["args"].get("path", "file"), "content": ""})
                         else:
                             yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
                             final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
+                            final_steps.append({"type": "tool_call", "title": evt_data["name"], "content": json.dumps(evt_data['args'])})
                     elif evt_type == "error":
                         yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
                         error_occurred = True
@@ -6499,6 +6505,7 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
+                            final_steps.append({"type": "tool_result", "title": tc["name"], "content": full_content or result[:200]})
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -6535,6 +6542,7 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data_oai["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
+                            final_steps.append({"type": "tool_result", "title": tc["name"], "content": full_content or result[:200]})
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -6555,6 +6563,7 @@ async def send_builder_message(
                 role="assistant",
                 content=final_text if final_text else None,
                 tool_calls=final_tool_calls if final_tool_calls else None,
+                steps=final_steps if final_steps else None,
             )
 
             # Handle auto-summarization if needed

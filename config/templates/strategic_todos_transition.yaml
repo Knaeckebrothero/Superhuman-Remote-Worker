@@ -36,38 +36,23 @@ todos:
 
   - id: 2
     content: >-
-      REFLECT on workspace.md: Read it fully, then REWRITE it.
+      REFLECT on project knowledge: Review and update the knowledge base.
 
-      workspace.md is injected into every LLM call. Stale or bloated content wastes
-      tokens and confuses future decisions. After rewriting, it should contain ONLY:
+      After the retrospective, update the project knowledge base:
+      (1) Search for existing notes related to this phase's work (kb_search).
+      (2) Record new decisions with reasoning using kb_write(type="decision").
+      (3) Record discovered facts (IDs, paths, configurations) using kb_write(type="learning").
+      (4) Record failed approaches using kb_write(type="learning", tag="failed-approach")
+          with the reason they failed — this prevents retrying the same strategy.
+      (5) If any existing notes are now outdated, update them:
+          kb_update(note_id, status="superseded") or kb_update with corrected content.
+      (6) Link related notes using kb_update(note_id, links=["references:other-note"]).
 
-      PROTECTED sections (preserve verbatim unless provably wrong):
-      - "## Pinned Instructions" — re-read instructions.md if you're unsure these are
-        still accurate and complete
-      - "## Facts" — durable knowledge: IDs, paths, credentials, configurations.
-        Only remove facts that are confirmed wrong or no longer relevant.
-      - "## Failed Approaches" — approaches that didn't work. Only remove entries
-        when the underlying issue is confirmed resolved.
+      COMPLETION CRITERIA: Knowledge base updated with decisions, facts, and failed
+      approaches from the completed phase. No duplicate notes created.
 
-      REWRITABLE sections (update freely):
-      - "## Deliverables" — update the status table based on the retrospective's
-        Deliverable Status section. Mark completed items as "done" with verification evidence.
-      - "## Key Decisions" — significant choices made so far, with brief reasoning
-      - "## Status" — current phase, active blockers (or "none")
-
-      BLOCKER CHALLENGE: If "## Status" lists blockers from previous phases,
-      re-verify them now. Re-read the source, re-run the command, or re-check the
-      assumption. If the blocker is still valid, keep it. If not, remove it.
-
-      Remove: progress percentages, phase completion status, todo summaries,
-      document inventories, anything already tracked in plan.md.
-
-      COMPLETION CRITERIA: workspace.md fully rewritten, under 4000 tokens (~60 lines),
-      protected sections preserved, stale blockers challenged.
-
-      INSTEAD OF: Appending new content to the existing file — rewrite the whole file.
-      Instead of merging Facts into Critical Context — keep Facts as a separate protected
-      section. Instead of removing entries you're unsure about — keep them.
+      INSTEAD OF: Creating notes for information already captured — search first.
+      Instead of skipping failed approaches — they are critical for preventing loops.
 
   - id: 3
     content: >-
@@ -102,10 +87,9 @@ todos:
 
       === STOP CONDITION (check this FIRST) ===
 
-      Check the "## Deliverables" table in workspace.md (or re-read plan.md's
-      Deliverables section). Then verify which outputs actually exist in output/
-      using list_files. If ALL required deliverables exist AND the REVIEW phase
-      (todo 1) confirmed their quality, then the job is DONE.
+      Check plan.md's "## Deliverables" section. Then verify which outputs actually
+      exist in output/ using list_files. If ALL required deliverables exist AND the
+      REVIEW phase (todo 1) confirmed their quality, then the job is DONE.
 
       Call job_complete with:
       - summary: What was accomplished across all phases

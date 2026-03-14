@@ -697,6 +697,7 @@ class ToolsConfig:
     git: List[str] = field(default_factory=list)
     coding: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
+    knowledge: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1086,6 +1087,7 @@ def load_agent_config(
         git=tools_data.get("git", []),
         coding=tools_data.get("coding", []),
         evaluation=tools_data.get("evaluation", []),
+        knowledge=tools_data.get("knowledge", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1235,6 +1237,7 @@ def load_agent_config_from_dict(
         git=tools_data.get("git", []),
         coding=tools_data.get("coding", []),
         evaluation=tools_data.get("evaluation", []),
+        knowledge=tools_data.get("knowledge", []),
     )
 
     connections_data = data.get("connections", {})
@@ -2251,7 +2254,8 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.mongodb +
         config.tools.git +
         config.tools.coding +
-        config.tools.evaluation
+        config.tools.evaluation +
+        config.tools.knowledge
     )
 
     # Shell mode aliasing for backward compatibility
