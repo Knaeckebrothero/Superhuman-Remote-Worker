@@ -252,6 +252,10 @@ services:
       SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
       SMTP_TRUST_SELF_SIGNED: ${SMTP_TRUST_SELF_SIGNED:-false}
       SMTP_FROM: ${SMTP_FROM:-noreply@h4ll.app}
+      # Admin user
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cockpit.local}
+      ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-Admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # MCP token verification
       MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
     volumes:

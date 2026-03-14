@@ -126,6 +126,9 @@ import { environment } from '../../core/environment';
               [style.background]="user.avatar_color"
             >{{ getInitials(user.display_name) }}</span>
             <span class="user-name">{{ user.display_name }}</span>
+            @if (user.is_admin) {
+              <span class="admin-badge">admin</span>
+            }
           </div>
           <div class="footer-actions">
             <a class="footer-link" routerLink="/settings" routerLinkActive="active" title="Settings">
@@ -337,6 +340,16 @@ import { environment } from '../../core/environment';
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
+      }
+
+      .admin-badge {
+        font-size: 9px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        color: var(--accent-color, #cba6f7);
+        opacity: 0.7;
+        flex-shrink: 0;
       }
 
       .footer-actions {

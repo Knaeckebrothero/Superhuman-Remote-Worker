@@ -1443,9 +1443,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"Failed to create branch '{branch_name}' from '{from_branch}' "
                             f"in '{parent_repo_name}' for subjob {job_id_str}"
                         )
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = parent.get("context", {}).get("git_remote_url", "")
-                    await postgres_db.update_job_context(job_id_str, ctx)
+                    await postgres_db.merge_job_context(job_id_str, {
+                        "git_remote_url": parent.get("context", {}).get("git_remote_url", ""),
+                    })
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
@@ -1469,9 +1469,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"Failed to create branch '{branch_name}' in "
                             f"'{jobs_repo['name']}' — main branch may not exist"
                         )
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = jobs_repo["repo_url"]
-                    await postgres_db.update_job_context(job_id_str, ctx)
+                    await postgres_db.merge_job_context(job_id_str, {
+                        "git_remote_url": jobs_repo["repo_url"],
+                    })
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
@@ -1484,9 +1484,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                     repo_name = f"job-{short_id}"
                     git_remote_url = await gitea_client.create_repo(repo_name)
                     if git_remote_url:
-                        ctx = dict(context) if context else {}
-                        ctx["git_remote_url"] = git_remote_url
-                        await postgres_db.update_job_context(job_id_str, ctx)
+                        await postgres_db.merge_job_context(job_id_str, {
+                            "git_remote_url": git_remote_url,
+                        })
                         async with postgres_db.acquire() as conn:
                             await conn.execute(
                                 "UPDATE jobs SET repo_name = $1 WHERE id = $2",
@@ -1498,9 +1498,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 repo_name = f"job-{short_id}"
                 git_remote_url = await gitea_client.create_repo(repo_name)
                 if git_remote_url:
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = git_remote_url
-                    await postgres_db.update_job_context(job_id_str, ctx)
+                    await postgres_db.merge_job_context(job_id_str, {
+                        "git_remote_url": git_remote_url,
+                    })
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET repo_name = $1 WHERE id = $2",
@@ -5282,6 +5282,7 @@ def _user_dict(user: dict) -> dict:
         "avatar_color": user["avatar_color"],
         "email": user.get("email"),
         "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
+        "is_admin": user.get("is_admin", False),
         "created_at": user["created_at"],
     }
 
@@ -5578,6 +5579,8 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
     scope = body.scope.strip()
     if scope not in ("user", "all") and not scope.startswith("project:"):
         raise HTTPException(status_code=400, detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'")
+    if scope == "all" and not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Only admins can create full-access tokens")
     if scope.startswith("project:"):
         project_id = scope.split(":", 1)[1]
         members = await postgres_db.get_project_members(project_id)

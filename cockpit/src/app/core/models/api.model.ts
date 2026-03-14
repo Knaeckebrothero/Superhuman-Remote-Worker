@@ -139,6 +139,7 @@ export interface User {
   avatar_color: string;
   email?: string | null;
   default_project_id?: string | null;
+  is_admin?: boolean;
   created_at: string;
 }
 
