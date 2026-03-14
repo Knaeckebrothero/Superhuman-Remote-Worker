@@ -1,0 +1,12 @@
+# code-server configuration for agent VMs
+# The management daemon controls auth tokens at runtime.
+# This is the base config baked into the image.
+
+bind-addr: 0.0.0.0:8080
+auth: password
+password: changeme
+cert: false
+
+# Open the agent workspace by default
+user-data-dir: /home/agent/.local/share/code-server
+extensions-dir: /home/agent/.local/share/code-server/extensions

@@ -1,0 +1,11 @@
+# Wraps the Packer-built qcow2 as a KubeVirt containerDisk image.
+#
+# Build (after packer build):
+#   podman build -t ghcr.io/knaeckebrothero/agent-vm-base:latest \
+#     -f Dockerfile.containerDisk .
+#
+# Push:
+#   podman push ghcr.io/knaeckebrothero/agent-vm-base:latest
+
+FROM scratch
+COPY output/agent-vm-base.qcow2 /disk/agent-vm-base.qcow2
