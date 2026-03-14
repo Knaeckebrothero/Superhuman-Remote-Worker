@@ -53,6 +53,14 @@ class ExtractedMemory(BaseModel):
     type: str = Field(
         description="One of: factual, procedural, error_solution, vocabulary, relational"
     )
+    retrieval_messages: List[str] = Field(
+        default_factory=list,
+        description=(
+            "3-5 synthetic trigger phrases representing situations where this "
+            "memory should be retrieved. Phrased as what the agent would be "
+            "saying or encountering when it needs this information."
+        ),
+    )
 
 
 class ExtractedMemories(BaseModel):
@@ -524,6 +532,7 @@ async def extract_and_store_memories(
                     source_turn_start=source_turn_start,
                     source_turn_end=source_turn_end,
                     source_phase=phase,
+                    retrieval_messages=mem.retrieval_messages or None,
                 )
                 if mem_id:
                     stored_count += 1

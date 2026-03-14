@@ -10,6 +10,7 @@ For each memory, provide:
 - **keywords**: 3-8 search terms. Include specific identifiers (file paths, function names, error codes) alongside general domain terms.
 - **importance**: How valuable is this for future work? (0.0-1.0, see calibration below)
 - **type**: One of the five types defined below.
+- **retrieval_messages**: 3-5 trigger phrases — short sentences representing situations where this memory should surface. See "Retrieval Messages" section below.
 
 ## Memory Types
 
@@ -43,6 +44,35 @@ For each memory, provide:
 - Patterns or approaches that worked well or failed
 - Constraints, requirements, or boundaries discovered during execution
 - Relationships and dependencies between components
+
+## Retrieval Messages (Trigger Phrases)
+
+For each memory, generate 3-5 **retrieval messages** — short phrases that represent situations where this memory should be retrieved. These are embedded alongside the memory and dramatically improve recall by matching the *context of need* rather than just the memory's content.
+
+Think: "What would the agent be saying, doing, or encountering when it needs this information?"
+
+**Guidelines:**
+- Phrase from the agent's working perspective, not as a description of the memory
+- Cover different situations (not just rephrasing the same query)
+- Use vocabulary the agent would naturally use in that moment
+- Include task-oriented phrases, not just question-style queries
+
+**Examples:**
+
+Memory: "SSH login for server 10.18.2.105 is user 'deploy', password from vault key 'srv105-pass'"
+Trigger phrases:
+- "I need to SSH into the server"
+- "How do I connect to 10.18.2.105?"
+- "I should log in to deploy the changes"
+- "What are the credentials for the server?"
+- "Let me run this command on the remote machine"
+
+Memory: "The orders table has a CHECK constraint requiring total >= 0. Negative totals from refunds must use the refunds table instead."
+Trigger phrases:
+- "I need to insert a refund record"
+- "Why is the INSERT into orders failing with a check constraint violation?"
+- "How should I handle negative order totals?"
+- "The database is rejecting my order update"
 
 ## What NOT to Extract
 
