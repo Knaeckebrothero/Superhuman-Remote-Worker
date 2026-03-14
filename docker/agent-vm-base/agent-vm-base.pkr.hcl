@@ -11,7 +11,7 @@
 #       -O input/noble-server-cloudimg-amd64.img
 #
 # Build:
-#   cd docs/HomeLab/deployments/srw/harvester/packer
+#   cd docker/agent-vm-base
 #   packer init agent-vm-base.pkr.hcl
 #   packer build agent-vm-base.pkr.hcl
 #
@@ -87,10 +87,10 @@ source "qemu" "agent-vm-base" {
   memory      = var.memory
   cpus        = var.cpus
 
-  ssh_username         = var.ssh_username
-  ssh_password         = var.ssh_password
-  ssh_timeout          = "10m"
-  ssh_handshake_attempts = 100
+  ssh_username           = var.ssh_username
+  ssh_password           = var.ssh_password
+  ssh_timeout            = "15m"
+  ssh_handshake_attempts = 200
 
   shutdown_command = "sudo shutdown -P now"
 
@@ -98,11 +98,8 @@ source "qemu" "agent-vm-base" {
   cd_files = ["cloud-init/*"]
   cd_label = "cidata"
 
-  # Network: user-mode networking with SSH port forward
-  net_device   = "virtio-net"
-  qemuargs = [
-    ["-cpu", "host"],
-  ]
+  # Network: user-mode (SLIRP) with virtio — provides NAT + DHCP to guest
+  net_device = "virtio-net"
 }
 
 # -----------------------------------------------------------------------------
@@ -117,6 +114,8 @@ build {
     inline = [
       "echo 'Waiting for cloud-init to complete...'",
       "sudo cloud-init status --wait",
+      "echo 'Cloud-init done. Testing network...'",
+      "curl -sSf --connect-timeout 10 https://archive.ubuntu.com > /dev/null && echo 'Network OK' || echo 'Network FAILED'",
     ]
   }
 
