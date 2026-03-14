@@ -235,6 +235,17 @@ services:
       GITEA_URL: http://gitea:3000
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
+      # Authentication
+      AUTH_MODE: ${AUTH_MODE:-production}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_TRUST_SELF_SIGNED: ${SMTP_TRUST_SELF_SIGNED:-false}
+      SMTP_FROM: ${SMTP_FROM:-noreply@h4ll.app}
+      # MCP token verification
+      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
     volumes:
       - workspace_data:/workspace:z
     ports:
@@ -320,6 +331,7 @@ services:
       COCKPIT_API_URL: http://orchestrator:8085
       MCP_TRANSPORT: http
       MCP_PORT: 8055
+      MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
     ports:
       - "${MCP_PORT:-8055}:8055"
     depends_on:

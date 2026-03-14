@@ -5,8 +5,9 @@
 -- Run with: python src/scripts/app_init.py --force-reset
 --
 -- Tables:
---   users             - User identity (no auth, just display names)
+--   users             - User identity with optional password authentication
 --   sessions          - Session-based authentication
+--   auth_tokens       - Email verification and password reset tokens
 --   projects          - Resource hubs grouping jobs, repos, datasources, members
 --   project_members   - User-project membership with roles (owner, editor, viewer)
 --   project_repositories - Repositories linked to projects (jobs, source, reference)
@@ -30,7 +31,9 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ============================================================================
 -- 0. USERS TABLE
--- Minimal user identity (no auth, just "pick who you are" from a dropdown).
+-- User identity with optional password-based authentication.
+-- In dev mode (AUTH_MODE=dev) only email is used (no password).
+-- In production mode, password_hash and email_verified are required.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS users (
@@ -63,6 +66,61 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+-- Migration: Add password and verification columns to users table
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN password_hash TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- ============================================================================
+-- 0e. AUTH TOKENS TABLE
+-- Verification codes and password reset tokens for production auth mode.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS auth_tokens (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    token_type VARCHAR(20) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_token_type CHECK (token_type IN ('verification', 'password_reset'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_token ON auth_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_email ON auth_tokens(email);
+CREATE INDEX IF NOT EXISTS idx_auth_tokens_expires ON auth_tokens(expires_at);
+
+-- ============================================================================
+-- 0g. MCP TOKENS TABLE
+-- API tokens for MCP server authentication. Users generate tokens via the
+-- cockpit settings page; the MCP server validates them on each request.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    token_prefix VARCHAR(12) NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'user',
+    expires_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE

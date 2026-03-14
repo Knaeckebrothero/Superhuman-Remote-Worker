@@ -1,14 +1,18 @@
 import { Injectable, signal, computed, inject } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-import { Observable, catchError, map, of, tap } from 'rxjs';
-import { User } from '../models/api.model';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
+import { Observable, catchError, map, of, tap, throwError } from 'rxjs';
+import { AuthMode, User } from '../models/api.model';
 import { ApiService } from './api.service';
 import { environment } from '../environment';
 
 /**
  * Manages user identity via session-based authentication.
  *
- * Login: POST /api/auth/login with email → backend sets httpOnly session cookie.
+ * Supports two auth modes (controlled by backend AUTH_MODE env var):
+ * - dev:        Email-only login, no password required
+ * - production: Email + password, with email verification and password reset
+ *
+ * Login: POST /api/auth/login with email (+password in production mode).
  * Session check: GET /api/auth/me → returns current user from session.
  * Logout: POST /api/auth/logout → clears session cookie.
  */
@@ -33,10 +37,30 @@ export class UserService {
   /** Convenience: current user's ID (used by job-create, job-list, builder). */
   readonly currentUserId = computed(() => this.currentUser()?.id ?? null);
 
+  /** Auth mode from backend: 'dev' or 'production'. */
+  readonly authMode = signal<AuthMode>('dev');
+
   constructor() {
+    this.checkAuthMode();
     this.checkSession();
     this.loadUsers();
   }
+
+  // ===========================================================================
+  // Auth Mode
+  // ===========================================================================
+
+  /** Fetch auth mode from backend (dev or production). */
+  checkAuthMode(): void {
+    this.http
+      .get<{ mode: AuthMode }>(`${this.baseUrl}/auth/mode`)
+      .pipe(catchError(() => of({ mode: 'dev' as AuthMode })))
+      .subscribe((res) => this.authMode.set(res.mode));
+  }
+
+  // ===========================================================================
+  // Session Management
+  // ===========================================================================
 
   /** Check if we have a valid session (called on init). */
   checkSession(): void {
@@ -56,12 +80,16 @@ export class UserService {
       });
   }
 
-  /** Login with email address. Returns observable so callers can react to completion. */
-  login(email: string): Observable<User | null> {
+  /** Login with email (dev) or email + password (production).
+   *  Errors are propagated so callers can show specific messages (401, 403). */
+  login(email: string, password?: string): Observable<User | null> {
+    const body: Record<string, string> = { email };
+    if (password) body['password'] = password;
+
     return this.http
       .post<{ user: User; csrf_token?: string; message: string }>(
         `${this.baseUrl}/auth/login`,
-        { email },
+        body,
         { withCredentials: true },
       )
       .pipe(
@@ -75,13 +103,12 @@ export class UserService {
           }
         }),
         map((res) => res?.user ?? null),
-        catchError(() => of(null)),
+        catchError((err: HttpErrorResponse) => throwError(() => err)),
       );
   }
 
   /** Logout and clear session. */
   logout(): void {
-    // Clear state immediately so auth guard redirects to login
     this.currentUser.set(null);
     this.api.csrfToken = null;
     this.http
@@ -89,6 +116,61 @@ export class UserService {
       .pipe(catchError(() => of(null)))
       .subscribe();
   }
+
+  // ===========================================================================
+  // Registration & Verification (production mode)
+  // ===========================================================================
+
+  /** Register a new account. Returns the API response or throws on error. */
+  register(email: string, password: string, displayName: string): Observable<{ message: string }> {
+    return this.http
+      .post<{ message: string }>(`${this.baseUrl}/auth/register`, {
+        email,
+        password,
+        display_name: displayName,
+      })
+      .pipe(catchError((err: HttpErrorResponse) => throwError(() => err)));
+  }
+
+  /** Verify email with a 6-digit code. */
+  verifyEmail(email: string, code: string): Observable<{ message: string }> {
+    return this.http
+      .post<{ message: string }>(`${this.baseUrl}/auth/verify`, { email, code })
+      .pipe(catchError((err: HttpErrorResponse) => throwError(() => err)));
+  }
+
+  /** Resend verification code. */
+  resendVerification(email: string): Observable<{ message: string }> {
+    return this.http
+      .post<{ message: string }>(`${this.baseUrl}/auth/resend-verification`, { email })
+      .pipe(catchError((err: HttpErrorResponse) => throwError(() => err)));
+  }
+
+  // ===========================================================================
+  // Password Reset (production mode)
+  // ===========================================================================
+
+  /** Request a password reset code. */
+  forgotPassword(email: string): Observable<{ message: string }> {
+    return this.http
+      .post<{ message: string }>(`${this.baseUrl}/auth/forgot-password`, { email })
+      .pipe(catchError((err: HttpErrorResponse) => throwError(() => err)));
+  }
+
+  /** Reset password with a verification code. */
+  resetPassword(email: string, code: string, newPassword: string): Observable<{ message: string }> {
+    return this.http
+      .post<{ message: string }>(`${this.baseUrl}/auth/reset-password`, {
+        email,
+        code,
+        new_password: newPassword,
+      })
+      .pipe(catchError((err: HttpErrorResponse) => throwError(() => err)));
+  }
+
+  // ===========================================================================
+  // User Management
+  // ===========================================================================
 
   /** Fetch users from the API (for user color dots in job list etc.). */
   loadUsers(): void {

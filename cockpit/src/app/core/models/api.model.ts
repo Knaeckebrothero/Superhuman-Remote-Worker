@@ -126,6 +126,11 @@ export interface DatasourceTestResult {
 // =============================================================================
 
 /**
+ * Auth mode: 'dev' (email only) or 'production' (email + password).
+ */
+export type AuthMode = 'dev' | 'production';
+
+/**
  * User identity with optional email for session-based auth.
  */
 export interface User {
@@ -135,6 +140,40 @@ export interface User {
   email?: string | null;
   default_project_id?: string | null;
   created_at: string;
+}
+
+// =============================================================================
+// MCP Token Models
+// =============================================================================
+
+/**
+ * An MCP API token (as returned by GET /api/mcp-tokens — no plaintext).
+ */
+export interface McpToken {
+  id: string;
+  name: string;
+  token_prefix: string;
+  scope: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+/**
+ * Request body for creating an MCP token.
+ */
+export interface McpTokenCreateRequest {
+  name: string;
+  scope?: string;
+  expires_in_days?: number | null;
+}
+
+/**
+ * Response from POST /api/mcp-tokens — includes plaintext token (shown once).
+ */
+export interface McpTokenCreateResponse extends McpToken {
+  token: string;
 }
 
 // =============================================================================
