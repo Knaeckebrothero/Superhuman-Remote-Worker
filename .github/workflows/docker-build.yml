@@ -27,7 +27,55 @@ jobs:
       - name: Ruff format
         run: ruff format src/ orchestrator/ tests/
 
+  # ---------------------------------------------------------------------------
+  # Detect which components changed — build jobs only run when needed
+  # workflow_dispatch always builds everything
+  # ---------------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      agent: ${{ steps.filter.outputs.agent }}
+      orchestrator: ${{ steps.filter.outputs.orchestrator }}
+      cockpit: ${{ steps.filter.outputs.cockpit }}
+      mcp: ${{ steps.filter.outputs.mcp }}
+      vpn: ${{ steps.filter.outputs.vpn }}
+      vm-base: ${{ steps.filter.outputs.vm-base }}
+      vm-controller: ${{ steps.filter.outputs.vm-controller }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            agent:
+              - 'src/**'
+              - 'config/**'
+              - 'agent.py'
+              - 'requirements.txt'
+              - 'docker/Dockerfile.agent'
+            orchestrator:
+              - 'orchestrator/**'
+              - 'config/**'
+              - 'docker/Dockerfile.orchestrator'
+            cockpit:
+              - 'cockpit/**'
+              - 'docker/Dockerfile.cockpit'
+            mcp:
+              - 'orchestrator/mcp/**'
+              - 'orchestrator/services/formatters.py'
+              - 'orchestrator/services/__init__.py'
+              - 'docker/Dockerfile.mcp'
+            vpn:
+              - 'docker/vpn/**'
+            vm-base:
+              - 'docker/agent-vm-base/**'
+            vm-controller:
+              - 'vm-controller/**'
+
   build-agent:
+    needs: changes
+    if: needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -84,6 +132,8 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-orchestrator:
+    needs: changes
+    if: needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -132,6 +182,8 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-cockpit:
+    needs: changes
+    if: needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -180,6 +232,8 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-mcp:
+    needs: changes
+    if: needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -228,6 +282,8 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-vpn:
+    needs: changes
+    if: needs.changes.outputs.vpn == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -276,6 +332,8 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-agent-vm-base:
+    needs: changes
+    if: needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -314,7 +372,7 @@ jobs:
           version: latest
 
       - name: Download Ubuntu cloud image
-        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        working-directory: docker/agent-vm-base
         run: |
           mkdir -p input
           wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
@@ -322,11 +380,11 @@ jobs:
           qemu-img info input/noble-server-cloudimg-amd64.img
 
       - name: Packer init
-        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        working-directory: docker/agent-vm-base
         run: packer init agent-vm-base.pkr.hcl
 
       - name: Packer build
-        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        working-directory: docker/agent-vm-base
         run: packer build agent-vm-base.pkr.hcl
 
       - name: Log in to Container Registry
@@ -337,7 +395,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push containerDisk image
-        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        working-directory: docker/agent-vm-base
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
           docker build -t "${IMAGE}:latest" -t "${IMAGE}:sha-${GITHUB_SHA::7}" -f Dockerfile.containerDisk .
@@ -346,6 +404,8 @@ jobs:
           echo "Pushed ${IMAGE}:latest"
 
   build-vm-controller:
+    needs: changes
+    if: needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
