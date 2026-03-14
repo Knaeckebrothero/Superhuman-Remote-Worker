@@ -58,7 +58,7 @@ class VMProvisioner:
         self._template_text: str = ""
         self._vm_namespace: str = os.environ.get("VM_NAMESPACE", "agent-vms")
         self._default_vm_image: str = os.environ.get(
-            "DEFAULT_VM_IMAGE", "ghcr.io/knaeckebrothero/agent-vm-base:latest"
+            "DEFAULT_VM_IMAGE", "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest"
         )
 
     @property
