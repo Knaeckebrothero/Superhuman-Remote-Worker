@@ -78,6 +78,12 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: Add is_admin flag to users table
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- ============================================================================
 -- 0e. AUTH TOKENS TABLE
 -- Verification codes and password reset tokens for production auth mode.

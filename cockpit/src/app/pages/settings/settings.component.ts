@@ -87,7 +87,9 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
                 @for (p of projects(); track p.id) {
                   <option [value]="'project:' + p.id">Project: {{ p.name }}</option>
                 }
-                <option value="all">Full Access</option>
+                @if (userService.currentUser()?.is_admin) {
+                  <option value="all">Full Access</option>
+                }
               </select>
               <select class="form-input" [(ngModel)]="newExpiry" [disabled]="creating()">
                 <option [ngValue]="null">Never expires</option>
@@ -370,7 +372,7 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
 })
 export class SettingsComponent implements OnInit {
   readonly tokenService = inject(McpTokenService);
-  private readonly userService = inject(UserService);
+  readonly userService = inject(UserService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
 
