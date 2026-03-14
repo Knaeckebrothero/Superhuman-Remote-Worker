@@ -92,7 +92,9 @@ source "qemu" "agent-vm-base" {
   ssh_timeout            = "15m"
   ssh_handshake_attempts = 200
 
-  shutdown_command = "sudo shutdown -P now"
+  # Shutdown is handled by cleanup.sh (must happen before packer user is deleted)
+  shutdown_command = ""
+  shutdown_timeout = "2m"
 
   # Attach cloud-init seed ISO for first-boot configuration
   cd_files = ["cloud-init/*"]
