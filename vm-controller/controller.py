@@ -33,7 +33,7 @@ NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4
 VM_TEMPLATE_PATH = os.environ.get("VM_TEMPLATE_PATH", "/config/vm-template.yaml")
 VM_NAMESPACE = os.environ.get("VM_NAMESPACE", "agent-vms")
 DEFAULT_VM_IMAGE = os.environ.get(
-    "DEFAULT_VM_IMAGE", "ghcr.io/knaeckebrothero/agent-vm-base:latest"
+    "DEFAULT_VM_IMAGE", "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest"
 )
 DEFAULT_CPU = int(os.environ.get("DEFAULT_CPU", "2"))
 DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")
