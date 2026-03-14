@@ -75,11 +75,8 @@ echo "--- Configuring Python ---"
 # Ensure python/python3 point to the system python
 sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
 
-# Upgrade pip
-python3 -m pip install --break-system-packages --upgrade pip setuptools wheel
-
-# Management daemon dependencies (system-wide, needed at boot before any venv)
-python3 -m pip install --break-system-packages nats-py psutil
+# Management daemon dependencies (system-wide so they survive packer user deletion)
+sudo python3 -m pip install --break-system-packages nats-py psutil
 
 # -----------------------------------------------------------------------------
 # 3. Node.js 22 + npm + global packages
