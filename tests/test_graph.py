@@ -198,8 +198,8 @@ class TestGetManagersFromWorkspace:
 class TestInitWorkspaceNode:
     """Tests for init_workspace node."""
 
-    def test_creates_workspace_md(self, managers, mock_config):
-        """Test that init creates workspace.md from template."""
+    def test_returns_empty_workspace_memory(self, managers, mock_config):
+        """Test that init returns empty workspace_memory (workspace.md no longer used)."""
         template = "# Test Template\n\n## Section\nContent"
         node = create_init_workspace_node(managers["memory"], template, mock_config)
 
@@ -207,22 +207,18 @@ class TestInitWorkspaceNode:
         result = node(state)
 
         assert "workspace_memory" in result
-        assert "Test Template" in result["workspace_memory"]
-        assert managers["memory"].exists()
+        assert result["workspace_memory"] == ""
 
-    def test_preserves_existing_workspace_md(self, managers, mock_config):
-        """Test that existing workspace.md is not overwritten."""
-        managers["memory"].write("# Existing Content")
-
+    def test_does_not_create_workspace_md(self, managers, mock_config):
+        """Test that init does not create workspace.md (replaced by knowledge base)."""
         template = "# New Template"
         node = create_init_workspace_node(managers["memory"], template, mock_config)
 
         state = {"job_id": "test-123"}
-        result = node(state)
+        node(state)
 
-        # Should preserve existing content
-        assert "Existing Content" in result["workspace_memory"]
-        assert "New Template" not in result["workspace_memory"]
+        # workspace.md should NOT be created
+        assert not managers["memory"].exists()
 
 
 class TestCheckTodosNode:
@@ -702,8 +698,8 @@ class TestPredefinedTodos:
 
         # Check content patterns
         contents = [t.content for t in todos]
-        assert any("summarize" in c.lower() for c in contents)
-        assert any("workspace.md" in c.lower() for c in contents)
+        assert any("review" in c.lower() for c in contents)
+        assert any("knowledge" in c.lower() or "kb_" in c.lower() for c in contents)
         assert any("plan.md" in c.lower() for c in contents)
         assert any("todos.yaml" in c.lower() or "job_complete" in c.lower() for c in contents)
 

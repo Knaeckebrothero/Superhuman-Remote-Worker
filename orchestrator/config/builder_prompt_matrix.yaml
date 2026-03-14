@@ -1,0 +1,12 @@
+# Builder Prompt Matrix — maps model families to prompt filenames.
+# Resolution: default → family-specific.
+# File search: orchestrator/config/prompts/
+
+default:
+  system_prompt: builder_system_prompt.md
+
+minimax:
+  system_prompt: builder_system_prompt_minimax.md
+
+gpt-oss:
+  system_prompt: builder_system_prompt_gpt_oss.md

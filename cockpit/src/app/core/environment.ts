@@ -35,6 +35,8 @@ export const environment = {
   models: getEnvArray<{ group: string; models: string[] }>('models'),
   modelPresets: getEnvArray<{ label: string; strategic: string; tactical: string }>('modelPresets'),
   builderModels: getEnvArray<{ label: string; id: string }>('builderModels', [
+    { label: 'GPT OSS 120B (Local)', id: 'openai/gpt-oss-120b' },
+    { label: 'MiniMax M2.5', id: 'openrouter/minimax/minimax-m2.5' },
     { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
     { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
   ]),

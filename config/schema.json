@@ -317,6 +317,14 @@
           },
           "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/)",
           "examples": [["approve_job", "return_job_with_feedback"]]
+        },
+        "knowledge": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/)",
+          "examples": [["kb_write", "kb_update", "kb_read", "kb_list", "kb_search", "kb_related"]]
         }
       }
     },

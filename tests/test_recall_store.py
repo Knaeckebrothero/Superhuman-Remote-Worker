@@ -190,9 +190,9 @@ class TestStore:
             importance=0.5,
         )
 
-        # Check the token_count arg (14th positional arg)
+        # Check the token_count arg (15th positional arg, $15 with project_id added)
         call_args = mock_db.fetchval.call_args
-        token_count_arg = call_args[0][14]  # $14 = token_count
+        token_count_arg = call_args[0][15]  # $15 = token_count
         assert token_count_arg == 100  # 400 chars / 4
 
     @pytest.mark.asyncio
@@ -208,7 +208,7 @@ class TestStore:
         )
 
         call_args = mock_db.fetchval.call_args
-        summary_arg = call_args[0][4]  # $4 = summary
+        summary_arg = call_args[0][5]  # $5 = summary (shifted by project_id)
         assert len(summary_arg) == 500
 
 
@@ -359,8 +359,8 @@ class TestAssembly:
         ]
 
         block = RecallStore.assemble_memory_block(memories)
-        assert "--- Relevant Memories ---" in block
-        assert "--- End Memories (2 items, ~150 tokens) ---" in block
+        assert "--- Retrieved Memories (relevance-ranked) ---" in block
+        assert "--- End Memories (2 items: 0 pinned + 2 retrieved, ~150 tokens) ---" in block
         assert "[1]" in block
         assert "[2]" in block
         assert "Memory one" in block
@@ -369,6 +369,49 @@ class TestAssembly:
     def test_assemble_memory_block_empty(self):
         """assemble_memory_block() returns empty string for no memories."""
         assert RecallStore.assemble_memory_block([]) == ""
+
+    def test_format_memory_pinned(self):
+        """format_memory() shows pinned status with TTL."""
+        memory = MemoryRecord(
+            content="Important pinned memory.",
+            importance=0.9,
+            remaining_turns=7,
+        )
+
+        result = RecallStore.format_memory(memory, 1)
+        assert "pinned, 7 turns left" in result
+        assert "importance: 0.9" in result
+
+    def test_assemble_memory_block_mixed(self):
+        """assemble_memory_block() separates pinned from retrieved."""
+        memories = [
+            MemoryRecord(content="Pinned one", importance=0.9, token_count=50, remaining_turns=5),
+            MemoryRecord(content="Retrieved one", importance=0.7, token_count=50, remaining_turns=0),
+            MemoryRecord(content="Retrieved two", importance=0.5, token_count=50),
+        ]
+
+        block = RecallStore.assemble_memory_block(memories)
+        assert "--- Pinned Memories (TTL-active) ---" in block
+        assert "--- Retrieved Memories (relevance-ranked) ---" in block
+        assert "1 pinned + 2 retrieved" in block
+        assert "Pinned one" in block
+        assert "Retrieved one" in block
+        assert "Retrieved two" in block
+
+    def test_memory_record_remaining_turns(self):
+        """MemoryRecord includes remaining_turns from row."""
+        row = {
+            "content": "Test memory",
+            "remaining_turns": 5,
+        }
+        record = MemoryRecord.from_row(row)
+        assert record.remaining_turns == 5
+
+    def test_memory_record_remaining_turns_null(self):
+        """MemoryRecord handles None remaining_turns."""
+        row = {"content": "Test memory"}
+        record = MemoryRecord.from_row(row)
+        assert record.remaining_turns is None
 
 
 # =============================================================================

@@ -8,9 +8,11 @@ Or from orchestrator directory:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -35,9 +37,13 @@ from security.auth import (  # noqa: E402
     create_session,
     validate_session,
     delete_session,
+    get_current_user,
     cleanup_expired_sessions,
 )
+from security.auth_mode import get_auth_mode  # noqa: E402
 from security.csrf import validate_csrf_token  # noqa: E402
+from security.password import hash_password, verify_password, validate_password_strength  # noqa: E402
+from services.email import email_service  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.builder_tools import (  # noqa: E402
@@ -49,12 +55,12 @@ from services.builder_tools import (  # noqa: E402
     get_builder_api_key,
     get_builder_base_url,
     get_builder_model,
-    get_builder_provider,
     is_auth_or_quota_error,
     rotate_builder_key,
 )
 from services.builder_search import tavily_search  # noqa: E402
 from services.builder_prompt import build_system_prompt  # noqa: E402
+from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
@@ -134,6 +140,19 @@ SUBJOB_CLEANUP_DIRS = [
     "documents",
     "reference",
 ]
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Deep merge two dicts. Override wins for scalars/lists; dicts merge recursively."""
+    result = base.copy()
+    for key, value in override.items():
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
@@ -892,9 +911,53 @@ class UserUpdate(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    """Request body for email login."""
+    """Request body for login. Password is optional (not required in dev mode)."""
 
     email: str = Field(..., description="Email address")
+    password: str | None = Field(None, description="Password (required in production mode)")
+
+
+class RegisterRequest(BaseModel):
+    """Request body for user registration (production mode)."""
+
+    email: str = Field(..., description="Email address")
+    password: str = Field(..., description="Password (min 8 chars)")
+    display_name: str = Field(..., description="Display name")
+
+
+class VerifyEmailRequest(BaseModel):
+    """Request body for email verification."""
+
+    email: str = Field(..., description="Email address")
+    code: str = Field(..., description="6-digit verification code")
+
+
+class PasswordResetRequest(BaseModel):
+    """Request body for requesting password reset."""
+
+    email: str = Field(..., description="Email address")
+
+
+class PasswordResetConfirm(BaseModel):
+    """Request body for confirming password reset."""
+
+    email: str = Field(..., description="Email address")
+    code: str = Field(..., description="6-digit reset code")
+    new_password: str = Field(..., description="New password (min 8 chars)")
+
+
+class McpTokenCreate(BaseModel):
+    """Request body for creating an MCP API token."""
+
+    name: str = Field(..., min_length=1, max_length=100, description="Token label")
+    scope: str = Field(default="user", description="'user', 'project:<uuid>', or 'all'")
+    expires_in_days: int | None = Field(None, description="Days until expiry (null = never)")
+
+
+class McpTokenVerifyRequest(BaseModel):
+    """Internal request from MCP server to verify a token hash."""
+
+    token_hash: str
 
 
 class ProjectCreate(BaseModel):
@@ -1185,8 +1248,26 @@ async def workspace_status() -> dict[str, Any]:
     }
 
 
+def _get_mcp_scope(request: Request) -> tuple[str | None, str | None]:
+    """Extract MCP scope from request headers (set by the MCP server).
+
+    Returns (user_id, scope) if the request comes from an authenticated
+    MCP client, otherwise (None, None). Headers are only trusted when
+    the X-Internal-Key matches MCP_INTERNAL_KEY.
+    """
+    mcp_user = request.headers.get("X-MCP-User-Id")
+    mcp_scope = request.headers.get("X-MCP-Scope")
+    if mcp_user and mcp_scope:
+        key = request.headers.get("X-Internal-Key", "")
+        expected = os.environ.get("MCP_INTERNAL_KEY", "")
+        if expected and key == expected:
+            return mcp_user, mcp_scope
+    return None, None
+
+
 @app.get("/api/jobs")
 async def list_jobs(
+    request: Request,
     status: str | None = Query(default=None),
     user_id: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
@@ -1194,9 +1275,23 @@ async def list_jobs(
     """List jobs with optional status and user filter.
 
     Returns jobs enriched with audit_count from MongoDB if available.
+    MCP scope filtering is applied when the request comes from an
+    authenticated MCP client.
     """
+    # Apply MCP scope filtering
+    mcp_user, mcp_scope = _get_mcp_scope(request)
+    if mcp_scope == "user":
+        user_id = mcp_user  # Override to show only the token owner's jobs
+    elif mcp_scope and mcp_scope.startswith("project:"):
+        pass  # project filtering applied below after fetching
+
     try:
         jobs = await postgres_db.get_jobs(status=status, user_id=user_id, limit=limit)
+
+        # Filter by project if MCP scope is project-scoped
+        if mcp_scope and mcp_scope.startswith("project:"):
+            project_id = mcp_scope.split(":", 1)[1]
+            jobs = [j for j in jobs if str(j.get("project_id", "")) == project_id]
 
         # Enrich with audit counts if MongoDB is available
         if mongodb.is_available:
@@ -1213,12 +1308,21 @@ async def list_jobs(
 
 
 @app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str) -> dict[str, Any]:
+async def get_job(request: Request, job_id: str) -> dict[str, Any]:
     """Get a single job by ID."""
     try:
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        # MCP scope check
+        mcp_user, mcp_scope = _get_mcp_scope(request)
+        if mcp_scope == "user" and str(job.get("user_id", "")) != mcp_user:
+            raise HTTPException(status_code=403, detail="Access denied by token scope")
+        elif mcp_scope and mcp_scope.startswith("project:"):
+            project_id = mcp_scope.split(":", 1)[1]
+            if str(job.get("project_id", "")) != project_id:
+                raise HTTPException(status_code=403, detail="Access denied by token scope")
 
         # Enrich with audit count if MongoDB is available
         if mongodb.is_available:
@@ -1282,8 +1386,13 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 )
             if config_name == "default" and project.get("default_config_name"):
                 config_name = project["default_config_name"]
-            if not config_override and project.get("default_config_override"):
-                config_override = project["default_config_override"]
+            project_default_override = project.get("default_config_override")
+            if project_default_override:
+                if config_override:
+                    # Deep merge: project defaults as base, job overrides on top
+                    config_override = _deep_merge_dicts(project_default_override, config_override)
+                else:
+                    config_override = project_default_override
 
         result = await postgres_db.create_job(
             description=job.description,
@@ -1334,9 +1443,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"Failed to create branch '{branch_name}' from '{from_branch}' "
                             f"in '{parent_repo_name}' for subjob {job_id_str}"
                         )
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = parent.get("context", {}).get("git_remote_url", "")
-                    await postgres_db.update_job_context(job_id_str, ctx)
+                    await postgres_db.merge_job_context(job_id_str, {
+                        "git_remote_url": parent.get("context", {}).get("git_remote_url", ""),
+                    })
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
@@ -1360,9 +1469,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"Failed to create branch '{branch_name}' in "
                             f"'{jobs_repo['name']}' — main branch may not exist"
                         )
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = jobs_repo["repo_url"]
-                    await postgres_db.update_job_context(job_id_str, ctx)
+                    await postgres_db.merge_job_context(job_id_str, {
+                        "git_remote_url": jobs_repo["repo_url"],
+                    })
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
@@ -1375,9 +1484,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                     repo_name = f"job-{short_id}"
                     git_remote_url = await gitea_client.create_repo(repo_name)
                     if git_remote_url:
-                        ctx = dict(context) if context else {}
-                        ctx["git_remote_url"] = git_remote_url
-                        await postgres_db.update_job_context(job_id_str, ctx)
+                        await postgres_db.merge_job_context(job_id_str, {
+                            "git_remote_url": git_remote_url,
+                        })
                         async with postgres_db.acquire() as conn:
                             await conn.execute(
                                 "UPDATE jobs SET repo_name = $1 WHERE id = $2",
@@ -1389,9 +1498,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 repo_name = f"job-{short_id}"
                 git_remote_url = await gitea_client.create_repo(repo_name)
                 if git_remote_url:
-                    ctx = dict(context) if context else {}
-                    ctx["git_remote_url"] = git_remote_url
-                    await postgres_db.update_job_context(job_id_str, ctx)
+                    await postgres_db.merge_job_context(job_id_str, {
+                        "git_remote_url": git_remote_url,
+                    })
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET repo_name = $1 WHERE id = $2",
@@ -2502,7 +2611,7 @@ async def _handle_critic_verdict_on_complete(
         current_round = critic_context.get("verification_round", 0)
         max_rounds = critic_context.get("max_verification_rounds", 3)
 
-        if current_round >= max_rounds:
+        if max_rounds > 0 and current_round >= max_rounds:
             # Round limit reached — auto-accept
             logger.warning(
                 f"Critic {job_id} returned feedback but round limit reached "
@@ -4247,6 +4356,162 @@ async def get_citation_stats(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.get("/api/jobs/{job_id}/memory/stats")
+async def get_memory_stats(job_id: str) -> dict[str, Any]:
+    """Get memory statistics for a job."""
+    try:
+        async with vector_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(token_count), 0) AS total_tokens,
+                    COALESCE(SUM(access_count), 0) AS total_accesses,
+                    COUNT(*) FILTER (WHERE memory_type = 'factual') AS factual,
+                    COUNT(*) FILTER (WHERE memory_type = 'procedural') AS procedural,
+                    COUNT(*) FILTER (WHERE memory_type = 'error_solution') AS error_solution,
+                    COUNT(*) FILTER (WHERE memory_type = 'vocabulary') AS vocabulary,
+                    COUNT(*) FILTER (WHERE memory_type = 'relational') AS relational,
+                    COUNT(*) FILTER (WHERE source = 'observer') AS from_observer,
+                    COUNT(*) FILTER (WHERE source = 'todo') AS from_todo,
+                    COUNT(*) FILTER (WHERE source = 'compaction') AS from_compaction,
+                    COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
+                    COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
+                    AVG(importance) AS avg_importance
+                FROM memories
+                WHERE job_id = $1::uuid
+                """,
+                job_id,
+            )
+            if row:
+                result = dict(row)
+                # Convert Decimal avg_importance to float for JSON serialization
+                if result.get("avg_importance") is not None:
+                    result["avg_importance"] = float(result["avg_importance"])
+                result["job_id"] = job_id
+                return result
+            return {"job_id": job_id, "total": 0, "total_tokens": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/memory/stats")
+async def get_project_memory_stats(project_id: str) -> dict[str, Any]:
+    """Get memory statistics for a project (all memories scoped to this project)."""
+    try:
+        async with vector_db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(token_count), 0) AS total_tokens,
+                    COALESCE(SUM(access_count), 0) AS total_accesses,
+                    COUNT(*) FILTER (WHERE memory_type = 'factual') AS factual,
+                    COUNT(*) FILTER (WHERE memory_type = 'procedural') AS procedural,
+                    COUNT(*) FILTER (WHERE memory_type = 'error_solution') AS error_solution,
+                    COUNT(*) FILTER (WHERE memory_type = 'vocabulary') AS vocabulary,
+                    COUNT(*) FILTER (WHERE memory_type = 'relational') AS relational,
+                    COUNT(*) FILTER (WHERE source = 'observer') AS from_observer,
+                    COUNT(*) FILTER (WHERE source = 'todo') AS from_todo,
+                    COUNT(*) FILTER (WHERE source = 'compaction') AS from_compaction,
+                    COUNT(*) FILTER (WHERE source = 'phase_archive') AS from_phase_archive,
+                    COUNT(*) FILTER (WHERE source = 'tool_error') AS from_tool_error,
+                    AVG(importance) AS avg_importance
+                FROM memories
+                WHERE project_id = $1::uuid
+                """,
+                project_id,
+            )
+            if row:
+                result = dict(row)
+                if result.get("avg_importance") is not None:
+                    result["avg_importance"] = float(result["avg_importance"])
+                result["project_id"] = project_id
+                return result
+            return {"project_id": project_id, "total": 0, "total_tokens": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/memories")
+async def list_job_memories(
+    job_id: str,
+    memory_type: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    sort_by: str = Query(default="created_at"),
+    sort_order: str = Query(default="desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    """List individual memories for a job with optional filters and pagination."""
+    # Validate sort parameters
+    valid_sort_fields = {"created_at", "importance", "access_count", "token_count", "last_accessed"}
+    if sort_by not in valid_sort_fields:
+        sort_by = "created_at"
+    if sort_order not in {"asc", "desc"}:
+        sort_order = "desc"
+
+    try:
+        async with vector_db.acquire() as conn:
+            conditions = ["job_id = $1::uuid"]
+            params: list[Any] = [job_id]
+            idx = 2
+
+            if memory_type:
+                conditions.append(f"memory_type = ${idx}")
+                params.append(memory_type)
+                idx += 1
+            if source:
+                conditions.append(f"source = ${idx}")
+                params.append(source)
+                idx += 1
+            if search:
+                conditions.append(f"(content ILIKE ${idx} OR summary ILIKE ${idx})")
+                params.append(f"%{search}%")
+                idx += 1
+
+            where = " AND ".join(conditions)
+
+            # Count total
+            count_row = await conn.fetchrow(
+                f"SELECT COUNT(*) as cnt FROM memories WHERE {where}",
+                *params,
+            )
+            total = count_row["cnt"] if count_row else 0
+
+            # Fetch page
+            params.extend([limit, offset])
+            rows = await conn.fetch(
+                f"SELECT id, job_id, project_id, agent_id, "
+                f"LEFT(content, 300) as content_preview, summary, "
+                f"memory_type, source, keywords, importance, "
+                f"source_turn_start, source_turn_end, source_phase, "
+                f"token_count, access_count, created_at, last_accessed "
+                f"FROM memories WHERE {where} "
+                f"ORDER BY {sort_by} {sort_order} "
+                f"LIMIT ${idx} OFFSET ${idx + 1}",
+                *params,
+            )
+            memories = []
+            for r in rows:
+                m = dict(r)
+                # Convert UUIDs and datetimes for JSON serialization
+                for k in ("id", "job_id", "project_id"):
+                    if m.get(k) is not None:
+                        m[k] = str(m[k])
+                for k in ("created_at", "last_accessed"):
+                    if m.get(k) is not None:
+                        m[k] = m[k].isoformat()
+                if m.get("importance") is not None:
+                    m["importance"] = float(m["importance"])
+                memories.append(m)
+
+        return {"memories": memories, "total": total, "limit": limit, "offset": offset}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/jobs/{job_id}/sources/search")
 async def search_job_sources(
     job_id: str,
@@ -4987,75 +5252,272 @@ async def get_project_expert(
 # =============================================================================
 
 
+def _cookie_params(request: Request) -> tuple[bool, str]:
+    """Compute Secure and SameSite cookie flags from the request."""
+    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
+    _samesite: str = "none" if _secure else "lax"
+    return _secure, _samesite
+
+
+def _set_session_cookies(
+    response: Response, session_key: str, csrf_token: str,
+    secure: bool, samesite: str, max_age: int,
+) -> None:
+    """Set the httpOnly session cookie and the JS-readable CSRF cookie."""
+    response.set_cookie(
+        key="session", value=session_key, max_age=max_age,
+        httponly=True, secure=secure, samesite=samesite, path="/",
+    )
+    response.set_cookie(
+        key="csrf_token", value=csrf_token, max_age=max_age,
+        httponly=False, secure=secure, samesite=samesite, path="/",
+    )
+
+
+def _user_dict(user: dict) -> dict:
+    """Build the public user dict for API responses."""
+    return {
+        "id": str(user["id"]),
+        "display_name": user["display_name"],
+        "avatar_color": user["avatar_color"],
+        "email": user.get("email"),
+        "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
+        "is_admin": user.get("is_admin", False),
+        "created_at": user["created_at"],
+    }
+
+
+async def _create_gitea_repo_for_project(user: dict, project: dict) -> None:
+    """Create a Gitea jobs repo for a user's default project (best-effort)."""
+    try:
+        if gitea_client.is_initialized and project:
+            repo_name = f"project-{str(project['id'])[:8]}-jobs"
+            repo_url = await gitea_client.create_repo(repo_name)
+            if repo_url:
+                await postgres_db.add_project_repository(
+                    project_id=str(project["id"]),
+                    name=repo_name,
+                    repo_url=repo_url,
+                    role="jobs",
+                    is_managed=True,
+                )
+    except Exception as e:
+        logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
+
+
+def _generate_verification_code() -> str:
+    """Generate a 6-digit verification code."""
+    import secrets
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+@app.get("/api/auth/mode")
+async def auth_mode_endpoint() -> dict[str, str]:
+    """Return the current auth mode so the frontend knows which UI to show."""
+    return {"mode": get_auth_mode()}
+
+
 @app.post("/api/auth/login")
 async def auth_login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
-    """Email-based login. Finds or creates user, issues session cookie."""
+    """Login with email (dev mode) or email + password (production mode)."""
     email = body.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email is required")
 
-    # Find existing user by email
-    user = await postgres_db.get_user_by_email(email)
+    mode = get_auth_mode()
 
-    if not user:
-        # Create new user from email
-        display_name = email.split("@")[0].title()
-        user = await postgres_db.create_user(
-            display_name=display_name,
-            email=email,
-        )
-        logger.info(f"Created new user via login: {email}")
+    if mode == "dev":
+        # Dev mode: find or create user by email (no password)
+        user = await postgres_db.get_user_by_email(email)
+        if not user:
+            display_name = email.split("@")[0].title()
+            user, project = await postgres_db.create_user_with_default_project(
+                display_name=display_name, email=email,
+            )
+            logger.info(f"Created new user via dev login: {email}")
+            await _create_gitea_repo_for_project(user, project)
+    else:
+        # Production mode: require password
+        if not body.password:
+            raise HTTPException(status_code=400, detail="Password is required")
 
-    # Create session
+        user_auth = await postgres_db.get_user_by_email_with_auth(email)
+        if not user_auth:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        if not user_auth.get("email_verified"):
+            raise HTTPException(status_code=403, detail="Email not verified. Check your inbox.")
+
+        if not user_auth.get("password_hash") or not verify_password(body.password, user_auth["password_hash"]):
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user = user_auth
+
+    # Create session (shared between dev and production)
     session_key, csrf_token = await create_session(
-        postgres_db,
-        user_id=str(user["id"]),
-        user_email=email,
+        postgres_db, user_id=str(user["id"]), user_email=email,
     )
-
-    # Session timeout from env or default 24h
     session_timeout_hours = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
     max_age = session_timeout_hours * 3600
+    _secure, _samesite = _cookie_params(request)
+    _set_session_cookies(response, session_key, csrf_token, _secure, _samesite, max_age)
 
-    # Cross-origin cookies (cockpit on different subdomain) require
-    # SameSite=None + Secure=True.  For localhost dev (same origin),
-    # these settings still work fine over http://localhost.
-    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-    _samesite: str = "none" if _secure else "lax"
+    return {"user": _user_dict(user), "csrf_token": csrf_token, "message": "Login successful"}
 
-    # Set httpOnly session cookie
-    response.set_cookie(
-        key="session",
-        value=session_key,
-        max_age=max_age,
-        httponly=True,
-        secure=_secure,
-        samesite=_samesite,
-        path="/",
+
+@app.post("/api/auth/register")
+async def auth_register(body: RegisterRequest) -> dict[str, str]:
+    """Register a new account (production mode only).
+
+    Creates an unverified user and sends a verification email.
+    """
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    # Validate password strength
+    is_valid, error_msg = validate_password_strength(body.password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    # Check if email already exists
+    existing = await postgres_db.get_user_by_email(email)
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    # Create user with password (unverified)
+    pw_hash = hash_password(body.password)
+    user, project = await postgres_db.create_user_with_password(
+        display_name=body.display_name.strip(),
+        email=email,
+        password_hash=pw_hash,
+    )
+    await _create_gitea_repo_for_project(user, project)
+
+    # Generate and send verification code
+    code = _generate_verification_code()
+    await postgres_db.delete_auth_tokens_by_email(email, "verification")
+    await postgres_db.create_auth_token(
+        email=email, token=code, token_type="verification",
+        user_id=str(user["id"]),
     )
 
-    # Set CSRF token cookie (readable by JS for double-submit pattern)
-    response.set_cookie(
-        key="csrf_token",
-        value=csrf_token,
-        max_age=max_age,
-        httponly=False,
-        secure=_secure,
-        samesite=_samesite,
-        path="/",
+    sent = await email_service.send_verification_email(
+        to=email, code=code, display_name=body.display_name.strip(),
+    )
+    if not sent:
+        logger.warning(f"Failed to send verification email to {email}")
+
+    return {"message": "Verification email sent. Check your inbox."}
+
+
+@app.post("/api/auth/verify")
+async def auth_verify(body: VerifyEmailRequest) -> dict[str, str]:
+    """Verify an email address with a 6-digit code."""
+    email = body.email.strip().lower()
+    code = body.code.strip()
+
+    token = await postgres_db.get_auth_token(code, "verification")
+    if not token or token["email"].lower() != email:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    # Mark token used and verify user
+    await postgres_db.mark_auth_token_used(code)
+    if token.get("user_id"):
+        await postgres_db.set_email_verified(str(token["user_id"]))
+
+    return {"message": "Email verified successfully. You can now log in."}
+
+
+@app.post("/api/auth/resend-verification")
+async def auth_resend_verification(body: PasswordResetRequest) -> dict[str, str]:
+    """Resend verification code (rate-limited: 60s cooldown)."""
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    user = await postgres_db.get_user_by_email_with_auth(email)
+    if not user:
+        return {"message": "If that email is registered, a new code was sent."}
+
+    if user.get("email_verified"):
+        return {"message": "Email is already verified."}
+
+    # Rate limit: check if last token was created within 60 seconds
+    from datetime import datetime, timezone
+    last_time = await postgres_db.get_latest_auth_token_time(email, "verification")
+    if last_time:
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
+        if elapsed < 60:
+            raise HTTPException(status_code=429, detail="Please wait before requesting a new code")
+
+    code = _generate_verification_code()
+    await postgres_db.delete_auth_tokens_by_email(email, "verification")
+    await postgres_db.create_auth_token(
+        email=email, token=code, token_type="verification",
+        user_id=str(user["id"]),
+    )
+    await email_service.send_verification_email(
+        to=email, code=code, display_name=user["display_name"],
     )
 
-    return {
-        "user": {
-            "id": str(user["id"]),
-            "display_name": user["display_name"],
-            "avatar_color": user["avatar_color"],
-            "email": user.get("email"),
-            "created_at": user["created_at"],
-        },
-        "csrf_token": csrf_token,
-        "message": "Login successful",
-    }
+    return {"message": "If that email is registered, a new code was sent."}
+
+
+@app.post("/api/auth/forgot-password")
+async def auth_forgot_password(body: PasswordResetRequest) -> dict[str, str]:
+    """Request a password reset code. Always returns 200 (don't leak email existence)."""
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    user = await postgres_db.get_user_by_email_with_auth(email)
+
+    if user and user.get("email_verified"):
+        code = _generate_verification_code()
+        await postgres_db.delete_auth_tokens_by_email(email, "password_reset")
+        await postgres_db.create_auth_token(
+            email=email, token=code, token_type="password_reset",
+            user_id=str(user["id"]),
+        )
+        await email_service.send_password_reset_email(
+            to=email, code=code, display_name=user["display_name"],
+        )
+
+    return {"message": "If that email exists, a reset code was sent."}
+
+
+@app.post("/api/auth/reset-password")
+async def auth_reset_password(body: PasswordResetConfirm) -> dict[str, str]:
+    """Reset password using a verification code."""
+    if get_auth_mode() == "dev":
+        raise HTTPException(status_code=404, detail="Not found")
+
+    email = body.email.strip().lower()
+    code = body.code.strip()
+
+    # Validate password strength
+    is_valid, error_msg = validate_password_strength(body.new_password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    token = await postgres_db.get_auth_token(code, "password_reset")
+    if not token or token["email"].lower() != email:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+
+    # Set new password and invalidate all sessions
+    pw_hash = hash_password(body.new_password)
+    user_id = str(token["user_id"])
+    await postgres_db.set_user_password(user_id, pw_hash)
+    await postgres_db.mark_auth_token_used(code)
+    await postgres_db.delete_sessions_by_user(user_id)
+
+    return {"message": "Password updated. Please log in with your new password."}
 
 
 @app.post("/api/auth/logout")
@@ -5065,8 +5527,7 @@ async def auth_logout(request: Request, response: Response) -> dict[str, str]:
     if session_key:
         await delete_session(postgres_db, session_key)
 
-    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-    _samesite: str = "none" if _secure else "lax"
+    _secure, _samesite = _cookie_params(request)
     response.delete_cookie(key="session", path="/", httponly=True, secure=_secure, samesite=_samesite)
     response.delete_cookie(key="csrf_token", path="/", httponly=False, secure=_secure, samesite=_samesite)
     return {"message": "Logged out successfully"}
@@ -5092,28 +5553,107 @@ async def auth_me(request: Request, response: Response) -> dict[str, Any]:
     csrf_cookie = request.cookies.get("csrf_token")
     csrf_token = session_info.get("csrf_token")
     if csrf_token and not csrf_cookie:
-        _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-        _samesite: str = "none" if _secure else "lax"
+        _secure, _samesite = _cookie_params(request)
         expires_in = session_info.get("expires_in", 86400)
         response.set_cookie(
-            key="csrf_token",
-            value=csrf_token,
-            max_age=expires_in,
-            httponly=False,
-            secure=_secure,
-            samesite=_samesite,
-            path="/",
+            key="csrf_token", value=csrf_token, max_age=expires_in,
+            httponly=False, secure=_secure, samesite=_samesite, path="/",
         )
 
+    return {"user": _user_dict(user), "csrf_token": csrf_token}
+
+
+# =============================================================================
+# MCP Token Endpoints
+# =============================================================================
+
+_MCP_INTERNAL_KEY = os.environ.get("MCP_INTERNAL_KEY", "")
+
+
+@app.post("/api/mcp-tokens")
+async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, Any]:
+    """Generate a new MCP API token. Returns the plaintext token once."""
+    user = await get_current_user(request, postgres_db)
+
+    # Validate scope
+    scope = body.scope.strip()
+    if scope not in ("user", "all") and not scope.startswith("project:"):
+        raise HTTPException(status_code=400, detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'")
+    if scope == "all" and not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Only admins can create full-access tokens")
+    if scope.startswith("project:"):
+        project_id = scope.split(":", 1)[1]
+        members = await postgres_db.get_project_members(project_id)
+        if not any(str(m["user_id"]) == str(user["id"]) for m in members):
+            raise HTTPException(status_code=403, detail="Not a member of this project")
+
+    # Generate token
+    token = "srw_" + secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_prefix = token[:12]
+
+    # Expiration
+    expires_at = None
+    if body.expires_in_days:
+        from datetime import timedelta
+        expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
+
+    row = await postgres_db.create_mcp_token(
+        user_id=str(user["id"]),
+        name=body.name,
+        token_hash=token_hash,
+        token_prefix=token_prefix,
+        scope=scope,
+        expires_at=expires_at,
+    )
+
+    result = {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+    result["token"] = token  # Plaintext returned once only
+    return result
+
+
+@app.get("/api/mcp-tokens")
+async def list_mcp_tokens(request: Request) -> list[dict[str, Any]]:
+    """List the current user's MCP tokens (no plaintext or hashes)."""
+    user = await get_current_user(request, postgres_db)
+    rows = await postgres_db.list_mcp_tokens(str(user["id"]))
+    return [
+        {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in r.items()}
+        for r in rows
+    ]
+
+
+@app.delete("/api/mcp-tokens/{token_id}")
+async def revoke_mcp_token(request: Request, token_id: str) -> dict[str, str]:
+    """Revoke an MCP token (soft delete)."""
+    user = await get_current_user(request, postgres_db)
+    revoked = await postgres_db.revoke_mcp_token(token_id, str(user["id"]))
+    if not revoked:
+        raise HTTPException(status_code=404, detail="Token not found or already revoked")
+    return {"status": "revoked"}
+
+
+@app.post("/api/internal/mcp-token-verify")
+async def internal_mcp_token_verify(request: Request, body: McpTokenVerifyRequest) -> dict[str, Any]:
+    """Internal endpoint for MCP server to verify a token hash.
+
+    Protected by X-Internal-Key header (shared secret).
+    """
+    internal_key = request.headers.get("X-Internal-Key", "")
+    if not _MCP_INTERNAL_KEY or internal_key != _MCP_INTERNAL_KEY:
+        raise HTTPException(status_code=401, detail="Invalid internal key")
+
+    token_data = await postgres_db.get_mcp_token_by_hash(body.token_hash)
+    if not token_data:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # Update last used
+    await postgres_db.update_mcp_token_last_used(body.token_hash)
+
     return {
-        "user": {
-            "id": str(user["id"]),
-            "display_name": user["display_name"],
-            "avatar_color": user["avatar_color"],
-            "email": user.get("email"),
-            "created_at": user["created_at"],
-        },
-        "csrf_token": csrf_token,
+        "user_id": str(token_data["user_id"]),
+        "scope": token_data["scope"],
+        "display_name": token_data["display_name"],
     }
 
 
@@ -5123,8 +5663,9 @@ async def auth_me(request: Request, response: Response) -> dict[str, Any]:
 
 
 @app.get("/api/users")
-async def list_users() -> list[dict[str, Any]]:
-    """List all users."""
+async def list_users(request: Request) -> list[dict[str, Any]]:
+    """List all users (requires authentication)."""
+    await get_current_user(request, postgres_db)
     try:
         return await postgres_db.list_users()
     except Exception as e:
@@ -5132,8 +5673,9 @@ async def list_users() -> list[dict[str, Any]]:
 
 
 @app.get("/api/users/{user_id}")
-async def get_user(user_id: str) -> dict[str, Any]:
-    """Get a single user by ID."""
+async def get_user(user_id: str, request: Request) -> dict[str, Any]:
+    """Get a single user by ID (requires authentication)."""
+    await get_current_user(request, postgres_db)
     user = await postgres_db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -5141,44 +5683,25 @@ async def get_user(user_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/users")
-async def create_user(body: UserCreate) -> dict[str, Any]:
-    """Create a new user with a default project."""
+async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
+    """Create a new user with a default project (requires authentication)."""
+    await get_current_user(request, postgres_db)
     try:
-        user = await postgres_db.create_user(
+        user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
-            avatar_color=body.avatar_color,
+            avatar_color=body.avatar_color or "#89b4fa",
             email=body.email,
         )
-
-        # Create default project for the new user
-        try:
-            project = await postgres_db.create_default_project_for_user(
-                str(user["id"]), body.display_name
-            )
-            # Create Gitea jobs repo for the project
-            if gitea_client.is_initialized and project:
-                repo_name = f"project-{str(project['id'])[:8]}-jobs"
-                repo_url = await gitea_client.create_repo(repo_name)
-                if repo_url:
-                    await postgres_db.add_project_repository(
-                        project_id=str(project["id"]),
-                        name=repo_name,
-                        repo_url=repo_url,
-                        role="jobs",
-                        is_managed=True,
-                    )
-        except Exception as e:
-            logger.warning(f"Failed to create default project for user {user['id']}: {e}")
-
-        # Re-fetch user to include default_project_id
-        return await postgres_db.get_user(str(user["id"])) or user
+        await _create_gitea_repo_for_project(user, project)
+        return user
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.put("/api/users/{user_id}")
-async def update_user(user_id: str, body: UserUpdate) -> dict[str, str]:
-    """Update a user."""
+async def update_user(user_id: str, body: UserUpdate, request: Request) -> dict[str, str]:
+    """Update a user (requires authentication)."""
+    await get_current_user(request, postgres_db)
     success = await postgres_db.update_user(
         user_id=user_id,
         display_name=body.display_name,
@@ -5191,8 +5714,9 @@ async def update_user(user_id: str, body: UserUpdate) -> dict[str, str]:
 
 
 @app.delete("/api/users/{user_id}")
-async def delete_user(user_id: str) -> dict[str, str]:
-    """Delete a user."""
+async def delete_user(user_id: str, request: Request) -> dict[str, str]:
+    """Delete a user (requires authentication)."""
+    await get_current_user(request, postgres_db)
     success = await postgres_db.delete_user(user_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -5307,7 +5831,6 @@ async def delete_project(project_id: str) -> dict[str, str]:
     async with postgres_db.acquire() as conn:
         await conn.execute("UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val)
         await conn.execute("UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val)
-        await conn.execute("UPDATE users SET default_project_id = NULL WHERE default_project_id = $1", uuid_val)
 
     success = await postgres_db.delete_project(project_id)
     if not success:
@@ -6129,6 +6652,18 @@ async def get_builder_session(session_id: str) -> dict[str, Any]:
     return session
 
 
+# Tools whose results are displayed as rich inspection panels in the frontend
+_INSPECTION_TOOLS = {
+    "list_jobs", "get_job", "get_job_progress", "get_workspace_file",
+    "get_workspace_overview", "get_frozen_job", "get_todos", "get_chat_history",
+}
+
+
+def _format_tool_name(name: str) -> str:
+    """Format a tool name for display: 'list_jobs' → 'List Jobs'."""
+    return name.replace("_", " ").title()
+
+
 def _build_workspace_proposal(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Build a workspace edit proposal for the frontend, or return an error.
 
@@ -6212,7 +6747,9 @@ async def send_builder_message(
 
     # Build context
     messages = await postgres_db.get_builder_messages(session_id)
+    raw_model_for_prompt = body.model or get_builder_model()
     system_prompt = build_system_prompt(
+        model=raw_model_for_prompt,
         instructions_content=body.instructions,
         config_settings=body.config,
         description=body.description,
@@ -6236,27 +6773,32 @@ async def send_builder_message(
         loop_messages = list(context_messages)
         final_text = ""
         final_tool_calls = []
+        final_steps = []
 
         try:
-            model = body.model or get_builder_model()
-            provider = _detect_provider(model)
-            api_key = _get_api_key_for_provider(provider)
-            use_responses_api = model in RESPONSES_API_MODELS
+            raw_model = body.model or get_builder_model()
+            provider = _detect_provider(raw_model)
+            model_name, base_url, resolved_key = _resolve_builder_model(raw_model)
+            api_key = resolved_key or _get_api_key_for_provider(provider)
+            use_responses_api = raw_model in RESPONSES_API_MODELS
+            builder_settings = resolve_builder_settings(raw_model)
 
             for iteration in range(MAX_ITERATIONS):
-                yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': 'Analyzing request...' if iteration == 0 else 'Processing tool results...'})}\n\n"
+                step_title = 'Analyzing request...' if iteration == 0 else 'Processing tool results...'
+                yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': step_title})}\n\n"
+                final_steps.append({"type": "thought", "title": step_title})
                 turn_text = ""
                 turn_tool_calls = []  # {"name", "args", "id"} dicts
                 error_occurred = False
 
                 # Select streaming function based on provider and API type
                 if provider == "anthropic":
-                    stream_fn = _stream_anthropic(system_prompt, loop_messages, model, api_key)
+                    stream_fn = _stream_anthropic(system_prompt, loop_messages, model_name, api_key, settings=builder_settings)
                 elif use_responses_api:
                     input_items = _chat_messages_to_responses_input(loop_messages)
-                    stream_fn = _stream_openai_responses(system_prompt, input_items, model, api_key)
+                    stream_fn = _stream_openai_responses(system_prompt, input_items, model_name, api_key, base_url=base_url, settings=builder_settings)
                 else:
-                    stream_fn = _stream_openai(system_prompt, loop_messages, model, api_key)
+                    stream_fn = _stream_openai(system_prompt, loop_messages, model_name, api_key, base_url=base_url, settings=builder_settings)
 
                 async for evt_type, evt_data in stream_fn:
                     if evt_type == "token":
@@ -6266,13 +6808,22 @@ async def send_builder_message(
                         turn_tool_calls.append(evt_data)
                         if evt_data["name"] in SERVER_SIDE_TOOLS:
                             yield f"event: tool_executing\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
+                            tool_display = _format_tool_name(evt_data["name"])
+                            if evt_data["name"] == "web_search":
+                                step_title = f"Searching: {evt_data['args'].get('query', tool_display)}"
+                            else:
+                                step_title = f"Running: {tool_display}"
+                            final_steps.append({"type": "tool_call", "title": step_title, "content": json.dumps(evt_data['args'])})
                         elif evt_data["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(evt_data["name"], evt_data["args"])
                             if not proposal.get("error"):
                                 yield f"event: workspace_proposal\ndata: {json.dumps(proposal)}\n\n"
+                                ws_label = "Write" if evt_data["name"] == "write_workspace_file" else "Edit"
+                                final_steps.append({"type": "workspace_proposal", "title": f"{ws_label}: {evt_data['args'].get('path', 'file')}", "content": ""})
                         else:
                             yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
                             final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
+                            final_steps.append({"type": "tool_call", "title": _format_tool_name(evt_data["name"]), "content": json.dumps(evt_data['args'])})
                     elif evt_type == "error":
                         yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
                         error_occurred = True
@@ -6310,6 +6861,11 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
+                            formatted = _format_tool_name(tc["name"])
+                            if full_content and tc["name"] in _INSPECTION_TOOLS:
+                                final_steps.append({"type": "inspection_result", "title": formatted, "content": full_content})
+                            else:
+                                final_steps.append({"type": "tool_result", "title": f"Result: {formatted}", "content": ""})
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -6346,6 +6902,11 @@ async def send_builder_message(
                             if full_content is not None:
                                 evt_data_oai["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
+                            formatted = _format_tool_name(tc["name"])
+                            if full_content and tc["name"] in _INSPECTION_TOOLS:
+                                final_steps.append({"type": "inspection_result", "title": formatted, "content": full_content})
+                            else:
+                                final_steps.append({"type": "tool_result", "title": f"Result: {formatted}", "content": ""})
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -6366,6 +6927,7 @@ async def send_builder_message(
                 role="assistant",
                 content=final_text if final_text else None,
                 tool_calls=final_tool_calls if final_tool_calls else None,
+                steps=final_steps if final_steps else None,
             )
 
             # Handle auto-summarization if needed
@@ -6415,21 +6977,35 @@ def _detect_provider(model: str) -> str:
 
 
 def _get_api_key_for_provider(provider: str) -> str | None:
-    """Get API key for the given provider.
+    """Get API key for the given provider via the KeyRing system.
 
-    Checks provider-specific BUILDER key first, then falls back to the
-    standard provider key.  BUILDER_API_KEY (without provider suffix) is
-    only used when there is no provider-specific override.
+    Routes through get_builder_api_key() which handles comma-separated keys
+    and KeyRing-based rotation.
     """
-    if provider == "anthropic":
-        return (
-            os.getenv("BUILDER_ANTHROPIC_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
-        )
-    return (
-        os.getenv("BUILDER_OPENAI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-    )
+    return get_builder_api_key(provider)
+
+
+def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]:
+    """Resolve a prefixed model ID into (model_name, base_url, api_key).
+
+    Handles model routing for different providers:
+    - ``openrouter/`` prefix → OpenRouter API
+    - ``openai/`` prefix → local vLLM at BUILDER_BASE_URL / OPENAI_BASE_URL / LLM_BASE_URL
+    - ``claude-`` prefix → Anthropic (base_url/api_key left to Anthropic client)
+    - No prefix → default OpenAI provider
+    """
+    if raw_model.startswith("openrouter/"):
+        model_name = raw_model[len("openrouter/"):]
+        base_url = "https://openrouter.ai/api/v1"
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        return model_name, base_url, api_key
+    if raw_model.startswith("openai/"):
+        model_name = raw_model[len("openai/"):]
+        base_url = os.getenv("BUILDER_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
+        api_key = get_builder_api_key("openai")
+        return model_name, base_url, api_key
+    # No prefix — use existing defaults
+    return raw_model, get_builder_base_url(), None
 
 
 def _chat_messages_to_responses_input(
@@ -6483,6 +7059,8 @@ async def _stream_openai_responses(
     model: str,
     api_key: str | None = None,
     _retried: bool = False,
+    base_url: str | None = None,
+    settings: dict[str, Any] | None = None,
 ):
     """Stream from OpenAI Responses API, yielding structured events.
 
@@ -6501,8 +7079,8 @@ async def _stream_openai_responses(
         return
 
     client = AsyncOpenAI(
-        api_key=api_key or get_builder_api_key(),
-        base_url=get_builder_base_url(),
+        api_key=api_key or get_builder_api_key("openai"),
+        base_url=base_url or get_builder_base_url(),
     )
 
     # Convert BUILDER_TOOLS to Responses API function tool format
@@ -6517,14 +7095,26 @@ async def _stream_openai_responses(
         })
 
     try:
-        stream = await client.responses.create(
+        create_kwargs: dict[str, Any] = dict(
             model=model,
             instructions=system_prompt,
             input=input_items,
             tools=response_tools,
-            reasoning={"effort": "high"},
             stream=True,
         )
+        # Apply inference params from settings matrix
+        if settings:
+            reasoning_effort = settings.get("reasoning_effort")
+            if reasoning_effort:
+                create_kwargs["reasoning"] = {"effort": reasoning_effort}
+            if settings.get("temperature") is not None:
+                create_kwargs["temperature"] = settings["temperature"]
+            if settings.get("top_p") is not None:
+                create_kwargs["top_p"] = settings["top_p"]
+            if settings.get("max_tokens") is not None:
+                create_kwargs["max_tokens"] = settings["max_tokens"]
+
+        stream = await client.responses.create(**create_kwargs)
 
         # Track function call assembly
         function_calls: dict[str, dict] = {}  # call_id -> {name, arguments}
@@ -6572,11 +7162,11 @@ async def _stream_openai_responses(
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e))
+            new_key = rotate_builder_key(str(e), provider="openai")
             if new_key:
                 logger.info("Builder: retrying OpenAI Responses API with rotated key")
                 async for event in _stream_openai_responses(
-                    system_prompt, input_items, model, api_key=new_key, _retried=True
+                    system_prompt, input_items, model, api_key=new_key, _retried=True, base_url=base_url, settings=settings
                 ):
                     yield event
                 return
@@ -6589,6 +7179,8 @@ async def _stream_openai(
     model: str,
     api_key: str | None = None,
     _retried: bool = False,
+    base_url: str | None = None,
+    settings: dict[str, Any] | None = None,
 ):
     """Stream from OpenAI Chat Completions API, yielding structured events.
 
@@ -6604,20 +7196,38 @@ async def _stream_openai(
         return
 
     client = AsyncOpenAI(
-        api_key=api_key or get_builder_api_key(),
-        base_url=get_builder_base_url(),
+        api_key=api_key or get_builder_api_key("openai"),
+        base_url=base_url or get_builder_base_url(),
     )
 
     llm_messages = [{"role": "system", "content": system_prompt}]
     llm_messages.extend(context_messages)
 
     try:
-        stream = await client.chat.completions.create(
+        create_kwargs: dict[str, Any] = dict(
             model=model,
             messages=llm_messages,
             tools=BUILDER_TOOLS,
             stream=True,
         )
+        # Apply inference params from settings matrix
+        if settings:
+            if settings.get("temperature") is not None:
+                create_kwargs["temperature"] = settings["temperature"]
+            if settings.get("top_p") is not None:
+                create_kwargs["top_p"] = settings["top_p"]
+            if settings.get("max_tokens") is not None:
+                create_kwargs["max_tokens"] = settings["max_tokens"]
+            # Provider-specific params via extra_body (top_k, min_p, etc.)
+            extra_body: dict[str, Any] = {}
+            if settings.get("top_k") is not None:
+                extra_body["top_k"] = settings["top_k"]
+            if settings.get("min_p") is not None:
+                extra_body["min_p"] = settings["min_p"]
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+
+        stream = await client.chat.completions.create(**create_kwargs)
 
         # Track tool call assembly across chunks
         tool_call_buffers: dict[int, dict] = {}
@@ -6654,11 +7264,11 @@ async def _stream_openai(
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e))
+            new_key = rotate_builder_key(str(e), provider="openai")
             if new_key:
                 logger.info("Builder: retrying OpenAI Chat API with rotated key")
                 async for event in _stream_openai(
-                    system_prompt, context_messages, model, api_key=new_key, _retried=True
+                    system_prompt, context_messages, model, api_key=new_key, _retried=True, base_url=base_url, settings=settings
                 ):
                     yield event
                 return
@@ -6671,6 +7281,7 @@ async def _stream_anthropic(
     model: str,
     api_key: str | None = None,
     _retried: bool = False,
+    settings: dict[str, Any] | None = None,
 ):
     """Stream from Anthropic API, yielding structured events.
 
@@ -6685,7 +7296,7 @@ async def _stream_anthropic(
         yield ("error", {"message": "anthropic package not installed"})
         return
 
-    client = AsyncAnthropic(api_key=api_key or get_builder_api_key())
+    client = AsyncAnthropic(api_key=api_key or get_builder_api_key("anthropic"))
 
     # Convert OpenAI tool format to Anthropic format
     anthropic_tools = []
@@ -6708,13 +7319,19 @@ async def _stream_anthropic(
         full_system += "\n\n" + extra_system
 
     try:
-        async with client.messages.stream(
+        stream_kwargs: dict[str, Any] = dict(
             model=model,
             system=full_system,
             messages=filtered_messages,
             tools=anthropic_tools,
-            max_tokens=4096,
-        ) as stream:
+            max_tokens=(settings or {}).get("max_tokens", 4096),
+        )
+        if (settings or {}).get("temperature") is not None:
+            stream_kwargs["temperature"] = settings["temperature"]
+        if (settings or {}).get("top_p") is not None:
+            stream_kwargs["top_p"] = settings["top_p"]
+
+        async with client.messages.stream(**stream_kwargs) as stream:
             current_tool_id = ""
             current_tool_name = ""
             current_tool_args = ""
@@ -6744,11 +7361,11 @@ async def _stream_anthropic(
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
-            new_key = rotate_builder_key(str(e))
+            new_key = rotate_builder_key(str(e), provider="anthropic")
             if new_key:
                 logger.info("Builder: retrying Anthropic API with rotated key")
                 async for event in _stream_anthropic(
-                    system_prompt, context_messages, model, api_key=new_key, _retried=True
+                    system_prompt, context_messages, model, api_key=new_key, _retried=True, settings=settings
                 ):
                     yield event
                 return
@@ -6772,33 +7389,37 @@ async def _summarize_builder_session(
     to_summarize = messages[:-4]
     summary_prompt = build_summarization_prompt(to_summarize)
 
-    provider = get_builder_provider()
-    model = get_builder_model()
+    raw_model = get_builder_model()
+    provider = _detect_provider(raw_model)
+    model_name, base_url, resolved_key = _resolve_builder_model(raw_model)
+    builder_settings = resolve_builder_settings(raw_model)
+    max_summary_tokens = builder_settings.get("max_summary_tokens", 1024)
 
     summary_text = ""
 
     if provider == "anthropic":
+        api_key = resolved_key or get_builder_api_key(provider)
         try:
             from anthropic import AsyncAnthropic
-            client = AsyncAnthropic(api_key=get_builder_api_key())
+            client = AsyncAnthropic(api_key=api_key)
             response = await client.messages.create(
-                model=model,
+                model=model_name,
                 system=summary_prompt[0]["content"],
                 messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
-                max_tokens=1024,
+                max_tokens=max_summary_tokens,
             )
             summary_text = response.content[0].text
         except Exception as e:
             if is_auth_or_quota_error(e):
-                new_key = rotate_builder_key(str(e))
+                new_key = rotate_builder_key(str(e), provider=provider)
                 if new_key:
                     try:
                         client = AsyncAnthropic(api_key=new_key)
                         response = await client.messages.create(
-                            model=model,
+                            model=model_name,
                             system=summary_prompt[0]["content"],
                             messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
-                            max_tokens=1024,
+                            max_tokens=max_summary_tokens,
                         )
                         summary_text = response.content[0].text
                     except Exception as e2:
@@ -6811,31 +7432,32 @@ async def _summarize_builder_session(
                 logger.warning(f"Anthropic summarization failed: {e}")
                 return
     else:
+        api_key = resolved_key or get_builder_api_key(provider)
         try:
             from openai import AsyncOpenAI
             client = AsyncOpenAI(
-                api_key=get_builder_api_key(),
-                base_url=get_builder_base_url(),
+                api_key=api_key,
+                base_url=base_url or get_builder_base_url(),
             )
             response = await client.chat.completions.create(
-                model=model,
+                model=model_name,
                 messages=summary_prompt,
-                max_tokens=1024,
+                max_tokens=max_summary_tokens,
             )
             summary_text = response.choices[0].message.content or ""
         except Exception as e:
             if is_auth_or_quota_error(e):
-                new_key = rotate_builder_key(str(e))
+                new_key = rotate_builder_key(str(e), provider=provider)
                 if new_key:
                     try:
                         client = AsyncOpenAI(
                             api_key=new_key,
-                            base_url=get_builder_base_url(),
+                            base_url=base_url or get_builder_base_url(),
                         )
                         response = await client.chat.completions.create(
-                            model=model,
+                            model=model_name,
                             messages=summary_prompt,
-                            max_tokens=1024,
+                            max_tokens=max_summary_tokens,
                         )
                         summary_text = response.choices[0].message.content or ""
                     except Exception as e2:

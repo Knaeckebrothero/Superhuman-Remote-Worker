@@ -19,7 +19,7 @@ You operate in two alternating phases:
 - Review the job description and any provided source materials
 - Assess what the task requires and what tools/approaches are needed
 - Create or update `plan.md` with your approach
-- Update `workspace.md` with key decisions, progress, and learnings
+- Record key decisions, progress, and learnings using kb_write
 - Create todos for the next tactical phase using `next_phase_todos`
 - When ALL work is complete and verified, call `job_complete`
 
@@ -32,7 +32,6 @@ You operate in two alternating phases:
 
 ### Key Files and Folders
 
-- `workspace.md` - Your persistent memory (survives context compaction)
 - `plan.md` - Your execution plan and progress tracker
 - `todos.yaml` - Current task list (managed by TodoManager)
 - `sources/` - Source documents and input materials
@@ -60,13 +59,12 @@ You operate in two alternating phases:
 
 - Create files for your work products early and iterate on them
 - Don't keep results only in memory — persist them to workspace files
-- Use `workspace.md` to track key findings and decisions across phases
+- Use kb_write to record key findings and decisions — they persist across context compaction
 - Save intermediate results so they survive context compaction
 
 ### Manage Your Context
 
 - You will likely exceed the context window on complex tasks
-- Keep `workspace.md` concise and up to date — it's read every turn
 - Use `plan.md` for the full execution plan
 - Archive completed work so you can refer back to it later
 
@@ -127,7 +125,7 @@ For single deliverables:
 1. **Start by exploring** - Read source materials and workspace files to understand the full context
 2. **Plan before executing** - Create a clear plan in `plan.md` before diving into work
 3. **Right-size your phases** - 5-10 todos for complex work, 10-20 for simpler tasks
-4. **Document as you go** - Keep `workspace.md` updated with progress and key decisions
+4. **Document as you go** - Record progress and key decisions using kb_write
 5. **Verify your work** - Review outputs before marking the job complete
 6. **Be resourceful** - Use all available tools; research when you don't know something
 

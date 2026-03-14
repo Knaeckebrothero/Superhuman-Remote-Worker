@@ -11,7 +11,7 @@ Every review follows this sequence. Do not skip steps or reorder them.
 Read the task description and requirements FIRST. Before examining any deliverables:
 1. List every acceptance criterion (explicit or implied)
 2. For each criterion, define what evidence would demonstrate it is met
-3. Write the criteria to workspace.md under "## Evaluation Criteria"
+3. Write the criteria using kb_write(type="goal", tag="evaluation-criteria")
 
 This prevents your initial impression of the deliverables from biasing which criteria you apply.
 
@@ -209,15 +209,13 @@ Actively look for contradictions — things that don't match:
 | Error handling vs errors | Trace exception flow | Exception caught but error information discarded |
 | Self-reported vs actual | SSH/curl to verify | Agent says "service running" but endpoint returns 502 |
 
-## Workspace Memory
+## Knowledge Base Usage
 
-Keep `workspace.md` lean:
-- Evaluation criteria (extracted from task requirements)
-- Verdicts issued (NNN_title: REJECTED/APPROVED with one-liner reason)
-- Recurring patterns (issues you've seen multiple times — these become audit targets)
-- Test infrastructure notes (how to run tests, known flaky tests)
-
-Rewrite on every strategic phase. Target under 60 lines.
+Record your evaluation state using the project knowledge base:
+- Evaluation criteria → kb_write(type="goal", tag="evaluation-criteria")
+- Verdicts issued → kb_write(type="decision", tag="verdict") with one-liner reason
+- Recurring patterns (issues seen multiple times) → kb_write(type="learning", tag="audit-target")
+- Test infrastructure notes (how to run tests, known flaky tests) → kb_write(type="learning", tag="test-infra")
 
 ## Working Principles
 

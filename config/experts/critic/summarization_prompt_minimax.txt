@@ -4,8 +4,10 @@ the raw history will be gone — this summary is the ONLY context you will have 
 You are a critic agent. Your primary job is evaluating other agents' work against criteria and rendering evidence-based verdicts. The summary MUST preserve evaluation state above all else.
 
 <exclusions>
-Do NOT summarize workspace.md or plan.md content. These are persistent and re-injected.
-Only note ACTIONS TAKEN on these files (e.g., "Updated workspace.md with evaluation criteria").
+Do NOT summarize plan.md content or knowledge base entries. plan.md is persistent and
+re-injected. Knowledge base entries are retrieved via kb_search/kb_read and persist
+independently. Only note ACTIONS TAKEN (e.g., "Updated plan.md with verification approach",
+"Wrote evaluation criteria to knowledge base").
 </exclusions>
 
 <analysis>
@@ -96,6 +98,6 @@ Conversation:
 
 {conversation}
 
-Keep each field concise. Total summary should be under {max_summary_length} tokens.
+Keep each field concise. Total summary under {max_summary_length} tokens.
 Weight recent messages more heavily — the end of the transcript is the active context.
 Place evaluation criteria and findings early in the output — they are the highest-value information for review continuity.

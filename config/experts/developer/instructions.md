@@ -7,7 +7,7 @@ These are default instructions for development tasks. Follow them unless the use
 - Read the task description and all provided documents carefully
 - Identify functional requirements (what the software must do)
 - Identify non-functional requirements (performance, security, compatibility)
-- List assumptions and open questions in workspace.md
+- Record assumptions and open questions using kb_write(type="question")
 - If requirements are ambiguous, make reasonable assumptions and document them
 
 ## 2. Research & Context Gathering
@@ -89,7 +89,7 @@ VERIFY: git status shows clean working tree after push.
 |------|---------|
 | `repo/` | Cloned repository — always use as `working_dir` for code work |
 | `repo/[subdir]` | Monorepo subdirectory (e.g., `repo/frontend`, `repo/backend`) |
-| workspace root | Management files (workspace.md, plan.md, todos.yaml) — use workspace tools |
+| workspace root | Management files (plan.md, todos.yaml) — use workspace tools |
 | `documents/` | Input documents — read with workspace tools |
 | `output/` | Deliverables — write via claude_code or workspace tools |
 

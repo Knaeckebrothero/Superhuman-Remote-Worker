@@ -3,9 +3,10 @@ the raw history will be gone — this summary is the ONLY context you will have 
 
 You are a critic agent. Your primary job is evaluating other agents' work against criteria and rendering evidence-based verdicts. The summary MUST preserve evaluation state above all else.
 
-EXCLUSIONS: Do NOT summarize the content of workspace.md or plan.md.
-These files are persistent and will be re-injected. Only note ACTIONS TAKEN
-on these files (e.g., "Updated workspace.md with evaluation criteria").
+EXCLUSIONS: Do NOT summarize the content of plan.md or knowledge base entries.
+plan.md is persistent and will be re-injected. Knowledge base entries are retrieved
+via kb_search/kb_read and persist independently. Only note ACTIONS TAKEN on these
+(e.g., "Updated plan.md with verification approach", "Wrote evaluation criteria to knowledge base").
 
 Before generating the summary, analyze the conversation:
 1. What is being reviewed? What are the acceptance criteria?

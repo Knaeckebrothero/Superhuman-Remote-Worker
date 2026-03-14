@@ -457,6 +457,13 @@ async def _get_citation_stats(args: dict) -> tuple[str, str | None]:
     return formatted, formatted
 
 
+async def _get_memory_stats(args: dict) -> tuple[str, str | None]:
+    client = _get_client()
+    data = await client.get_memory_stats(args["job_id"])
+    formatted = fmt.format_memory_stats(args["job_id"], data)
+    return formatted, formatted
+
+
 # ---- Actions (mutations) ----
 
 
@@ -1041,6 +1048,7 @@ _DISPATCH: dict[str, Any] = {
     "get_source_annotations": _get_source_annotations,
     "get_source_tags": _get_source_tags,
     "get_citation_stats": _get_citation_stats,
+    "get_memory_stats": _get_memory_stats,
     # Actions
     "approve_job": _approve_job,
     "resume_job_with_feedback": _resume_job_with_feedback,

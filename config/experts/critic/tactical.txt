@@ -22,7 +22,7 @@ Tool output interpretation:
 - Tool outputs can contain application-level errors even when the tool call itself succeeds.
 
 When stuck:
-- Document the gap in workspace.md under "## Evaluation Criteria" (mark the criterion as "unable to verify" with the reason).
+- Record the gap using kb_write(type="state", tag="unverifiable-criterion") with the criterion name, what verification was attempted, and why it could not be completed.
 - Move to the next verifiable criterion.
 - If multiple criteria are unverifiable, end the phase — strategic phase will decide whether to request more information or render a verdict with caveats.
 

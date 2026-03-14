@@ -404,6 +404,25 @@ class AsyncCockpitClient:
             "COCKPIT_API_URL", "http://localhost:8085"
         )
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
+        self._scope_headers: dict[str, str] = {}
+        self._internal_key = os.environ.get("MCP_INTERNAL_KEY", "")
+
+    def set_scope_headers(self, user_id: str, scope: str) -> None:
+        """Set per-request scope headers from authenticated MCP token.
+
+        Updates the httpx client's default headers so all subsequent
+        requests include the scope context without modifying each call site.
+        """
+        self._client.headers["X-MCP-User-Id"] = user_id
+        self._client.headers["X-MCP-Scope"] = scope
+        if self._internal_key:
+            self._client.headers["X-Internal-Key"] = self._internal_key
+
+    def clear_scope_headers(self) -> None:
+        """Remove scope headers (unauthenticated or stdio mode)."""
+        self._client.headers.pop("X-MCP-User-Id", None)
+        self._client.headers.pop("X-MCP-Scope", None)
+        self._client.headers.pop("X-Internal-Key", None)
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -1404,6 +1423,20 @@ class AsyncCockpitClient:
             Stats with source/citation counts by type, status, confidence, method
         """
         resp = await self._client.get(f"/api/jobs/{job_id}/citations/stats")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def get_memory_stats(self, job_id: str) -> dict[str, Any]:
+        """Get memory statistics for a job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            Stats with counts by type, source, tokens, accesses, avg importance
+        """
+        resp = await self._client.get(f"/api/jobs/{job_id}/memory/stats")
         resp.raise_for_status()
         return resp.json()
 

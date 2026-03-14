@@ -255,6 +255,66 @@ import { environment } from '../../../core/environment';
                 <span class="field-hint">{{ autonomyDescription() }}</span>
               </div>
 
+              <!-- Project Memory Opt-out -->
+              @if (projectHasSharedMemory()) {
+                <div class="form-group">
+                  <label class="memory-toggle">
+                    <input
+                      type="checkbox"
+                      [checked]="useProjectMemory()"
+                      (change)="onUseProjectMemoryChange($event)"
+                      [disabled]="isSubmitting()"
+                    />
+                    <span>Use project memory</span>
+                  </label>
+                  <span class="field-hint">
+                    When enabled, this job shares memories with other jobs in the project.
+                    Uncheck to isolate this job's memories.
+                  </span>
+                </div>
+              }
+
+              <!-- Subjob Toggles (Scholar & Critic) -->
+              <div class="form-group">
+                <label class="form-label">Subjobs</label>
+                <label class="memory-toggle">
+                  <input
+                    type="checkbox"
+                    [checked]="enableScholar()"
+                    (change)="onEnableScholarChange($event)"
+                    [disabled]="isSubmitting()"
+                  />
+                  <span>Scholar (research phase)</span>
+                </label>
+                <span class="field-hint">
+                  Spawns a research job before the main job starts to gather information
+                </span>
+                <label class="memory-toggle" style="margin-top: 8px;">
+                  <input
+                    type="checkbox"
+                    [checked]="enableCritic()"
+                    (change)="onEnableCriticChange($event)"
+                    [disabled]="isSubmitting()"
+                  />
+                  <span>Critic (verification phase)</span>
+                </label>
+                @if (enableCritic()) {
+                  <div class="subjob-detail">
+                    <label class="form-label compact-label">Feedback rounds</label>
+                    <select class="form-input compact-select"
+                      [ngModel]="criticMaxRounds()" (ngModelChange)="criticMaxRounds.set($event)"
+                      name="criticMaxRounds" [disabled]="isSubmitting()">
+                      @for (opt of criticRoundOptions; track opt.value) {
+                        <option [ngValue]="opt.value">{{ opt.label }}</option>
+                      }
+                    </select>
+                  </div>
+                }
+                <span class="field-hint">
+                  Spawns a reviewer job after completion to verify deliverables
+                </span>
+              </div>
+
               <!-- Model Preset -->
               @if (availablePresets.length > 0) {
                 <div class="form-group">
@@ -875,6 +935,40 @@ import { environment } from '../../../core/environment';
       .multimodal-toggle input[type="checkbox"] {
         margin: 0;
         accent-color: var(--accent-color, #cba6f7);
+      }
+
+      .memory-toggle {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--text, #cdd6f4);
+        cursor: pointer;
+      }
+
+      .memory-toggle input[type="checkbox"] {
+        margin: 0;
+        accent-color: var(--accent-color, #cba6f7);
+      }
+
+      .subjob-detail {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        margin-left: 24px;
+      }
+
+      .compact-label {
+        margin-bottom: 0 !important;
+        white-space: nowrap;
+      }
+
+      .compact-select {
+        width: auto;
+        min-width: 140px;
+        padding: 6px 28px 6px 10px !important;
+        font-size: 12px;
       }
 
       /* Select dropdown */
@@ -1572,6 +1666,20 @@ export class JobCreateComponent implements OnInit {
   ];
 
   readonly selectedAutonomy = signal<string | null>(null);
+  readonly useProjectMemory = signal(true);
+  readonly enableScholar = signal(true);
+  readonly enableCritic = signal(true);
+  readonly criticMaxRounds = signal<number>(5);
+  readonly projectHasSharedMemory = computed(() => {
+    const pid = this.selectedProjectId();
+    if (!pid) return false;
+    const proj = this.projects().find((p) => p.id === pid);
+    if (!proj) return false;
+    // Project-scoped memory is on by default (defaults.yaml), so treat absent as true
+    const override = proj.default_config_override as Record<string, any> | null;
+    const val = override?.['memory']?.['project_scoped'];
+    return val !== false;
+  });
 
   readonly autonomyLevels = [
     { value: 'full', label: 'Full', description: 'Never freezes, runs to completion autonomously' },
@@ -1591,6 +1699,15 @@ export class JobCreateComponent implements OnInit {
   // Model list for combo-box (loaded from env.js at runtime)
   readonly availableModels = environment.models;
   readonly availablePresets = environment.modelPresets;
+
+  // Critic feedback round options
+  readonly criticRoundOptions = [
+    { value: 1, label: '1 round' },
+    { value: 3, label: '3 rounds' },
+    { value: 5, label: '5 rounds (default)' },
+    { value: 10, label: '10 rounds' },
+    { value: 0, label: 'Unlimited' },
+  ];
 
   // Tool category metadata for toggles
   readonly toolCategories = [
@@ -1822,6 +1939,18 @@ export class JobCreateComponent implements OnInit {
     });
   }
 
+  onUseProjectMemoryChange(event: Event): void {
+    this.useProjectMemory.set((event.target as HTMLInputElement).checked);
+  }
+
+  onEnableScholarChange(event: Event): void {
+    this.enableScholar.set((event.target as HTMLInputElement).checked);
+  }
+
+  onEnableCriticChange(event: Event): void {
+    this.enableCritic.set((event.target as HTMLInputElement).checked);
+  }
+
   /** Build config_override by diffing form values against expert defaults. */
   private buildConfigOverride(): Record<string, unknown> | undefined {
     const override: Record<string, unknown> = {};
@@ -1883,6 +2012,27 @@ export class JobCreateComponent implements OnInit {
       override['autonomy'] = autonomy;
     }
 
+    // Project memory opt-out
+    if (this.projectHasSharedMemory() && !this.useProjectMemory()) {
+      override['memory'] = { project_scoped: false };
+    }
+
+    // Scholar subjob toggle
+    const scholarDefault = (this.getExpertDefault('scholar.enabled') as boolean) ?? true;
+    if (this.enableScholar() !== scholarDefault) {
+      override['scholar'] = { enabled: this.enableScholar() };
+    }
+
+    // Critic (verification) subjob toggle + max rounds
+    const criticDefault = (this.getExpertDefault('verification.enabled') as boolean) ?? true;
+    const roundsDefault = (this.getExpertDefault('verification.max_rounds') as number) ?? 5;
+    if (this.enableCritic() !== criticDefault || this.criticMaxRounds() !== roundsDefault) {
+      override['verification'] = {
+        enabled: this.enableCritic(),
+        max_rounds: this.criticMaxRounds(),
+      };
+    }
+
     return Object.keys(override).length > 0 ? override : undefined;
   }
 
@@ -1899,6 +2049,9 @@ export class JobCreateComponent implements OnInit {
       this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
       this.selectedAutonomy.set(null);
+      this.enableScholar.set(true);
+      this.enableCritic.set(true);
+      this.criticMaxRounds.set(5);
       return;
     }
 
@@ -1936,6 +2089,13 @@ export class JobCreateComponent implements OnInit {
 
     // Pre-fill autonomy level
     this.selectedAutonomy.set((detail.config['autonomy'] as string) ?? null);
+
+    // Pre-fill subjob toggles
+    const scholar = detail.config['scholar'] as Record<string, unknown> | undefined;
+    this.enableScholar.set((scholar?.['enabled'] as boolean) ?? true);
+    const verification = detail.config['verification'] as Record<string, unknown> | undefined;
+    this.enableCritic.set((verification?.['enabled'] as boolean) ?? true);
+    this.criticMaxRounds.set((verification?.['max_rounds'] as number) ?? 5);
   }
 
   // ===== Datasource Methods =====
@@ -2237,6 +2397,10 @@ export class JobCreateComponent implements OnInit {
     this.tacticalMultimodal.set(null);
     this.disabledToolCategories.set(new Set());
     this.selectedAutonomy.set(null);
+    this.useProjectMemory.set(true);
+    this.enableScholar.set(true);
+    this.enableCritic.set(true);
+    this.criticMaxRounds.set(5);
     this.selectedPriority.set(5);
     // Reset advanced options
     this.showAdvanced.set(false);

@@ -154,8 +154,8 @@ class PostgresDB:
                 try:
                     from pgvector.asyncpg import register_vector
                     await register_vector(conn)
-                except ImportError:
-                    pass  # pgvector not installed, skip registration
+                except (ImportError, ValueError):
+                    pass  # pgvector not installed or extension not on this DB
 
             self._pool = await asyncpg.create_pool(
                 self._connection_string,
@@ -799,6 +799,72 @@ class PostgresDB:
         query = "UPDATE jobs SET context = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(context), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def merge_job_context(self, job_id: str, updates: Dict[str, Any]) -> bool:
+        """Atomically merge updates into the job's context JSONB column.
+
+        Uses PostgreSQL's || operator for a top-level merge, avoiding the
+        read-modify-write race in update_job_context().
+
+        Args:
+            job_id: Job UUID as string
+            updates: Dictionary of keys to merge into existing context
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def merge_vm_context(self, job_id: str, vm_updates: Dict[str, Any]) -> bool:
+        """Atomically merge updates into context.vm without touching other keys.
+
+        Uses jsonb_set + || to merge into the nested 'vm' key in a single
+        atomic SQL statement, eliminating the read-modify-write race.
+
+        Args:
+            job_id: Job UUID as string
+            vm_updates: Dictionary of keys to merge into context.vm
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "    COALESCE(context, '{}'::jsonb), "
+            "    '{vm}', "
+            "    COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(vm_updates), uuid_val)
 
         return result == "UPDATE 1"
 
@@ -1886,6 +1952,288 @@ class PostgresDB:
             )
 
     # =========================================================================
+    # Auth Tokens (verification codes, password reset tokens)
+    # =========================================================================
+
+    async def create_auth_token(
+        self,
+        email: str,
+        token: str,
+        token_type: str,
+        user_id: str | None = None,
+        expires_minutes: int = 30,
+    ) -> None:
+        """Create an auth token (verification or password reset)."""
+        from datetime import datetime, timedelta, timezone
+
+        user_uuid = UUID(user_id) if user_id else None
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=expires_minutes)
+
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO auth_tokens (user_id, email, token, token_type, expires_at)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                user_uuid,
+                email.lower(),
+                token,
+                token_type,
+                expires_at,
+            )
+
+    async def get_auth_token(self, token: str, token_type: str) -> Dict[str, Any] | None:
+        """Get a valid (non-expired, unused) auth token."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, email, token, token_type, expires_at, used_at, created_at
+                FROM auth_tokens
+                WHERE token = $1 AND token_type = $2
+                  AND expires_at > NOW() AND used_at IS NULL
+                """,
+                token,
+                token_type,
+            )
+        return dict(row) if row else None
+
+    async def mark_auth_token_used(self, token: str) -> None:
+        """Mark an auth token as used."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE auth_tokens SET used_at = NOW() WHERE token = $1",
+                token,
+            )
+
+    async def delete_auth_tokens_by_email(self, email: str, token_type: str) -> None:
+        """Delete all tokens of a given type for an email (cleanup before issuing new one)."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM auth_tokens WHERE LOWER(email) = LOWER($1) AND token_type = $2",
+                email,
+                token_type,
+            )
+
+    async def delete_expired_auth_tokens(self) -> None:
+        """Delete all expired auth tokens."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM auth_tokens WHERE expires_at < NOW()"
+            )
+            if result != "DELETE 0":
+                logger.debug(f"Cleaned up expired auth tokens: {result}")
+
+    async def get_latest_auth_token_time(self, email: str, token_type: str):
+        """Get the creation time of the most recent token for rate limiting."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT created_at FROM auth_tokens
+                WHERE LOWER(email) = LOWER($1) AND token_type = $2
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                email,
+                token_type,
+            )
+        return row["created_at"] if row else None
+
+    # =========================================================================
+    # User Auth Fields (password, email verification)
+    # =========================================================================
+
+    async def get_user_by_email_with_auth(self, email: str) -> Dict[str, Any] | None:
+        """Get a user by email including auth fields (password_hash, email_verified)."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       created_at, password_hash, email_verified, is_admin
+                FROM users
+                WHERE LOWER(email) = LOWER($1)
+                """,
+                email,
+            )
+        return dict(row) if row else None
+
+    async def set_user_password(self, user_id: str, password_hash: str) -> bool:
+        """Set or update a user's password hash."""
+        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET password_hash = $1 WHERE id = $2",
+                password_hash,
+                user_uuid,
+            )
+        return result == "UPDATE 1"
+
+    async def set_email_verified(self, user_id: str) -> bool:
+        """Mark a user's email as verified."""
+        user_uuid = UUID(user_id) if isinstance(user_id, str) else user_id
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET email_verified = TRUE WHERE id = $1",
+                user_uuid,
+            )
+        return result == "UPDATE 1"
+
+    async def create_user_with_password(
+        self,
+        display_name: str,
+        email: str,
+        password_hash: str,
+        avatar_color: str = "#89b4fa",
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Create a user with password (unverified) and their default project atomically."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Create project first
+                project_row = await conn.fetchrow(
+                    """
+                    INSERT INTO projects (name, description, is_default)
+                    VALUES ($1, $2, TRUE)
+                    RETURNING id, name, description, goal, status, is_default,
+                              default_config_name, default_config_override,
+                              created_at, updated_at
+                    """,
+                    f"{display_name}'s Workspace",
+                    f"Default workspace for {display_name}",
+                )
+
+                # Create user with password_hash and email_verified=FALSE
+                user_row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (display_name, avatar_color, email,
+                                       default_project_id, password_hash, email_verified)
+                    VALUES ($1, $2, $3, $4, $5, FALSE)
+                    RETURNING id, display_name, avatar_color, email,
+                              default_project_id, created_at
+                    """,
+                    display_name,
+                    avatar_color,
+                    email,
+                    project_row["id"],
+                    password_hash,
+                )
+
+                # Add user as project owner
+                await conn.execute(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, 'owner')
+                    """,
+                    project_row["id"],
+                    user_row["id"],
+                )
+
+        return dict(user_row), dict(project_row)
+
+    async def migrate_existing_users_verified(self) -> None:
+        """Mark existing dev-mode users (no password) as email_verified.
+
+        Called during init to ensure existing users aren't locked out
+        if AUTH_MODE switches to production.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE users SET email_verified = TRUE
+                WHERE email_verified = FALSE AND password_hash IS NULL
+                """
+            )
+            if result != "UPDATE 0":
+                logger.info(f"Migrated existing users to verified: {result}")
+
+    # =========================================================================
+    # MCP TOKEN OPERATIONS
+    # =========================================================================
+
+    async def create_mcp_token(
+        self,
+        user_id: str,
+        name: str,
+        token_hash: str,
+        token_prefix: str,
+        scope: str = "user",
+        expires_at=None,
+    ) -> Dict[str, Any]:
+        """Create a new MCP API token."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, scope, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, user_id, name, token_prefix, scope,
+                          expires_at, revoked_at, last_used_at, created_at
+                """,
+                user_id, name, token_hash, token_prefix, scope, expires_at,
+            )
+            return dict(row)
+
+    async def get_mcp_token_by_hash(self, token_hash: str) -> Dict[str, Any] | None:
+        """Look up an active MCP token by its hash. Returns None if revoked/expired."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT t.id, t.user_id, t.name, t.token_prefix, t.scope,
+                       t.expires_at, t.last_used_at, t.created_at,
+                       u.display_name, u.email
+                FROM mcp_tokens t
+                JOIN users u ON u.id = t.user_id
+                WHERE t.token_hash = $1
+                  AND t.revoked_at IS NULL
+                  AND (t.expires_at IS NULL OR t.expires_at > CURRENT_TIMESTAMP)
+                """,
+                token_hash,
+            )
+            return dict(row) if row else None
+
+    async def list_mcp_tokens(self, user_id: str) -> List[Dict[str, Any]]:
+        """List all MCP tokens for a user (excludes token_hash)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, name, token_prefix, scope,
+                       expires_at, revoked_at, last_used_at, created_at
+                FROM mcp_tokens
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                """,
+                user_id,
+            )
+            return [dict(r) for r in rows]
+
+    async def revoke_mcp_token(self, token_id: str, user_id: str) -> bool:
+        """Revoke an MCP token. Returns True if a token was revoked."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE mcp_tokens SET revoked_at = CURRENT_TIMESTAMP
+                WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+                """,
+                token_id, user_id,
+            )
+            return result == "UPDATE 1"
+
+    async def update_mcp_token_last_used(self, token_hash: str) -> None:
+        """Update the last_used_at timestamp for an MCP token."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                "UPDATE mcp_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE token_hash = $1",
+                token_hash,
+            )
+
+    async def cleanup_expired_mcp_tokens(self) -> None:
+        """Delete expired and long-revoked MCP tokens."""
+        async with self.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM mcp_tokens
+                WHERE (expires_at IS NOT NULL AND expires_at < CURRENT_TIMESTAMP)
+                   OR (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
+                """
+            )
+
+    # =========================================================================
     # USER OPERATIONS
     # =========================================================================
 
@@ -1901,7 +2249,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, created_at
                 FROM users
                 ORDER BY created_at ASC
                 LIMIT $1
@@ -1928,7 +2277,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, created_at
                 FROM users
                 WHERE id = $1
                 """,
@@ -1949,7 +2299,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, created_at
                 FROM users
                 WHERE LOWER(email) = LOWER($1)
                 """,
@@ -1987,6 +2338,66 @@ class PostgresDB:
             )
 
         return dict(row)
+
+    async def create_user_with_default_project(
+        self,
+        display_name: str,
+        avatar_color: str = "#89b4fa",
+        email: str | None = None,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Create a user and their default project atomically.
+
+        Inserts both user and project in a single transaction so the
+        NOT NULL constraint on default_project_id is never violated.
+
+        Args:
+            display_name: User's display name
+            avatar_color: Hex color for avatar dot
+            email: Optional email address
+
+        Returns:
+            Tuple of (user dict, project dict)
+        """
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                # Create project first
+                project_row = await conn.fetchrow(
+                    """
+                    INSERT INTO projects (name, description, is_default)
+                    VALUES ($1, $2, TRUE)
+                    RETURNING id, name, description, goal, status, is_default,
+                              default_config_name, default_config_override,
+                              created_at, updated_at
+                    """,
+                    f"{display_name}'s Workspace",
+                    f"Default workspace for {display_name}",
+                )
+
+                # Create user with default_project_id set
+                user_row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (display_name, avatar_color, email, default_project_id)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id, display_name, avatar_color, email,
+                              default_project_id, created_at
+                    """,
+                    display_name,
+                    avatar_color,
+                    email,
+                    project_row["id"],
+                )
+
+                # Add user as project owner
+                await conn.execute(
+                    """
+                    INSERT INTO project_members (project_id, user_id, role)
+                    VALUES ($1, $2, 'owner')
+                    """,
+                    project_row["id"],
+                    user_row["id"],
+                )
+
+        return dict(user_row), dict(project_row)
 
     async def update_user(
         self,
@@ -2070,16 +2481,23 @@ class PostgresDB:
         display_name: str,
         avatar_color: str = "#89b4fa",
         email: str | None = None,
+        is_admin: bool = False,
+        password_hash: str | None = None,
+        email_verified: bool = False,
     ) -> Dict[str, Any]:
         """Create a default user if one with the same display_name doesn't exist.
 
-        Used during init seeding. If the user exists and email is provided,
-        updates the email if it's currently NULL.
+        Used during init seeding. If the user exists, updates email (if NULL)
+        and is_admin (if changed). Supports optional password and email_verified
+        for production-mode admin seeding.
 
         Args:
             display_name: User's display name
             avatar_color: Hex color for avatar dot
             email: Optional email address
+            is_admin: Whether this user is an admin
+            password_hash: Pre-hashed password (for production mode admin)
+            email_verified: Whether email is verified
 
         Returns:
             Existing or newly created user dict
@@ -2087,33 +2505,67 @@ class PostgresDB:
         async with self.acquire() as conn:
             # Check if user with this name already exists
             existing = await conn.fetchrow(
-                "SELECT id, display_name, avatar_color, email, created_at FROM users WHERE display_name = $1",
+                "SELECT id, display_name, avatar_color, email, is_admin, created_at FROM users WHERE display_name = $1",
                 display_name,
             )
             if existing:
+                updates = []
+                params = []
+                idx = 1
                 # Update email if provided and currently NULL
                 if email and existing["email"] is None:
+                    updates.append(f"email = ${idx}")
+                    params.append(email)
+                    idx += 1
+                # Update is_admin if changed
+                if is_admin != existing["is_admin"]:
+                    updates.append(f"is_admin = ${idx}")
+                    params.append(is_admin)
+                    idx += 1
+                # Update password_hash if provided
+                if password_hash:
+                    updates.append(f"password_hash = ${idx}")
+                    params.append(password_hash)
+                    idx += 1
+                    updates.append(f"email_verified = ${idx}")
+                    params.append(email_verified)
+                    idx += 1
+                if updates:
+                    params.append(existing["id"])
                     await conn.execute(
-                        "UPDATE users SET email = $1 WHERE id = $2",
-                        email,
-                        existing["id"],
+                        f"UPDATE users SET {', '.join(updates)} WHERE id = ${idx}",
+                        *params,
                     )
-                    return {**dict(existing), "email": email}
-                return dict(existing)
+                result = {**dict(existing), "is_admin": is_admin}
+                if email and existing["email"] is None:
+                    result["email"] = email
+                return result
 
             # Create new user
             row = await conn.fetchrow(
                 """
-                INSERT INTO users (display_name, avatar_color, email)
-                VALUES ($1, $2, $3)
-                RETURNING id, display_name, avatar_color, email, created_at
+                INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                   password_hash, email_verified)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, display_name, avatar_color, email, is_admin, created_at
                 """,
                 display_name,
                 avatar_color,
                 email,
+                is_admin,
+                password_hash,
+                email_verified,
             )
 
         return dict(row)
+
+    async def get_admin_user(self) -> Dict[str, Any] | None:
+        """Get the first admin user."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE is_admin = TRUE LIMIT 1"
+            )
+            return dict(row) if row else None
 
     # =========================================================================
     # PROJECT OPERATIONS
@@ -2860,6 +3312,7 @@ class PostgresDB:
         role: str,
         content: str | None = None,
         tool_calls: List[Dict[str, Any]] | None = None,
+        steps: List[Dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         """Create a new message in a builder session.
 
@@ -2868,6 +3321,7 @@ class PostgresDB:
             role: Message role ('user' or 'assistant')
             content: Conversational text content
             tool_calls: List of artifact mutations (assistant only)
+            steps: Agent reasoning steps (assistant only)
 
         Returns:
             Created message dict
@@ -2877,14 +3331,15 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO builder_messages (session_id, role, content, tool_calls)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id, session_id, role, content, tool_calls, created_at
+                INSERT INTO builder_messages (session_id, role, content, tool_calls, steps)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id, session_id, role, content, tool_calls, steps, created_at
                 """,
                 session_uuid,
                 role,
                 content,
                 json.dumps(tool_calls) if tool_calls else None,
+                json.dumps(steps) if steps else None,
             )
 
         return dict(row)
@@ -2911,7 +3366,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, session_id, role, content, tool_calls, created_at
+                SELECT id, session_id, role, content, tool_calls, steps, created_at
                 FROM builder_messages
                 WHERE session_id = $1
                 ORDER BY created_at ASC
@@ -2921,7 +3376,13 @@ class PostgresDB:
                 limit,
             )
 
-        return [dict(row) for row in rows]
+        results = [dict(row) for row in rows]
+        for msg in results:
+            for key in ("tool_calls", "steps"):
+                val = msg.get(key)
+                if isinstance(val, str):
+                    msg[key] = json.loads(val)
+        return results
 
     # =========================================================================
     # SCHEMA MANAGEMENT
@@ -2984,6 +3445,10 @@ class PostgresDB:
             await conn.execute(schema_sql)
 
         logger.info(f"Applied schema from {SCHEMA_FILE}")
+
+        # Migration: mark existing dev-mode users (no password) as verified
+        await self.migrate_existing_users_verified()
+
         return True
 
     async def reset_schema(self) -> None:
