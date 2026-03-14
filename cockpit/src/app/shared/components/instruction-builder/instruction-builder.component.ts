@@ -1008,6 +1008,14 @@ export class InstructionBuilderComponent implements AfterViewChecked, OnInit {
             role: m.role,
             content: m.content || '(applied changes)',
             toolCalls: m.tool_calls?.map((tc) => ({ tool: tc.tool, args: tc.args })),
+            steps: m.steps?.map((s, i) => ({
+              id: `restored-${m.id}-${i}`,
+              type: (s.type || 'thought') as AgentStepType,
+              title: s.title || '',
+              content: s.content || '',
+              timestamp: Date.now(),
+              status: 'complete' as BuilderStepStatus,
+            })),
           }));
           this.messages.set(restored);
           this.shouldScrollToBottom = true;
