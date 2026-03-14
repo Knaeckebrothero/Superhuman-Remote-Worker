@@ -127,7 +127,12 @@ import { environment } from '../../core/environment';
             >{{ getInitials(user.display_name) }}</span>
             <span class="user-name">{{ user.display_name }}</span>
           </div>
-          <button class="logout-button" (click)="logout()">Logout</button>
+          <div class="footer-actions">
+            <a class="footer-link" routerLink="/settings" routerLinkActive="active" title="Settings">
+              <span class="nav-icon">settings</span>
+            </a>
+            <button class="logout-button" (click)="logout()">Logout</button>
+          </div>
         }
       </div>
     </nav>
@@ -334,8 +339,36 @@ import { environment } from '../../core/environment';
         white-space: nowrap;
       }
 
+      .footer-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .footer-link {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 30px;
+        height: 30px;
+        border-radius: 6px;
+        color: var(--text-muted, #6c7086);
+        text-decoration: none;
+        transition: color 0.15s ease, background 0.15s ease;
+      }
+
+      .footer-link:hover,
+      .footer-link.active {
+        color: var(--accent-color, #cba6f7);
+        background: var(--surface-0, #313244);
+      }
+
+      .footer-link .nav-icon {
+        font-size: 18px;
+      }
+
       .logout-button {
-        width: 100%;
+        flex: 1;
         padding: 6px 12px;
         background: transparent;
         border: 1px solid var(--border-color, #313244);

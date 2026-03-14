@@ -220,7 +220,7 @@ auxiliary:
 verification:
   enabled: true          # Spawn a critic job after job_complete to review deliverables
   critic_config: critic  # Which expert config to use for the reviewer
-  max_rounds: 5          # Max feedback round-trips before auto-accepting
+  max_rounds: 5          # Max feedback round-trips before auto-accepting (0 = unlimited)
 
 # Curation — inline knowledge extraction via AuxiliaryLLM at archive_phase.
 # Runs CurateKnowledgeTask in agent mode to extract knowledge notes
