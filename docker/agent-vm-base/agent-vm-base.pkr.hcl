@@ -109,13 +109,21 @@ source "qemu" "agent-vm-base" {
 build {
   sources = ["source.qemu.agent-vm-base"]
 
-  # Wait for cloud-init to finish
+  # Wait for cloud-init to finish and diagnose issues
   provisioner "shell" {
     inline = [
       "echo 'Waiting for cloud-init to complete...'",
-      "sudo cloud-init status --wait",
-      "echo 'Cloud-init done. Testing network...'",
-      "curl -sSf --connect-timeout 10 https://archive.ubuntu.com > /dev/null && echo 'Network OK' || echo 'Network FAILED'",
+      "sudo cloud-init status --wait || true",
+      "echo '--- cloud-init status ---'",
+      "sudo cloud-init status --long || true",
+      "echo '--- cloud-init log (last 30 lines) ---'",
+      "sudo tail -30 /var/log/cloud-init.log || true",
+      "echo '--- network interfaces ---'",
+      "ip addr show || true",
+      "echo '--- DNS config ---'",
+      "cat /etc/resolv.conf || true",
+      "echo '--- testing network ---'",
+      "wget -q --spider --timeout=10 http://archive.ubuntu.com && echo 'Network OK' || echo 'Network unreachable (non-fatal)'",
     ]
   }
 
