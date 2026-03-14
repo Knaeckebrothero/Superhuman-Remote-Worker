@@ -802,6 +802,72 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def merge_job_context(self, job_id: str, updates: Dict[str, Any]) -> bool:
+        """Atomically merge updates into the job's context JSONB column.
+
+        Uses PostgreSQL's || operator for a top-level merge, avoiding the
+        read-modify-write race in update_job_context().
+
+        Args:
+            job_id: Job UUID as string
+            updates: Dictionary of keys to merge into existing context
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def merge_vm_context(self, job_id: str, vm_updates: Dict[str, Any]) -> bool:
+        """Atomically merge updates into context.vm without touching other keys.
+
+        Uses jsonb_set + || to merge into the nested 'vm' key in a single
+        atomic SQL statement, eliminating the read-modify-write race.
+
+        Args:
+            job_id: Job UUID as string
+            vm_updates: Dictionary of keys to merge into context.vm
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "    COALESCE(context, '{}'::jsonb), "
+            "    '{vm}', "
+            "    COALESCE(context->'vm', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(vm_updates), uuid_val)
+
+        return result == "UPDATE 1"
+
     async def get_requirements(
         self,
         job_id: str,
@@ -1981,7 +2047,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       created_at, password_hash, email_verified
+                       created_at, password_hash, email_verified, is_admin
                 FROM users
                 WHERE LOWER(email) = LOWER($1)
                 """,
@@ -2183,7 +2249,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, created_at
                 FROM users
                 ORDER BY created_at ASC
                 LIMIT $1
@@ -2210,7 +2277,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, created_at
                 FROM users
                 WHERE id = $1
                 """,
@@ -2231,7 +2299,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, display_name, avatar_color, email, default_project_id, created_at
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, created_at
                 FROM users
                 WHERE LOWER(email) = LOWER($1)
                 """,
@@ -2412,16 +2481,23 @@ class PostgresDB:
         display_name: str,
         avatar_color: str = "#89b4fa",
         email: str | None = None,
+        is_admin: bool = False,
+        password_hash: str | None = None,
+        email_verified: bool = False,
     ) -> Dict[str, Any]:
         """Create a default user if one with the same display_name doesn't exist.
 
-        Used during init seeding. If the user exists and email is provided,
-        updates the email if it's currently NULL.
+        Used during init seeding. If the user exists, updates email (if NULL)
+        and is_admin (if changed). Supports optional password and email_verified
+        for production-mode admin seeding.
 
         Args:
             display_name: User's display name
             avatar_color: Hex color for avatar dot
             email: Optional email address
+            is_admin: Whether this user is an admin
+            password_hash: Pre-hashed password (for production mode admin)
+            email_verified: Whether email is verified
 
         Returns:
             Existing or newly created user dict
@@ -2429,33 +2505,67 @@ class PostgresDB:
         async with self.acquire() as conn:
             # Check if user with this name already exists
             existing = await conn.fetchrow(
-                "SELECT id, display_name, avatar_color, email, created_at FROM users WHERE display_name = $1",
+                "SELECT id, display_name, avatar_color, email, is_admin, created_at FROM users WHERE display_name = $1",
                 display_name,
             )
             if existing:
+                updates = []
+                params = []
+                idx = 1
                 # Update email if provided and currently NULL
                 if email and existing["email"] is None:
+                    updates.append(f"email = ${idx}")
+                    params.append(email)
+                    idx += 1
+                # Update is_admin if changed
+                if is_admin != existing["is_admin"]:
+                    updates.append(f"is_admin = ${idx}")
+                    params.append(is_admin)
+                    idx += 1
+                # Update password_hash if provided
+                if password_hash:
+                    updates.append(f"password_hash = ${idx}")
+                    params.append(password_hash)
+                    idx += 1
+                    updates.append(f"email_verified = ${idx}")
+                    params.append(email_verified)
+                    idx += 1
+                if updates:
+                    params.append(existing["id"])
                     await conn.execute(
-                        "UPDATE users SET email = $1 WHERE id = $2",
-                        email,
-                        existing["id"],
+                        f"UPDATE users SET {', '.join(updates)} WHERE id = ${idx}",
+                        *params,
                     )
-                    return {**dict(existing), "email": email}
-                return dict(existing)
+                result = {**dict(existing), "is_admin": is_admin}
+                if email and existing["email"] is None:
+                    result["email"] = email
+                return result
 
             # Create new user
             row = await conn.fetchrow(
                 """
-                INSERT INTO users (display_name, avatar_color, email)
-                VALUES ($1, $2, $3)
-                RETURNING id, display_name, avatar_color, email, created_at
+                INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                   password_hash, email_verified)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, display_name, avatar_color, email, is_admin, created_at
                 """,
                 display_name,
                 avatar_color,
                 email,
+                is_admin,
+                password_hash,
+                email_verified,
             )
 
         return dict(row)
+
+    async def get_admin_user(self) -> Dict[str, Any] | None:
+        """Get the first admin user."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE is_admin = TRUE LIMIT 1"
+            )
+            return dict(row) if row else None
 
     # =========================================================================
     # PROJECT OPERATIONS

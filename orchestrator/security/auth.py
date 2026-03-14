@@ -101,12 +101,16 @@ async def delete_session(db, session_key: str) -> None:
 async def get_current_user(request: Request, db) -> dict:
     """FastAPI dependency: extract current user from session cookie.
 
+    Returns the full user record (id, display_name, avatar_color, email,
+    default_project_id, is_admin, created_at) so endpoints can use user["id"]
+    directly.
+
     Args:
         request: FastAPI Request
         db: PostgresDB instance
 
     Returns:
-        User info dict
+        Full user dict from the users table
 
     Raises:
         HTTPException 401 if not authenticated
@@ -115,11 +119,15 @@ async def get_current_user(request: Request, db) -> dict:
     if not session_key:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    user_info = await validate_session(db, session_key)
-    if not user_info:
+    session_info = await validate_session(db, session_key)
+    if not session_info:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
-    return user_info
+    user = await db.get_user(session_info["user_id"])
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    return user
 
 
 async def cleanup_expired_sessions(db, shutdown_event: asyncio.Event) -> None:
