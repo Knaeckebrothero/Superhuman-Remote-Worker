@@ -49,6 +49,10 @@ rm -f /root/.bash_history /home/*/.bash_history
 rm -f /etc/sudoers.d/90-cloud-init-users
 userdel -r packer 2>/dev/null || true
 
+# Verify critical files exist before shutdown
+ls -la /opt/srw/management-daemon.py /etc/systemd/system/management-daemon.service
+
 echo "=== Cleanup complete ==="
+sync
 shutdown -P now
 CLEANUP
