@@ -113,4 +113,31 @@ def create_assembler_tools(recall_store: Any) -> List[Any]:
         except Exception as e:
             return f"Error deprecating memory: {e}"
 
-    return [memory_search, memory_boost, memory_deprecate]
+    @tool
+    async def memory_add_triggers(memory_id: str, messages: list[str]) -> str:
+        """Add retrieval trigger phrases to an existing memory.
+
+        Trigger phrases are synthetic queries that represent situations where
+        the memory should be retrieved. They are embedded and used during
+        hybrid search to improve recall.
+
+        Args:
+            memory_id: UUID of the memory to add triggers to
+            messages: List of 3-5 trigger phrases
+        """
+        try:
+            mem_uuid = uuid.UUID(memory_id)
+            if not messages or len(messages) == 0:
+                return "No trigger phrases provided."
+            # Cap at 7 to avoid excessive embedding costs
+            phrases = messages[:7]
+            count = await recall_store.store_retrieval_messages(mem_uuid, phrases)
+            return (
+                f"Added {count} retrieval trigger phrases to memory {memory_id}."
+            )
+        except ValueError:
+            return f"Invalid UUID: {memory_id}"
+        except Exception as e:
+            return f"Error adding trigger phrases: {e}"
+
+    return [memory_search, memory_boost, memory_deprecate, memory_add_triggers]

@@ -275,6 +275,76 @@ jobs:
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn:latest" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
+  build-agent-vm-base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          echo "=== Before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/share/chromium \
+            /usr/share/swift /usr/local/julia* /opt/hostedtoolcache
+          echo "=== After cleanup ==="
+          df -h /
+
+      - name: Install QEMU and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-utils genisoimage
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: latest
+
+      - name: Download Ubuntu cloud image
+        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        run: |
+          mkdir -p input
+          wget -q https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img \
+            -O input/noble-server-cloudimg-amd64.img
+          qemu-img info input/noble-server-cloudimg-amd64.img
+
+      - name: Packer init
+        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        run: packer init agent-vm-base.pkr.hcl
+
+      - name: Packer build
+        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        run: packer build agent-vm-base.pkr.hcl
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push containerDisk image
+        working-directory: docs/HomeLab/deployments/srw/harvester/packer
+        run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-agent-vm-base" | tr '[:upper:]' '[:lower:]')
+          docker build -t "${IMAGE}:latest" -t "${IMAGE}:sha-${GITHUB_SHA::7}" -f Dockerfile.containerDisk .
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
+          echo "Pushed ${IMAGE}:latest"
+
   build-vm-controller:
     runs-on: ubuntu-latest
     timeout-minutes: 15
