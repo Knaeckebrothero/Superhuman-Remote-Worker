@@ -1,0 +1,24 @@
+#cloud-config
+
+# Minimal cloud-init for Packer build — sets up SSH access so Packer
+# can connect and run provisioners. The real per-job config is injected
+# at VM creation time via the KubeVirt cloud-init volume.
+
+users:
+  - name: packer
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    plain_text_passwd: packer
+    shell: /bin/bash
+    ssh_authorized_keys: []
+
+# Enable password auth for Packer SSH (disabled in final image by cleanup.sh)
+ssh_pwauth: true
+
+# Grow the root partition to fill the disk
+growpart:
+  mode: auto
+  devices: ["/"]
+
+runcmd:
+  - systemctl enable ssh

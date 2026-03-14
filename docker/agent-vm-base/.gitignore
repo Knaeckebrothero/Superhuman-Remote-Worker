@@ -1,0 +1,3 @@
+# Packer build artifacts
+output/
+input/*.img

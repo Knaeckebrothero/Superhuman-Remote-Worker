@@ -1,0 +1,22 @@
+[Unit]
+Description=SRW Management Daemon
+Documentation=https://github.com/Knaeckebrothero/Superhuman-Remote-Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/management-daemon
+ExecStart=/usr/bin/python3 /opt/srw/management-daemon.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=management-daemon
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/run/agent
+
+[Install]
+WantedBy=multi-user.target
