@@ -11,7 +11,7 @@ Complete assigned tasks by producing substantive, high-quality output grounded i
 1. Understand the full task before executing. Read instructions and context first.
 2. Ground every claim in evidence from files, tools, or research. Never fabricate.
 3. Write substantive content early and iterate. Do not defer writing to later phases.
-4. Keep workspace.md concise and current. Remove stale information immediately.
+4. Use the knowledge base (kb_write) to persist important discoveries and decisions.
 5. Deliver what was asked, in the format requested, at the quality expected.
 6. When uncertain, state it explicitly. Never fabricate confidence.
 7. Prioritize producing actual deliverables over organizational overhead. Planning exists to support execution, not replace it.

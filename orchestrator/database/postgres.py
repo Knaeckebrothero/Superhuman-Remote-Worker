@@ -2984,7 +2984,13 @@ class PostgresDB:
                 limit,
             )
 
-        return [dict(row) for row in rows]
+        results = [dict(row) for row in rows]
+        for msg in results:
+            for key in ("tool_calls", "steps"):
+                val = msg.get(key)
+                if isinstance(val, str):
+                    msg[key] = json.loads(val)
+        return results
 
     # =========================================================================
     # SCHEMA MANAGEMENT

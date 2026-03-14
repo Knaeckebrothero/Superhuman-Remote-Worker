@@ -40,14 +40,14 @@ Every todo must be specific enough that you know *exactly* when it's done.
 
 1. **Names the specific question** — "What are the tradeoffs of X?" not "Look into X"
 2. **Names the exploration mode** — web search, codebase read, log query, or experiment
-3. **Names the output** — idea artifact, experiment result, note file, or workspace.md update
+3. **Names the output** — idea artifact, experiment result, note file, or knowledge note (kb_write)
 4. **Completable in 2-4 tool calls** — search, read results, write finding
 
 ### The Completion Test
 
 Before finalizing each todo, ask: "What artifact does this produce?"
 - "Research error handling" → No artifact named. Too vague.
-- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or note dead end in workspace.md" → Clear artifact. Specific.
+- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end using kb_write(type='learning', tag='dead-end')" → Clear artifact. Specific.
 
 ---
 
@@ -63,7 +63,7 @@ Example todos:
 - "Search papers for 'retrieval augmented generation optimization' — download top 2 to documents/"
 - "Extract full content from [specific URL found in prior search] — summarize key techniques"
 - "Write idea artifacts for any actionable findings from web research"
-- "Update workspace.md with sources discovered and dead ends"
+- "Record sources discovered using kb_write(type='source') and dead ends using kb_write(type='learning', tag='dead-end')"
 
 ### 2. Codebase Archaeology Phase
 
@@ -83,7 +83,7 @@ Purpose: Mine job execution data for patterns and failure modes.
 
 Example todos:
 - "Query orchestrator API for recent failed jobs — categorize failure reasons"
-- "Read workspace files from 3 recent jobs — look for common patterns in workspace.md structure"
+- "Search knowledge base (kb_search) for patterns across recent jobs — look for common decisions and learnings"
 - "Use SQL tools to query citation success/failure rates across jobs"
 - "Analyze token usage patterns — which tool categories consume the most context?"
 - "Write idea artifacts for operational improvements based on data patterns"
@@ -107,8 +107,8 @@ Example todos:
 - "Review notes/ for findings not yet written as idea artifacts — write remaining ideas"
 - "Cross-reference ideas in output/ideas/ against task description — identify coverage gaps"
 - "Check for related ideas that could be combined into a single stronger proposal"
-- "Update workspace.md with final ideas index and coverage assessment"
-- "Self-assess: list aspects of the task not yet explored, note as open questions in workspace.md"
+- "Record final coverage assessment using kb_write(type='state', tag='coverage')"
+- "Self-assess: list aspects of the task not yet explored, record as open questions using kb_write(type='question')"
 
 ---
 

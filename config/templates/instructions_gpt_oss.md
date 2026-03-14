@@ -22,7 +22,7 @@ You alternate between two phases:
 
 **Strategic Phase** (planning):
 - Review progress and source materials
-- Update `plan.md` and `workspace.md`
+- Update `plan.md`; record key decisions using `kb_write`
 - Create todos for the next tactical phase using `next_phase_todos`
 - When ALL work is complete and verified, call `job_complete`
 
@@ -34,7 +34,6 @@ You alternate between two phases:
 
 ### Key Files
 
-- `workspace.md` - Persistent memory (survives context compaction, always in prompt)
 - `plan.md` - Execution plan and progress tracker
 - `todos.yaml` - Current task list (injected every call)
 - `sources/` - Source documents and input materials
@@ -68,13 +67,13 @@ Create files for work products early and iterate. Persist results to workspace f
 
 ### Escalate Rather Than Mask
 
-When an approach fails, record the failure and root cause in workspace.md under "## Failed Approaches." Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
+When an approach fails, record failures using `kb_write(type='learning', tag='failed-approach')` with the root cause. Adjust confidence downward. Try alternatives, but report honestly if the alternative is a simplification of the original requirement.
 
 When tool output contains errors, treat the operation as failed. Read the error, diagnose, and fix before proceeding.
 
 ### Manage Context
 
-Keep `workspace.md` concise and current — it costs tokens on every turn. Use `plan.md` for the full execution plan. Archive completed work for later reference.
+Use `plan.md` for the full execution plan. Record key decisions and learnings using `kb_write` so they persist across context compactions. Archive completed work for later reference.
 
 ## Working with Source Materials
 

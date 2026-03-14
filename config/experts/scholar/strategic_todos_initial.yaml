@@ -1,6 +1,6 @@
 # Strategic todos for scholar job initialization (first strategic phase)
 # These todos guide the scholar through understanding the exploration task,
-# setting up workspace memory, and launching the first exploration sweep.
+# setting up the knowledge base, and launching the first exploration sweep.
 #
 # Scholar-specific: focuses on exploration direction and breadth,
 # not deliverables and execution phases.
@@ -16,14 +16,17 @@ todos:
       (4) Use list_files on documents/ to inventory all input materials.
       (5) Use list_files on reference/ to check for domain-specific reference material.
 
-      Then PIN critical rules to workspace.md under "## Pinned Instructions":
-      - Exploration scope (what to investigate, what's out of bounds)
-      - Output expectations (idea format, depth level, specific deliverables if any)
-      - Constraints (time limits, focus areas, required exploration modes)
-      - Quality criteria (what makes a good idea artifact for this task)
+      Then persist critical rules as knowledge notes using kb_write:
+      - Exploration scope (what to investigate, what's out of bounds) → kb_write with type="goal", tag="scope"
+      - Output expectations (idea format, depth level, specific deliverables if any) → kb_write with type="goal", tag="deliverable"
+      - Constraints (time limits, focus areas, required exploration modes) → kb_write with type="decision", tag="constraint"
+      - Quality criteria (what makes a good idea artifact for this task) → kb_write with type="goal", tag="acceptance-criteria"
 
-      COMPLETION CRITERIA: workspace.md exists and contains "## Pinned Instructions"
-      populated from instructions.md and task_brief.md.
+      These knowledge notes persist across context compaction AND across future jobs
+      in the same project. Search existing notes first (kb_search) to avoid duplicates.
+
+      COMPLETION CRITERIA: Knowledge notes created for all four categories above
+      (verify with kb_list). instructions.md and task_brief.md have been read in full.
 
       INSTEAD OF: Starting to research now — this phase is read-only exploration.
       Instead of skimming instructions.md — read every line.
@@ -38,13 +41,13 @@ todos:
       (3) What existing knowledge is available? (documents/, reference/, codebase)
       (4) Are there specific technologies, patterns, or domains to focus on?
 
-      Update workspace.md "## Exploration Focus" with:
+      Record your exploration direction using kb_write(type="state", tag="exploration-focus"):
       - One-line task summary
       - Relevant exploration modes
       - Scope boundaries (in scope vs out of scope)
       - Initial questions to investigate (numbered list)
 
-      COMPLETION CRITERIA: workspace.md has "## Exploration Focus" with specific
+      COMPLETION CRITERIA: Knowledge note created with exploration focus containing specific
       questions and scope boundaries, not just a restatement of the task description.
 
       INSTEAD OF: Vague direction like "explore the topic" — list specific questions.
@@ -82,20 +85,26 @@ todos:
 
   - id: 4
     content: >-
-      INITIALIZE workspace.md: Complete the long-term memory structure.
+      REVIEW PROJECT KNOWLEDGE: Check the project knowledge base for existing context.
 
-      workspace.md should contain (in addition to sections from todos 1-2):
-      - "## Ideas Index" — empty table (will be populated as ideas are written)
-      - "## Experiments Index" — empty table
-      - "## Key Sources" — empty (will collect important references)
-      - "## Dead Ends" — empty (will track explored-and-abandoned directions)
-      - "## Status" — current phase and coverage assessment
+      Search the knowledge base for existing notes from prior jobs in this project:
+      (1) Use kb_list to see all existing notes (filter by status="active").
+      (2) Use kb_search with key terms from the task description to find relevant prior knowledge.
+      (3) Review any existing decision notes — they may constrain your approach.
+      (4) Check for contradictions (kb_contradictions) that need resolution.
 
-      COMPLETION CRITERIA: workspace.md has all sections above and is under 60 lines.
-      The Exploration Focus section has specific questions, not vague directions.
+      If this is the first job in the project, the knowledge base will be empty — that's fine.
+      The notes you create during this job will benefit future jobs.
 
-      INSTEAD OF: Dumping document inventories — use compact references.
-      Instead of exceeding 60 lines — every line costs tokens on every LLM call.
+      Create initial state notes if they don't exist:
+      - A "goal" note summarizing the current job's exploration objective
+      - Any facts discovered during exploration as "learning" notes
+
+      COMPLETION CRITERIA: kb_list or kb_search called at least once. If prior knowledge
+      exists, it has been reviewed. Initial state notes created for this job.
+
+      INSTEAD OF: Skipping this step — prior knowledge from the same project can save
+      significant work. Instead of creating notes that duplicate existing ones — search first.
 
   - id: 5
     content: >-
@@ -114,7 +123,7 @@ todos:
       The first phase should typically be a broad exploration sweep — web search
       or codebase archaeology — to establish context before going deeper.
 
-      Include at least one todo for updating workspace.md with findings.
+      Include at least one todo for recording findings as knowledge notes (kb_write).
 
       COMPLETION CRITERIA: next_phase_todos called successfully with 5-7 todos.
 
