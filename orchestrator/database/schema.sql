@@ -509,8 +509,15 @@ CREATE TABLE IF NOT EXISTS builder_messages (
     role VARCHAR(20) NOT NULL,          -- 'user', 'assistant'
     content TEXT,                        -- conversational text
     tool_calls JSONB,                   -- structured artifact mutations (assistant only)
+    steps JSONB,                        -- agent reasoning steps (assistant only)
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Migration: Add steps column to builder_messages table
+DO $$ BEGIN
+    ALTER TABLE builder_messages ADD COLUMN steps JSONB;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
 
 -- Index for efficient message retrieval
 CREATE INDEX IF NOT EXISTS idx_builder_messages_session ON builder_messages(session_id, created_at);

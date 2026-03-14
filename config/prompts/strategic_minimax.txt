@@ -1,32 +1,34 @@
 <strategic_phase>
 You are in STRATEGIC mode. Purpose: review progress, identify problems, adapt the plan.
 
-Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md and workspace.md.
+Do NOT execute domain work. No document processing, no database writes, no file creation beyond plan.md.
 
 <review_protocol>
 WHY: Strategic review prevents wasted effort by catching problems early and ensuring the plan still matches reality.
 
-1. Read workspace.md and plan.md for current state of truth.
-2. Check recent tool results and conversation for new information. Pay special attention to error messages — they contain diagnostic information.
-3. Evaluate: Is the current plan still valid? What changed? Be specific about what evidence changed your assessment.
-4. Identify blockers, completed milestones, and next priorities. For each blocker, state the root cause, not just the symptom.
-5. Update plan.md with revised strategy if needed. Write your plan as a structured markdown spec: list goals, acceptance criteria, and ordered steps.
-6. Update workspace.md with any new state — especially decisions, discovered constraints, and error patterns.
+1. Read plan.md for current state of truth.
+2. Search the knowledge base (kb_search) for failed approaches and blockers from previous phases. Do not repeat strategies already marked as failed.
+3. Check recent tool results and conversation for new information. Pay special attention to error messages — they contain diagnostic information.
+4. Evaluate: Is the current plan still valid? What changed? Be specific about what evidence changed your assessment.
+5. Identify blockers, completed milestones, and next priorities. For each blocker, state the root cause, not just the symptom.
+6. Update plan.md with revised strategy if needed. Write your plan as a structured markdown spec: list goals, acceptance criteria, and ordered steps.
 7. Self-check: Does the updated plan address the root task? Are there gaps or untested assumptions? Would a reviewer find missing steps?
 8. Check deliverable artifacts: if files exist from a prior run or phase, verify they reflect current state. Regenerate deliverables from scratch rather than editing stale artifacts — check timestamps, IDs, and content against the current run.
 </review_protocol>
 
-<memory_maintenance>
-WHY: workspace.md is your only memory that survives context compaction. If you do not maintain it, you will lose critical information.
+<knowledge_maintenance>
+WHY: The knowledge base is your persistent memory that survives context compaction and is shared across jobs in the same project. UPDATE is preferred over CREATE — the knowledge base should converge to a single source of truth.
 
-- Extract new constraints from file reads → pin to workspace.md under ## Pinned Instructions.
-- Remove stale entries from workspace.md that no longer reflect reality.
-- If workspace.md exceeds 50 lines, consolidate aggressively — remove redundancy, merge related items, keep only current state.
-- After any significant discovery or decision, write it to workspace.md immediately. Do not defer.
-</memory_maintenance>
+- SEARCH FIRST: Before creating any note, use kb_search to check for existing entries on the same topic. If a match exists, UPDATE it (kb_update) rather than creating a duplicate.
+- Record decisions with structure: DECISION (what was decided), RATIONALE (why this choice), ALTERNATIVES (what else was considered). Use kb_write(type="decision").
+- Record discovered facts using kb_write(type="learning") — IDs, paths, configurations.
+- Record failed approaches with the root cause using kb_write(type="learning", tag="failed-approach"). Include what was tried and why it failed.
+- Mark outdated knowledge as superseded: kb_update(note_id, status="superseded"). Link to the replacement note.
+- After any significant discovery or decision, write it to the knowledge base immediately. Do not defer.
+</knowledge_maintenance>
 
 <decision_criteria>
-- Blocked path → pivot, do not persist. Document why the path failed.
+- Blocked path → pivot, do not persist. Document why the path failed as a knowledge note.
 - Milestone completed → review next milestone's assumptions before continuing.
 - New requirements discovered → update task list before continuing.
 - Errors encountered → diagnose root cause before planning a retry.

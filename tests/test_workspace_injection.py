@@ -1,62 +1,19 @@
-"""Tests for workspace injection — synthetic tool messages for workspace.md.
+"""Tests for workspace injection — synthetic tool messages for transient injection.
 
-Tests create_workspace_tool_messages, create_todos_human_message,
-create_instruction_tool_messages, and is_workspace_injection_message.
+Tests create_todos_human_message, create_instruction_tool_messages,
+and is_workspace_injection_message.
 """
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.core.workspace_injection import (
-    WORKSPACE_TOOL_CALL_ID_PREFIX,
     INSTRUCTION_TOOL_CALL_ID_PREFIX,
     TODOS_INJECTION_CONTENT_PREFIX,
-    create_workspace_tool_messages,
     create_todos_human_message,
     create_instruction_tool_messages,
     is_workspace_injection_message,
 )
-
-
-# =============================================================================
-# create_workspace_tool_messages
-# =============================================================================
-
-
-class TestCreateWorkspaceToolMessages:
-    """Tests for workspace.md injection as fake tool call."""
-
-    def test_returns_ai_and_tool_message_pair(self):
-        ai_msg, tool_msg = create_workspace_tool_messages("# Workspace content")
-        assert isinstance(ai_msg, AIMessage)
-        assert isinstance(tool_msg, ToolMessage)
-
-    def test_ai_message_has_tool_call(self):
-        ai_msg, _ = create_workspace_tool_messages("content")
-        assert len(ai_msg.tool_calls) == 1
-        tc = ai_msg.tool_calls[0]
-        assert tc["name"] == "read_file"
-        assert tc["args"] == {"path": "workspace.md"}
-
-    def test_tool_call_id_has_prefix(self):
-        ai_msg, tool_msg = create_workspace_tool_messages("content")
-        tc_id = ai_msg.tool_calls[0]["id"]
-        assert tc_id.startswith(WORKSPACE_TOOL_CALL_ID_PREFIX)
-        assert tool_msg.tool_call_id == tc_id
-
-    def test_tool_message_contains_content(self):
-        _, tool_msg = create_workspace_tool_messages("my workspace data")
-        assert tool_msg.content == "my workspace data"
-
-    def test_ai_message_has_empty_content(self):
-        ai_msg, _ = create_workspace_tool_messages("x")
-        assert ai_msg.content == ""
-
-    def test_unique_ids_per_call(self):
-        """Each call should generate a unique tool_call_id."""
-        _, msg1 = create_workspace_tool_messages("a")
-        _, msg2 = create_workspace_tool_messages("b")
-        assert msg1.tool_call_id != msg2.tool_call_id
 
 
 # =============================================================================
@@ -121,14 +78,6 @@ class TestCreateInstructionToolMessages:
 
 class TestIsWorkspaceInjectionMessage:
     """Tests for detecting transient injection messages."""
-
-    def test_detects_workspace_tool_message(self):
-        _, tool_msg = create_workspace_tool_messages("content")
-        assert is_workspace_injection_message(tool_msg) is True
-
-    def test_detects_workspace_ai_message(self):
-        ai_msg, _ = create_workspace_tool_messages("content")
-        assert is_workspace_injection_message(ai_msg) is True
 
     def test_detects_instruction_tool_message(self):
         _, tool_msg = create_instruction_tool_messages("f.md", "x")
