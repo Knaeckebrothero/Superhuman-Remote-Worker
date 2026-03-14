@@ -6617,7 +6617,7 @@ def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]
 
     Handles model routing for different providers:
     - ``openrouter/`` prefix → OpenRouter API
-    - ``openai/`` prefix → local vLLM at OPENAI_BASE_URL
+    - ``openai/`` prefix → local vLLM at BUILDER_BASE_URL / OPENAI_BASE_URL / LLM_BASE_URL
     - ``claude-`` prefix → Anthropic (base_url/api_key left to Anthropic client)
     - No prefix → default OpenAI provider
     """
@@ -6628,7 +6628,7 @@ def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]
         return model_name, base_url, api_key
     if raw_model.startswith("openai/"):
         model_name = raw_model[len("openai/"):]
-        base_url = os.getenv("BUILDER_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        base_url = os.getenv("BUILDER_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
         api_key = get_builder_api_key("openai")
         return model_name, base_url, api_key
     # No prefix — use existing defaults
