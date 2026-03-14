@@ -242,7 +242,9 @@ EXCEPTION WHEN others THEN
     RAISE NOTICE 'Skipping HNSW index on memories (dimension > 2000 or other error): %', SQLERRM;
 END $$;
 
--- Hybrid search function: RRF-based fusion of dense, sparse, and recency channels
+-- Hybrid search function: RRF-based fusion of dense, sparse, recency channels.
+-- Dense channel includes both content embeddings AND retrieval message (trigger phrase) embeddings,
+-- taking the best match per memory across both sources.
 CREATE OR REPLACE FUNCTION memory_hybrid_search(
     query_text text,
     query_embedding vector(4096),
@@ -255,10 +257,29 @@ CREATE OR REPLACE FUNCTION memory_hybrid_search(
     importance_floor float DEFAULT 0.0
 ) RETURNS SETOF memories LANGUAGE sql AS $$
 WITH dense AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
-    FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL AND importance >= importance_floor
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
-    ORDER BY rank_ix LIMIT match_count * 2
+    SELECT id, ROW_NUMBER() OVER (ORDER BY best_dist) AS rank_ix
+    FROM (
+        SELECT id, MIN(dist) AS best_dist
+        FROM (
+            -- Content embedding matches
+            SELECT id, embedding <=> query_embedding AS dist
+            FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL AND importance >= importance_floor
+                AND (remaining_turns IS NULL OR remaining_turns <= 0)
+            ORDER BY dist LIMIT match_count * 3
+
+            UNION ALL
+
+            -- Trigger phrase embedding matches → parent memory_id
+            SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
+            FROM memory_retrieval_messages rm
+            INNER JOIN memories m ON rm.memory_id = m.id
+            WHERE m.job_id = job_id_param AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
+                AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
+            ORDER BY dist LIMIT match_count * 5
+        ) all_matches
+        GROUP BY id
+    ) best_per_memory
+    LIMIT match_count * 2
 ),
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix
@@ -286,6 +307,25 @@ ORDER BY ranked.rrf_score DESC
 LIMIT match_count
 $$;
 
+-- Retrieval messages: synthetic trigger phrases for improved recall.
+-- Each memory can have multiple trigger phrases embedded separately,
+-- so retrieval matches against "when would this memory be useful?" queries.
+CREATE TABLE IF NOT EXISTS memory_retrieval_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    message TEXT NOT NULL,
+    embedding vector(4096),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mrm_memory ON memory_retrieval_messages(memory_id);
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_mrm_embedding ON memory_retrieval_messages
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'Skipping HNSW index on memory_retrieval_messages: %', SQLERRM;
+END $$;
+
 -- Project-scoped memory: denormalize project_id for cross-job retrieval
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS project_id UUID;
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
@@ -296,7 +336,8 @@ ALTER TABLE memories ADD COLUMN IF NOT EXISTS remaining_turns INTEGER;
 CREATE INDEX IF NOT EXISTS idx_memories_ttl_active ON memories(job_id, remaining_turns) WHERE remaining_turns > 0;
 CREATE INDEX IF NOT EXISTS idx_memories_project_ttl_active ON memories(project_id, remaining_turns) WHERE remaining_turns > 0;
 
--- Project-scoped hybrid search: identical to memory_hybrid_search but scoped by project_id
+-- Project-scoped hybrid search: identical to memory_hybrid_search but scoped by project_id.
+-- Dense channel includes retrieval message trigger phrases.
 CREATE OR REPLACE FUNCTION memory_project_hybrid_search(
     query_text text,
     query_embedding vector(4096),
@@ -309,10 +350,29 @@ CREATE OR REPLACE FUNCTION memory_project_hybrid_search(
     importance_floor float DEFAULT 0.0
 ) RETURNS SETOF memories LANGUAGE sql AS $$
 WITH dense AS (
-    SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <=> query_embedding) AS rank_ix
-    FROM memories WHERE project_id = project_id_param AND embedding IS NOT NULL AND importance >= importance_floor
-        AND (remaining_turns IS NULL OR remaining_turns <= 0)
-    ORDER BY rank_ix LIMIT match_count * 2
+    SELECT id, ROW_NUMBER() OVER (ORDER BY best_dist) AS rank_ix
+    FROM (
+        SELECT id, MIN(dist) AS best_dist
+        FROM (
+            -- Content embedding matches
+            SELECT id, embedding <=> query_embedding AS dist
+            FROM memories WHERE project_id = project_id_param AND embedding IS NOT NULL AND importance >= importance_floor
+                AND (remaining_turns IS NULL OR remaining_turns <= 0)
+            ORDER BY dist LIMIT match_count * 3
+
+            UNION ALL
+
+            -- Trigger phrase embedding matches → parent memory_id
+            SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
+            FROM memory_retrieval_messages rm
+            INNER JOIN memories m ON rm.memory_id = m.id
+            WHERE m.project_id = project_id_param AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
+                AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
+            ORDER BY dist LIMIT match_count * 5
+        ) all_matches
+        GROUP BY id
+    ) best_per_memory
+    LIMIT match_count * 2
 ),
 sparse AS (
     SELECT id, ROW_NUMBER() OVER (ORDER BY ts_rank_cd(sparse_keywords, websearch_to_tsquery('english', query_text)) DESC) AS rank_ix

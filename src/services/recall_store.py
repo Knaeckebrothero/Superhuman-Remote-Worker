@@ -222,6 +222,7 @@ class RecallStore:
         source_phase: Optional[int] = None,
         token_count: Optional[int] = None,
         remaining_turns: Optional[int] = None,
+        retrieval_messages: Optional[List[str]] = None,
     ) -> Optional[uuid.UUID]:
         """Store a memory with automatic embedding and dedup.
 
@@ -335,6 +336,18 @@ class RecallStore:
             ttl,
         )
 
+        # Store retrieval messages (trigger phrases) if provided
+        if retrieval_messages and mem_id:
+            try:
+                rm_count = await self.store_retrieval_messages(mem_id, retrieval_messages)
+                logger.debug(
+                    f"Stored {rm_count} retrieval messages for memory {mem_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to store retrieval messages for {mem_id}: {e}"
+                )
+
         logger.debug(
             f"Stored memory {mem_id} (type={memory_type}, source={source}, "
             f"importance={importance})"
@@ -355,6 +368,50 @@ class RecallStore:
                 },
             )
         return mem_id
+
+    async def store_retrieval_messages(
+        self,
+        memory_id: uuid.UUID,
+        messages: List[str],
+    ) -> int:
+        """Store retrieval messages (trigger phrases) for a memory.
+
+        Each message is embedded and stored so that hybrid search can match
+        against "when would this memory be useful?" queries in addition to
+        the memory's own content embedding.
+
+        Args:
+            memory_id: UUID of the parent memory
+            messages: List of trigger phrase strings
+
+        Returns:
+            Number of messages successfully stored
+        """
+        if not messages:
+            return 0
+
+        # Batch embed all messages in one API call
+        embeddings = await self.embedding_service.embed_batch(messages)
+
+        stored = 0
+        for msg, emb in zip(messages, embeddings):
+            try:
+                await self.db.execute(
+                    """
+                    INSERT INTO memory_retrieval_messages (memory_id, message, embedding)
+                    VALUES ($1, $2, $3)
+                    """,
+                    memory_id,
+                    msg,
+                    emb,
+                )
+                stored += 1
+            except Exception as e:
+                logger.warning(
+                    f"Failed to store retrieval message for {memory_id}: {e}"
+                )
+
+        return stored
 
     # =========================================================================
     # Deduplication
