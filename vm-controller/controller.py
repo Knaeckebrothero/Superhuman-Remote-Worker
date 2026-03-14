@@ -85,7 +85,9 @@ class VMController:
             "${VM_IMAGE}": job_config.get("vm_image", DEFAULT_VM_IMAGE),
             "${CPU_CORES}": str(job_config.get("cpu_cores", DEFAULT_CPU)),
             "${MEMORY}": job_config.get("memory", DEFAULT_MEMORY),
-            "${NATS_URL}": job_config.get("nats_url", NATS_URL),
+            # Always use the local leaf node URL — the VM runs on this cluster,
+            # not the orchestrator's cluster where the job's nats_url points.
+            "${NATS_URL}": NATS_URL,
             "${DESCRIPTION}": job_config.get("description", ""),
         }
 
