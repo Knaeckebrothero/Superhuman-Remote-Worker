@@ -284,9 +284,15 @@ class NatsBridge:
             }
             if data.get("error"):
                 updates["error"] = data["error"]
+            # VM controller reports the pod IP once the VMI is running —
+            # this is the address agents use for SSH (not the VM's internal
+            # 10.0.2.x masquerade address).
+            if data.get("pod_ip"):
+                updates["pod_ip"] = data["pod_ip"]
 
             logger.info(
-                "VM lifecycle status for job %s: %s", job_id, data.get("status")
+                "VM lifecycle status for job %s: %s (pod_ip=%s)",
+                job_id, data.get("status"), data.get("pod_ip"),
             )
             await self._set_vm_context(job_id, updates)
         except Exception:
@@ -295,7 +301,13 @@ class NatsBridge:
     async def _on_daemon_register(self, msg) -> None:
         """Handle agent.vm.*.register — daemon announces VM is ready.
 
-        Payload: {job_id, hostname, pid, status: "ready"}
+        Payload: {job_id, hostname, ip, pid}
+
+        For SSH access, we prefer the pod_ip (reported earlier by the VM
+        controller) over the daemon's self-reported IP.  The daemon runs
+        inside the VM and sees its masquerade address (10.0.2.x), which
+        is not reachable from cluster pods.  The pod IP (from the VMI
+        status) is the address that agents can actually SSH to.
         """
         try:
             data = json.loads(msg.data.decode())
@@ -303,13 +315,27 @@ class NatsBridge:
             if not job_id:
                 return
 
-            # Prefer explicit IP, fall back to hostname for SSH access
-            ssh_host = data.get("ip") or data.get("hostname")
+            # Prefer the pod IP (set by VM controller) over the daemon's
+            # self-reported IP (which is the VM-internal masquerade address).
+            existing_vm_ctx = {}
+            if self._db:
+                try:
+                    job = await self._db.get_job(job_id)
+                    if job:
+                        ctx = job.get("context") or {}
+                        if isinstance(ctx, str):
+                            ctx = json.loads(ctx)
+                        existing_vm_ctx = ctx.get("vm", {})
+                except Exception:
+                    pass
+
+            pod_ip = existing_vm_ctx.get("pod_ip")
+            daemon_ip = data.get("ip") or data.get("hostname")
+            ssh_host = pod_ip or daemon_ip
+
             logger.info(
-                "Daemon registered for job %s (ssh_host=%s, hostname=%s)",
-                job_id,
-                ssh_host,
-                data.get("hostname"),
+                "Daemon registered for job %s (ssh_host=%s, pod_ip=%s, daemon_ip=%s)",
+                job_id, ssh_host, pod_ip, daemon_ip,
             )
             await self._set_vm_context(job_id, {
                 "status": "ready",
