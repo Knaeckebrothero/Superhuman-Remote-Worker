@@ -1,0 +1,120 @@
+# vm-template.yaml
+#
+# KubeVirt VirtualMachine template for agent jobs.
+# The orchestrator renders this template with job-specific values
+# and applies it to the Harvester cluster via kubectl/API.
+#
+# Placeholders (replaced by orchestrator):
+#   ${JOB_ID}        - Job UUID
+#   ${AGENT_CONFIG}  - Agent config name (e.g., "developer", "scholar")
+#   ${VM_IMAGE}      - Container disk image (e.g., "dockerhub/agent-base:latest")
+#   ${CPU_CORES}     - vCPU count (default: 2)
+#   ${MEMORY}        - RAM allocation (default: 4Gi)
+#   ${NATS_URL}      - NATS server URL on main k3s cluster
+#   ${DESCRIPTION}   - Job description
+
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: agent-vm-${JOB_ID}
+  namespace: agent-vms
+  labels:
+    app: agent-vm
+    job-id: "${JOB_ID}"
+    agent-config: "${AGENT_CONFIG}"
+spec:
+  runStrategy: RerunOnFailure
+
+  template:
+    metadata:
+      labels:
+        app: agent-vm
+        job-id: "${JOB_ID}"
+    spec:
+      domain:
+        cpu:
+          cores: ${CPU_CORES}
+          sockets: 1
+          threads: 1
+        memory:
+          guest: ${MEMORY}
+        devices:
+          disks:
+          - name: rootdisk
+            disk:
+              bus: virtio
+          - name: cloudinit
+            disk:
+              bus: virtio
+          interfaces:
+          - name: default
+            masquerade: {}
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: ${MEMORY}
+
+      networks:
+      - name: default
+        pod: {}
+
+      volumes:
+      # Boot disk from container registry (ephemeral)
+      - name: rootdisk
+        containerDisk:
+          image: ${VM_IMAGE}
+
+      # Per-job cloud-init configuration
+      - name: cloudinit
+        cloudInitNoCloud:
+          userData: |
+            #cloud-config
+            hostname: agent-vm-${JOB_ID}
+
+            write_files:
+            - path: /run/agent/job-config.json
+              permissions: '0644'
+              content: |
+                {
+                  "job_id": "${JOB_ID}",
+                  "agent_config": "${AGENT_CONFIG}",
+                  "description": "${DESCRIPTION}",
+                  "nats_url": "${NATS_URL}"
+                }
+
+            - path: /etc/default/management-daemon
+              permissions: '0644'
+              content: |
+                NATS_URL=nats://10.43.114.69:4222
+                JOB_ID=${JOB_ID}
+
+            - path: /etc/systemd/system/management-daemon.service
+              permissions: '0644'
+              content: |
+                [Unit]
+                Description=SRW Management Daemon
+                After=network-online.target
+                Wants=network-online.target
+                [Service]
+                Type=simple
+                EnvironmentFile=/etc/default/management-daemon
+                ExecStart=/usr/bin/python3 /opt/srw/management-daemon.py
+                Restart=always
+                RestartSec=5
+                StandardOutput=journal+console
+                StandardError=journal+console
+                SyslogIdentifier=management-daemon
+                [Install]
+                WantedBy=multi-user.target
+
+            runcmd:
+            - mkdir -p /run/agent
+            - systemctl daemon-reload
+            - systemctl enable --now management-daemon
+            # Inject SSH authorized key for agent-host (RemoteBackend access)
+            - mkdir -p /home/agent-host/.ssh
+            - echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access" > /home/agent-host/.ssh/authorized_keys
+            - chmod 700 /home/agent-host/.ssh
+            - chmod 600 /home/agent-host/.ssh/authorized_keys
+            - chown -R agent-host:agent-host /home/agent-host/.ssh
