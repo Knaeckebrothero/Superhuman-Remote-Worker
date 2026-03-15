@@ -1263,8 +1263,6 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if metadata.get("requirement_data"):
             req = metadata["requirement_data"]
             requirement_md = self._format_requirement_as_markdown(req)
-            analysis_dir = self._workspace_manager.get_path("analysis")
-            analysis_dir.mkdir(parents=True, exist_ok=True)
             self._workspace_manager.write_file("analysis/requirement_input.md", requirement_md)
             logger.info("Wrote requirement to analysis/requirement_input.md")
 
@@ -1467,7 +1465,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Generate tool documentation in workspace (before overrides so full docstrings are captured)
         tools_dir = self._workspace_manager.get_path("tools")
-        generate_workspace_tool_docs(tool_names, tools_dir, tools=self._tools)
+
+        def _write_tool_doc(rel_path: str, content: str) -> None:
+            self._workspace_manager.write_file(f"tools/{rel_path}", content)
+
+        generate_workspace_tool_docs(tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc)
 
         # Apply description overrides for deferred tools
         # Domain tools get short descriptions; agent reads full docs from workspace
