@@ -5,7 +5,6 @@ _normalize_content (archiver.py) which handle the Responses API
 content block format used by models like GPT-5.2-pro.
 """
 
-import pytest
 from unittest.mock import MagicMock
 
 from src.llm.reasoning_chat import _extract_responses_api_reasoning

@@ -19,7 +19,7 @@ See docs/features/auxiliary.md for the full design document.
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, List, Optional, Type
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (

@@ -30,7 +30,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List
 
 if TYPE_CHECKING:
     from ...services.embedding_service import EmbeddingService

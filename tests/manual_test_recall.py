@@ -256,13 +256,12 @@ async def main():
 
         # Check if expected topics are covered
         all_content = " ".join(m.content.lower() for m in memories)
-        found = [t for t in expected if t.lower() in all_content]
         missing = [t for t in expected if t.lower() not in all_content]
 
         if missing:
             print(f"    WARNING: Missing expected topics: {', '.join(missing)}")
         else:
-            print(f"    OK: All expected topics found in results")
+            print("    OK: All expected topics found in results")
 
     # Cleanup
     print(f"\n{'=' * 70}")

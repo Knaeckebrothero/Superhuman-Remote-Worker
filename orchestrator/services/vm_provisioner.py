@@ -17,10 +17,9 @@ The VM endpoints and lifecycle hooks in main.py use this provisioner exclusively
 """
 
 import asyncio
-import json
 import logging
 import os
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import yaml
 

@@ -4,7 +4,6 @@ Tests _extract_rate_limit_delay, _extract_tool_use_failed,
 _build_tool_use_failed_feedback, _is_tool_error, _extract_markdown_content.
 """
 
-import pytest
 from unittest.mock import MagicMock
 
 from src.graph import (

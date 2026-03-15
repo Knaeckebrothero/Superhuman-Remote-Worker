@@ -3,7 +3,6 @@
 Tests each detection pattern and the overall validate_response function.
 """
 
-import pytest
 
 from src.core.response_validator import (
     ValidationResult,

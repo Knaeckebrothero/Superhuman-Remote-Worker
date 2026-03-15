@@ -4,7 +4,6 @@ Tests create_todos_human_message, create_instruction_tool_messages,
 and is_workspace_injection_message.
 """
 
-import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.core.workspace_injection import (

@@ -9,7 +9,6 @@ Validates:
 """
 
 import asyncio
-import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -17,8 +16,6 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from src.services.auxiliary import (
     AuxiliaryLLM,
-    AuxTask,
-    AuxAgentTask,
     CurateKnowledgeTask,
     ExtractedMemories,
     ExtractedMemory,
@@ -28,8 +25,6 @@ from src.services.auxiliary import (
     _get_message_role,
 )
 from src.core.loader import (
-    AuxiliaryConfig,
-    AuxiliaryTaskConfig,
     _parse_auxiliary_config,
 )
 

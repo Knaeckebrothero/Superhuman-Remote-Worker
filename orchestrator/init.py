@@ -39,10 +39,13 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-# Add project root to path for imports
+# Add project root and orchestrator dir to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
+ORCHESTRATOR_DIR = Path(__file__).parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(ORCHESTRATOR_DIR) not in sys.path:
+    sys.path.insert(0, str(ORCHESTRATOR_DIR))
 
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
@@ -613,7 +616,7 @@ async def _seed_default_users(db) -> None:
     Creates only if no user with the same display_name exists (idempotent).
     Admin credentials come from env vars with sensible defaults.
     """
-    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@cockpit.local")
+    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin")
     ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
     ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Admin")
 

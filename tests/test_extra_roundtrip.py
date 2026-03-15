@@ -5,12 +5,10 @@ survive serialize_resolved_config → load_config_from_resolved without
 double-nesting into extra["extra"].
 """
 
-import dataclasses
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from src.core.loader import (
     AgentConfig,
-    load_agent_config_from_dict,
     load_config_from_resolved,
     serialize_resolved_config,
 )

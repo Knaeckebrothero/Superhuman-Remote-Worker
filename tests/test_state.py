@@ -3,9 +3,8 @@
 Verifies all default values, metadata handling, and type correctness.
 """
 
-import pytest
 
-from src.core.state import create_initial_state, UniversalAgentState
+from src.core.state import create_initial_state
 
 
 class TestCreateInitialState:
