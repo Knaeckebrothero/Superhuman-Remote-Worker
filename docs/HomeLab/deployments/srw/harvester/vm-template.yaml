@@ -83,6 +83,15 @@ spec:
                   "nats_url": "${NATS_URL}"
                 }
 
+            # SSH key MUST be written before the daemon env file, because
+            # the daemon (enabled in image, Restart=always) may auto-start
+            # once it sees valid NATS_URL/JOB_ID. Key must be in place first.
+            - path: /home/agent-host/.ssh/authorized_keys
+              permissions: '0600'
+              owner: agent-host:agent-host
+              content: |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access
+
             - path: /etc/default/management-daemon
               permissions: '0644'
               content: |
@@ -94,7 +103,7 @@ spec:
               content: |
                 [Unit]
                 Description=SRW Management Daemon
-                After=network-online.target
+                After=network-online.target cloud-init.target
                 Wants=network-online.target
                 [Service]
                 Type=simple
@@ -107,14 +116,6 @@ spec:
                 SyslogIdentifier=management-daemon
                 [Install]
                 WantedBy=multi-user.target
-
-            # SSH key for agent-host — write_files runs before runcmd,
-            # ensuring the key is in place before the daemon registers.
-            - path: /home/agent-host/.ssh/authorized_keys
-              permissions: '0600'
-              owner: agent-host:agent-host
-              content: |
-                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access
 
             runcmd:
             - mkdir -p /run/agent
