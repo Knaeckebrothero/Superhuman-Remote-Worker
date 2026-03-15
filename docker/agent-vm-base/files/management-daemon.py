@@ -306,9 +306,29 @@ class ManagementDaemon:
     # Main
     # =========================================================================
 
+    async def _wait_for_cloud_init(self, timeout: int = 120):
+        """Wait for cloud-init to finish before registering.
+
+        Cloud-init writes SSH authorized_keys and job config. The daemon
+        service may start before cloud-init completes (enabled in image),
+        so we wait for the cloud-init sentinel or SSH key to appear.
+        """
+        ssh_key_path = Path("/home/agent-host/.ssh/authorized_keys")
+        for i in range(timeout):
+            if ssh_key_path.exists() and ssh_key_path.stat().st_size > 0:
+                log.info("Cloud-init ready (SSH key present after %ds)", i)
+                return
+            if self._shutdown.is_set():
+                return
+            await asyncio.sleep(1)
+        log.warning("Cloud-init wait timed out after %ds — registering anyway", timeout)
+
     async def run(self):
         """Main entry point."""
         log.info("Management daemon starting (job_id=%s)", self.job_id)
+
+        # Wait for cloud-init to write SSH keys before registering
+        await self._wait_for_cloud_init()
 
         await self.connect_nats()
         if self._shutdown.is_set() or not self.nc:

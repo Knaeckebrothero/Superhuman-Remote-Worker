@@ -157,7 +157,9 @@ sudo chmod 755 /opt/srw/management-daemon.py
 
 sudo cp /tmp/management-daemon.service /etc/systemd/system/management-daemon.service
 sudo systemctl daemon-reload
-sudo systemctl enable management-daemon
+# Don't enable here — cloud-init runcmd starts it with the correct env vars.
+# The daemon's _wait_for_cloud_init() method also ensures SSH keys are in
+# place before registering, as a safety net.
 
 # Create default env file (overwritten by cloud-init at VM creation)
 sudo tee /etc/default/management-daemon > /dev/null <<'EOF'
