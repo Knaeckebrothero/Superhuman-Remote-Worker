@@ -103,7 +103,7 @@ spec:
               content: |
                 [Unit]
                 Description=SRW Management Daemon
-                After=network-online.target cloud-init.target
+                After=network-online.target
                 Wants=network-online.target
                 [Service]
                 Type=simple

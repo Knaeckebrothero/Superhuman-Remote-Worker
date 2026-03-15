@@ -108,6 +108,7 @@ sudo chmod 0440 /etc/sudoers.d/agent-host
 
 # Workspace directory (where the agent operates)
 sudo mkdir -p /home/agent-host/workspace
+sudo chown agent-host:agent-host /home/agent-host/workspace
 
 # SSH key directory (keys injected at runtime by orchestrator or cloud-init)
 sudo mkdir -p /home/agent-host/.ssh
