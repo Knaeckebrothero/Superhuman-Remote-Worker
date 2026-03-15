@@ -167,11 +167,6 @@ class VMController:
                 "namespace": VM_NAMESPACE,
             })
 
-            # Poll for the VMI pod IP in the background — the agent needs
-            # this to SSH into the VM (the VM's internal 10.0.2.x is not
-            # reachable from the cluster network).
-            asyncio.create_task(self._poll_vmi_pod_ip(job_id, vm_name))
-
         except Exception as e:
             job_id = "unknown"
             try:
@@ -292,43 +287,53 @@ class VMController:
             else:
                 await self._publish_status(job_id, error_response)
 
-    async def _poll_vmi_pod_ip(self, job_id: str, vm_name: str):
-        """Poll for the virt-launcher pod IP, then publish it.
+    async def handle_pod_ip_query(self, msg):
+        """Handle vm.lifecycle.pod-ip — look up the virt-launcher pod IP.
 
-        The agent needs the pod IP (not the VM's internal 10.0.2.x) to
-        SSH into the VM.  We query the virt-launcher pod directly since
-        that always reflects the correct cluster-routable address,
-        regardless of the KubeVirt network binding mode.
+        The orchestrator calls this (request/reply) when the management
+        daemon registers, to get the cluster-routable IP for SSH access
+        (the daemon only knows its internal 10.0.2.x masquerade address).
+
+        Expected payload: {"job_id": "uuid"}
+        Response: {"job_id": "...", "pod_ip": "10.42.x.x"} or {"error": "..."}
         """
         from kubernetes import client
 
-        core_v1 = client.CoreV1Api()
+        try:
+            data = json.loads(msg.data.decode())
+            job_id = data["job_id"]
+            vm_name = f"agent-vm-{job_id}"
 
-        for attempt in range(30):  # ~5 minutes max
-            await asyncio.sleep(10)
+            core_v1 = client.CoreV1Api()
+            pods = core_v1.list_namespaced_pod(
+                VM_NAMESPACE,
+                label_selector=f"kubevirt.io/domain={vm_name}",
+            )
+
+            pod_ip = None
+            for pod in pods.items:
+                if pod.status and pod.status.pod_ip:
+                    pod_ip = pod.status.pod_ip
+                    break
+
+            response = {"job_id": job_id, "pod_ip": pod_ip}
+            log.info("Pod IP query for %s: %s", vm_name, pod_ip)
+
+            if msg.reply:
+                await self.nc.publish(msg.reply, json.dumps(response).encode())
+
+        except Exception as e:
+            job_id = "unknown"
             try:
-                pods = core_v1.list_namespaced_pod(
-                    VM_NAMESPACE,
-                    label_selector=f"kubevirt.io/domain={vm_name}",
+                job_id = json.loads(msg.data.decode()).get("job_id", "unknown")
+            except Exception:
+                pass
+            log.exception("Failed pod-ip query for job %s", job_id)
+            if msg.reply:
+                await self.nc.publish(
+                    msg.reply,
+                    json.dumps({"job_id": job_id, "error": str(e)}).encode(),
                 )
-                for pod in pods.items:
-                    pod_ip = pod.status.pod_ip if pod.status else None
-                    if pod_ip:
-                        log.info(
-                            "VM %s pod IP: %s (attempt %d)",
-                            vm_name, pod_ip, attempt + 1,
-                        )
-                        await self._publish_status(job_id, {
-                            "job_id": job_id,
-                            "status": "running",
-                            "vm_name": vm_name,
-                            "namespace": VM_NAMESPACE,
-                            "pod_ip": pod_ip,
-                        })
-                        return
-            except Exception as e:
-                log.debug("VM %s pod not ready yet: %s", vm_name, e)
-        log.warning("Gave up waiting for VM %s pod IP", vm_name)
 
     async def _publish_status(self, job_id: str, payload: dict):
         """Publish a status message on vm.lifecycle.status."""
@@ -352,8 +357,9 @@ class VMController:
         await self.nc.subscribe("vm.lifecycle.create", cb=self.handle_create)
         await self.nc.subscribe("vm.lifecycle.delete", cb=self.handle_delete)
         await self.nc.subscribe("vm.lifecycle.get", cb=self.handle_status_query)
+        await self.nc.subscribe("vm.lifecycle.pod-ip", cb=self.handle_pod_ip_query)
         log.info(
-            "Subscribed to vm.lifecycle.{create,delete,get} — waiting for requests"
+            "Subscribed to vm.lifecycle.{create,delete,get,pod-ip} — waiting for requests"
         )
 
         # Wait for shutdown signal

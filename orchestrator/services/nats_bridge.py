@@ -284,15 +284,12 @@ class NatsBridge:
             }
             if data.get("error"):
                 updates["error"] = data["error"]
-            # VM controller reports the pod IP once the VMI is running —
-            # this is the address agents use for SSH (not the VM's internal
-            # 10.0.2.x masquerade address).
+            # Store pod_ip if reported (future-proofing)
             if data.get("pod_ip"):
                 updates["pod_ip"] = data["pod_ip"]
 
             logger.info(
-                "VM lifecycle status for job %s: %s (pod_ip=%s)",
-                job_id, data.get("status"), data.get("pod_ip"),
+                "VM lifecycle status for job %s: %s", job_id, data.get("status")
             )
             await self._set_vm_context(job_id, updates)
         except Exception:
@@ -315,22 +312,23 @@ class NatsBridge:
             if not job_id:
                 return
 
-            # Prefer the pod IP (set by VM controller) over the daemon's
-            # self-reported IP (which is the VM-internal masquerade address).
-            existing_vm_ctx = {}
-            if self._db:
-                try:
-                    job = await self._db.get_job(job_id)
-                    if job:
-                        ctx = job.get("context") or {}
-                        if isinstance(ctx, str):
-                            ctx = json.loads(ctx)
-                        existing_vm_ctx = ctx.get("vm", {})
-                except Exception:
-                    pass
-
-            pod_ip = existing_vm_ctx.get("pod_ip")
+            # Query the VM controller for the virt-launcher pod IP.
+            # The daemon's self-reported IP is the VM-internal masquerade
+            # address (10.0.2.x) which is not reachable from cluster pods.
             daemon_ip = data.get("ip") or data.get("hostname")
+            pod_ip = None
+            if self._nc and self._nc.is_connected:
+                try:
+                    reply = await self._nc.request(
+                        "vm.lifecycle.pod-ip",
+                        json.dumps({"job_id": job_id}).encode(),
+                        timeout=5.0,
+                    )
+                    pod_data = json.loads(reply.data.decode())
+                    pod_ip = pod_data.get("pod_ip")
+                except Exception as e:
+                    logger.warning("Failed to query pod IP for job %s: %s", job_id, e)
+
             ssh_host = pod_ip or daemon_ip
 
             logger.info(
