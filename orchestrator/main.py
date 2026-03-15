@@ -379,10 +379,11 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             remote.setdefault("host", vm_ctx["ssh_host"])
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
             remote.setdefault("username", "agent-host")
+            remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-worker/workspace")
             logger.info(
                 f"Dispatch: injected VM workspace config for job {job_id} "
-                f"(host={vm_ctx['ssh_host']})"
+                f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
 
         # Build job start request
@@ -473,10 +474,11 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             remote.setdefault("host", vm_ctx["ssh_host"])
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
             remote.setdefault("username", "agent-host")
+            remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
             remote.setdefault("workspace_path", "/home/agent-worker/workspace")
             logger.info(
                 f"Resume dispatch: injected VM workspace config for job {job_id} "
-                f"(host={vm_ctx['ssh_host']})"
+                f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
 
         # Extract queued feedback (stored by resume endpoint when no agent was available)
