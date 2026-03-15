@@ -323,7 +323,7 @@ class NatsBridge:
             if nc_connected:
                 try:
                     reply = await self._nc.request(
-                        "vm.lifecycle.pod-ip",
+                        "vm.query.pod-ip",
                         json.dumps({"job_id": job_id}).encode(),
                         timeout=5.0,
                     )
