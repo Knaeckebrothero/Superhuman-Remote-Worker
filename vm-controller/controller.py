@@ -405,6 +405,19 @@ class VMController:
             nodeport = created.spec.ports[0].node_port
             log.info("SSH service created: %s (NodePort %d)", svc_name, nodeport)
             return nodeport
+        except client.exceptions.ApiException as e:
+            if e.status == 409:
+                # Service already exists — read the existing one
+                try:
+                    existing = self.core_v1.read_namespaced_service(svc_name, VM_NAMESPACE)
+                    nodeport = existing.spec.ports[0].node_port
+                    log.info("SSH service already exists: %s (NodePort %d)", svc_name, nodeport)
+                    return nodeport
+                except Exception:
+                    log.exception("Failed to read existing SSH service for %s", vm_name)
+                    return None
+            log.exception("Failed to create SSH service for %s", vm_name)
+            return None
         except Exception:
             log.exception("Failed to create SSH service for %s", vm_name)
             return None

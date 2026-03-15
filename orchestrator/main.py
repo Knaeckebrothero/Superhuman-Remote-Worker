@@ -19,6 +19,13 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 load_dotenv(find_dotenv())
+
+# Configure application-level logging (Uvicorn only configures its own loggers)
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 from datetime import date, datetime, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from typing import Any  # noqa: E402
@@ -302,7 +309,6 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
     Extracted from assign_job_to_agent() endpoint. Handles datasource resolution,
     config overrides, HTTP POST to agent pod, and status updates.
     """
-    import httpx
 
     job_id = str(job["id"])
     agent_id = str(agent["id"])
@@ -441,7 +447,6 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
 
 async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
     """Resume a paused job on an agent. Returns True on success."""
-    import httpx
 
     job_id = str(job["id"])
     agent_id = str(agent["id"])
@@ -539,7 +544,6 @@ async def _initiate_pause(job: dict) -> None:
     The agent will finish its current node, save checkpoint, and become available.
     The actual dispatch of the high-priority job happens on the next dispatcher cycle.
     """
-    import httpx
 
     job_id = str(job["id"])
     agent_id = str(job.get("assigned_agent_id", ""))
@@ -1660,7 +1664,6 @@ async def cancel_job(job_id: str) -> dict[str, str]:
     If the job is assigned to an agent, this will also send a cancel request
     to the agent pod.
     """
-    import httpx
 
     try:
         # First get the job to check if it's assigned to an agent
@@ -1740,7 +1743,6 @@ async def pause_job(job_id: str) -> dict[str, str]:
     The paused job re-enters the dispatch queue and will be auto-resumed
     when an agent becomes available.
     """
-    import httpx
 
     try:
         job = await postgres_db.get_job(job_id)
@@ -1929,7 +1931,6 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
     Returns:
         Status message indicating resume result
     """
-    import httpx
 
     if request is None:
         request = JobResumeRequest()
@@ -2542,7 +2543,6 @@ async def _handle_critic_verdict_on_complete(
     """
     from services.completion import (
         _parse_freeze_data,
-        get_curation_config,
         is_curation_enabled,
     )
 
@@ -4702,7 +4702,6 @@ async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
     Returns CPU, memory, disk, processes, listening ports, and network
     connections from the agent's container.
     """
-    import httpx
 
     try:
         agent = await postgres_db.get_agent(agent_id)
@@ -4781,13 +4780,13 @@ async def get_job_logs(
         if level_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
             raise HTTPException(status_code=400, detail=f"Invalid level: {level}. Must be DEBUG, INFO, WARNING, or ERROR")
         pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{level_upper}\s+-")
-        all_lines = [l for l in all_lines if pattern.match(l)]
+        all_lines = [line for line in all_lines if pattern.match(line)]
         filtered = True
 
     # Grep filter
     if grep:
         grep_lower = grep.lower()
-        all_lines = [l for l in all_lines if grep_lower in l.lower()]
+        all_lines = [line for line in all_lines if grep_lower in line.lower()]
         filtered = True
 
     total_lines = len(all_lines)
