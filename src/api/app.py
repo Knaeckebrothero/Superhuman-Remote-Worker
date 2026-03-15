@@ -579,7 +579,6 @@ async def _update_job_status_from_result(job_id: str, result: Dict[str, Any]) ->
         return
 
     try:
-        import json as _json
 
         error = result.get("error")
         should_stop = result.get("should_stop", False)

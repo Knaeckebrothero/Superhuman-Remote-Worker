@@ -2511,8 +2511,8 @@ class PostgresDB:
                 updates = []
                 params = []
                 idx = 1
-                # Update email if provided and currently NULL
-                if email and existing["email"] is None:
+                # Update email if provided and different
+                if email and email != existing.get("email"):
                     updates.append(f"email = ${idx}")
                     params.append(email)
                     idx += 1

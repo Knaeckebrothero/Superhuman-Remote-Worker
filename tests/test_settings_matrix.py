@@ -1,7 +1,5 @@
 """Tests for settings matrix: model-family-specific inference defaults."""
 
-import os
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 

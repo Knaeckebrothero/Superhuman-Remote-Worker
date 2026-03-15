@@ -9,7 +9,6 @@ Covers:
 - Password hashing and validation
 """
 
-import hashlib
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -824,7 +823,6 @@ class TestMcpTokenEndpoints:
 
         # Simulate the endpoint logic directly
         from security.auth import get_current_user
-        from fastapi import HTTPException
 
         request = MagicMock()
         request.cookies = {"session": "valid-key"}
@@ -838,7 +836,7 @@ class TestMcpTokenEndpoints:
     @pytest.mark.asyncio
     async def test_non_admin_cannot_create_full_access_token(self, mock_db):
         """Non-admin user should get 403 for scope='all'."""
-        regular_user = self._setup_auth(mock_db, is_admin=False)
+        self._setup_auth(mock_db, is_admin=False)
 
         from security.auth import get_current_user
 
@@ -853,7 +851,7 @@ class TestMcpTokenEndpoints:
     @pytest.mark.asyncio
     async def test_non_admin_can_create_user_scope_token(self, mock_db):
         """Non-admin user should be able to create scope='user' tokens."""
-        regular_user = self._setup_auth(mock_db, is_admin=False)
+        self._setup_auth(mock_db, is_admin=False)
 
         from security.auth import get_current_user
 

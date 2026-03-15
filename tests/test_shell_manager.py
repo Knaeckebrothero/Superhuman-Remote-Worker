@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
     reason="tmux not installed"
 )
 
-from src.tools.coding.shell_manager import ShellManager, ShellTab, TAB_NAME_PATTERN
+from src.tools.coding.shell_manager import ShellManager, TAB_NAME_PATTERN  # noqa: E402
 
 
 @pytest.fixture

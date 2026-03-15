@@ -6,7 +6,7 @@ message formatting for the extraction LLM.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -240,7 +240,7 @@ class TestFormatMessages:
         result = MemoryObserver._format_messages_for_extraction(messages)
         assert "[User] Hello" in result
         assert "[User] World" in result
-        lines = [l for l in result.split("\n\n") if l.strip()]
+        lines = [line for line in result.split("\n\n") if line.strip()]
         assert len(lines) == 2
 
     def test_truncates_long_tool_results(self):

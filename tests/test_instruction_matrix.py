@@ -1,7 +1,6 @@
 """Tests for instruction matrix resolution: InstructionMatrixResolver."""
 
 import textwrap
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +13,6 @@ from src.core.loader import (
     PromptMatrixResolver,
     PromptResolver,
     load_instructions,
-    load_strategic_todos_template,
     serialize_resolved_config,
     load_config_from_resolved,
 )

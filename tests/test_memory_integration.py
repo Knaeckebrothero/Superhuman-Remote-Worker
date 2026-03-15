@@ -5,12 +5,10 @@ keyword extraction, and Phase 3 additions
 (memory_observer field, turn_count state, observer window truncation).
 """
 
-import uuid
 from dataclasses import dataclass
 from typing import List, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
-import pytest
 
 from src.services.recall_store import extract_keywords
 from src.tools.context import ToolContext

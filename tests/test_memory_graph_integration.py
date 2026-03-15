@@ -7,20 +7,17 @@ Migration note: Memory extraction was migrated from MemoryObserver to
 AuxiliaryLLM.chain(ExtractMemoriesTask). See docs/features/auxiliary.md.
 """
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
 from src.services.auxiliary import (
     AuxiliaryLLM,
     ExtractedMemories,
     ExtractedMemory,
-    ExtractMemoriesTask,
     _should_extract_memories,
     extract_and_store_memories,
-    _MAX_OBSERVATION_WINDOW,
 )
 from src.tools.context import ToolContext
 
@@ -192,7 +189,6 @@ class TestExtractAndStoreMemories:
         )
 
         # Verify the task received capped messages
-        call_args = structured.ainvoke.call_args[0][0]
         # The HumanMessage context was built from capped messages
         assert structured.ainvoke.called
 

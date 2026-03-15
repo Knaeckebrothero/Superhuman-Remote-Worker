@@ -6,7 +6,6 @@ trim_messages, and sanitize_message_history.
 """
 
 import pytest
-from unittest.mock import MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.core.context import ContextManager, ContextConfig, sanitize_message_history

@@ -5,7 +5,7 @@ registration, and instruction enforcement wrappers.
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from dataclasses import dataclass
 
 from src.tools.registry import (
@@ -18,7 +18,6 @@ from src.tools.registry import (
     get_phase_tool_summary,
     load_tools,
     load_tools_for_phase,
-    load_tools_by_category,
     register_tool,
     unregister_tool,
     apply_instruction_enforcement,
@@ -518,7 +517,6 @@ class TestApplyInstructionEnforcement:
             )
         ]
         tool = self._make_tool("next_phase_todos")
-        original_func = tool.func
         tools = [tool]
         apply_instruction_enforcement(tools, ctx)
 
