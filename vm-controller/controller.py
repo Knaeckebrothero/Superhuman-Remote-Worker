@@ -167,6 +167,11 @@ class VMController:
                 "namespace": VM_NAMESPACE,
             })
 
+            # Poll for the VMI pod IP in the background — the agent needs
+            # this to SSH into the VM (the VM's internal 10.0.2.x is not
+            # reachable from the cluster network).
+            asyncio.create_task(self._poll_vmi_pod_ip(job_id, vm_name))
+
         except Exception as e:
             job_id = "unknown"
             try:
@@ -286,6 +291,44 @@ class VMController:
                 await self.nc.publish(msg.reply, json.dumps(error_response).encode())
             else:
                 await self._publish_status(job_id, error_response)
+
+    async def _poll_vmi_pod_ip(self, job_id: str, vm_name: str):
+        """Poll for the virt-launcher pod IP, then publish it.
+
+        The agent needs the pod IP (not the VM's internal 10.0.2.x) to
+        SSH into the VM.  We query the virt-launcher pod directly since
+        that always reflects the correct cluster-routable address,
+        regardless of the KubeVirt network binding mode.
+        """
+        from kubernetes import client
+
+        core_v1 = client.CoreV1Api()
+
+        for attempt in range(30):  # ~5 minutes max
+            await asyncio.sleep(10)
+            try:
+                pods = core_v1.list_namespaced_pod(
+                    VM_NAMESPACE,
+                    label_selector=f"kubevirt.io/domain={vm_name}",
+                )
+                for pod in pods.items:
+                    pod_ip = pod.status.pod_ip if pod.status else None
+                    if pod_ip:
+                        log.info(
+                            "VM %s pod IP: %s (attempt %d)",
+                            vm_name, pod_ip, attempt + 1,
+                        )
+                        await self._publish_status(job_id, {
+                            "job_id": job_id,
+                            "status": "running",
+                            "vm_name": vm_name,
+                            "namespace": VM_NAMESPACE,
+                            "pod_ip": pod_ip,
+                        })
+                        return
+            except Exception as e:
+                log.debug("VM %s pod not ready yet: %s", vm_name, e)
+        log.warning("Gave up waiting for VM %s pod IP", vm_name)
 
     async def _publish_status(self, job_id: str, payload: dict):
         """Publish a status message on vm.lifecycle.status."""
