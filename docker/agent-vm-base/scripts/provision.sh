@@ -9,7 +9,7 @@
 #   - Node.js 22 + npm + Angular CLI + TypeScript
 #   - Management daemon (NATS bridge to orchestrator)
 #   - SSH server configured for RemoteBackend
-#   - User setup (agent-host for SSH, agent-worker workspace)
+#   - User setup (agent-host for SSH + workspace)
 #
 # Run by Packer as a shell provisioner.
 # =============================================================================
@@ -107,9 +107,7 @@ echo "agent-host ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/agent-host
 sudo chmod 0440 /etc/sudoers.d/agent-host
 
 # Workspace directory (where the agent operates)
-sudo mkdir -p /home/agent-worker/workspace
-sudo chown agent-host:agent-host /home/agent-worker
-sudo chown agent-host:agent-host /home/agent-worker/workspace
+sudo mkdir -p /home/agent-host/workspace
 
 # SSH key directory (keys injected at runtime by orchestrator or cloud-init)
 sudo mkdir -p /home/agent-host/.ssh

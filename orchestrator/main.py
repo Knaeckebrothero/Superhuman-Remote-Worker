@@ -40,7 +40,6 @@ from security.auth import (  # noqa: E402
     get_current_user,
     cleanup_expired_sessions,
 )
-from security.auth_mode import get_auth_mode  # noqa: E402
 from security.csrf import validate_csrf_token  # noqa: E402
 from security.password import hash_password, verify_password, validate_password_strength  # noqa: E402
 from services.email import email_service  # noqa: E402
@@ -380,7 +379,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
             remote.setdefault("username", "agent-host")
             remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
-            remote.setdefault("workspace_path", "/home/agent-worker/workspace")
+            remote.setdefault("workspace_path", "/home/agent-host/workspace")
             logger.info(
                 f"Dispatch: injected VM workspace config for job {job_id} "
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
@@ -475,7 +474,7 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             remote.setdefault("port", vm_ctx.get("ssh_port", 22))
             remote.setdefault("username", "agent-host")
             remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
-            remote.setdefault("workspace_path", "/home/agent-worker/workspace")
+            remote.setdefault("workspace_path", "/home/agent-host/workspace")
             logger.info(
                 f"Resume dispatch: injected VM workspace config for job {job_id} "
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
@@ -5313,47 +5312,27 @@ def _generate_verification_code() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
 
 
-@app.get("/api/auth/mode")
-async def auth_mode_endpoint() -> dict[str, str]:
-    """Return the current auth mode so the frontend knows which UI to show."""
-    return {"mode": get_auth_mode()}
-
-
 @app.post("/api/auth/login")
 async def auth_login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
-    """Login with email (dev mode) or email + password (production mode)."""
+    """Login with email + password."""
     email = body.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email is required")
 
-    mode = get_auth_mode()
+    if not body.password:
+        raise HTTPException(status_code=400, detail="Password is required")
 
-    if mode == "dev":
-        # Dev mode: find or create user by email (no password)
-        user = await postgres_db.get_user_by_email(email)
-        if not user:
-            display_name = email.split("@")[0].title()
-            user, project = await postgres_db.create_user_with_default_project(
-                display_name=display_name, email=email,
-            )
-            logger.info(f"Created new user via dev login: {email}")
-            await _create_gitea_repo_for_project(user, project)
-    else:
-        # Production mode: require password
-        if not body.password:
-            raise HTTPException(status_code=400, detail="Password is required")
+    user_auth = await postgres_db.get_user_by_email_with_auth(email)
+    if not user_auth:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        user_auth = await postgres_db.get_user_by_email_with_auth(email)
-        if not user_auth:
-            raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user_auth.get("email_verified"):
+        raise HTTPException(status_code=403, detail="Email not verified. Check your inbox.")
 
-        if not user_auth.get("email_verified"):
-            raise HTTPException(status_code=403, detail="Email not verified. Check your inbox.")
+    if not user_auth.get("password_hash") or not verify_password(body.password, user_auth["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
-        if not user_auth.get("password_hash") or not verify_password(body.password, user_auth["password_hash"]):
-            raise HTTPException(status_code=401, detail="Invalid email or password")
-
-        user = user_auth
+    user = user_auth
 
     # Create session (shared between dev and production)
     session_key, csrf_token = await create_session(
@@ -5373,9 +5352,6 @@ async def auth_register(body: RegisterRequest) -> dict[str, str]:
 
     Creates an unverified user and sends a verification email.
     """
-    if get_auth_mode() == "dev":
-        raise HTTPException(status_code=404, detail="Not found")
-
     email = body.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email is required")
@@ -5437,9 +5413,6 @@ async def auth_verify(body: VerifyEmailRequest) -> dict[str, str]:
 @app.post("/api/auth/resend-verification")
 async def auth_resend_verification(body: PasswordResetRequest) -> dict[str, str]:
     """Resend verification code (rate-limited: 60s cooldown)."""
-    if get_auth_mode() == "dev":
-        raise HTTPException(status_code=404, detail="Not found")
-
     email = body.email.strip().lower()
     user = await postgres_db.get_user_by_email_with_auth(email)
     if not user:
@@ -5474,9 +5447,6 @@ async def auth_resend_verification(body: PasswordResetRequest) -> dict[str, str]
 @app.post("/api/auth/forgot-password")
 async def auth_forgot_password(body: PasswordResetRequest) -> dict[str, str]:
     """Request a password reset code. Always returns 200 (don't leak email existence)."""
-    if get_auth_mode() == "dev":
-        raise HTTPException(status_code=404, detail="Not found")
-
     email = body.email.strip().lower()
     user = await postgres_db.get_user_by_email_with_auth(email)
 
@@ -5497,9 +5467,6 @@ async def auth_forgot_password(body: PasswordResetRequest) -> dict[str, str]:
 @app.post("/api/auth/reset-password")
 async def auth_reset_password(body: PasswordResetConfirm) -> dict[str, str]:
     """Reset password using a verification code."""
-    if get_auth_mode() == "dev":
-        raise HTTPException(status_code=404, detail="Not found")
-
     email = body.email.strip().lower()
     code = body.code.strip()
 
