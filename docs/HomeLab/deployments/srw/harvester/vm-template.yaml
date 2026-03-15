@@ -108,13 +108,15 @@ spec:
                 [Install]
                 WantedBy=multi-user.target
 
+            # SSH key for agent-host — write_files runs before runcmd,
+            # ensuring the key is in place before the daemon registers.
+            - path: /home/agent-host/.ssh/authorized_keys
+              permissions: '0600'
+              owner: agent-host:agent-host
+              content: |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access
+
             runcmd:
             - mkdir -p /run/agent
             - systemctl daemon-reload
             - systemctl enable --now management-daemon
-            # Inject SSH authorized key for agent-host (RemoteBackend access)
-            - mkdir -p /home/agent-host/.ssh
-            - echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access" > /home/agent-host/.ssh/authorized_keys
-            - chmod 700 /home/agent-host/.ssh
-            - chmod 600 /home/agent-host/.ssh/authorized_keys
-            - chown -R agent-host:agent-host /home/agent-host/.ssh
