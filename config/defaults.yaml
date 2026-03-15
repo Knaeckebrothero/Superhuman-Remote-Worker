@@ -40,7 +40,7 @@ workspace:
   #   port: 22
   #   username: agent-host
   #   key_path: /run/secrets/vm-ssh-key               # Path to SSH private key
-  #   workspace_path: /home/agent-worker/workspace    # Workspace root on the VM
+  #   workspace_path: /home/agent-host/workspace    # Workspace root on the VM
 
 tools:
   # Workspace tools - file operations (src/tools/workspace/)

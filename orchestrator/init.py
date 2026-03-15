@@ -614,20 +614,19 @@ async def _seed_default_users(db) -> None:
     Admin credentials come from env vars with sensible defaults.
     """
     ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@cockpit.local")
-    ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+    ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
     ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Admin")
 
-    # Admin user (always seeded)
+    # Admin user (always seeded with password and verified)
+    from security.password import hash_password
     admin_kwargs = {
         "display_name": ADMIN_DISPLAY_NAME,
         "avatar_color": "#f38ba8",
         "email": ADMIN_EMAIL,
         "is_admin": True,
+        "password_hash": hash_password(ADMIN_PASSWORD),
+        "email_verified": True,
     }
-    if ADMIN_PASSWORD:
-        from security.password import hash_password
-        admin_kwargs["password_hash"] = hash_password(ADMIN_PASSWORD)
-        admin_kwargs["email_verified"] = True
 
     default_users = [
         admin_kwargs,

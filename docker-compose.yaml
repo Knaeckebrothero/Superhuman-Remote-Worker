@@ -236,7 +236,8 @@ services:
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
       # Authentication
-      AUTH_MODE: ${AUTH_MODE:-production}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cockpit.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}

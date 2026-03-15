@@ -291,11 +291,7 @@ export class RegisterComponent implements OnInit {
   readonly error = signal('');
   readonly success = signal('');
 
-  ngOnInit(): void {
-    if (this.userService.authMode() === 'dev') {
-      this.router.navigate(['/login']);
-    }
-  }
+  ngOnInit(): void {}
 
   canRegister(): boolean {
     return (

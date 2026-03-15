@@ -27,16 +27,14 @@ import { UserService } from '../../core/services/user.service';
             autofocus
           />
 
-          @if (userService.authMode() === 'production') {
-            <input
-              type="password"
-              class="form-input"
-              placeholder="Password"
-              [(ngModel)]="password"
-              (keyup.enter)="login()"
-              [disabled]="loading()"
-            />
-          }
+          <input
+            type="password"
+            class="form-input"
+            placeholder="Password"
+            [(ngModel)]="password"
+            (keyup.enter)="login()"
+            [disabled]="loading()"
+          />
 
           <button
             class="login-button"
@@ -53,12 +51,10 @@ import { UserService } from '../../core/services/user.service';
             <p class="error-message">{{ error() }}</p>
           }
 
-          @if (userService.authMode() === 'production') {
-            <div class="auth-links">
-              <a routerLink="/register">Create Account</a>
-              <a routerLink="/forgot-password">Forgot Password?</a>
-            </div>
-          }
+          <div class="auth-links">
+            <a routerLink="/register">Create Account</a>
+            <a routerLink="/forgot-password">Forgot Password?</a>
+          </div>
         </div>
       </div>
     </div>
@@ -216,7 +212,7 @@ export class LoginComponent implements OnInit {
 
   canSubmit(): boolean {
     if (!this.email.trim()) return false;
-    if (this.userService.authMode() === 'production' && !this.password) return false;
+    if (!this.password) return false;
     return true;
   }
 
@@ -226,9 +222,7 @@ export class LoginComponent implements OnInit {
     this.loading.set(true);
     this.error.set('');
 
-    const pw = this.userService.authMode() === 'production' ? this.password : undefined;
-
-    this.userService.login(this.email.trim(), pw).subscribe({
+    this.userService.login(this.email.trim(), this.password).subscribe({
       next: (user) => {
         this.loading.set(false);
         if (user) {

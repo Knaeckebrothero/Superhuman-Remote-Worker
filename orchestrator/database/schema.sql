@@ -31,9 +31,8 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ============================================================================
 -- 0. USERS TABLE
--- User identity with optional password-based authentication.
--- In dev mode (AUTH_MODE=dev) only email is used (no password).
--- In production mode, password_hash and email_verified are required.
+-- User identity with password-based authentication.
+-- password_hash and email_verified are required for login.
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS users (
