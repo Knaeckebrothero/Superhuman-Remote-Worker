@@ -55,7 +55,7 @@ The VM workspace backend is a **transparent proxy**, not a "run the agent inside
 Agent Pod (main cluster)              VM (agent cluster)
   ├─ LLM calls                        ├─ Filesystem (workspace files)
   ├─ Tool logic                        ├─ tmux sessions (shell commands)
-  └─ WorkspaceManager ──SSH/SFTP──►    └─ /home/agent-worker/workspace/
+  └─ WorkspaceManager ──SSH/SFTP──►    └─ /home/agent-host/workspace/
 ```
 
 The agent pod runs on the main cluster. All file I/O and shell commands are forwarded to the VM over SSH/SFTP via `RemoteBackend` (`src/core/backends/remote.py`). This gives fault isolation — VM destruction doesn't crash the agent, and phase snapshots are pulled to the pod at phase boundaries for recovery.

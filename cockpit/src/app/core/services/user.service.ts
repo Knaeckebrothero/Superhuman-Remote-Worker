@@ -1,18 +1,14 @@
 import { Injectable, signal, computed, inject } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { Observable, catchError, map, of, tap, throwError } from 'rxjs';
-import { AuthMode, User } from '../models/api.model';
+import { User } from '../models/api.model';
 import { ApiService } from './api.service';
 import { environment } from '../environment';
 
 /**
  * Manages user identity via session-based authentication.
  *
- * Supports two auth modes (controlled by backend AUTH_MODE env var):
- * - dev:        Email-only login, no password required
- * - production: Email + password, with email verification and password reset
- *
- * Login: POST /api/auth/login with email (+password in production mode).
+ * Login: POST /api/auth/login with email + password.
  * Session check: GET /api/auth/me → returns current user from session.
  * Logout: POST /api/auth/logout → clears session cookie.
  */
@@ -37,25 +33,9 @@ export class UserService {
   /** Convenience: current user's ID (used by job-create, job-list, builder). */
   readonly currentUserId = computed(() => this.currentUser()?.id ?? null);
 
-  /** Auth mode from backend: 'dev' or 'production'. */
-  readonly authMode = signal<AuthMode>('dev');
-
   constructor() {
-    this.checkAuthMode();
     this.checkSession();
     this.loadUsers();
-  }
-
-  // ===========================================================================
-  // Auth Mode
-  // ===========================================================================
-
-  /** Fetch auth mode from backend (dev or production). */
-  checkAuthMode(): void {
-    this.http
-      .get<{ mode: AuthMode }>(`${this.baseUrl}/auth/mode`)
-      .pipe(catchError(() => of({ mode: 'dev' as AuthMode })))
-      .subscribe((res) => this.authMode.set(res.mode));
   }
 
   // ===========================================================================
@@ -80,11 +60,10 @@ export class UserService {
       });
   }
 
-  /** Login with email (dev) or email + password (production).
+  /** Login with email + password.
    *  Errors are propagated so callers can show specific messages (401, 403). */
-  login(email: string, password?: string): Observable<User | null> {
-    const body: Record<string, string> = { email };
-    if (password) body['password'] = password;
+  login(email: string, password: string): Observable<User | null> {
+    const body = { email, password };
 
     return this.http
       .post<{ user: User; csrf_token?: string; message: string }>(
@@ -118,7 +97,7 @@ export class UserService {
   }
 
   // ===========================================================================
-  // Registration & Verification (production mode)
+  // Registration & Verification
   // ===========================================================================
 
   /** Register a new account. Returns the API response or throws on error. */
@@ -147,7 +126,7 @@ export class UserService {
   }
 
   // ===========================================================================
-  // Password Reset (production mode)
+  // Password Reset
   // ===========================================================================
 
   /** Request a password reset code. */

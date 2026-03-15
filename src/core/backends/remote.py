@@ -86,7 +86,7 @@ class RemoteBackend(WorkspaceBackend):
         port: int = 22,
         username: str = "agent-host",
         key_path: Optional[str] = None,
-        workspace_path: str = "/home/agent-worker/workspace",
+        workspace_path: str = "/home/agent-host/workspace",
         job_id: str = "",
         scrollback_limit: int = 5000,
         default_timeout: int = 120,

@@ -276,11 +276,7 @@ export class ForgotPasswordComponent implements OnInit {
   readonly loading = signal(false);
   readonly error = signal('');
 
-  ngOnInit(): void {
-    if (this.userService.authMode() === 'dev') {
-      this.router.navigate(['/login']);
-    }
-  }
+  ngOnInit(): void {}
 
   requestReset(): void {
     if (!this.email.trim() || this.loading()) return;

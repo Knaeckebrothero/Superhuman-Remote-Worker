@@ -126,11 +126,6 @@ export interface DatasourceTestResult {
 // =============================================================================
 
 /**
- * Auth mode: 'dev' (email only) or 'production' (email + password).
- */
-export type AuthMode = 'dev' | 'production';
-
-/**
  * User identity with optional email for session-based auth.
  */
 export interface User {

@@ -247,7 +247,7 @@ class RemoteBackend(WorkspaceBackend):
         port: int = 22,
         username: str = "agent-host",
         key_path: Optional[str] = None,
-        workspace_path: str = "/home/agent-worker/workspace",
+        workspace_path: str = "/home/agent-host/workspace",
         job_id: str = "",
         scrollback_limit: int = 5000,
         default_timeout: int = 120,
@@ -324,56 +324,37 @@ def search_files(self, query, path="", case_sensitive=False):
 
 ### Workspace Initialization
 
-**Decision (unchanged):** Cloud-init creates the base `~/workspace/` directory with correct ownership (`agent-worker`). The agent's `WorkspaceManager` initialization creates subdirectories via `backend.mkdir()` as needed. This mirrors the current local behavior.
+**Decision (updated):** The VM image provisions `~/workspace/` in `agent-host`'s home directory. The agent's `WorkspaceManager` initialization creates subdirectories via `backend.mkdir()` as needed. This mirrors the current local behavior. Single-user model — `agent-host` owns everything.
 
 ## VM User Model
 
-Each VM has two users, mirroring the management/agent plane separation from [vm.md](./vm.md):
+Each VM has a single user for simplicity — one VM per job, no shared state:
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│  agent-host (service user, has SSH access)            │
+│  agent-host (sole user, has SSH access + sudo)        │
 │  ├── Receives SSH connections from agent pod          │
-│  ├── Owns the tmux session (created on VM boot)       │
-│  ├── Tmux shell runs as agent-worker (via su -)       │
-│  └── Can attach, send-keys, capture-pane on own session│
-│                                                        │
-│  agent-worker (unprivileged, no wheel)                 │
-│  ├── Owns ~/workspace/ directory                       │
-│  ├── Shell commands execute as this user (inside tmux) │
-│  ├── Cannot sudo without approval plugin               │
-│  └── This is what the agent "is" on the VM             │
+│  ├── Owns the tmux session and all shell commands     │
+│  ├── Owns ~/workspace/ directory                      │
+│  └── Full control of the VM environment               │
 └────────────────────────────────────────────────────────┘
 ```
 
 ### tmux Session Ownership
 
-The tmux session is owned by `agent-host` (the SSH user). When the session is created, each pane runs `su - agent-worker` so that the shell inside executes as the unprivileged user. This avoids the complexity of cross-user tmux socket sharing.
+The tmux session is owned by `agent-host` (the SSH user). No cross-user complexity — the same user owns the session, the workspace, and the shell.
 
 ```bash
-# On VM boot (cloud-init or management daemon):
-# Create tmux session as agent-host, shell drops into agent-worker
-tmux new-session -d -s agent_session \
-  "su - agent-worker -c 'cd ~/workspace && exec bash'"
-
-# Agent pod then operates via SSH:
+# Agent pod operates via SSH:
 ssh agent-host@vm "tmux send-keys -t agent_session 'make build' Enter"
 ssh agent-host@vm "tmux capture-pane -t agent_session -p"
 ```
 
-Because `agent-host` owns the tmux session:
-- SSH connects as `agent-host`, tmux commands work directly (no cross-user issues)
-- The shell inside the pane runs as `agent-worker` (permissions, sudo plugin, etc.)
-- If `agent-worker`'s shell crashes, `agent-host` can respawn the pane with another `su -`
+Because `agent-host` owns everything:
+- SSH connects as `agent-host`, tmux commands work directly
+- SFTP file operations work without ACLs or group hacks — user owns `~/workspace/`
 - The SSH connection survives regardless of what happens inside the pane
-- `agent-host` can create new tmux windows (tabs) that all drop into `agent-worker`
-
-For SFTP file operations, `agent-host` reads/writes files in `agent-worker`'s home directory. This requires either:
-- `agent-host` is in the same group as `agent-worker` (group-readable workspace), or
-- SFTP commands run through `su` (slower, more complex), or
-- `agent-host` has read/write ACLs on the workspace directory (cleanest)
-
-**Decision:** Use POSIX ACLs. The workspace directory gets `setfacl -R -m u:agent-host:rwX /home/agent-worker/workspace` during VM provisioning. This gives `agent-host` full access without modifying `agent-worker`'s permissions or group memberships.
+- No permission issues between SSH user and workspace owner (same user)
 
 ## Communication Model
 
@@ -464,7 +445,7 @@ The [vm.md](./vm.md) design assumed the agent runs inside the VM (option 2). Wit
 
 | Responsibility | vm.md (option 2) | This design (option 1) |
 |----------------|-------------------|------------------------|
-| Start/stop agent process | Daemon launches `python agent.py` as agent-worker | **Not needed** — agent is a K8s pod on the main cluster |
+| Start/stop agent process | Daemon launches `python agent.py` as agent-host | **Not needed** — agent is a K8s pod on the main cluster |
 | Receive job config | Daemon receives config over NATS, passes to agent | **Not needed** — orchestrator configures agent pod directly |
 | Freeze/resume agent | Daemon sends SIGSTOP/SIGCONT to agent process | **Simplified** — orchestrator pauses agent pod; daemon can still freeze the tmux session for workspace inspection |
 | Sudo plugin | Daemon intercepts sudo, routes to orchestrator | **Unchanged** — still needed, still runs on VM |
@@ -503,7 +484,7 @@ workspace:
   #   port: 22
   #   username: agent-host
   #   key_path: /run/secrets/vm-ssh-key               # Path to SSH private key
-  #   workspace_path: /home/agent-worker/workspace    # Workspace root on the VM
+  #   workspace_path: /home/agent-host/workspace    # Workspace root on the VM
 ```
 
 **Config schema** (`config/schema.json`): Added `backend` enum property (`"local"|"remote"`) and `remote` object schema with `host`, `port`, `username`, `key_path`, `workspace_path` properties.
@@ -623,8 +604,8 @@ Alternatively, the orchestrator can pull snapshots via SFTP periodically, indepe
 | 7 | Cross-cluster communication | **NATS (hub+leaf)** | Only for traffic between main cluster and agent cluster. Orchestrator↔VM controller, management daemon↔orchestrator. |
 | 8 | VM lifecycle management | **VM controller on agent cluster** | Small service subscribes to NATS, calls KubeVirt API locally. Orchestrator doesn't need remote kubeconfig. |
 | 9 | Mount-based approach | **Rejected** | NFS/SSHFS mounts fail silently on network issues. Explicit backend with error handling is more resilient. |
-| 10 | tmux ownership | **agent-host owns session, panes run as agent-worker via `su -`** | Avoids cross-user socket sharing. SSH user can always manage the session. |
-| 11 | Workspace file access (SFTP) | **POSIX ACLs on workspace dir** | `agent-host` gets read/write ACLs. No group hacks, no `su` overhead for file ops. |
+| 10 | tmux ownership | **agent-host owns session and all shells** | Single-user model — no cross-user complexity. SSH user owns everything. |
+| 11 | Workspace file access (SFTP) | **Direct ownership** | `agent-host` owns `~/workspace/`. No ACLs, no group hacks needed. |
 | 12 | Phase snapshot survival | **Extract to agent pod at phase boundaries** | Snapshots must survive VM destruction for recovery to work. |
 | 13 | SSH keys (MVP) | **Shared keypair** | One keypair for all agent↔VM connections. Per-job keys as a hardening step later. |
 | 14 | ShellManager vs backend | **ShellManager delegates, backend owns shell logic** | Sentinel detection, stall detection, prompt detection all live in `RemoteBackend.shell_run()`. ShellManager is a thin delegator when `_use_backend` is True. For local, ShellManager keeps its libtmux code unchanged. |

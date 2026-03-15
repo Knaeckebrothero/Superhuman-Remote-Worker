@@ -851,7 +851,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     port=remote_cfg.get("port", 22),
                     username=remote_cfg.get("username", "agent-host"),
                     key_path=remote_cfg.get("key_path"),
-                    workspace_path=remote_cfg.get("workspace_path", "/home/agent-worker/workspace"),
+                    workspace_path=remote_cfg.get("workspace_path", "/home/agent-host/workspace"),
                     job_id=job_id,
                     scrollback_limit=self.config.extra.get("shell", {}).get("scrollback_limit", 5000),
                     default_timeout=self.config.extra.get("shell", {}).get("default_timeout", 120),

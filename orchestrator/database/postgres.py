@@ -2128,10 +2128,9 @@ class PostgresDB:
         return dict(user_row), dict(project_row)
 
     async def migrate_existing_users_verified(self) -> None:
-        """Mark existing dev-mode users (no password) as email_verified.
+        """Mark existing users without a password as email_verified.
 
-        Called during init to ensure existing users aren't locked out
-        if AUTH_MODE switches to production.
+        Called during init to ensure existing users aren't locked out.
         """
         async with self.acquire() as conn:
             result = await conn.execute(
