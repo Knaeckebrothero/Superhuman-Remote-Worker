@@ -288,7 +288,7 @@ class VMController:
                 await self._publish_status(job_id, error_response)
 
     async def handle_pod_ip_query(self, msg):
-        """Handle vm.lifecycle.pod-ip — look up the virt-launcher pod IP.
+        """Handle vm.query.pod-ip — look up the virt-launcher pod IP.
 
         The orchestrator calls this (request/reply) when the management
         daemon registers, to get the cluster-routable IP for SSH access
@@ -357,9 +357,9 @@ class VMController:
         await self.nc.subscribe("vm.lifecycle.create", cb=self.handle_create)
         await self.nc.subscribe("vm.lifecycle.delete", cb=self.handle_delete)
         await self.nc.subscribe("vm.lifecycle.get", cb=self.handle_status_query)
-        await self.nc.subscribe("vm.lifecycle.pod-ip", cb=self.handle_pod_ip_query)
+        await self.nc.subscribe("vm.query.pod-ip", cb=self.handle_pod_ip_query)
         log.info(
-            "Subscribed to vm.lifecycle.{create,delete,get,pod-ip} — waiting for requests"
+            "Subscribed to vm.lifecycle.{create,delete,get}, vm.query.pod-ip — waiting for requests"
         )
 
         # Wait for shutdown signal
