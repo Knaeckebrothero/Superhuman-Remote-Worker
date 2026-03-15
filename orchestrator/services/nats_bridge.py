@@ -121,7 +121,6 @@ class NatsBridge:
             await self._nc.subscribe("agent.vm.*.status", cb=self._on_daemon_status)
 
             self._available = True
-            print(f"[NATS-BRIDGE] Connected to {self._url}", flush=True)
             logger.info("NATS bridge connected: %s", self._url)
         except Exception as e:
             logger.warning("NATS bridge connection failed: %s", e)
@@ -320,7 +319,6 @@ class NatsBridge:
             ssh_host = None
             ssh_port = 22
             nc_connected = self._nc and self._nc.is_connected
-            print(f"[NATS-BRIDGE] Daemon register: job={job_id}, daemon_ip={daemon_ip}, nc_connected={nc_connected}", flush=True)
             if nc_connected:
                 try:
                     reply = await self._nc.request(
@@ -332,13 +330,10 @@ class NatsBridge:
                     ssh_host = pod_data.get("ssh_host") or pod_data.get("pod_ip")
                     if pod_data.get("ssh_port"):
                         ssh_port = pod_data["ssh_port"]
-                    print(f"[NATS-BRIDGE] SSH endpoint reply: {pod_data}", flush=True)
                 except Exception as e:
-                    print(f"[NATS-BRIDGE] SSH endpoint query failed: {e}", flush=True)
                     logger.warning("Failed to query SSH endpoint for job %s: %s", job_id, e)
 
             ssh_host = ssh_host or daemon_ip
-            print(f"[NATS-BRIDGE] Setting ssh_host={ssh_host}:{ssh_port} (daemon_ip={daemon_ip})", flush=True)
 
             logger.info(
                 "Daemon registered for job %s (ssh=%s:%d, daemon_ip=%s)",
