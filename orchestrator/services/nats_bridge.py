@@ -121,6 +121,7 @@ class NatsBridge:
             await self._nc.subscribe("agent.vm.*.status", cb=self._on_daemon_status)
 
             self._available = True
+            print(f"[NATS-BRIDGE] Connected to {self._url}", flush=True)
             logger.info("NATS bridge connected: %s", self._url)
         except Exception as e:
             logger.warning("NATS bridge connection failed: %s", e)
@@ -317,7 +318,9 @@ class NatsBridge:
             # address (10.0.2.x) which is not reachable from cluster pods.
             daemon_ip = data.get("ip") or data.get("hostname")
             pod_ip = None
-            if self._nc and self._nc.is_connected:
+            nc_connected = self._nc and self._nc.is_connected
+            print(f"[NATS-BRIDGE] Daemon register: job={job_id}, daemon_ip={daemon_ip}, nc_connected={nc_connected}", flush=True)
+            if nc_connected:
                 try:
                     reply = await self._nc.request(
                         "vm.lifecycle.pod-ip",
@@ -326,10 +329,13 @@ class NatsBridge:
                     )
                     pod_data = json.loads(reply.data.decode())
                     pod_ip = pod_data.get("pod_ip")
+                    print(f"[NATS-BRIDGE] Pod IP reply: {pod_data}", flush=True)
                 except Exception as e:
+                    print(f"[NATS-BRIDGE] Pod IP query failed: {e}", flush=True)
                     logger.warning("Failed to query pod IP for job %s: %s", job_id, e)
 
             ssh_host = pod_ip or daemon_ip
+            print(f"[NATS-BRIDGE] Setting ssh_host={ssh_host} (pod_ip={pod_ip}, daemon_ip={daemon_ip})", flush=True)
 
             logger.info(
                 "Daemon registered for job %s (ssh_host=%s, pod_ip=%s, daemon_ip=%s)",
