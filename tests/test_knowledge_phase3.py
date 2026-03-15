@@ -4,11 +4,10 @@ Tests the orchestrator API endpoints (via direct function calls),
 workspace converter, memory migrator, and Angular model contracts.
 """
 
-import asyncio
 import sys
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

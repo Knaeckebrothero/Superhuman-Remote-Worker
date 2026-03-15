@@ -5,7 +5,6 @@ description overrides for deferred tools, and module-level convenience functions
 """
 
 import pytest
-from pathlib import Path
 from unittest.mock import MagicMock
 
 from src.tools.description_manager import (

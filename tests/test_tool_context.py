@@ -6,10 +6,8 @@ and async job status updates.
 """
 
 import pytest
-from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.tools.context import ToolContext
 

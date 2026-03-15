@@ -7,7 +7,7 @@ Integration tests require DATABASE_URL and are skipped otherwise.
 import os
 import uuid
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

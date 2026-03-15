@@ -4,8 +4,6 @@ Tests count_request_tokens, ContextOverflowError raising, reasoning_content
 extraction, _extract_responses_api_reasoning, and the _is_quota_error heuristic.
 """
 
-import json
-import pytest
 from unittest.mock import MagicMock
 
 from src.llm.exceptions import ContextOverflowError

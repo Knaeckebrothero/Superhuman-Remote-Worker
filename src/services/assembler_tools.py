@@ -11,7 +11,6 @@ AssembleMemoriesTask (AuxAgentTask) for agent-mode execution.
 See docs/features/memory_light.md for architecture.
 """
 
-import asyncio
 import logging
 import uuid
 from typing import Any, List

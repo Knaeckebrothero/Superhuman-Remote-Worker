@@ -13,7 +13,6 @@ See docs/features/project_knowledge_base.md for full architecture.
 """
 
 import asyncio
-import json
 import logging
 import uuid
 from datetime import datetime, timezone

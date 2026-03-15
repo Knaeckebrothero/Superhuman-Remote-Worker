@@ -433,8 +433,8 @@ def format_job_log(job_id: str, data: dict[str, Any]) -> str:
     header += f" — showing {len(log_lines)} of {total} lines"
 
     lines = [header, ""]
-    for l in log_lines:
-        lines.append(l)
+    for line in log_lines:
+        lines.append(line)
 
     return "\n".join(lines)
 

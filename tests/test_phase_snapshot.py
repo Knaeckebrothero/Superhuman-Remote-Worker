@@ -7,9 +7,6 @@ recovery logic, cleanup, and the format_snapshots_table utility.
 import json
 import shutil
 import sqlite3
-import pytest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from src.core.phase_snapshot import (
     PhaseSnapshot,

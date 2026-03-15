@@ -25,6 +25,9 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# Silence noisy third-party loggers
+for _noisy in ("pymongo", "httpcore", "httpx"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 from datetime import date, datetime, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402

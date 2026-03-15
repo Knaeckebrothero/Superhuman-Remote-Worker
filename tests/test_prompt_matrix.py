@@ -1,18 +1,12 @@
 """Tests for prompt matrix resolution: detect_model_family + PromptMatrixResolver."""
 
-import os
 import textwrap
-from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 from src.core.loader import (
     AgentConfig,
-    FileResolver,
-    InstructionMatrixResolver,
     LLMConfig,
-    MatrixResolver,
     PhaseLLMOverride,
     PromptMatrixResolver,
     PromptResolver,
@@ -20,9 +14,7 @@ from src.core.loader import (
     detect_reasoning_method,
     get_phase_system_prompt,
     load_base_system_prompt,
-    load_instructions,
     load_phase_component,
-    load_summarization_prompt,
 )
 
 

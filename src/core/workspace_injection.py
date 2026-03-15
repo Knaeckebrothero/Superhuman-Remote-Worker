@@ -13,9 +13,9 @@ Handles injection of:
 """
 
 import uuid
-from typing import List, Tuple
+from typing import Tuple
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 # Prefix for identifying synthetic instruction tool calls
 # Used to exclude these messages from summarization

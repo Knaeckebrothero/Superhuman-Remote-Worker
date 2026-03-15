@@ -12,8 +12,6 @@ Tests:
 import json
 import pytest
 import sys
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,7 +24,6 @@ from src.core.phase import should_freeze_at_boundary, freeze_for_review  # noqa:
 from src.core.loader import (  # noqa: E402
     AgentConfig,
     VALID_AUTONOMY_LEVELS,
-    load_agent_config,
     load_agent_config_from_dict,
 )
 
@@ -208,7 +205,7 @@ class TestFreezeForReview:
         workspace = MagicMock()
         todo_manager = MagicMock()
 
-        result = freeze_for_review(state, workspace, todo_manager, "tactical", 3)
+        freeze_for_review(state, workspace, todo_manager, "tactical", 3)
 
         call_args = workspace.write_file.call_args
         frozen_data = json.loads(call_args[0][1])

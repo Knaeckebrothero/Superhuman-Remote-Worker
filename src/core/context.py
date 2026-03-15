@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import Any, Callable, Dict, List, Optional
 
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -1049,7 +1048,7 @@ class ContextManager:
                         if isinstance(constraints, list):
                             anchor_parts.append("Constraints: " + "; ".join(constraints))
                     if anchor_parts:
-                        parts.append(f"**Identity Anchor:**\n" + "\n".join(anchor_parts))
+                        parts.append("**Identity Anchor:**\n" + "\n".join(anchor_parts))
                 elif isinstance(result.identity_anchor, str) and result.identity_anchor.strip():
                     parts.append(f"**Identity Anchor:**\n{result.identity_anchor.strip()}")
             summary = "\n\n".join(parts)

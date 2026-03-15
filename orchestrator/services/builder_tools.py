@@ -4,10 +4,15 @@ The builder LLM receives these as tool/function definitions. When it calls them,
 the backend emits SSE `tool_call` events that the frontend applies to the job form.
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.llm.key_ring import KeyRing
 
 logger = logging.getLogger(__name__)
 
@@ -2585,7 +2590,7 @@ def get_builder_model() -> str:
     return os.getenv("BUILDER_MODEL", "openai/gpt-oss-120b")
 
 
-_builder_key_rings: dict[str, "KeyRing | None"] = {}
+_builder_key_rings: dict[str, KeyRing | None] = {}
 _builder_key_ring_lock = __import__("threading").Lock()
 
 
