@@ -285,9 +285,10 @@ class NatsBridge:
             }
             if data.get("error"):
                 updates["error"] = data["error"]
-            # Store pod_ip if reported (future-proofing)
             if data.get("pod_ip"):
                 updates["pod_ip"] = data["pod_ip"]
+            if data.get("ssh_nodeport"):
+                updates["ssh_nodeport"] = data["ssh_nodeport"]
 
             logger.info(
                 "VM lifecycle status for job %s: %s", job_id, data.get("status")
@@ -313,11 +314,11 @@ class NatsBridge:
             if not job_id:
                 return
 
-            # Query the VM controller for the virt-launcher pod IP.
-            # The daemon's self-reported IP is the VM-internal masquerade
-            # address (10.0.2.x) which is not reachable from cluster pods.
+            # Query the VM controller for the SSH endpoint.
+            # Prefers NodePort service (cross-cluster), falls back to pod IP.
             daemon_ip = data.get("ip") or data.get("hostname")
-            pod_ip = None
+            ssh_host = None
+            ssh_port = 22
             nc_connected = self._nc and self._nc.is_connected
             print(f"[NATS-BRIDGE] Daemon register: job={job_id}, daemon_ip={daemon_ip}, nc_connected={nc_connected}", flush=True)
             if nc_connected:
@@ -328,22 +329,25 @@ class NatsBridge:
                         timeout=5.0,
                     )
                     pod_data = json.loads(reply.data.decode())
-                    pod_ip = pod_data.get("pod_ip")
-                    print(f"[NATS-BRIDGE] Pod IP reply: {pod_data}", flush=True)
+                    ssh_host = pod_data.get("ssh_host") or pod_data.get("pod_ip")
+                    if pod_data.get("ssh_port"):
+                        ssh_port = pod_data["ssh_port"]
+                    print(f"[NATS-BRIDGE] SSH endpoint reply: {pod_data}", flush=True)
                 except Exception as e:
-                    print(f"[NATS-BRIDGE] Pod IP query failed: {e}", flush=True)
-                    logger.warning("Failed to query pod IP for job %s: %s", job_id, e)
+                    print(f"[NATS-BRIDGE] SSH endpoint query failed: {e}", flush=True)
+                    logger.warning("Failed to query SSH endpoint for job %s: %s", job_id, e)
 
-            ssh_host = pod_ip or daemon_ip
-            print(f"[NATS-BRIDGE] Setting ssh_host={ssh_host} (pod_ip={pod_ip}, daemon_ip={daemon_ip})", flush=True)
+            ssh_host = ssh_host or daemon_ip
+            print(f"[NATS-BRIDGE] Setting ssh_host={ssh_host}:{ssh_port} (daemon_ip={daemon_ip})", flush=True)
 
             logger.info(
-                "Daemon registered for job %s (ssh_host=%s, pod_ip=%s, daemon_ip=%s)",
-                job_id, ssh_host, pod_ip, daemon_ip,
+                "Daemon registered for job %s (ssh=%s:%d, daemon_ip=%s)",
+                job_id, ssh_host, ssh_port, daemon_ip,
             )
             await self._set_vm_context(job_id, {
                 "status": "ready",
                 "ssh_host": ssh_host,
+                "ssh_port": ssh_port,
                 "hostname": data.get("hostname"),
                 "daemon_pid": data.get("pid"),
             })
