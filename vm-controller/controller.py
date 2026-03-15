@@ -307,7 +307,7 @@ class VMController:
             core_v1 = client.CoreV1Api()
             pods = core_v1.list_namespaced_pod(
                 VM_NAMESPACE,
-                label_selector=f"kubevirt.io/domain={vm_name}",
+                label_selector=f"vm.kubevirt.io/name={vm_name}",
             )
 
             pod_ip = None
