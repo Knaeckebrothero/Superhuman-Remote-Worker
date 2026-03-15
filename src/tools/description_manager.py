@@ -8,7 +8,7 @@ Handles:
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .registry import TOOL_REGISTRY
 
@@ -148,6 +148,7 @@ class DescriptionManager:
         self,
         tool_names: List[str],
         output_dir: Path,
+        write_fn: Optional[Callable[[str, str], Any]] = None,
     ) -> int:
         """Generate tool documentation files in workspace directory.
 
@@ -158,27 +159,37 @@ class DescriptionManager:
         Args:
             tool_names: List of tool names to document
             output_dir: Path to the tools/ directory in workspace
+            write_fn: Optional callback ``write_fn(relative_path, content)``
+                that writes a file through the workspace backend (local or
+                remote).  When *None*, falls back to direct ``Path.write_text``
+                for backward compatibility.
 
         Returns:
             Number of files created
         """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if write_fn is None:
+            # Local fallback — write via pathlib
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            def _local_write(rel: str, content: str) -> None:
+                path = output_dir / rel
+                path.write_text(content, encoding="utf-8")
+
+            write_fn = _local_write
 
         files_created = 0
 
         # Generate index
         index_content = self.generate_tool_index(tool_names)
-        index_path = output_dir / "README.md"
-        index_path.write_text(index_content, encoding="utf-8")
+        write_fn("README.md", index_content)
         files_created += 1
-        logger.debug(f"Generated tool index: {index_path}")
+        logger.debug(f"Generated tool index: {output_dir}/README.md")
 
         # Generate individual tool docs
         for tool_name in tool_names:
             doc_content = self.generate_tool_description(tool_name)
-            doc_path = output_dir / f"{tool_name}.md"
-            doc_path.write_text(doc_content, encoding="utf-8")
+            write_fn(f"{tool_name}.md", doc_content)
             files_created += 1
 
         logger.info(f"Generated {files_created} tool documentation files in {output_dir}")
@@ -275,6 +286,7 @@ def generate_workspace_tool_docs(
     tool_names: List[str],
     output_dir: Path,
     tools: Optional[List[Any]] = None,
+    write_fn: Optional[Callable[[str, str], Any]] = None,
 ) -> int:
     """Generate tool documentation files in a workspace directory.
 
@@ -286,6 +298,9 @@ def generate_workspace_tool_docs(
         tool_names: List of tool names to document
         output_dir: Path to the tools/ directory in workspace
         tools: Optional list of loaded tool objects (for extracting docstrings)
+        write_fn: Optional callback ``write_fn(relative_path, content)``
+            for writing files through the workspace backend. When *None*,
+            falls back to local pathlib writes.
 
     Returns:
         Number of files created
@@ -293,7 +308,7 @@ def generate_workspace_tool_docs(
     manager = _get_manager()
     if tools:
         manager.extract_docstrings(tools)
-    return manager.generate_workspace_docs(tool_names, output_dir)
+    return manager.generate_workspace_docs(tool_names, output_dir, write_fn=write_fn)
 
 
 def generate_tool_description(tool_name: str) -> str:
