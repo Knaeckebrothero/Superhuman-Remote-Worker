@@ -17,14 +17,17 @@ EnvironmentFile=/etc/default/sudo-gated
 User=sudo-gated
 Group=sudo-gated
 
-# Hardening — daemon only needs Unix socket + NATS TCP
+# Hardening — daemon only needs Unix socket + NATS TCP + /proc/pid/exe reads
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
-CapabilityBoundingSet=
+# CAP_SYS_PTRACE: required to readlink /proc/{pid}/exe of root-owned sudo
+# process when kernel.yama.ptrace_scope=1 (Ubuntu default)
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/run/sudo-gated
 
