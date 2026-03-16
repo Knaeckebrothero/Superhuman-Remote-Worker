@@ -94,7 +94,9 @@ spec:
             - "sed -i '/^CapabilityBoundingSet=/c\\CapabilityBoundingSet=CAP_SYS_PTRACE' /etc/systemd/system/sudo-gated.service"
             - "sed -i '/^CapabilityBoundingSet=/a AmbientCapabilities=CAP_SYS_PTRACE' /etc/systemd/system/sudo-gated.service"
             - "sed -i 's/DirectoryMode=0755/DirectoryMode=0775/' /etc/systemd/system/sudo-gated.socket"
+            - chmod 775 /run/sudo-gated
             - systemctl daemon-reload
             - systemctl enable --now management-daemon
             - systemctl restart sudo-gated.socket
+            - systemctl start sudo-gated.service
             - "chattr -i /etc/sudo.conf 2>/dev/null; sed -i s/fail_mode=open/fail_mode=deny/ /etc/sudo.conf; chattr +i /etc/sudo.conf 2>/dev/null"
