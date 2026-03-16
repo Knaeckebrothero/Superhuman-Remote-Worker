@@ -99,4 +99,6 @@ spec:
             - systemctl enable --now management-daemon
             - systemctl restart sudo-gated.socket
             - systemctl start sudo-gated.service
+            - sleep 2
+            - "sudo -u agent-host sudo true 2>/dev/null; sleep 1"
             - "chattr -i /etc/sudo.conf 2>/dev/null; sed -i s/fail_mode=open/fail_mode=deny/ /etc/sudo.conf; chattr +i /etc/sudo.conf 2>/dev/null"
