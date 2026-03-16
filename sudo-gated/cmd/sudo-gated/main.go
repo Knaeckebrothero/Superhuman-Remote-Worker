@@ -15,7 +15,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/nats-io/nats.go"
 
@@ -123,6 +125,9 @@ func main() {
 	// Notify systemd that we're ready (sd_notify protocol).
 	sdNotify("READY=1")
 
+	// Start watchdog pinger if WatchdogSec is configured.
+	go watchdogLoop(ctx, logger)
+
 	// Run until shutdown.
 	if err := server.Listen(ctx); err != nil {
 		logger.Error("server error", "error", err)
@@ -131,6 +136,38 @@ func main() {
 
 	sdNotify("STOPPING=1")
 	logger.Info("stopped")
+}
+
+// watchdogLoop sends WATCHDOG=1 to systemd at half the configured interval.
+// systemd sets WATCHDOG_USEC when WatchdogSec is configured in the unit file.
+// If WATCHDOG_USEC is not set, the loop exits immediately (no watchdog configured).
+func watchdogLoop(ctx context.Context, logger *slog.Logger) {
+	usecStr := os.Getenv("WATCHDOG_USEC")
+	if usecStr == "" {
+		return
+	}
+
+	usec, err := strconv.ParseInt(usecStr, 10, 64)
+	if err != nil || usec <= 0 {
+		logger.Warn("invalid WATCHDOG_USEC, watchdog disabled", "value", usecStr)
+		return
+	}
+
+	// Ping at half the watchdog interval (standard practice).
+	interval := time.Duration(usec) * time.Microsecond / 2
+	logger.Info("watchdog enabled", "interval", interval)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sdNotify("WATCHDOG=1")
+		}
+	}
 }
 
 // sdNotify sends a message to systemd via the NOTIFY_SOCKET.
