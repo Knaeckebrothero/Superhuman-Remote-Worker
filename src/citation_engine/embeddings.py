@@ -9,6 +9,7 @@ Environment Variables:
     CITATION_EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
     CITATION_EMBEDDING_URL: API base URL (default: https://api.openai.com/v1)
     CITATION_EMBEDDING_KEY: API key (defaults to OPENAI_API_KEY)
+    CITATION_EMBEDDING_BATCH_SIZE: Max texts per API batch (default: 2048)
 """
 
 import logging
@@ -93,7 +94,9 @@ class EmbeddingService:
             )
 
         self.max_tokens_per_batch = max_tokens_per_batch
-        self.max_texts_per_batch = max_texts_per_batch
+        self.max_texts_per_batch = int(
+            os.getenv("CITATION_EMBEDDING_BATCH_SIZE", str(max_texts_per_batch))
+        )
         self.max_tokens_per_text = max_tokens_per_text
         self.timeout = timeout
 
