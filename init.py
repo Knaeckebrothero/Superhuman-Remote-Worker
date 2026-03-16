@@ -53,12 +53,21 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure logging for initialization."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    if verbose and not os.getenv("DEBUG_ALL"):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        for namespace in ("__main__", "src", "orchestrator"):
+            logging.getLogger(namespace).setLevel(logging.DEBUG)
+    else:
+        level = logging.DEBUG if verbose else logging.INFO
+        logging.basicConfig(
+            level=level,
+            format="%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
 
 def get_git_commit() -> str:

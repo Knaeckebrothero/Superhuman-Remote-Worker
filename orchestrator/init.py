@@ -55,12 +55,21 @@ logger = logging.getLogger(__name__)
 
 def setup_logging(verbose: bool = False) -> None:
     """Configure logging for initialization."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    if verbose and not os.getenv("DEBUG_ALL"):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        for namespace in ("__main__", "orchestrator", "database"):
+            logging.getLogger(namespace).setLevel(logging.DEBUG)
+    else:
+        level = logging.DEBUG if verbose else logging.INFO
+        logging.basicConfig(
+            level=level,
+            format="%(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
 
 # =============================================================================
@@ -239,9 +248,11 @@ async def init_vector_db(force_reset: bool = False) -> bool:
                 await conn.execute("DROP TABLE IF EXISTS job_sources CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS sources CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
+                await conn.execute("DROP TABLE IF EXISTS memory_retrieval_messages CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS memories CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS knowledge_index CASCADE")
                 await conn.execute("DROP FUNCTION IF EXISTS memory_hybrid_search CASCADE")
+                await conn.execute("DROP FUNCTION IF EXISTS memory_project_hybrid_search CASCADE")
                 await conn.execute("DROP FUNCTION IF EXISTS knowledge_hybrid_search CASCADE")
                 await conn.execute("DROP TYPE IF EXISTS source_type CASCADE")
                 await conn.execute("DROP TYPE IF EXISTS confidence_level CASCADE")
@@ -704,22 +715,56 @@ async def _enforce_default_project_constraint(db) -> None:
 async def _seed_admin_mcp_token(db) -> None:
     """Generate a root MCP token for the admin user if none exists.
 
-    Prints the plaintext token to stdout so the operator can configure
-    .mcp.json immediately without logging into the cockpit.
+    When MCP_DEV_TOKEN is set in the environment, uses that fixed value
+    instead of generating a random token. This keeps the token stable
+    across database resets so .mcp.json never goes stale during local
+    development.
+
+    Env vars:
+        MCP_DEV_TOKEN: Fixed token value (must start with "srw_").
+                       When set, this exact token is inserted on every init.
+                       When unset, a random token is generated once.
     """
     try:
         admin = await db.get_admin_user()
         if not admin:
             return
 
+        dev_token = os.environ.get("MCP_DEV_TOKEN", "").strip()
+
         # Check if admin already has an MCP token
         existing = await db.list_mcp_tokens(str(admin["id"]))
         if existing:
-            logger.info("  Admin MCP token already exists")
-            return
+            if dev_token:
+                # Dev token configured — ensure it matches what's in the DB.
+                # If the hash differs (e.g. env var changed), replace it.
+                expected_hash = hashlib.sha256(dev_token.encode()).hexdigest()
+                current_hash_matches = False
+                for tok in existing:
+                    stored = await db.get_mcp_token_by_hash(expected_hash)
+                    if stored:
+                        current_hash_matches = True
+                        break
+                if current_hash_matches:
+                    logger.info("  Admin MCP dev token already exists and matches")
+                    return
+                # Hash mismatch — revoke old tokens and insert the new dev token
+                for tok in existing:
+                    await db.revoke_mcp_token(str(tok["id"]), str(admin["id"]))
+                logger.info("  Replaced admin MCP token with updated dev token")
+            else:
+                logger.info("  Admin MCP token already exists")
+                return
 
-        # Generate token
-        token = "srw_" + secrets.token_urlsafe(32)
+        # Use fixed dev token or generate a random one
+        if dev_token:
+            if not dev_token.startswith("srw_"):
+                logger.warning("  MCP_DEV_TOKEN must start with 'srw_' — ignoring")
+                return
+            token = dev_token
+        else:
+            token = "srw_" + secrets.token_urlsafe(32)
+
         token_hash = hashlib.sha256(token.encode()).hexdigest()
         token_prefix = token[:12]
 
@@ -731,11 +776,14 @@ async def _seed_admin_mcp_token(db) -> None:
             scope="all",
         )
 
-        logger.info("  ============================================")
-        logger.info("  Admin MCP Token (scope: all):")
-        logger.info(f"  {token}")
-        logger.info("  Save this token — it will not be shown again.")
-        logger.info("  ============================================")
+        if dev_token:
+            logger.info("  Admin MCP token seeded from MCP_DEV_TOKEN (scope: all)")
+        else:
+            logger.info("  ============================================")
+            logger.info("  Admin MCP Token (scope: all):")
+            logger.info(f"  {token}")
+            logger.info("  Save this token — it will not be shown again.")
+            logger.info("  ============================================")
     except Exception as e:
         logger.warning(f"  Admin MCP token seeding failed: {e}")
 

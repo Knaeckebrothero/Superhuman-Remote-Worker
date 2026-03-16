@@ -6,6 +6,7 @@ Run the Universal Agent in various modes:
 
 Logging is controlled via environment variables:
 - LOG_LEVEL: DEBUG, INFO (default), WARNING, ERROR
+- DEBUG_ALL: Set to "1" to include third-party library debug output
 - DEBUG_LLM_STREAM: Set to "1" for LLM token output to stderr
 - DEBUG_LLM_TAIL: Characters to show in LLM debug output (default: 500)
 
@@ -79,39 +80,30 @@ def setup_logging():
     """Configure logging from LOG_LEVEL environment variable.
 
     Reads LOG_LEVEL env var (default: INFO). Valid values: DEBUG, INFO, WARNING, ERROR.
+
+    When LOG_LEVEL=DEBUG, only app loggers (src.*, orchestrator.*) get DEBUG;
+    the root logger stays at INFO to suppress noisy third-party libraries.
+    Set DEBUG_ALL=1 to also include third-party debug output.
     """
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
 
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Always suppress noisy third-party libraries - even in verbose mode
-    # These produce massive log output that drowns out useful information
-    noisy_libraries = [
-        "httpx",
-        "httpcore",
-        "httpcore.http11",
-        "openai",
-        "openai._base_client",
-        "groq",
-        "groq._base_client",
-        "pymongo",
-        "pymongo.command",
-        "pymongo.connection",
-        "pymongo.serverSelection",
-        "urllib3",
-        "asyncio",
-        "aiosqlite",  # LangGraph checkpointer - very verbose
-    ]
-    for lib in noisy_libraries:
-        logging.getLogger(lib).setLevel(logging.WARNING)
-
-    # uvicorn can be INFO level
-    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    if level <= logging.DEBUG and not os.getenv("DEBUG_ALL"):
+        # Root stays at INFO — silences all third-party DEBUG noise automatically
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        # Only app namespaces get DEBUG
+        for namespace in ("src", "orchestrator"):
+            logging.getLogger(namespace).setLevel(logging.DEBUG)
+    else:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
 
 class FlushingFileHandler(logging.FileHandler):

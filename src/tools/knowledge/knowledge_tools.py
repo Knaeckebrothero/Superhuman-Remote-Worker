@@ -120,22 +120,6 @@ def _get_project_id(context: ToolContext) -> Optional[str]:
     return context.project_id
 
 
-def _run_async(coro):
-    """Run an async coroutine from sync tool context."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        # We're in an async context — create a task on the running loop
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return pool.submit(asyncio.run, coro).result()
-    else:
-        return asyncio.run(coro)
-
-
 def create_kb_tools(context: ToolContext) -> List[Any]:
     """Create knowledge base tools with injected context.
 
@@ -147,6 +131,23 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
     """
     kg = context.knowledge_graph
     ks = context.knowledge_store
+
+    # Capture the event loop at tool creation time (async graph setup).
+    # Sync tools run in executor threads — they must schedule async work
+    # on the original loop to preserve asyncpg connection pool affinity.
+    # Using asyncio.run() from a thread would create a NEW loop, breaking
+    # connections tied to the original one ("attached to a different loop").
+    try:
+        _creator_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _creator_loop = None
+
+    def _run_async(coro):
+        """Run async coroutine from sync tool context on the original event loop."""
+        if _creator_loop and _creator_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, _creator_loop)
+            return future.result()
+        return asyncio.run(coro)
 
     if not kg or not ks:
         raise ValueError("Knowledge tools require knowledge_graph and knowledge_store in ToolContext")
