@@ -263,7 +263,7 @@ The existing CI pipeline (GitHub Actions) can be extended with build steps for G
 - Step 3: `sudo ls` → plugin connects to daemon, daemon approves, command executes
 - Step 4: Kill daemon → plugin returns 0 (deny) or -1 (error), `sudo` rejects command
 - Step 4: Set timeout to 5s, don't respond → plugin times out, command denied
-- Plugin binary owned by root:root mode 0644, installed in `/usr/lib/sudo/`
+- Plugin binary owned by root:root mode 0644, installed in `/usr/libexec/sudo/`
 - `/etc/sudo.conf` owned by root:root mode 0644
 
 **CRITICAL**: A broken plugin `.so` prevents ALL sudo usage on the VM — there is no fallback. Always:
@@ -490,7 +490,7 @@ CREATE INDEX idx_sudo_rules_active ON sudo_auto_rules (priority ASC) WHERE enabl
 **Provisioning additions** (to `provision.sh`):
 ```bash
 # Sudo approval gate
-sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/lib/sudo/
+sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/libexec/sudo/
 sudo install -o root -g root -m 0755 /tmp/sudo-gated /usr/local/bin/
 sudo install -o root -g root -m 0644 /tmp/sudo-gated.service /etc/systemd/system/
 sudo install -o root -g root -m 0644 /tmp/sudo-gated.socket /etc/systemd/system/
@@ -505,7 +505,7 @@ sudo cp /tmp/sudo-gate.conf /etc/sudo.conf.d/ || \
     | sudo tee -a /etc/sudo.conf
 
 # Immutable attributes (defense-in-depth)
-sudo chattr +i /usr/lib/sudo/sudo_gate.so
+sudo chattr +i /usr/libexec/sudo/sudo_gate.so
 sudo chattr +i /etc/sudo.conf
 sudo chattr +i /etc/sudoers
 

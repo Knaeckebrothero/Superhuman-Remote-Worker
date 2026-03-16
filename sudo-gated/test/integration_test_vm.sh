@@ -58,7 +58,7 @@ echo ""
 # Verify components are in place
 echo "--- Pre-flight checks ---"
 echo -n "  Plugin installed: "
-[ -f /usr/lib/sudo/sudo_gate.so ] && echo -e "${GREEN}yes${NC}" || echo -e "${RED}no${NC}"
+[ -f /usr/libexec/sudo/sudo_gate.so ] && echo -e "${GREEN}yes${NC}" || echo -e "${RED}no${NC}"
 echo -n "  Daemon binary: "
 [ -x /usr/local/bin/sudo-gated ] && echo -e "${GREEN}yes${NC}" || echo -e "${RED}no${NC}"
 echo -n "  Socket active: "

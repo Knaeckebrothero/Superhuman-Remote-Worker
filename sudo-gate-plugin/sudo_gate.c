@@ -26,7 +26,7 @@
  *       sudo_gate.c json_util.c
  *
  * Install:
- *   sudo install -o root -g root -m 0644 sudo_gate.so /usr/lib/sudo/
+ *   sudo install -o root -g root -m 0644 sudo_gate.so /usr/libexec/sudo/
  *   echo 'Plugin sudo_gate_approval sudo_gate.so' | sudo tee -a /etc/sudo.conf
  */
 

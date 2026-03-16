@@ -184,7 +184,7 @@ echo "--- Setting up sudo approval gate ---"
 
 if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
     # Install plugin
-    sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/lib/sudo/
+    sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/libexec/sudo/
 
     # Install daemon binary
     sudo install -o root -g root -m 0755 /tmp/sudo-gated /usr/local/bin/
@@ -221,7 +221,7 @@ SGEOF
 
     # Defense-in-depth: make plugin and sudo.conf immutable
     # (prevents agent-host from modifying or replacing the gate)
-    sudo chattr +i /usr/lib/sudo/sudo_gate.so
+    sudo chattr +i /usr/libexec/sudo/sudo_gate.so
     sudo chattr +i /etc/sudo.conf
     # Note: /etc/sudoers is NOT made immutable here because cloud-init
     # may need to modify it. The orchestrator can set it immutable after
