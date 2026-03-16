@@ -225,6 +225,12 @@ CREATE TABLE IF NOT EXISTS memories (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     last_accessed TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
+    -- Project scoping (cross-job retrieval)
+    project_id UUID,
+
+    -- TTL system (guaranteed injection for N turns, then fade to retrieval-based)
+    remaining_turns INTEGER,
+
     CONSTRAINT valid_memory_type CHECK (memory_type IN ('factual', 'procedural', 'error_solution', 'vocabulary', 'relational')),
     CONSTRAINT valid_memory_source CHECK (source IN ('observer', 'todo', 'compaction', 'phase_archive', 'tool_error'))
 );
@@ -240,6 +246,26 @@ DO $$ BEGIN
         USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
 EXCEPTION WHEN others THEN
     RAISE NOTICE 'Skipping HNSW index on memories (dimension > 2000 or other error): %', SQLERRM;
+END $$;
+
+-- Retrieval messages: synthetic trigger phrases for improved recall.
+-- Each memory can have multiple trigger phrases embedded separately,
+-- so retrieval matches against "when would this memory be useful?" queries.
+-- NOTE: Must be created BEFORE memory_hybrid_search which references it.
+CREATE TABLE IF NOT EXISTS memory_retrieval_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    message TEXT NOT NULL,
+    embedding vector(4096),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mrm_memory ON memory_retrieval_messages(memory_id);
+DO $$ BEGIN
+    CREATE INDEX IF NOT EXISTS idx_mrm_embedding ON memory_retrieval_messages
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
+EXCEPTION WHEN others THEN
+    RAISE NOTICE 'Skipping HNSW index on memory_retrieval_messages: %', SQLERRM;
 END $$;
 
 -- Hybrid search function: RRF-based fusion of dense, sparse, recency channels.
@@ -262,20 +288,20 @@ WITH dense AS (
         SELECT id, MIN(dist) AS best_dist
         FROM (
             -- Content embedding matches
-            SELECT id, embedding <=> query_embedding AS dist
+            (SELECT id, embedding <=> query_embedding AS dist
             FROM memories WHERE job_id = job_id_param AND embedding IS NOT NULL AND importance >= importance_floor
                 AND (remaining_turns IS NULL OR remaining_turns <= 0)
-            ORDER BY dist LIMIT match_count * 3
+            ORDER BY dist LIMIT match_count * 3)
 
             UNION ALL
 
             -- Trigger phrase embedding matches → parent memory_id
-            SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
+            (SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
             WHERE m.job_id = job_id_param AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
                 AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
-            ORDER BY dist LIMIT match_count * 5
+            ORDER BY dist LIMIT match_count * 5)
         ) all_matches
         GROUP BY id
     ) best_per_memory
@@ -307,34 +333,16 @@ ORDER BY ranked.rrf_score DESC
 LIMIT match_count
 $$;
 
--- Retrieval messages: synthetic trigger phrases for improved recall.
--- Each memory can have multiple trigger phrases embedded separately,
--- so retrieval matches against "when would this memory be useful?" queries.
-CREATE TABLE IF NOT EXISTS memory_retrieval_messages (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
-    message TEXT NOT NULL,
-    embedding vector(4096),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_mrm_memory ON memory_retrieval_messages(memory_id);
-DO $$ BEGIN
-    CREATE INDEX IF NOT EXISTS idx_mrm_embedding ON memory_retrieval_messages
-        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 256);
-EXCEPTION WHEN others THEN
-    RAISE NOTICE 'Skipping HNSW index on memory_retrieval_messages: %', SQLERRM;
-END $$;
-
--- Project-scoped memory: denormalize project_id for cross-job retrieval
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS project_id UUID;
+-- Indexes for project-scoped memory and TTL system
+-- (columns now included in CREATE TABLE above, but indexes still needed)
 CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
 CREATE INDEX IF NOT EXISTS idx_memories_project_importance ON memories(project_id, importance DESC);
-
--- TTL system: guaranteed injection for N turns, then fade to retrieval-based
-ALTER TABLE memories ADD COLUMN IF NOT EXISTS remaining_turns INTEGER;
 CREATE INDEX IF NOT EXISTS idx_memories_ttl_active ON memories(job_id, remaining_turns) WHERE remaining_turns > 0;
 CREATE INDEX IF NOT EXISTS idx_memories_project_ttl_active ON memories(project_id, remaining_turns) WHERE remaining_turns > 0;
+
+-- Keep ALTER TABLE for backward compatibility with existing databases
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS project_id UUID;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS remaining_turns INTEGER;
 
 -- Project-scoped hybrid search: identical to memory_hybrid_search but scoped by project_id.
 -- Dense channel includes retrieval message trigger phrases.
@@ -355,20 +363,20 @@ WITH dense AS (
         SELECT id, MIN(dist) AS best_dist
         FROM (
             -- Content embedding matches
-            SELECT id, embedding <=> query_embedding AS dist
+            (SELECT id, embedding <=> query_embedding AS dist
             FROM memories WHERE project_id = project_id_param AND embedding IS NOT NULL AND importance >= importance_floor
                 AND (remaining_turns IS NULL OR remaining_turns <= 0)
-            ORDER BY dist LIMIT match_count * 3
+            ORDER BY dist LIMIT match_count * 3)
 
             UNION ALL
 
             -- Trigger phrase embedding matches → parent memory_id
-            SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
+            (SELECT rm.memory_id AS id, rm.embedding <=> query_embedding AS dist
             FROM memory_retrieval_messages rm
             INNER JOIN memories m ON rm.memory_id = m.id
             WHERE m.project_id = project_id_param AND rm.embedding IS NOT NULL AND m.importance >= importance_floor
                 AND (m.remaining_turns IS NULL OR m.remaining_turns <= 0)
-            ORDER BY dist LIMIT match_count * 5
+            ORDER BY dist LIMIT match_count * 5)
         ) all_matches
         GROUP BY id
     ) best_per_memory

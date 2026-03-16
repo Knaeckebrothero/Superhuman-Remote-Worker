@@ -21,13 +21,23 @@ from dotenv import find_dotenv, load_dotenv
 load_dotenv(find_dotenv())
 
 # Configure application-level logging (Uvicorn only configures its own loggers)
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-# Silence noisy third-party loggers
-for _noisy in ("pymongo", "httpcore", "httpx"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+# When DEBUG, only app loggers get DEBUG; third-party stays at INFO.
+# Set DEBUG_ALL=1 to include third-party debug output.
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # App namespaces (covers both `uvicorn orchestrator.main:app` and `uvicorn main:app`)
+    for _ns in ("orchestrator", "main", "database", "security", "services",
+                "uploads", "mcp", "graph_routes", "workspace"):
+        logging.getLogger(_ns).setLevel(logging.DEBUG)
+else:
+    logging.basicConfig(
+        level=_log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 from datetime import date, datetime, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
@@ -1713,10 +1723,15 @@ async def cancel_job(job_id: str) -> dict[str, str]:
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
-            raise HTTPException(
-                status_code=400,
-                detail="Job cannot be cancelled (already completed or cancelled)",
-            )
+            # Agent may have already set status to 'cancelled' before we got here
+            refreshed = await postgres_db.get_job(job_id)
+            if refreshed and refreshed.get("status") == "cancelled":
+                logger.info(f"Job {job_id} already cancelled (agent beat us to it)")
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Job cannot be cancelled (already completed or cancelled)",
+                )
 
         # If this was a scholar, unblock the parent job
         job["status"] = "cancelled"

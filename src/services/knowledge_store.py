@@ -115,16 +115,20 @@ class KnowledgeStore:
         return hashlib.sha256(content.encode()).hexdigest()
 
     @staticmethod
-    def _encode_embedding(embedding: Union[List[float], str]) -> str:
-        """Encode embedding as a pgvector-compatible string.
+    def _prepare_embedding(embedding: Union[List[float], str]) -> List[float]:
+        """Prepare embedding for asyncpg with pgvector codec.
 
-        asyncpg needs the pgvector codec (pgvector.asyncpg.register_vector)
-        to pass lists directly. If that codec isn't registered, we serialize
-        as a '[0.1, 0.2, ...]' string that PostgreSQL can cast to vector.
+        The pgvector asyncpg codec (registered via register_vector on
+        connection init) expects List[float] or numpy arrays — not strings.
+        If a string is passed (legacy), convert it back to a list.
         """
-        if isinstance(embedding, str):
+        if isinstance(embedding, list):
             return embedding
-        return "[" + ",".join(str(v) for v in embedding) + "]"
+        if isinstance(embedding, str):
+            # Legacy string format "[0.1,0.2,...]" — parse back to list
+            cleaned = embedding.strip("[]")
+            return [float(v) for v in cleaned.split(",") if v.strip()]
+        return list(embedding)
 
     async def upsert_note(
         self,
@@ -207,7 +211,7 @@ class KnowledgeStore:
             embed_text += "\n\n" + "\n".join(retrieval_list)
 
         embedding_raw = await self.embedding_service.embed(embed_text)
-        embedding_str = self._encode_embedding(embedding_raw)
+        embedding_vec = self._prepare_embedding(embedding_raw)
 
         # Build tsvector text from all searchable fields
         search_text = " ".join([
@@ -228,7 +232,7 @@ class KnowledgeStore:
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10, $11, $12,
-                $13::vector, to_tsvector('english', $14), $15, $16, NOW(),
+                $13, to_tsvector('english', $14), $15, $16, NOW(),
                 $17
             )
             ON CONFLICT (project_id, note_id) DO UPDATE SET
@@ -251,7 +255,7 @@ class KnowledgeStore:
             """,
             note_id, project_id, title, note_type, status, confidence,
             tags_list, keywords_list, job_id, phase, content, retrieval_list,
-            embedding_str, search_text, created_at, modified_at,
+            embedding_vec, search_text, created_at, modified_at,
             new_hash,
         )
 
@@ -305,17 +309,16 @@ class KnowledgeStore:
         Returns:
             List of KnowledgeRecord objects ranked by RRF score
         """
-        query_embedding_raw = await self.embedding_service.embed(query)
-        query_embedding_str = self._encode_embedding(query_embedding_raw)
+        query_embedding = await self.embedding_service.embed(query)
 
         rows = await self.db.fetch(
             """
             SELECT * FROM knowledge_hybrid_search(
-                $1, $2::vector, $3, $4, $5, $6, $7
+                $1, $2, $3, $4, $5, $6, $7
             )
             """,
             query,
-            query_embedding_str,
+            query_embedding,
             project_id,
             match_count,
             dense_weight,
