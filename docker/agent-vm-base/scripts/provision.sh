@@ -183,7 +183,7 @@ EOF
 echo "--- Setting up sudo approval gate ---"
 
 if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
-    echo "Installing plugin..."
+    echo "Installing plugin .so..."
     sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/libexec/sudo/
 
     echo "Installing daemon binary..."
@@ -201,34 +201,40 @@ if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
     sudo mkdir -p /etc/sudo-gate
     sudo install -o root -g root -m 0644 /tmp/sudo-gated-config.yaml /etc/sudo-gate/config.yaml
 
-    echo "Registering plugin in sudo.conf..."
-    cat /tmp/sudo-gate.conf | sudo tee -a /etc/sudo.conf > /dev/null
-
-    echo "Writing env file..."
-    sudo tee /etc/default/sudo-gated > /dev/null <<'SGEOF'
-# Overwritten by cloud-init at VM creation time
-NATS_URL=
-JOB_ID=
-VM_ID=
-SGEOF
-
     echo "Setting up tmpfiles.d..."
     sudo mkdir -p /etc/tmpfiles.d
-    echo "d /run/sudo-gated 0755 root sudo-gated -" | sudo tee /etc/tmpfiles.d/sudo-gated.conf > /dev/null
+    sudo sh -c 'echo "d /run/sudo-gated 0755 root sudo-gated -" > /etc/tmpfiles.d/sudo-gated.conf'
 
     echo "Enabling socket activation..."
     sudo systemctl daemon-reload
     sudo systemctl enable sudo-gated.socket
 
     echo "Applying immutable flags..."
-    # chattr may fail on some filesystems (overlayfs, tmpfs) — non-fatal
-    sudo chattr +i /usr/libexec/sudo/sudo_gate.so 2>/dev/null || echo "  chattr on sudo_gate.so skipped (unsupported fs)"
-    sudo chattr +i /etc/sudo.conf 2>/dev/null || echo "  chattr on sudo.conf skipped (unsupported fs)"
+    sudo chattr +i /usr/libexec/sudo/sudo_gate.so 2>/dev/null || echo "  chattr skipped (unsupported fs)"
+
+    # Register plugin in sudo.conf LAST — once registered, the plugin runs on
+    # every sudo invocation. Since the daemon isn't running during provisioning,
+    # fail_mode=deny would break all subsequent sudo commands in this script
+    # and in later Packer provisioners (tmux, git config, cleanup).
+    # We use fail_mode=open here; cloud-init switches to fail_mode=deny at boot.
+    echo "Registering plugin in sudo.conf..."
+    sudo sh -c 'echo "Plugin sudo_gate_approval sudo_gate.so socket_path=/run/sudo-gated/sudo-gated.sock timeout=305 fail_mode=open" >> /etc/sudo.conf'
+    sudo chattr +i /etc/sudo.conf 2>/dev/null || echo "  chattr skipped (unsupported fs)"
 
     echo "Sudo approval gate installed"
 else
     echo "Sudo gate binaries not found at /tmp/ — skipping (gate is optional)"
 fi
+
+# Default env file for sudo-gated (always created, overwritten by cloud-init).
+# Placed outside the if-block because heredocs inside conditional blocks
+# fail under Packer's SSH script provisioner.
+sudo tee /etc/default/sudo-gated > /dev/null <<'SGEOF'
+# Overwritten by cloud-init at VM creation time
+NATS_URL=
+JOB_ID=
+VM_ID=
+SGEOF
 
 # -----------------------------------------------------------------------------
 # 8. tmux configuration
