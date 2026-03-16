@@ -2780,6 +2780,23 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
         except FileNotFoundError:
             instructions[it] = None
 
+    # Also resolve custom instruction files from config.instruction_files
+    # (e.g. research_guide.md) — these aren't in the matrix but need to survive
+    # serialization so resumed/VM jobs can copy them to the workspace.
+    if config.instruction_files:
+        templates_dir = get_project_root() / "config" / "templates"
+        file_resolver = FileResolver(
+            deployment_dir=config._deployment_dir,
+            framework_dir=templates_dir,
+        )
+        for entry in config.instruction_files:
+            basename = Path(entry.file).stem
+            if basename not in instructions:
+                try:
+                    instructions[basename] = file_resolver.load(Path(entry.file).name)
+                except FileNotFoundError:
+                    pass
+
     return {
         "agent": agent_dict,
         "prompts": prompts,
