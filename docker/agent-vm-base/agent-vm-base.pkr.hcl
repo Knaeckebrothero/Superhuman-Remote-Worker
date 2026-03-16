@@ -166,17 +166,11 @@ build {
     destination = "/tmp/sudo-gate.conf"
   }
 
-  # Copy sudo gate compiled binaries if they exist (built by CI or locally).
-  # provision.sh gracefully skips installation when binaries are absent.
-  # The shell-local step creates empty placeholder files so the file
-  # provisioner never fails — provision.sh checks file size, not just existence.
-  provisioner "shell-local" {
-    inline = [
-      "test -f files/sudo-gated-bin || touch files/sudo-gated-bin",
-      "test -f files/sudo_gate.so   || touch files/sudo_gate.so",
-    ]
-  }
-
+  # Copy sudo gate compiled binaries (built by CI or locally).
+  # CI creates empty placeholders if binaries aren't available, so these
+  # file provisioners always succeed. provision.sh uses -s (non-empty)
+  # to skip installation when placeholders are empty.
+  # For local Packer builds: touch files/sudo-gated-bin files/sudo_gate.so
   provisioner "file" {
     source      = "files/sudo-gated-bin"
     destination = "/tmp/sudo-gated"
