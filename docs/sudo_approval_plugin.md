@@ -35,7 +35,7 @@ The security model holds because:
 
 The agent cannot:
 - Write to `/etc/sudoers` or `/etc/sudoers.d/` (owned by root, mode 0440)
-- Replace the plugin shared object (owned by root in `/usr/lib/sudo/`)
+- Replace the plugin shared object (owned by root in `/usr/libexec/sudo/`)
 - Write to the approval daemon's Unix socket (owned by root/wheel)
 - Fake an approval response (the daemon validates responses cryptographically or via the external orchestrator)
 - Kill or manipulate the approval daemon (different UID, agent has no CAP_SYS_PTRACE)

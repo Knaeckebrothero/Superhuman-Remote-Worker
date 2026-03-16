@@ -379,7 +379,13 @@ jobs:
 
   build-agent-vm-base:
     needs: [changes, build-sudo-gate]
-    if: always() && (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch')
+    # Rebuild when vm-base OR sudo-gate changes (sudo gate binaries are baked into the image)
+    if: >-
+      always() && (
+        needs.changes.outputs.vm-base == 'true' ||
+        needs.changes.outputs.sudo-gate == 'true' ||
+        github.event_name == 'workflow_dispatch'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -387,6 +393,14 @@ jobs:
       packages: write
 
     steps:
+      - name: Fail if sudo-gate build failed
+        # If sudo-gate was supposed to run (changes detected) but failed,
+        # don't publish a VM image missing the gate binaries
+        if: needs.build-sudo-gate.result == 'failure'
+        run: |
+          echo "::error::build-sudo-gate failed — refusing to build VM image without gate binaries"
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -395,25 +409,26 @@ jobs:
         with:
           name: sudo-gate-binaries
           path: docker/agent-vm-base/files/
+        # Allowed to fail when build-sudo-gate was skipped (no changes)
         continue-on-error: true
 
       - name: Prepare sudo gate binaries for Packer
         working-directory: docker/agent-vm-base
         run: |
           # Move binaries from artifact layout to where Packer expects them.
-          # If artifacts weren't downloaded (build-sudo-gate skipped/failed),
-          # create empty placeholders so Packer's file provisioner doesn't fail
-          # at validation. provision.sh uses -s (non-empty check) to skip them.
+          # If artifacts weren't downloaded (build-sudo-gate was skipped),
+          # create empty placeholders so Packer's file provisioner doesn't fail.
+          # provision.sh uses -s (non-empty check) to skip installation.
           if [ -f files/sudo-gated/sudo-gated ]; then
             mv files/sudo-gated/sudo-gated files/sudo-gated-bin
-            echo "sudo-gated binary ready"
+            echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
           else
             touch files/sudo-gated-bin
             echo "sudo-gated binary not available — creating empty placeholder"
           fi
           if [ -f files/sudo-gate-plugin/sudo_gate.so ]; then
             mv files/sudo-gate-plugin/sudo_gate.so files/sudo_gate.so
-            echo "sudo_gate.so ready"
+            echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
           else
             touch files/sudo_gate.so
             echo "sudo_gate.so not available — creating empty placeholder"
