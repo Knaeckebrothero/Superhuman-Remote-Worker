@@ -1,4 +1,4 @@
-# Home Lab Deployment Status (2026-03-14)
+# Home Lab Deployment Status (2026-03-16)
 
 ## Cluster Status
 
@@ -6,8 +6,9 @@
 - Orchestrator, 2 agent pods, cockpit, Gitea, PostgreSQL (app + vector), MongoDB, Neo4j, pgAdmin, Mongo Express, Dozzle, 3 VPN containers
 
 **Agent cluster** (`vms` context) — KubeVirt installed, VM controller running:
-- VM controller connected to NATS, subscribed to `vm.lifecycle.{create,delete,get}` since March 11
+- VM controller connected to NATS, subscribed to `vm.lifecycle.{create,delete,get}`, `vm.query.pod-ip`
 - NATS leaf node bridging the two clusters
+- Sudo approval gate deployed: C plugin + Go daemon baked into VM base image, orchestrator endpoints active, cockpit `/sudo` page live
 
 ## The Job
 
@@ -89,3 +90,17 @@ curl -X POST http://orchestrator:8085/api/jobs \
 ```
 
 Alternatively, check if the cockpit UI has a "use VM workspace" toggle when creating jobs.
+
+## Sudo Approval Gate: E2E Test (2026-03-16)
+
+Tested the full sudo approval flow on a live VM (`config_override.workspace.backend: "remote"`):
+
+| Test | Command | Mechanism | Result |
+|------|---------|-----------|--------|
+| Auto-approve | `sudo ls /tmp` | Rule: `ls *` → approve | EXIT=0, directory listed |
+| Manual approve | `sudo apt-get install -y cowsay` | REST API `/approve` | EXIT=0 (apt ran as root, package not found in default repos) |
+| Manual deny | `sudo reboot` | REST API `/deny` | Blocked, sudo rejected |
+
+**Flow verified**: C plugin → Unix socket → Go daemon → NATS leaf → NATS hub → orchestrator → PostgreSQL → REST/SSE → cockpit. Reply path: orchestrator `msg.respond()` → NATS → daemon → socket → plugin.
+
+**Known issue**: Daemon crashes on first connection after boot (SO_PEERCRED race in socket activation). Mitigated by cloud-init warmup `sudo true` call. After restart, all subsequent calls work. See `docs/features/sudo_approval_gate.md` Deployment Notes for full details.

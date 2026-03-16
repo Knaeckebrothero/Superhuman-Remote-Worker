@@ -16,6 +16,8 @@ related:
 
 # Sudo Approval Plugin: Human-in-the-Loop Privilege Escalation for LLM Agents
 
+> **Status: Implemented.** This is the original concept design document. For the detailed implementation roadmap, deployment notes, and current file layout, see `docs/features/sudo_approval_gate.md`.
+
 ## Concept
 
 A custom `sudo` plugin that intercepts privilege escalation requests from an autonomous agent, freezes them, and forwards them to an external approval authority (the orchestrator). The agent cannot proceed with the privileged operation until a human operator approves or denies the request via the cockpit UI.
