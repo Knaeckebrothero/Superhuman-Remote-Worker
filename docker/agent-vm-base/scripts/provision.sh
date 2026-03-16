@@ -183,28 +183,28 @@ EOF
 echo "--- Setting up sudo approval gate ---"
 
 if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
-    # Install plugin
+    echo "Installing plugin..."
     sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/libexec/sudo/
 
-    # Install daemon binary
+    echo "Installing daemon binary..."
     sudo install -o root -g root -m 0755 /tmp/sudo-gated /usr/local/bin/
 
-    # Create daemon user and group
+    echo "Creating daemon user..."
     sudo groupadd -r sudo-gated
     sudo useradd -r -g sudo-gated -s /usr/sbin/nologin -d /nonexistent sudo-gated
 
-    # Install systemd units
+    echo "Installing systemd units..."
     sudo install -o root -g root -m 0644 /tmp/sudo-gated.service /etc/systemd/system/
     sudo install -o root -g root -m 0644 /tmp/sudo-gated.socket /etc/systemd/system/
 
-    # Install daemon config
+    echo "Installing daemon config..."
     sudo mkdir -p /etc/sudo-gate
     sudo install -o root -g root -m 0644 /tmp/sudo-gated-config.yaml /etc/sudo-gate/config.yaml
 
-    # Register plugin in sudo.conf
+    echo "Registering plugin in sudo.conf..."
     cat /tmp/sudo-gate.conf | sudo tee -a /etc/sudo.conf > /dev/null
 
-    # Create default env file (overwritten by cloud-init at VM creation)
+    echo "Writing env file..."
     sudo tee /etc/default/sudo-gated > /dev/null <<'SGEOF'
 # Overwritten by cloud-init at VM creation time
 NATS_URL=
@@ -212,20 +212,18 @@ JOB_ID=
 VM_ID=
 SGEOF
 
-    # Ensure /run/sudo-gated survives reboots via tmpfiles.d
-    echo "d /run/sudo-gated 0755 root sudo-gated -" | sudo tee /etc/tmpfiles.d/sudo-gated.conf
+    echo "Setting up tmpfiles.d..."
+    sudo mkdir -p /etc/tmpfiles.d
+    echo "d /run/sudo-gated 0755 root sudo-gated -" | sudo tee /etc/tmpfiles.d/sudo-gated.conf > /dev/null
 
-    # Enable socket activation (daemon starts on first sudo)
+    echo "Enabling socket activation..."
     sudo systemctl daemon-reload
     sudo systemctl enable sudo-gated.socket
 
-    # Defense-in-depth: make plugin and sudo.conf immutable
-    # (prevents agent-host from modifying or replacing the gate)
-    sudo chattr +i /usr/libexec/sudo/sudo_gate.so
-    sudo chattr +i /etc/sudo.conf
-    # Note: /etc/sudoers is NOT made immutable here because cloud-init
-    # may need to modify it. The orchestrator can set it immutable after
-    # cloud-init completes via the management daemon.
+    echo "Applying immutable flags..."
+    # chattr may fail on some filesystems (overlayfs, tmpfs) — non-fatal
+    sudo chattr +i /usr/libexec/sudo/sudo_gate.so 2>/dev/null || echo "  chattr on sudo_gate.so skipped (unsupported fs)"
+    sudo chattr +i /etc/sudo.conf 2>/dev/null || echo "  chattr on sudo.conf skipped (unsupported fs)"
 
     echo "Sudo approval gate installed"
 else
