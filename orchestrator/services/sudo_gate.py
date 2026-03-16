@@ -35,6 +35,7 @@ class SudoGateService:
         self._nc: Optional[Any] = None  # NATS connection (from NatsBridge)
         self._sse_queues: list[asyncio.Queue] = []
         self._lock = asyncio.Lock()
+        self._pending_msgs: dict[str, Any] = {}  # request_id → NATS msg for respond()
 
     def connect(self, db: Any, nc: Optional[Any] = None) -> None:
         """Bind to database and optional NATS connection."""
@@ -125,7 +126,10 @@ class SudoGateService:
                 pass
             return
 
-        # No auto-match — push to SSE for human review.
+        # No auto-match — store msg for later respond() and push to SSE.
+        if request_id:
+            self._pending_msgs[request_id] = msg
+
         event = {
             "id": str(request_id),
             "job_id": job_id,
@@ -158,6 +162,15 @@ class SudoGateService:
             request_id, "approved", reason, decided_by, reply_subject,
         )
 
+        # Respond via the stored NATS msg object (most reliable for cross-leaf)
+        msg = self._pending_msgs.pop(request_id, None)
+        if msg:
+            try:
+                await msg.respond(json.dumps({"approved": True, "reason": reason}).encode())
+                logger.info("Responded via msg.respond() for request %s", request_id)
+            except Exception as e:
+                logger.warning("msg.respond() failed for %s: %s", request_id, e)
+
         await self._broadcast_sse("request_decided", {
             "id": str(request_id),
             "status": "approved",
@@ -180,6 +193,15 @@ class SudoGateService:
         await self._finalize_request(
             request_id, "denied", reason, decided_by, reply_subject,
         )
+
+        # Respond via the stored NATS msg object
+        msg = self._pending_msgs.pop(request_id, None)
+        if msg:
+            try:
+                await msg.respond(json.dumps({"approved": False, "reason": reason}).encode())
+                logger.info("Responded via msg.respond() for request %s", request_id)
+            except Exception as e:
+                logger.warning("msg.respond() failed for %s: %s", request_id, e)
 
         await self._broadcast_sse("request_decided", {
             "id": str(request_id),
@@ -218,8 +240,17 @@ class SudoGateService:
 
             count = 0
             for row in rows:
+                req_id = str(row["id"])
                 reply_subject = row.get("nats_reply_subject")
-                await self._nats_reply(reply_subject, False, "approval timed out")
+                # Try msg.respond() first, fallback to publish
+                msg = self._pending_msgs.pop(req_id, None)
+                if msg:
+                    try:
+                        await msg.respond(json.dumps({"approved": False, "reason": "approval timed out"}).encode())
+                    except Exception:
+                        await self._nats_reply(reply_subject, False, "approval timed out")
+                else:
+                    await self._nats_reply(reply_subject, False, "approval timed out")
                 count += 1
 
                 await self._broadcast_sse("request_decided", {
