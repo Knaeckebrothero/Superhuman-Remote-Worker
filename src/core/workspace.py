@@ -252,16 +252,29 @@ class WorkspaceManager:
         - Initializes a git repository with .gitignore
         - Creates initial phase_state.yaml
         - Makes an initial commit
+
+        When a git_remote_url is configured, the workspace is cloned from
+        the remote BEFORE creating subdirectories so that the local history
+        extends the remote's (required for pushes and subjob branches).
         """
-        # Create workspace root
+        # When we have a remote, clone first (needs empty/non-existent dir),
+        # then layer subdirectories on top.
+        if self.config.git_versioning and self.config.git_remote_url:
+            self._workspace_path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize_git()
+            # Create any subdirectories the clone didn't provide
+            for subdir in self.config.structure:
+                self._backend.mkdir(subdir)
+            self._initialized = True
+            return
+
+        # No remote — standard path: create dirs, then git init
         self._workspace_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Initialized workspace at {self._workspace_path}")
 
-        # Create subdirectories via backend
         for subdir in self.config.structure:
             self._backend.mkdir(subdir)
 
-        # Initialize git versioning if enabled
         if self.config.git_versioning:
             self._initialize_git()
 
@@ -270,23 +283,44 @@ class WorkspaceManager:
     def _initialize_git(self) -> None:
         """Initialize git versioning for the workspace.
 
-        Creates GitManager and initializes repository with .gitignore.
+        If a git_remote_url is configured, clones the remote repo so that
+        local history extends the remote's — this ensures pushes succeed and
+        subjob branches (forked from the remote) inherit the workspace files.
+
+        Falls back to ``git init`` + ``add_remote`` only when no remote URL
+        is available.
         """
         try:
             from ..managers.git_manager import GitManager
         except ImportError:
-            # Handle case where module is imported directly (e.g., in tests)
             from src.managers.git_manager import GitManager
 
-        # Create GitManager instance
-        self._git_manager = GitManager(self._workspace_path)
+        if self.config.git_remote_url:
+            # Clone from remote so histories stay connected.
+            git_mgr = GitManager.clone(
+                self.config.git_remote_url, self._workspace_path
+            )
+            if git_mgr:
+                self._git_manager = git_mgr
+                # Checkout job branch if specified
+                if self.config.branch_name:
+                    if git_mgr.checkout_branch(self.config.branch_name, create=True):
+                        logger.info(f"Checked out branch: {self.config.branch_name}")
+                    else:
+                        logger.warning(
+                            f"Failed to checkout branch {self.config.branch_name}"
+                        )
+                logger.info("Git versioning enabled (cloned from remote)")
+                return
+            # Clone failed — fall through to git init
+            logger.warning("Failed to clone remote repo, falling back to git init")
 
-        # Initialize repository (no-op if already exists)
+        # No remote URL or clone failed: plain git init
+        self._git_manager = GitManager(self._workspace_path)
         success = self._git_manager.init_repository()
 
         if success:
             logger.info("Git versioning enabled for workspace")
-            # Configure remote for workspace delivery if URL provided
             if self.config.git_remote_url:
                 self._git_manager.add_remote("origin", self.config.git_remote_url)
         else:

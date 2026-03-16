@@ -538,10 +538,11 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if queued_feedback:
             resume_payload["feedback"] = queued_feedback
             # Clean up queued_feedback from context so it's not re-injected
-            await postgres_db.pool.execute(
-                "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                json.dumps(job_context), job_id,
-            )
+            async with postgres_db.acquire() as conn:
+                await conn.execute(
+                    "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                    json.dumps(job_context), job_id,
+                )
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -2160,16 +2161,18 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
                         except json.JSONDecodeError:
                             job_context = {}
                     job_context["queued_feedback"] = feedback
-                    await postgres_db.pool.execute(
-                        "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                        json.dumps(job_context), job_id,
-                    )
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
+                            json.dumps(job_context), job_id,
+                        )
 
-                await postgres_db.update_job_status(
-                    job_id=job_id,
-                    status="paused",
-                    assigned_agent_id=None,
-                )
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET status = 'paused', assigned_agent_id = NULL, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
+                        job_id,
+                    )
                 logger.info(
                     f"No agents available — queued job {job_id} for auto-dispatch "
                     f"(previous status: {job['status']}, feedback: {bool(feedback)})"
@@ -2469,16 +2472,13 @@ async def _internal_resume_job(job_id: str, feedback: str) -> None:
         except json.JSONDecodeError:
             job_context = {}
     job_context["queued_feedback"] = feedback
-    await postgres_db.pool.execute(
-        "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-        json.dumps(job_context), job_id,
-    )
-
-    await postgres_db.update_job_status(
-        job_id=job_id,
-        status="paused",
-        assigned_agent_id=None,
-    )
+    async with postgres_db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $1::jsonb, status = 'paused', "
+            "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2::uuid",
+            json.dumps(job_context), job_id,
+        )
     logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
     _trigger_dispatch()
 
