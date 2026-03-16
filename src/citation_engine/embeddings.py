@@ -12,8 +12,14 @@ Environment Variables:
     CITATION_EMBEDDING_BATCH_SIZE: Max texts per API batch (default: 2048)
 """
 
+from __future__ import annotations
+
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import httpx
 
 log = logging.getLogger(__name__)
 
@@ -200,7 +206,7 @@ class EmbeddingService:
     def _embed_single_batch(
         self,
         texts: list[str],
-        client: "httpx.Client",
+        client: httpx.Client,
         url: str,
         headers: dict[str, str],
     ) -> list[list[float]]:
@@ -300,7 +306,7 @@ class EmbeddingService:
                 batch_results = self._embed_single_batch(
                     batch_texts, client, url, headers
                 )
-                for idx, embedding in zip(batch_indices, batch_results):
+                for idx, embedding in zip(batch_indices, batch_results, strict=True):
                     results[idx] = embedding
 
         # Cache dimension from first result

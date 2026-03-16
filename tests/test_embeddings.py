@@ -268,7 +268,7 @@ class TestEmbeddingService:
         # ~15000 tokens estimated (30000 chars / 2), well above limit of 100
         oversized = "a" * 30_000
         original_texts = [oversized, "short"]
-        results = service.embed_batch(original_texts)
+        service.embed_batch(original_texts)
 
         # Verify the API received truncated text (100 tokens * 2 = 200 chars)
         call_args = mock_client.post.call_args
@@ -305,7 +305,7 @@ class TestEmbeddingService:
         # Long text that will exceed 10 tokens
         oversized = "This is a longer sentence that should definitely exceed ten tokens by a wide margin."
         original_texts = [oversized]
-        results = service.embed_batch(original_texts)
+        service.embed_batch(original_texts)
 
         # Verify the API received truncated text
         call_args = mock_client.post.call_args
