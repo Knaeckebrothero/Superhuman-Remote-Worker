@@ -42,6 +42,7 @@ jobs:
       vpn: ${{ steps.filter.outputs.vpn }}
       vm-base: ${{ steps.filter.outputs.vm-base }}
       vm-controller: ${{ steps.filter.outputs.vm-controller }}
+      sudo-gate: ${{ steps.filter.outputs.sudo-gate }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -72,6 +73,9 @@ jobs:
               - 'docker/agent-vm-base/**'
             vm-controller:
               - 'vm-controller/**'
+            sudo-gate:
+              - 'sudo-gated/**'
+              - 'sudo-gate-plugin/**'
 
   build-agent:
     needs: changes
@@ -331,9 +335,51 @@ jobs:
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vpn:latest" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
 
-  build-agent-vm-base:
+  build-sudo-gate:
     needs: changes
-    if: needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch'
+    if: needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build sudo-gated (Go daemon)
+        working-directory: sudo-gated
+        run: |
+          go mod tidy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-s -w -X main.version=sha-${GITHUB_SHA::7}" \
+            -o sudo-gated ./cmd/sudo-gated/
+          file sudo-gated
+          ls -lh sudo-gated
+
+      - name: Build sudo_gate.so (C plugin)
+        working-directory: sudo-gate-plugin
+        run: |
+          gcc -fPIC -shared -Wall -Wextra -Werror -O2 -I./include \
+            -o sudo_gate.so sudo_gate.c json_util.c
+          file sudo_gate.so
+          ls -lh sudo_gate.so
+
+      - name: Upload sudo gate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sudo-gate-binaries
+          path: |
+            sudo-gated/sudo-gated
+            sudo-gate-plugin/sudo_gate.so
+          retention-days: 7
+
+  build-agent-vm-base:
+    needs: [changes, build-sudo-gate]
+    if: always() && (needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -343,6 +389,28 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download sudo gate artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sudo-gate-binaries
+          path: docker/agent-vm-base/files/
+        continue-on-error: true
+
+      - name: Prepare sudo gate binaries for Packer
+        working-directory: docker/agent-vm-base
+        run: |
+          # Move binaries to where Packer file provisioners expect them
+          # (provision.sh checks for /tmp/sudo_gate.so and /tmp/sudo-gated)
+          if [ -f files/sudo-gated/sudo-gated ]; then
+            mv files/sudo-gated/sudo-gated files/sudo-gated-bin
+            echo "sudo-gated binary ready"
+          fi
+          if [ -f files/sudo-gate-plugin/sudo_gate.so ]; then
+            mv files/sudo-gate-plugin/sudo_gate.so files/sudo_gate.so
+            echo "sudo_gate.so ready"
+          fi
+          ls -la files/
 
       - name: Free disk space
         run: |

@@ -120,6 +120,11 @@ class NatsBridge:
             await self._nc.subscribe("agent.vm.*.heartbeat", cb=self._on_daemon_heartbeat)
             await self._nc.subscribe("agent.vm.*.status", cb=self._on_daemon_status)
 
+            # Subscribe to sudo approval requests (from sudo-gated daemons)
+            from .sudo_gate import sudo_gate
+            sudo_gate.connect(db=db, nc=self._nc)
+            await self._nc.subscribe("sudo.request.>", cb=sudo_gate.on_sudo_request)
+
             self._available = True
             logger.info("NATS bridge connected: %s", self._url)
         except Exception as e:

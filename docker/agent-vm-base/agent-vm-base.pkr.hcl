@@ -145,6 +145,48 @@ build {
     destination = "/tmp/code-server-config.yaml"
   }
 
+  # Copy sudo approval gate files
+  provisioner "file" {
+    source      = "files/sudo-gated.service"
+    destination = "/tmp/sudo-gated.service"
+  }
+
+  provisioner "file" {
+    source      = "files/sudo-gated.socket"
+    destination = "/tmp/sudo-gated.socket"
+  }
+
+  provisioner "file" {
+    source      = "files/sudo-gated-config.yaml"
+    destination = "/tmp/sudo-gated-config.yaml"
+  }
+
+  provisioner "file" {
+    source      = "files/sudo-gate.conf"
+    destination = "/tmp/sudo-gate.conf"
+  }
+
+  # Copy sudo gate compiled binaries if they exist (built by CI or locally).
+  # provision.sh gracefully skips installation when binaries are absent.
+  # The shell-local step creates empty placeholder files so the file
+  # provisioner never fails — provision.sh checks file size, not just existence.
+  provisioner "shell-local" {
+    inline = [
+      "test -f files/sudo-gated-bin || touch files/sudo-gated-bin",
+      "test -f files/sudo_gate.so   || touch files/sudo_gate.so",
+    ]
+  }
+
+  provisioner "file" {
+    source      = "files/sudo-gated-bin"
+    destination = "/tmp/sudo-gated"
+  }
+
+  provisioner "file" {
+    source      = "files/sudo_gate.so"
+    destination = "/tmp/sudo_gate.so"
+  }
+
   # Main provisioning script
   provisioner "shell" {
     script = "scripts/provision.sh"

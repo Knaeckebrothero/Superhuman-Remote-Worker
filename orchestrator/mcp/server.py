@@ -2348,3 +2348,113 @@ async def _search_audit(
         lines.append("")
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# Sudo Approval Gate
+# =============================================================================
+
+
+@mcp.tool
+async def list_sudo_requests(
+    job_id: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+) -> str:
+    """List sudo approval requests from agent VMs.
+
+    Shows pending, approved, denied, and expired sudo requests.
+    Use this to see what privileged commands agents are requesting.
+
+    Args:
+        job_id: Filter by job ID
+        status: Filter by status (pending, approved, denied, expired, auto_approved, auto_denied)
+        limit: Maximum requests to return (1-100, default 20)
+
+    Returns:
+        Formatted list of sudo approval requests
+    """
+    if limit < 1:
+        limit = 1
+    elif limit > 100:
+        limit = 100
+
+    client = _get_client()
+    requests = await client.list_sudo_requests(job_id=job_id, status=status, limit=limit)
+
+    if not requests:
+        return "No sudo approval requests found."
+
+    lines = [f"Found {len(requests)} sudo request(s):\n"]
+    for req in requests:
+        rid = req.get("id", "?")[:8]
+        jid = req.get("job_id", "?")[:8]
+        cmd = req.get("command", "?")
+        argv = req.get("arguments", [])
+        cmd_str = " ".join(argv) if argv else cmd
+        st = req.get("status", "?")
+        user = req.get("requesting_user", "?")
+        target = req.get("target_user", "root")
+        vm = req.get("vm_name", "?")
+        ts = req.get("requested_at", "?")
+
+        status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌", "expired": "⏰"}.get(st, "•")
+        lines.append(f"{status_icon} [{rid}] {st.upper()}")
+        lines.append(f"  Command: {cmd_str}")
+        lines.append(f"  User: {user} → {target} | VM: {vm} | Job: {jid}")
+        lines.append(f"  Requested: {ts}")
+        if req.get("decided_by"):
+            lines.append(f"  Decided by: {req['decided_by']} — {req.get('decision_reason', '')}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@mcp.tool
+async def approve_sudo_request(
+    request_id: str,
+    reason: str = "",
+) -> str:
+    """Approve a pending sudo approval request.
+
+    This sends the approval to the agent's VM, allowing the sudo command
+    to execute. The agent's run_command call will unblock and return output.
+
+    Args:
+        request_id: UUID of the sudo request to approve
+        reason: Optional reason for approval
+
+    Returns:
+        Confirmation message
+    """
+    client = _get_client()
+    try:
+        result = await client.approve_sudo_request(request_id, reason=reason)
+        return f"Approved sudo request {request_id}: {result.get('status', 'ok')}"
+    except Exception as e:
+        return f"Failed to approve: {e}"
+
+
+@mcp.tool
+async def deny_sudo_request(
+    request_id: str,
+    reason: str,
+) -> str:
+    """Deny a pending sudo approval request.
+
+    This sends a denial to the agent's VM. The sudo command will be rejected
+    and the agent will see 'sudo request denied by operator' in stderr.
+
+    Args:
+        request_id: UUID of the sudo request to deny
+        reason: Reason for denial (required)
+
+    Returns:
+        Confirmation message
+    """
+    client = _get_client()
+    try:
+        result = await client.deny_sudo_request(request_id, reason=reason)
+        return f"Denied sudo request {request_id}: {result.get('status', 'ok')}"
+    except Exception as e:
+        return f"Failed to deny: {e}"

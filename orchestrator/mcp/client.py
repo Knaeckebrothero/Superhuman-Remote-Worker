@@ -2169,3 +2169,79 @@ class AsyncCockpitClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    # =========================================================================
+    # Sudo Approval Gate
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def list_sudo_requests(
+        self,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List sudo approval requests.
+
+        Args:
+            job_id: Optional job ID filter.
+            status: Optional status filter (pending, approved, denied, expired).
+            limit: Maximum results (default 50).
+
+        Returns:
+            List of sudo approval request dicts.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if job_id:
+            params["job_id"] = job_id
+        if status:
+            params["status"] = status
+        resp = await self._client.get("/api/sudo/requests", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def approve_sudo_request(
+        self,
+        request_id: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Approve a pending sudo request.
+
+        Args:
+            request_id: UUID of the sudo approval request.
+            reason: Optional approval reason.
+
+        Returns:
+            Dict with id and status.
+        """
+        body: dict[str, Any] = {}
+        if reason:
+            body["reason"] = reason
+        resp = await self._client.post(
+            f"/api/sudo/requests/{request_id}/approve", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def deny_sudo_request(
+        self,
+        request_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Deny a pending sudo request.
+
+        Args:
+            request_id: UUID of the sudo approval request.
+            reason: Denial reason (required).
+
+        Returns:
+            Dict with id and status.
+        """
+        resp = await self._client.post(
+            f"/api/sudo/requests/{request_id}/deny",
+            json={"reason": reason},
+        )
+        resp.raise_for_status()
+        return resp.json()
