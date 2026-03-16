@@ -100,6 +100,7 @@ python agent.py --config validator --job-id <id> --approve
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LOG_LEVEL` | `INFO` | Logging level: DEBUG, INFO, WARNING, ERROR |
+| `DEBUG_ALL` | unset | Set to `1` to include third-party library debug output |
 | `DEBUG_LLM_STREAM` | unset | Set to `1` for LLM token output to stderr |
 | `DEBUG_LLM_TAIL` | `500` | Characters to show in LLM debug output |
 

@@ -718,6 +718,8 @@ interface JobRow {
       .action-btn.confirming {
         font-weight: 700;
         animation: pulse-confirm 1s ease-in-out infinite;
+        color: #f38ba8;
+        border-color: #f38ba8;
       }
 
       @keyframes pulse-confirm {

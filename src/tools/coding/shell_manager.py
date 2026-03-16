@@ -26,9 +26,6 @@ import libtmux
 
 logger = logging.getLogger(__name__)
 
-# Suppress libtmux DEBUG logging (it logs every capture-pane call)
-logging.getLogger("libtmux").setLevel(logging.WARNING)
-
 # Tab name validation pattern
 TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
 

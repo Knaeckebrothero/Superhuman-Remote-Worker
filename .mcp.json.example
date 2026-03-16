@@ -3,7 +3,7 @@
     "orchestrator": {
       "type": "http",
       "url": "http://localhost:8055/mcp",
-      "auth": "srw_YOUR_TOKEN_HERE"
+      "auth": "Bearer srw_dev_localtoken_do_not_use_in_production"
     }
   }
 }
