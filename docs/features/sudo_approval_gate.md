@@ -22,6 +22,8 @@ related:
 
 # Sudo Approval Gate — Implementation Roadmap
 
+> **Status: Implemented and deployed (2026-03-16).** All 7 phases complete. The gate is active on agent VMs — `sudo` commands are intercepted, forwarded to the orchestrator, and held for human approval via the cockpit `/sudo` page, REST API, or MCP tools. Auto-approval rules provide instant approval for safe patterns.
+
 Human-in-the-loop privilege escalation for autonomous LLM agents running inside KubeVirt VMs.
 
 ## Problem
@@ -122,7 +124,7 @@ The daemon uses NATS core request/reply — **not** pub/sub or JetStream:
 2. NATS internally creates a unique ephemeral `_INBOX.xxx` subject and sets it as the reply-to header
 3. The orchestrator, subscribed to `sudo.request.>`, receives the message with `msg.Reply` containing the `_INBOX` subject
 4. The orchestrator stores `msg.Reply` in the `nats_reply_subject` column of `sudo_approval_requests`
-5. When the human approves/denies (or auto-approval fires, or expiry triggers), the orchestrator publishes the decision to the stored `_INBOX` subject via `nc.Publish(reply_subject, response)`
+5. When the human approves/denies (or auto-approval fires, or expiry triggers), the orchestrator responds using the stored NATS `msg` object via `msg.respond(response)` (most reliable for cross-leaf-node delivery), with a fallback `nc.Publish(reply_subject, response)` + `flush()`
 6. The daemon's `nc.Request()` call receives the reply, unblocks, and writes the response to the Unix socket
 
 If the daemon's 300s timeout fires before the orchestrator replies, `nc.Request()` returns `nats.ErrTimeout`, the daemon writes a denial to the socket, and any later reply from the orchestrator to the `_INBOX` is silently dropped (the subscription is already gone). This is the correct behavior — a stale approval must never execute.
@@ -147,7 +149,7 @@ The agent should note this in `workspace.md` and either try an alternative appro
 ### Why this architecture holds
 
 1. **The plugin runs as root** — loaded by sudo's SUID binary before any uid/gid transition. The agent process (`agent-host` user) cannot modify, replace, or bypass it.
-2. **The daemon runs as a separate system user** — with aggressive systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `CapabilityBoundingSet=`). The agent cannot kill, inspect, or manipulate it.
+2. **The daemon runs as a separate system user** — with aggressive systemd hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `CapabilityBoundingSet=CAP_SYS_PTRACE`). The only capability granted is `CAP_SYS_PTRACE` — required to read `/proc/{pid}/exe` of the SUID sudo process for peer verification when `kernel.yama.ptrace_scope=1` (Ubuntu default). The agent cannot kill, inspect, or manipulate the daemon.
 3. **The decision comes from outside** — the orchestrator and cockpit live on a different cluster entirely. The agent has no path to influence the approval decision.
 4. **Fail-closed by default** — any failure at any layer (plugin crash, daemon down, NATS unreachable, orchestrator offline, human timeout) results in command denial.
 
@@ -242,12 +244,12 @@ The existing CI pipeline (GitHub Actions) can be extended with build steps for G
 
 **Prerequisites**:
 - Obtain `sudo_plugin.h`: `apt-get source sudo` on Ubuntu 24.04 provides `sudo-1.9.15p5/include/sudo_plugin.h`
-- Vendor cJSON: download `cJSON.c` and `cJSON.h` from the DaveGamble/cJSON repository (single-file library, no runtime dependencies)
+- JSON handling: a purpose-built `json_util.c`/`json_util.h` provides safe serialization and parsing (no external dependency like cJSON needed — the plugin only needs to build/parse two simple JSON shapes)
 
 **Deliverables**:
 - `sudo-gate-plugin/sudo_gate.c` — Approval plugin implementation (built incrementally, see below)
 - `sudo-gate-plugin/include/sudo_plugin.h` — Vendored from sudo source (avoids build-time dependency on `apt-get source`)
-- `sudo-gate-plugin/cJSON.c`, `sudo-gate-plugin/cJSON.h` — Vendored single-file JSON library
+- `sudo-gate-plugin/json_util.c`, `sudo-gate-plugin/json_util.h` — Purpose-built JSON serialization/parsing (safe `find_key()` parser that skips string values to prevent injection)
 - `sudo-gate-plugin/Makefile` — Build with GCC 14, `-fPIC -shared -Wall -Wextra -O2 -I./include`
 - `sudo-gate-plugin/sudo.conf.d/sudo_gate.conf` — Plugin registration for `/etc/sudo.conf`
 
@@ -288,7 +290,7 @@ ListenStream=/run/sudo-gated/sudo-gated.sock
 SocketMode=0660
 SocketUser=root
 SocketGroup=sudo-gated
-DirectoryMode=0755
+DirectoryMode=0775
 
 [Install]
 WantedBy=sockets.target
@@ -316,7 +318,10 @@ ProtectHome=yes
 PrivateTmp=yes
 MemoryDenyWriteExecute=yes
 SystemCallFilter=@system-service
-CapabilityBoundingSet=
+# CAP_SYS_PTRACE: required to readlink /proc/{pid}/exe of root-owned sudo
+# process when kernel.yama.ptrace_scope=1 (Ubuntu 24.04 default)
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/run/sudo-gated
 
@@ -357,9 +362,8 @@ CREATE TYPE sudo_request_status AS ENUM (
 );
 
 CREATE TABLE sudo_approval_requests (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    agent_id        UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     vm_name         VARCHAR(255) NOT NULL,
     command         TEXT NOT NULL,
     arguments       TEXT[] DEFAULT '{}',
@@ -372,8 +376,9 @@ CREATE TABLE sudo_approval_requests (
     decided_by      VARCHAR(255),
     decision_reason TEXT,
     ttl_seconds     INTEGER NOT NULL DEFAULT 300,
-    expires_at      TIMESTAMPTZ GENERATED ALWAYS AS
-        (requested_at + (ttl_seconds || ' seconds')::INTERVAL) STORED,
+    -- Computed at INSERT time (GENERATED ALWAYS AS not used — PostgreSQL 15
+    -- rejects non-immutable interval expressions in generated columns)
+    expires_at      TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '300 seconds'),
     -- Stored so the expiration sweeper can send denials after the originating
     -- NATS subscription handler has already returned.
     nats_reply_subject TEXT,
@@ -524,16 +529,16 @@ sudo systemctl enable sudo-gated.socket
 ```
 
 **Security hardening checklist**:
-- [ ] Plugin `.so` owned by root:root, mode 0644, `chattr +i`
-- [ ] `/etc/sudo.conf` owned by root:root, mode 0644, `chattr +i`
-- [ ] `/etc/sudoers` and `/etc/sudoers.d/` owned by root:root, `chattr +i`
-- [ ] Daemon binary owned by root:root, mode 0755
-- [ ] Socket at `/run/sudo-gated/sudo-gated.sock` mode 0660, owner root:sudo-gated
-- [ ] Daemon runs as `sudo-gated` user with empty `CapabilityBoundingSet`
-- [ ] `SO_PEERCRED` verification: daemon checks connecting PID is `/usr/bin/sudo`
-- [ ] NATS auth: NKey or JWT credentials scoped to `sudo.request.{vm_id}.>` subjects only
-- [ ] Commands with `|`, `>`, `;`, `&&`, `||` never auto-approved
-- [ ] `virtctl console` tested as recovery path for lockout scenarios
+- [x] Plugin `.so` owned by root:root, mode 0644, `chattr +i`
+- [x] `/etc/sudo.conf` owned by root:root, `chattr +i` (set during provisioning)
+- [x] `/etc/sudoers` and `/etc/sudoers.d/` owned by root:root
+- [x] Daemon binary owned by root:root, mode 0755
+- [x] Socket at `/run/sudo-gated/sudo-gated.sock` mode 0660, owner root:sudo-gated, directory mode 0775
+- [x] Daemon runs as `sudo-gated` user with `CapabilityBoundingSet=CAP_SYS_PTRACE` (required for `/proc/pid/exe` reads)
+- [x] `SO_PEERCRED` verification: daemon checks connecting PID is `/usr/bin/sudo`
+- [ ] NATS auth: NKey or JWT credentials scoped to `sudo.request.{vm_id}.>` subjects only (future)
+- [x] Commands with `|`, `>`, `;`, `&&`, `||` never auto-approved
+- [x] Cloud-init warmup call absorbs daemon first-call crash before agent SSH access
 
 **Test criteria (end-to-end on real cluster)**:
 - Build VM image with Packer → image includes plugin + daemon
@@ -580,32 +585,35 @@ sudo-gated/                          # Go daemon (new directory at repo root)
 
 sudo-gate-plugin/                    # C plugin (new directory at repo root)
 ├── sudo_gate.c                      # Approval plugin implementation
+├── json_util.c                      # Purpose-built JSON serialization/parsing
+├── json_util.h                      # (no external dependencies — avoids cJSON bloat)
 ├── include/
-│   └── sudo_plugin.h                # Vendored from sudo 1.9.15p5 source
-├── cJSON.c                          # Vendored single-file JSON library
-├── cJSON.h
-├── Makefile                         # gcc -fPIC -shared -Wall -Wextra -O2 -I./include
+│   └── sudo_plugin.h                # Minimal header extracted from sudo 1.9.15p5
+├── Makefile                         # gcc -fPIC -shared -Wall -Wextra -Werror -O2 -I./include
 └── sudo.conf.d/
     └── sudo_gate.conf               # Plugin registration line for /etc/sudo.conf
 
 orchestrator/
-├── database/queries/postgres/
-│   └── sudo_schema.sql              # New: approval requests + auto-approval rules
-├── main.py                          # Modified: new /api/sudo/* endpoints + SSE
+├── database/
+│   └── schema.sql                   # Modified: sudo_approval_requests + sudo_auto_rules tables
+├── main.py                          # Modified: 9 new /api/sudo/* endpoints + SSE + Pydantic models
 ├── services/
-│   ├── nats_bridge.py               # Modified: new sudo.request.> subscription
-│   └── sudo_gate.py                 # New: auto-approval engine, expiration sweeper
+│   ├── nats_bridge.py               # Modified: sudo.request.> subscription, calls sudo_gate.connect()
+│   └── sudo_gate.py                 # New: NATS handler, auto-approval engine, msg.respond() reply,
+│                                    #       expiration sweeper, SSE broadcasting, _pending_msgs cache
 └── mcp/
-    └── (sudo tools added)           # Modified: approve/deny/list MCP tools
+    ├── client.py                    # Modified: list/approve/deny sudo request HTTP methods
+    └── server.py                    # Modified: 3 new MCP tools (list, approve, deny)
 
 cockpit/src/app/
-├── services/
-│   └── sudo-approval.service.ts     # New: SSE client + WritableSignal state
-└── components/
-    └── sudo-approval/               # New
-        ├── sudo-approval-card.component.ts
-        ├── sudo-approval-list.component.ts
-        └── sudo-rule-manager.component.ts
+├── core/services/
+│   └── sudo.service.ts              # New: SSE via EventSource + HTTP, signal-based state
+├── simple/pages/sudo/
+│   └── sudo-page.component.ts       # New: two-panel layout (requests + rules), risk badges,
+│                                    #       countdown timer, approve/deny dialogs, rule management
+├── layout/sidebar/
+│   └── sidebar.component.ts         # Modified: added "Sudo" nav link
+└── app.routes.ts                    # Modified: /sudo route with authGuard
 
 docker/agent-vm-base/
 ├── scripts/provision.sh             # Modified: install plugin + daemon + systemd units
@@ -633,3 +641,40 @@ docs/HomeLab/deployments/srw/harvester/
 | Cross-component timeout race | Medium — approval recorded after plugin timeout | Cascading timeout hierarchy (295s < 300s < 305s) prevents this. Test extensively with deliberate delays. |
 | `run_command` default timeout too short | Medium — agent's 120s default times out before 305s approval window | Agent instructions must note `timeout=600` for sudo commands. Consider auto-adjusting timeout in `run_command` when command starts with `sudo`. |
 | Daemon `nats_reply_subject` stale after restart | Low — pending approval lost if daemon restarts | Daemon restarts close all socket connections; plugin receives error and denies. The orchestrator-side row remains `pending` and will be cleaned up by the expiration sweeper. No data inconsistency. |
+| Daemon first-call crash on socket activation | Medium — first sudo call fails | SO_PEERCRED race during socket activation startup. Cloud-init runs a warmup `sudo true` call to trigger the crash/restart before the agent SSHs in. All subsequent calls work. |
+
+## Deployment Notes (2026-03-16)
+
+Issues discovered and fixed during first cluster deployment:
+
+### PostgreSQL 15: GENERATED ALWAYS AS requires immutable expressions
+
+The original schema used `expires_at TIMESTAMPTZ GENERATED ALWAYS AS (requested_at + (ttl_seconds || ' seconds')::INTERVAL) STORED`. PostgreSQL 15 rejects this because the `||` text concatenation and `::INTERVAL` cast are not immutable operators. Fixed by making `expires_at` a regular column with a default, computed at INSERT time by the application.
+
+### CAP_SYS_PTRACE required for peer verification
+
+The daemon's `SO_PEERCRED` + `/proc/{pid}/exe` verification requires `CAP_SYS_PTRACE` when `kernel.yama.ptrace_scope=1` (Ubuntu 24.04 default). Without it, the daemon cannot read the exe link of the root-owned sudo process. Fixed by adding `CapabilityBoundingSet=CAP_SYS_PTRACE` and `AmbientCapabilities=CAP_SYS_PTRACE` to the systemd service unit.
+
+### DirectoryMode 0775 for daemon restart recovery
+
+When the daemon crashes and restarts (not via socket activation), it tries to remove the stale socket file before creating a new one. With `DirectoryMode=0755`, the `sudo-gated` user doesn't have write permission to the directory. Fixed by changing to `0775` in both the socket unit and `tmpfiles.d`.
+
+### NATS _INBOX reply delivery across leaf nodes
+
+Publishing to a stored `_INBOX` reply subject via `nc.publish()` from a different asyncio context does not reliably deliver across NATS leaf node boundaries. The orchestrator now stores the original NATS `msg` object for pending requests and uses `msg.respond()` when the human decides, which correctly routes through the leaf connection. Auto-approval uses `msg.respond()` directly within the subscription callback.
+
+### Cloud-init warmup for socket activation race
+
+The daemon crashes on its very first connection after boot due to a race condition in socket activation + NATS initialization. Cloud-init runs a warmup `sudo -u agent-host sudo true` call to trigger the crash/restart cycle before the agent's SSH access begins. After the restart, the daemon is fully initialized and all subsequent calls work reliably.
+
+### Plugin registration must be last in provision.sh
+
+The plugin with `fail_mode=deny` causes ALL subsequent `sudo` commands to fail if the daemon isn't running. During Packer provisioning, the daemon's socket isn't active. The plugin registration line is appended to `/etc/sudo.conf` as the **last step** in provision.sh with `fail_mode=open`. Cloud-init switches to `fail_mode=deny` at VM boot time (after the daemon is started).
+
+### KubeVirt cloud-init 2048-byte limit
+
+The `cloudInitNoCloud` userData section has a 2048-byte limit. The original template exceeded this after adding sudo-gated env vars. Fixed by removing the inline management-daemon systemd unit (already baked into the image) and stripping comments. The rendered userData is ~1500 bytes.
+
+### CI/CD: cross-job dependency for VM image builds
+
+The `build-agent-vm-base` Packer job depends on artifacts from `build-sudo-gate` (Go binary + C .so). The GitHub Actions workflow uses `needs:` and an early failure gate step to ensure the VM image isn't built with stale or missing sudo gate binaries.

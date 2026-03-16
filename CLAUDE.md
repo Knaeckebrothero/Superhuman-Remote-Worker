@@ -395,15 +395,17 @@ NATS takes priority when both are available. All VM features are fully optional 
 
 Control commands (freeze/resume/terminate) require NATS since they target the management daemon inside the VM. On same-cluster without NATS, `cancel_job` compensates by deleting the VM directly via K8s API.
 
-### Sudo Approval Gate (Optional)
+### Sudo Approval Gate (Optional, Implemented)
 
-Human-in-the-loop privilege escalation for agents in VMs. When an agent runs `sudo`, the command is intercepted by a plugin, forwarded via a Go daemon over NATS to the orchestrator, and held for human approval via the cockpit UI or MCP tools.
+Human-in-the-loop privilege escalation for agents in VMs. When an agent runs `sudo`, the command is intercepted by a C plugin, forwarded via a Go daemon over NATS to the orchestrator, and held for human approval via the cockpit UI, REST API, or MCP tools. Auto-approval rules provide instant approval for safe patterns (e.g., `ls *`, `apt-get install *-dev`).
 
 **Components:** C plugin (`sudo-gate-plugin/`), Go daemon (`sudo-gated/`), orchestrator service (`orchestrator/services/sudo_gate.py`), cockpit UI (`/sudo` route), MCP tools (`list_sudo_requests`, `approve_sudo_request`, `deny_sudo_request`).
 
 **REST endpoints:** `/api/sudo/events` (SSE), `/api/sudo/requests` (CRUD), `/api/sudo/rules` (auto-approval management).
 
-All sudo gate features are fully optional — the system works without them (agents get unrestricted sudo, the pre-gate default). See `docs/features/sudo_approval_gate.md` for the full design and implementation roadmap.
+**CI/CD:** The `build-sudo-gate` job compiles both the Go daemon and C plugin, uploads as artifacts. The `build-agent-vm-base` job downloads them and bakes them into the VM image via Packer. Cloud-init configures NATS URL, job ID, and switches `fail_mode=open` → `fail_mode=deny` at boot.
+
+All sudo gate features are fully optional — the system works without them (agents get unrestricted sudo, the pre-gate default). See `docs/features/sudo_approval_gate.md` for the full design, implementation details, and deployment notes.
 
 See `docs/features/vm_backend.md` for the full workspace backend design and `docs/features/nats.md` for the messaging layer architecture.
 
