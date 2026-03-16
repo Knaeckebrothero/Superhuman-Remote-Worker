@@ -400,15 +400,23 @@ jobs:
       - name: Prepare sudo gate binaries for Packer
         working-directory: docker/agent-vm-base
         run: |
-          # Move binaries to where Packer file provisioners expect them
-          # (provision.sh checks for /tmp/sudo_gate.so and /tmp/sudo-gated)
+          # Move binaries from artifact layout to where Packer expects them.
+          # If artifacts weren't downloaded (build-sudo-gate skipped/failed),
+          # create empty placeholders so Packer's file provisioner doesn't fail
+          # at validation. provision.sh uses -s (non-empty check) to skip them.
           if [ -f files/sudo-gated/sudo-gated ]; then
             mv files/sudo-gated/sudo-gated files/sudo-gated-bin
             echo "sudo-gated binary ready"
+          else
+            touch files/sudo-gated-bin
+            echo "sudo-gated binary not available — creating empty placeholder"
           fi
           if [ -f files/sudo-gate-plugin/sudo_gate.so ]; then
             mv files/sudo-gate-plugin/sudo_gate.so files/sudo_gate.so
             echo "sudo_gate.so ready"
+          else
+            touch files/sudo_gate.so
+            echo "sudo_gate.so not available — creating empty placeholder"
           fi
           ls -la files/
 
