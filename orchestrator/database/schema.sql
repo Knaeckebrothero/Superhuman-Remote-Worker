@@ -632,7 +632,68 @@ CREATE TRIGGER update_project_repositories_updated_at
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
--- 8. VIEWS
+-- 8. SUDO APPROVAL GATE
+-- ============================================================================
+
+-- Status enum for sudo approval requests
+DO $$ BEGIN
+    CREATE TYPE sudo_request_status AS ENUM (
+        'pending', 'approved', 'denied', 'expired', 'auto_approved', 'auto_denied'
+    );
+EXCEPTION WHEN duplicate_object THEN null;
+END $$;
+
+CREATE TABLE IF NOT EXISTS sudo_approval_requests (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_id              UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    vm_name             VARCHAR(255) NOT NULL,
+    command             TEXT NOT NULL,
+    arguments           TEXT[] DEFAULT '{}',
+    working_directory   TEXT,
+    requesting_user     VARCHAR(255) NOT NULL,
+    target_user         VARCHAR(255) NOT NULL DEFAULT 'root',
+    status              sudo_request_status NOT NULL DEFAULT 'pending',
+    requested_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at          TIMESTAMPTZ,
+    decided_by          VARCHAR(255),
+    decision_reason     TEXT,
+    ttl_seconds         INTEGER NOT NULL DEFAULT 300,
+    expires_at          TIMESTAMPTZ GENERATED ALWAYS AS
+        (requested_at + (ttl_seconds || ' seconds')::INTERVAL) STORED,
+    nats_reply_subject  TEXT,
+    metadata            JSONB DEFAULT '{}'
+);
+
+-- Hot path: UI polling and SSE push for pending requests
+CREATE INDEX IF NOT EXISTS idx_sudo_pending
+    ON sudo_approval_requests (status, requested_at DESC)
+    WHERE status = 'pending';
+-- Job-scoped views in cockpit job detail panel
+CREATE INDEX IF NOT EXISTS idx_sudo_job
+    ON sudo_approval_requests (job_id, requested_at DESC);
+-- Expiration sweeper: find pending requests past their TTL
+CREATE INDEX IF NOT EXISTS idx_sudo_expiry
+    ON sudo_approval_requests (expires_at)
+    WHERE status = 'pending';
+
+CREATE TABLE IF NOT EXISTS sudo_auto_rules (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    pattern     TEXT NOT NULL,
+    action      VARCHAR(20) NOT NULL,
+    priority    INTEGER NOT NULL DEFAULT 100,
+    description TEXT,
+    created_by  VARCHAR(255),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT valid_action CHECK (action IN ('approve', 'deny', 'review'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_sudo_rules_active
+    ON sudo_auto_rules (priority ASC)
+    WHERE enabled = TRUE;
+
+-- ============================================================================
+-- 9. VIEWS
 -- ============================================================================
 
 -- Drop and recreate: adding project columns requires view recreation

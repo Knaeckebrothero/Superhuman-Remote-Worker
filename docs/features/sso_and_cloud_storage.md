@@ -8,7 +8,7 @@ tags:
 
 # SSO via Keycloak & Shared Cloud Storage
 
-Design document for introducing centralized identity management (Keycloak SSO) and a shared cloud storage layer (MinIO) so that users authenticate once and collaborate on files with AI agents across all system components.
+Design document for introducing centralized identity management (Keycloak SSO) and a shared cloud storage layer (Nextcloud) so that users authenticate once and collaborate on files with AI agents across all system components.
 
 **Status:** Design phase.
 
@@ -20,7 +20,7 @@ The system is composed of multiple applications that each maintain their own use
 |-------------|-------------|-----------------|
 | Cockpit (Angular) | Session-based email/password (orchestrator) | User registers/logs in here |
 | Gitea | Gitea-internal accounts | Separate credentials required |
-| MinIO (planned) | MinIO-internal accounts | Would require yet another login |
+| Nextcloud (planned) | Nextcloud-internal accounts | Would require yet another login |
 | pgAdmin | HTTP basic auth | Admin credentials in compose file |
 | Mongo Express | HTTP basic auth | Admin credentials in compose file |
 
@@ -42,7 +42,7 @@ Deploy a **Keycloak** instance as the single source of truth for all user identi
 
 - **OIDC + SAML support** — Covers both modern (OIDC) and enterprise-legacy (SAML) protocols
 - **Self-hosted** — No external dependency, runs alongside the stack in Podman/K8s
-- **Native support in target apps** — Gitea, MinIO, and pgAdmin all have built-in OIDC client support
+- **Native support in target apps** — Gitea, Nextcloud, and pgAdmin all have built-in OIDC client support
 - **User management UI** — Admin console for managing users, roles, groups without custom code
 - **Enterprise features out of the box** — MFA, social login (Google/GitHub/Microsoft), LDAP federation, brute-force protection, password policies
 - **Realm export/import** — Declarative realm config for reproducible deployments
@@ -58,16 +58,16 @@ Deploy a **Keycloak** instance as the single source of truth for all user identi
                          │  Clients:         │
                          │   - cockpit       │
                          │   - gitea         │
-                         │   - minio         │
+                         │   - nextcloud     │
                          │   - pgadmin       │
                          └────────┬──────────┘
                                   │ OIDC
                ┌──────────┬──────┴───────┬──────────┐
                ▼          ▼              ▼          ▼
           ┌─────────┐ ┌────────┐  ┌──────────┐ ┌────────┐
-          │ Cockpit │ │ Gitea  │  │  MinIO   │ │pgAdmin │
-          │(Angular)│ │        │  │          │ │        │
-          └─────────┘ └────────┘  └──────────┘ └────────┘
+          │ Cockpit │ │ Gitea  │  │Nextcloud │ │pgAdmin │
+          │(Angular)│ │        │  │(Files)   │ │        │
+          └────┬────┘ └────────┘  └──────────┘ └────────┘
                │
                ▼
           ┌──────────┐
@@ -82,7 +82,7 @@ Deploy a **Keycloak** instance as the single source of truth for all user identi
 3. Keycloak issues OIDC tokens → cockpit receives them
 4. Cockpit sends access token to orchestrator API (Bearer header)
 5. User clicks "Show Workspace" → redirected to Gitea → **already authenticated** via Keycloak SSO cookie
-6. User opens MinIO file browser → **already authenticated** via same SSO session
+6. User clicks "View Files" → opens Nextcloud → **already authenticated** via same SSO session
 
 ### OIDC Client Configuration
 
@@ -93,7 +93,7 @@ Each application registers as an OIDC client in the `srw` Keycloak realm:
 | `cockpit` | Public (SPA) | `http://localhost:4200/*`, `http://localhost:4000/*` | PKCE flow, no client secret |
 | `orchestrator-api` | Bearer-only | — | Validates tokens, does not initiate login |
 | `gitea` | Confidential | `http://localhost:3000/user/oauth2/keycloak/callback` | Server-side, has client secret |
-| `minio` | Confidential | `http://localhost:9001/oauth_callback` | MinIO Console OIDC |
+| `nextcloud` | Confidential | `http://localhost:8800/apps/user_oidc/code` | Nextcloud `user_oidc` app (official) |
 | `pgadmin` | Confidential | `http://localhost:5050/oauth2/authorize` | Optional |
 
 ### What Changes in the Codebase
@@ -175,20 +175,29 @@ OPENID_CONNECT_SCOPES = openid profile email
 
 Auto-create Gitea accounts on first OIDC login. Map Keycloak roles to Gitea org membership if needed.
 
-#### MinIO
+#### Nextcloud
 
-No code changes. Environment configuration:
+Nextcloud OIDC is configured via the `user_oidc` app (official Nextcloud first-party app, preferred over the third-party `oidc_login` for Nextcloud 28+):
 
-```bash
-MINIO_IDENTITY_OPENID_CONFIG_URL=http://keycloak:8080/realms/srw/.well-known/openid-configuration
-MINIO_IDENTITY_OPENID_CLIENT_ID=minio
-MINIO_IDENTITY_OPENID_CLIENT_SECRET=<from keycloak>
-MINIO_IDENTITY_OPENID_CLAIM_NAME=policy
-MINIO_IDENTITY_OPENID_SCOPES=openid,profile,email
-MINIO_IDENTITY_OPENID_REDIRECT_URI=http://localhost:9001/oauth_callback
+```php
+// config/config.php (or via occ commands during init)
+// 1. Install and enable the app
+//    occ app:install user_oidc
+//    occ app:enable user_oidc
+// 2. Register the Keycloak provider
+//    occ user_oidc:provider:create "Keycloak" \
+//        --clientid="nextcloud" \
+//        --clientsecret="<from keycloak>" \
+//        --discoveryuri="http://keycloak:8080/realms/srw/.well-known/openid-configuration" \
+//        --unique-uid=0 \
+//        --check-bearer=1
+
+// Optional: auto-redirect to Keycloak (skip Nextcloud login page)
+'allow_user_to_change_display_name' => false,
+'lost_password_link' => 'disabled',
 ```
 
-Map Keycloak roles/groups to MinIO policies (e.g., `srw-user` role → `readwrite` policy on project buckets).
+Auto-create Nextcloud user accounts on first OIDC login. Map Keycloak groups to Nextcloud groups for shared folder access per project.
 
 #### Docker Compose
 
@@ -217,6 +226,18 @@ keycloak:
 
 A `keycloak/realm-export.json` file contains the full `srw` realm definition (clients, roles, scopes, default users) for reproducible one-command setup. This file is committed to the repository and updated via Keycloak admin UI export when the realm configuration changes.
 
+**Database prerequisites:** Both Keycloak and Nextcloud need their own PostgreSQL databases on the shared `postgres` container. These are created during `init.py` setup (alongside the existing `orchestrator` and `vector` databases):
+
+```sql
+CREATE DATABASE keycloak;
+CREATE USER keycloak WITH PASSWORD 'keycloak';
+GRANT ALL PRIVILEGES ON DATABASE keycloak TO keycloak;
+
+CREATE DATABASE nextcloud;
+CREATE USER nextcloud WITH PASSWORD 'nextcloud';
+GRANT ALL PRIVILEGES ON DATABASE nextcloud TO nextcloud;
+```
+
 ### Keycloak Realm Design
 
 **Realm:** `srw`
@@ -232,11 +253,69 @@ A `keycloak/realm-export.json` file contains the full `srw` realm definition (cl
 - `openid` (standard)
 - `profile` (name, avatar)
 - `email` (email, email_verified)
-- `roles` (realm + client roles, for MinIO policy mapping)
+- `roles` (realm + client roles, for Nextcloud group mapping and access control)
+
+**Realm Settings:**
+- `Registration: ON` — Self-registration enabled (see Account Creation below)
+- `Email as username: ON` — Consistent with current system
+- `Verify email: ON` — Keycloak sends verification emails via its own SMTP config
+- `Login with email: ON`
 
 **Default Users (dev):**
 - `admin` / `admin` — Realm admin, mapped to orchestrator admin
 - Matches current `ADMIN_EMAIL` / `ADMIN_PASSWORD` defaults for zero-friction migration
+
+### Account Creation & User Management
+
+With Keycloak as IdP, account creation is handled entirely outside the cockpit's codebase. There are two paths:
+
+#### Self-Registration (users sign up themselves)
+
+Keycloak's built-in registration is enabled on the `srw` realm. When a user opens the cockpit and is redirected to Keycloak's login page, a "Register" link is shown. Keycloak handles the full registration flow:
+
+1. User opens cockpit → redirected to Keycloak login page
+2. User clicks "Register" → Keycloak registration form (name, email, password)
+3. Keycloak sends verification email (configured via Keycloak's own SMTP settings)
+4. User verifies → can now log in
+5. First login to cockpit → JIT provisioning creates local `users` row with defaults
+
+Keycloak manages password policies, CAPTCHA, brute-force protection, and email verification — none of this needs to be built in the cockpit or orchestrator.
+
+#### Admin-Managed Accounts (admin creates users)
+
+The cockpit keeps its existing user management page (list, create, edit, delete) but rewires it to the **Keycloak Admin REST API** via the orchestrator:
+
+| Cockpit Action | Current Implementation | New Implementation |
+|----------------|----------------------|-------------------|
+| Create user | `POST /api/users` → insert into `users` table | `POST /api/users` → orchestrator calls Keycloak Admin API (`POST /admin/realms/srw/users`) + creates local `users` row |
+| List users | `GET /api/users` → query `users` table | `GET /api/users` → query local `users` table (synced from Keycloak on login) |
+| Edit user | `PUT /api/users/{id}` → update `users` table | `PUT /api/users/{id}` → orchestrator updates both Keycloak (name, email) and local table (avatar, project) |
+| Delete user | `DELETE /api/users/{id}` → delete from `users` table | `DELETE /api/users/{id}` → orchestrator deletes from Keycloak + local table |
+| Reset password | `POST /api/auth/reset-password` | `PUT /api/users/{id}/reset-password` → orchestrator calls Keycloak Admin API (`PUT /admin/realms/srw/users/{kc_id}/reset-password-email`) |
+| Assign role | *(not implemented)* | `POST /api/users/{id}/roles` → orchestrator calls Keycloak Admin API to assign realm roles |
+
+The cockpit UI stays the same from the user's perspective. Admins don't need to leave the cockpit or learn the Keycloak admin console (though it remains available at `:8080/admin` for advanced configuration like MFA policies, social login setup, LDAP federation, etc.).
+
+**Orchestrator requirements for admin API access:**
+```bash
+# Service account for Keycloak Admin API calls
+KEYCLOAK_ADMIN_CLIENT_ID=admin-cli
+KEYCLOAK_ADMIN_CLIENT_SECRET=<secret>
+```
+
+The orchestrator authenticates to Keycloak's Admin API using a confidential client (`admin-cli`) with service account enabled. This is a server-to-server flow — no user interaction needed.
+
+#### What the Cockpit No Longer Needs
+
+These pages/components are removed since Keycloak owns the flows:
+
+- **Login page** → Keycloak login page (redirect)
+- **Registration page** → Keycloak registration page (link on Keycloak login)
+- **Email verification page** → Keycloak handles verification
+- **Forgot password page** → Keycloak "Forgot password?" link on login page
+- **Password reset page** → Keycloak reset flow
+
+The cockpit becomes a pure **application UI** — it never touches credentials directly.
 
 ### MCP Token Compatibility
 
@@ -274,106 +353,286 @@ There is no shared file space where users and agents can both read and write. Us
 - Download agent outputs without going through Gitea
 - Collaborate on files with running agents in real time
 
-## Solution: MinIO as Shared Cloud Storage
+## Solution: Nextcloud as Shared Cloud Storage
 
-Deploy **MinIO** (S3-compatible object storage) as the shared file layer. Users upload/download via the cockpit or MinIO Console. Agents read/write via S3-compatible tools.
+Deploy a standalone **Nextcloud** instance as the shared file layer. Users interact with Nextcloud's native UI (Google Drive-like experience). Agents access files via Nextcloud's **WebDAV API**, integrated as a datasource through the existing datasource system.
 
-### Why MinIO
+This is a **dev/testing stack**. Enterprises will bring their own cloud storage — Google Drive, OneDrive, Dropbox, or another WebDAV-compatible service. The agent tools depend on the datasource abstraction, not on Nextcloud specifically.
 
-- **S3-compatible API** — Massive ecosystem, every language has a client
-- **Self-hosted** — Runs alongside the stack, no external dependency
-- **OIDC support** — Authenticates against Keycloak (see SSO section above)
-- **Web Console** — Built-in file browser at port 9001, no custom UI needed initially
-- **Already in the architecture** — Referenced in `cloud_workspace.md` for checkpoint archival
-- **Lightweight** — Single binary, runs well in Podman and K8s
+### Why Nextcloud (Not MinIO + Filestash)
 
-### Bucket Structure
+We evaluated several self-hosted cloud storage solutions including MinIO, Filestash, oCIS, Seafile, Pydio Cells, and Cloudreve. The key insight is that the **agent API protocol matters more than the storage backend** — and enterprise cloud storage does not converge on S3:
+
+| Enterprise Service | Primary Client API | S3 Compatible? | WebDAV? |
+|-------------------|-------------------|----------------|---------|
+| Google Drive | Google Drive REST API | No | No |
+| OneDrive / SharePoint | Microsoft Graph API | No | No |
+| Dropbox | Dropbox REST API | No | No |
+| Box | Box REST API | No | Partial |
+| AWS S3 | S3 | Yes | No |
+| Azure Blob | REST + S3 compat | Partial | No |
+| Nextcloud / ownCloud | **WebDAV** + OCS REST | No (backend only) | **Yes, native** |
+| Seafile | Seafile REST API | No (backend only) | Yes |
+
+No single protocol covers all enterprise storage. Each will eventually need its own datasource connector type. The question is which to build **first** — and WebDAV is the right choice because:
+
+1. **Nextcloud is the dev/testing stack** — it's the most common self-hosted cloud drive, users already know the UI
+2. **WebDAV is a standard protocol** — if an enterprise uses ownCloud, Seafile, or any WebDAV-capable storage, the same connector works without changes
+3. **Nextcloud offers expansion potential** — messaging (Nextcloud Talk), collaborative editing (Nextcloud Office), calendar, mobile/desktop sync clients. We may not need these now, but they're there if we do.
+4. **Enterprise proprietary APIs get added later as separate datasource types** — `google_drive`, `onedrive`, `s3`, each with their own connector, following the exact same datasource pattern
+5. **The datasource abstraction protects us** — agent tools call `cloud_list`, `cloud_read`, `cloud_write` regardless of which connector is behind it
+
+**Alternatives considered but rejected:**
+
+| Solution | Verdict |
+|----------|---------|
+| **MinIO + Filestash** | S3 API is great for infrastructure but not what enterprise cloud drives expose. Two containers for what Nextcloud does in one. Filestash is a UI skin, not a storage system. |
+| **oCIS (ownCloud Infinite Scale)** | Strong technically, but ownCloud was acquired by Kiteworks (proprietary) in late 2024. Community fork (OpenCloud) not yet production-ready. |
+| **Seafile CE** | Block-level storage, most performant, but files not accessible via standard API from agents. |
+| **MinIO alone** | No end-user UI. Admin console is not user-friendly for file browsing. |
+
+### Architecture
 
 ```
-minio/
-├── project-<uuid>/              # One bucket per project
-│   ├── shared/                  # User-uploaded shared files
-│   │   ├── reference-data/
-│   │   ├── templates/
-│   │   └── datasets/
-│   ├── jobs/                    # Agent job outputs (auto-synced)
-│   │   ├── <job-uuid>/
-│   │   │   ├── output/
-│   │   │   ├── workspace.md
-│   │   │   └── plan.md
-│   │   └── <job-uuid>/
-│   └── knowledge/               # Knowledge base exports
-└── system/                      # System bucket (backups, checkpoints)
-    ├── checkpoints/
-    └── backups/
+                    ┌──────────────┐
+                    │   Keycloak   │
+                    │   (OIDC)     │
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌───────────┐ ┌─────────┐ ┌──────────┐
+        │ Nextcloud │ │ Cockpit │ │  Agent   │
+        │ (Web UI)  │ │         │ │ (WebDAV) │
+        │ :8800     │ │         │ │          │
+        └───────────┘ └────┬────┘ └──────────┘
+                           ▼
+                      ┌──────────┐
+                      │Orchestr. │
+                      │(FastAPI) │
+                      └──────────┘
 ```
 
-Files are scoped per **project** — shared across all jobs within that project. This matches the existing project model in the orchestrator (`projects` table, project membership).
+- **Users** go to Nextcloud (`:8800`), log in via Keycloak SSO, browse/upload/download/share files
+- **Agents** access files via Nextcloud's WebDAV endpoint, connected as a `webdav` datasource
+- **Cockpit** deep-links to Nextcloud for "view files" actions (SSO means no second login)
 
-### Integration Points
+### Nextcloud Deployment
 
-#### Orchestrator
+Single-container standalone deployment for dev/testing:
 
-New endpoints for file management (proxying to MinIO):
+```yaml
+# docker-compose.dev.yaml
+nextcloud:
+  image: nextcloud:31-apache
+  environment:
+    NEXTCLOUD_ADMIN_USER: admin
+    NEXTCLOUD_ADMIN_PASSWORD: admin
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: nextcloud
+    POSTGRES_USER: nextcloud
+    POSTGRES_PASSWORD: nextcloud
+    # OIDC configured via occ commands in init script (see below)
+  volumes:
+    - nextcloud_data:/var/www/html
+  ports:
+    - "8800:80"
+  depends_on:
+    - postgres
+    - keycloak
+```
 
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/api/projects/{id}/files` | GET | List files in project bucket |
-| `/api/projects/{id}/files/{path}` | GET | Download file |
-| `/api/projects/{id}/files/{path}` | PUT | Upload file |
-| `/api/projects/{id}/files/{path}` | DELETE | Delete file |
-| `/api/projects/{id}/files/presign` | POST | Generate presigned upload/download URLs |
+`user_oidc` app configured during initialization via `occ` commands (see Nextcloud section above).
 
-Alternatively, the cockpit can talk to MinIO directly using presigned URLs generated by the orchestrator, avoiding the orchestrator as a file proxy for large uploads.
+Nextcloud stores its data on a Docker volume (`nextcloud_data`). For production/K8s, this would be a PVC or external object storage (Nextcloud supports S3 as a backend for its own storage).
 
-**New environment variables:**
+### Folder Structure
+
+Nextcloud organizes files per user. For project-scoped collaboration, we use **Group Folders** (Nextcloud app):
+
+```
+Nextcloud/
+├── Group Folders/
+│   ├── Project: <project-name>/        # One group folder per project
+│   │   ├── Shared/                     # User-uploaded shared files
+│   │   │   ├── reference-data/
+│   │   │   ├── templates/
+│   │   │   └── datasets/
+│   │   ├── Jobs/                       # Agent job outputs (auto-synced)
+│   │   │   ├── <job-uuid>/
+│   │   │   │   ├── output/
+│   │   │   │   ├── workspace.md
+│   │   │   │   └── plan.md
+│   │   │   └── <job-uuid>/
+│   │   └── Knowledge/                  # Knowledge base exports
+```
+
+Group folder membership is managed via Keycloak groups → Nextcloud groups (synced on OIDC login). Users see only the project folders they're members of.
+
+### Cloud Storage as a Datasource
+
+The cloud storage integration follows the **existing datasource pattern** — same lifecycle, same cockpit UX, same tool injection mechanism. This is the most natural fit because:
+
+- Users already know how to attach datasources to jobs (checkboxes in job creation)
+- The orchestrator already handles datasource resolution (job > project > global)
+- Tool injection/stripping already works per datasource type
+- Connection testing already has an endpoint (`/api/datasources/{id}/test`)
+- Read-only flag already controls which tools are available
+
+#### New Datasource Type: `webdav`
+
+| Field | Value |
+|-------|-------|
+| **Type** | `webdav` |
+| **Connection URL** | `http://nextcloud:80/remote.php/dav/files/USERNAME/` (or group folder path) |
+| **Credentials** | `{ "username": "agent-service", "password": "app-password" }` |
+| **Read-only** | Configurable per datasource (controls whether agent can write back) |
+
+Stored in the existing `datasources` table. No schema changes needed — `type` is a free-text field, `credentials` is JSONB.
+
+#### DS_TOOL_MAP Entry
+
+Added to the orchestrator's `DS_TOOL_MAP` alongside `postgresql`, `neo4j`, `mongodb`:
+
+```python
+DS_TOOL_MAP = {
+    # ... existing entries ...
+    "webdav": {
+        "category": "cloud",
+        "read": ["cloud_list", "cloud_read", "cloud_info"],
+        "write": ["cloud_list", "cloud_read", "cloud_info", "cloud_write", "cloud_delete"],
+    },
+}
+```
+
+#### Agent Tools (`src/tools/cloud/`)
+
+New tool category `cloud` with WebDAV-backed implementations:
+
+| Tool | Purpose | Read-only? |
+|------|---------|-----------|
+| `cloud_list(path, recursive)` | List files/folders at path | Yes |
+| `cloud_read(path, target)` | Download file from cloud storage to workspace | Yes |
+| `cloud_info(path)` | Get file metadata (size, modified, content type) | Yes |
+| `cloud_write(workspace_path, target_path)` | Upload workspace file to cloud storage | No |
+| `cloud_delete(path)` | Delete file from cloud storage | No |
+
+Implementation uses `webdavclient3` (Python WebDAV client library, added to `requirements.txt`).
+
+The tool factory receives the already-connected WebDAV client from `ToolContext` — the same pattern used by `create_graph_tools`, `create_sql_tools`, and `create_mongodb_tools`:
+
+```python
+# src/tools/cloud/webdav.py
+from webdav3.client import Client
+
+def create_cloud_tools(context: ToolContext) -> list:
+    # context.get_datasource() returns the Client instance created by
+    # _create_datasource_connection() — NOT the raw config dict
+    client: Client = context.get_datasource("webdav")
+
+    @tool
+    def cloud_list(path: str = "/", recursive: bool = False) -> str:
+        """List files and folders in cloud storage."""
+        return client.list(path, get_info=True)
+
+    @tool
+    def cloud_read(path: str, target: str = "") -> str:
+        """Download a file from cloud storage into the workspace."""
+        local_path = context.workspace_manager.resolve_path(target or os.path.basename(path))
+        client.download_sync(path, local_path)
+        return f"Downloaded {path} to {local_path}"
+
+    # ... cloud_write, cloud_delete, cloud_info ...
+```
+
+#### Tool Registry Integration
+
+Cloud tools register in `src/tools/registry.py` following the existing pattern:
+
+```python
+# In load_tools() — alongside graph, sql, mongodb blocks
+if "cloud" in tools_by_category:
+    if not context.has_datasource("webdav"):
+        logger.warning("Cloud tools require a webdav datasource — skipping")
+    else:
+        from src.tools.cloud import create_cloud_tools
+        cloud_tools = create_cloud_tools(context)
+        all_tools.extend(cloud_tools)
+```
+
+#### Connection Factory
+
+Added to `src/agent.py` `_create_datasource_connection()`:
+
+```python
+elif ds_type == "webdav":
+    from webdav3.client import Client
+    creds = ds.get("credentials") or {}
+    client = Client({
+        "webdav_hostname": url,
+        "webdav_login": creds.get("username"),
+        "webdav_password": creds.get("password"),
+    })
+    client.list("/")  # Connection test
+    return client
+```
+
+#### Default Datasource via Environment
+
 ```bash
-MINIO_URL=http://minio:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-# Or with OIDC: MinIO uses Keycloak tokens directly, no static keys needed for user requests
+# .env
+DEFAULT_DS_WEBDAV_URL=http://nextcloud:80/remote.php/dav/files/agent-service/
+DEFAULT_DS_WEBDAV_USERNAME=agent-service
+DEFAULT_DS_WEBDAV_PASSWORD=<app-password>
+DEFAULT_DS_WEBDAV_NAME=Default Cloud Storage
+DEFAULT_DS_WEBDAV_READ_ONLY=false
 ```
 
-#### Agent Tools
+Seeded as a global datasource by `init.py`, same pattern as `DEFAULT_DS_NEO4J_*`.
 
-New tool category `cloud_storage` (or extend existing `workspace` tools):
+#### Nextcloud Service Account
 
-| Tool | Purpose |
-|------|---------|
-| `cloud_list(prefix)` | List files in the project's shared bucket |
-| `cloud_read(path)` | Download a file from shared storage to workspace |
-| `cloud_write(path, workspace_path)` | Upload a workspace file to shared storage |
-| `cloud_sync(direction)` | Sync workspace outputs to/from shared storage |
+A dedicated Nextcloud user (`agent-service`) is created during initialization with an **app password** (not the user's main password). This service account:
 
-These tools use the MinIO Python SDK (`minio`) with credentials injected via environment or the job's datasource config. The agent accesses only its own project's bucket.
+- Has access to project group folders
+- Is used by agents for WebDAV file operations
+- App password is stored in the datasource `credentials` JSONB field
+- Can be scoped per project (different service accounts per project datasource)
 
-#### Cockpit
+### Cockpit Integration
 
-**Option A (simple, initial):** Link to MinIO Console (port 9001). User is already authenticated via Keycloak SSO. MinIO Console provides a full file browser with upload/download/preview.
+The cockpit does not need its own file browser. Instead:
 
-**Option B (integrated, later):** Build a file browser component into the cockpit. Uses presigned URLs from the orchestrator for direct S3 uploads/downloads. Provides tighter integration with the job list (e.g., "view files for this job").
-
-Recommend starting with Option A to get value quickly, then building Option B when UX requirements become clearer.
-
-#### Job Lifecycle Integration
-
-- **Job start:** Agent receives the project's MinIO bucket path in its config/metadata. Optionally auto-downloads `shared/` contents to `documents/`.
-- **Job completion:** Agent's output files are auto-synced to `jobs/<job-uuid>/` in the project bucket.
-- **Job workspace viewer:** "Show Workspace" button can link to MinIO Console filtered to `jobs/<job-uuid>/` instead of (or in addition to) Gitea.
+- **"View Files" button** on job cards → deep-links to Nextcloud at the job's output folder. User is already authenticated via Keycloak SSO.
+- **"Project Files" tab** on project page → links to Nextcloud's group folder for that project
+- **Upload during job creation** → continues to use the existing orchestrator upload API (staged to `workspace/uploads/`), which is lightweight and doesn't require Nextcloud
+- **Datasource attachment** → same checkbox UX as PostgreSQL/Neo4j/MongoDB. User selects the cloud storage datasource when creating a job.
 
 ### Access Control
 
-MinIO policies are mapped from Keycloak roles:
+Nextcloud's native permissions model handles access control:
 
-| Keycloak Role | MinIO Policy | Access |
-|---------------|-------------|--------|
-| `admin` | `consoleAdmin` | Full access to all buckets |
-| `user` | Custom per-project | Read/write to `project-<uuid>/` buckets they're a member of |
-| `viewer` | Custom per-project | Read-only to project buckets |
+| Keycloak Group | Nextcloud Group | Access |
+|---------------|----------------|--------|
+| `project-<uuid>-members` | Same (synced via OIDC) | Read/write to project's group folder |
+| `project-<uuid>-viewers` | Same | Read-only to project's group folder |
+| `admin` | Nextcloud admin | Full access |
 
-Policy assignment happens via Keycloak token claims. When a user authenticates to MinIO via OIDC, MinIO reads the `policy` claim from the JWT and applies the corresponding policy.
+Keycloak group membership → Nextcloud group membership is synced automatically on OIDC login. When a user is added to a project in the cockpit, the orchestrator adds them to the corresponding Keycloak group, which flows through to Nextcloud.
 
-For agents (non-browser), the orchestrator generates scoped temporary credentials (MinIO STS with AssumeRoleWithWebIdentity) or uses a service account with per-bucket policies.
+### Future: Additional Cloud Storage Datasource Types
+
+The datasource pattern makes it straightforward to add connectors for enterprise cloud storage later:
+
+| Datasource Type | Client Library | When to Build |
+|----------------|---------------|---------------|
+| `webdav` | `webdavclient3` | **Phase 3 (now)** — Nextcloud, ownCloud, any WebDAV server |
+| `s3` | `boto3` / `minio` | When an enterprise needs raw S3 bucket access |
+| `google_drive` | `google-api-python-client` | When an enterprise uses Google Workspace |
+| `onedrive` | `msgraph-sdk-python` | When an enterprise uses Microsoft 365 |
+| `dropbox` | `dropbox` SDK | When an enterprise uses Dropbox Business |
+
+All connectors implement the same abstract tool interface (`cloud_list`, `cloud_read`, `cloud_write`, `cloud_info`, `cloud_delete`). The agent doesn't know or care which backend is behind the tools — the datasource type determines which connector is loaded, identical to how `sql_query` works the same whether the datasource is a local PostgreSQL or a cloud-hosted RDS instance.
 
 ---
 
@@ -381,10 +640,10 @@ For agents (non-browser), the orchestrator generates scoped temporary credential
 
 ### Phase 1: Keycloak Foundation
 1. Add Keycloak to `docker-compose.dev.yaml`
-2. Create `srw` realm with default clients, roles, and dev users
-3. Export realm config to `keycloak/realm-export.json` for reproducible setup
-4. Configure Gitea as OIDC client → **solves the immediate workspace viewer pain point**
-5. Update `init.py` to initialize Keycloak database alongside existing databases
+2. Update `init.py` to create `keycloak` database on the shared PostgreSQL container
+3. Create `srw` realm with default clients, roles, and dev users
+4. Export realm config to `keycloak/realm-export.json` for reproducible setup
+5. Configure Gitea as OIDC client → **solves the immediate workspace viewer pain point**
 
 ### Phase 2: Cockpit + Orchestrator OIDC Migration
 6. Add `keycloak-angular` to cockpit, replace login page with Keycloak redirect
@@ -392,36 +651,39 @@ For agents (non-browser), the orchestrator generates scoped temporary credential
 8. Add `keycloak_sub` column to `users` table, implement JIT provisioning
 9. Remove legacy auth code (sessions, password hashing, email verification, SMTP)
 
-### Phase 3: MinIO Cloud Storage
-10. Add MinIO to `docker-compose.dev.yaml`
-11. Configure MinIO OIDC client in Keycloak realm
-12. Add orchestrator endpoints for file management (or presigned URL generation)
-13. Create `cloud_storage` agent tool category
-14. Wire job lifecycle: auto-sync outputs to project bucket on completion
+### Phase 3: Nextcloud + WebDAV Datasource
+10. Add Nextcloud to `docker-compose.dev.yaml`, create `nextcloud` database on shared PostgreSQL
+11. Configure Nextcloud OIDC client in Keycloak realm (`user_oidc` app via `occ` commands)
+12. Create `agent-service` Nextcloud user with app password
+13. Add `webdavclient3` to `requirements.txt`
+14. Add `webdav` to `DS_TOOL_MAP` in orchestrator (`orchestrator/main.py`)
+15. Implement `src/tools/cloud/webdav.py` (`create_cloud_tools`) + register in `src/tools/registry.py`
+16. Add WebDAV connection factory branch to `src/agent.py` `_create_datasource_connection()`
+17. Add `DEFAULT_DS_WEBDAV_*` env var handling to `init.py` / `orchestrator/init.py`
+18. Wire job lifecycle: auto-sync outputs to project folder on completion
 
-### Phase 4: Cockpit File Integration
-15. Link "Show Workspace" to MinIO Console (quick win, SSO makes this seamless)
-16. Build integrated file browser component in cockpit (if needed beyond MinIO Console)
-17. Add drag-and-drop upload to project shared storage from cockpit
+### Phase 4: Cockpit Integration
+19. Add "View Files" deep-links from job cards to Nextcloud (SSO makes this seamless)
+20. Add "Project Files" tab linking to Nextcloud group folder for the project
+21. Add `webdav` as a datasource type option in the cockpit datasource management UI
 
 ### Phase 5: Hardening
-18. Per-project MinIO policies mapped from Keycloak groups
-19. Audit logging for file access (MinIO audit log → MongoDB)
-20. Presigned URL expiration and rate limiting
-21. Quota management per project bucket
+22. Keycloak group → Nextcloud group sync for per-project access control
+23. Audit logging for file access
+24. Quota management per project group folder
+25. Additional cloud storage datasource types (S3, Google Drive, OneDrive) as needed
 
 ## Service Ports (Updated)
 
-| Service | Port |
-|---------|------|
-| Keycloak | 8080 |
-| MinIO API | 9000 |
-| MinIO Console | 9001 |
-| *(all existing ports unchanged)* | |
+| Service | Port | Notes |
+|---------|------|-------|
+| Keycloak | 8080 | Common default — remap if conflicts with local dev servers |
+| Nextcloud | 8800 | |
+| *(all existing ports unchanged)* | | |
 
 ## Related
 
-- [[cloud_workspace]] — K8s workspace architecture, references MinIO for checkpoint archival
-- [[projects]] — Project model that scopes file storage buckets
-- [[datasources]] — Datasource connector pattern (MinIO could become a datasource type)
-- [[vm_backend]] — VM workspace backend, could use MinIO for workspace seeding
+- `docs/cloud_workspace.md` — K8s workspace architecture (MinIO remains relevant for checkpoint archival, separate from user-facing cloud storage)
+- `docs/features/projects.md` — Project model that scopes Nextcloud group folders
+- `docs/datasources.md` — Datasource connector pattern, `webdav` is the new type
+- `docs/features/vm_backend.md` — VM workspace backend, could sync files from cloud storage on job start

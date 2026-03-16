@@ -1,3 +1,7 @@
 # Packer build artifacts
 output/
 input/*.img
+
+# Compiled sudo gate binaries (built by CI or locally, never committed)
+files/sudo-gated-bin
+files/sudo_gate.so
