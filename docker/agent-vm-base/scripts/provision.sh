@@ -105,6 +105,8 @@ echo "--- Setting up users ---"
 sudo useradd -m -s /bin/bash agent-host
 echo "agent-host ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/agent-host
 sudo chmod 0440 /etc/sudoers.d/agent-host
+# Allow agent-host to read systemd journal (for debugging daemon issues)
+sudo usermod -aG systemd-journal agent-host
 
 # Workspace directory (where the agent operates)
 sudo mkdir -p /home/agent-host/workspace
@@ -203,7 +205,7 @@ if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
 
     echo "Setting up tmpfiles.d..."
     sudo mkdir -p /etc/tmpfiles.d
-    sudo sh -c 'echo "d /run/sudo-gated 0755 root sudo-gated -" > /etc/tmpfiles.d/sudo-gated.conf'
+    sudo sh -c 'echo "d /run/sudo-gated 0775 root sudo-gated -" > /etc/tmpfiles.d/sudo-gated.conf'
 
     echo "Enabling socket activation..."
     sudo systemctl daemon-reload
