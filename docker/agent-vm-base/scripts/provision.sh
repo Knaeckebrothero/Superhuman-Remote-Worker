@@ -168,7 +168,72 @@ JOB_ID=
 EOF
 
 # -----------------------------------------------------------------------------
-# 7. tmux configuration
+# 7. Sudo approval gate
+# -----------------------------------------------------------------------------
+#
+# The sudo approval gate intercepts every sudo invocation and forwards it
+# to the orchestrator for human approval. Components:
+#   - sudo_gate.so    — C plugin loaded by sudo (compiled from sudo-gate-plugin/)
+#   - sudo-gated      — Go daemon bridging plugin to orchestrator via NATS
+#
+# Compiled binaries are expected at /tmp/ (placed by Packer file provisioner
+# from CI artifacts, or compiled during an earlier build step).
+# If the binaries aren't present, this section is skipped — the gate is optional.
+
+echo "--- Setting up sudo approval gate ---"
+
+if [ -s /tmp/sudo_gate.so ] && [ -s /tmp/sudo-gated ]; then
+    # Install plugin
+    sudo install -o root -g root -m 0644 /tmp/sudo_gate.so /usr/lib/sudo/
+
+    # Install daemon binary
+    sudo install -o root -g root -m 0755 /tmp/sudo-gated /usr/local/bin/
+
+    # Create daemon user and group
+    sudo groupadd -r sudo-gated
+    sudo useradd -r -g sudo-gated -s /usr/sbin/nologin -d /nonexistent sudo-gated
+
+    # Install systemd units
+    sudo install -o root -g root -m 0644 /tmp/sudo-gated.service /etc/systemd/system/
+    sudo install -o root -g root -m 0644 /tmp/sudo-gated.socket /etc/systemd/system/
+
+    # Install daemon config
+    sudo mkdir -p /etc/sudo-gate
+    sudo install -o root -g root -m 0644 /tmp/sudo-gated-config.yaml /etc/sudo-gate/config.yaml
+
+    # Register plugin in sudo.conf
+    cat /tmp/sudo-gate.conf | sudo tee -a /etc/sudo.conf > /dev/null
+
+    # Create default env file (overwritten by cloud-init at VM creation)
+    sudo tee /etc/default/sudo-gated > /dev/null <<'SGEOF'
+# Overwritten by cloud-init at VM creation time
+NATS_URL=
+JOB_ID=
+VM_ID=
+SGEOF
+
+    # Ensure /run/sudo-gated survives reboots via tmpfiles.d
+    echo "d /run/sudo-gated 0755 root sudo-gated -" | sudo tee /etc/tmpfiles.d/sudo-gated.conf
+
+    # Enable socket activation (daemon starts on first sudo)
+    sudo systemctl daemon-reload
+    sudo systemctl enable sudo-gated.socket
+
+    # Defense-in-depth: make plugin and sudo.conf immutable
+    # (prevents agent-host from modifying or replacing the gate)
+    sudo chattr +i /usr/lib/sudo/sudo_gate.so
+    sudo chattr +i /etc/sudo.conf
+    # Note: /etc/sudoers is NOT made immutable here because cloud-init
+    # may need to modify it. The orchestrator can set it immutable after
+    # cloud-init completes via the management daemon.
+
+    echo "Sudo approval gate installed"
+else
+    echo "Sudo gate binaries not found at /tmp/ — skipping (gate is optional)"
+fi
+
+# -----------------------------------------------------------------------------
+# 8. tmux configuration
 # -----------------------------------------------------------------------------
 
 echo "--- Configuring tmux ---"
@@ -183,7 +248,7 @@ TMUXEOF
 sudo chown agent-host:agent-host /home/agent-host/.tmux.conf
 
 # -----------------------------------------------------------------------------
-# 8. Git configuration
+# 9. Git configuration
 # -----------------------------------------------------------------------------
 
 echo "--- Configuring git ---"

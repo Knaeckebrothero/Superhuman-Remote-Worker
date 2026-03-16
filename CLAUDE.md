@@ -391,8 +391,19 @@ NATS takes priority when both are available. All VM features are fully optional 
 | `agent.vm.*.register` | Daemon → Orchestrator | VM ready notification |
 | `agent.vm.*.heartbeat` | Daemon → Orchestrator | Periodic health updates |
 | `agent.vm.*.status` | Daemon → Orchestrator | Agent process exit |
+| `sudo.request.{vm_id}.{job_id}` | Daemon → Orchestrator | Sudo approval request/reply |
 
 Control commands (freeze/resume/terminate) require NATS since they target the management daemon inside the VM. On same-cluster without NATS, `cancel_job` compensates by deleting the VM directly via K8s API.
+
+### Sudo Approval Gate (Optional)
+
+Human-in-the-loop privilege escalation for agents in VMs. When an agent runs `sudo`, the command is intercepted by a plugin, forwarded via a Go daemon over NATS to the orchestrator, and held for human approval via the cockpit UI or MCP tools.
+
+**Components:** C plugin (`sudo-gate-plugin/`), Go daemon (`sudo-gated/`), orchestrator service (`orchestrator/services/sudo_gate.py`), cockpit UI (`/sudo` route), MCP tools (`list_sudo_requests`, `approve_sudo_request`, `deny_sudo_request`).
+
+**REST endpoints:** `/api/sudo/events` (SSE), `/api/sudo/requests` (CRUD), `/api/sudo/rules` (auto-approval management).
+
+All sudo gate features are fully optional — the system works without them (agents get unrestricted sudo, the pre-gate default). See `docs/features/sudo_approval_gate.md` for the full design and implementation roadmap.
 
 See `docs/features/vm_backend.md` for the full workspace backend design and `docs/features/nats.md` for the messaging layer architecture.
 
@@ -411,7 +422,7 @@ See `docs/features/vm_backend.md` for the full workspace backend design and `doc
 - `orchestrator/services/builder_tools.py` - Instruction builder tool schemas (cockpit chat assistant)
 - `orchestrator/mcp/` - MCP server for Claude Code integration
 
-**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/core/backends/` (LocalBackend, RemoteBackend for VM workspaces), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `orchestrator/services/` (nats_bridge, vm_provisioner, gitea, builder, completion), `cockpit/` (Angular frontend), `vm-controller/` (KubeVirt VM lifecycle on agent cluster), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
+**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/core/backends/` (LocalBackend, RemoteBackend for VM workspaces), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `orchestrator/services/` (nats_bridge, vm_provisioner, sudo_gate, gitea, builder, completion), `cockpit/` (Angular frontend), `vm-controller/` (KubeVirt VM lifecycle on agent cluster), `sudo-gated/` (Go daemon for sudo approval gate), `sudo-gate-plugin/` (C sudo approval plugin), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
 
 **Design documents:** `docs/` contains concept/design documents for features — `docs/persistent_shell.md`, `docs/datasources.md`, `docs/features/` (memory_light, projects, repo_datasource, prompting, summary_tool, etc.). These are architectural specs, not user-facing docs.
 

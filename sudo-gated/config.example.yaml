@@ -1,0 +1,27 @@
+# sudo-gated configuration
+# Copy to /etc/sudo-gate/config.yaml on the VM, or pass --config flag.
+# Environment variables NATS_URL, JOB_ID, VM_ID override file values.
+
+socket_path: /run/sudo-gated/sudo-gated.sock
+
+nats:
+  url: nats://127.0.0.1:4222
+  max_reconnects: -1       # -1 = reconnect indefinitely
+  reconnect_wait: 2s
+  subject_prefix: sudo.request
+  # credentials_file: /etc/sudo-gate/nats.creds  # NKey/JWT auth (optional)
+
+rate_limit:
+  requests_per_minute: 5
+  burst: 3
+
+timeouts:
+  nats_request: 300s       # Must be < plugin's poll() timeout (305s)
+  socket_read: 10s         # Time to read the plugin's request
+  graceful_shutdown: 30s   # Wait for in-flight requests on SIGTERM
+
+log_level: info            # debug, info, warn, error
+
+# Set by cloud-init or environment variables:
+# job_id: ""
+# vm_id: ""

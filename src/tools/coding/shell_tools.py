@@ -183,7 +183,12 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
           - SSH: sshpass -p 'pass' ssh -o StrictHostKeyChecking=no user@host "cmd"
           - apt/dnf: use -y flag
           - git: configure credential helper
-          - sudo: echo 'pass' | sudo -S command
+
+        SUDO NOTE: Commands prefixed with `sudo` require human approval and
+        may block for up to 5 minutes while awaiting operator consent. Always
+        use timeout=600 for sudo commands. If denied, exit code 1 with
+        "sudo request denied by operator" in stderr. On denial, try an
+        alternative approach or note the need in workspace.md.
 
         For long output, only the last `tail` lines are returned. Use
         shell_read() to page through the full scrollback if needed.
@@ -192,6 +197,7 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             command: Shell command to execute (e.g., "pytest tests/ -x",
                 "git status", "curl -s https://api.example.com/health").
             timeout: Maximum seconds to wait (default 120, max 600).
+                Use 600 for sudo commands (approval may take minutes).
             tail: Max stdout lines to return (default 30). Increase for
                 verbose output (test suites, builds, logs).
 

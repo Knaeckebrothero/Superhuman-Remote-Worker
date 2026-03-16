@@ -1,0 +1,5 @@
+# Compiled binary
+sudo-gated
+
+# Test artifacts
+*.sock

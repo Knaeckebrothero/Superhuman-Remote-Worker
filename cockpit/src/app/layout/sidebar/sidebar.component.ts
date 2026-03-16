@@ -67,6 +67,14 @@ import { environment } from '../../core/environment';
           </a>
           <a
             class="nav-link"
+            routerLink="/sudo"
+            routerLinkActive="active"
+          >
+            <span class="nav-icon">admin_panel_settings</span>
+            Sudo
+          </a>
+          <a
+            class="nav-link"
             routerLink="/debug"
             routerLinkActive="active"
           >

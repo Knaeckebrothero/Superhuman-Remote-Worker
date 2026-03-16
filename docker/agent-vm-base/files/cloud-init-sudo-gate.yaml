@@ -1,0 +1,26 @@
+# Cloud-init additions for the sudo approval gate.
+#
+# Merge these into the VM template's cloud-init user-data section.
+# The placeholders ${NATS_URL} and ${JOB_ID} are substituted by the
+# VM controller's render_template() method at VM creation time.
+#
+# This file is NOT used directly — it documents what needs to be added
+# to the KubeVirt VM template ConfigMap.
+
+# --- Add to write_files: ---
+
+write_files:
+  - path: /etc/default/sudo-gated
+    permissions: '0644'
+    content: |
+      NATS_URL=${NATS_URL}
+      JOB_ID=${JOB_ID}
+      VM_ID=agent-vm-${JOB_ID}
+
+# --- Add to runcmd: ---
+
+runcmd:
+  # Start the sudo approval gate daemon (via socket activation)
+  # The socket is already enabled from provisioning; this ensures
+  # the daemon picks up the env vars from cloud-init.
+  - systemctl restart sudo-gated.socket

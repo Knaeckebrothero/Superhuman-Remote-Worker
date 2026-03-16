@@ -1,0 +1,23 @@
+# sudo-gated daemon configuration (VM base image defaults).
+# NATS_URL, JOB_ID, and VM_ID are set via /etc/default/sudo-gated
+# (written by cloud-init at VM creation time).
+
+socket_path: /run/sudo-gated/sudo-gated.sock
+
+nats:
+  # Overridden by NATS_URL env var from cloud-init
+  url: nats://127.0.0.1:4222
+  max_reconnects: -1
+  reconnect_wait: 2s
+  subject_prefix: sudo.request
+
+rate_limit:
+  requests_per_minute: 5
+  burst: 3
+
+timeouts:
+  nats_request: 300s
+  socket_read: 10s
+  graceful_shutdown: 30s
+
+log_level: info

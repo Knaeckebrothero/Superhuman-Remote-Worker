@@ -10,6 +10,7 @@ import { ReviewPageComponent } from './simple/pages/review/review-page.component
 import { DebugPageComponent } from './debug/pages/debug.component';
 import { ProjectListPageComponent } from './shared/pages/project-list.component';
 import { ProjectDetailPageComponent } from './pages/project-detail/project-detail.component';
+import { SudoPageComponent } from './simple/pages/sudo/sudo-page.component';
 import { authGuard } from './core/guards/auth.guard';
 
 export const routes: Routes = [
@@ -23,6 +24,7 @@ export const routes: Routes = [
   { path: 'projects', component: ProjectListPageComponent, canActivate: [authGuard] },
   { path: 'projects/:id', component: ProjectDetailPageComponent, canActivate: [authGuard] },
   { path: 'settings', component: SettingsComponent, canActivate: [authGuard] },
+  { path: 'sudo', component: SudoPageComponent, canActivate: [authGuard] },
   { path: 'debug', component: DebugPageComponent, canActivate: [authGuard] },
   { path: '**', redirectTo: '' },
 ];

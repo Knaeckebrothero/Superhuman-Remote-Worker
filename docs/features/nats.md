@@ -79,18 +79,16 @@ Gateways create a peer topology where both clusters are equal. Our clusters aren
 
 ## Subject Namespace
 
-All subjects live under the `agent.` prefix, split into two namespaces: `agent.vm.{job_id}.*` for VM management daemon communication (Phase 2) and `agent.{agent_id}.*` for direct agent↔orchestrator communication (Phases 3–4).
+All subjects live under a few top-level namespaces: `agent.vm.{job_id}.*` for VM management daemon communication, `agent.{agent_id}.*` for direct agent↔orchestrator communication, `vm.lifecycle.*` for VM controller lifecycle, and `sudo.request.*` for the sudo approval gate.
 
 ```
 # Management daemon → orchestrator
 agent.vm.{job_id}.register         VM is booted and ready
 agent.vm.{job_id}.heartbeat        Periodic health + resource report
 agent.vm.{job_id}.status           State changes (running, frozen, completed, failed)
-agent.vm.{job_id}.sudo.request     Privilege escalation request (future)
 
 # Orchestrator → management daemon
 agent.vm.{job_id}.control          Commands: start, freeze, resume, terminate
-agent.vm.{job_id}.sudo.response    Approve/deny sudo (future)
 agent.vm.{job_id}.job.config       Job configuration push
 
 # Agent → orchestrator (replaces HTTP heartbeat)
@@ -101,7 +99,13 @@ agent.{agent_id}.status            Agent status changes
 agent.{agent_id}.job.assign        Job assignment (replaces POST /job/start)
 agent.{agent_id}.job.pause         Pause request (replaces POST /job/pause)
 agent.{agent_id}.job.cancel        Cancel request (replaces POST /job/cancel)
+
+# Sudo approval gate (request/reply, core NATS — NOT JetStream)
+sudo.request.{vm_id}.{job_id}     Daemon → orchestrator (request/reply)
+(reply via _INBOX)                 Orchestrator → daemon (approval/denial)
 ```
+
+The sudo approval gate uses NATS core request/reply (`nc.Request()`), not JetStream. The daemon blocks on `nc.Request()` for up to 300s. The orchestrator stores `msg.Reply` (the ephemeral `_INBOX` subject) in PostgreSQL and replies asynchronously when the human decides. See `docs/features/sudo_approval_gate.md` for the full design.
 
 ### JetStream Streams
 

@@ -311,6 +311,30 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
     logger.info("Stale agent detector stopped")
 
 
+async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that denies expired sudo approval requests.
+
+    Runs every 15 seconds. For each expired request, publishes a denial
+    to the stored NATS reply subject so the daemon unblocks.
+    """
+    from services.sudo_gate import sudo_gate  # noqa: E402
+
+    logger.info("Sudo expiration sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            await sudo_gate.sweep_expired()
+        except Exception as e:
+            logger.error("Error in sudo expiration sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=15.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Sudo expiration sweeper stopped")
+
+
 # =============================================================================
 # Job Auto-Assignment Dispatcher
 # =============================================================================
@@ -1137,6 +1161,7 @@ async def lifespan(app: FastAPI):
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
     session_cleanup_task = asyncio.create_task(cleanup_expired_sessions(postgres_db, _shutdown_event))
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
+    sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
 
     yield
 
@@ -1145,6 +1170,7 @@ async def lifespan(app: FastAPI):
     await stale_detector_task
     await session_cleanup_task
     await dispatcher_task
+    await sudo_sweeper_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -1926,6 +1952,142 @@ async def delete_vm(job_id: str) -> dict[str, str]:
         raise HTTPException(status_code=500, detail="Failed to delete VM")
 
     return {"status": "deleting", "job_id": job_id}
+
+
+# =============================================================================
+# Sudo Approval Gate
+# =============================================================================
+
+from services.sudo_gate import sudo_gate  # noqa: E402
+
+
+class SudoApproveRequest(BaseModel):
+    """Request body for approving a sudo request."""
+
+    reason: str = Field("", description="Optional approval reason")
+
+
+class SudoDenyRequest(BaseModel):
+    """Request body for denying a sudo request."""
+
+    reason: str = Field(..., description="Denial reason (required)")
+
+
+class SudoRuleCreateRequest(BaseModel):
+    """Request body for creating an auto-approval rule."""
+
+    pattern: str = Field(..., description="fnmatch pattern (e.g. 'apt-get install *')")
+    action: str = Field(..., description="'approve', 'deny', or 'review'")
+    priority: int = Field(100, ge=0, le=1000, description="Lower = higher priority")
+    description: str = Field("", description="Human-readable description")
+
+
+@app.get("/api/sudo/events")
+async def sudo_sse_events(request: Request) -> StreamingResponse:
+    """SSE stream of sudo approval events.
+
+    Pushes events:
+      - new_request: a new sudo request is pending
+      - request_decided: a request was approved/denied/expired
+    """
+    queue = sudo_gate.subscribe_sse()
+
+    async def event_stream():
+        try:
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                try:
+                    event_type, data = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # Send keepalive comment
+                    yield ": keepalive\n\n"
+        finally:
+            sudo_gate.unsubscribe_sse(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/sudo/requests")
+async def list_sudo_requests(
+    job_id: str | None = Query(None, description="Filter by job ID"),
+    status: str | None = Query(None, description="Filter by status"),
+    limit: int = Query(50, ge=1, le=200),
+) -> list[dict]:
+    """List sudo approval requests."""
+    return await sudo_gate.list_requests(job_id=job_id, status=status, limit=limit)
+
+
+@app.get("/api/sudo/requests/{request_id}")
+async def get_sudo_request(request_id: str) -> dict:
+    """Get a single sudo approval request."""
+    result = await sudo_gate.get_request(request_id)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Sudo request '{request_id}' not found")
+    return result
+
+
+@app.post("/api/sudo/requests/{request_id}/approve")
+async def approve_sudo_request(request_id: str, body: SudoApproveRequest | None = None) -> dict:
+    """Approve a pending sudo request."""
+    reason = body.reason if body else ""
+    result = await sudo_gate.approve_request(request_id, reason=reason)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Sudo request '{request_id}' not found")
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/sudo/requests/{request_id}/deny")
+async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
+    """Deny a pending sudo request."""
+    result = await sudo_gate.deny_request(request_id, reason=body.reason)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Sudo request '{request_id}' not found")
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.get("/api/sudo/rules")
+async def list_sudo_rules() -> list[dict]:
+    """List auto-approval rules."""
+    return await sudo_gate.list_rules()
+
+
+@app.post("/api/sudo/rules")
+async def create_sudo_rule(body: SudoRuleCreateRequest) -> dict:
+    """Create an auto-approval rule."""
+    if body.action not in ("approve", "deny", "review"):
+        raise HTTPException(status_code=400, detail="action must be 'approve', 'deny', or 'review'")
+    result = await sudo_gate.create_rule(
+        pattern=body.pattern,
+        action=body.action,
+        priority=body.priority,
+        description=body.description,
+    )
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to create rule")
+    return result
+
+
+@app.delete("/api/sudo/rules/{rule_id}")
+async def delete_sudo_rule(rule_id: str) -> dict:
+    """Delete an auto-approval rule."""
+    if not await sudo_gate.delete_rule(rule_id):
+        raise HTTPException(status_code=404, detail=f"Rule '{rule_id}' not found")
+    return {"status": "deleted", "id": rule_id}
 
 
 class JobResumeRequest(BaseModel):
