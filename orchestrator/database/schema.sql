@@ -658,8 +658,7 @@ CREATE TABLE IF NOT EXISTS sudo_approval_requests (
     decided_by          VARCHAR(255),
     decision_reason     TEXT,
     ttl_seconds         INTEGER NOT NULL DEFAULT 300,
-    expires_at          TIMESTAMPTZ GENERATED ALWAYS AS
-        (requested_at + (ttl_seconds || ' seconds')::INTERVAL) STORED,
+    expires_at          TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '300 seconds'),
     nats_reply_subject  TEXT,
     metadata            JSONB DEFAULT '{}'
 );

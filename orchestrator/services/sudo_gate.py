@@ -106,6 +106,11 @@ class SudoGateService:
                 request_id, "auto_approved", "auto-approval rule", "system",
                 reply_subject,
             )
+            # Also respond directly via msg for immediate delivery
+            try:
+                await msg.respond(json.dumps({"approved": True, "reason": "auto-approval rule"}).encode())
+            except Exception:
+                pass
             return
 
         if auto_result == "deny":
@@ -114,6 +119,10 @@ class SudoGateService:
                 request_id, "auto_denied", "auto-denial rule", "system",
                 reply_subject,
             )
+            try:
+                await msg.respond(json.dumps({"approved": False, "reason": "auto-denial rule"}).encode())
+            except Exception:
+                pass
             return
 
         # No auto-match — push to SSE for human review.
@@ -430,8 +439,10 @@ class SudoGateService:
                     """
                     INSERT INTO sudo_approval_requests
                         (job_id, vm_name, command, arguments, working_directory,
-                         requesting_user, target_user, nats_reply_subject, metadata)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                         requesting_user, target_user, nats_reply_subject, metadata,
+                         expires_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                            NOW() + INTERVAL '300 seconds')
                     RETURNING id
                     """,
                     job_id, vm_name, command, arguments, cwd,
@@ -496,7 +507,10 @@ class SudoGateService:
             response["reason"] = reason
 
         try:
+            logger.info("Publishing NATS reply to %s: %s", reply_subject, response)
             await self._nc.publish(reply_subject, json.dumps(response).encode())
+            await self._nc.flush()
+            logger.info("NATS reply published and flushed to %s", reply_subject)
         except Exception as e:
             logger.error("Failed to publish NATS reply to %s: %s", reply_subject, e)
 

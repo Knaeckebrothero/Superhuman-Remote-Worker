@@ -71,53 +71,29 @@ spec:
           userData: |
             #cloud-config
             hostname: agent-vm-${JOB_ID}
-
             write_files:
             - path: /run/agent/job-config.json
-              permissions: '0644'
               content: |
-                {
-                  "job_id": "${JOB_ID}",
-                  "agent_config": "${AGENT_CONFIG}",
-                  "description": "${DESCRIPTION}",
-                  "nats_url": "${NATS_URL}"
-                }
-
-            # SSH key MUST be written before the daemon env file, because
-            # the daemon (enabled in image, Restart=always) may auto-start
-            # once it sees valid NATS_URL/JOB_ID. Key must be in place first.
+                {"job_id":"${JOB_ID}","agent_config":"${AGENT_CONFIG}","nats_url":"${NATS_URL}"}
             - path: /home/agent-host/.ssh/authorized_keys
               permissions: '0600'
               owner: agent-host:agent-host
               content: |
                 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM1hi+I86ZtC8OOmv2dEUtUbXTgtgvWuSWtszPsts5bY srw-agent-vm-access
-
             - path: /etc/default/management-daemon
-              permissions: '0644'
               content: |
                 NATS_URL=nats://10.43.114.69:4222
                 JOB_ID=${JOB_ID}
-
-            - path: /etc/systemd/system/management-daemon.service
-              permissions: '0644'
+            - path: /etc/default/sudo-gated
               content: |
-                [Unit]
-                Description=SRW Management Daemon
-                After=network-online.target
-                Wants=network-online.target
-                [Service]
-                Type=simple
-                EnvironmentFile=/etc/default/management-daemon
-                ExecStart=/usr/bin/python3 /opt/srw/management-daemon.py
-                Restart=always
-                RestartSec=5
-                StandardOutput=journal+console
-                StandardError=journal+console
-                SyslogIdentifier=management-daemon
-                [Install]
-                WantedBy=multi-user.target
-
+                NATS_URL=nats://10.43.114.69:4222
+                JOB_ID=${JOB_ID}
+                VM_ID=agent-vm-${JOB_ID}
             runcmd:
             - mkdir -p /run/agent
+            - "sed -i '/^CapabilityBoundingSet=/c\\CapabilityBoundingSet=CAP_SYS_PTRACE' /etc/systemd/system/sudo-gated.service"
+            - "sed -i '/^CapabilityBoundingSet=/a AmbientCapabilities=CAP_SYS_PTRACE' /etc/systemd/system/sudo-gated.service"
             - systemctl daemon-reload
             - systemctl enable --now management-daemon
+            - systemctl restart sudo-gated.socket
+            - "chattr -i /etc/sudo.conf 2>/dev/null; sed -i s/fail_mode=open/fail_mode=deny/ /etc/sudo.conf; chattr +i /etc/sudo.conf 2>/dev/null"
