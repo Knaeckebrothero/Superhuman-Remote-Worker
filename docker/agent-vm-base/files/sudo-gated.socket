@@ -7,7 +7,7 @@ ListenStream=/run/sudo-gated/sudo-gated.sock
 SocketMode=0660
 SocketUser=root
 SocketGroup=sudo-gated
-DirectoryMode=0755
+DirectoryMode=0775
 
 # Queue up to 5 connections while daemon starts
 Backlog=5
