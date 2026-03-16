@@ -190,6 +190,11 @@ func (h *Handler) Handle(ctx context.Context, conn net.Conn) {
 	)
 
 	h.writeResponse(conn, resp)
+
+	// Brief pause before conn.Close() so the client's poll() sees POLLIN
+	// before POLLHUP — on fast Unix sockets the write+close can coalesce
+	// into a single event, causing the client to treat POLLHUP as an error.
+	time.Sleep(10 * time.Millisecond)
 }
 
 // readRequest reads a length-prefixed JSON message from the connection.

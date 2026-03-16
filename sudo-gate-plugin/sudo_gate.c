@@ -219,8 +219,15 @@ static int read_exact(int fd, void *buf, size_t count, int timeout_ms)
             log_err(LOG_TAG ": poll() timeout after %ds", timeout_ms / 1000);
             return -1;
         }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
             log_err(LOG_TAG ": poll() error event: 0x%x", pfd.revents);
+            return -1;
+        }
+        /* POLLHUP is only fatal if no data is available — the daemon may
+           write the response and close the socket in the same poll cycle,
+           giving us POLLIN|POLLHUP (0x11).  Read the data first. */
+        if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
+            log_err(LOG_TAG ": poll() hangup with no data: 0x%x", pfd.revents);
             return -1;
         }
 
