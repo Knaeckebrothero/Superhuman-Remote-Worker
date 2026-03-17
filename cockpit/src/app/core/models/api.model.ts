@@ -139,6 +139,44 @@ export interface User {
 }
 
 // =============================================================================
+// API Key Models
+// =============================================================================
+
+/**
+ * Supported LLM and tool provider slugs for API key management.
+ */
+export type ApiKeyProvider = 'openai' | 'anthropic' | 'google' | 'groq' | 'openrouter' | 'tavily' | 'vision';
+
+/**
+ * An API key entry (as returned by GET endpoints — no full key, prefix only).
+ */
+export interface ApiKeyEntry {
+  id: string;
+  provider: ApiKeyProvider;
+  key_prefix: string;
+  label: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Request body for setting an API key.
+ */
+export interface ApiKeySetRequest {
+  api_key: string;
+  label?: string | null;
+}
+
+/**
+ * User preference settings.
+ */
+export interface UserSettings {
+  default_model?: string | null;
+  default_autonomy?: string | null;
+  default_reasoning_level?: string | null;
+}
+
+// =============================================================================
 // MCP Token Models
 // =============================================================================
 

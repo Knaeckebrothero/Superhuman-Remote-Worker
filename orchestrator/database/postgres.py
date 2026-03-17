@@ -37,7 +37,7 @@ SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "users", "projects", "project_members", "project_repositories"})
 
 # Required tables that must exist for the orchestrator to function
-REQUIRED_TABLES = ["users", "sessions", "projects", "project_members", "project_repositories", "jobs", "agents", "requirements", "datasources", "builder_sessions", "builder_messages"]
+REQUIRED_TABLES = ["users", "sessions", "projects", "project_members", "project_repositories", "jobs", "agents", "requirements", "datasources", "builder_sessions", "builder_messages", "user_api_keys", "project_api_keys"]
 
 # Tables in the vector DB (verified separately when VECTOR_DB_URL is set)
 VECTOR_REQUIRED_TABLES = ["memories", "knowledge_index", "sources", "citations", "job_sources", "source_annotations", "source_tags", "source_embeddings", "schema_migrations"]
@@ -2231,6 +2231,208 @@ class PostgresDB:
                    OR (revoked_at IS NOT NULL AND revoked_at < CURRENT_TIMESTAMP - INTERVAL '30 days')
                 """
             )
+
+    # =========================================================================
+    # USER API KEY OPERATIONS
+    # =========================================================================
+
+    async def upsert_user_api_key(
+        self,
+        user_id: str,
+        provider: str,
+        api_key: str,
+        key_prefix: str,
+        label: str | None = None,
+    ) -> Dict[str, Any]:
+        """Create or replace a user's API key for a provider."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_api_keys (user_id, provider, api_key, key_prefix, label)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (user_id, provider) DO UPDATE
+                SET api_key = EXCLUDED.api_key,
+                    key_prefix = EXCLUDED.key_prefix,
+                    label = EXCLUDED.label,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id, user_id, provider, key_prefix, label, created_at, updated_at
+                """,
+                UUID(user_id),
+                provider,
+                api_key,
+                key_prefix,
+                label,
+            )
+            return dict(row)
+
+    async def list_user_api_keys(self, user_id: str) -> List[Dict[str, Any]]:
+        """List all API keys for a user (key_prefix only, no full key)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, provider, key_prefix, label, created_at, updated_at
+                FROM user_api_keys
+                WHERE user_id = $1
+                ORDER BY provider
+                """,
+                UUID(user_id),
+            )
+            return [dict(r) for r in rows]
+
+    async def get_user_api_key(self, user_id: str, provider: str) -> str | None:
+        """Get the full API key for a user+provider (for dispatch only)."""
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT api_key FROM user_api_keys WHERE user_id = $1 AND provider = $2",
+                UUID(user_id),
+                provider,
+            )
+
+    async def delete_user_api_key(self, user_id: str, provider: str) -> bool:
+        """Delete a user's API key for a provider."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM user_api_keys WHERE user_id = $1 AND provider = $2",
+                UUID(user_id),
+                provider,
+            )
+            return result == "DELETE 1"
+
+    # =========================================================================
+    # PROJECT API KEY OPERATIONS
+    # =========================================================================
+
+    async def upsert_project_api_key(
+        self,
+        project_id: str,
+        provider: str,
+        api_key: str,
+        key_prefix: str,
+        label: str | None = None,
+    ) -> Dict[str, Any]:
+        """Create or replace a project's API key for a provider."""
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO project_api_keys (project_id, provider, api_key, key_prefix, label)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (project_id, provider) DO UPDATE
+                SET api_key = EXCLUDED.api_key,
+                    key_prefix = EXCLUDED.key_prefix,
+                    label = EXCLUDED.label,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id, project_id, provider, key_prefix, label, created_at, updated_at
+                """,
+                UUID(project_id),
+                provider,
+                api_key,
+                key_prefix,
+                label,
+            )
+            return dict(row)
+
+    async def list_project_api_keys(self, project_id: str) -> List[Dict[str, Any]]:
+        """List all API keys for a project (key_prefix only, no full key)."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, provider, key_prefix, label, created_at, updated_at
+                FROM project_api_keys
+                WHERE project_id = $1
+                ORDER BY provider
+                """,
+                UUID(project_id),
+            )
+            return [dict(r) for r in rows]
+
+    async def get_project_api_key(self, project_id: str, provider: str) -> str | None:
+        """Get the full API key for a project+provider (for dispatch only)."""
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT api_key FROM project_api_keys WHERE project_id = $1 AND provider = $2",
+                UUID(project_id),
+                provider,
+            )
+
+    async def delete_project_api_key(self, project_id: str, provider: str) -> bool:
+        """Delete a project's API key for a provider."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM project_api_keys WHERE project_id = $1 AND provider = $2",
+                UUID(project_id),
+                provider,
+            )
+            return result == "DELETE 1"
+
+    # =========================================================================
+    # API KEY RESOLUTION (for job dispatch)
+    # =========================================================================
+
+    async def resolve_api_keys_for_job(
+        self,
+        user_id: str | None,
+        project_id: str | None,
+    ) -> Dict[str, str]:
+        """Resolve all API keys for a job (user > project fallback).
+
+        Returns dict mapping provider -> api_key for all providers
+        where at least one key exists.
+        """
+        resolved: Dict[str, str] = {}
+
+        # Project keys first (lower priority — user keys will override)
+        if project_id:
+            async with self.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT provider, api_key FROM project_api_keys WHERE project_id = $1",
+                    UUID(project_id),
+                )
+                for row in rows:
+                    resolved[row["provider"]] = row["api_key"]
+
+        # User keys override project keys
+        if user_id:
+            async with self.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT provider, api_key FROM user_api_keys WHERE user_id = $1",
+                    UUID(user_id),
+                )
+                for row in rows:
+                    resolved[row["provider"]] = row["api_key"]
+
+        return resolved
+
+    # =========================================================================
+    # USER SETTINGS OPERATIONS
+    # =========================================================================
+
+    async def get_user_settings(self, user_id: str) -> Dict[str, Any]:
+        """Get user preferences/settings. Returns empty dict if unset."""
+        async with self.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT COALESCE(settings, '{}') FROM users WHERE id = $1",
+                UUID(user_id),
+            )
+            if val is None:
+                return {}
+            return json.loads(val) if isinstance(val, str) else val
+
+    async def update_user_settings(self, user_id: str, settings: Dict[str, Any]) -> bool:
+        """Merge settings into user's settings JSONB (patch semantics).
+
+        Keys set to null are removed from the settings object.
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE users
+                SET settings = jsonb_strip_nulls(COALESCE(settings, '{}'::jsonb) || $2::jsonb)
+                WHERE id = $1
+                """,
+                UUID(user_id),
+                json.dumps(settings),
+            )
+            return result == "UPDATE 1"
 
     # =========================================================================
     # USER OPERATIONS

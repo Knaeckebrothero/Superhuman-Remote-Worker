@@ -4,7 +4,18 @@ import { Router } from '@angular/router';
 import { McpTokenService } from '../../core/services/mcp-token.service';
 import { UserService } from '../../core/services/user.service';
 import { ApiService } from '../../core/services/api.service';
-import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
+import { SettingsService } from '../../core/services/settings.service';
+import { McpTokenCreateResponse, Project, ApiKeyProvider } from '../../core/models/api.model';
+
+const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'google', label: 'Google' },
+  { value: 'groq', label: 'Groq' },
+  { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'tavily', label: 'Tavily (Web Search)' },
+  { value: 'vision', label: 'Vision' },
+];
 
 @Component({
   selector: 'app-settings',
@@ -15,8 +26,130 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
       <div class="settings-container">
         <h1 class="page-title">Settings</h1>
 
-        <!-- MCP Tokens Section -->
+        <!-- API Keys Section -->
         <section class="settings-section">
+          <h2 class="section-title">API Keys</h2>
+          <p class="section-desc">
+            Set your own API keys for LLM providers and tools. These take priority over
+            system-wide keys when running jobs.
+          </p>
+
+          <!-- Key List -->
+          @if (settingsService.apiKeys().length > 0) {
+            <div class="key-table">
+              <div class="key-header">
+                <span class="col-provider">Provider</span>
+                <span class="col-prefix">Key</span>
+                <span class="col-label">Label</span>
+                <span class="col-updated">Updated</span>
+                <span class="col-action"></span>
+              </div>
+              @for (key of settingsService.apiKeys(); track key.id) {
+                <div class="key-row">
+                  <span class="col-provider">{{ providerLabel(key.provider) }}</span>
+                  <span class="col-prefix mono">{{ key.key_prefix }}...</span>
+                  <span class="col-label">{{ key.label || '-' }}</span>
+                  <span class="col-updated">{{ formatDate(key.updated_at) }}</span>
+                  <span class="col-action">
+                    <button class="revoke-btn" (click)="deleteApiKey(key.provider)">Delete</button>
+                  </span>
+                </div>
+              }
+            </div>
+          } @else {
+            <p class="empty-state">No API keys configured. Add one to use your own provider keys.</p>
+          }
+
+          <!-- Set Key Form -->
+          <div class="create-form">
+            <h3 class="form-title">Add / Update Key</h3>
+            <div class="form-row two-col">
+              <select class="form-input" [(ngModel)]="keyProvider" [disabled]="settingKey()">
+                @for (p of providers; track p.value) {
+                  <option [value]="p.value">{{ p.label }}</option>
+                }
+              </select>
+              <input
+                type="text"
+                class="form-input"
+                placeholder="Label (optional)"
+                [(ngModel)]="keyLabel"
+                [disabled]="settingKey()"
+              />
+            </div>
+            <div class="form-row">
+              <input
+                type="password"
+                class="form-input"
+                placeholder="API key (e.g. sk-...)"
+                [(ngModel)]="keyValue"
+                [disabled]="settingKey()"
+              />
+            </div>
+            <button
+              class="create-btn"
+              (click)="saveApiKey()"
+              [disabled]="settingKey() || !keyValue.trim()"
+            >
+              {{ settingKey() ? 'Saving...' : 'Save Key' }}
+            </button>
+          </div>
+        </section>
+
+        <!-- Preferences Section -->
+        <section class="settings-section" style="margin-top: 24px;">
+          <h2 class="section-title">Preferences</h2>
+          <p class="section-desc">
+            Default settings applied when creating new jobs. Can be overridden per-job.
+          </p>
+
+          <div class="create-form" style="border-top: none; padding-top: 0;">
+            <div class="form-row">
+              <label class="field-label">Default Model</label>
+              <input
+                type="text"
+                class="form-input"
+                placeholder="e.g. gpt-4o, claude-sonnet-4-6"
+                [(ngModel)]="prefModel"
+              />
+            </div>
+            <div class="form-row two-col">
+              <div>
+                <label class="field-label">Default Autonomy</label>
+                <select class="form-input" [(ngModel)]="prefAutonomy">
+                  <option value="">Not set</option>
+                  <option value="full">Full</option>
+                  <option value="review">Review</option>
+                  <option value="partial">Partial</option>
+                  <option value="guided">Guided</option>
+                  <option value="dependent">Dependent</option>
+                </select>
+              </div>
+              <div>
+                <label class="field-label">Default Reasoning Level</label>
+                <select class="form-input" [(ngModel)]="prefReasoning">
+                  <option value="">Not set</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+            </div>
+            <button
+              class="create-btn"
+              (click)="savePreferences()"
+              [disabled]="savingPrefs()"
+            >
+              {{ savingPrefs() ? 'Saving...' : 'Save Preferences' }}
+            </button>
+            @if (prefsSaved()) {
+              <span class="save-feedback">Saved</span>
+            }
+          </div>
+        </section>
+
+        <!-- MCP Tokens Section -->
+        <section class="settings-section" style="margin-top: 24px;">
           <h2 class="section-title">MCP Tokens</h2>
           <p class="section-desc">
             Generate API tokens for Claude Code or other MCP clients to access the orchestrator.
@@ -161,12 +294,21 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
       font-size: 12px;
     }
 
-    /* Token table */
-    .token-table {
+    /* Key + Token tables */
+    .key-table, .token-table {
       margin-bottom: 20px;
       border: 1px solid var(--border-color, #313244);
       border-radius: 8px;
       overflow: hidden;
+    }
+
+    .key-header, .key-row {
+      display: grid;
+      grid-template-columns: 1.5fr 1.2fr 1.2fr 1fr 80px;
+      padding: 10px 14px;
+      gap: 8px;
+      align-items: center;
+      font-size: 13px;
     }
 
     .token-header, .token-row {
@@ -178,7 +320,7 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
       font-size: 13px;
     }
 
-    .token-header {
+    .key-header, .token-header {
       background: var(--surface-0, #313244);
       font-weight: 600;
       font-size: 12px;
@@ -187,7 +329,7 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
       letter-spacing: 0.5px;
     }
 
-    .token-row {
+    .key-row, .token-row {
       border-top: 1px solid var(--border-color, #313244);
     }
 
@@ -285,6 +427,16 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
       color: var(--text-primary, #cdd6f4);
     }
 
+    .field-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted, #6c7086);
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
     .form-row {
       margin-bottom: 10px;
     }
@@ -350,6 +502,13 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
     .create-btn:hover:not(:disabled) { opacity: 0.9; }
     .create-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+    .save-feedback {
+      margin-left: 12px;
+      font-size: 13px;
+      color: var(--green, #a6e3a1);
+      font-weight: 600;
+    }
+
     /* Instructions */
     .instructions {
       border-top: 1px solid var(--border-color, #313244);
@@ -373,18 +532,34 @@ import { McpTokenCreateResponse, Project } from '../../core/models/api.model';
 export class SettingsComponent implements OnInit {
   readonly tokenService = inject(McpTokenService);
   readonly userService = inject(UserService);
+  readonly settingsService = inject(SettingsService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
 
-  // Create form state
+  // Provider list for dropdown
+  readonly providers = PROVIDERS;
+
+  // MCP token form state
   newName = '';
   newScope = 'user';
   newExpiry: number | null = null;
-
   readonly creating = signal(false);
   readonly newToken = signal<McpTokenCreateResponse | null>(null);
   readonly copied = signal(false);
   readonly projects = signal<Project[]>([]);
+
+  // API key form state
+  keyProvider: ApiKeyProvider = 'openai';
+  keyValue = '';
+  keyLabel = '';
+  readonly settingKey = signal(false);
+
+  // Preferences form state
+  prefModel = '';
+  prefAutonomy = '';
+  prefReasoning = '';
+  readonly savingPrefs = signal(false);
+  readonly prefsSaved = signal(false);
 
   /** Only show active (non-revoked) tokens. */
   activeTokens = () =>
@@ -392,9 +567,23 @@ export class SettingsComponent implements OnInit {
 
   ngOnInit(): void {
     this.tokenService.loadTokens();
+    this.settingsService.loadApiKeys();
+    this.settingsService.loadPreferences();
     this.apiService
       .getProjects(this.userService.currentUserId() ?? undefined)
       .subscribe((p) => this.projects.set(p));
+
+    // Pre-fill preferences once loaded
+    setTimeout(() => {
+      const prefs = this.settingsService.preferences();
+      this.prefModel = prefs.default_model || '';
+      this.prefAutonomy = prefs.default_autonomy || '';
+      this.prefReasoning = prefs.default_reasoning_level || '';
+    }, 500);
+  }
+
+  providerLabel(provider: string): string {
+    return PROVIDERS.find((p) => p.value === provider)?.label || provider;
   }
 
   formatScope(scope: string): string {
@@ -432,6 +621,54 @@ export class SettingsComponent implements OnInit {
       null,
       2,
     );
+
+  // ── API Keys ──────────────────────────────────────────────────────
+
+  saveApiKey(): void {
+    if (!this.keyValue.trim()) return;
+    this.settingKey.set(true);
+
+    this.settingsService
+      .setApiKey(this.keyProvider, {
+        api_key: this.keyValue.trim(),
+        label: this.keyLabel.trim() || undefined,
+      })
+      .subscribe({
+        next: () => {
+          this.keyValue = '';
+          this.keyLabel = '';
+          this.settingKey.set(false);
+        },
+        error: () => this.settingKey.set(false),
+      });
+  }
+
+  deleteApiKey(provider: string): void {
+    this.settingsService.deleteApiKey(provider).subscribe();
+  }
+
+  // ── Preferences ───────────────────────────────────────────────────
+
+  savePreferences(): void {
+    this.savingPrefs.set(true);
+    this.prefsSaved.set(false);
+
+    const settings: Record<string, string | null> = {};
+    settings['default_model'] = this.prefModel.trim() || null;
+    settings['default_autonomy'] = this.prefAutonomy || null;
+    settings['default_reasoning_level'] = this.prefReasoning || null;
+
+    this.settingsService.updatePreferences(settings).subscribe({
+      next: () => {
+        this.savingPrefs.set(false);
+        this.prefsSaved.set(true);
+        setTimeout(() => this.prefsSaved.set(false), 2000);
+      },
+      error: () => this.savingPrefs.set(false),
+    });
+  }
+
+  // ── MCP Tokens ────────────────────────────────────────────────────
 
   createToken(): void {
     if (!this.newName.trim()) return;
