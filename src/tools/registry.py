@@ -30,6 +30,7 @@ from .citation import create_citation_tools, get_citation_metadata
 from .graph import create_graph_tools, get_graph_metadata
 from .sql import create_sql_tools, get_sql_metadata
 from .mongodb import create_mongodb_tools, get_mongodb_metadata
+from .cloud import create_cloud_tools, get_cloud_metadata
 from .git import create_git_tools, get_git_metadata
 from .coding import create_coding_tools, get_coding_metadata
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
@@ -58,6 +59,7 @@ TOOL_REGISTRY.update(get_citation_metadata())
 TOOL_REGISTRY.update(get_graph_metadata())
 TOOL_REGISTRY.update(get_sql_metadata())
 TOOL_REGISTRY.update(get_mongodb_metadata())
+TOOL_REGISTRY.update(get_cloud_metadata())
 TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_coding_metadata())
 TOOL_REGISTRY.update(get_evaluation_metadata())
@@ -361,6 +363,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded mongodb tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load mongodb tools: {e}")
+
+    # Cloud storage tools (WebDAV)
+    if "cloud" in tools_by_category:
+        if not context.has_datasource("webdav"):
+            logger.warning("Cloud tools require a webdav datasource in ToolContext")
+        else:
+            try:
+                cloud_tools = create_cloud_tools(context)
+                requested = set(tools_by_category["cloud"])
+                for tool in cloud_tools:
+                    if tool.name in requested:
+                        all_tools.append(tool)
+                        logger.debug(f"Loaded cloud tool: {tool.name}")
+            except Exception as e:
+                logger.warning(f"Could not load cloud tools: {e}")
 
     # Git tools
     if "git" in tools_by_category:

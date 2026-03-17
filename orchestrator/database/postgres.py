@@ -2277,7 +2277,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, created_at
+                       is_admin, keycloak_sub, created_at
                 FROM users
                 WHERE id = $1
                 """,
@@ -2285,6 +2285,117 @@ class PostgresDB:
             )
 
         return dict(row) if row else None
+
+    async def get_user_by_keycloak_sub(self, sub: str) -> Dict[str, Any] | None:
+        """Get a user by Keycloak subject ID.
+
+        Args:
+            sub: Keycloak user subject (UUID from the `sub` claim)
+
+        Returns:
+            User dict or None if not found
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, keycloak_sub, created_at
+                FROM users
+                WHERE keycloak_sub = $1
+                """,
+                sub,
+            )
+
+        return dict(row) if row else None
+
+    async def upsert_user_from_oidc(
+        self,
+        sub: str,
+        email: str,
+        display_name: str,
+        is_admin: bool = False,
+    ) -> Dict[str, Any]:
+        """Create or update a user from OIDC claims (JIT provisioning).
+
+        On first OIDC login, tries to match an existing user by email and link
+        the keycloak_sub. If no email match, creates a new user. On subsequent
+        logins, updates display_name and is_admin from the token claims.
+
+        Also creates a default project for newly provisioned users.
+
+        Args:
+            sub: Keycloak subject ID
+            email: Email from OIDC claims
+            display_name: Display name from OIDC claims
+            is_admin: Whether the user has the admin realm role
+
+        Returns:
+            Full user dict
+        """
+        async with self.acquire() as conn:
+            # Try to link to existing user by email (handles pre-seeded admin)
+            if email:
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id, display_name, avatar_color, email, default_project_id,
+                           is_admin, keycloak_sub, created_at
+                    FROM users
+                    WHERE LOWER(email) = LOWER($1) AND keycloak_sub IS NULL
+                    """,
+                    email,
+                )
+                if existing:
+                    await conn.execute(
+                        "UPDATE users SET keycloak_sub = $1, is_admin = $2 WHERE id = $3",
+                        sub,
+                        is_admin,
+                        existing["id"],
+                    )
+                    result = dict(existing)
+                    result["keycloak_sub"] = sub
+                    result["is_admin"] = is_admin
+                    return result
+
+            # Check if keycloak_sub already linked (concurrent request)
+            existing_sub = await conn.fetchrow(
+                """
+                SELECT id, display_name, avatar_color, email, default_project_id,
+                       is_admin, keycloak_sub, created_at
+                FROM users WHERE keycloak_sub = $1
+                """,
+                sub,
+            )
+            if existing_sub:
+                return dict(existing_sub)
+
+            # Create new user + project atomically (constraint requires default_project_id)
+            row = await conn.fetchrow(
+                """
+                WITH new_project AS (
+                    INSERT INTO projects (name, description, is_default)
+                    VALUES ($1 || '''s Project', 'Default project', true)
+                    RETURNING id
+                ),
+                new_user AS (
+                    INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                      keycloak_sub, default_project_id)
+                    VALUES ($1, '#89b4fa', $2, $3, $4, (SELECT id FROM new_project))
+                    RETURNING id, display_name, avatar_color, email, default_project_id,
+                              is_admin, keycloak_sub, created_at
+                ),
+                membership AS (
+                    INSERT INTO project_members (project_id, user_id, role)
+                    SELECT (SELECT id FROM new_project), id, 'owner'
+                    FROM new_user
+                )
+                SELECT * FROM new_user
+                """,
+                display_name,
+                email,
+                is_admin,
+                sub,
+            )
+            return dict(row)
 
     async def get_user_by_email(self, email: str) -> Dict[str, Any] | None:
         """Get a user by email (case-insensitive).
@@ -2299,7 +2410,7 @@ class PostgresDB:
             row = await conn.fetchrow(
                 """
                 SELECT id, display_name, avatar_color, email, default_project_id,
-                       is_admin, created_at
+                       is_admin, keycloak_sub, created_at
                 FROM users
                 WHERE LOWER(email) = LOWER($1)
                 """,

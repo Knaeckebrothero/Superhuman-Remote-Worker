@@ -105,15 +105,6 @@ export class ApiService {
   private readonly toast = inject(ToastService);
   private readonly baseUrl = environment.apiUrl;
 
-  /** CSRF token read from the csrf_token cookie after login. */
-  csrfToken: string | null = null;
-
-  /** Read the csrf_token cookie value and store it for the interceptor. */
-  readCsrfTokenFromCookie(): void {
-    const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]*)/);
-    this.csrfToken = match ? decodeURIComponent(match[1]) : null;
-  }
-
   /**
    * Get list of available tables with row counts.
    */
