@@ -5,6 +5,10 @@ OpenAI-compatible embedding API client for vector search.
 
 Supports any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, LiteLLM).
 
+Fallback: When OPENROUTER_API_KEY is set and the primary embedding server
+is unreachable, requests automatically fall back to OpenRouter using the
+same model (prefixed with ``qwen/``).
+
 Environment Variables:
     CITATION_EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
     CITATION_EMBEDDING_URL: API base URL (default: https://api.openai.com/v1)
@@ -116,6 +120,21 @@ class EmbeddingService:
             log.debug(f"tiktoken unavailable for model {self.model}, using heuristic")
 
         self._dimension: int | None = _KNOWN_DIMENSIONS.get(self.model)
+
+        # Fallback: OpenRouter (same model, different endpoint)
+        self._fallback_url: str | None = None
+        self._fallback_key: str | None = None
+        self._fallback_model: str | None = None
+        _openrouter_key = os.getenv("OPENROUTER_API_KEY")
+        if _openrouter_key and "openrouter.ai" not in self.api_url:
+            self._fallback_url = "https://openrouter.ai/api/v1"
+            self._fallback_key = _openrouter_key
+            self._fallback_model = f"qwen/{self.model}"
+            log.info(
+                f"EmbeddingService fallback configured: "
+                f"model={self._fallback_model}, url={self._fallback_url}"
+            )
+
         log.info(
             f"EmbeddingService configured: model={self.model}, "
             f"url={self.api_url}, dimension={self._dimension or 'unknown'}"
@@ -213,6 +232,9 @@ class EmbeddingService:
         """
         Send a single embedding API request for a batch of texts.
 
+        Falls back to OpenRouter when the primary server is unreachable
+        and OPENROUTER_API_KEY is configured.
+
         Returns:
             List of embedding vectors in input order.
         """
@@ -231,6 +253,13 @@ class EmbeddingService:
             raise EmbeddingServiceError(
                 f"Embedding API returned {e.response.status_code}: {e.response.text[:500]}"
             ) from e
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # Primary server unreachable — try fallback
+            if not self._fallback_url:
+                raise EmbeddingServiceError(
+                    f"Embedding API request failed: {e}"
+                ) from e
+            return self._embed_single_batch_fallback(texts, client, e)
         except httpx.RequestError as e:
             raise EmbeddingServiceError(
                 f"Embedding API request failed: {e}"
@@ -243,6 +272,56 @@ class EmbeddingService:
             )
 
         # Sort by index to ensure correct order
+        embeddings_data.sort(key=lambda x: x.get("index", 0))
+        return [item["embedding"] for item in embeddings_data]
+
+    def _embed_single_batch_fallback(
+        self,
+        texts: list[str],
+        client: httpx.Client,
+        original_error: Exception,
+    ) -> list[list[float]]:
+        """Retry a batch against the OpenRouter fallback endpoint."""
+        import httpx
+
+        log.warning(
+            f"Primary embedding server unreachable "
+            f"({type(original_error).__name__}), "
+            f"falling back to OpenRouter ({len(texts)} texts)"
+        )
+
+        fallback_url = f"{self._fallback_url}/embeddings"
+        fallback_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._fallback_key}",
+        }
+        payload = {
+            "model": self._fallback_model,
+            "input": texts,
+        }
+
+        try:
+            response = client.post(
+                fallback_url, json=payload, headers=fallback_headers
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as e:
+            raise EmbeddingServiceError(
+                f"Fallback embedding API returned {e.response.status_code}: "
+                f"{e.response.text[:500]}"
+            ) from e
+        except httpx.RequestError as e:
+            raise EmbeddingServiceError(
+                f"Fallback embedding API request also failed: {e}"
+            ) from e
+
+        embeddings_data = data.get("data", [])
+        if len(embeddings_data) != len(texts):
+            raise EmbeddingServiceError(
+                f"Expected {len(texts)} embeddings, got {len(embeddings_data)}"
+            )
+
         embeddings_data.sort(key=lambda x: x.get("index", 0))
         return [item["embedding"] for item in embeddings_data]
 
