@@ -125,12 +125,26 @@ interface FrozenJobData {
             </div>
           }
 
-          <!-- Workspace Link -->
-          @if (getWorkspaceUrl()) {
-            <div class="section">
-              <a class="workspace-link" [href]="getWorkspaceUrl()" target="_blank">
-                Browse workspace in Gitea
-              </a>
+          <!-- Workspace Links -->
+          @if (getWorkspaceUrl() || hasSnapshot()) {
+            <div class="section workspace-links">
+              @if (getWorkspaceUrl()) {
+                <a class="workspace-link" [href]="getWorkspaceUrl()" target="_blank">
+                  Browse workspace in Gitea
+                </a>
+              }
+              @if (hasSnapshot()) {
+                @if (ideLoading()) {
+                  <button class="workspace-link ide-link loading" disabled>
+                    <span class="ide-spinner"></span>
+                    Starting IDE...
+                  </button>
+                } @else {
+                  <button class="workspace-link ide-link" (click)="openIde()">
+                    Open in Web IDE
+                  </button>
+                }
+              }
             </div>
           }
 
@@ -430,6 +444,48 @@ interface FrozenJobData {
         background: rgba(148, 226, 213, 0.1);
       }
 
+      .workspace-links {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .workspace-link.ide-link {
+        border-color: #89b4fa;
+        color: #89b4fa;
+        cursor: pointer;
+        background: none;
+        font: inherit;
+      }
+
+      .workspace-link.ide-link:hover {
+        background: rgba(137, 180, 250, 0.1);
+      }
+
+      .workspace-link.ide-link.loading {
+        color: #6c7086;
+        border-color: #6c7086;
+        cursor: not-allowed;
+        opacity: 0.7;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
+      .ide-spinner {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border: 1.5px solid #6c7086;
+        border-top-color: #89b4fa;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+
       /* Actions */
       .actions-section {
         display: flex;
@@ -568,7 +624,9 @@ export class JobReviewComponent {
   readonly resultMessage = signal<string | null>(null);
   readonly resultIsError = signal(false);
   readonly confirmingApprove = signal(false);
+  readonly ideLoading = signal(false);
   private confirmTimeout: ReturnType<typeof setTimeout> | null = null;
+  private idePollingInterval: ReturnType<typeof setInterval> | null = null;
 
   feedbackText = '';
 
@@ -621,6 +679,80 @@ export class JobReviewComponent {
       return `${giteaUrl}/${repoName}/src/branch/${currentJob.branch_name}`;
     }
     return `${giteaUrl}/${repoName}`;
+  }
+
+  hasSnapshot(): boolean {
+    const currentJob = this.job();
+    if (!currentJob) return false;
+    // Show IDE button if: live VM, snapshot available, or has Gitea repo
+    if (currentJob.status === 'processing') return true;
+    const snapshotStatus = currentJob.context?.['snapshot']?.['status'];
+    if (snapshotStatus === 'available') return true;
+    return !!currentJob.repo_name;
+  }
+
+  openIde(): void {
+    const currentJob = this.job();
+    if (!currentJob) return;
+    const jobId = currentJob.id;
+
+    this.ideLoading.set(true);
+
+    this.api.getIdeSession(jobId).subscribe((result) => {
+      if (!result) {
+        this.ideLoading.set(false);
+        return;
+      }
+
+      if (result.status === 'active' || result.status === 'idle') {
+        this.ideLoading.set(false);
+        if (result.code_server_url) {
+          window.open(result.code_server_url, '_blank');
+        }
+        return;
+      }
+
+      if (result.status === 'available' || result.status === 'expired') {
+        this.api.startIdeSession(jobId).subscribe((startResult) => {
+          if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
+            this.ideLoading.set(false);
+            return;
+          }
+          this.pollIdeSession(jobId);
+        });
+        return;
+      }
+
+      if (result.status === 'restoring') {
+        this.pollIdeSession(jobId);
+        return;
+      }
+
+      this.ideLoading.set(false);
+    });
+  }
+
+  private pollIdeSession(jobId: string): void {
+    if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+
+    this.idePollingInterval = setInterval(() => {
+      this.api.getIdeSession(jobId).subscribe((result) => {
+        if (!result) return;
+
+        if (result.status === 'active' || result.status === 'idle') {
+          if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+          this.idePollingInterval = null;
+          this.ideLoading.set(false);
+          if (result.code_server_url) {
+            window.open(result.code_server_url, '_blank');
+          }
+        } else if (result.status === 'failed' || result.status === 'unavailable') {
+          if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+          this.idePollingInterval = null;
+          this.ideLoading.set(false);
+        }
+      });
+    }, 3000);
   }
 
   confirmApprove(): void {

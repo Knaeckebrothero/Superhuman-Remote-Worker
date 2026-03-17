@@ -496,6 +496,21 @@ Required in `.env`:
 - `VM_NAMESPACE` - Target K8s namespace for VMs (default: `agent-vms`)
 - `DEFAULT_VM_IMAGE` - Default VM container disk image
 
+**S3 Snapshots** (optional, for VM environment snapshots + IDE sessions):
+- `S3_ENDPOINT` - S3-compatible endpoint (e.g., `http://minio:9000`)
+- `S3_ACCESS_KEY` - S3 access key
+- `S3_SECRET_KEY` - S3 secret key
+- `S3_BUCKET` - Bucket name (default: `srw-snapshots`)
+- `S3_REGION` - AWS region (default: `us-east-1`, MinIO ignores but boto3 requires)
+- `SNAPSHOT_MAX_SIZE_GB` - Max snapshot size in GB (default: `10`)
+
+**IDE Sessions** (optional, for on-demand code-server):
+- `IDE_SESSION_IDLE_TIMEOUT` - Idle timeout in minutes (default: `30`)
+- `IDE_SESSION_MAX_LIFETIME` - Max session lifetime in minutes (default: `240`)
+- `IDE_MAX_CONCURRENT_PER_USER` - Max concurrent IDE sessions per user (default: `2`)
+- `CODE_SERVER_IMAGE` - Container image for Gitea fallback IDE (default: `codercom/code-server:latest`)
+- `GITEA_INTERNAL_URL` - Gitea URL reachable from containers (default: same as `GITEA_URL`)
+
 ## Service Ports
 
 | Service | Port |
@@ -514,6 +529,8 @@ Required in `.env`:
 | Mongo Express | 8081 |
 | MongoDB | 27017 |
 | VPN Workstation forward | 8090 (host) → 8080 (container) |
+| MinIO API (S3) | 9000 |
+| MinIO Console | 9001 |
 | Dozzle (container logs) | 9999 |
 
 ## Debugging

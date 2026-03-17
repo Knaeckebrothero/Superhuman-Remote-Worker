@@ -558,6 +558,7 @@ export interface Job {
   completed_at?: string;
   error_message?: string;
   audit_count?: number;
+  context?: Record<string, any> | null;
 }
 
 /**

@@ -27,6 +27,7 @@ export const environment = {
   // External tools
   giteaUrl: getEnv('giteaUrl', 'http://localhost:3000/srw'),
   dozzleUrl: getEnv('dozzleUrl', 'http://localhost:9999'),
+  minioConsoleUrl: getEnvOrNull('minioConsoleUrl'),
   neo4jUrl: getEnv('neo4jUrl', 'http://localhost:7474'),
   pgadminUrl: getEnv('pgadminUrl', 'http://localhost:5050'),
   mongoExpressUrl: getEnv('mongoExpressUrl', 'http://localhost:8081'),

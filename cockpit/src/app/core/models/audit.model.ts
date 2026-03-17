@@ -111,4 +111,5 @@ export interface JobSummary {
   priority?: number;
   created_at: string;
   audit_count?: number | null;
+  snapshot_status?: string | null;
 }
