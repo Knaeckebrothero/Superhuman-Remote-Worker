@@ -1090,7 +1090,7 @@ export class JobListComponent implements OnInit, OnDestroy {
         return;
       }
 
-      if (result.status === 'available' || result.status === 'expired') {
+      if (result.status === 'available' || result.status === 'expired' || result.status === 'failed') {
         // Start a new session
         this.api.startIdeSession(jobId).subscribe((startResult) => {
           if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
