@@ -97,6 +97,33 @@ export interface JobVersionInfo {
 }
 
 /**
+ * IDE session status from the orchestrator.
+ */
+export interface IdeSessionStatus {
+  status: 'unavailable' | 'available' | 'restoring' | 'active' | 'idle' | 'expired' | 'failed';
+  code_server_url?: string | null;
+  snapshot_type?: string;
+  estimated_seconds?: number;
+  expires_at?: string;
+  started_at?: string;
+  source?: string;
+  restore_type?: 'vm' | 'container';
+  error?: string;
+}
+
+/**
+ * Snapshot storage statistics from the orchestrator.
+ */
+export interface SnapshotStorageStats {
+  available: boolean;
+  total_snapshots: number;
+  total_size_bytes: number;
+  gc_pending_count: number;
+  gc_pending_size_bytes: number;
+  error?: string;
+}
+
+/**
  * HTTP client service for the cockpit API.
  */
 @Injectable({ providedIn: 'root' })
@@ -757,6 +784,79 @@ export class ApiService {
         catchError((error) => {
           console.error(`Failed to resume job ${jobId}:`, error);
           this.toast.error('Failed to resume job');
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Get IDE session status for a job.
+   */
+  getIdeSession(jobId: string): Observable<IdeSessionStatus | null> {
+    return this.http
+      .get<IdeSessionStatus>(`${this.baseUrl}/jobs/${jobId}/ide`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to get IDE session for ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Start an IDE session for a job (restores snapshot into a fresh VM).
+   */
+  startIdeSession(jobId: string): Observable<IdeSessionStatus | null> {
+    return this.http
+      .post<IdeSessionStatus>(`${this.baseUrl}/jobs/${jobId}/ide`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to start IDE session for ${jobId}:`, error);
+          this.toast.error('Failed to start IDE session');
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Stop an active IDE session.
+   */
+  stopIdeSession(jobId: string): Observable<{ status: string } | null> {
+    return this.http
+      .delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/ide`)
+      .pipe(
+        tap(() => this.toast.success('IDE session stopped')),
+        catchError((error) => {
+          console.error(`Failed to stop IDE session for ${jobId}:`, error);
+          this.toast.error('Failed to stop IDE session');
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Get snapshot storage statistics (total count, size, GC pending).
+   */
+  getSnapshotStats(): Observable<SnapshotStorageStats | null> {
+    return this.http
+      .get<SnapshotStorageStats>(`${this.baseUrl}/snapshots/stats`)
+      .pipe(
+        catchError((error) => {
+          console.error('Failed to get snapshot stats:', error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Toggle pin on a job's snapshot (GC exemption).
+   */
+  toggleSnapshotPin(jobId: string): Observable<{ pinned: boolean } | null> {
+    return this.http
+      .put<{ pinned: boolean }>(`${this.baseUrl}/jobs/${jobId}/snapshot/pin`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to toggle snapshot pin for ${jobId}:`, error);
           return of(null);
         }),
       );

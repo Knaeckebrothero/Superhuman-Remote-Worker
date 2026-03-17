@@ -75,6 +75,8 @@ from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
+from services.snapshot_service import snapshot_service  # noqa: E402
+from services.ide_session import ide_session_service  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -326,6 +328,58 @@ async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("Sudo expiration sweeper stopped")
+
+
+async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that expires IDE sessions past their TTL.
+
+    Runs every 60 seconds. Checks active/idle sessions for:
+    - Max lifetime exceeded (default: 4 hours)
+    - Idle timeout exceeded (default: 30 minutes, only for 'idle' status)
+    """
+    logger.info("IDE session TTL sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            expired = await ide_session_service.check_ttl_all()
+            if expired:
+                logger.info("IDE session sweeper: expired %d sessions", expired)
+        except Exception as e:
+            logger.error("Error in IDE session TTL sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("IDE session TTL sweeper stopped")
+
+
+async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that runs snapshot garbage collection daily.
+
+    Applies retention policies, soft-deletes expired snapshots, and
+    purges items past the 7-day grace period.
+    """
+    logger.info("Snapshot GC sweeper started")
+    gc_interval = 24 * 3600  # 24 hours
+
+    while not shutdown_event.is_set():
+        try:
+            if snapshot_service.is_available:
+                stats = await snapshot_service.run_gc()
+                if stats.get("soft_deleted") or stats.get("purged"):
+                    logger.info("Snapshot GC: %s", stats)
+        except Exception as e:
+            logger.error("Error in snapshot GC sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=gc_interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Snapshot GC sweeper stopped")
 
 
 # =============================================================================
@@ -1183,12 +1237,25 @@ async def lifespan(app: FastAPI):
     # Initialize VM provisioner (uses NATS if available, else direct K8s)
     vm_provisioner.connect(db=postgres_db)
 
+    # Initialize S3 snapshot service (graceful if S3 not configured)
+    await snapshot_service.connect(db=postgres_db)
+
+    # Initialize IDE session service
+    ide_session_service.connect(
+        db=postgres_db,
+        snapshot_service=snapshot_service,
+        vm_provisioner=vm_provisioner,
+        gitea_client=gitea_client,
+    )
+
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
     token_cleanup_task = asyncio.create_task(cleanup_expired_tokens(postgres_db, _shutdown_event))
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
+    ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
+    gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
 
     yield
 
@@ -1198,6 +1265,8 @@ async def lifespan(app: FastAPI):
     await token_cleanup_task
     await dispatcher_task
     await sudo_sweeper_task
+    await ide_sweeper_task
+    await gc_sweeper_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -2244,6 +2313,24 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         if resolved_ds:
             config_override = _build_datasource_tool_override(resolved_ds, config_override)
 
+        # Restore S3 environment snapshot into the VM before resuming.
+        # This gives true "pick up where you left off" (environment + state).
+        # Non-blocking: if restore fails, resume proceeds without it.
+        snapshot_restored = False
+        if snapshot_service.is_available:
+            vm_ctx = job_context.get("vm", {}) if job_context else {}
+            ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
+            ssh_port = vm_ctx.get("ssh_port")
+            if ssh_host and ssh_port:
+                try:
+                    snapshot_restored = await ide_session_service.restore_snapshot_for_resume(
+                        job_id, ssh_host, int(ssh_port)
+                    )
+                    if snapshot_restored:
+                        logger.info(f"Snapshot restored for job {job_id} resume")
+                except Exception as e:
+                    logger.warning(f"Snapshot restore failed for job {job_id} resume (non-blocking): {e}")
+
         resume_payload = {
             "job_id": job_id,
             "config_name": job_config_name,
@@ -2251,6 +2338,7 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             "config_override": config_override,
             "datasources": datasources_payload,
             "previous_status": job["status"],
+            "snapshot_restored": snapshot_restored,
         }
         if request and request.feedback:
             resume_payload["feedback"] = request.feedback
@@ -3216,7 +3304,35 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         # 6. Trigger dispatch (freed agent can pick up queued work)
         _trigger_dispatch()
 
-        # 7. If job had a VM, request teardown
+        # 7. Capture environment snapshot to S3 (non-blocking)
+        if job.get("status") in ("completed", "failed") and snapshot_service.is_available:
+            snapshot_on_failure = job.get("status") == "completed" or True  # on_failure=true by default
+            if snapshot_on_failure:
+                ctx = job.get("context") or {}
+                if isinstance(ctx, str):
+                    ctx = json.loads(ctx)
+                vm_ctx = ctx.get("vm", {})
+                ssh_host = vm_ctx.get("ssh_host")
+                ssh_port = vm_ctx.get("ssh_port")
+
+                if ssh_host and ssh_port and vm_ctx.get("status") not in ("deleted", "deleting"):
+                    try:
+                        config_name = job.get("config_name") or "defaults"
+                        await snapshot_service.capture_vm_snapshot(
+                            job_id=job_id,
+                            ssh_host=ssh_host,
+                            ssh_port=int(ssh_port),
+                            source_type="vm",
+                            agent_config=config_name,
+                        )
+                        actions.append("snapshot captured")
+                    except Exception as e:
+                        logger.warning(
+                            f"Snapshot capture failed for job {job_id} (non-blocking): {e}"
+                        )
+                        actions.append(f"snapshot capture failed: {e}")
+
+        # 8. If job had a VM, request teardown
         if job.get("status") in ("completed", "failed") and vm_provisioner.is_available:
             vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
             if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
@@ -3279,6 +3395,120 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
 
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/snapshot")
+async def get_job_snapshot(job_id: str) -> dict[str, Any]:
+    """Get snapshot metadata for a job.
+
+    Returns status, source type, size, and environment summary.
+    Used by the cockpit to show snapshot availability indicators.
+    """
+    try:
+        result = await snapshot_service.get_snapshot_status(job_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/jobs/{job_id}/snapshot")
+async def delete_job_snapshot(job_id: str) -> dict[str, Any]:
+    """Delete all snapshots for a job from S3."""
+    try:
+        success = await snapshot_service.delete_snapshot(job_id)
+        if not success:
+            raise HTTPException(
+                status_code=500, detail="Failed to delete snapshot"
+            )
+        return {"status": "deleted", "job_id": job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.put("/api/jobs/{job_id}/snapshot/pin")
+async def toggle_snapshot_pin(job_id: str) -> dict[str, Any]:
+    """Toggle pin state on a snapshot (GC exemption).
+
+    Pinned snapshots are exempt from automatic garbage collection.
+    """
+    try:
+        new_value = await snapshot_service.toggle_pin(job_id)
+        return {"job_id": job_id, "pinned": new_value}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/snapshots/stats")
+async def get_snapshot_stats() -> dict[str, Any]:
+    """Get aggregate snapshot storage statistics.
+
+    Returns total snapshot count, total size, GC pending info.
+    """
+    try:
+        return await snapshot_service.get_storage_stats()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class IdeSessionRequest(BaseModel):
+    """Request body for starting an IDE session."""
+
+    cpu_cores: int = Field(2, description="VM CPU cores")
+    memory: str = Field("4Gi", description="VM memory")
+    idle_timeout_minutes: int | None = Field(
+        None, description="Override default idle timeout"
+    )
+
+
+@app.post("/api/jobs/{job_id}/ide")
+async def start_ide_session(job_id: str, request: IdeSessionRequest | None = None) -> dict[str, Any]:
+    """Start or get an IDE session for a job.
+
+    Idempotent: if a session is already active, returns it.
+    If restoring, returns current progress status.
+    """
+    if request is None:
+        request = IdeSessionRequest()
+
+    try:
+        result = await ide_session_service.start_session(
+            job_id=job_id,
+            cpu_cores=request.cpu_cores,
+            memory=request.memory,
+            idle_timeout_minutes=request.idle_timeout_minutes,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/ide")
+async def get_ide_session(job_id: str) -> dict[str, Any]:
+    """Get IDE session status and URL.
+
+    Used by the cockpit to poll session state and determine
+    IDE button visibility/behavior.
+    """
+    try:
+        return await ide_session_service.get_session_status(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/jobs/{job_id}/ide")
+async def stop_ide_session(job_id: str) -> dict[str, Any]:
+    """Tear down an active IDE session.
+
+    Deletes the restored VM and marks the session as expired.
+    The underlying S3 snapshot is preserved for future restores.
+    """
+    try:
+        result = await ide_session_service.stop_session(job_id)
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
