@@ -165,6 +165,11 @@ async def init_all(
                 return False
             logger.info("")
 
+            # Create Keycloak/Nextcloud databases on the same PostgreSQL instance
+            from orchestrator.init import ensure_sso_databases
+            logger.info("  Creating SSO databases (Keycloak, Nextcloud)...")
+            await ensure_sso_databases()
+
             step += 1
             logger.info(f"[{step}/{total_steps}] Initializing Vector DB...")
             if not await init_vector_db(force_reset):

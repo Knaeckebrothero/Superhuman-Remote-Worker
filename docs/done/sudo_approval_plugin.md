@@ -16,7 +16,7 @@ related:
 
 # Sudo Approval Plugin: Human-in-the-Loop Privilege Escalation for LLM Agents
 
-> **Status: Implemented.** This is the original concept design document. For the detailed implementation roadmap, deployment notes, and current file layout, see `docs/features/sudo_approval_gate.md`.
+> **Status: Implemented.** This is the original concept design document. For the detailed implementation roadmap, deployment notes, and current file layout, see `docs/done/sudo_approval_gate.md`.
 
 ## Concept
 

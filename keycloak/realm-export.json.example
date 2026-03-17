@@ -1,0 +1,239 @@
+{
+  "realm": "srw",
+  "enabled": true,
+  "displayName": "Superhuman Remote Worker",
+  "displayNameHtml": "<strong>Superhuman Remote Worker</strong>",
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": false,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "sslRequired": "none",
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 5,
+  "roles": {
+    "realm": [
+      {
+        "name": "admin",
+        "description": "Full system access, user management",
+        "composite": false
+      },
+      {
+        "name": "user",
+        "description": "Standard access to cockpit, Gitea repos, own project files",
+        "composite": false
+      },
+      {
+        "name": "viewer",
+        "description": "Read-only access for stakeholder dashboards",
+        "composite": false
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "cockpit",
+      "name": "SRW Cockpit",
+      "description": "Angular frontend (SPA, public client with PKCE)",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:4200/*",
+        "http://localhost:4000/*"
+      ],
+      "webOrigins": [
+        "http://localhost:4200",
+        "http://localhost:4000"
+      ],
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:4200/*##http://localhost:4000/*"
+      },
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email",
+        "roles"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ]
+    },
+    {
+      "clientId": "orchestrator-api",
+      "name": "SRW Orchestrator API",
+      "description": "FastAPI backend — validates tokens, never initiates login",
+      "enabled": true,
+      "bearerOnly": true,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email",
+        "roles"
+      ]
+    },
+    {
+      "clientId": "gitea",
+      "name": "Gitea",
+      "description": "Git repository service (confidential client)",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "gitea-client-secret",
+      "redirectUris": [
+        "http://localhost:3000/user/oauth2/Keycloak/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:3000"
+      ],
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "openid",
+        "email"
+      ],
+      "protocolMappers": [
+        {
+          "name": "gitea-username",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "gitea_username",
+            "claim.name": "preferred_username",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "given-name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "firstName",
+            "claim.name": "given_name",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        },
+        {
+          "name": "family-name",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "lastName",
+            "claim.name": "family_name",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "nextcloud",
+      "name": "Nextcloud",
+      "description": "Cloud storage — Phase 3, pre-registered for convenience",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "nextcloud-client-secret",
+      "redirectUris": [
+        "http://localhost:8800/apps/user_oidc/code"
+      ],
+      "webOrigins": [
+        "http://localhost:8800"
+      ],
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email"
+      ]
+    },
+    {
+      "clientId": "pgadmin",
+      "name": "pgAdmin",
+      "description": "Database administration UI (optional)",
+      "enabled": true,
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "pgadmin-client-secret",
+      "redirectUris": [
+        "http://localhost:5050/oauth2/authorize"
+      ],
+      "webOrigins": [
+        "http://localhost:5050"
+      ],
+      "protocol": "openid-connect",
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "email": "admin@srw.dev",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "SRW",
+      "lastName": "Admin",
+      "attributes": {
+        "gitea_username": ["srw-admin"]
+      },
+      "realmRoles": [
+        "admin",
+        "user",
+        "default-roles-srw"
+      ],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin",
+          "temporary": false
+        }
+      ]
+    }
+  ],
+  "scopeMappings": [
+    {
+      "clientScope": "roles",
+      "roles": [
+        "admin",
+        "user",
+        "viewer"
+      ]
+    }
+  ],
+  "smtpServer": {},
+  "internationalizationEnabled": false,
+  "loginTheme": "keycloak",
+  "accountTheme": "keycloak.v3"
+}

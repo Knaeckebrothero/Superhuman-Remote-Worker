@@ -105,7 +105,7 @@ sudo.request.{vm_id}.{job_id}     Daemon → orchestrator (request/reply)
 (reply via _INBOX)                 Orchestrator → daemon (approval/denial)
 ```
 
-The sudo approval gate uses NATS core request/reply (`nc.Request()`), not JetStream. The daemon blocks on `nc.Request()` for up to 300s. The orchestrator stores the NATS `msg` object in memory and the `_INBOX` reply subject in PostgreSQL. For auto-approval, `msg.respond()` fires within the subscription callback. For manual approval/denial, the stored `msg` object's `respond()` is called when the operator decides — this is more reliable than publishing to the `_INBOX` subject for cross-leaf-node delivery. See `docs/features/sudo_approval_gate.md` for the full design and deployment notes.
+The sudo approval gate uses NATS core request/reply (`nc.Request()`), not JetStream. The daemon blocks on `nc.Request()` for up to 300s. The orchestrator stores the NATS `msg` object in memory and the `_INBOX` reply subject in PostgreSQL. For auto-approval, `msg.respond()` fires within the subscription callback. For manual approval/denial, the stored `msg` object's `respond()` is called when the operator decides — this is more reliable than publishing to the `_INBOX` subject for cross-leaf-node delivery. See `docs/done/sudo_approval_gate.md` for the full design and deployment notes.
 
 ### JetStream Streams
 
