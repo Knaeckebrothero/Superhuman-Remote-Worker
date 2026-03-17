@@ -44,6 +44,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
+      - ./orchestrator/database/init_sso_dbs.sh:/docker-entrypoint-initdb.d/000_init_sso_dbs.sh:Z
       - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -152,13 +153,15 @@ services:
     environment:
       GITEA__database__DB_TYPE: sqlite3
       GITEA__database__PATH: /var/lib/gitea/data/gitea.db
-      GITEA__server__ROOT_URL: http://gitea:3000
+      GITEA__server__ROOT_URL: http://localhost:3000
       GITEA__server__HTTP_PORT: "3000"
       GITEA__security__INSTALL_LOCK: "true"
       GITEA__server__DISABLE_SSH: "true"
       GITEA__service__DISABLE_REGISTRATION: "false"
       GITEA__service__REQUIRE_SIGNIN_VIEW: "false"
       GITEA__service__ENABLE_CAPTCHA: "false"
+      GITEA__service__AUTO_WATCH_NEW_REPOS: "false"
+      GITEA__oauth2_client__ENABLE_AUTO_REGISTRATION: "true"
       GITEA__repository__DEFAULT_PRIVATE: private
       GITEA__repository__ENABLE_PUSH_CREATE_USER: "true"
     volumes:
@@ -170,6 +173,42 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    container_name: srw-keycloak
+    command: start-dev --import-realm
+    environment:
+      # Database
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      # Hostname — front-channel URLs use localhost so the browser can reach them.
+      # KC_HOSTNAME_BACKCHANNEL_DYNAMIC allows container-to-container backchannel
+      # requests (e.g. Gitea token exchange) to use the internal hostname.
+      KC_HOSTNAME: "http://localhost:${KEYCLOAK_PORT:-8180}"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      # Admin console credentials
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    volumes:
+      # Copy realm-export.json.example to realm-export.json and edit credentials.
+      # See keycloak/realm-export.json.example for the template.
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
+    ports:
+      - "${KEYCLOAK_PORT:-8180}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
 
   mcp:
     build:

@@ -157,7 +157,7 @@ The agent should note this in `workspace.md` and either try an alternative appro
 
 | Document | Location | Relevance |
 |----------|----------|-----------|
-| Concept design | `docs/sudo_approval_plugin.md` | Original architecture proposal, component descriptions, security analysis |
+| Concept design | `docs/done/sudo_approval_plugin.md` | Original architecture proposal, component descriptions, security analysis |
 | Research: Technical blueprint | `docs/researches/sudo_plugin/Human-in-the-Loop Sudo Approval Gate for Autonomous LLM Agents.pdf` | Sudo plugin API deep dive, C skeleton code, Go daemon architecture, NATS request/reply patterns, build order, Ubuntu 24.04 specifics |
 | Research: Academic analysis | `docs/researches/sudo_plugin/LLM Agent Sudo Approval Research.pdf` | Formal analysis of plugin lifecycle, return codes, cross-component timeout coordination, attack surface modeling, Angular signals integration |
 | Container security checklist | `docs/security_checklist.md` | Broader container hardening context; sudo gate addresses the privilege escalation gap |
@@ -538,7 +538,9 @@ sudo systemctl enable sudo-gated.socket
 - [x] `SO_PEERCRED` verification: daemon checks connecting PID is `/usr/bin/sudo`
 - [ ] NATS auth: NKey or JWT credentials scoped to `sudo.request.{vm_id}.>` subjects only (future)
 - [x] Commands with `|`, `>`, `;`, `&&`, `||` never auto-approved
-- [x] Cloud-init warmup call absorbs daemon first-call crash before agent SSH access
+- [x] Systemd watchdog pings implemented (daemon no longer crash-loops)
+- [x] C plugin handles POLLIN|POLLHUP correctly (reads data before checking hangup)
+- [x] Cloud-init warmup call retained as defense-in-depth
 
 **Test criteria (end-to-end on real cluster)**:
 - Build VM image with Packer → image includes plugin + daemon
@@ -641,7 +643,7 @@ docs/HomeLab/deployments/srw/harvester/
 | Cross-component timeout race | Medium — approval recorded after plugin timeout | Cascading timeout hierarchy (295s < 300s < 305s) prevents this. Test extensively with deliberate delays. |
 | `run_command` default timeout too short | Medium — agent's 120s default times out before 305s approval window | Agent instructions must note `timeout=600` for sudo commands. Consider auto-adjusting timeout in `run_command` when command starts with `sudo`. |
 | Daemon `nats_reply_subject` stale after restart | Low — pending approval lost if daemon restarts | Daemon restarts close all socket connections; plugin receives error and denies. The orchestrator-side row remains `pending` and will be cleaned up by the expiration sweeper. No data inconsistency. |
-| Daemon first-call crash on socket activation | Medium — first sudo call fails | SO_PEERCRED race during socket activation startup. Cloud-init runs a warmup `sudo true` call to trigger the crash/restart before the agent SSHs in. All subsequent calls work. |
+| ~~Daemon first-call crash on socket activation~~ | ~~Medium~~ **Fixed** | Was caused by missing systemd watchdog pings + C plugin POLLIN\|POLLHUP race (see Deployment Notes). Both fixed in daemon and plugin code. |
 
 ## Deployment Notes (2026-03-16)
 
@@ -663,9 +665,23 @@ When the daemon crashes and restarts (not via socket activation), it tries to re
 
 Publishing to a stored `_INBOX` reply subject via `nc.publish()` from a different asyncio context does not reliably deliver across NATS leaf node boundaries. The orchestrator now stores the original NATS `msg` object for pending requests and uses `msg.respond()` when the human decides, which correctly routes through the leaf connection. Auto-approval uses `msg.respond()` directly within the subscription callback.
 
-### Cloud-init warmup for socket activation race
+### Systemd watchdog kills daemon every 30 seconds (fixed 2026-03-17)
 
-The daemon crashes on its very first connection after boot due to a race condition in socket activation + NATS initialization. Cloud-init runs a warmup `sudo -u agent-host sudo true` call to trigger the crash/restart cycle before the agent's SSH access begins. After the restart, the daemon is fully initialized and all subsequent calls work reliably.
+**Root cause (not SO_PEERCRED as originally suspected):** The systemd service unit declared `WatchdogSec=30`, requiring the daemon to send `WATCHDOG=1` pings every 30 seconds. The daemon sent `READY=1` at startup but never sent watchdog pings. systemd killed it with SIGABRT every 30 seconds — a permanent crash loop (111+ restarts observed on a test VM). Diagnosed by reading `journalctl -u sudo-gated.service` after adding `agent-host` to the `systemd-journal` group.
+
+**Fix:** Added `watchdogLoop()` goroutine in `main.go` that reads `WATCHDOG_USEC` from the environment (set by systemd) and sends `WATCHDOG=1` pings at half the configured interval (15s for WatchdogSec=30). The loop exits cleanly on context cancellation.
+
+### C plugin POLLIN|POLLHUP race on Unix socket (fixed 2026-03-17)
+
+On fast Unix domain sockets, the daemon's `writeResponse()` + `defer conn.Close()` can coalesce into a single kernel event, causing the client's `poll()` to return `POLLIN|POLLHUP` (0x11) simultaneously. The C plugin's `read_exact()` treated any `POLLHUP` as a fatal error — even when data was available to read.
+
+**Fix (C plugin):** Changed `read_exact()` to only treat `POLLHUP` as fatal when `POLLIN` is not set. When both are set, read the data first.
+
+**Fix (Go daemon):** Added a 10ms `time.Sleep` after `writeResponse()` and before the deferred `conn.Close()`, ensuring the client's `poll()` sees `POLLIN` before `POLLHUP`. Belt-and-suspenders with the C plugin fix.
+
+### Cloud-init warmup call (defense-in-depth)
+
+Cloud-init still runs `sudo -u agent-host sudo true` as a warmup call before the agent SSHs in. This is now defense-in-depth rather than a required workaround — the watchdog and POLLIN|POLLHUP bugs are fixed in the daemon and plugin code.
 
 ### Plugin registration must be last in provision.sh
 

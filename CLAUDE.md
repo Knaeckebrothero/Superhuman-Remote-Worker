@@ -405,7 +405,7 @@ Human-in-the-loop privilege escalation for agents in VMs. When an agent runs `su
 
 **CI/CD:** The `build-sudo-gate` job compiles both the Go daemon and C plugin, uploads as artifacts. The `build-agent-vm-base` job downloads them and bakes them into the VM image via Packer. Cloud-init configures NATS URL, job ID, and switches `fail_mode=open` → `fail_mode=deny` at boot.
 
-All sudo gate features are fully optional — the system works without them (agents get unrestricted sudo, the pre-gate default). See `docs/features/sudo_approval_gate.md` for the full design, implementation details, and deployment notes.
+All sudo gate features are fully optional — the system works without them (agents get unrestricted sudo, the pre-gate default). See `docs/done/sudo_approval_gate.md` for the full design, implementation details, and deployment notes.
 
 See `docs/features/vm_backend.md` for the full workspace backend design and `docs/features/nats.md` for the messaging layer architecture.
 

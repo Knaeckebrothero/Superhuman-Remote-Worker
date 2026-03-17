@@ -14,6 +14,9 @@ docker/vpn/config
 docker/vpn/cluster.conf
 docker/vpn/research.conf
 
+# Keycloak realm config (contains credentials; .example is tracked)
+keycloak/realm-export.json
+
 # MCP configuration files
 .mcp.json
 .playwright-mcp/*

@@ -125,7 +125,7 @@ Each application registers as an OIDC client in the `srw` Keycloak realm:
 
 **New environment variables:**
 ```bash
-KEYCLOAK_URL=http://keycloak:8080
+KEYCLOAK_URL=http://localhost:8180
 KEYCLOAK_REALM=srw
 KEYCLOAK_CLIENT_ID=orchestrator-api
 # Optional: for admin API calls
@@ -212,17 +212,23 @@ keycloak:
     KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
     KC_DB_USERNAME: keycloak
     KC_DB_PASSWORD: keycloak
-    KC_HOSTNAME_STRICT: "false"
+    KC_HOSTNAME: "http://localhost:${KEYCLOAK_PORT:-8180}"
+    KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
     KC_HTTP_ENABLED: "true"
     KEYCLOAK_ADMIN: admin
     KEYCLOAK_ADMIN_PASSWORD: admin
   volumes:
     - ./keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro
   ports:
-    - "8080:8080"
+    - "${KEYCLOAK_PORT:-8180}:8080"
   depends_on:
-    - postgres
+    postgres:
+      condition: service_healthy
 ```
+
+**Port note:** Default host port is `8180` (not `8080`) to avoid conflict with the VPN cluster service. Override via `KEYCLOAK_PORT` in `.env`.
+
+**Hostname resolution:** `KC_HOSTNAME` sets browser-facing URLs to `localhost:8180` so OIDC redirects work from the user's browser. `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` allows container-to-container traffic (e.g., Gitea token exchange at `keycloak:8080`) to work without hostname conflicts. Services that need split URLs (browser vs. server-to-server) use custom endpoint overrides — see `keycloak/setup-gitea-oidc.sh`.
 
 A `keycloak/realm-export.json` file contains the full `srw` realm definition (clients, roles, scopes, default users) for reproducible one-command setup. This file is committed to the repository and updated via Keycloak admin UI export when the realm configuration changes.
 
@@ -294,7 +300,7 @@ The cockpit keeps its existing user management page (list, create, edit, delete)
 | Reset password | `POST /api/auth/reset-password` | `PUT /api/users/{id}/reset-password` → orchestrator calls Keycloak Admin API (`PUT /admin/realms/srw/users/{kc_id}/reset-password-email`) |
 | Assign role | *(not implemented)* | `POST /api/users/{id}/roles` → orchestrator calls Keycloak Admin API to assign realm roles |
 
-The cockpit UI stays the same from the user's perspective. Admins don't need to leave the cockpit or learn the Keycloak admin console (though it remains available at `:8080/admin` for advanced configuration like MFA policies, social login setup, LDAP federation, etc.).
+The cockpit UI stays the same from the user's perspective. Admins don't need to leave the cockpit or learn the Keycloak admin console (though it remains available at `:8180/admin` for advanced configuration like MFA policies, social login setup, LDAP federation, etc.).
 
 **Orchestrator requirements for admin API access:**
 ```bash
@@ -454,18 +460,13 @@ Nextcloud organizes files per user. For project-scoped collaboration, we use **G
 Nextcloud/
 ├── Group Folders/
 │   ├── Project: <project-name>/        # One group folder per project
-│   │   ├── Shared/                     # User-uploaded shared files
-│   │   │   ├── reference-data/
-│   │   │   ├── templates/
-│   │   │   └── datasets/
-│   │   ├── Jobs/                       # Agent job outputs (auto-synced)
-│   │   │   ├── <job-uuid>/
-│   │   │   │   ├── output/
-│   │   │   │   ├── workspace.md
-│   │   │   │   └── plan.md
-│   │   │   └── <job-uuid>/
-│   │   └── Knowledge/                  # Knowledge base exports
+│   │   ├── reference-data/             # User-uploaded shared files
+│   │   ├── templates/
+│   │   ├── datasets/
+│   │   └── ...                         # User-organized folders
 ```
+
+Agent deliverables stay in the job's `output/` folder (viewed via Gitea/cockpit). Nextcloud is for **user → agent** file sharing, not the other way around. Write-back can be added later if needed.
 
 Group folder membership is managed via Keycloak groups → Nextcloud groups (synced on OIDC login). Users see only the project folders they're members of.
 
@@ -486,7 +487,7 @@ The cloud storage integration follows the **existing datasource pattern** — sa
 | **Type** | `webdav` |
 | **Connection URL** | `http://nextcloud:80/remote.php/dav/files/USERNAME/` (or group folder path) |
 | **Credentials** | `{ "username": "agent-service", "password": "app-password" }` |
-| **Read-only** | Configurable per datasource (controls whether agent can write back) |
+| **Read-only** | `true` (default — agent reads user-provided files, deliverables stay in job output folder) |
 
 Stored in the existing `datasources` table. No schema changes needed — `type` is a free-text field, `credentials` is JSONB.
 
@@ -507,15 +508,15 @@ DS_TOOL_MAP = {
 
 #### Agent Tools (`src/tools/cloud/`)
 
-New tool category `cloud` with WebDAV-backed implementations:
+New tool category `cloud` with WebDAV-backed implementations. Initial scope is **read-only** — agents pull user-provided reference files into the workspace. Deliverables remain in the job's `output/` folder (accessed via Gitea or cockpit).
 
-| Tool | Purpose | Read-only? |
-|------|---------|-----------|
-| `cloud_list(path, recursive)` | List files/folders at path | Yes |
-| `cloud_read(path, target)` | Download file from cloud storage to workspace | Yes |
-| `cloud_info(path)` | Get file metadata (size, modified, content type) | Yes |
-| `cloud_write(workspace_path, target_path)` | Upload workspace file to cloud storage | No |
-| `cloud_delete(path)` | Delete file from cloud storage | No |
+| Tool | Purpose | Phase |
+|------|---------|-------|
+| `cloud_list(path, recursive)` | List files/folders at path | **Initial** |
+| `cloud_read(path, target)` | Download file from cloud storage to workspace | **Initial** |
+| `cloud_info(path)` | Get file metadata (size, modified, content type) | **Initial** |
+| `cloud_write(workspace_path, target_path)` | Upload workspace file to cloud storage | Future (when user-directed upload is needed) |
+| `cloud_delete(path)` | Delete file from cloud storage | Future |
 
 Implementation uses `webdavclient3` (Python WebDAV client library, added to `requirements.txt`).
 
@@ -585,7 +586,7 @@ DEFAULT_DS_WEBDAV_URL=http://nextcloud:80/remote.php/dav/files/agent-service/
 DEFAULT_DS_WEBDAV_USERNAME=agent-service
 DEFAULT_DS_WEBDAV_PASSWORD=<app-password>
 DEFAULT_DS_WEBDAV_NAME=Default Cloud Storage
-DEFAULT_DS_WEBDAV_READ_ONLY=false
+DEFAULT_DS_WEBDAV_READ_ONLY=true
 ```
 
 Seeded as a global datasource by `init.py`, same pattern as `DEFAULT_DS_NEO4J_*`.
@@ -594,10 +595,17 @@ Seeded as a global datasource by `init.py`, same pattern as `DEFAULT_DS_NEO4J_*`
 
 A dedicated Nextcloud user (`agent-service`) is created during initialization with an **app password** (not the user's main password). This service account:
 
-- Has access to project group folders
 - Is used by agents for WebDAV file operations
 - App password is stored in the datasource `credentials` JSONB field
-- Can be scoped per project (different service accounts per project datasource)
+
+**Scoping concern:** Using a single admin-level service account would give every agent access to every project's files. To enforce project isolation, there are two options:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Per-project service account** — create a Nextcloud user per project, add to that project's group | Clean isolation, agent only sees its project's files | Operationally heavier, more accounts to manage |
+| **Scoped WebDAV URL** — single service account, but the datasource `connection_url` points to the specific group folder path | Simple, one account | Agent could theoretically navigate outside the path (server-dependent) |
+
+For **dev/testing**, a single `agent-service` user with a scoped URL path is fine. For **production**, per-project service accounts (created automatically when a project is created in the cockpit) provide proper isolation.
 
 ### Cockpit Integration
 
@@ -660,26 +668,30 @@ All connectors implement the same abstract tool interface (`cloud_list`, `cloud_
 15. Implement `src/tools/cloud/webdav.py` (`create_cloud_tools`) + register in `src/tools/registry.py`
 16. Add WebDAV connection factory branch to `src/agent.py` `_create_datasource_connection()`
 17. Add `DEFAULT_DS_WEBDAV_*` env var handling to `init.py` / `orchestrator/init.py`
-18. Wire job lifecycle: auto-sync outputs to project folder on completion
 
 ### Phase 4: Cockpit Integration
-19. Add "View Files" deep-links from job cards to Nextcloud (SSO makes this seamless)
-20. Add "Project Files" tab linking to Nextcloud group folder for the project
-21. Add `webdav` as a datasource type option in the cockpit datasource management UI
+18. Add "View Files" deep-links from job cards to Nextcloud (SSO makes this seamless)
+19. Add "Project Files" tab linking to Nextcloud group folder for the project
+20. Add `webdav` as a datasource type option in the cockpit datasource management UI
 
 ### Phase 5: Hardening
-22. Keycloak group → Nextcloud group sync for per-project access control
-23. Audit logging for file access
-24. Quota management per project group folder
-25. Additional cloud storage datasource types (S3, Google Drive, OneDrive) as needed
+21. Keycloak group → Nextcloud group sync for per-project access control
+22. Per-project service accounts for production isolation (auto-created with projects)
+23. `cloud_write` / `cloud_delete` tools (user-directed upload from agent to cloud storage)
+24. Production domain configuration (`KC_HOSTNAME`, cookie domain, HTTPS termination)
+25. Audit logging for file access
+26. Quota management per project group folder
+27. Additional cloud storage datasource types (S3, Google Drive, OneDrive) as needed
 
 ## Service Ports (Updated)
 
 | Service | Port | Notes |
 |---------|------|-------|
-| Keycloak | 8080 | Common default — remap if conflicts with local dev servers |
+| Keycloak | 8180 | Avoids conflict with VPN cluster on 8080; override via `KEYCLOAK_PORT` |
 | Nextcloud | 8800 | |
 | *(all existing ports unchanged)* | | |
+
+**Production note:** In dev, SSO works because all OIDC redirects route through Keycloak on `localhost:8080`. In production with separate subdomains (`cockpit.example.com`, `git.example.com`, etc.), `KC_HOSTNAME` and cookie domain settings need explicit configuration. Deferred to Phase 5.
 
 ## Related
 

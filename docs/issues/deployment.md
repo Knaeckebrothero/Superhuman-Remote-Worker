@@ -103,4 +103,4 @@ Tested the full sudo approval flow on a live VM (`config_override.workspace.back
 
 **Flow verified**: C plugin → Unix socket → Go daemon → NATS leaf → NATS hub → orchestrator → PostgreSQL → REST/SSE → cockpit. Reply path: orchestrator `msg.respond()` → NATS → daemon → socket → plugin.
 
-**Known issue**: Daemon crashes on first connection after boot (SO_PEERCRED race in socket activation). Mitigated by cloud-init warmup `sudo true` call. After restart, all subsequent calls work. See `docs/features/sudo_approval_gate.md` Deployment Notes for full details.
+**Resolved (2026-03-17)**: Daemon crash loop was caused by missing systemd watchdog pings (`WatchdogSec=30` with no `WATCHDOG=1` pings — not SO_PEERCRED as originally suspected) and a C plugin bug treating `POLLIN|POLLHUP` as error on fast Unix sockets. Both fixed in daemon and plugin code. See `docs/done/sudo_approval_gate.md` Deployment Notes for full details.

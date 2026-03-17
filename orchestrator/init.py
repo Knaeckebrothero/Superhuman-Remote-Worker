@@ -101,6 +101,72 @@ def _parse_connection_string(connection_string: str) -> dict:
     }
 
 
+async def ensure_sso_databases() -> bool:
+    """Create Keycloak and Nextcloud databases on the shared PostgreSQL instance.
+
+    For fresh deployments, the compose init script (init_sso_dbs.sh) handles this.
+    This function covers existing deployments where the postgres volume already exists.
+
+    Connects to the maintenance 'postgres' database to create the SSO databases
+    and roles. Idempotent — safe to run repeatedly.
+    """
+    import psycopg
+    from psycopg import sql
+
+    connection_string = get_postgres_connection_string()
+    parsed = _parse_connection_string(connection_string)
+
+    # Connect to the 'postgres' maintenance database (not the app database)
+    maint_url = f"postgresql://{parsed['user']}:{parsed['password']}@{parsed['host']}:{parsed['port']}/postgres"
+
+    sso_databases = [
+        {"name": "keycloak", "user": "keycloak", "password": "keycloak"},
+        {"name": "nextcloud", "user": "nextcloud", "password": "nextcloud"},
+    ]
+
+    try:
+        conn = await psycopg.AsyncConnection.connect(maint_url, autocommit=True)
+        try:
+            for db in sso_databases:
+                # Create role if not exists
+                result = await conn.execute(
+                    "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s",
+                    (db["user"],),
+                )
+                if not await result.fetchone():
+                    # DDL statements can't use parameterized values — use psycopg.sql
+                    await conn.execute(
+                        sql.SQL("CREATE ROLE {} WITH LOGIN PASSWORD {}").format(
+                            sql.Identifier(db["user"]),
+                            sql.Literal(db["password"]),
+                        )
+                    )
+                    logger.info(f"    Created role: {db['user']}")
+
+                # Create database if not exists
+                result = await conn.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = %s",
+                    (db["name"],),
+                )
+                if not await result.fetchone():
+                    await conn.execute(
+                        sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                            sql.Identifier(db["name"]),
+                            sql.Identifier(db["user"]),
+                        )
+                    )
+                    logger.info(f"    Created database: {db['name']}")
+                else:
+                    logger.info(f"    Database exists: {db['name']}")
+        finally:
+            await conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"    Could not create SSO databases: {e}")
+        logger.warning("    (This is expected if Keycloak/Nextcloud are not being used)")
+        return False
+
+
 async def init_postgres(force_reset: bool = False) -> bool:
     """Initialize PostgreSQL database.
 
