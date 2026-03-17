@@ -824,6 +824,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self.config = load_agent_config_from_dict(merged_config_data)
             logger.info("Applied inline config overrides")
 
+        # Apply env_keys overrides (user/project API keys for non-LLM providers)
+        env_keys = (metadata.get("config_override") or {}).get("env_keys")
+        if env_keys:
+            import os as _os
+            for k, v in env_keys.items():
+                _os.environ[k] = v
+            logger.info(f"Applied {len(env_keys)} env key override(s)")
+
         # Recreate LLMs if config was modified for this job (skip if already loaded from DB)
         if not _config_from_db and (metadata.get("config_name") or metadata.get("config_upload_id") or metadata.get("config_override")):
             logger.info("Config changed for this job — recreating LLMs")

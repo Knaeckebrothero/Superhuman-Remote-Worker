@@ -421,6 +421,24 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
 
+        # Resolve user/project API keys (user > project > env var fallback)
+        resolved_keys = await postgres_db.resolve_api_keys_for_job(
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
+            project_id=str(job["project_id"]) if job.get("project_id") else None,
+        )
+        if resolved_keys:
+            config_override = config_override or {}
+            # Detect main LLM provider and inject key
+            llm_provider = _detect_llm_provider_for_dispatch(job, config_override)
+            if llm_provider and llm_provider in resolved_keys:
+                config_override.setdefault("llm", {})["api_key"] = resolved_keys[llm_provider]
+            # Inject non-LLM tool keys as env_keys
+            _ENV_KEY_MAP = {"tavily": "TAVILY_API_KEY", "vision": "VISION_API_KEY"}
+            env_keys = {_ENV_KEY_MAP[p]: resolved_keys[p] for p in ("tavily", "vision") if p in resolved_keys}
+            if env_keys:
+                config_override.setdefault("env_keys", {}).update(env_keys)
+            logger.info(f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}")
+
         # Build job start request
         job_start = JobStartRequest(
             job_id=job_id,
@@ -633,6 +651,36 @@ def _get_vm_context(job: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             ctx = {}
     return ctx.get("vm", {})
+
+
+def _detect_llm_provider_for_dispatch(job: dict, config_override: dict | None) -> str | None:
+    """Detect the LLM provider for a job from its config override or config name.
+
+    Uses the same prefix-matching logic as src/core/loader.py:_detect_provider().
+    """
+    # Check config_override for explicit provider or model
+    if config_override:
+        llm = config_override.get("llm", {})
+        if llm.get("provider"):
+            return llm["provider"].lower()
+        model = llm.get("model")
+        if model:
+            model_lower = model.lower()
+            if model_lower.startswith("openrouter/"):
+                return "openrouter"
+            if model_lower.startswith("groq/"):
+                return "groq"
+            if model_lower.startswith("claude"):
+                return "anthropic"
+            if model_lower.startswith("gemini"):
+                return "google"
+            return "openai"
+
+    # Fall back to config_name heuristic (most configs use openai-compatible default)
+    config_name = job.get("config_name", "default")
+    if config_name and "anthropic" in config_name.lower():
+        return "anthropic"
+    return "openai"
 
 
 async def _try_dispatch_pending_jobs() -> None:
@@ -958,6 +1006,24 @@ class McpTokenVerifyRequest(BaseModel):
     """Internal request from MCP server to verify a token hash."""
 
     token_hash: str
+
+
+VALID_API_KEY_PROVIDERS = {"openai", "anthropic", "google", "groq", "openrouter", "tavily", "vision"}
+
+
+class ApiKeySet(BaseModel):
+    """Request body for setting an API key for a provider."""
+
+    api_key: str = Field(..., min_length=1, description="The API key value")
+    label: str | None = Field(None, description="Optional label (e.g. 'team key', 'personal')")
+
+
+class UserSettingsUpdate(BaseModel):
+    """Request body for updating user preferences. Null values remove the key."""
+
+    default_model: str | None = None
+    default_autonomy: str | None = None
+    default_reasoning_level: str | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -5518,6 +5584,130 @@ async def internal_mcp_token_verify(request: Request, body: McpTokenVerifyReques
         "scope": token_data["scope"],
         "display_name": token_data["display_name"],
     }
+
+
+# =============================================================================
+# User Settings & API Key Endpoints
+# =============================================================================
+
+
+@app.get("/api/settings/api-keys")
+async def list_user_api_keys(request: Request) -> list[dict[str, Any]]:
+    """List the current user's API keys (prefix only, no full keys)."""
+    user = await get_current_user(request, postgres_db)
+    rows = await postgres_db.list_user_api_keys(str(user["id"]))
+    return [
+        {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in r.items()}
+        for r in rows
+    ]
+
+
+@app.put("/api/settings/api-keys/{provider}")
+async def set_user_api_key(request: Request, provider: str, body: ApiKeySet) -> dict[str, Any]:
+    """Set (create or replace) an API key for a provider."""
+    user = await get_current_user(request, postgres_db)
+    if provider not in VALID_API_KEY_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}")
+
+    key_prefix = body.api_key[:8]
+    row = await postgres_db.upsert_user_api_key(
+        user_id=str(user["id"]),
+        provider=provider,
+        api_key=body.api_key,
+        key_prefix=key_prefix,
+        label=body.label,
+    )
+    return {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+
+
+@app.delete("/api/settings/api-keys/{provider}")
+async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]:
+    """Delete the current user's API key for a provider."""
+    user = await get_current_user(request, postgres_db)
+    deleted = await postgres_db.delete_user_api_key(str(user["id"]), provider)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No API key for provider '{provider}'")
+    return {"status": "deleted"}
+
+
+@app.get("/api/settings/preferences")
+async def get_user_preferences(request: Request) -> dict[str, Any]:
+    """Get the current user's preference settings."""
+    user = await get_current_user(request, postgres_db)
+    return await postgres_db.get_user_settings(str(user["id"]))
+
+
+@app.patch("/api/settings/preferences")
+async def update_user_preferences(request: Request, body: UserSettingsUpdate) -> dict[str, str]:
+    """Update the current user's preference settings (patch-merge)."""
+    user = await get_current_user(request, postgres_db)
+    settings = {k: v for k, v in body.model_dump().items() if v is not None or k in body.model_fields_set}
+    if not settings:
+        raise HTTPException(status_code=400, detail="No settings provided")
+    await postgres_db.update_user_settings(str(user["id"]), settings)
+    return {"status": "updated"}
+
+
+# =============================================================================
+# Project API Key Endpoints
+# =============================================================================
+
+
+@app.get("/api/projects/{project_id}/api-keys")
+async def list_project_api_keys(request: Request, project_id: str) -> list[dict[str, Any]]:
+    """List a project's API keys (prefix only). Requires project membership."""
+    user = await get_current_user(request, postgres_db)
+    members = await postgres_db.get_project_members(project_id)
+    if not any(str(m["user_id"]) == str(user["id"]) for m in members):
+        raise HTTPException(status_code=403, detail="Not a member of this project")
+
+    rows = await postgres_db.list_project_api_keys(project_id)
+    return [
+        {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in r.items()}
+        for r in rows
+    ]
+
+
+@app.put("/api/projects/{project_id}/api-keys/{provider}")
+async def set_project_api_key(
+    request: Request, project_id: str, provider: str, body: ApiKeySet
+) -> dict[str, Any]:
+    """Set (create or replace) a project API key. Requires owner or editor role."""
+    user = await get_current_user(request, postgres_db)
+    if provider not in VALID_API_KEY_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}")
+
+    members = await postgres_db.get_project_members(project_id)
+    member = next((m for m in members if str(m["user_id"]) == str(user["id"])), None)
+    if not member or member["role"] not in ("owner", "editor"):
+        raise HTTPException(status_code=403, detail="Requires owner or editor role")
+
+    key_prefix = body.api_key[:8]
+    row = await postgres_db.upsert_project_api_key(
+        project_id=project_id,
+        provider=provider,
+        api_key=body.api_key,
+        key_prefix=key_prefix,
+        label=body.label,
+    )
+    return {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+
+
+@app.delete("/api/projects/{project_id}/api-keys/{provider}")
+async def delete_project_api_key(
+    request: Request, project_id: str, provider: str
+) -> dict[str, str]:
+    """Delete a project's API key for a provider. Requires owner or editor role."""
+    user = await get_current_user(request, postgres_db)
+    members = await postgres_db.get_project_members(project_id)
+    member = next((m for m in members if str(m["user_id"]) == str(user["id"])), None)
+    if not member or member["role"] not in ("owner", "editor"):
+        raise HTTPException(status_code=403, detail="Requires owner or editor role")
+
+    deleted = await postgres_db.delete_project_api_key(project_id, provider)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"No API key for provider '{provider}'")
+    return {"status": "deleted"}
 
 
 # =============================================================================

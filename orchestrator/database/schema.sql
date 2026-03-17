@@ -90,6 +90,12 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 CREATE INDEX IF NOT EXISTS idx_users_keycloak_sub ON users(keycloak_sub);
 
+-- Migration: Add settings JSONB for user preferences (model, autonomy, etc.)
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN settings JSONB DEFAULT '{}';
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- ============================================================================
 -- 0e. AUTH TOKENS TABLE
 -- Verification codes and password reset tokens for production auth mode.
@@ -133,6 +139,53 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_user ON mcp_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_tokens_hash ON mcp_tokens(token_hash);
+
+-- ============================================================================
+-- 0h. USER API KEYS TABLE
+-- Per-user API keys for LLM and tool providers.
+-- Resolution chain at dispatch: user key > project key > env var.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS user_api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL,
+    api_key TEXT NOT NULL,
+    key_prefix VARCHAR(12) NOT NULL,
+    label TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_user_api_key_provider CHECK (provider IN (
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+    ))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_api_keys_provider ON user_api_keys(user_id, provider);
+CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id);
+
+-- ============================================================================
+-- 0i. PROJECT API KEYS TABLE
+-- Per-project API keys (fallback when user has no key for a provider).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS project_api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL,
+    api_key TEXT NOT NULL,
+    key_prefix VARCHAR(12) NOT NULL,
+    label TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_project_api_key_provider CHECK (provider IN (
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+    ))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_project_api_keys_provider ON project_api_keys(project_id, provider);
+CREATE INDEX IF NOT EXISTS idx_project_api_keys_project ON project_api_keys(project_id);
 
 -- ============================================================================
 -- 0c. PROJECTS TABLE
@@ -636,6 +689,16 @@ CREATE TRIGGER update_projects_updated_at
 DROP TRIGGER IF EXISTS update_project_repositories_updated_at ON project_repositories;
 CREATE TRIGGER update_project_repositories_updated_at
     BEFORE UPDATE ON project_repositories
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_user_api_keys_updated_at ON user_api_keys;
+CREATE TRIGGER update_user_api_keys_updated_at
+    BEFORE UPDATE ON user_api_keys
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_project_api_keys_updated_at ON project_api_keys;
+CREATE TRIGGER update_project_api_keys_updated_at
+    BEFORE UPDATE ON project_api_keys
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- ============================================================================
