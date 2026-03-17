@@ -1,8 +1,9 @@
 """WebDAV tools.
 
-Provides read-only file access to WebDAV (Nextcloud, ownCloud, or any
-WebDAV server) attached as a datasource. Agents use these to pull user-provided
-reference files into the workspace.
+Provides file access to WebDAV (Nextcloud, ownCloud, or any WebDAV server)
+attached as a datasource. Read tools (list, read, info) are always available.
+Write tools (write, delete) are only injected when the datasource is not
+marked read-only.
 
 Connection is established by the agent's _create_datasource_connection() and
 injected via ToolContext.get_datasource("webdav").
@@ -37,6 +38,18 @@ CLOUD_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cloud_info",
         "category": "cloud",
         "phases": ["strategic", "tactical"],
+    },
+    "cloud_write": {
+        "module": "cloud.webdav",
+        "function": "cloud_write",
+        "category": "cloud",
+        "phases": ["tactical"],
+    },
+    "cloud_delete": {
+        "module": "cloud.webdav",
+        "function": "cloud_delete",
+        "category": "cloud",
+        "phases": ["tactical"],
     },
 }
 
@@ -122,8 +135,9 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
             if not filename:
                 return "Error: could not determine filename from path"
 
-            local_path = os.path.join(workspace.documents_dir, filename)
-            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            documents_dir = str(workspace.get_path("documents"))
+            os.makedirs(documents_dir, exist_ok=True)
+            local_path = os.path.join(documents_dir, filename)
 
             client.download_sync(remote_path=path, local_path=local_path)
 
@@ -160,7 +174,53 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
         except Exception as e:
             return f"Error getting info for {path}: {e}"
 
-    return [cloud_list, cloud_read, cloud_info]
+    @tool
+    def cloud_write(source: str, remote_path: str) -> str:
+        """Upload a file from the workspace to WebDAV.
+
+        Args:
+            source: Relative path within workspace (e.g. "output/report.pdf")
+            remote_path: Target path in WebDAV (e.g. "/project-files/report.pdf")
+
+        Returns:
+            Confirmation with file size, or error message
+        """
+        try:
+            local_path = str(workspace.get_path(source))
+            if not os.path.isfile(local_path):
+                return f"Error: file not found in workspace: {source}"
+
+            # Create parent directories on WebDAV if needed
+            parent = "/".join(remote_path.rstrip("/").split("/")[:-1])
+            if parent and parent != "/":
+                try:
+                    client.mkdir(parent)
+                except Exception:
+                    pass  # Directory may already exist
+
+            client.upload_sync(remote_path=remote_path, local_path=local_path)
+            size = os.path.getsize(local_path)
+            return f"Uploaded {source} → {remote_path} ({_human_size(size)})"
+        except Exception as e:
+            return f"Error uploading {source} to {remote_path}: {e}"
+
+    @tool
+    def cloud_delete(path: str) -> str:
+        """Delete a file or folder from WebDAV.
+
+        Args:
+            path: Path in WebDAV to delete (e.g. "/project-files/old-report.pdf")
+
+        Returns:
+            Confirmation message, or error message
+        """
+        try:
+            client.clean(path)
+            return f"Deleted {path} from WebDAV"
+        except Exception as e:
+            return f"Error deleting {path}: {e}"
+
+    return [cloud_list, cloud_read, cloud_info, cloud_write, cloud_delete]
 
 
 def _human_size(size_bytes: int) -> str:
