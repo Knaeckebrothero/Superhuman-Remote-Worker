@@ -53,16 +53,7 @@ from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
-from security.auth import (  # noqa: E402
-    create_session,
-    validate_session,
-    delete_session,
-    get_current_user,
-    cleanup_expired_sessions,
-)
-from security.csrf import validate_csrf_token  # noqa: E402
-from security.password import hash_password, verify_password, validate_password_strength  # noqa: E402
-from services.email import email_service  # noqa: E402
+from security.auth import get_current_user, cleanup_expired_tokens  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.builder_tools import (  # noqa: E402
@@ -953,42 +944,6 @@ class UserUpdate(BaseModel):
     email: str | None = None
 
 
-class LoginRequest(BaseModel):
-    """Request body for login. Password is optional (not required in dev mode)."""
-
-    email: str = Field(..., description="Email address")
-    password: str | None = Field(None, description="Password (required in production mode)")
-
-
-class RegisterRequest(BaseModel):
-    """Request body for user registration (production mode)."""
-
-    email: str = Field(..., description="Email address")
-    password: str = Field(..., description="Password (min 8 chars)")
-    display_name: str = Field(..., description="Display name")
-
-
-class VerifyEmailRequest(BaseModel):
-    """Request body for email verification."""
-
-    email: str = Field(..., description="Email address")
-    code: str = Field(..., description="6-digit verification code")
-
-
-class PasswordResetRequest(BaseModel):
-    """Request body for requesting password reset."""
-
-    email: str = Field(..., description="Email address")
-
-
-class PasswordResetConfirm(BaseModel):
-    """Request body for confirming password reset."""
-
-    email: str = Field(..., description="Email address")
-    code: str = Field(..., description="6-digit reset code")
-    new_password: str = Field(..., description="New password (min 8 chars)")
-
-
 class McpTokenCreate(BaseModel):
     """Request body for creating an MCP API token."""
 
@@ -1160,7 +1115,7 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
-    session_cleanup_task = asyncio.create_task(cleanup_expired_sessions(postgres_db, _shutdown_event))
+    token_cleanup_task = asyncio.create_task(cleanup_expired_tokens(postgres_db, _shutdown_event))
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
 
@@ -1169,7 +1124,7 @@ async def lifespan(app: FastAPI):
     # Signal shutdown to background tasks
     _shutdown_event.set()
     await stale_detector_task
-    await session_cleanup_task
+    await token_cleanup_task
     await dispatcher_task
     await sudo_sweeper_task
 
@@ -1206,15 +1161,6 @@ app.add_middleware(
 )
 
 # CSRF middleware — validates X-CSRF-Token header on mutating requests
-@app.middleware("http")
-async def csrf_middleware(request: Request, call_next):
-    """Validate CSRF token on mutating requests (double-submit cookie pattern)."""
-    is_valid = await validate_csrf_token(request)
-    if not is_valid:
-        return JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
-    return await call_next(request)
-
-
 # Include routers
 app.include_router(graph_router)
 app.include_router(uploads_router)
@@ -3884,6 +3830,11 @@ def _build_datasource_tool_override(
             "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
             "write": ["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"],
         },
+        "webdav": {
+            "category": "cloud",
+            "read": ["cloud_list", "cloud_read", "cloud_info"],
+            "write": ["cloud_list", "cloud_read", "cloud_info"],
+        },
     }
 
     attached_types = {ds["type"] for ds in datasources}
@@ -5432,28 +5383,6 @@ async def get_project_expert(
 # =============================================================================
 
 
-def _cookie_params(request: Request) -> tuple[bool, str]:
-    """Compute Secure and SameSite cookie flags from the request."""
-    _secure = request.url.scheme == "https" or "localhost" not in str(request.url)
-    _samesite: str = "none" if _secure else "lax"
-    return _secure, _samesite
-
-
-def _set_session_cookies(
-    response: Response, session_key: str, csrf_token: str,
-    secure: bool, samesite: str, max_age: int,
-) -> None:
-    """Set the httpOnly session cookie and the JS-readable CSRF cookie."""
-    response.set_cookie(
-        key="session", value=session_key, max_age=max_age,
-        httponly=True, secure=secure, samesite=samesite, path="/",
-    )
-    response.set_cookie(
-        key="csrf_token", value=csrf_token, max_age=max_age,
-        httponly=False, secure=secure, samesite=samesite, path="/",
-    )
-
-
 def _user_dict(user: dict) -> dict:
     """Build the public user dict for API responses."""
     return {
@@ -5485,230 +5414,11 @@ async def _create_gitea_repo_for_project(user: dict, project: dict) -> None:
         logger.warning(f"Failed to create Gitea repo for user {user['id']}: {e}")
 
 
-def _generate_verification_code() -> str:
-    """Generate a 6-digit verification code."""
-    import secrets
-    return f"{secrets.randbelow(1_000_000):06d}"
-
-
-@app.post("/api/auth/login")
-async def auth_login(body: LoginRequest, request: Request, response: Response) -> dict[str, Any]:
-    """Login with email + password."""
-    email = body.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
-
-    if not body.password:
-        raise HTTPException(status_code=400, detail="Password is required")
-
-    user_auth = await postgres_db.get_user_by_email_with_auth(email)
-    if not user_auth:
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    if not user_auth.get("email_verified"):
-        raise HTTPException(status_code=403, detail="Email not verified. Check your inbox.")
-
-    if not user_auth.get("password_hash") or not verify_password(body.password, user_auth["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-
-    user = user_auth
-
-    # Create session (shared between dev and production)
-    session_key, csrf_token = await create_session(
-        postgres_db, user_id=str(user["id"]), user_email=email,
-    )
-    session_timeout_hours = int(os.getenv("SESSION_TIMEOUT_HOURS", "24"))
-    max_age = session_timeout_hours * 3600
-    _secure, _samesite = _cookie_params(request)
-    _set_session_cookies(response, session_key, csrf_token, _secure, _samesite, max_age)
-
-    return {"user": _user_dict(user), "csrf_token": csrf_token, "message": "Login successful"}
-
-
-@app.post("/api/auth/register")
-async def auth_register(body: RegisterRequest) -> dict[str, str]:
-    """Register a new account (production mode only).
-
-    Creates an unverified user and sends a verification email.
-    """
-    email = body.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email is required")
-
-    # Validate password strength
-    is_valid, error_msg = validate_password_strength(body.password)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=error_msg)
-
-    # Check if email already exists
-    existing = await postgres_db.get_user_by_email(email)
-    if existing:
-        raise HTTPException(status_code=409, detail="An account with this email already exists")
-
-    # Create user with password (unverified)
-    pw_hash = hash_password(body.password)
-    user, project = await postgres_db.create_user_with_password(
-        display_name=body.display_name.strip(),
-        email=email,
-        password_hash=pw_hash,
-    )
-    await _create_gitea_repo_for_project(user, project)
-
-    # Generate and send verification code
-    code = _generate_verification_code()
-    await postgres_db.delete_auth_tokens_by_email(email, "verification")
-    await postgres_db.create_auth_token(
-        email=email, token=code, token_type="verification",
-        user_id=str(user["id"]),
-    )
-
-    sent = await email_service.send_verification_email(
-        to=email, code=code, display_name=body.display_name.strip(),
-    )
-    if not sent:
-        logger.warning(f"Failed to send verification email to {email}")
-
-    return {"message": "Verification email sent. Check your inbox."}
-
-
-@app.post("/api/auth/verify")
-async def auth_verify(body: VerifyEmailRequest) -> dict[str, str]:
-    """Verify an email address with a 6-digit code."""
-    email = body.email.strip().lower()
-    code = body.code.strip()
-
-    token = await postgres_db.get_auth_token(code, "verification")
-    if not token or token["email"].lower() != email:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
-
-    # Mark token used and verify user
-    await postgres_db.mark_auth_token_used(code)
-    if token.get("user_id"):
-        await postgres_db.set_email_verified(str(token["user_id"]))
-
-    return {"message": "Email verified successfully. You can now log in."}
-
-
-@app.post("/api/auth/resend-verification")
-async def auth_resend_verification(body: PasswordResetRequest) -> dict[str, str]:
-    """Resend verification code (rate-limited: 60s cooldown)."""
-    email = body.email.strip().lower()
-    user = await postgres_db.get_user_by_email_with_auth(email)
-    if not user:
-        return {"message": "If that email is registered, a new code was sent."}
-
-    if user.get("email_verified"):
-        return {"message": "Email is already verified."}
-
-    # Rate limit: check if last token was created within 60 seconds
-    from datetime import datetime, timezone
-    last_time = await postgres_db.get_latest_auth_token_time(email, "verification")
-    if last_time:
-        if last_time.tzinfo is None:
-            last_time = last_time.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - last_time).total_seconds()
-        if elapsed < 60:
-            raise HTTPException(status_code=429, detail="Please wait before requesting a new code")
-
-    code = _generate_verification_code()
-    await postgres_db.delete_auth_tokens_by_email(email, "verification")
-    await postgres_db.create_auth_token(
-        email=email, token=code, token_type="verification",
-        user_id=str(user["id"]),
-    )
-    await email_service.send_verification_email(
-        to=email, code=code, display_name=user["display_name"],
-    )
-
-    return {"message": "If that email is registered, a new code was sent."}
-
-
-@app.post("/api/auth/forgot-password")
-async def auth_forgot_password(body: PasswordResetRequest) -> dict[str, str]:
-    """Request a password reset code. Always returns 200 (don't leak email existence)."""
-    email = body.email.strip().lower()
-    user = await postgres_db.get_user_by_email_with_auth(email)
-
-    if user and user.get("email_verified"):
-        code = _generate_verification_code()
-        await postgres_db.delete_auth_tokens_by_email(email, "password_reset")
-        await postgres_db.create_auth_token(
-            email=email, token=code, token_type="password_reset",
-            user_id=str(user["id"]),
-        )
-        await email_service.send_password_reset_email(
-            to=email, code=code, display_name=user["display_name"],
-        )
-
-    return {"message": "If that email exists, a reset code was sent."}
-
-
-@app.post("/api/auth/reset-password")
-async def auth_reset_password(body: PasswordResetConfirm) -> dict[str, str]:
-    """Reset password using a verification code."""
-    email = body.email.strip().lower()
-    code = body.code.strip()
-
-    # Validate password strength
-    is_valid, error_msg = validate_password_strength(body.new_password)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=error_msg)
-
-    token = await postgres_db.get_auth_token(code, "password_reset")
-    if not token or token["email"].lower() != email:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
-
-    # Set new password and invalidate all sessions
-    pw_hash = hash_password(body.new_password)
-    user_id = str(token["user_id"])
-    await postgres_db.set_user_password(user_id, pw_hash)
-    await postgres_db.mark_auth_token_used(code)
-    await postgres_db.delete_sessions_by_user(user_id)
-
-    return {"message": "Password updated. Please log in with your new password."}
-
-
-@app.post("/api/auth/logout")
-async def auth_logout(request: Request, response: Response) -> dict[str, str]:
-    """Logout: invalidate session and clear cookies."""
-    session_key = request.cookies.get("session")
-    if session_key:
-        await delete_session(postgres_db, session_key)
-
-    _secure, _samesite = _cookie_params(request)
-    response.delete_cookie(key="session", path="/", httponly=True, secure=_secure, samesite=_samesite)
-    response.delete_cookie(key="csrf_token", path="/", httponly=False, secure=_secure, samesite=_samesite)
-    return {"message": "Logged out successfully"}
-
-
 @app.get("/api/auth/me")
-async def auth_me(request: Request, response: Response) -> dict[str, Any]:
-    """Get current authenticated user from session cookie."""
-    session_key = request.cookies.get("session")
-    if not session_key:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    session_info = await validate_session(postgres_db, session_key)
-    if not session_info:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
-
-    # Fetch full user record
-    user = await postgres_db.get_user(session_info["user_id"])
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    # Ensure CSRF cookie is set
-    csrf_cookie = request.cookies.get("csrf_token")
-    csrf_token = session_info.get("csrf_token")
-    if csrf_token and not csrf_cookie:
-        _secure, _samesite = _cookie_params(request)
-        expires_in = session_info.get("expires_in", 86400)
-        response.set_cookie(
-            key="csrf_token", value=csrf_token, max_age=expires_in,
-            httponly=False, secure=_secure, samesite=_samesite, path="/",
-        )
-
-    return {"user": _user_dict(user), "csrf_token": csrf_token}
+async def auth_me(request: Request) -> dict[str, Any]:
+    """Get current user from Bearer token (OIDC)."""
+    user = await get_current_user(request, postgres_db)
+    return {"user": _user_dict(user)}
 
 
 # =============================================================================

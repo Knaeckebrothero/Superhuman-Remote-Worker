@@ -88,6 +88,7 @@ import {
                   <option value="postgresql">PostgreSQL</option>
                   <option value="neo4j">Neo4j</option>
                   <option value="mongodb">MongoDB</option>
+                  <option value="webdav">WebDAV</option>
                 </select>
               </div>
             </div>
@@ -113,7 +114,7 @@ import {
               ></textarea>
             </div>
 
-            @if (formData.type === 'neo4j') {
+            @if (formData.type === 'neo4j' || formData.type === 'webdav') {
               <div class="form-row">
                 <div class="form-group flex-1">
                   <label class="form-label">Username</label>
@@ -747,6 +748,11 @@ import {
         color: #94e2d5;
       }
 
+      .type-webdav {
+        background: rgba(250, 179, 135, 0.2);
+        color: #fab387;
+      }
+
       /* Name cell */
       .name-cell {
         max-width: 200px;
@@ -899,6 +905,7 @@ export class DatasourceListComponent implements OnInit {
       postgresql: 'postgres://user:pass@host:5432/dbname',
       neo4j: 'bolt://host:7687',
       mongodb: 'mongodb://user:pass@host:27017/dbname',
+      webdav: 'http://host:8800/remote.php/dav/files/user/',
     };
     return placeholders[this.formData.type] || '';
   });
@@ -990,7 +997,7 @@ export class DatasourceListComponent implements OnInit {
         connection_url: this.formData.connection_url,
         read_only: this.formData.read_only,
       };
-      if (this.formData.type === 'neo4j') {
+      if (this.formData.type === 'neo4j' || this.formData.type === 'webdav') {
         update.credentials = this.buildCredentials();
       }
 
@@ -1019,7 +1026,7 @@ export class DatasourceListComponent implements OnInit {
         description: this.formData.description || undefined,
         read_only: this.formData.read_only,
       };
-      if (this.formData.type === 'neo4j') {
+      if (this.formData.type === 'neo4j' || this.formData.type === 'webdav') {
         create.credentials = this.buildCredentials();
       }
 
@@ -1071,7 +1078,7 @@ export class DatasourceListComponent implements OnInit {
         description: this.formData.description || undefined,
         read_only: this.formData.read_only,
       };
-      if (this.formData.type === 'neo4j') {
+      if (this.formData.type === 'neo4j' || this.formData.type === 'webdav') {
         create.credentials = this.buildCredentials();
       }
 
@@ -1158,6 +1165,7 @@ export class DatasourceListComponent implements OnInit {
       postgresql: 'database',
       neo4j: 'hub',
       mongodb: 'eco',
+      webdav: 'cloud',
     };
     return icons[type] || 'storage';
   }

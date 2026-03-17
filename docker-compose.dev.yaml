@@ -210,6 +210,31 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  nextcloud:
+    image: docker.io/library/nextcloud:31-apache
+    container_name: srw-nextcloud
+    environment:
+      NEXTCLOUD_ADMIN_USER: admin
+      NEXTCLOUD_ADMIN_PASSWORD: admin
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: nextcloud
+    volumes:
+      - nextcloud_dev_data:/var/www/html
+    ports:
+      - "${NEXTCLOUD_PORT:-8800}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
   mcp:
     build:
       context: .
@@ -358,3 +383,5 @@ volumes:
     name: srw_nats_dev_data
   gitea_dev_data:
     name: srw_gitea_dev_data
+  nextcloud_dev_data:
+    name: srw_nextcloud_dev_data

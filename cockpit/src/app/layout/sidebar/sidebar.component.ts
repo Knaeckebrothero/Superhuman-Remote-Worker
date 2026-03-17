@@ -449,7 +449,6 @@ export class SidebarComponent {
 
   logout(): void {
     this.userService.logout();
-    this.router.navigate(['/login']);
   }
 
   toggleLayoutPicker(buttonEl: HTMLButtonElement): void {

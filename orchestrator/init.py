@@ -677,6 +677,25 @@ async def _seed_default_datasources(db) -> None:
         logger.info(f"    Seeded default datasource: mongodb ({name})")
         seeded += 1
 
+    # WebDAV datasource (Nextcloud or any WebDAV server)
+    webdav_url = os.getenv("DEFAULT_DS_WEBDAV_URL")
+    if webdav_url:
+        name = os.getenv("DEFAULT_DS_WEBDAV_NAME", "Default WebDAV")
+        read_only = os.getenv("DEFAULT_DS_WEBDAV_READ_ONLY", "true").lower() == "true"
+        credentials = {}
+        username = os.getenv("DEFAULT_DS_WEBDAV_USERNAME")
+        password = os.getenv("DEFAULT_DS_WEBDAV_PASSWORD")
+        if username:
+            credentials["username"] = username
+        if password:
+            credentials["password"] = password
+        await db.upsert_default_datasource(
+            name=name, ds_type="webdav", connection_url=webdav_url,
+            credentials=credentials if credentials else None, read_only=read_only,
+        )
+        logger.info(f"    Seeded default datasource: webdav ({name})")
+        seeded += 1
+
     if seeded > 0:
         logger.info(f"  Seeded {seeded} default datasource(s)")
     else:
@@ -688,29 +707,28 @@ async def _seed_default_datasources(db) -> None:
 # =============================================================================
 
 async def _seed_default_users(db) -> None:
-    """Seed default users including an admin so the system is usable on first deploy.
+    """Seed default users so the system is usable on first deploy.
 
     Creates only if no user with the same display_name exists (idempotent).
-    Admin credentials come from env vars with sensible defaults.
+    The admin user is pre-registered in Keycloak (admin/admin); this seeds the
+    local row for app-specific data (avatar_color, default_project_id). The
+    keycloak_sub gets linked on first OIDC login via JIT provisioning.
     """
-    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin")
-    ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin")
+    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@srw.dev")
     ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Admin")
 
-    # Admin user (always seeded with password and verified)
-    from security.password import hash_password
-    admin_kwargs = {
-        "display_name": ADMIN_DISPLAY_NAME,
-        "avatar_color": "#f38ba8",
-        "email": ADMIN_EMAIL,
-        "is_admin": True,
-        "password_hash": hash_password(ADMIN_PASSWORD),
-        "email_verified": True,
-    }
-
     default_users = [
-        admin_kwargs,
-        {"display_name": "Default", "avatar_color": "#89b4fa", "email": "default@cockpit.local"},
+        {
+            "display_name": ADMIN_DISPLAY_NAME,
+            "avatar_color": "#f38ba8",
+            "email": ADMIN_EMAIL,
+            "is_admin": True,
+        },
+        {
+            "display_name": "Default",
+            "avatar_color": "#89b4fa",
+            "email": "default@cockpit.local",
+        },
     ]
     for user in default_users:
         await db.upsert_default_user(**user)

@@ -1690,6 +1690,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._datasource_clients[ds_type] = client
             return db
 
+        elif ds_type == "webdav":
+            from webdav3.client import Client
+            client = Client({
+                "webdav_hostname": url,
+                "webdav_login": creds.get("username"),
+                "webdav_password": creds.get("password"),
+            })
+            client.list("/")  # Connection test
+            return client
+
         else:
             raise ValueError(f"Unknown datasource type: {ds_type}")
 

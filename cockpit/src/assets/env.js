@@ -7,6 +7,11 @@
   window['env']['pgadminUrl'] = 'http://localhost:5050';
   window['env']['mongoExpressUrl'] = 'http://localhost:8081';
 
+  // Keycloak SSO
+  window['env']['keycloakUrl'] = 'http://localhost:8180';
+  window['env']['keycloakRealm'] = 'srw';
+  window['env']['keycloakClientId'] = 'cockpit';
+
   // Available models for the job creation form (group + model IDs).
   window['env']['models'] = [
     { group: 'Local', models: ['openai/gpt-oss-120b'] },

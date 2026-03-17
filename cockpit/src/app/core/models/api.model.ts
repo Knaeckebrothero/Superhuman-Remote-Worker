@@ -71,7 +71,7 @@ export interface ExpertDetail extends Expert {
 /**
  * Supported datasource types.
  */
-export type DatasourceType = 'postgresql' | 'neo4j' | 'mongodb';
+export type DatasourceType = 'postgresql' | 'neo4j' | 'mongodb' | 'webdav';
 
 /**
  * Datasource configuration from the orchestrator.
