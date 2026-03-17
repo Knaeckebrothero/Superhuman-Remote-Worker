@@ -490,13 +490,14 @@ class IdeSessionService:
             # The container clones the repo, then starts code-server on port 8080
             entrypoint_script = (
                 f"git clone --branch {branch} {clone_url} /home/coder/workspace 2>/dev/null; "
-                f"exec code-server --bind-addr 0.0.0.0:8080 --auth none /home/coder/workspace"
+                f"exec code-server --bind-addr 0.0.0.0:{host_port} --auth none /home/coder/workspace"
             )
 
             cmd = [
                 runtime, "run", "-d",
                 "--name", container_name,
-                "-p", f"{host_port}:8080",
+                "--network", "host",
+                "-e", f"PORT={host_port}",
                 "--label", f"srw.job_id={job_id}",
                 "--label", "srw.type=ide-session",
                 code_server_image,
@@ -806,7 +807,7 @@ class IdeSessionService:
                     resp = await client.get(url)
                     if resp.status_code < 500:
                         return True
-                except (httpx.ConnectError, httpx.ReadTimeout):
+                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
                     pass
                 await asyncio.sleep(1)
         return False

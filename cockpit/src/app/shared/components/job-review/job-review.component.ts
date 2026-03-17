@@ -712,7 +712,7 @@ export class JobReviewComponent {
         return;
       }
 
-      if (result.status === 'available' || result.status === 'expired') {
+      if (result.status === 'available' || result.status === 'expired' || result.status === 'failed') {
         this.api.startIdeSession(jobId).subscribe((startResult) => {
           if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
             this.ideLoading.set(false);
