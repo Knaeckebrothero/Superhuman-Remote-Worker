@@ -470,7 +470,8 @@ class PostgresDB:
                 SELECT id, description, status, creator_status, validator_status,
                        config_name, assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
-                       repo_name, branch_name, merge_status, created_at
+                       repo_name, branch_name, merge_status, created_at,
+                       context->'snapshot'->>'status' AS snapshot_status
                 FROM jobs
                 {where_clause}
                 ORDER BY created_at DESC
@@ -865,6 +866,76 @@ class PostgresDB:
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(vm_updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def merge_snapshot_context(self, job_id: str, snapshot_updates: Dict[str, Any]) -> bool:
+        """Atomically merge updates into context.snapshot without touching other keys.
+
+        Uses jsonb_set + || to merge into the nested 'snapshot' key in a single
+        atomic SQL statement, same pattern as merge_vm_context().
+
+        Args:
+            job_id: Job UUID as string
+            snapshot_updates: Dictionary of keys to merge into context.snapshot
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "    COALESCE(context, '{}'::jsonb), "
+            "    '{snapshot}', "
+            "    COALESCE(context->'snapshot', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(snapshot_updates), uuid_val)
+
+        return result == "UPDATE 1"
+
+    async def merge_ide_session_context(self, job_id: str, session_updates: Dict[str, Any]) -> bool:
+        """Atomically merge updates into context.ide_session without touching other keys.
+
+        Uses jsonb_set + || to merge into the nested 'ide_session' key in a single
+        atomic SQL statement, same pattern as merge_vm_context().
+
+        Args:
+            job_id: Job UUID as string
+            session_updates: Dictionary of keys to merge into context.ide_session
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "    COALESCE(context, '{}'::jsonb), "
+            "    '{ide_session}', "
+            "    COALESCE(context->'ide_session', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(query, json_module.dumps(session_updates), uuid_val)
 
         return result == "UPDATE 1"
 

@@ -44,6 +44,11 @@ interface JobRow {
         <button class="refresh-btn" (click)="refresh()" [disabled]="isLoading()">
           Refresh
         </button>
+        @if (snapshotStats()?.available) {
+          <span class="snapshot-stats" title="S3 snapshot storage">
+            {{ snapshotStats()!.total_snapshots }} snapshots &middot; {{ formatBytes(snapshotStats()!.total_size_bytes) }}
+          </span>
+        }
       </div>
 
       <!-- Loading State -->
@@ -104,6 +109,9 @@ interface JobRow {
                       <span class="status-badge" [class]="'status-' + row.job.status">
                         {{ formatStatus(row.job.status) }}
                       </span>
+                      @if (row.job.snapshot_status === 'available') {
+                        <span class="snapshot-badge" title="Environment snapshot available">S</span>
+                      }
                       @if (row.isChild && row.job.config_name) {
                         <span class="config-badge">{{ row.job.config_name }}</span>
                       }
@@ -149,6 +157,28 @@ interface JobRow {
                       >
                         Workspace
                       </a>
+                    }
+                    @if (canOpenIde(row.job)) {
+                      @if (ideLoadingJobIds().has(row.job.id)) {
+                        <button
+                          class="action-btn ide loading"
+                          disabled
+                          (click)="$event.stopPropagation()"
+                          title="Starting IDE session..."
+                        >
+                          <span class="btn-spinner"></span>
+                          Starting
+                        </button>
+                      } @else {
+                        <button
+                          class="action-btn ide"
+                          [class.gitea-only]="!row.job.snapshot_status && !hasLiveVm(row.job)"
+                          (click)="openIde(row.job.id); $event.stopPropagation()"
+                          [title]="row.job.snapshot_status === 'available' ? 'Open workspace in Web IDE (from snapshot)' : 'Open workspace in Web IDE (code only)'"
+                        >
+                          IDE
+                        </button>
+                      }
                     }
                     @if (row.job.status === 'processing') {
                       @if (cancelingJobIds().has(row.job.id)) {
@@ -367,6 +397,13 @@ interface JobRow {
         background: var(--surface-0, #313244);
       }
 
+      .snapshot-stats {
+        font-size: 10px;
+        color: #6c7086;
+        margin-left: 8px;
+        flex-shrink: 0;
+      }
+
       /* Loading State */
       .loading-state {
         display: flex;
@@ -574,6 +611,22 @@ interface JobRow {
         flex-shrink: 0;
       }
 
+      .snapshot-badge {
+        display: inline-block;
+        width: 16px;
+        height: 16px;
+        border-radius: 3px;
+        font-size: 9px;
+        font-weight: 600;
+        line-height: 16px;
+        text-align: center;
+        background: rgba(166, 227, 161, 0.15);
+        color: #a6e3a1;
+        margin-left: 4px;
+        flex-shrink: 0;
+        cursor: help;
+      }
+
       /* User dot */
       .user-dot {
         display: inline-block;
@@ -705,6 +758,29 @@ interface JobRow {
         text-decoration: none;
       }
 
+      .action-btn.ide {
+        color: #89b4fa;
+        border-color: #89b4fa;
+        text-decoration: none;
+        cursor: pointer;
+      }
+
+      .action-btn.ide.gitea-only {
+        color: #7f849c;
+        border-color: #7f849c;
+        opacity: 0.7;
+      }
+
+      .action-btn.ide.loading {
+        color: #6c7086;
+        border-color: #6c7086;
+        cursor: not-allowed;
+        opacity: 0.7;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+      }
+
       .action-btn.promote {
         color: #94e2d5;
         border-color: #94e2d5;
@@ -799,6 +875,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   readonly jobs = signal<JobSummary[]>([]);
   readonly isLoading = signal(false);
   readonly activeFilter = signal<StatusFilter>('all');
+  readonly snapshotStats = signal<{ available: boolean; total_snapshots: number; total_size_bytes: number } | null>(null);
   readonly selectedJobId = signal<string | null>(null);
 
   // Expand/collapse state for parent jobs
@@ -806,6 +883,8 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   // In-flight action tracking
   readonly cancelingJobIds = signal<Set<string>>(new Set());
+  readonly ideLoadingJobIds = signal<Set<string>>(new Set());
+  private idePollingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   // Inline confirmation state
   readonly confirmingDeleteId = signal<string | null>(null);
@@ -913,6 +992,9 @@ export class JobListComponent implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     this.refresh();
+    this.api.getSnapshotStats().subscribe((stats) => {
+      if (stats) this.snapshotStats.set(stats);
+    });
     // Auto-refresh every 30 seconds
     this.refreshInterval = setInterval(() => {
       if (!this.isLoading()) {
@@ -925,6 +1007,11 @@ export class JobListComponent implements OnInit, OnDestroy {
     if (this.refreshInterval) {
       clearInterval(this.refreshInterval);
     }
+    // Clean up IDE polling intervals
+    for (const interval of this.idePollingIntervals.values()) {
+      clearInterval(interval);
+    }
+    this.idePollingIntervals.clear();
   }
 
   refresh(): void {
@@ -970,6 +1057,95 @@ export class JobListComponent implements OnInit, OnDestroy {
       return `${giteaUrl}/${repoName}/src/branch/${job.branch_name}`;
     }
     return `${giteaUrl}/${repoName}`;
+  }
+
+  hasLiveVm(job: JobSummary): boolean {
+    return job.status === 'processing';
+  }
+
+  canOpenIde(job: JobSummary): boolean {
+    // Show IDE button if: live VM, snapshot available, or has Gitea repo
+    return this.hasLiveVm(job) || job.snapshot_status === 'available' || !!job.repo_name;
+  }
+
+  openIde(jobId: string): void {
+    // Mark as loading
+    const next = new Set(this.ideLoadingJobIds());
+    next.add(jobId);
+    this.ideLoadingJobIds.set(next);
+
+    // First check current session status
+    this.api.getIdeSession(jobId).subscribe((result) => {
+      if (!result) {
+        this.removeIdeLoading(jobId);
+        return;
+      }
+
+      if (result.status === 'active' || result.status === 'idle') {
+        // Already active — open directly
+        this.removeIdeLoading(jobId);
+        if (result.code_server_url) {
+          window.open(result.code_server_url, '_blank');
+        }
+        return;
+      }
+
+      if (result.status === 'available' || result.status === 'expired') {
+        // Start a new session
+        this.api.startIdeSession(jobId).subscribe((startResult) => {
+          if (!startResult || startResult.status === 'unavailable' || startResult.status === 'failed') {
+            this.removeIdeLoading(jobId);
+            return;
+          }
+          // Poll until active
+          this.pollIdeSession(jobId);
+        });
+        return;
+      }
+
+      if (result.status === 'restoring') {
+        // Already restoring (started from another tab) — just poll
+        this.pollIdeSession(jobId);
+        return;
+      }
+
+      // unavailable or other — stop loading
+      this.removeIdeLoading(jobId);
+    });
+  }
+
+  private pollIdeSession(jobId: string): void {
+    // Clear any existing poll for this job
+    const existing = this.idePollingIntervals.get(jobId);
+    if (existing) clearInterval(existing);
+
+    const interval = setInterval(() => {
+      this.api.getIdeSession(jobId).subscribe((result) => {
+        if (!result) return;
+
+        if (result.status === 'active' || result.status === 'idle') {
+          clearInterval(interval);
+          this.idePollingIntervals.delete(jobId);
+          this.removeIdeLoading(jobId);
+          if (result.code_server_url) {
+            window.open(result.code_server_url, '_blank');
+          }
+        } else if (result.status === 'failed' || result.status === 'unavailable') {
+          clearInterval(interval);
+          this.idePollingIntervals.delete(jobId);
+          this.removeIdeLoading(jobId);
+        }
+        // else 'restoring' — keep polling
+      });
+    }, 3000);
+
+    this.idePollingIntervals.set(jobId, interval);
+  }
+
+  private removeIdeLoading(jobId: string): void {
+    const next = new Set(this.ideLoadingJobIds());
+    next.delete(jobId);
+    this.ideLoadingJobIds.set(next);
   }
 
   viewJob(jobId: string): void {
@@ -1126,5 +1302,12 @@ export class JobListComponent implements OnInit, OnDestroy {
       minute: '2-digit',
       hour12: false,
     });
+  }
+
+  formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
   }
 }

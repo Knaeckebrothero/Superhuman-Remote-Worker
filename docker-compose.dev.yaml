@@ -351,6 +351,28 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
+  # S3-compatible object store (MinIO) — VM snapshots + IDE sessions
+  # ---------------------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: srw-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-srw}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-srw_password}
+    volumes:
+      - minio_dev_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Container log viewer (Dozzle)
   # ---------------------------------------------------------------------------
   # Socket path varies by runtime:
@@ -385,3 +407,5 @@ volumes:
     name: srw_gitea_dev_data
   nextcloud_dev_data:
     name: srw_nextcloud_dev_data
+  minio_dev_data:
+    name: srw_minio_dev_data

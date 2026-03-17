@@ -364,7 +364,8 @@ class NatsBridge:
     async def _on_daemon_heartbeat(self, msg) -> None:
         """Handle agent.vm.*.heartbeat — periodic health updates.
 
-        Payload: {job_id, agent_pid, agent_running, cpu_percent, memory_percent, disk_percent}
+        Payload: {job_id, agent_pid, agent_running, cpu_percent, memory_percent,
+                  disk_percent, code_server_connections?}
         """
         try:
             data = json.loads(msg.data.decode())
@@ -373,9 +374,29 @@ class NatsBridge:
                 return
 
             logger.debug("Heartbeat for job %s: agent_running=%s", job_id, data.get("agent_running"))
+            now = datetime.now(timezone.utc).isoformat()
             await self._set_vm_context(job_id, {
-                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "last_heartbeat": now,
             })
+
+            # Track code-server activity for IDE session idle detection.
+            # When the daemon reports active code-server connections, update
+            # last_activity in the IDE session context so the TTL sweeper
+            # knows the session is still in use.
+            cs_connections = data.get("code_server_connections")
+            if cs_connections is not None and self._db:
+                try:
+                    updates = {"code_server_connections": cs_connections}
+                    if cs_connections > 0:
+                        updates["last_activity"] = now
+                        updates["status"] = "active"
+                    else:
+                        # No connections — mark as idle (if currently active)
+                        updates["status"] = "idle"
+                    await self._db.merge_ide_session_context(job_id, updates)
+                except Exception:
+                    pass  # Non-critical, don't break heartbeat processing
+
         except Exception:
             logger.exception("Error handling daemon heartbeat")
 

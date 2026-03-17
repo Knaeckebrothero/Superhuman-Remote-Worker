@@ -105,6 +105,11 @@ import { environment } from '../../core/environment';
             <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F4CB;</span>Dozzle
             </a>
+            @if (minioConsoleUrl) {
+              <a class="section-link" [href]="minioConsoleUrl" target="_blank" rel="noopener">
+                <span class="link-icon">&#x1F4E6;</span>MinIO
+              </a>
+            }
           </div>
 
           <div class="section">
@@ -433,6 +438,7 @@ export class SidebarComponent {
   readonly neo4jUrl = environment.neo4jUrl;
   readonly pgadminUrl = environment.pgadminUrl;
   readonly mongoExpressUrl = environment.mongoExpressUrl;
+  readonly minioConsoleUrl = environment.minioConsoleUrl;
 
   readonly isLayoutPickerOpen = signal(false);
   readonly pickerTop = signal(0);
