@@ -56,6 +56,7 @@ from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa
 from security.auth import get_current_user, cleanup_expired_tokens  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
+from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
 from services.builder_tools import (  # noqa: E402
     BUILDER_TOOLS,
     SERVER_SIDE_TOOLS,
@@ -87,6 +88,7 @@ logger = logging.getLogger(__name__)
 postgres_db = PostgresDB()
 mongodb = MongoDB()
 gitea_client = GiteaClient()
+keycloak_groups = KeycloakGroupSync()
 
 # Vector DB — separate pgvector instance for citations, memories + knowledge_index.
 _vector_url = os.getenv("VECTOR_DB_URL")
@@ -1105,6 +1107,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize Gitea workspace delivery (graceful if unavailable)
     await gitea_client.ensure_initialized()
+
+    # Initialize Keycloak group sync (graceful if unavailable)
+    await keycloak_groups.ensure_initialized()
 
     # Initialize NATS bridge for VM lifecycle (graceful if unavailable)
     await nats_bridge.connect(db=postgres_db, on_vm_ready=_trigger_dispatch)
@@ -3833,7 +3838,7 @@ def _build_datasource_tool_override(
         "webdav": {
             "category": "cloud",
             "read": ["cloud_list", "cloud_read", "cloud_info"],
-            "write": ["cloud_list", "cloud_read", "cloud_info"],
+            "write": ["cloud_list", "cloud_read", "cloud_info", "cloud_write", "cloud_delete"],
         },
     }
 
@@ -5618,6 +5623,19 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                     is_managed=True,
                 )
 
+        # Create Keycloak group and add creator
+        if keycloak_groups.is_initialized:
+            project_id_str = str(project["id"])
+            group_id = await keycloak_groups.ensure_project_group(
+                project_id_str, body.name
+            )
+            if group_id and body.user_id:
+                user = await postgres_db.get_user(body.user_id)
+                if user and user.get("keycloak_sub"):
+                    await keycloak_groups.add_user_to_project_group(
+                        user["keycloak_sub"], project_id_str
+                    )
+
         return project
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -5693,6 +5711,11 @@ async def delete_project(project_id: str) -> dict[str, str]:
     success = await postgres_db.delete_project(project_id)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to delete project")
+
+    # Clean up Keycloak group
+    if keycloak_groups.is_initialized:
+        await keycloak_groups.delete_project_group(project_id)
+
     return {"status": "deleted"}
 
 
@@ -5712,11 +5735,21 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
     if not project:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found")
     try:
-        return await postgres_db.add_project_member(
+        result = await postgres_db.add_project_member(
             project_id=project_id,
             user_id=body.user_id,
             role=body.role,
         )
+
+        # Sync to Keycloak group
+        if keycloak_groups.is_initialized:
+            user = await postgres_db.get_user(body.user_id)
+            if user and user.get("keycloak_sub"):
+                await keycloak_groups.add_user_to_project_group(
+                    user["keycloak_sub"], project_id
+                )
+
+        return result
     except Exception as e:
         if "duplicate key" in str(e).lower() or "unique" in str(e).lower():
             raise HTTPException(status_code=409, detail="User is already a member")
@@ -5752,6 +5785,15 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
     success = await postgres_db.remove_project_member(project_id, user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Member not found")
+
+    # Remove from Keycloak group
+    if keycloak_groups.is_initialized:
+        user = await postgres_db.get_user(user_id)
+        if user and user.get("keycloak_sub"):
+            await keycloak_groups.remove_user_from_project_group(
+                user["keycloak_sub"], project_id
+            )
+
     return {"status": "removed"}
 
 
