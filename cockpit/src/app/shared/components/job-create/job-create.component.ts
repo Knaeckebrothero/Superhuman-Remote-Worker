@@ -1450,6 +1450,7 @@ import { environment } from '../../../core/environment';
       .ds-type-postgresql { color: #89b4fa; }
       .ds-type-neo4j { color: #a6e3a1; }
       .ds-type-mongodb { color: #94e2d5; }
+      .ds-type-webdav { color: #fab387; }
 
       .ds-info {
         flex: 1;
@@ -2146,6 +2147,7 @@ export class JobCreateComponent implements OnInit {
       postgresql: 'database',
       neo4j: 'hub',
       mongodb: 'eco',
+      webdav: 'cloud',
     };
     return icons[type] || 'storage';
   }

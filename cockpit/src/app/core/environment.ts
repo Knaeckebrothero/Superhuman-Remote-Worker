@@ -31,6 +31,11 @@ export const environment = {
   pgadminUrl: getEnv('pgadminUrl', 'http://localhost:5050'),
   mongoExpressUrl: getEnv('mongoExpressUrl', 'http://localhost:8081'),
 
+  // Keycloak SSO
+  keycloakUrl: getEnv('keycloakUrl', 'http://localhost:8180'),
+  keycloakRealm: getEnv('keycloakRealm', 'srw'),
+  keycloakClientId: getEnv('keycloakClientId', 'cockpit'),
+
   // Model configuration
   models: getEnvArray<{ group: string; models: string[] }>('models'),
   modelPresets: getEnvArray<{ label: string; strategic: string; tactical: string }>('modelPresets'),

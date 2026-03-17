@@ -83,6 +83,13 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: Add keycloak_sub for OIDC user linking (SSO Phase 2)
+DO $$ BEGIN
+    ALTER TABLE users ADD COLUMN keycloak_sub TEXT UNIQUE;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_users_keycloak_sub ON users(keycloak_sub);
+
 -- ============================================================================
 -- 0e. AUTH TOKENS TABLE
 -- Verification codes and password reset tokens for production auth mode.

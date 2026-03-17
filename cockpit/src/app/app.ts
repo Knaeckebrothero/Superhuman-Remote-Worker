@@ -1,7 +1,5 @@
 import { Component, inject, OnInit, computed } from '@angular/core';
-import { Router, RouterOutlet, NavigationEnd } from '@angular/router';
-import { toSignal } from '@angular/core/rxjs-interop';
-import { filter, map } from 'rxjs';
+import { RouterOutlet } from '@angular/router';
 import { SidebarComponent } from './layout/sidebar/sidebar.component';
 import { ToastComponent } from './core/components/toast/toast.component';
 import { ComponentRegistryService } from './core/services/component-registry.service';
@@ -64,25 +62,13 @@ import { MemoryPanelComponent } from './debug/components/memory-panel/memory-pan
   ],
 })
 export class App implements OnInit {
-  private readonly router = inject(Router);
   private readonly viewport = inject(ViewportService);
   private readonly userService = inject(UserService);
   private readonly registry = inject(ComponentRegistryService);
   readonly sidebar = inject(SidebarService);
 
-  private readonly currentUrl = toSignal(
-    this.router.events.pipe(
-      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
-      map((e) => e.urlAfterRedirects),
-    ),
-    { initialValue: this.router.url },
-  );
-
   readonly showSidebar = computed(
-    () =>
-      !this.viewport.isMobile() &&
-      this.userService.isAuthenticated() &&
-      this.currentUrl() !== '/login',
+    () => !this.viewport.isMobile() && this.userService.isAuthenticated(),
   );
 
   ngOnInit(): void {

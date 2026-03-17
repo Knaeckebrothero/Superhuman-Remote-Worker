@@ -1,23 +1,28 @@
 import { HttpInterceptorFn } from '@angular/common/http';
 import { inject } from '@angular/core';
-import { ApiService } from '../services/api.service';
+import { from, switchMap } from 'rxjs';
+import { KeycloakService } from '../services/keycloak.service';
 
 /**
- * HTTP interceptor that:
- * 1. Sets withCredentials on all requests (sends session cookie)
- * 2. Attaches X-CSRF-Token header from the ApiService
+ * HTTP interceptor that attaches the Keycloak Bearer token to API requests.
  */
 export const authInterceptor: HttpInterceptorFn = (req, next) => {
-  const api = inject(ApiService);
+  const keycloak = inject(KeycloakService);
 
-  let authReq = req.clone({ withCredentials: true });
-
-  const csrfToken = api.csrfToken;
-  if (csrfToken && !req.headers.has('X-CSRF-Token')) {
-    authReq = authReq.clone({
-      headers: authReq.headers.set('X-CSRF-Token', csrfToken),
-    });
+  // Skip for non-API requests and Keycloak's own endpoints
+  if (!keycloak.authenticated || req.url.includes('/realms/')) {
+    return next(req);
   }
 
-  return next(authReq);
+  return from(keycloak.getToken()).pipe(
+    switchMap((token) => {
+      if (token) {
+        const authReq = req.clone({
+          headers: req.headers.set('Authorization', `Bearer ${token}`),
+        });
+        return next(authReq);
+      }
+      return next(req);
+    }),
+  );
 };

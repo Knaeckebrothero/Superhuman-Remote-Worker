@@ -1,28 +1,21 @@
 import { inject } from '@angular/core';
-import { CanActivateFn, Router } from '@angular/router';
-import { toObservable } from '@angular/core/rxjs-interop';
-import { filter, map, take } from 'rxjs';
-import { UserService } from '../services/user.service';
+import { CanActivateFn } from '@angular/router';
+import { KeycloakService } from '../services/keycloak.service';
 
 /**
- * Functional auth guard that waits for the initial session check
- * to complete, then allows or redirects based on authentication state.
+ * Route guard that redirects unauthenticated users to Keycloak login.
+ *
+ * Because Keycloak is initialised via APP_INITIALIZER before the app boots,
+ * `keycloak.authenticated` is already resolved — no async waiting needed.
  */
 export const authGuard: CanActivateFn = () => {
-  const userService = inject(UserService);
-  const router = inject(Router);
+  const keycloak = inject(KeycloakService);
 
-  // If session check already completed, decide immediately
-  if (userService.sessionReady()) {
-    return userService.isAuthenticated() || router.createUrlTree(['/login']);
+  if (keycloak.authenticated) {
+    return true;
   }
 
-  // Wait for sessionReady to become true, then check auth
-  return toObservable(userService.sessionReady).pipe(
-    filter((ready) => ready),
-    take(1),
-    map(() =>
-      userService.isAuthenticated() || router.createUrlTree(['/login']),
-    ),
-  );
+  // Redirect to Keycloak login page
+  keycloak.login();
+  return false;
 };
