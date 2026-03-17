@@ -54,7 +54,7 @@ import { MemoryPanelComponent } from './debug/components/memory-panel/memory-pan
 
       .content-area {
         flex: 1;
-        overflow: hidden;
+        overflow: auto;
         position: relative;
       }
 
