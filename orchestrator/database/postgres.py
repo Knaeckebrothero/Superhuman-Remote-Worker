@@ -668,6 +668,7 @@ class PostgresDB:
         validator_status: str | None = None,
         assigned_agent_id: str | None = None,
         error_message: str | None = None,
+        freeze_data: Dict[str, Any] | None = None,
     ) -> bool:
         """Update job status fields.
 
@@ -678,6 +679,7 @@ class PostgresDB:
             validator_status: New validator status
             assigned_agent_id: Agent ID if being assigned
             error_message: Error message if failed
+            freeze_data: Freeze metadata dict (for waiting_for_reply, pending_review)
 
         Returns:
             True if updated, False if not found
@@ -716,6 +718,11 @@ class PostgresDB:
             param_count += 1
             updates.append(f"assigned_agent_id = ${param_count}")
             values.append(UUID(assigned_agent_id) if assigned_agent_id else None)
+
+        if freeze_data is not None:
+            param_count += 1
+            updates.append(f"freeze_data = ${param_count}::jsonb")
+            values.append(json.dumps(freeze_data))
 
         if not updates:
             return False
@@ -3883,6 +3890,204 @@ class PostgresDB:
             logger.info(f"All {len(REQUIRED_TABLES)} required tables exist")
 
         return result
+
+    # =========================================================================
+    # MESSAGE LOG (Agent-Human Communication)
+    # =========================================================================
+
+    async def log_message(
+        self,
+        job_id: str,
+        thread_id: str,
+        direction: str,
+        subject: str,
+        message: str,
+        status: str,
+        user_id: str | None = None,
+        recipient_email: str | None = None,
+        mode: str | None = None,
+        error_message: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Log a message to the message_log table.
+
+        Args:
+            job_id: Job UUID
+            thread_id: Short thread identifier
+            direction: 'outbound' or 'inbound'
+            subject: Message subject
+            message: Message body
+            status: 'sent', 'failed', 'rate_limited', 'delivered'
+            user_id: Optional user UUID
+            recipient_email: Recipient email address
+            mode: 'async' or 'blocking' (outbound only)
+            error_message: Error details if failed
+
+        Returns:
+            Created message_log row as dict, or None on failure
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return None
+
+        user_uuid = None
+        if user_id:
+            try:
+                user_uuid = UUID(user_id)
+            except ValueError:
+                pass
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO message_log (
+                    job_id, user_id, thread_id, direction, recipient_email,
+                    subject, message, mode, status, error_message
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING id, job_id, thread_id, direction, status, created_at
+                """,
+                job_uuid,
+                user_uuid,
+                thread_id,
+                direction,
+                recipient_email,
+                subject,
+                message,
+                mode,
+                status,
+                error_message,
+            )
+
+        return dict(row) if row else None
+
+    async def check_message_rate_limit(
+        self,
+        job_id: str,
+        user_id: str | None = None,
+    ) -> Dict[str, int]:
+        """Check message rate limits for a job and user.
+
+        Args:
+            job_id: Job UUID
+            user_id: Optional user UUID for per-user limit check
+
+        Returns:
+            Dict with 'job_hourly', 'job_daily', 'user_daily' counts
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return {"job_hourly": 0, "job_daily": 0, "user_daily": 0}
+
+        async with self.acquire() as conn:
+            job_hourly = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM message_log
+                WHERE job_id = $1
+                  AND direction = 'outbound'
+                  AND status != 'rate_limited'
+                  AND created_at > NOW() - INTERVAL '1 hour'
+                """,
+                job_uuid,
+            )
+
+            job_daily = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM message_log
+                WHERE job_id = $1
+                  AND direction = 'outbound'
+                  AND status != 'rate_limited'
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                """,
+                job_uuid,
+            )
+
+            user_daily = 0
+            if user_id:
+                try:
+                    user_uuid = UUID(user_id)
+                    user_daily = await conn.fetchval(
+                        """
+                        SELECT COUNT(*) FROM message_log
+                        WHERE user_id = $1
+                          AND direction = 'outbound'
+                          AND status != 'rate_limited'
+                          AND created_at > NOW() - INTERVAL '24 hours'
+                        """,
+                        user_uuid,
+                    )
+                except ValueError:
+                    pass
+
+        return {
+            "job_hourly": job_hourly or 0,
+            "job_daily": job_daily or 0,
+            "user_daily": user_daily or 0,
+        }
+
+    async def get_message_threads(self, job_id: str) -> List[Dict[str, Any]]:
+        """Get message threads for a job.
+
+        Args:
+            job_id: Job UUID
+
+        Returns:
+            List of thread summary dicts with thread_id, subject, message_count, etc.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    thread_id,
+                    MIN(subject) AS subject,
+                    COUNT(*) AS message_count,
+                    MAX(created_at) AS last_message_at,
+                    COUNT(*) FILTER (WHERE direction = 'outbound') AS sent_count,
+                    COUNT(*) FILTER (WHERE direction = 'inbound') AS received_count,
+                    MIN(mode) FILTER (WHERE direction = 'outbound') AS mode,
+                    MIN(created_at) AS started_at
+                FROM message_log
+                WHERE job_id = $1
+                GROUP BY thread_id
+                ORDER BY MAX(created_at) DESC
+                """,
+                job_uuid,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def get_message_sequence(self, job_id: str, thread_id: str) -> int:
+        """Get the next sequence number for a thread.
+
+        Args:
+            job_id: Job UUID
+            thread_id: Thread identifier
+
+        Returns:
+            Next sequence number (1-based)
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return 1
+
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM message_log
+                WHERE job_id = $1 AND thread_id = $2
+                """,
+                job_uuid,
+                thread_id,
+            )
+
+        return (count or 0) + 1
 
     # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)

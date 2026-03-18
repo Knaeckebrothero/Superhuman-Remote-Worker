@@ -1,4 +1,5 @@
-import { Injectable } from '@angular/core';
+import { inject, Injectable, PLATFORM_ID } from '@angular/core';
+import { isPlatformBrowser } from '@angular/common';
 import Keycloak from 'keycloak-js';
 import { environment } from '../environment';
 
@@ -10,6 +11,7 @@ import { environment } from '../environment';
  */
 @Injectable({ providedIn: 'root' })
 export class KeycloakService {
+  private readonly platformId = inject(PLATFORM_ID);
   private keycloak!: Keycloak;
   private _authenticated = false;
 
@@ -24,6 +26,8 @@ export class KeycloakService {
    * a redirect on every page load.
    */
   async init(): Promise<void> {
+    if (!isPlatformBrowser(this.platformId)) return;
+
     this.keycloak = new Keycloak({
       url: environment.keycloakUrl,
       realm: environment.keycloakRealm,

@@ -1930,8 +1930,13 @@ def route_after_execute(state: UniversalAgentState) -> Literal["tools", "check_t
     return "check_todos"
 
 
-def route_after_check_todos(state: UniversalAgentState) -> Literal["execute", "archive_phase"]:
-    """Route based on whether todos are complete."""
+def route_after_check_todos(
+    state: UniversalAgentState,
+) -> Literal["execute", "archive_phase", "check_goal"]:
+    """Route based on whether todos are complete or a freeze was requested."""
+    # Mid-phase freeze (e.g., blocking send_message) — skip archive, go straight to exit
+    if state.get("should_stop", False):
+        return "check_goal"
     if state.get("phase_complete", False):
         return "archive_phase"
     return "execute"
@@ -2090,6 +2095,39 @@ def create_restore_from_feedback_node(
         )
         workspace.write_file("feedback.md", feedback_content)
         logger.info(f"[{job_id}] Wrote feedback.md to workspace")
+
+        # Step 2b: If this is a reply to a blocking message, write received message file
+        freeze_data = None
+        try:
+            frozen_content = workspace.read_file("output/job_frozen.json")
+            if frozen_content:
+                freeze_data = json.loads(frozen_content)
+        except Exception:
+            pass
+
+        if freeze_data and freeze_data.get("freeze_type") == "blocking_message":
+            thread_id = freeze_data.get("thread_id", "unknown")
+            msg_dir = f"messages/{thread_id}"
+            try:
+                existing = workspace.list_directory(msg_dir)
+                seq = len(existing) + 1
+            except Exception:
+                seq = 2  # First message was sent, reply is #2
+            from datetime import datetime, timezone as tz
+            msg_content = (
+                f"---\n"
+                f"from: user\n"
+                f"to: agent\n"
+                f"date: {datetime.now(tz.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+                f"subject: {freeze_data.get('subject', 'Reply')}\n"
+                f"thread: {thread_id}\n"
+                f"sequence: {seq}\n"
+                f"status: unread\n"
+                f"---\n\n"
+                f"{feedback}\n"
+            )
+            workspace.write_file(f"{msg_dir}/{seq:03d}_received.md", msg_content)
+            logger.info(f"[{job_id}] Wrote received message to {msg_dir}/{seq:03d}_received.md")
 
         # Step 3: Create HumanMessage with formatted feedback
         feedback_message = HumanMessage(
@@ -2370,6 +2408,25 @@ def create_audited_tool_node(
                 except Exception as e:
                     logger.warning(f"[{job_id}] Failed to store queued memory: {e}")
 
+        # Communication: check if a tool requested a job freeze (blocking send_message)
+        if tool_context:
+            freeze_req = tool_context.consume_freeze_request()
+            if freeze_req:
+                try:
+                    workspace.write_file(
+                        "output/job_frozen.json",
+                        json.dumps(freeze_req, indent=2, ensure_ascii=False),
+                    )
+                    if workspace.git_manager and workspace.git_manager.is_active:
+                        workspace.git_manager.commit("Job frozen: waiting for reply")
+                    result["should_stop"] = True
+                    logger.info(
+                        f"[{job_id}] Freeze requested by tool: "
+                        f"{freeze_req.get('freeze_type')}"
+                    )
+                except Exception as e:
+                    logger.error(f"[{job_id}] Failed to process freeze request: {e}")
+
         return result
 
     return audited_tools
@@ -2595,6 +2652,7 @@ def build_phase_alternation_graph(
         {
             "execute": "execute",
             "archive_phase": "archive_phase",
+            "check_goal": "check_goal",
         },
     )
 

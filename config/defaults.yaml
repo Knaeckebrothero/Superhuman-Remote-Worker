@@ -126,6 +126,9 @@ tools:
     - kb_provenance
     - kb_unanswered
     - kb_export
+  # Communication tools - agent-human messaging via email (src/tools/communication/)
+  communication:
+    - send_message
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -240,6 +243,14 @@ scholar:
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent
 autonomy: review
+
+# Communication — agent-initiated messaging to humans via email
+# Messages stored in workspace/messages/ as markdown files with YAML frontmatter.
+communication:
+  enabled: true
+  blocking_timeout_hours: 24       # Auto-resume blocked jobs after this timeout
+  max_message_length: 5000         # Max chars per message body
+  allowed_recipients: owner        # "owner" (job owner only) or "project" (all project members)
 
 # Browser automation settings (browser-use + Playwright)
 browser:

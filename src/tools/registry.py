@@ -35,6 +35,7 @@ from .git import create_git_tools, get_git_metadata
 from .coding import create_coding_tools, get_coding_metadata
 from .evaluation import create_evaluation_tools, get_evaluation_metadata
 from .knowledge import create_knowledge_tools, get_knowledge_metadata
+from .communication import create_communication_tools, get_communication_metadata
 
 # Import from core toolkit package
 from .core import create_core_tools, get_core_metadata
@@ -64,6 +65,7 @@ TOOL_REGISTRY.update(get_git_metadata())
 TOOL_REGISTRY.update(get_coding_metadata())
 TOOL_REGISTRY.update(get_evaluation_metadata())
 TOOL_REGISTRY.update(get_knowledge_metadata())
+TOOL_REGISTRY.update(get_communication_metadata())
 
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
@@ -437,6 +439,18 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                         logger.debug(f"Loaded knowledge tool: {tool.name}")
             except Exception as e:
                 logger.warning(f"Could not load knowledge tools: {e}")
+
+    # Communication tools
+    if "communication" in tools_by_category:
+        try:
+            comm_tools = create_communication_tools(context)
+            requested = set(tools_by_category["communication"])
+            for tool in comm_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded communication tool: {tool.name}")
+        except Exception as e:
+            logger.warning(f"Could not load communication tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

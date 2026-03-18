@@ -113,6 +113,15 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 [(ngModel)]="prefModel"
               />
             </div>
+            <div class="form-row">
+              <label class="field-label">Auxiliary Model</label>
+              <input
+                type="text"
+                class="form-input"
+                placeholder="e.g. groq/llama-3.3-70b-versatile (blank = use default)"
+                [(ngModel)]="prefAuxModel"
+              />
+            </div>
             <div class="form-row two-col">
               <div>
                 <label class="field-label">Default Autonomy</label>
@@ -556,6 +565,7 @@ export class SettingsComponent implements OnInit {
 
   // Preferences form state
   prefModel = '';
+  prefAuxModel = '';
   prefAutonomy = '';
   prefReasoning = '';
   readonly savingPrefs = signal(false);
@@ -577,6 +587,7 @@ export class SettingsComponent implements OnInit {
     setTimeout(() => {
       const prefs = this.settingsService.preferences();
       this.prefModel = prefs.default_model || '';
+      this.prefAuxModel = prefs.default_auxiliary_model || '';
       this.prefAutonomy = prefs.default_autonomy || '';
       this.prefReasoning = prefs.default_reasoning_level || '';
     }, 500);
@@ -655,6 +666,7 @@ export class SettingsComponent implements OnInit {
 
     const settings: Record<string, string | null> = {};
     settings['default_model'] = this.prefModel.trim() || null;
+    settings['default_auxiliary_model'] = this.prefAuxModel.trim() || null;
     settings['default_autonomy'] = this.prefAutonomy || null;
     settings['default_reasoning_level'] = this.prefReasoning || null;
 
