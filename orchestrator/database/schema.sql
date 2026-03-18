@@ -392,7 +392,7 @@ DO $$ BEGIN
     ALTER TABLE jobs ADD CONSTRAINT valid_status
         CHECK (status IN ('created', 'processing', 'completed', 'failed',
                           'cancelled', 'pending_review', 'paused',
-                          'reviewing', 'waiting'));
+                          'reviewing', 'waiting', 'waiting_for_reply'));
 END $$;
 
 -- ============================================================================
