@@ -1606,6 +1606,78 @@ def create_archive_phase_node(
     return archive_phase
 
 
+async def _process_queued_replies(
+    job_id: str,
+    workspace: "WorkspaceManager",
+    postgres_db,
+) -> int:
+    """Consume queued async replies from job context and write to workspace.
+
+    Called at tactical→strategic phase boundaries so replies appear in
+    ``git_diff`` during the upcoming strategic review.
+
+    Returns:
+        Number of replies processed.
+    """
+    from datetime import datetime, timezone as tz
+
+    # Read queued_replies from job context
+    row = await postgres_db.fetchrow(
+        "SELECT context FROM jobs WHERE id = $1::uuid", job_id,
+    )
+    if not row:
+        return 0
+
+    ctx = row.get("context") or {}
+    if isinstance(ctx, str):
+        ctx = json.loads(ctx)
+
+    queued = ctx.get("queued_replies")
+    if not queued:
+        return 0
+
+    # Atomically clear queued_replies from context
+    await postgres_db.execute(
+        "UPDATE jobs SET context = context - 'queued_replies' WHERE id = $1::uuid",
+        job_id,
+    )
+
+    # Write each reply as a workspace file
+    for reply in queued:
+        thread_id = reply.get("thread_id", "unknown")
+        message = reply.get("message", "")
+        timestamp = reply.get("timestamp", datetime.now(tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+        msg_dir = f"messages/{thread_id}"
+        try:
+            existing = workspace.list_directory(msg_dir)
+            seq = len(existing) + 1
+        except Exception:
+            seq = 1
+
+        msg_content = (
+            f"---\n"
+            f"from: user\n"
+            f"to: agent\n"
+            f"date: {timestamp}\n"
+            f"subject: (async reply)\n"
+            f"thread: {thread_id}\n"
+            f"sequence: {seq}\n"
+            f"status: unread\n"
+            f"---\n\n"
+            f"{message}\n"
+        )
+        workspace.write_file(f"{msg_dir}/{seq:03d}_received.md", msg_content)
+
+    if queued and workspace.git_manager and workspace.git_manager.is_active:
+        workspace.git_manager.commit(
+            f"Received {len(queued)} queued reply(ies)"
+        )
+
+    logger.info(f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary")
+    return len(queued)
+
+
 def create_handle_transition_node(
     workspace: WorkspaceManager,
     todo_manager: TodoManager,
@@ -1638,6 +1710,15 @@ def create_handle_transition_node(
             f"[{job_id}] Handling phase transition from "
             f"{'strategic' if is_strategic else 'tactical'} phase"
         )
+
+        # Process queued async replies at tactical→strategic boundaries.
+        # Writes received message files to workspace so they appear in
+        # git_diff during the upcoming strategic review phase.
+        if not is_strategic and postgres_db:
+            try:
+                await _process_queued_replies(job_id, workspace, postgres_db)
+            except Exception as e:
+                logger.warning(f"[{job_id}] Failed to process queued replies: {e}")
 
         # Call transition handler
         result = handle_phase_transition(

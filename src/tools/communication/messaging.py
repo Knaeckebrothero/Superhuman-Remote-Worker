@@ -129,11 +129,20 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
             return f"Error: message too long ({len(message)} chars, max 5000)."
         if mode not in ("async", "blocking"):
             return f"Error: mode must be 'async' or 'blocking', got '{mode}'."
+
+        # Check config restriction on recipients
         if to != "user":
-            return (
-                f"Error: Phase 1 only supports to='user' (job owner). "
-                f"Multi-recipient messaging is not yet available."
-            )
+            allowed = "project"
+            if hasattr(context, "config") and context.config:
+                comm_cfg = getattr(context.config, "communication", None)
+                if isinstance(comm_cfg, dict):
+                    allowed = comm_cfg.get("allowed_recipients", "project")
+            if allowed == "owner":
+                return (
+                    "Error: this agent config restricts messaging to the job owner only "
+                    "(to='user'). Set allowed_recipients: project in config to enable "
+                    "multi-recipient messaging."
+                )
 
         job_id = context.job_id
         if not job_id:
@@ -199,6 +208,7 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
                         "message": message,
                         "mode": mode,
                         "thread_id": thread_id,
+                        "project_id": getattr(context, "project_id", None),
                     },
                 )
 

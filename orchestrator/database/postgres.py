@@ -3907,6 +3907,7 @@ class PostgresDB:
         recipient_email: str | None = None,
         mode: str | None = None,
         error_message: str | None = None,
+        email_message_id: str | None = None,
     ) -> Dict[str, Any] | None:
         """Log a message to the message_log table.
 
@@ -3921,6 +3922,7 @@ class PostgresDB:
             recipient_email: Recipient email address
             mode: 'async' or 'blocking' (outbound only)
             error_message: Error details if failed
+            email_message_id: RFC822 Message-ID for IMAP reply correlation
 
         Returns:
             Created message_log row as dict, or None on failure
@@ -3942,9 +3944,9 @@ class PostgresDB:
                 """
                 INSERT INTO message_log (
                     job_id, user_id, thread_id, direction, recipient_email,
-                    subject, message, mode, status, error_message
+                    subject, message, mode, status, error_message, email_message_id
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 RETURNING id, job_id, thread_id, direction, status, created_at
                 """,
                 job_uuid,
@@ -3957,8 +3959,56 @@ class PostgresDB:
                 mode,
                 status,
                 error_message,
+                email_message_id,
             )
 
+        return dict(row) if row else None
+
+    async def message_exists_by_email_id(self, email_message_id: str) -> bool:
+        """Check if a message with this RFC822 Message-ID already exists.
+
+        Used by the IMAP poller for deduplication.
+        """
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM message_log WHERE email_message_id = $1",
+                email_message_id,
+            )
+        return (count or 0) > 0
+
+    async def get_thread_email_message_id(
+        self, job_id: str, thread_id: str
+    ) -> str | None:
+        """Get the most recent outbound Message-ID for building In-Reply-To headers."""
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT email_message_id FROM message_log
+                WHERE job_id = $1 AND thread_id = $2 AND direction = 'outbound'
+                      AND email_message_id IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                job_uuid, thread_id,
+            )
+
+    async def get_job_by_short_id(self, short_id: str) -> Dict[str, Any] | None:
+        """Look up a job by the first 8 characters of its UUID.
+
+        Used by the IMAP poller to resolve job from + sub-address.
+        """
+        if not short_id or len(short_id) < 4:
+            return None
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM jobs WHERE id::text LIKE $1 || '%' LIMIT 1",
+                short_id,
+            )
         return dict(row) if row else None
 
     async def check_message_rate_limit(

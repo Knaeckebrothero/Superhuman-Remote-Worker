@@ -397,6 +397,15 @@ class UniversalAgent:
         self._datasource_clients = {}
         logger.info(f"Processing job {job_id}")
 
+        # Wire archiver + job context into AuxiliaryLLM for auxiliary call logging
+        if self._auxiliary_llm:
+            from src.core.archiver import get_archiver as _get_archiver_for_aux
+            self._auxiliary_llm.set_job_context(
+                archiver=_get_archiver_for_aux(),
+                job_id=job_id,
+                agent_type=self.config.agent_id,
+            )
+
         try:
             # Create workspace for this job
             # Base path comes from WORKSPACE_PATH env var or defaults

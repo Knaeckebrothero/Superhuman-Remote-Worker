@@ -78,6 +78,7 @@ from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.email import email_service  # noqa: E402
+from services.imap_poller import imap_poller  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -381,6 +382,36 @@ async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("Snapshot GC sweeper stopped")
+
+
+async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
+    """Background task that polls IMAP for inbound email replies.
+
+    Runs every IMAP_POLL_INTERVAL seconds (default: 30).
+    Gracefully disabled when IMAP is not configured.
+    """
+    if not imap_poller.is_available:
+        logger.info("IMAP poller not started (not configured)")
+        return
+
+    logger.info("IMAP poller started (interval=%ds)", imap_poller.poll_interval)
+    while not shutdown_event.is_set():
+        try:
+            count = await imap_poller.poll_once()
+            if count > 0:
+                logger.info("IMAP poller: processed %d email reply(ies)", count)
+        except Exception as e:
+            logger.error("IMAP poller error: %s", e)
+
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(), timeout=imap_poller.poll_interval,
+            )
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("IMAP poller stopped")
 
 
 # =============================================================================
@@ -1284,6 +1315,21 @@ async def lifespan(app: FastAPI):
         gitea_client=gitea_client,
     )
 
+    # Initialize IMAP poller for email reply routing (graceful if unconfigured)
+    async def _imap_reply_handler(
+        job_id: str, thread_id: str, message: str,
+        sender_email: str | None = None, email_message_id: str | None = None,
+    ) -> str:
+        """Adapter: strips sequence number from _route_inbound_reply return."""
+        strategy, _seq = await _route_inbound_reply(
+            job_id, thread_id, message,
+            sender_email=sender_email,
+            email_message_id=email_message_id,
+        )
+        return strategy
+
+    imap_poller.connect(db=postgres_db, reply_handler=_imap_reply_handler)
+
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
@@ -1292,6 +1338,7 @@ async def lifespan(app: FastAPI):
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
+    imap_task = asyncio.create_task(imap_poll_loop(_shutdown_event))
 
     yield
 
@@ -1303,6 +1350,7 @@ async def lifespan(app: FastAPI):
     await sudo_sweeper_task
     await ide_sweeper_task
     await gc_sweeper_task
+    await imap_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -1675,6 +1723,17 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                         )
                     result["repo_name"] = repo_name
 
+            # Grant job creator read access to the Gitea repo
+            if result.get("repo_name") and job.user_id:
+                try:
+                    creator = await postgres_db.get_user(job.user_id)
+                    if creator and creator.get("email"):
+                        await gitea_client.grant_user_repo_access(
+                            creator["email"], result["repo_name"]
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to grant Gitea access for job {job_id_str}: {e}")
+
         # Clone selected global datasources as job-scoped
         if job.datasource_ids:
             new_job_id = str(result["id"])
@@ -1970,11 +2029,12 @@ async def pause_job(job_id: str) -> dict[str, str]:
 class MessageSendRequest(BaseModel):
     """Request body for agent-initiated message send."""
 
-    to: str = Field(..., description="Recipient: 'user' for job owner")
+    to: str = Field(..., description="Recipient: 'user' for job owner, or display name / email of a project member")
     subject: str = Field(..., max_length=200, description="Subject line")
     message: str = Field(..., max_length=5000, description="Message body (markdown)")
     mode: str = Field("async", description="'async' or 'blocking'")
     thread_id: str | None = Field(None, description="Existing thread ID, or null for new thread")
+    project_id: str | None = Field(None, description="Project ID for member resolution (auto-filled from job)")
 
 
 class MessageReplyRequest(BaseModel):
@@ -2013,21 +2073,59 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
             )
 
         # Resolve recipient
-        if request.to != "user":
-            raise HTTPException(
-                status_code=400,
-                detail="Only to='user' (job owner) is supported in Phase 1.",
+        if request.to == "user":
+            # Job owner
+            user = await postgres_db.get_user(user_id)
+            if not user or not user.get("email"):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Job owner has no email address.",
+                )
+            recipient_email = user["email"]
+            recipient_name = user.get("display_name", "User")
+        else:
+            # Multi-recipient: resolve from project members
+            project_id = request.project_id or (
+                str(job["project_id"]) if job.get("project_id") else None
             )
-
-        user = await postgres_db.get_user(user_id)
-        if not user or not user.get("email"):
-            raise HTTPException(
-                status_code=404,
-                detail="Job owner has no email address.",
-            )
-
-        recipient_email = user["email"]
-        recipient_name = user.get("display_name", "User")
+            if not project_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot resolve recipient '{request.to}': "
+                        "job has no project_id. Use to='user' for the job owner."
+                    ),
+                )
+            members = await postgres_db.get_project_members(project_id)
+            if not members:
+                raise HTTPException(
+                    status_code=404,
+                    detail="No project members found.",
+                )
+            # Match by display_name or email (case-insensitive)
+            to_lower = request.to.lower()
+            match = None
+            for m in members:
+                if (
+                    m.get("email", "").lower() == to_lower
+                    or m.get("display_name", "").lower() == to_lower
+                ):
+                    match = m
+                    break
+            if not match:
+                available = ", ".join(
+                    m.get("display_name", "?") for m in members
+                )
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Recipient '{request.to}' not found among project members. "
+                        f"Available: {available}"
+                    ),
+                )
+            recipient_email = match["email"]
+            recipient_name = match.get("display_name", "User")
+            user_id = str(match["user_id"])
 
         # Check rate limits
         limits = await postgres_db.check_message_rate_limit(job_id, user_id)
@@ -2080,7 +2178,7 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
         sequence = await postgres_db.get_message_sequence(job_id, thread_id)
 
         # Send email (graceful if SMTP not configured)
-        email_sent = await email_service.send_agent_message(
+        email_sent, email_msg_id = await email_service.send_agent_message(
             to=recipient_email,
             to_name=recipient_name,
             subject=request.subject,
@@ -2106,6 +2204,7 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
             mode=request.mode,
             status=status,
             error_message=error_msg,
+            email_message_id=email_msg_id,
         )
 
         # If blocking mode, update job status and store freeze data
@@ -2143,82 +2242,142 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+async def _route_inbound_reply(
+    job_id: str,
+    thread_id: str,
+    message: str,
+    sender_email: str | None = None,
+    email_message_id: str | None = None,
+    urgent: bool = False,
+) -> tuple[str, int]:
+    """Route an inbound reply to the correct job/thread.
+
+    Shared by the cockpit reply endpoint and the IMAP poller.
+
+    Args:
+        job_id: Target job UUID
+        thread_id: Target thread ID
+        message: Reply body
+        sender_email: Sender's email (for user resolution, IMAP only)
+        email_message_id: RFC822 Message-ID for dedup (IMAP only)
+        urgent: Whether the reply should interrupt immediately
+
+    Returns:
+        Tuple of (delivery_strategy, sequence_number).
+
+    Raises:
+        ValueError: If the job is not found.
+    """
+    job = await postgres_db.get_job(job_id)
+    if not job:
+        raise ValueError(f"Job '{job_id}' not found")
+
+    # Resolve user_id from sender email or job owner
+    user_id = None
+    if sender_email:
+        async with postgres_db.acquire() as conn:
+            user_row = await conn.fetchrow(
+                "SELECT id FROM users WHERE email = $1", sender_email,
+            )
+        if user_row:
+            user_id = str(user_row["id"])
+    if not user_id:
+        user_id = str(job.get("user_id", "")) if job.get("user_id") else None
+
+    # Get sequence number
+    sequence = await postgres_db.get_message_sequence(job_id, thread_id)
+
+    # Log inbound message
+    await postgres_db.log_message(
+        job_id=job_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        direction="inbound",
+        subject="(reply)",
+        message=message,
+        status="delivered",
+        email_message_id=email_message_id,
+    )
+
+    # Check if job is waiting for a reply on this thread
+    job_status = job.get("status", "")
+    freeze_data = job.get("freeze_data")
+    if isinstance(freeze_data, str):
+        try:
+            freeze_data = json.loads(freeze_data)
+        except json.JSONDecodeError:
+            freeze_data = None
+
+    is_blocking_reply = (
+        job_status == "waiting_for_reply"
+        and freeze_data
+        and freeze_data.get("thread_id") == thread_id
+    )
+
+    if is_blocking_reply:
+        await _internal_resume_job(job_id, feedback=message)
+        return "immediate_resume", sequence
+
+    # Look up user delivery preferences
+    user_prefs = {}
+    if user_id:
+        try:
+            user_settings = await postgres_db.get_user_settings(user_id)
+            user_prefs = (user_settings or {}).get("communication", {}).get("delivery", {})
+        except Exception:
+            pass  # Non-critical — fall back to defaults
+
+    # Check urgent flag (explicit from cockpit, or user preference)
+    urgent_override = user_prefs.get("urgent_override", True)
+    if urgent and urgent_override:
+        await _internal_resume_job(job_id, feedback=message)
+        return "immediate_interrupt", sequence
+
+    # Check user's async reply preference
+    async_pref = user_prefs.get("async_reply", "next_strategic_phase")
+    if async_pref == "immediate_interrupt":
+        await _internal_resume_job(job_id, feedback=message)
+        return "immediate_interrupt", sequence
+
+    # Default: queue for next strategic phase
+    job_context = job.get("context") or {}
+    if isinstance(job_context, str):
+        try:
+            job_context = json.loads(job_context)
+        except json.JSONDecodeError:
+            job_context = {}
+    queued_replies = job_context.get("queued_replies", [])
+    queued_replies.append({
+        "thread_id": thread_id,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    job_context["queued_replies"] = queued_replies
+    await postgres_db.update_job_context(job_id, job_context)
+    return "next_strategic_phase", sequence
+
+
 @app.post("/api/jobs/{job_id}/messages/{thread_id}/reply")
 async def reply_to_agent_message(
     job_id: str,
     thread_id: str,
     request: MessageReplyRequest,
 ) -> dict[str, Any]:
-    """Reply to an agent's message (cockpit UI).
+    """Reply to an agent's message (cockpit UI or IMAP).
 
     If the job is in 'waiting_for_reply' status and the thread matches,
     resumes the job with the reply as feedback. Otherwise, queues the reply
     for the next strategic phase.
     """
     try:
-        job = await postgres_db.get_job(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
-
-        user_id = str(job.get("user_id", "")) if job.get("user_id") else None
-
-        # Get sequence number
-        sequence = await postgres_db.get_message_sequence(job_id, thread_id)
-
-        # Log inbound message
-        await postgres_db.log_message(
+        delivery_strategy, sequence = await _route_inbound_reply(
             job_id=job_id,
-            user_id=user_id,
             thread_id=thread_id,
-            direction="inbound",
-            subject="(reply)",
             message=request.message,
-            status="delivered",
+            urgent=request.urgent,
         )
 
         file_path = f"messages/{thread_id}/{sequence:03d}_received.md"
-
-        # Check if job is waiting for a reply on this thread
-        job_status = job.get("status", "")
-        freeze_data = job.get("freeze_data")
-        if isinstance(freeze_data, str):
-            try:
-                freeze_data = json.loads(freeze_data)
-            except json.JSONDecodeError:
-                freeze_data = None
-
-        is_blocking_reply = (
-            job_status == "waiting_for_reply"
-            and freeze_data
-            and freeze_data.get("thread_id") == thread_id
-        )
-
-        if is_blocking_reply:
-            # Resume the job with the reply as feedback
-            await _internal_resume_job(job_id, feedback=request.message)
-            delivery_strategy = "immediate_resume"
-        elif request.urgent:
-            # Urgent reply to async thread — also resume with feedback
-            await _internal_resume_job(job_id, feedback=request.message)
-            delivery_strategy = "immediate_interrupt"
-        else:
-            # Async reply — queue for next strategic phase
-            # Store in job context for the agent to discover
-            job_context = job.get("context") or {}
-            if isinstance(job_context, str):
-                try:
-                    job_context = json.loads(job_context)
-                except json.JSONDecodeError:
-                    job_context = {}
-            queued_replies = job_context.get("queued_replies", [])
-            queued_replies.append({
-                "thread_id": thread_id,
-                "message": request.message,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            job_context["queued_replies"] = queued_replies
-            await postgres_db.update_job_context(job_id, job_context)
-            delivery_strategy = "next_strategic_phase"
 
         return {
             "status": "delivered",
@@ -2227,6 +2386,8 @@ async def reply_to_agent_message(
             "delivery_strategy": delivery_strategy,
         }
 
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
@@ -5839,9 +6000,14 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
     for key in ("$extends", "connections"):
         merged.pop(key, None)
 
+    # Expose the defaults' tool lists so the cockpit can re-enable
+    # categories that an expert disabled (e.g., scholar sets citation: []).
+    defaults_tools = defaults.get("tools", {})
+
     return {
         "config": merged,
         "instructions": instructions_content,
+        "defaults_tools": defaults_tools,
     }
 
 
@@ -6376,7 +6542,7 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
             role="owner",
         )
 
-        # Create Gitea jobs repo
+        # Create Gitea jobs repo and grant creator access
         if gitea_client.is_initialized:
             repo_name = f"project-{str(project['id'])[:8]}-jobs"
             repo_url = await gitea_client.create_repo(repo_name)
@@ -6388,6 +6554,16 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                     role="jobs",
                     is_managed=True,
                 )
+                # Grant creator read access
+                if body.user_id:
+                    try:
+                        creator = await postgres_db.get_user(body.user_id)
+                        if creator and creator.get("email"):
+                            await gitea_client.grant_user_repo_access(
+                                creator["email"], repo_name
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to grant Gitea access for project creator: {e}")
 
         # Create Keycloak group and add creator
         if keycloak_groups.is_initialized:
@@ -6515,6 +6691,22 @@ async def add_project_member(project_id: str, body: ProjectMemberAdd) -> dict[st
                     user["keycloak_sub"], project_id
                 )
 
+        # Grant Gitea access to all managed project repos
+        if gitea_client.is_initialized:
+            try:
+                member_user = await postgres_db.get_user(body.user_id)
+                if member_user and member_user.get("email"):
+                    repos = await postgres_db.get_project_repositories(project_id)
+                    for repo in repos:
+                        if repo.get("is_managed"):
+                            await gitea_client.grant_user_repo_access(
+                                member_user["email"], repo["name"]
+                            )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to grant Gitea access for member {body.user_id}: {e}"
+                )
+
         return result
     except Exception as e:
         if "duplicate key" in str(e).lower() or "unique" in str(e).lower():
@@ -6558,6 +6750,22 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
         if user and user.get("keycloak_sub"):
             await keycloak_groups.remove_user_from_project_group(
                 user["keycloak_sub"], project_id
+            )
+
+    # Revoke Gitea access from managed project repos
+    if gitea_client.is_initialized:
+        try:
+            removed_user = await postgres_db.get_user(user_id)
+            if removed_user and removed_user.get("email"):
+                repos = await postgres_db.get_project_repositories(project_id)
+                for repo in repos:
+                    if repo.get("is_managed"):
+                        await gitea_client.revoke_user_repo_access(
+                            removed_user["email"], repo["name"]
+                        )
+        except Exception as e:
+            logger.warning(
+                f"Failed to revoke Gitea access for member {user_id}: {e}"
             )
 
     return {"status": "removed"}
