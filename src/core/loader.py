@@ -803,6 +803,7 @@ class AuxiliaryConfig:
     enabled: bool = True
     model: Optional[str] = None       # null = use main LLM
     base_url: Optional[str] = None    # null = use main LLM endpoint
+    api_key: Optional[str] = None     # null = use provider env var
     temperature: float = 0.0
     max_iterations: int = 15          # Cap for agent mode loops
     timeout: float = 120.0            # Seconds per LLM call
@@ -966,6 +967,7 @@ def _parse_auxiliary_config(data: Dict[str, Any]) -> AuxiliaryConfig:
         enabled=data.get("enabled", True),
         model=data.get("model"),
         base_url=data.get("base_url"),
+        api_key=data.get("api_key"),
         temperature=data.get("temperature", 0.0),
         max_iterations=data.get("max_iterations", 15),
         timeout=data.get("timeout", 120.0),

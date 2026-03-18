@@ -468,9 +468,7 @@ class IdeSessionService:
             return
 
         container_name = f"srw-ide-{job_id[:12]}"
-        gitea_url = os.environ.get("GITEA_URL", "http://gitea:3000")
-        gitea_internal_url = os.environ.get("GITEA_INTERNAL_URL", gitea_url)
-        clone_url = f"{gitea_internal_url}/srw/{repo_name}.git"
+        clone_url = self._build_gitea_clone_url(repo_name)
         host_port = await self._find_free_port()
 
         code_server_image = os.environ.get(
@@ -487,9 +485,9 @@ class IdeSessionService:
             runtime = await self._detect_container_runtime()
 
             # Run code-server container with git clone as entrypoint
-            # The container clones the repo, then starts code-server on port 8080
+            # The container clones the repo, then starts code-server
             entrypoint_script = (
-                f"git clone --branch {branch} {clone_url} /home/coder/workspace 2>/dev/null; "
+                f"git clone --branch {branch} {clone_url} /home/coder/workspace && "
                 f"exec code-server --bind-addr 0.0.0.0:{host_port} --auth none /home/coder/workspace"
             )
 
@@ -500,8 +498,9 @@ class IdeSessionService:
                 "-e", f"PORT={host_port}",
                 "--label", f"srw.job_id={job_id}",
                 "--label", "srw.type=ide-session",
+                "--entrypoint", "sh",
                 code_server_image,
-                "sh", "-c", entrypoint_script,
+                "-c", entrypoint_script,
             ]
 
             proc = await asyncio.create_subprocess_exec(
@@ -652,8 +651,7 @@ class IdeSessionService:
         if not repo_name:
             return
 
-        gitea_url = os.environ.get("GITEA_URL", "http://gitea:3000")
-        clone_url = f"{gitea_url}/srw/{repo_name}.git"
+        clone_url = self._build_gitea_clone_url(repo_name)
         branch = job.get("branch_name") or "main"
 
         cmd = (
@@ -772,6 +770,32 @@ class IdeSessionService:
     # =========================================================================
     # Container helpers (Gitea fallback)
     # =========================================================================
+
+    @staticmethod
+    def _build_gitea_clone_url(repo_name: str) -> str:
+        """Build a Gitea clone URL with embedded credentials.
+
+        Uses GITEA_INTERNAL_URL (for container-to-host reachability),
+        falling back to GITEA_URL. Injects GITEA_ADMIN_USER/PASSWORD
+        for authentication.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        gitea_url = os.environ.get("GITEA_URL", "http://localhost:3000")
+        gitea_internal_url = os.environ.get("GITEA_INTERNAL_URL", gitea_url)
+        user = os.environ.get("GITEA_ADMIN_USER", "srw")
+        password = os.environ.get("GITEA_ADMIN_PASSWORD", "")
+
+        parsed = urlparse(gitea_internal_url)
+        if password:
+            netloc = f"{user}:{password}@{parsed.hostname}"
+        else:
+            netloc = parsed.hostname
+        if parsed.port:
+            netloc += f":{parsed.port}"
+
+        base = urlunparse(parsed._replace(netloc=netloc))
+        return f"{base}/srw/{repo_name}.git"
 
     @staticmethod
     async def _detect_container_runtime() -> str:

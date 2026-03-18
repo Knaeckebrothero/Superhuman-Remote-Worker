@@ -165,29 +165,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_user_api_keys_provider ON user_api_keys(use
 CREATE INDEX IF NOT EXISTS idx_user_api_keys_user ON user_api_keys(user_id);
 
 -- ============================================================================
--- 0i. PROJECT API KEYS TABLE
--- Per-project API keys (fallback when user has no key for a provider).
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS project_api_keys (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    provider VARCHAR(50) NOT NULL,
-    api_key TEXT NOT NULL,
-    key_prefix VARCHAR(12) NOT NULL,
-    label TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT valid_project_api_key_provider CHECK (provider IN (
-        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
-    ))
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_project_api_keys_provider ON project_api_keys(project_id, provider);
-CREATE INDEX IF NOT EXISTS idx_project_api_keys_project ON project_api_keys(project_id);
-
--- ============================================================================
 -- 0c. PROJECTS TABLE
 -- Resource hub grouping jobs, repositories, datasources, and members.
 -- ============================================================================
@@ -265,6 +242,29 @@ END $$;
 -- init.py after seeding default projects, to avoid ordering issues.
 
 -- ============================================================================
+-- 0i. PROJECT API KEYS TABLE
+-- Per-project API keys (fallback when user has no key for a provider).
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS project_api_keys (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    provider VARCHAR(50) NOT NULL,
+    api_key TEXT NOT NULL,
+    key_prefix VARCHAR(12) NOT NULL,
+    label TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT valid_project_api_key_provider CHECK (provider IN (
+        'openai', 'anthropic', 'google', 'groq', 'openrouter', 'tavily', 'vision'
+    ))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_project_api_keys_provider ON project_api_keys(project_id, provider);
+CREATE INDEX IF NOT EXISTS idx_project_api_keys_project ON project_api_keys(project_id);
+
+-- ============================================================================
 -- 1. JOBS TABLE
 -- Tracks all processing jobs submitted to the system
 -- ============================================================================
@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- Scheduling
     priority INTEGER NOT NULL DEFAULT 5,
 
-    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused', 'reviewing', 'waiting')),
+    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply')),
     CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
     CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
 );
@@ -382,14 +382,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_priority ON jobs(priority DESC);
 DO $$ BEGIN
     ALTER TABLE jobs ADD COLUMN repo_name VARCHAR(200);
 EXCEPTION WHEN duplicate_column THEN null;
-END $$;
-
--- Migration: Add 'paused' to valid job statuses
--- (CHECK constraint is defined in CREATE TABLE; this handles existing databases)
-DO $$ BEGIN
-    ALTER TABLE jobs DROP CONSTRAINT IF EXISTS valid_status;
-    ALTER TABLE jobs ADD CONSTRAINT valid_status
-        CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused'));
 END $$;
 
 -- Migration: Add 'reviewing' and 'waiting' statuses for critic feedback loop
@@ -762,7 +754,34 @@ CREATE INDEX IF NOT EXISTS idx_sudo_rules_active
     WHERE enabled = TRUE;
 
 -- ============================================================================
--- 9. VIEWS
+-- 9. MESSAGE LOG (Agent-Human Communication)
+-- Stores all messages between agents and humans for audit trail
+-- and rate limit enforcement. Messages are also stored as workspace files.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS message_log (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id           UUID REFERENCES jobs(id) ON DELETE CASCADE,
+    user_id          UUID REFERENCES users(id) ON DELETE SET NULL,
+    thread_id        VARCHAR(12) NOT NULL,
+    direction        VARCHAR(10) NOT NULL,          -- 'outbound' or 'inbound'
+    recipient_email  TEXT,
+    subject          TEXT NOT NULL,
+    message          TEXT NOT NULL,
+    mode             VARCHAR(10),                   -- 'async', 'blocking' (outbound only)
+    status           VARCHAR(20) NOT NULL,          -- sent, failed, rate_limited, delivered
+    error_message    TEXT,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_log_job ON message_log(job_id);
+CREATE INDEX IF NOT EXISTS idx_message_log_thread ON message_log(thread_id);
+CREATE INDEX IF NOT EXISTS idx_message_log_user_created ON message_log(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_log_rate ON message_log(job_id, created_at)
+    WHERE direction = 'outbound';
+
+-- ============================================================================
+-- 10. VIEWS
 -- ============================================================================
 
 -- Drop and recreate: adding project columns requires view recreation

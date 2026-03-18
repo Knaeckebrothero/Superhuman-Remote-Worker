@@ -77,6 +77,7 @@ from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
+from services.email import email_service  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -243,7 +244,7 @@ async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
         repo_name,
         pr["number"],
         merge_strategy="squash",
-        delete_branch_after_merge=True,
+        delete_branch_after_merge=False,
     )
 
     if not merged:
@@ -493,6 +494,23 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 config_override.setdefault("env_keys", {}).update(env_keys)
             logger.info(f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}")
 
+        # Inject user's auxiliary model preference + API key
+        if job.get("user_id"):
+            user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
+            aux_model = user_settings.get("default_auxiliary_model")
+            if aux_model:
+                config_override = config_override or {}
+                aux_override = config_override.setdefault("auxiliary", {})
+                if "model" not in aux_override:
+                    aux_override["model"] = aux_model
+                    aux_provider = _detect_provider_from_model(aux_model)
+                    if resolved_keys and aux_provider in resolved_keys:
+                        aux_override["api_key"] = resolved_keys[aux_provider]
+                    logger.info(
+                        f"Dispatch: injected auxiliary model override: "
+                        f"{aux_model} (provider={aux_provider})"
+                    )
+
         # Build job start request
         job_start = JobStartRequest(
             job_id=job_id,
@@ -543,7 +561,7 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         return True
 
     except Exception as e:
-        logger.error(f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}")
+        logger.error(f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}", exc_info=True)
         return False
 
 
@@ -734,6 +752,23 @@ def _detect_llm_provider_for_dispatch(job: dict, config_override: dict | None) -
     config_name = job.get("config_name", "default")
     if config_name and "anthropic" in config_name.lower():
         return "anthropic"
+    return "openai"
+
+
+def _detect_provider_from_model(model: str) -> str:
+    """Detect LLM provider from a model name string.
+
+    Uses the same prefix-matching logic as _detect_llm_provider_for_dispatch().
+    """
+    model_lower = model.lower()
+    if model_lower.startswith("openrouter/"):
+        return "openrouter"
+    if model_lower.startswith("groq/"):
+        return "groq"
+    if model_lower.startswith("claude"):
+        return "anthropic"
+    if model_lower.startswith("gemini"):
+        return "google"
     return "openai"
 
 
@@ -1078,6 +1113,7 @@ class UserSettingsUpdate(BaseModel):
     default_model: str | None = None
     default_autonomy: str | None = None
     default_reasoning_level: str | None = None
+    default_auxiliary_model: str | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -1927,6 +1963,314 @@ async def pause_job(job_id: str) -> dict[str, str]:
 
 
 # =============================================================================
+# Agent Messaging Endpoints (Live Communication)
+# =============================================================================
+
+
+class MessageSendRequest(BaseModel):
+    """Request body for agent-initiated message send."""
+
+    to: str = Field(..., description="Recipient: 'user' for job owner")
+    subject: str = Field(..., max_length=200, description="Subject line")
+    message: str = Field(..., max_length=5000, description="Message body (markdown)")
+    mode: str = Field("async", description="'async' or 'blocking'")
+    thread_id: str | None = Field(None, description="Existing thread ID, or null for new thread")
+
+
+class MessageReplyRequest(BaseModel):
+    """Request body for human reply to agent message."""
+
+    message: str = Field(..., description="Reply body")
+    urgent: bool = Field(False, description="Deliver as immediate interrupt")
+
+
+def _mask_email(email: str) -> str:
+    """Mask email for display: alice@example.com -> a***@example.com"""
+    if not email or "@" not in email:
+        return email or ""
+    local, domain = email.rsplit("@", 1)
+    return f"{local[0]}***@{domain}" if len(local) > 1 else f"*@{domain}"
+
+
+@app.post("/api/jobs/{job_id}/messages/send")
+async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[str, Any]:
+    """Send a message from an agent to a human.
+
+    Agent-facing endpoint (no auth required). Resolves recipient from job
+    ownership, checks rate limits, sends email, and logs to message_log.
+    """
+    try:
+        # Validate job exists and has an owner
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        user_id = str(job.get("user_id", "")) if job.get("user_id") else None
+        if not user_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Job has no associated user. Cannot resolve recipient.",
+            )
+
+        # Resolve recipient
+        if request.to != "user":
+            raise HTTPException(
+                status_code=400,
+                detail="Only to='user' (job owner) is supported in Phase 1.",
+            )
+
+        user = await postgres_db.get_user(user_id)
+        if not user or not user.get("email"):
+            raise HTTPException(
+                status_code=404,
+                detail="Job owner has no email address.",
+            )
+
+        recipient_email = user["email"]
+        recipient_name = user.get("display_name", "User")
+
+        # Check rate limits
+        limits = await postgres_db.check_message_rate_limit(job_id, user_id)
+        if limits["job_hourly"] >= 5:
+            await postgres_db.log_message(
+                job_id=job_id, thread_id=request.thread_id or "?",
+                direction="outbound", subject=request.subject,
+                message=request.message, status="rate_limited",
+                user_id=user_id, mode=request.mode,
+                error_message="Rate limit: 5 per hour per job",
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "rate_limited",
+                    "error": "Rate limit exceeded: 5 messages per hour per job",
+                    "retry_after_seconds": 3600,
+                },
+            )
+        if limits["job_daily"] >= 15:
+            await postgres_db.log_message(
+                job_id=job_id, thread_id=request.thread_id or "?",
+                direction="outbound", subject=request.subject,
+                message=request.message, status="rate_limited",
+                user_id=user_id, mode=request.mode,
+                error_message="Rate limit: 15 per day per job",
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "rate_limited",
+                    "error": "Rate limit exceeded: 15 messages per 24 hours per job",
+                    "retry_after_seconds": 86400,
+                },
+            )
+        if limits["user_daily"] >= 30:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "rate_limited",
+                    "error": "Rate limit exceeded: 30 messages per 24 hours per user",
+                    "retry_after_seconds": 86400,
+                },
+            )
+
+        # Generate thread_id if not provided
+        thread_id = request.thread_id or secrets.token_hex(3)
+
+        # Get sequence number
+        sequence = await postgres_db.get_message_sequence(job_id, thread_id)
+
+        # Send email (graceful if SMTP not configured)
+        email_sent = await email_service.send_agent_message(
+            to=recipient_email,
+            to_name=recipient_name,
+            subject=request.subject,
+            message_md=request.message,
+            job_id=job_id,
+            job_description=job.get("description", "")[:100],
+            config_name=job.get("config_name", "default"),
+            thread_id=thread_id,
+        )
+
+        status = "sent" if email_sent else "sent"  # Message logged even if email fails
+        error_msg = None if email_sent else "SMTP not configured or send failed"
+
+        # Log to message_log
+        log_entry = await postgres_db.log_message(
+            job_id=job_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            direction="outbound",
+            recipient_email=recipient_email,
+            subject=request.subject,
+            message=request.message,
+            mode=request.mode,
+            status=status,
+            error_message=error_msg,
+        )
+
+        # If blocking mode, update job status and store freeze data
+        if request.mode == "blocking":
+            freeze_data = {
+                "status": "waiting_for_reply",
+                "freeze_type": "blocking_message",
+                "thread_id": thread_id,
+                "subject": request.subject,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "job_id": job_id,
+            }
+            await postgres_db.update_job_status(
+                job_id=job_id,
+                status="waiting_for_reply",
+                freeze_data=freeze_data,
+            )
+
+        file_path = f"messages/{thread_id}/{sequence:03d}_sent.md"
+
+        return {
+            "status": "sent",
+            "thread_id": thread_id,
+            "sequence": sequence,
+            "file_path": file_path,
+            "recipient": _mask_email(recipient_email),
+            "to_name": recipient_name,
+            "email_delivered": email_sent,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to send agent message for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/messages/{thread_id}/reply")
+async def reply_to_agent_message(
+    job_id: str,
+    thread_id: str,
+    request: MessageReplyRequest,
+) -> dict[str, Any]:
+    """Reply to an agent's message (cockpit UI).
+
+    If the job is in 'waiting_for_reply' status and the thread matches,
+    resumes the job with the reply as feedback. Otherwise, queues the reply
+    for the next strategic phase.
+    """
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        user_id = str(job.get("user_id", "")) if job.get("user_id") else None
+
+        # Get sequence number
+        sequence = await postgres_db.get_message_sequence(job_id, thread_id)
+
+        # Log inbound message
+        await postgres_db.log_message(
+            job_id=job_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            direction="inbound",
+            subject="(reply)",
+            message=request.message,
+            status="delivered",
+        )
+
+        file_path = f"messages/{thread_id}/{sequence:03d}_received.md"
+
+        # Check if job is waiting for a reply on this thread
+        job_status = job.get("status", "")
+        freeze_data = job.get("freeze_data")
+        if isinstance(freeze_data, str):
+            try:
+                freeze_data = json.loads(freeze_data)
+            except json.JSONDecodeError:
+                freeze_data = None
+
+        is_blocking_reply = (
+            job_status == "waiting_for_reply"
+            and freeze_data
+            and freeze_data.get("thread_id") == thread_id
+        )
+
+        if is_blocking_reply:
+            # Resume the job with the reply as feedback
+            await _internal_resume_job(job_id, feedback=request.message)
+            delivery_strategy = "immediate_resume"
+        elif request.urgent:
+            # Urgent reply to async thread — also resume with feedback
+            await _internal_resume_job(job_id, feedback=request.message)
+            delivery_strategy = "immediate_interrupt"
+        else:
+            # Async reply — queue for next strategic phase
+            # Store in job context for the agent to discover
+            job_context = job.get("context") or {}
+            if isinstance(job_context, str):
+                try:
+                    job_context = json.loads(job_context)
+                except json.JSONDecodeError:
+                    job_context = {}
+            queued_replies = job_context.get("queued_replies", [])
+            queued_replies.append({
+                "thread_id": thread_id,
+                "message": request.message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            job_context["queued_replies"] = queued_replies
+            await postgres_db.update_job_context(job_id, job_context)
+            delivery_strategy = "next_strategic_phase"
+
+        return {
+            "status": "delivered",
+            "sequence": sequence,
+            "file_path": file_path,
+            "delivery_strategy": delivery_strategy,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to deliver reply for job {job_id} thread {thread_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/jobs/{job_id}/messages")
+async def list_message_threads(job_id: str) -> dict[str, Any]:
+    """List message threads for a job."""
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        threads = await postgres_db.get_message_threads(job_id)
+
+        # Enrich with job freeze status
+        freeze_data = job.get("freeze_data")
+        if isinstance(freeze_data, str):
+            try:
+                freeze_data = json.loads(freeze_data)
+            except json.JSONDecodeError:
+                freeze_data = None
+
+        waiting_thread = None
+        if job.get("status") == "waiting_for_reply" and freeze_data:
+            waiting_thread = freeze_data.get("thread_id")
+
+        for thread in threads:
+            thread["status"] = (
+                "waiting_for_reply" if thread["thread_id"] == waiting_thread else "active"
+            )
+
+        return {"threads": threads}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to list message threads for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
 # VM Lifecycle Endpoints (optional — requires NATS)
 # =============================================================================
 
@@ -2699,6 +3043,7 @@ async def _spawn_scholar_subjob(
         parent_job_id=job_id,
         project_id=project_id,
         priority=10,
+        user_id=str(job["user_id"]) if job.get("user_id") else None,
     )
 
     scholar_job_id = str(scholar_job["id"])
@@ -3083,6 +3428,7 @@ async def _trigger_verification_on_complete(
             parent_job_id=job_id,
             project_id=project_id,
             priority=10,
+            user_id=str(job["user_id"]) if job.get("user_id") else None,
         )
 
         critic_job_id = str(critic_job["id"])
