@@ -1,4 +1,4 @@
-import { Component, inject, signal, OnInit } from '@angular/core';
+import { Component, effect, inject, signal, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { McpTokenService } from '../../core/services/mcp-token.service';
@@ -571,6 +571,19 @@ export class SettingsComponent implements OnInit {
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
+  constructor() {
+    // Reactively sync preference form fields when the preferences signal updates.
+    effect(() => {
+      const prefs = this.settingsService.preferences();
+      if (Object.keys(prefs).length > 0) {
+        this.prefModel = prefs.default_model || '';
+        this.prefAuxModel = prefs.default_auxiliary_model || '';
+        this.prefAutonomy = prefs.default_autonomy || '';
+        this.prefReasoning = prefs.default_reasoning_level || '';
+      }
+    });
+  }
+
   /** Only show active (non-revoked) tokens. */
   activeTokens = () =>
     this.tokenService.tokens().filter((t) => !t.revoked_at);
@@ -583,14 +596,6 @@ export class SettingsComponent implements OnInit {
       .getProjects(this.userService.currentUserId() ?? undefined)
       .subscribe((p) => this.projects.set(p));
 
-    // Pre-fill preferences once loaded
-    setTimeout(() => {
-      const prefs = this.settingsService.preferences();
-      this.prefModel = prefs.default_model || '';
-      this.prefAuxModel = prefs.default_auxiliary_model || '';
-      this.prefAutonomy = prefs.default_autonomy || '';
-      this.prefReasoning = prefs.default_reasoning_level || '';
-    }, 500);
   }
 
   providerLabel(provider: string): string {

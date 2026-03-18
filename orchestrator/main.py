@@ -525,7 +525,8 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 config_override.setdefault("env_keys", {}).update(env_keys)
             logger.info(f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}")
 
-        # Inject user's auxiliary model preference + API key
+        # Inject user preferences as lowest-priority config overrides
+        # (only fill gaps not set by per-job or project-level overrides)
         if job.get("user_id"):
             user_settings = await postgres_db.get_user_settings(str(job["user_id"]))
             aux_model = user_settings.get("default_auxiliary_model")
@@ -541,6 +542,32 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                         f"Dispatch: injected auxiliary model override: "
                         f"{aux_model} (provider={aux_provider})"
                     )
+
+            default_model = user_settings.get("default_model")
+            if default_model:
+                config_override = config_override or {}
+                llm_override = config_override.setdefault("llm", {})
+                if "model" not in llm_override:
+                    llm_override["model"] = default_model
+                    model_provider = _detect_provider_from_model(default_model)
+                    if resolved_keys and model_provider in resolved_keys and "api_key" not in llm_override:
+                        llm_override["api_key"] = resolved_keys[model_provider]
+                    logger.info(f"Dispatch: injected user default_model: {default_model}")
+
+            default_autonomy = user_settings.get("default_autonomy")
+            if default_autonomy:
+                config_override = config_override or {}
+                if "autonomy" not in config_override:
+                    config_override["autonomy"] = default_autonomy
+                    logger.info(f"Dispatch: injected user default_autonomy: {default_autonomy}")
+
+            default_reasoning = user_settings.get("default_reasoning_level")
+            if default_reasoning:
+                config_override = config_override or {}
+                llm_override = config_override.setdefault("llm", {})
+                if "reasoning_level" not in llm_override:
+                    llm_override["reasoning_level"] = default_reasoning
+                    logger.info(f"Dispatch: injected user default_reasoning_level: {default_reasoning}")
 
         # Build job start request
         job_start = JobStartRequest(

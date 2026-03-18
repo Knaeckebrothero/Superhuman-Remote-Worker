@@ -1972,7 +1972,8 @@ export class JobCreateComponent implements OnInit {
       strategic['reasoning_level'] = sr;
     }
     const st = this.strategicTemperature();
-    if (st !== null && st !== this.getExpertPhaseDefault('strategic', 'temperature')) {
+    const stDefault = this.getExpertPhaseDefault('strategic', 'temperature') as number | null;
+    if (st !== null && st !== (stDefault ?? 0)) {
       strategic['temperature'] = st;
     }
     const smm = this.strategicMultimodal();
@@ -1990,7 +1991,8 @@ export class JobCreateComponent implements OnInit {
       tactical['reasoning_level'] = tr;
     }
     const tt = this.tacticalTemperature();
-    if (tt !== null && tt !== this.getExpertPhaseDefault('tactical', 'temperature')) {
+    const ttDefault = this.getExpertPhaseDefault('tactical', 'temperature') as number | null;
+    if (tt !== null && tt !== (ttDefault ?? 0)) {
       tactical['temperature'] = tt;
     }
     const tmm = this.tacticalMultimodal();
