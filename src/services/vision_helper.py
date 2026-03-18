@@ -112,6 +112,7 @@ class VisionHelper:
         image_data: Union[bytes, str],
         mime_type: str = "image/png",
         query: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """
         Generate a description of an image.
@@ -120,6 +121,7 @@ class VisionHelper:
             image_data: Raw image bytes or base64-encoded string
             mime_type: MIME type of the image (e.g., "image/jpeg", "image/png")
             query: Optional specific question about the image
+            job_id: Optional job ID for archiving the LLM call
 
         Returns:
             Text description of the image
@@ -132,7 +134,11 @@ class VisionHelper:
             "objects, colors, layout, and any other relevant information."
         )
 
+        prompt_text = query or default_prompt
+
         try:
+            import time as _time
+            start = _time.monotonic()
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -141,7 +147,7 @@ class VisionHelper:
                         "content": [
                             {
                                 "type": "text",
-                                "text": query or default_prompt,
+                                "text": prompt_text,
                             },
                             {
                                 "type": "image_url",
@@ -154,8 +160,19 @@ class VisionHelper:
                 ],
                 max_tokens=1000,
             )
+            latency_ms = int((_time.monotonic() - start) * 1000)
+            content = response.choices[0].message.content
 
-            return response.choices[0].message.content
+            self._archive_vision_call(
+                job_id=job_id,
+                prompt_text=prompt_text,
+                response_text=content,
+                mime_type=mime_type,
+                image_size=len(image_data),
+                latency_ms=latency_ms,
+            )
+
+            return content
 
         except Exception as e:
             logger.error(f"Error in describe_image: {e}", exc_info=True)
@@ -166,12 +183,13 @@ class VisionHelper:
         image_data: Union[bytes, str],
         mime_type: str = "image/png",
         query: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """Synchronous wrapper for describe_image.
 
         Use this in sync tool implementations.
         """
-        return run_async(self.describe_image(image_data, mime_type, query))
+        return run_async(self.describe_image(image_data, mime_type, query, job_id))
 
     async def describe_document_page(
         self,
@@ -179,6 +197,7 @@ class VisionHelper:
         page_num: int,
         mime_type: str = "image/png",
         query: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """
         Describe a rendered document page (e.g., PDF page, PowerPoint slide).
@@ -188,6 +207,7 @@ class VisionHelper:
             page_num: Page number (for context in the prompt)
             mime_type: MIME type of the image (default: "image/png")
             query: Optional specific question about the page
+            job_id: Optional job ID for archiving the LLM call
 
         Returns:
             Text description of the page's visual content
@@ -208,6 +228,8 @@ class VisionHelper:
             )
 
         try:
+            import time as _time
+            start = _time.monotonic()
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -229,8 +251,20 @@ class VisionHelper:
                 ],
                 max_tokens=2000,
             )
+            latency_ms = int((_time.monotonic() - start) * 1000)
+            content = response.choices[0].message.content
 
-            return response.choices[0].message.content
+            self._archive_vision_call(
+                job_id=job_id,
+                prompt_text=prompt,
+                response_text=content,
+                mime_type=mime_type,
+                image_size=len(page_image),
+                latency_ms=latency_ms,
+                page_num=page_num,
+            )
+
+            return content
 
         except Exception as e:
             logger.error(f"Error in describe_document_page: {e}", exc_info=True)
@@ -242,14 +276,62 @@ class VisionHelper:
         page_num: int,
         mime_type: str = "image/png",
         query: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> str:
         """Synchronous wrapper for describe_document_page.
 
         Use this in sync tool implementations.
         """
         return run_async(
-            self.describe_document_page(page_image, page_num, mime_type, query)
+            self.describe_document_page(page_image, page_num, mime_type, query, job_id)
         )
+
+    def _archive_vision_call(
+        self,
+        job_id: Optional[str],
+        prompt_text: str,
+        response_text: str,
+        mime_type: str,
+        image_size: int,
+        latency_ms: int,
+        page_num: Optional[int] = None,
+    ) -> None:
+        """Archive a vision LLM call. Fire-and-forget — never raises."""
+        if not job_id:
+            return
+
+        try:
+            from src.core.archiver import get_archiver
+            from langchain_core.messages import HumanMessage as _HM, AIMessage as _AI
+
+            archiver = get_archiver()
+            if not archiver:
+                return
+
+            # Build synthetic LangChain messages (image data replaced with placeholder)
+            human_content = (
+                f"{prompt_text}\n\n"
+                f"[image: {mime_type}, {image_size} bytes]"
+            )
+            messages = [_HM(content=human_content)]
+            response = _AI(content=response_text)
+
+            aux_meta = {"trigger": "vision"}
+            if page_num is not None:
+                aux_meta["page_num"] = page_num
+
+            archiver.archive(
+                job_id=job_id,
+                agent_type="vision",
+                messages=messages,
+                response=response,
+                model=self.model,
+                latency_ms=latency_ms,
+                call_type="vision",
+                auxiliary_metadata=aux_meta,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to archive vision call: {e}")
 
 
 # Module-level singleton instance (lazy-loaded)

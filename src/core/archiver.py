@@ -216,6 +216,15 @@ class LLMArchiver:
             self._chat_history_collection = self._mongo_db.db["chat_history"]
             self._connected = True
 
+            # Create compound index for call_type-filtered queries
+            try:
+                self._collection.create_index(
+                    [("job_id", 1), ("call_type", 1), ("timestamp", 1)],
+                    background=True,
+                )
+            except Exception as e:
+                logger.debug(f"Index creation skipped (may already exist): {e}")
+
             logger.info(f"LLM Archiver connected to MongoDB: {self._database_name}")
             return True
 
@@ -273,6 +282,8 @@ class LLMArchiver:
         phase_number: Optional[int] = None,
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
         model_kwargs: Optional[Dict[str, Any]] = None,
+        call_type: str = "main",
+        auxiliary_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Archive an LLM request/response.
 
@@ -289,6 +300,10 @@ class LLMArchiver:
             phase_number: Current phase number
             tool_schemas: Tool definition schemas sent to the LLM (OpenAI format)
             model_kwargs: Model parameters (temperature, tool_choice, etc.)
+            call_type: Type of call ("main", "summarization", "memory_extraction",
+                       "memory_assembly", "knowledge_curation", "vision")
+            auxiliary_metadata: Optional call-type-specific context (task class,
+                               trigger, iteration count, etc.)
 
         Returns:
             Inserted document ID, or None if archiving failed.
@@ -313,6 +328,7 @@ class LLMArchiver:
                 "agent_type": agent_type,
                 "timestamp": datetime.now(timezone.utc),
                 "model": model,
+                "call_type": call_type,
                 "request": request_data,
                 "response": _message_to_dict(response),
             }
@@ -326,6 +342,9 @@ class LLMArchiver:
 
             if metadata:
                 doc["metadata"] = _serialize_for_mongo(metadata)
+
+            if auxiliary_metadata:
+                doc["auxiliary_metadata"] = _serialize_for_mongo(auxiliary_metadata)
 
             # Count tokens approximately
             total_input_chars = sum(
@@ -351,25 +370,28 @@ class LLMArchiver:
             iter_str = f"iter={iteration}" if iteration else ""
             latency_str = f"{latency_ms}ms" if latency_ms else "?"
             tool_str = f"{tool_count} tools" if tool_count > 0 else "no tools"
+            type_str = f" | type={call_type}" if call_type != "main" else ""
 
             logger.info(
                 f"[LLM] {doc_id[-8:]} | job={job_id[:8]}... | {iter_str} | "
-                f"{latency_str} | {tool_str}"
+                f"{latency_str} | {tool_str}{type_str}"
             )
 
-            # Also write to chat_history collection for clean conversation view
-            self._archive_chat_entry(
-                job_id=job_id,
-                agent_type=agent_type,
-                messages=messages,
-                response=response,
-                model=model,
-                latency_ms=latency_ms,
-                iteration=iteration,
-                request_id=doc_id,
-                phase=phase,
-                phase_number=phase_number,
-            )
+            # Only write to chat_history for main loop calls — auxiliary calls
+            # aren't part of the agent's conversational flow
+            if call_type == "main":
+                self._archive_chat_entry(
+                    job_id=job_id,
+                    agent_type=agent_type,
+                    messages=messages,
+                    response=response,
+                    model=model,
+                    latency_ms=latency_ms,
+                    iteration=iteration,
+                    request_id=doc_id,
+                    phase=phase,
+                    phase_number=phase_number,
+                )
 
             return doc_id
 
@@ -382,6 +404,7 @@ class LLMArchiver:
         job_id: str,
         agent_type: Optional[str] = None,
         limit: int = 100,
+        call_type: Optional[str] = "main",
     ) -> List[Dict[str, Any]]:
         """Get conversation history for a job.
 
@@ -389,6 +412,8 @@ class LLMArchiver:
             job_id: Job identifier
             agent_type: Optional filter by agent type
             limit: Maximum number of records to return
+            call_type: Filter by call type. Defaults to "main".
+                       Pass None to include all call types.
 
         Returns:
             List of archived requests, sorted by timestamp ascending.
@@ -397,9 +422,11 @@ class LLMArchiver:
             return []
 
         try:
-            query = {"job_id": job_id}
+            query: Dict[str, Any] = {"job_id": job_id}
             if agent_type:
                 query["agent_type"] = agent_type
+            if call_type is not None:
+                query["call_type"] = call_type
 
             cursor = self._collection.find(query).sort("timestamp", 1).limit(limit)
             return list(cursor)
@@ -415,12 +442,13 @@ class LLMArchiver:
             job_id: Job identifier
 
         Returns:
-            Dict with usage statistics.
+            Dict with usage statistics including breakdown by call_type.
         """
         if not self._ensure_connected():
             return {}
 
         try:
+            # Overall totals
             pipeline = [
                 {"$match": {"job_id": job_id}},
                 {
@@ -439,11 +467,36 @@ class LLMArchiver:
             ]
 
             results = list(self._collection.aggregate(pipeline))
-            if results:
-                stats = results[0]
-                stats.pop("_id", None)
-                return stats
-            return {}
+            if not results:
+                return {}
+
+            stats = results[0]
+            stats.pop("_id", None)
+
+            # Breakdown by call_type
+            type_pipeline = [
+                {"$match": {"job_id": job_id}},
+                {
+                    "$group": {
+                        "_id": "$call_type",
+                        "count": {"$sum": 1},
+                        "input_chars": {"$sum": "$metrics.input_chars"},
+                        "output_chars": {"$sum": "$metrics.output_chars"},
+                    }
+                },
+            ]
+
+            type_results = list(self._collection.aggregate(type_pipeline))
+            stats["by_call_type"] = {
+                r["_id"]: {
+                    "count": r["count"],
+                    "input_chars": r["input_chars"],
+                    "output_chars": r["output_chars"],
+                }
+                for r in type_results
+            }
+
+            return stats
 
         except Exception as e:
             logger.warning(f"Failed to get job stats: {e}")
@@ -1039,6 +1092,8 @@ def archive_llm_request(
     phase_number: Optional[int] = None,
     tool_schemas: Optional[List[Dict[str, Any]]] = None,
     model_kwargs: Optional[Dict[str, Any]] = None,
+    call_type: str = "main",
+    auxiliary_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     """Convenience function to archive an LLM request using default archiver.
 
@@ -1059,5 +1114,7 @@ def archive_llm_request(
             phase_number=phase_number,
             tool_schemas=tool_schemas,
             model_kwargs=model_kwargs,
+            call_type=call_type,
+            auxiliary_metadata=auxiliary_metadata,
         )
     return None

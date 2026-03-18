@@ -195,6 +195,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     image_data,
                     mime_type=_get_mime_type(full_path),
                     query=describe,
+                    job_id=context.job_id,
                 )
 
                 # Cache for future use
@@ -260,6 +261,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     page_image,
                     page_num=page_num,
                     query=describe,
+                    job_id=context.job_id,
                 )
 
                 # Cache for future use

@@ -10,7 +10,7 @@ AuxiliaryLLM.chain(ExtractMemoriesTask). See docs/features/auxiliary.md.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from src.services.auxiliary import (
     AuxiliaryLLM,
@@ -127,7 +127,11 @@ class TestExtractAndStoreMemories:
         ])
         mock_llm = MagicMock()
         structured = AsyncMock()
-        structured.ainvoke = AsyncMock(return_value=memories)
+        structured.ainvoke = AsyncMock(return_value={
+            "raw": AIMessage(content="structured output"),
+            "parsed": memories,
+            "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
@@ -172,7 +176,11 @@ class TestExtractAndStoreMemories:
         memories = ExtractedMemories(memories=[])
         mock_llm = MagicMock()
         structured = AsyncMock()
-        structured.ainvoke = AsyncMock(return_value=memories)
+        structured.ainvoke = AsyncMock(return_value={
+            "raw": AIMessage(content="structured output"),
+            "parsed": memories,
+            "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
@@ -207,7 +215,11 @@ class TestExtractAndStoreMemories:
         ])
         mock_llm = MagicMock()
         structured = AsyncMock()
-        structured.ainvoke = AsyncMock(return_value=memories)
+        structured.ainvoke = AsyncMock(return_value={
+            "raw": AIMessage(content="structured output"),
+            "parsed": memories,
+            "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)

@@ -960,6 +960,178 @@ class GiteaClient:
             logger.warning(f"Failed to rename Gitea repo '{old_name}': {e}")
             return False
 
+    # =========================================================================
+    # Collaborator / Access Control
+    # =========================================================================
+
+    async def find_user_by_email(self, email: str) -> Optional[str]:
+        """Find a Gitea username by email address.
+
+        Searches Gitea's user list and filters by exact email match.
+        Returns None if the user hasn't logged into Gitea yet (e.g. no
+        OIDC auto-registration has occurred).
+
+        Args:
+            email: Email address to search for.
+
+        Returns:
+            Gitea username (login) if found, None otherwise.
+        """
+        if not self._initialized or not email:
+            return None
+
+        client = self._get_client()
+
+        try:
+            resp = await client.get(
+                f"{self._url}/api/v1/users/search",
+                params={"q": email, "limit": 50},
+            )
+            if resp.status_code != 200:
+                logger.debug(f"Gitea user search failed (status {resp.status_code})")
+                return None
+
+            for user in resp.json().get("data", []):
+                if user.get("email", "").lower() == email.lower():
+                    return user["login"]
+
+            return None
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to search Gitea user by email: {e}")
+            return None
+
+    async def add_collaborator(
+        self, repo_name: str, username: str, permission: str = "read"
+    ) -> bool:
+        """Add a user as a collaborator on a repository.
+
+        Args:
+            repo_name: Repository name (owned by the service account).
+            username: Gitea username to add.
+            permission: Access level — "read", "write", or "admin".
+
+        Returns:
+            True if added (or already a collaborator), False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.put(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                f"/collaborators/{username}",
+                json={"permission": permission},
+            )
+
+            if resp.status_code in (204, 200):
+                logger.debug(
+                    f"Added '{username}' as {permission} collaborator on '{repo_name}'"
+                )
+                return True
+            elif resp.status_code == 422:
+                # Already a collaborator
+                return True
+            else:
+                logger.warning(
+                    f"Failed to add collaborator '{username}' on '{repo_name}' "
+                    f"(status {resp.status_code}): {resp.text[:200]}"
+                )
+                return False
+
+        except httpx.HTTPError as e:
+            logger.warning(f"Failed to add collaborator '{username}' on '{repo_name}': {e}")
+            return False
+
+    async def remove_collaborator(self, repo_name: str, username: str) -> bool:
+        """Remove a collaborator from a repository.
+
+        Args:
+            repo_name: Repository name (owned by the service account).
+            username: Gitea username to remove.
+
+        Returns:
+            True if removed (or was not a collaborator), False on failure.
+        """
+        if not self._initialized:
+            return False
+
+        client = self._get_client()
+
+        try:
+            resp = await client.delete(
+                f"{self._url}/api/v1/repos/{self._user}/{repo_name}"
+                f"/collaborators/{username}",
+            )
+
+            if resp.status_code in (204, 404):
+                return True
+            else:
+                logger.warning(
+                    f"Failed to remove collaborator '{username}' from '{repo_name}' "
+                    f"(status {resp.status_code})"
+                )
+                return False
+
+        except httpx.HTTPError as e:
+            logger.warning(
+                f"Failed to remove collaborator '{username}' from '{repo_name}': {e}"
+            )
+            return False
+
+    async def grant_user_repo_access(
+        self, email: str, repo_name: str, permission: str = "read"
+    ) -> bool:
+        """Grant a user access to a repository by email.
+
+        Resolves the user's Gitea account by email, then adds them as a
+        collaborator. Skips gracefully if the user has no Gitea account
+        (hasn't logged into Gitea via OIDC yet).
+
+        Args:
+            email: User's email address.
+            repo_name: Repository name.
+            permission: Access level — "read", "write", or "admin".
+
+        Returns:
+            True if granted, False if user not found or operation failed.
+        """
+        if not self._initialized:
+            return False
+
+        username = await self.find_user_by_email(email)
+        if not username:
+            logger.debug(
+                f"No Gitea account for '{email}', skipping access grant on '{repo_name}'"
+            )
+            return False
+
+        return await self.add_collaborator(repo_name, username, permission)
+
+    async def revoke_user_repo_access(self, email: str, repo_name: str) -> bool:
+        """Revoke a user's access to a repository by email.
+
+        Resolves the user's Gitea account by email, then removes them as
+        a collaborator. Skips gracefully if user has no Gitea account.
+
+        Args:
+            email: User's email address.
+            repo_name: Repository name.
+
+        Returns:
+            True if revoked, False if user not found or operation failed.
+        """
+        if not self._initialized:
+            return False
+
+        username = await self.find_user_by_email(email)
+        if not username:
+            return True  # No account = no access to revoke
+
+        return await self.remove_collaborator(repo_name, username)
+
     async def close(self) -> None:
         """Close the httpx client."""
         if self._client and not self._client.is_closed:

@@ -250,7 +250,7 @@ communication:
   enabled: true
   blocking_timeout_hours: 24       # Auto-resume blocked jobs after this timeout
   max_message_length: 5000         # Max chars per message body
-  allowed_recipients: owner        # "owner" (job owner only) or "project" (all project members)
+  allowed_recipients: project      # "owner" (job owner only) or "project" (all project members)
 
 # Browser automation settings (browser-use + Playwright)
 browser:

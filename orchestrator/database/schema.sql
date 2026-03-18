@@ -780,6 +780,14 @@ CREATE INDEX IF NOT EXISTS idx_message_log_user_created ON message_log(user_id, 
 CREATE INDEX IF NOT EXISTS idx_message_log_rate ON message_log(job_id, created_at)
     WHERE direction = 'outbound';
 
+-- Migration: Add email_message_id for IMAP reply correlation (Phase 2)
+DO $$ BEGIN
+    ALTER TABLE message_log ADD COLUMN email_message_id TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_message_log_email_msgid
+    ON message_log(email_message_id) WHERE email_message_id IS NOT NULL;
+
 -- ============================================================================
 -- 10. VIEWS
 -- ============================================================================
