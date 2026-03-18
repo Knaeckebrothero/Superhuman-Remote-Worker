@@ -1,0 +1,382 @@
+"""Unified notification dispatcher for agent-human communication.
+
+Orchestrates delivery across all configured channels (email, Ntfy, Slack,
+Discord) while respecting user channel preferences and quiet hours.
+
+Sits between the send endpoint and individual transports::
+
+    send_agent_message() → notification_service.dispatch()
+                              ├── email_service.send_agent_message()
+                              ├── ntfy_transport.send()
+                              ├── slack_transport.send()
+                              ├── discord_transport.send()
+                              └── notification_feed.broadcast() (SSE)
+
+Follows the NatsBridge graceful degradation pattern: fully optional,
+all operations are no-ops when unconfigured.
+"""
+
+import logging
+import os
+from datetime import datetime, time
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from services.webhook_transports import (
+    DiscordWebhookTransport,
+    NotificationPayload,
+    NtfyTransport,
+    SlackWebhookTransport,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class NotificationService:
+    """Multi-channel notification dispatcher.
+
+    Reads user channel preferences from ``users.settings.communication.channels``
+    and dispatches to each enabled channel. Queues notifications during quiet hours.
+    """
+
+    def __init__(self) -> None:
+        self._db: Any = None
+        self._email_service: Any = None
+        self._notification_feed: Any = None
+        self._available = False
+
+        self._cockpit_url = os.getenv("COCKPIT_EXTERNAL_URL", "http://localhost:4200").rstrip("/")
+
+        # Initialize transports (each checks its own env vars)
+        self._transports = {
+            "ntfy": NtfyTransport(),
+            "slack_webhook": SlackWebhookTransport(),
+            "discord_webhook": DiscordWebhookTransport(),
+        }
+
+        configured = [name for name, t in self._transports.items() if t.is_configured]
+        if configured:
+            logger.info("Webhook transports configured: %s", ", ".join(configured))
+        else:
+            logger.info("No webhook transports configured. Email-only notifications.")
+
+    @property
+    def is_available(self) -> bool:
+        return self._available
+
+    @property
+    def configured_transports(self) -> list[str]:
+        """Names of transports that have valid configuration."""
+        return [name for name, t in self._transports.items() if t.is_configured]
+
+    def connect(
+        self,
+        db: Any,
+        email_service: Any,
+        notification_feed: Any = None,
+    ) -> None:
+        """Store references to collaborating services.
+
+        Args:
+            db: PostgresDB instance
+            email_service: EmailService instance for SMTP delivery
+            notification_feed: NotificationFeedService for SSE broadcast (optional)
+        """
+        self._db = db
+        self._email_service = email_service
+        self._notification_feed = notification_feed
+        self._available = True
+        logger.info("NotificationService initialized")
+
+    async def dispatch(
+        self,
+        user_id: str,
+        job_id: str,
+        subject: str,
+        message_md: str,
+        job_description: str,
+        config_name: str,
+        thread_id: str | None = None,
+        phase_number: int | None = None,
+        recipient_email: str | None = None,
+        recipient_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch notification to all enabled channels.
+
+        Respects user channel preferences and quiet hours.
+
+        Returns:
+            Dict with channel results, e.g.::
+
+                {
+                    "email": True,
+                    "email_message_id": "<uuid@domain>",
+                    "ntfy": True,
+                    "queued": False,
+                }
+        """
+        if not self._available:
+            return {"error": "NotificationService not initialized"}
+
+        results: dict[str, Any] = {}
+
+        # Load user channel preferences
+        user_channels = await self._get_user_channels(user_id)
+        user_settings = await self._get_user_settings(user_id)
+
+        # Check quiet hours
+        if self._is_in_quiet_hours(user_settings):
+            # Queue for digest delivery when quiet hours end
+            await self._queue_notification(
+                user_id=user_id,
+                job_id=job_id,
+                thread_id=thread_id,
+                subject=subject,
+                message=message_md,
+                channels=user_channels,
+            )
+            results["queued"] = True
+            logger.info(
+                "Notification queued (quiet hours): job=%s, subject=%s",
+                job_id[:8], subject,
+            )
+
+            # Still broadcast to cockpit SSE (in-app is not affected by quiet hours)
+            await self._broadcast_sse(user_id, job_id, subject, thread_id)
+
+            return results
+
+        results["queued"] = False
+
+        # Build cockpit deep link
+        cockpit_link = f"{self._cockpit_url}/jobs/{job_id}"
+        if thread_id:
+            cockpit_link += f"/messages/{thread_id}"
+
+        # Dispatch to email
+        if user_channels.get("email", True) and self._email_service:
+            try:
+                email_sent, email_msg_id = await self._email_service.send_agent_message(
+                    to=recipient_email or "",
+                    to_name=recipient_name or "User",
+                    subject=subject,
+                    message_md=message_md,
+                    job_id=job_id,
+                    job_description=job_description,
+                    config_name=config_name,
+                    phase_number=phase_number,
+                    thread_id=thread_id,
+                )
+                results["email"] = email_sent
+                if email_msg_id:
+                    results["email_message_id"] = email_msg_id
+            except Exception as e:
+                logger.warning("Email dispatch failed: %s", e)
+                results["email"] = False
+
+        # Build webhook payload
+        payload = NotificationPayload(
+            subject=subject,
+            body_text=message_md,
+            job_id=job_id,
+            job_description=job_description,
+            config_name=config_name,
+            thread_id=thread_id,
+            cockpit_url=cockpit_link,
+        )
+
+        # Dispatch to webhook transports
+        for name, transport in self._transports.items():
+            if not transport.is_configured:
+                continue
+            if not user_channels.get(name, True):
+                continue
+            try:
+                results[name] = await transport.send(payload)
+            except Exception as e:
+                logger.warning("Transport %s failed: %s", name, e)
+                results[name] = False
+
+        # Broadcast to cockpit notification feed (SSE)
+        await self._broadcast_sse(user_id, job_id, subject, thread_id)
+
+        return results
+
+    async def dispatch_digest(
+        self,
+        user_id: str,
+        notifications: list[dict],
+    ) -> dict[str, bool]:
+        """Send a batched digest of queued notifications.
+
+        Called by the quiet hours digest loop when quiet hours end.
+        """
+        if not notifications:
+            return {}
+
+        # Build digest body
+        lines = [f"You have {len(notifications)} notification(s) from while you were away:\n"]
+        for n in notifications:
+            lines.append(f"**{n['subject']}**")
+            lines.append(f"{n['message'][:200]}")
+            lines.append("")
+
+        digest_body = "\n".join(lines)
+        digest_subject = f"{len(notifications)} queued notification(s)"
+
+        # Get user's email for the digest
+        user = None
+        if self._db:
+            try:
+                user = await self._db.get_user(user_id)
+            except Exception:
+                pass
+
+        user_channels = await self._get_user_channels(user_id)
+        cockpit_link = self._cockpit_url
+
+        results: dict[str, bool] = {}
+
+        # Send email digest
+        if user_channels.get("email", True) and self._email_service and user:
+            try:
+                email_sent, _ = await self._email_service.send_agent_message(
+                    to=user.get("email", ""),
+                    to_name=user.get("display_name", "User"),
+                    subject=digest_subject,
+                    message_md=digest_body,
+                    job_id=notifications[0].get("job_id", ""),
+                    job_description="Notification Digest",
+                    config_name="system",
+                )
+                results["email"] = email_sent
+            except Exception as e:
+                logger.warning("Digest email failed: %s", e)
+                results["email"] = False
+
+        # Send webhook digest
+        payload = NotificationPayload(
+            subject=digest_subject,
+            body_text=digest_body,
+            job_id=notifications[0].get("job_id", ""),
+            cockpit_url=cockpit_link,
+        )
+
+        for name, transport in self._transports.items():
+            if not transport.is_configured:
+                continue
+            if not user_channels.get(name, True):
+                continue
+            try:
+                results[name] = await transport.send(payload)
+            except Exception as e:
+                logger.warning("Digest transport %s failed: %s", name, e)
+                results[name] = False
+
+        return results
+
+    async def _get_user_channels(self, user_id: str) -> dict[str, bool]:
+        """Load user's channel preferences from settings JSONB."""
+        defaults = {"email": True, "cockpit": True}
+        if not self._db:
+            return defaults
+        try:
+            settings = await self._db.get_user_settings(user_id)
+            channels = (settings or {}).get("communication", {}).get("channels", {})
+            return {**defaults, **channels}
+        except Exception:
+            return defaults
+
+    async def _get_user_settings(self, user_id: str) -> dict:
+        """Load full user settings."""
+        if not self._db:
+            return {}
+        try:
+            return await self._db.get_user_settings(user_id) or {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _is_in_quiet_hours(user_settings: dict) -> bool:
+        """Check if current time falls within user's quiet hours."""
+        qh = (user_settings or {}).get("communication", {}).get("quiet_hours", {})
+        if not qh.get("enabled"):
+            return False
+
+        start_str = qh.get("start", "")
+        end_str = qh.get("end", "")
+        tz_str = qh.get("timezone", "UTC")
+
+        if not start_str or not end_str:
+            return False
+
+        try:
+            tz = ZoneInfo(tz_str)
+        except (ZoneInfoNotFoundError, KeyError):
+            logger.warning("Invalid timezone in quiet hours: %s", tz_str)
+            return False
+
+        try:
+            start = time.fromisoformat(start_str)
+            end = time.fromisoformat(end_str)
+        except ValueError:
+            return False
+
+        now = datetime.now(tz).time()
+
+        # Handle overnight ranges (e.g., 22:00 - 08:00)
+        if start <= end:
+            return start <= now <= end
+        else:
+            return now >= start or now <= end
+
+    async def _queue_notification(
+        self,
+        user_id: str,
+        job_id: str,
+        thread_id: str | None,
+        subject: str,
+        message: str,
+        channels: dict,
+    ) -> None:
+        """Queue a notification for later digest delivery."""
+        if not self._db:
+            return
+        try:
+            await self._db.queue_notification(
+                user_id=user_id,
+                job_id=job_id,
+                thread_id=thread_id,
+                subject=subject,
+                message=message,
+                channels=channels,
+            )
+        except Exception as e:
+            logger.warning("Failed to queue notification: %s", e)
+
+    async def _broadcast_sse(
+        self,
+        user_id: str,
+        job_id: str,
+        subject: str,
+        thread_id: str | None,
+    ) -> None:
+        """Broadcast to cockpit notification feed (SSE)."""
+        if not self._notification_feed:
+            return
+        try:
+            self._notification_feed.broadcast(
+                user_id=user_id,
+                event_type="new_message",
+                data={
+                    "job_id": job_id,
+                    "subject": subject,
+                    "thread_id": thread_id,
+                },
+            )
+        except Exception as e:
+            logger.debug("SSE broadcast failed: %s", e)
+
+
+# Module-level singleton
+notification_service = NotificationService()

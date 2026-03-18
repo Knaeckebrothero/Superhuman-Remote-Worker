@@ -2458,3 +2458,99 @@ async def deny_sudo_request(
         return f"Denied sudo request {request_id}: {result.get('status', 'ok')}"
     except Exception as e:
         return f"Failed to deny: {e}"
+
+
+# =============================================================================
+# Messaging Tools (Live Communication)
+# =============================================================================
+
+
+@mcp.tool
+async def list_message_threads(job_id: str) -> str:
+    """List message threads for an agent job.
+
+    Shows all communication threads between the agent and humans,
+    including thread ID, subject, message count, and status.
+
+    Args:
+        job_id: Job UUID to list threads for
+
+    Returns:
+        Formatted list of message threads
+    """
+    client = _get_client()
+    data = await client.list_message_threads(job_id)
+    return fmt.format_message_threads(data.get("threads", []))
+
+
+@mcp.tool
+async def send_message_to_job(
+    job_id: str,
+    thread_id: str,
+    message: str,
+    urgent: bool = False,
+) -> str:
+    """Send a reply to an agent's message thread (as a human).
+
+    Routes the reply to the agent. If the agent is waiting for a reply
+    on this thread (blocking mode), it resumes immediately. Otherwise
+    the reply is queued for the next strategic phase.
+
+    Args:
+        job_id: Job UUID
+        thread_id: Thread ID to reply to
+        message: Reply body text
+        urgent: If true, deliver as immediate interrupt regardless of mode
+
+    Returns:
+        Delivery confirmation with strategy used
+    """
+    client = _get_client()
+    try:
+        result = await client.reply_to_message(
+            job_id, thread_id, message, urgent=urgent,
+        )
+        strategy = result.get("delivery_strategy", "unknown")
+        seq = result.get("sequence", "?")
+        return (
+            f"Reply delivered to thread {thread_id} (message #{seq}).\n"
+            f"Delivery strategy: {strategy}"
+        )
+    except Exception as e:
+        return f"Failed to send reply: {e}"
+
+
+@mcp.tool
+async def get_message_thread(job_id: str, thread_id: str) -> str:
+    """Get full message history for a specific thread.
+
+    Shows all messages in chronological order with direction,
+    timestamps, and content.
+
+    Args:
+        job_id: Job UUID
+        thread_id: Thread ID to retrieve
+
+    Returns:
+        Formatted thread message history
+    """
+    client = _get_client()
+    data = await client.list_message_threads(job_id)
+    threads = data.get("threads", [])
+
+    # Find the matching thread and its messages
+    target = None
+    for t in threads:
+        if t.get("thread_id") == thread_id:
+            target = t
+            break
+
+    if not target:
+        return f"Thread {thread_id} not found in job {job_id}."
+
+    messages = target.get("messages", [])
+    if not messages:
+        # Thread found but no inline messages — format what we have
+        return fmt.format_message_threads([target])
+
+    return fmt.format_thread_messages(messages, thread_id)

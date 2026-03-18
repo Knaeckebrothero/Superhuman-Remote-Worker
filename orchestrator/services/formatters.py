@@ -2265,3 +2265,59 @@ def format_created_datasource(result: dict[str, Any]) -> str:
         "\nUse test_datasource(datasource_id) to verify connectivity."
     )
     return "\n".join(lines)
+
+
+# =============================================================================
+# Message Thread Formatters
+# =============================================================================
+
+
+def format_message_threads(threads: list[dict[str, Any]]) -> str:
+    """Format message thread list for display."""
+    if not threads:
+        return "No message threads found for this job."
+
+    lines = [f"Found {len(threads)} thread(s):\n"]
+    for t in threads:
+        thread_id = t.get("thread_id", "?")
+        subject = t.get("subject", "(no subject)")
+        count = t.get("message_count", 0)
+        last_at = t.get("last_message_at", "")
+        mode = t.get("mode", "")
+        status = t.get("status", "")
+
+        status_str = ""
+        if status == "waiting_for_reply":
+            status_str = " [WAITING FOR REPLY]"
+        elif mode == "blocking":
+            status_str = " [blocking]"
+
+        lines.append(f"  Thread {thread_id}: {subject}{status_str}")
+        lines.append(f"    Messages: {count} | Last: {last_at}")
+
+    return "\n".join(lines)
+
+
+def format_thread_messages(messages: list[dict[str, Any]], thread_id: str) -> str:
+    """Format individual messages within a thread."""
+    if not messages:
+        return f"No messages found in thread {thread_id}."
+
+    lines = [f"Thread {thread_id} — {len(messages)} message(s):\n"]
+    for m in messages:
+        direction = m.get("direction", "?")
+        icon = "→" if direction == "outbound" else "←"
+        created = m.get("created_at", "")
+        subject = m.get("subject", "")
+        body = m.get("message", "")
+        sender = m.get("recipient_email", "") if direction == "outbound" else "(human)"
+
+        lines.append(f"  {icon} [{created}] {subject}")
+        if body:
+            # Truncate long messages
+            preview = body[:500] + "..." if len(body) > 500 else body
+            for line in preview.split("\n"):
+                lines.append(f"    {line}")
+        lines.append("")
+
+    return "\n".join(lines)

@@ -177,6 +177,56 @@ export interface UserSettings {
   default_autonomy?: string | null;
   default_reasoning_level?: string | null;
   default_auxiliary_model?: string | null;
+  communication?: CommunicationSettings | null;
+}
+
+/**
+ * Communication delivery preferences (Phase 3 Live Communication).
+ */
+export interface CommunicationSettings {
+  delivery?: {
+    async_reply?: 'immediate_interrupt' | 'next_strategic_phase' | 'llm_triage';
+    urgent_override?: boolean;
+  };
+  channels?: {
+    email?: boolean;
+    cockpit?: boolean;
+    ntfy?: boolean;
+    slack_webhook?: boolean;
+    discord_webhook?: boolean;
+  };
+  quiet_hours?: {
+    enabled?: boolean;
+    start?: string;
+    end?: string;
+    timezone?: string;
+  };
+}
+
+/**
+ * A notification entry from the orchestrator.
+ */
+export interface AppNotification {
+  id: string;
+  job_id: string | null;
+  thread_id: string | null;
+  subject: string;
+  message: string;
+  job_description: string | null;
+  config_name: string | null;
+  status: string;
+  read_at: string | null;
+  created_at: string;
+}
+
+/**
+ * An external contact linked to a project.
+ */
+export interface ExternalContact {
+  id: string;
+  display_name: string;
+  email: string;
+  created_at: string | null;
 }
 
 // =============================================================================
