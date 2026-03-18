@@ -14,10 +14,12 @@ Environment variables:
     IMAP_PORT           — IMAP port (default: 993)
     IMAP_USER           — IMAP username
     IMAP_PASSWORD       — IMAP password
-    IMAP_USE_SSL        — Use SSL/TLS (default: true)
-    IMAP_POLL_INTERVAL  — Seconds between polls (default: 30)
-    AGENT_EMAIL         — Agent email address (e.g., agent@example.com)
-    MAIL_DOMAIN         — Mail domain (e.g., example.com)
+    IMAP_USE_SSL            — Use implicit SSL/TLS (default: true). Set to false for
+                              STARTTLS on port 1143 (e.g. Proton Bridge).
+    IMAP_TRUST_SELF_SIGNED  — Accept self-signed certs (default: false)
+    IMAP_POLL_INTERVAL      — Seconds between polls (default: 30)
+    AGENT_EMAIL             — Agent email address (e.g., agent@example.com)
+    MAIL_DOMAIN             — Mail domain (e.g., example.com)
 """
 
 import asyncio
@@ -25,6 +27,7 @@ import email as email_lib
 import imaplib
 import logging
 import os
+import ssl
 from email.header import decode_header
 from typing import Any, Callable, Coroutine
 
@@ -53,6 +56,9 @@ class ImapPoller:
         self._user = os.getenv("IMAP_USER", "")
         self._password = os.getenv("IMAP_PASSWORD", "")
         self._use_ssl = os.getenv("IMAP_USE_SSL", "true").lower() in ("true", "1", "yes")
+        self._trust_self_signed = os.getenv("IMAP_TRUST_SELF_SIGNED", "false").lower() in (
+            "true", "1", "yes",
+        )
         self._poll_interval = int(os.getenv("IMAP_POLL_INTERVAL", "30"))
         self._agent_email = os.getenv("AGENT_EMAIL", "")
         self._mail_domain = os.getenv("MAIL_DOMAIN", "")
@@ -149,6 +155,26 @@ class ImapPoller:
 
         return processed
 
+    def _get_ssl_context(self) -> ssl.SSLContext:
+        """Build SSL context, optionally trusting self-signed certs."""
+        ctx = ssl.create_default_context()
+        if self._trust_self_signed:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _connect_imap(self) -> imaplib.IMAP4:
+        """Connect to IMAP server with appropriate SSL/STARTTLS mode."""
+        ctx = self._get_ssl_context()
+        if self._use_ssl:
+            # Implicit TLS (port 993 typically)
+            return imaplib.IMAP4_SSL(self._host, self._port, ssl_context=ctx)
+        else:
+            # Plain connection + STARTTLS (port 1143 for Proton Bridge)
+            conn = imaplib.IMAP4(self._host, self._port)
+            conn.starttls(ssl_context=ctx)
+            return conn
+
     def _fetch_unseen(self) -> list[tuple[bytes, bytes]]:
         """Synchronous IMAP fetch of unseen messages.
 
@@ -156,10 +182,7 @@ class ImapPoller:
         """
         conn = None
         try:
-            if self._use_ssl:
-                conn = imaplib.IMAP4_SSL(self._host, self._port)
-            else:
-                conn = imaplib.IMAP4(self._host, self._port)
+            conn = self._connect_imap()
 
             conn.login(self._user, self._password)
             conn.select("INBOX")
@@ -204,11 +227,7 @@ class ImapPoller:
         """Update IMAP flags for processed messages."""
         conn = None
         try:
-            if self._use_ssl:
-                conn = imaplib.IMAP4_SSL(self._host, self._port)
-            else:
-                conn = imaplib.IMAP4(self._host, self._port)
-
+            conn = self._connect_imap()
             conn.login(self._user, self._password)
             conn.select("INBOX")
 
@@ -260,7 +279,13 @@ class ImapPoller:
                 break
 
         if not routing:
-            logger.debug(f"No + sub-address found in email {email_msg_id} — skipping")
+            # Fallback: resolve via In-Reply-To header → message_log lookup.
+            # Some email clients (e.g. Proton Mail) strip + sub-addressing
+            # but preserve the In-Reply-To header referencing our Message-ID.
+            routing = await self._resolve_via_in_reply_to(msg)
+
+        if not routing:
+            logger.debug(f"No routing info found in email {email_msg_id} — skipping")
             return False
 
         job_short_id, thread_id = routing
@@ -302,6 +327,41 @@ class ImapPoller:
         )
         return True
 
+    async def _resolve_via_in_reply_to(
+        self, msg: email_lib.message.Message
+    ) -> tuple[str, str] | None:
+        """Resolve job/thread from In-Reply-To header via message_log lookup.
+
+        Fallback when + sub-addressing is stripped by the email client.
+        The In-Reply-To header references the Message-ID of our outbound email,
+        which is stored in message_log.email_message_id.
+
+        Returns:
+            (job_short_id, thread_id) or None.
+        """
+        in_reply_to = msg.get("In-Reply-To", "").strip()
+        if not in_reply_to:
+            return None
+
+        record = await self._db.resolve_message_by_email_id(in_reply_to)
+        if not record:
+            # Also try References header (some clients put it there)
+            references = msg.get("References", "")
+            for ref in references.split():
+                ref = ref.strip()
+                if ref:
+                    record = await self._db.resolve_message_by_email_id(ref)
+                    if record:
+                        break
+
+        if not record:
+            return None
+
+        job_id = record["job_id"]
+        thread_id = record["thread_id"]
+        # Return job_short_id (first 8 chars) for consistency with _parse_plus_address
+        return (job_id[:8], thread_id)
+
     def _parse_plus_address(self, address: str) -> tuple[str, str] | None:
         """Parse ``agent+{job_short}+{thread_id}@domain`` into (job_short, thread_id).
 
@@ -333,28 +393,77 @@ class ImapPoller:
 
     @staticmethod
     def _extract_text_body(msg: email_lib.message.Message) -> str:
-        """Walk MIME parts and return the first text/plain content."""
-        if msg.is_multipart():
-            for part in msg.walk():
-                content_type = part.get_content_type()
-                disposition = str(part.get("Content-Disposition", ""))
+        """Walk MIME parts and return the body as plain text.
 
-                if content_type == "text/plain" and "attachment" not in disposition:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        charset = part.get_content_charset() or "utf-8"
-                        try:
-                            return payload.decode(charset, errors="replace")
-                        except (LookupError, UnicodeDecodeError):
-                            return payload.decode("utf-8", errors="replace")
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                charset = msg.get_content_charset() or "utf-8"
-                try:
-                    return payload.decode(charset, errors="replace")
-                except (LookupError, UnicodeDecodeError):
-                    return payload.decode("utf-8", errors="replace")
+        Prefers text/plain. Falls back to text/html with tag stripping
+        when no plain text part exists (e.g. Proton Mail HTML-only replies).
+        """
+        plain = ""
+        html = ""
+
+        parts = msg.walk() if msg.is_multipart() else [msg]
+        for part in parts:
+            content_type = part.get_content_type()
+            disposition = str(part.get("Content-Disposition", ""))
+            if "attachment" in disposition:
+                continue
+
+            payload = part.get_payload(decode=True)
+            if not payload:
+                continue
+
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                text = payload.decode(charset, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                text = payload.decode("utf-8", errors="replace")
+
+            if content_type == "text/plain" and not plain:
+                plain = text
+            elif content_type == "text/html" and not html:
+                html = text
+
+        if plain:
+            return plain
+
+        # Fallback: convert HTML to plain text
+        if html:
+            return ImapPoller._html_to_text(html)
+
+        return ""
+
+    @staticmethod
+    def _html_to_text(html: str) -> str:
+        """Basic HTML to plain text conversion."""
+        import re
+
+        # Remove blockquote content (quoted original message)
+        text = re.sub(
+            r"<blockquote[^>]*>.*?</blockquote>",
+            "", text := html, flags=re.DOTALL | re.IGNORECASE,
+        )
+        # Remove protonmail_quote div (Proton Mail quoted text)
+        text = re.sub(
+            r'<div[^>]*class="protonmail_quote"[^>]*>.*?</div>\s*$',
+            "", text, flags=re.DOTALL | re.IGNORECASE,
+        )
+        # Remove signature blocks
+        text = re.sub(
+            r'<div[^>]*class="[^"]*signature[^"]*"[^>]*>.*?</div>',
+            "", text, flags=re.DOTALL | re.IGNORECASE,
+        )
+        # Replace <br> and </div><div> with newlines
+        text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"</div>\s*<div", "\n<div", text, flags=re.IGNORECASE)
+        # Strip remaining HTML tags
+        text = re.sub(r"<[^>]+>", "", text)
+        # Decode common HTML entities
+        text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+        text = text.replace("&lt;", "<").replace("&gt;", ">")
+        text = text.replace("&quot;", '"')
+        # Collapse whitespace
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
         return ""
 

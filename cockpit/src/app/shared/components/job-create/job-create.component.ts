@@ -8,6 +8,7 @@ import { UserService } from '../../../core/services/user.service';
 import { JobCreateRequest, Expert, ExpertDetail, Datasource, DatasourceType, Project } from '../../../core/models/api.model';
 import { FilePreview, FileType, UploadStatus } from '../../../core/models/file.model';
 import { environment } from '../../../core/environment';
+import { ConfigEditorComponent } from '../config-editor/config-editor.component';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -15,7 +16,7 @@ import { environment } from '../../../core/environment';
 @Component({
   selector: 'app-job-create',
   standalone: true,
-  imports: [FormsModule],
+  imports: [FormsModule, ConfigEditorComponent],
   template: `
     <div class="job-create-container">
       <div class="header-bar">
@@ -600,6 +601,30 @@ import { environment } from '../../../core/environment';
                 }
                 <span class="field-hint">Select external databases the agent can access during this job</span>
               </div>
+            </div>
+          }
+
+          <!-- Config Override Editor Toggle -->
+          <button
+            type="button"
+            class="toggle-advanced config-editor-toggle"
+            (click)="showConfigEditor.set(!showConfigEditor())"
+            [disabled]="isSubmitting()"
+          >
+            <span class="toggle-text">{{ showConfigEditor() ? 'Hide' : 'Show' }} Config Override Editor</span>
+            <span class="toggle-icon">{{ showConfigEditor() ? 'expand_less' : 'expand_more' }}</span>
+          </button>
+
+          @if (showConfigEditor()) {
+            <div class="advanced-section">
+              <span class="field-hint" style="display: block; margin-bottom: 8px;">
+                Override any agent config field. Values here take precedence over the Advanced Options above.
+              </span>
+              <app-config-editor
+                [expertConfig]="expertDetail()?.config ?? {}"
+                [value]="configEditorOverrides()"
+                (valueChange)="configEditorOverrides.set($event)"
+              />
             </div>
           }
 
@@ -1725,6 +1750,10 @@ export class JobCreateComponent implements OnInit {
   // Advanced section state
   readonly showAdvanced = signal(false);
 
+  // Config editor state
+  readonly showConfigEditor = signal(false);
+  readonly configEditorOverrides = signal<Record<string, unknown>>({});
+
   // Project selector state
   readonly projects = signal<Project[]>([]);
   readonly selectedProjectId = signal<string | null>(null);
@@ -2053,6 +2082,26 @@ export class JobCreateComponent implements OnInit {
     return Object.keys(override).length > 0 ? override : undefined;
   }
 
+  /** Deep merge two objects. Source values override target. Objects recurse, arrays replace, null deletes. */
+  private deepMerge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown> {
+    const result = { ...target };
+    for (const key of Object.keys(source)) {
+      const sv = source[key];
+      const tv = result[key];
+      if (sv === null || sv === undefined) {
+        delete result[key];
+      } else if (
+        typeof sv === 'object' && !Array.isArray(sv) &&
+        typeof tv === 'object' && !Array.isArray(tv) && tv !== null
+      ) {
+        result[key] = this.deepMerge(tv as Record<string, unknown>, sv as Record<string, unknown>);
+      } else {
+        result[key] = sv;
+      }
+    }
+    return result;
+  }
+
   private prefillConfigFromExpert(): void {
     const detail = this.expertDetail();
     if (!detail?.config) {
@@ -2279,8 +2328,13 @@ export class JobCreateComponent implements OnInit {
     if (this.uploadId) {
       request.upload_id = this.uploadId;
     }
-    const configOverride = this.buildConfigOverride();
-    if (configOverride) {
+    // Build override from UI form, then merge config editor overrides on top
+    let configOverride = this.buildConfigOverride();
+    const editorOverrides = this.configEditorOverrides();
+    if (Object.keys(editorOverrides).length > 0) {
+      configOverride = this.deepMerge(configOverride ?? {}, editorOverrides);
+    }
+    if (configOverride && Object.keys(configOverride).length > 0) {
       request.config_override = configOverride;
     }
     const instructions = this.instructionsContent();
@@ -2430,6 +2484,9 @@ export class JobCreateComponent implements OnInit {
     this.selectedPriority.set(5);
     // Reset advanced options
     this.showAdvanced.set(false);
+    // Reset config editor
+    this.showConfigEditor.set(false);
+    this.configEditorOverrides.set({});
     // Reset datasource selections
     this.selectedDatasourceIds.set(new Set());
     // Reset project to default

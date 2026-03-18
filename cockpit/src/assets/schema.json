@@ -1,0 +1,711 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/agent-config.schema.json",
+  "title": "Universal Agent Configuration",
+  "description": "Configuration schema for the Universal Agent in the workspace-centric architecture",
+  "type": "object",
+  "required": ["agent_id", "display_name", "llm", "workspace", "tools", "connections"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference"
+    },
+    "agent_id": {
+      "type": "string",
+      "description": "Unique identifier for this agent type",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "examples": ["creator", "validator"]
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Human-readable name for the agent",
+      "examples": ["Creator Agent", "Validator Agent"]
+    },
+    "description": {
+      "type": "string",
+      "description": "Brief description of what this agent does"
+    },
+    "icon": {
+      "type": "string",
+      "description": "Material Symbols icon name for expert discovery UI",
+      "default": "psychology",
+      "examples": ["science", "edit_note", "search"]
+    },
+    "color": {
+      "type": "string",
+      "description": "Accent color (hex) for expert discovery UI",
+      "default": "#cba6f7",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "examples": ["#89b4fa", "#a6e3a1", "#f9e2af"]
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Tags for categorization and filtering in expert discovery",
+      "examples": [["research", "academic"], ["documentation", "writing"]]
+    },
+    "llm": {
+      "type": "object",
+      "description": "LLM configuration with optional phase-specific overrides",
+      "required": ["model"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Default model identifier (used when no phase override)",
+          "examples": ["gpt-oss-120b", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"]
+        },
+        "provider": {
+          "type": ["string", "null"],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
+          "default": null,
+          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai). Groq requires explicit setting."
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2,
+          "default": 0.0,
+          "description": "Sampling temperature"
+        },
+        "top_p": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "default": null,
+          "description": "Top-p (nucleus) sampling parameter. null uses provider default."
+        },
+        "top_k": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "default": null,
+          "description": "Top-k sampling parameter. null uses provider default."
+        },
+        "reasoning_level": {
+          "type": "string",
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+          "default": "high",
+          "description": "Reasoning depth for models that support it"
+        },
+        "reasoning_method": {
+          "type": ["string", "null"],
+          "enum": ["prompt", "api", "none", null],
+          "default": null,
+          "description": "How reasoning level is delivered. 'prompt' injects in system prompt (gpt-oss). 'api' passes as API parameter (OpenAI, OpenRouter). 'none' disables (Anthropic, Google, Groq). null auto-detects from model name."
+        },
+        "base_url": {
+          "type": ["string", "null"],
+          "description": "Custom API base URL (null for default)"
+        },
+        "timeout": {
+          "type": ["number", "null"],
+          "minimum": 1,
+          "default": 600,
+          "description": "Request timeout in seconds (null for no timeout, default 600s = 10 minutes)"
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 3,
+          "description": "Number of retries for failed LLM requests with exponential backoff"
+        },
+        "multimodal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the primary model can process images directly. When true, visual content (document screenshots, images) is sent as base64-encoded images. When false, visual content is converted to text descriptions via a separate vision model."
+        },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the model to make multiple tool calls per response. Enable for models that handle parallel calls well (e.g., GPT-5.2 Pro, Opus 4.6)."
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "default": null,
+          "description": "Override max output tokens (auto-detected if null)"
+        },
+        "strategic": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for strategic (planning) phases. Uses more capable models for high-level decisions."
+        },
+        "tactical": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for tactical (execution) phases. Can use faster/cheaper models for task execution."
+        },
+        "summarization": {
+          "$ref": "#/$defs/llmPhaseOverride",
+          "description": "LLM overrides for context summarization. Can use different model for compacting conversation history."
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "description": "Workspace configuration",
+      "required": ["structure", "instructions_template"],
+      "properties": {
+        "structure": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Directories to create in the workspace. Standard: archive/ (phase history), output/ (deliverables), reference/ (domain material), tools/ (auto-generated tool docs)",
+          "examples": [["archive/", "output/", "reference/", "tools/"]]
+        },
+        "instructions_template": {
+          "type": "string",
+          "description": "Name of the instructions template file"
+        },
+        "initial_files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Files to copy into workspace on initialization. Keys are destination paths, values are source paths relative to src/agent/config/"
+        },
+        "max_read_words": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 25000,
+          "description": "Maximum word count for workspace read operations. For non-PDF files, estimated from file size (bytes / 5.5). For PDFs, counted during page iteration."
+        },
+        "max_write_words": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 10000,
+          "description": "Maximum word count for a single write_file call. Returns an error with guidance to split into multiple calls if exceeded."
+        },
+        "max_read_size": {
+          "type": "integer",
+          "minimum": 1000,
+          "description": "DEPRECATED: Use max_read_words instead. If max_read_words is not set, falls back to max_read_size / 5.5."
+        },
+        "git_versioning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable git versioning for workspace history. Creates a git repository in the workspace for automatic change tracking."
+        },
+        "backend": {
+          "type": "string",
+          "enum": ["local", "remote"],
+          "default": "local",
+          "description": "Workspace backend type. 'local' uses the local filesystem (default). 'remote' uses SSH/SFTP to a VM."
+        },
+        "remote": {
+          "type": "object",
+          "description": "Remote backend settings (only used when backend: remote)",
+          "properties": {
+            "host": {
+              "type": "string",
+              "description": "VM IP address or hostname"
+            },
+            "port": {
+              "type": "integer",
+              "default": 22,
+              "description": "SSH port"
+            },
+            "username": {
+              "type": "string",
+              "default": "agent-host",
+              "description": "SSH username"
+            },
+            "key_path": {
+              "type": "string",
+              "description": "Path to SSH private key file"
+            },
+            "workspace_path": {
+              "type": "string",
+              "default": "/home/agent-host/workspace",
+              "description": "Workspace root path on the remote VM"
+            }
+          },
+          "required": ["host"]
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "description": "Tool configuration by category (matches src/tools/ packages)",
+      "required": ["workspace", "core"],
+      "properties": {
+        "workspace": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Workspace file operation tools (src/tools/workspace/)",
+          "examples": [["read_file", "write_file", "list_files", "edit_file"]]
+        },
+        "core": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Core tools: todo management + job completion (src/tools/core/)",
+          "examples": [["next_phase_todos", "todo_complete", "mark_complete", "job_complete"]]
+        },
+        "document": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Document processing tools (src/tools/document/)",
+          "examples": [["chunk_document"]]
+        },
+        "research": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Research/web search tools (src/tools/research/)",
+          "examples": [["web_search"]]
+        },
+        "citation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Citation management tools (src/tools/citation/)",
+          "examples": [["cite_document", "cite_web", "list_sources"]]
+        },
+        "graph": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Neo4j graph tools (src/tools/graph/). Injected automatically when a Neo4j datasource is attached to the job. Usually left empty in config.",
+          "examples": [["execute_cypher_query", "get_database_schema"]]
+        },
+        "sql": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "PostgreSQL query tools (src/tools/sql/). Injected automatically when a PostgreSQL datasource is attached to the job.",
+          "examples": [["sql_query", "sql_schema", "sql_execute"]]
+        },
+        "mongodb": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "MongoDB query tools (src/tools/mongodb/). Injected automatically when a MongoDB datasource is attached to the job.",
+          "examples": [["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"]]
+        },
+        "git": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Git version control tools for workspace history (src/tools/git/)",
+          "examples": [["git_log", "git_show", "git_diff", "git_status", "git_tags"]]
+        },
+        "coding": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Coding/execution tools: shell commands (src/tools/coding/)",
+          "examples": [["run_command", "shell_read"], ["shell_execute", "shell_read"]]
+        },
+        "evaluation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Evaluation/verdict tools for critic agents: approve or return jobs with feedback (src/tools/evaluation/)",
+          "examples": [["approve_job", "return_job_with_feedback"]]
+        },
+        "knowledge": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/)",
+          "examples": [["kb_write", "kb_update", "kb_read", "kb_list", "kb_search", "kb_related"]]
+        }
+      }
+    },
+    "instruction_files": {
+      "type": "array",
+      "description": "Instruction files with config-driven trigger conditions for auto-injection. Each entry copies a file to the workspace and triggers delivery based on conditions.",
+      "items": {
+        "type": "object",
+        "required": ["file", "trigger"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Workspace-relative target path for the instruction file (e.g., 'todo_guide.md' or 'instructions/review_guide.md')"
+          },
+          "trigger": {
+            "type": "string",
+            "description": "Trigger condition. Format: 'before_tool:<tool_name>' (fires before tool execution) or 'phase:<phase_name>' (fires on phase transition). Examples: 'before_tool:next_phase_todos', 'phase:strategic'",
+            "pattern": "^(before_tool|phase):.+$"
+          },
+          "enforce": {
+            "type": "boolean",
+            "default": true,
+            "description": "If true (passive), the tool rejects until the agent reads the file. If false (active), the system auto-injects the content as a transient message."
+          }
+        },
+        "additionalProperties": false
+      },
+      "examples": [
+        [
+          {"file": "todo_guide.md", "trigger": "before_tool:next_phase_todos", "enforce": true},
+          {"file": "instructions/review_guide.md", "trigger": "phase:strategic", "enforce": false}
+        ]
+      ]
+    },
+    "connections": {
+      "type": "object",
+      "description": "Database connections required",
+      "required": ["postgres"],
+      "properties": {
+        "postgres": {
+          "type": "boolean",
+          "description": "Whether PostgreSQL is required"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "description": "Behavioral execution limits. Model-dependent limits (context_threshold_tokens, model_max_context_tokens, etc.) are set via settings_matrix.yaml.",
+      "properties": {
+        "message_count_threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 200,
+          "description": "Message count threshold for triggering summarization (requires min tokens too)"
+        },
+        "tool_retry_count": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 3,
+          "description": "Number of retries for failed tool calls"
+        },
+        "response_validation": {
+          "type": "object",
+          "description": "LLM response degeneration validation settings",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Enable response degeneration validation"
+            },
+            "max_content_length": {
+              "type": "integer",
+              "minimum": 1000,
+              "default": 50000,
+              "description": "Character threshold for excessive length warning (only when no tool calls)"
+            },
+            "max_tag_repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 50,
+              "description": "Flag if the same closing XML/HTML tag appears more than this many times"
+            },
+            "max_token_repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 20,
+              "description": "Flag if the same token/word repeats consecutively more than this many times"
+            },
+            "max_line_repetitions": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 10,
+              "description": "Flag if the same line appears more than this many times in the output"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "context_management": {
+      "type": "object",
+      "description": "Context management configuration",
+      "properties": {
+        "compact_on_archive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Trigger context compaction when archiving todos"
+        },
+        "keep_recent_tool_results": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 15,
+          "description": "Number of recent tool results to preserve in full during context compaction. Higher values retain more context but slow compaction."
+        },
+        "keep_recent_messages": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Number of recent messages to preserve during compaction and trimming"
+        },
+        "summarization_template": {
+          "type": "string",
+          "description": "Filename of summarization prompt template (in prompts/ folder)",
+          "default": "summarization_prompt.txt"
+        },
+        "reasoning_level": {
+          "type": "string",
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+          "default": "high",
+          "description": "Reasoning effort level for summarization. Only injected in prompt when reasoning_method is 'prompt'."
+        },
+        "max_summary_length": {
+          "type": "integer",
+          "minimum": 1000,
+          "default": 10000,
+          "description": "Maximum summary length in tokens (injected as {max_summary_length} in prompt)"
+        }
+      }
+    },
+    "research": {
+      "type": "object",
+      "description": "Research capabilities configuration",
+      "properties": {
+        "proxy": {
+          "type": "object",
+          "description": "Proxy configuration for institutional access (e.g., SSH tunnel to university VPN)",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "default": false,
+              "description": "Enable proxy for research tool requests"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["none", "http", "socks5"],
+              "default": "socks5",
+              "description": "Proxy type"
+            },
+            "host": {
+              "type": ["string", "null"],
+              "description": "Proxy host (e.g., 'localhost' for SSH tunnel)"
+            },
+            "port": {
+              "type": ["integer", "null"],
+              "description": "Proxy port (e.g., 1080 for SOCKS)"
+            }
+          }
+        }
+      }
+    },
+    "browser": {
+      "type": "object",
+      "description": "Browser automation configuration (browser-use + Playwright)",
+      "properties": {
+        "headless": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run browser without visible UI"
+        },
+        "timeout": {
+          "type": "integer",
+          "default": 60000,
+          "description": "Browser operation timeout in milliseconds"
+        },
+        "use_vision": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use screenshot-based navigation instead of DOM/accessibility tree"
+        }
+      }
+    },
+    "claude_code": {
+      "type": "object",
+      "description": "Claude Code settings (model for auto-started claude-code shell tab)",
+      "properties": {
+        "model": {
+          "type": "string",
+          "default": "claude-opus-4-6",
+          "description": "Model for Claude Code sessions (--model flag)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "shell": {
+      "type": "object",
+      "description": "Shell command execution settings (tmux-backed terminal multiplexer). Requires tmux installed.",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["stateless", "persistent"],
+          "default": "stateless",
+          "description": "Shell mode: 'stateless' exposes run_command (simple command→output), 'persistent' exposes shell_execute (full tab management, keys, async)"
+        },
+        "max_tabs": {
+          "type": "integer",
+          "minimum": 2,
+          "default": 15,
+          "description": "Maximum number of concurrent shell tabs. Agent must close tabs before opening new ones when limit is reached."
+        },
+        "max_read_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 200,
+          "description": "Maximum lines shell_read can return"
+        },
+        "scrollback_limit": {
+          "type": "integer",
+          "minimum": 100,
+          "default": 5000,
+          "description": "Tmux history-limit per pane (scrollback buffer size)"
+        },
+        "default_timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 120,
+          "description": "Default timeout for synchronous command execution in seconds"
+        },
+        "blocked_commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Commands blocked from execution for safety",
+          "default": ["sudo", "reboot", "shutdown", "poweroff", "halt", "init", "systemctl"]
+        },
+        "sandbox": {
+          "type": "boolean",
+          "default": true,
+          "description": "Restrict working directory to workspace root"
+        },
+        "auto_start_claude_code": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-open a Claude Code tab on job start (requires claude CLI in PATH)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "verification": {
+      "type": "object",
+      "description": "Verification phase: auto-spawn a critic job after job_complete to review deliverables. The critic either approves the job or resumes it with feedback. See docs/features/verification_phase.md.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: spawn a critic job after job_complete freezes the job as pending_review"
+        },
+        "critic_config": {
+          "type": "string",
+          "default": "critic",
+          "description": "Expert config name to use for the reviewer job"
+        }
+      },
+      "additionalProperties": false
+    },
+    "scholar": {
+      "type": "object",
+      "description": "Scholar phase: auto-spawn a research job before the main job starts. The scholar gathers information, does web research, and writes findings to the research/ folder. The main job starts after the scholar completes.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Spawn a scholar research job before the main job starts"
+        },
+        "scholar_config": {
+          "type": "string",
+          "default": "scholar",
+          "description": "Expert config name to use for the research job"
+        }
+      },
+      "additionalProperties": false
+    },
+    "autonomy": {
+      "type": "string",
+      "enum": ["full", "review", "partial", "guided", "dependent"],
+      "default": "partial",
+      "description": "Controls when the agent pauses for human review. full=never, review=after job_complete, partial=after first strategic + job_complete, guided=after every strategic + job_complete, dependent=after every phase + job_complete."
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "llmPhaseOverride": {
+      "type": "object",
+      "description": "Phase-specific LLM overrides. Only specified fields override the base config.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model identifier for this phase"
+        },
+        "provider": {
+          "type": ["string", "null"],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
+          "description": "LLM provider override"
+        },
+        "temperature": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature override"
+        },
+        "top_p": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Top-p (nucleus) sampling override for this phase"
+        },
+        "top_k": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Top-k sampling override for this phase"
+        },
+        "reasoning_level": {
+          "type": "string",
+          "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+          "description": "Reasoning depth override"
+        },
+        "reasoning_method": {
+          "type": ["string", "null"],
+          "enum": ["prompt", "api", "none", null],
+          "description": "Override how reasoning level is delivered for this phase"
+        },
+        "base_url": {
+          "type": ["string", "null"],
+          "description": "Custom API base URL override"
+        },
+        "api_key": {
+          "type": ["string", "null"],
+          "description": "API key override (for different provider)"
+        },
+        "timeout": {
+          "type": ["number", "null"],
+          "minimum": 1,
+          "description": "Request timeout override"
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Retry count override"
+        },
+        "multimodal": {
+          "type": "boolean",
+          "description": "Override whether this phase's model can process images directly"
+        },
+        "parallel_tool_calls": {
+          "type": "boolean",
+          "description": "Override parallel tool calls for this phase"
+        },
+        "max_output_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Override max output tokens for this phase"
+        },
+        "model_max_context_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 1000,
+          "description": "Hard limit for this phase model's context window. Overrides the base llm.model_max_context_tokens for this phase."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

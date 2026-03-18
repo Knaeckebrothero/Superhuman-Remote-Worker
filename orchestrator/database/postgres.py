@@ -4011,6 +4011,29 @@ class PostgresDB:
             )
         return dict(row) if row else None
 
+    async def resolve_message_by_email_id(
+        self, email_message_id: str
+    ) -> Dict[str, Any] | None:
+        """Look up a message_log entry by its RFC822 Message-ID.
+
+        Used by the IMAP poller to resolve In-Reply-To headers when
+        + sub-addressing is stripped by the email client.
+
+        Returns:
+            Dict with job_id (str) and thread_id, or None.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT job_id::text AS job_id, thread_id
+                FROM message_log
+                WHERE email_message_id = $1
+                LIMIT 1
+                """,
+                email_message_id,
+            )
+        return dict(row) if row else None
+
     async def check_message_rate_limit(
         self,
         job_id: str,
