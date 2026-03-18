@@ -6,12 +6,13 @@ import { UserService } from '../../core/services/user.service';
 import { SidebarService } from '../../core/services/sidebar.service';
 import { LayoutService } from '../../debug/services/layout.service';
 import { LayoutPickerComponent } from '../../debug/components/layout-picker/layout-picker.component';
+import { NotificationBellComponent } from '../../shared/components/notification-bell/notification-bell.component';
 import { environment } from '../../core/environment';
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent],
+  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent],
   template: `
     <nav class="sidebar">
       <div class="sidebar-header">
@@ -144,6 +145,7 @@ import { environment } from '../../core/environment';
             }
           </div>
           <div class="footer-actions">
+            <app-notification-bell />
             <a class="footer-link" routerLink="/settings" routerLinkActive="active" title="Settings">
               <span class="nav-icon">settings</span>
             </a>
