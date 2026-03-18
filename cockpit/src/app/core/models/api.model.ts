@@ -174,6 +174,7 @@ export interface UserSettings {
   default_model?: string | null;
   default_autonomy?: string | null;
   default_reasoning_level?: string | null;
+  default_auxiliary_model?: string | null;
 }
 
 // =============================================================================

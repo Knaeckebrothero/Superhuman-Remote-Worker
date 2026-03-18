@@ -290,6 +290,7 @@ class UniversalAgent:
             aux_llm_config = LLMConfig(
                 model=aux_config.model,
                 base_url=aux_config.base_url,
+                api_key=aux_config.api_key,
                 temperature=aux_config.temperature,
                 top_p=model_settings.get("top_p"),
                 top_k=model_settings.get("top_k"),
@@ -819,9 +820,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info(f"Applying inline config override: {list(config_override.keys())}")
 
             # Convert current config to dict, merge, and reload
+            # Preserve _deployment_dir so instruction file resolution still works
+            prev_deployment_dir = self.config._deployment_dir
             current_config_dict = dataclasses.asdict(self.config)
             merged_config_data = deep_merge(current_config_dict, config_override)
-            self.config = load_agent_config_from_dict(merged_config_data)
+            self.config = load_agent_config_from_dict(merged_config_data, deployment_dir=prev_deployment_dir)
             logger.info("Applied inline config overrides")
 
         # Apply env_keys overrides (user/project API keys for non-LLM providers)

@@ -74,6 +74,7 @@ class ToolContext:
     knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)
     _project_id: Optional[str] = None  # Project UUID for knowledge scoping
     _pending_memories: List[Dict[str, Any]] = field(default_factory=list)  # Sync-safe memory queue
+    _freeze_request: Optional[Dict[str, Any]] = None  # Tool-requested job freeze (blocking send_message)
 
     def __post_init__(self):
         """Validate context after initialization."""
@@ -382,6 +383,30 @@ class ToolContext:
         pending = self._pending_memories[:]
         self._pending_memories.clear()
         return pending
+
+    def request_freeze(self, freeze_data: Dict[str, Any]) -> None:
+        """Request a job freeze from a tool (e.g., blocking send_message).
+
+        The freeze is consumed by the graph's audited_tools node after
+        tool execution completes. This is sync-safe — can be called from
+        ``@tool`` functions.
+
+        Args:
+            freeze_data: Freeze metadata dict (freeze_type, thread_id, etc.)
+        """
+        self._freeze_request = freeze_data
+
+    def consume_freeze_request(self) -> Optional[Dict[str, Any]]:
+        """Return and clear any pending freeze request.
+
+        Called from the async audited_tools graph node after tool execution.
+
+        Returns:
+            Freeze data dict if a freeze was requested, None otherwise.
+        """
+        req = self._freeze_request
+        self._freeze_request = None
+        return req
 
     def close_citation_engine(self) -> None:
         """Close CitationEngine connection if open.

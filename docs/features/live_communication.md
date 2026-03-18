@@ -20,7 +20,7 @@ related:
 
 Bidirectional email communication between agents and humans, with a filesystem-native message store that integrates naturally into the workspace, git versioning, and phase-based review cycle.
 
-**Status:** Design phase.
+**Status:** Phase 1 implemented and tested. Phase 2 in progress.
 **Parent design:** `docs/email_and_mobile.md`
 
 ## Motivation
@@ -479,29 +479,38 @@ Stored in the existing `users.settings` JSONB column. Managed via `GET/PATCH /ap
 
 ## Implementation Plan
 
-### Phase 1 — Core Mailbox (MVP)
+### Phase 1 — Core Mailbox (MVP) [IMPLEMENTED]
 
 Agent sends messages, user replies via cockpit, messages stored on filesystem, outbound via existing SMTP.
 
-**Create:**
+**Scope:** `send_message` with async/blocking modes, job owner only (`to: "user"`), cockpit-only replies, rate limiting.
+
+**Created:**
 
 | File | Purpose |
 |------|---------|
 | `src/tools/communication/__init__.py` | Category boilerplate |
-| `src/tools/communication/messaging.py` | `send_message` tool + metadata |
+| `src/tools/communication/messaging.py` | `send_message` tool with async/blocking modes |
+| `orchestrator/services/email.py` | EmailService with `send_agent_message()` + branded HTML template |
 
-**Modify:**
+**Modified:**
 
 | File | Change |
 |------|--------|
-| `src/tools/registry.py` | Import + register `communication` category |
-| `config/defaults.yaml` | Add `communication: [send_message]` + settings |
-| `orchestrator/main.py` | Message send/reply/list endpoints |
-| `orchestrator/services/email.py` | `send_agent_message()` method + HTML template |
-| `orchestrator/database/schema.sql` | `message_log` table |
-| `orchestrator/database/postgres.py` | Message log, rate limit, thread queries |
+| `src/tools/registry.py` | Imported + registered `communication` category |
+| `src/tools/context.py` | Added `_freeze_request` field + `request_freeze()`/`consume_freeze_request()` methods |
+| `src/graph.py` | Freeze request check in `audited_tools`, `should_stop` route in `route_after_check_todos` → `check_goal`, received message file write in `restore_from_feedback` |
+| `config/defaults.yaml` | Added `communication: [send_message]` tool + `communication:` config section |
+| `orchestrator/main.py` | Added `POST /messages/send`, `POST /messages/{thread}/reply`, `GET /messages` endpoints |
+| `orchestrator/database/schema.sql` | Added `message_log` table with 4 indexes |
+| `orchestrator/database/postgres.py` | Added `log_message()`, `check_message_rate_limit()`, `get_message_threads()`, `get_message_sequence()` + `freeze_data` param on `update_job_status()` |
 
-**Scope:** `send_message` with async/blocking modes, job owner only (`to: "user"`), cockpit-only replies, rate limiting.
+**Key design decisions:**
+- Blocking mode uses the existing job freeze mechanism (`job_frozen.json` + `should_stop`) with a new `waiting_for_reply` status
+- Tool-initiated freeze via `ToolContext._freeze_request` → consumed by `audited_tools` graph node (follows `_pending_memories` pattern)
+- Graph route: `check_todos` → `check_goal` (bypasses `archive_phase`/`handle_transition` for mid-phase freeze)
+- Reply delivery reuses `_internal_resume_job()` with reply as feedback → `restore_from_feedback` writes received message file
+- Graceful degradation: messages saved to workspace even if SMTP is unconfigured
 
 **Not in Phase 1:** IMAP reply routing, AuxiliaryLLM triage, delivery preferences UI, multi-recipient.
 
