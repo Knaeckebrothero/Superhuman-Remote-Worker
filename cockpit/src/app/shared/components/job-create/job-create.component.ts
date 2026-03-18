@@ -1656,6 +1656,10 @@ export class JobCreateComponent implements OnInit {
   );
 
   readonly disabledToolCategories = signal<Set<string>>(new Set());
+  /** Categories the expert config originally disabled (empty array in config). */
+  private expertDisabledCategories = new Set<string>();
+  /** Default tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
+  private defaultsTools: Record<string, string[]> = {};
 
   // Autonomy level override
   readonly selectedPriority = signal<number>(5);
@@ -1773,6 +1777,8 @@ export class JobCreateComponent implements OnInit {
       this.tacticalTemperature.set(null);
       this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
+      this.expertDisabledCategories = new Set();
+      this.defaultsTools = {};
       this.selectedAutonomy.set(null);
     } else {
       this.selectedExpert.set(expert);
@@ -1997,13 +2003,21 @@ export class JobCreateComponent implements OnInit {
       override['llm'] = llm;
     }
 
-    // Tool overrides — only include disabled categories (set to empty array)
+    // Tool overrides — disabled categories set to empty array,
+    // re-enabled categories (expert had them disabled, user toggled ON)
+    // get the defaults' tool list so they override the expert's empty array.
     const disabled = this.disabledToolCategories();
-    if (disabled.size > 0) {
-      const tools: Record<string, unknown> = {};
-      disabled.forEach((cat) => {
-        tools[cat] = [];
-      });
+    const tools: Record<string, unknown> = {};
+    disabled.forEach((cat) => {
+      tools[cat] = [];
+    });
+    // Re-enabled: was disabled in expert config, user toggled ON
+    for (const cat of this.expertDisabledCategories) {
+      if (!disabled.has(cat) && this.defaultsTools[cat]?.length) {
+        tools[cat] = [...this.defaultsTools[cat]];
+      }
+    }
+    if (Object.keys(tools).length > 0) {
       override['tools'] = tools;
     }
 
@@ -2049,6 +2063,8 @@ export class JobCreateComponent implements OnInit {
       this.tacticalTemperature.set(null);
       this.tacticalMultimodal.set(null);
       this.disabledToolCategories.set(new Set());
+      this.expertDisabledCategories = new Set();
+      this.defaultsTools = {};
       this.selectedAutonomy.set(null);
       this.enableScholar.set(true);
       this.enableCritic.set(true);
@@ -2087,6 +2103,10 @@ export class JobCreateComponent implements OnInit {
       }
     }
     this.disabledToolCategories.set(disabled);
+    // Remember expert's original disabled set and defaults' tool lists so
+    // buildConfigOverride() can re-enable categories the user toggles ON.
+    this.expertDisabledCategories = new Set(disabled);
+    this.defaultsTools = detail.defaults_tools ?? {};
 
     // Pre-fill autonomy level
     this.selectedAutonomy.set((detail.config['autonomy'] as string) ?? null);
@@ -2398,6 +2418,8 @@ export class JobCreateComponent implements OnInit {
     this.tacticalTemperature.set(null);
     this.tacticalMultimodal.set(null);
     this.disabledToolCategories.set(new Set());
+    this.expertDisabledCategories = new Set();
+    this.defaultsTools = {};
     this.selectedAutonomy.set(null);
     this.useProjectMemory.set(true);
     this.enableScholar.set(true);

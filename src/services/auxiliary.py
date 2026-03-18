@@ -18,8 +18,9 @@ See docs/features/auxiliary.md for the full design document.
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Type
+from typing import TYPE_CHECKING, Any, List, Optional, Type
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -30,6 +31,9 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from src.core.archiver import LLMArchiver
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +345,22 @@ class AssembleMemoriesTask(AuxAgentTask):
 # AuxiliaryLLM — the unified executor
 # =============================================================================
 
+# Maps task class names to call_type values for archiving
+_TASK_CALL_TYPES = {
+    "SummarizeTask": "summarization",
+    "ExtractMemoriesTask": "memory_extraction",
+    "AssembleMemoriesTask": "memory_assembly",
+    "CurateKnowledgeTask": "knowledge_curation",
+}
+
+
+def _get_model_name(llm: BaseChatModel) -> str:
+    """Extract model name from a LangChain chat model."""
+    for attr in ("model_name", "model"):
+        if hasattr(llm, attr):
+            return getattr(llm, attr)
+    return "unknown"
+
 
 class AuxiliaryLLM:
     """Unified support task execution with chain and agent modes.
@@ -357,10 +377,27 @@ class AuxiliaryLLM:
         llm: BaseChatModel,
         max_iterations: int = 15,
         timeout: float = 120.0,
+        archiver: Optional["LLMArchiver"] = None,
+        job_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
     ):
         self.llm = llm
         self.max_iterations = max_iterations
         self.timeout = timeout
+        self._archiver = archiver
+        self._job_id = job_id
+        self._agent_type = agent_type or "unknown"
+
+    def set_job_context(
+        self,
+        archiver: Optional["LLMArchiver"],
+        job_id: str,
+        agent_type: str,
+    ) -> None:
+        """Set archiver and job context for logging. Called at job start."""
+        self._archiver = archiver
+        self._job_id = job_id
+        self._agent_type = agent_type
 
     async def chain(self, task: AuxTask) -> BaseModel:
         """Single LLM call: system prompt + context -> structured output.
@@ -376,22 +413,32 @@ class AuxiliaryLLM:
         Raises:
             asyncio.TimeoutError: If the LLM call exceeds timeout
         """
-        structured_llm = self.llm.with_structured_output(task.output_schema)
+        structured_llm = self.llm.with_structured_output(
+            task.output_schema, include_raw=True
+        )
         messages = [
             SystemMessage(content=task.system_prompt),
             HumanMessage(content=task.build_context()),
         ]
 
-        result = await asyncio.wait_for(
+        start = time.monotonic()
+        raw_result = await asyncio.wait_for(
             structured_llm.ainvoke(messages),
             timeout=self.timeout,
         )
+        latency_ms = int((time.monotonic() - start) * 1000)
+
+        parsed = raw_result["parsed"]
+        raw_response = raw_result["raw"]
 
         logger.debug(
             f"AuxiliaryLLM.chain completed: {task.__class__.__name__} -> "
-            f"{type(result).__name__}"
+            f"{type(parsed).__name__}"
         )
-        return result
+
+        self._archive_call(task, messages, raw_response, latency_ms)
+
+        return parsed
 
     async def agent(self, task: AuxAgentTask) -> BaseModel:
         """Short-lived agent loop: system prompt + tools -> structured result.
@@ -418,6 +465,7 @@ class AuxiliaryLLM:
             HumanMessage(content=task.build_context()),
         ]
 
+        start = time.monotonic()
         tool_calls_made = 0
         for iteration in range(self.max_iterations):
             response = await asyncio.wait_for(
@@ -456,22 +504,72 @@ class AuxiliaryLLM:
                     tool_call_id=tool_id,
                 ))
 
+        iterations_used = iteration + 1
+
         logger.info(
             f"AuxiliaryLLM.agent completed: {task.__class__.__name__}, "
-            f"{tool_calls_made} tool calls in {iteration + 1} iterations"
+            f"{tool_calls_made} tool calls in {iterations_used} iterations"
         )
 
         # Final structured-output call to get the result
-        structured_llm = self.llm.with_structured_output(task.output_schema)
+        structured_llm = self.llm.with_structured_output(
+            task.output_schema, include_raw=True
+        )
         messages.append(HumanMessage(
             content="Summarize what you accomplished in the required output format."
         ))
 
-        result = await asyncio.wait_for(
+        raw_result = await asyncio.wait_for(
             structured_llm.ainvoke(messages),
             timeout=self.timeout,
         )
-        return result
+        latency_ms = int((time.monotonic() - start) * 1000)
+
+        parsed = raw_result["parsed"]
+        raw_response = raw_result["raw"]
+
+        self._archive_call(
+            task, messages, raw_response, latency_ms,
+            auxiliary_metadata={
+                "iterations": iterations_used,
+                "tool_calls_made": tool_calls_made,
+            },
+        )
+
+        return parsed
+
+    def _archive_call(
+        self,
+        task: AuxTask,
+        messages: List[BaseMessage],
+        response: AIMessage,
+        latency_ms: int,
+        auxiliary_metadata: Optional[dict] = None,
+    ) -> None:
+        """Archive an auxiliary LLM call. Fire-and-forget — never raises."""
+        if not self._archiver or not self._job_id:
+            return
+
+        try:
+            task_class = task.__class__.__name__
+            call_type = _TASK_CALL_TYPES.get(task_class, "auxiliary")
+
+            meta = {"task_class": task_class}
+            if auxiliary_metadata:
+                meta.update(auxiliary_metadata)
+
+            self._archiver.archive(
+                job_id=self._job_id,
+                agent_type=self._agent_type,
+                messages=messages,
+                response=response,
+                model=_get_model_name(self.llm),
+                latency_ms=latency_ms,
+                call_type=call_type,
+                auxiliary_metadata=meta,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to archive auxiliary call ({task.__class__.__name__}): {e}")
 
 
 # =============================================================================

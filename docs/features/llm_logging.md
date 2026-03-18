@@ -1,6 +1,6 @@
 # Auxiliary LLM Call Logging
 
-## Status: Design
+## Status: Implemented
 
 ## Problem
 
@@ -91,7 +91,7 @@ def archive(
 
 #### 2. `AuxiliaryLLM` — accept and use archiver
 
-Pass the archiver and job context into `AuxiliaryLLM` so it can log calls.
+Pass the archiver and job context into `AuxiliaryLLM` so it can log calls. The construction happens in `src/agent.py` (where `AuxiliaryLLM` is instantiated), not in `graph.py`.
 
 ```python
 class AuxiliaryLLM:
@@ -106,9 +106,33 @@ class AuxiliaryLLM:
     ):
 ```
 
-**`chain()` logging**: Single archive call after the LLM responds. Derives `call_type` from `task.__class__.__name__` → mapped value.
+**Structured output and raw responses**: Both `chain()` and `agent()` use `with_structured_output()`, which returns a Pydantic model — not an `AIMessage`. To archive the raw LLM response, use `include_raw=True`:
 
-**`agent()` logging**: Archive each iteration of the tool loop individually. Each doc gets `auxiliary_metadata.iteration` and `auxiliary_metadata.total_iterations` (filled in after the loop completes, or on each call). The final structured-output call is logged as a separate entry with `auxiliary_metadata.trigger = "final_structured_output"`.
+```python
+structured_llm = self.llm.with_structured_output(task.output_schema, include_raw=True)
+result = await structured_llm.ainvoke(messages)
+# result = {"raw": AIMessage, "parsed": PydanticModel, "parsing_error": None}
+raw_response = result["raw"]   # For archiving
+parsed = result["parsed"]      # Return value
+```
+
+This gives us the `AIMessage` (with `response_metadata` containing token usage) for the archive call, and the parsed Pydantic model to return to the caller. No change to the return type of `chain()` / `agent()`.
+
+**`chain()` logging**: Single archive call after the LLM responds. Derives `call_type` from the task class name via mapping. Wraps archiving in try/except — logging failures must never break the actual operation.
+
+**`agent()` logging**: Log one document per agent run (not per iteration). The document captures the final structured-output call's messages/response. `auxiliary_metadata` includes `iterations` (how many tool-loop rounds ran) and `tool_calls_made` (total tool invocations). Individual tool-loop iterations don't warrant separate documents — the cost of the final structured-output call already captures the full message history as input.
+
+**Model name extraction**: The archiver needs a model name string. LangChain chat models expose this inconsistently (`model_name`, `model`, or buried in `kwargs`). Add a helper:
+
+```python
+def _get_model_name(llm: BaseChatModel) -> str:
+    for attr in ("model_name", "model"):
+        if hasattr(llm, attr):
+            return getattr(llm, attr)
+    return "unknown"
+```
+
+**Latency**: Measured inside `chain()` and `agent()` by timing the `ainvoke()` call(s). For agent mode, report the total wall-clock time of the entire run (not per-iteration).
 
 #### 3. `VisionHelper` — add archiver support
 
@@ -119,6 +143,22 @@ Vision uses raw `AsyncOpenAI`, not LangChain messages. Two options:
 **Option B**: Add a lightweight `archiver.archive_raw()` method that accepts plain dicts instead of LangChain messages.
 
 Prefer **Option A** — it keeps the archive format consistent and the conversion is trivial (one `HumanMessage` with the prompt text, one `AIMessage` with the response content). Image data should be excluded from the archive (just log `"[image: {mime_type}, {len(image_data)} bytes]"` as a placeholder).
+
+**Job context threading**: `VisionHelper` is a module-level singleton (`get_vision_helper()`) with no knowledge of which job it's serving. Rather than adding job state to the singleton, pass `job_id` as an optional parameter on the call methods:
+
+```python
+async def describe_image(
+    self,
+    image_data: Union[bytes, str],
+    mime_type: str = "image/png",
+    query: Optional[str] = None,
+    job_id: Optional[str] = None,       # NEW
+) -> str:
+```
+
+The call sites in `src/tools/workspace/files.py` (`read_file` tool) have access to `ToolContext` which carries `job_id`. The archiver is obtained via `get_archiver()` (module-level singleton, same as the main loop uses).
+
+When `job_id` is `None`, skip archiving (graceful no-op for any non-job usage of VisionHelper).
 
 #### 4. Existing queries — add default filter
 
@@ -147,6 +187,19 @@ Affected locations:
 }
 ```
 
+#### 6. MongoDB index
+
+The `llm_requests` collection has no explicit indexes (relies on `_id` and whatever MongoDB auto-creates). With `call_type` filtering becoming common, add a compound index on first connection:
+
+```python
+self._collection.create_index(
+    [("job_id", 1), ("call_type", 1), ("timestamp", 1)],
+    background=True,
+)
+```
+
+This keeps both filtered queries (`call_type: "main"`) and unfiltered aggregations (`group by call_type`) fast.
+
 ### Task class → call_type mapping
 
 In `AuxiliaryLLM`, derive `call_type` from the task class:
@@ -162,17 +215,15 @@ _TASK_CALL_TYPES = {
 
 Unmapped task classes fall back to `"auxiliary"` as a catch-all.
 
-### Backwards compatibility
+### Error handling
 
-- Old documents without `call_type` are treated as `"main"` (query filter: `{"$or": [{"call_type": "main"}, {"call_type": {"$exists": false}}]}`).
-- No migration needed — the field is simply absent on old docs.
-- `get_job_stats()` continues to return the same top-level totals; `by_call_type` is additive.
+Archiving must be fire-and-forget. Every archive call is wrapped in try/except with a warning log — never raising, never blocking the caller. This is especially important for memory extraction and assembly, which are launched as `asyncio.create_task()` background tasks from the execute node. A MongoDB timeout or connection error in archiving must not surface as an unhandled exception in those tasks.
 
 ## Implementation Order
 
-1. Add `call_type` + `auxiliary_metadata` to `LLMArchiver.archive()`, gate `chat_history` writes on `call_type == "main"`
-2. Wire archiver + job context into `AuxiliaryLLM.__init__()`, log from `chain()` and `agent()`
-3. Add archiver to `VisionHelper`, log from `describe_image()` and `describe_document_page()`
+1. Add `call_type` + `auxiliary_metadata` to `LLMArchiver.archive()`, gate `chat_history` writes on `call_type == "main"`, add compound index
+2. Wire archiver + job context into `AuxiliaryLLM.__init__()` (constructed in `src/agent.py`), switch to `include_raw=True`, log from `chain()` and `agent()`
+3. Add `job_id` parameter to `VisionHelper` call methods, log from `describe_image()` and `describe_document_page()`
 4. Update `get_conversation()` and `get_job_stats()` with `call_type` awareness
 5. Update downstream consumers (viewer script, MCP tools, cockpit endpoints)
 
@@ -180,10 +231,11 @@ Unmapped task classes fall back to `"auxiliary"` as a catch-all.
 
 | File | Change |
 |---|---|
-| `src/core/archiver.py` | Add `call_type`, `auxiliary_metadata` params; update `get_conversation()`, `get_job_stats()` |
-| `src/services/auxiliary.py` | Accept archiver in `AuxiliaryLLM`, log from `chain()` and `agent()` |
-| `src/services/vision_helper.py` | Accept archiver, log from `describe_image()` and `describe_document_page()` |
-| `src/graph.py` | Pass archiver + job context when constructing `AuxiliaryLLM` |
+| `src/core/archiver.py` | Add `call_type`, `auxiliary_metadata` params; update queries; add compound index |
+| `src/services/auxiliary.py` | Accept archiver in `AuxiliaryLLM`; `include_raw=True`; log from `chain()` and `agent()` |
+| `src/services/vision_helper.py` | Add `job_id` param to call methods; archive via `get_archiver()` |
+| `src/agent.py` | Pass archiver + job context when constructing `AuxiliaryLLM` |
+| `src/tools/workspace/files.py` | Pass `job_id` from tool context to `VisionHelper` calls |
 | `src/core/context.py` | No change (calls go through `AuxiliaryLLM.chain()` which now logs) |
 | `DEPRECATED_scripts/view_llm_conversation.py` | Add `--all` / `--call-type` filter |
 | `orchestrator/mcp/tools/debug.py` | Add `call_type` filter to LLM request tools |
@@ -193,4 +245,5 @@ Unmapped task classes fall back to `"auxiliary"` as a catch-all.
 - **Logging embeddings**: Different API, high volume, low cost. Not worth the noise.
 - **Logging to `agent_audit`**: Auxiliary calls aren't agent decisions. Keep audit clean.
 - **Logging to `chat_history`**: Auxiliary calls aren't part of the conversation. Keep chat clean.
-- **Real-time streaming of auxiliary logs**: Nice-to-have, but out of scope. Standard async logging is sufficient.
+- **Per-iteration logging for agent-mode tasks**: One document per agent run is sufficient. Per-iteration logging would multiply documents for marginal debugging value.
+- **Real-time streaming of auxiliary logs**: Standard async logging is sufficient.

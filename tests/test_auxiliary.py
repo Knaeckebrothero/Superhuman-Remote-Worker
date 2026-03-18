@@ -35,14 +35,20 @@ from src.core.loader import (
 
 
 def _make_structured_llm(return_value):
-    """Create a mock LLM that supports with_structured_output().
+    """Create a mock LLM that supports with_structured_output(include_raw=True).
 
     The mock LLM's with_structured_output() returns a new mock
-    whose ainvoke() returns the given return_value.
+    whose ainvoke() returns the include_raw dict format:
+    {"raw": AIMessage, "parsed": return_value, "parsing_error": None}
     """
     mock_llm = MagicMock()
+    raw_response = AIMessage(content="structured output")
     structured_mock = AsyncMock()
-    structured_mock.ainvoke = AsyncMock(return_value=return_value)
+    structured_mock.ainvoke = AsyncMock(return_value={
+        "raw": raw_response,
+        "parsed": return_value,
+        "parsing_error": None,
+    })
     mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
     return mock_llm
 
@@ -272,7 +278,7 @@ class TestAuxiliaryLLMChain:
         assert result is expected
         assert len(result.memories) == 2
         assert result.memories[0].content == "The users table uses soft deletes via deleted_at."
-        mock_llm.with_structured_output.assert_called_once_with(ExtractedMemories)
+        mock_llm.with_structured_output.assert_called_once_with(ExtractedMemories, include_raw=True)
 
     @pytest.mark.asyncio
     async def test_chain_passes_correct_messages(self):
@@ -336,9 +342,12 @@ class TestAuxiliaryLLMAgent:
         tool_loop_mock.ainvoke = AsyncMock(return_value=no_tools_response)
         mock_llm.bind_tools = MagicMock(return_value=tool_loop_mock)
 
-        # Final structured output call
+        # Final structured output call (include_raw=True format)
+        raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value=expected)
+        structured_mock.ainvoke = AsyncMock(return_value={
+            "raw": raw_response, "parsed": expected, "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         aux = AuxiliaryLLM(llm=mock_llm, max_iterations=5, timeout=30.0)
@@ -378,9 +387,12 @@ class TestAuxiliaryLLMAgent:
         tool_loop_mock.ainvoke = AsyncMock(side_effect=[tool_call_response, done_response])
         mock_llm.bind_tools = MagicMock(return_value=tool_loop_mock)
 
-        # Final structured output
+        # Final structured output (include_raw=True format)
+        raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value=expected)
+        structured_mock.ainvoke = AsyncMock(return_value={
+            "raw": raw_response, "parsed": expected, "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         # Create a mock tool
@@ -420,9 +432,12 @@ class TestAuxiliaryLLMAgent:
         tool_loop_mock.ainvoke = AsyncMock(return_value=infinite_response)
         mock_llm.bind_tools = MagicMock(return_value=tool_loop_mock)
 
-        # Final structured output
+        # Final structured output (include_raw=True format)
+        raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value=expected)
+        structured_mock.ainvoke = AsyncMock(return_value={
+            "raw": raw_response, "parsed": expected, "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         mock_tool = AsyncMock()
@@ -464,8 +479,12 @@ class TestAuxiliaryLLMAgent:
         tool_loop_mock.ainvoke = AsyncMock(side_effect=[tool_call_response, done_response])
         mock_llm.bind_tools = MagicMock(return_value=tool_loop_mock)
 
+        # Final structured output (include_raw=True format)
+        raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value=expected)
+        structured_mock.ainvoke = AsyncMock(return_value={
+            "raw": raw_response, "parsed": expected, "parsing_error": None,
+        })
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         # Tool that raises an error

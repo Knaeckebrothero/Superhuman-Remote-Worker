@@ -12,11 +12,14 @@ Environment variables:
     SMTP_TRUST_SELF_SIGNED — Accept self-signed certs (default: false)
     SMTP_FROM              — Sender email address (default: noreply@example.com)
     COCKPIT_EXTERNAL_URL   — Cockpit URL for deep links in emails (default: http://localhost:4200)
+    AGENT_EMAIL            — Agent email for IMAP reply routing (e.g., agent@example.com)
+    MAIL_DOMAIN            — Mail domain for Message-ID generation (e.g., example.com)
 """
 
 import logging
 import os
 import ssl
+import uuid as uuid_mod
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -41,11 +44,18 @@ class EmailService:
         )
         self.from_address = os.getenv("SMTP_FROM", "noreply@example.com")
         self.cockpit_url = os.getenv("COCKPIT_EXTERNAL_URL", "http://localhost:4200").rstrip("/")
+        self.agent_email = os.getenv("AGENT_EMAIL", "")
+        self.mail_domain = os.getenv("MAIL_DOMAIN", "")
 
     @property
     def is_configured(self) -> bool:
         """Whether SMTP is configured (host is set)."""
         return bool(self.host)
+
+    @property
+    def reply_routing_configured(self) -> bool:
+        """Whether IMAP reply routing is available (agent email + mail domain set)."""
+        return bool(self.agent_email and self.mail_domain)
 
     def _get_tls_context(self) -> ssl.SSLContext | None:
         """Build TLS context, optionally trusting self-signed certs."""
@@ -57,8 +67,28 @@ class EmailService:
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    async def _send(self, to: str, subject: str, body_text: str, body_html: str) -> bool:
+    async def _send(
+        self,
+        to: str | list[str],
+        subject: str,
+        body_text: str,
+        body_html: str,
+        reply_to: str | None = None,
+        message_id: str | None = None,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> bool:
         """Send an email via SMTP.
+
+        Args:
+            to: Recipient email address(es)
+            subject: Email subject
+            body_text: Plain text body
+            body_html: HTML body
+            reply_to: Reply-To header (for IMAP routing)
+            message_id: RFC822 Message-ID header
+            in_reply_to: In-Reply-To header for threading
+            references: References header for threading
 
         Returns True on success, False on failure (logs the error).
         """
@@ -68,10 +98,20 @@ class EmailService:
 
         msg = MIMEMultipart("alternative")
         msg["From"] = self.from_address
-        msg["To"] = to
+        msg["To"] = ", ".join(to) if isinstance(to, list) else to
         msg["Subject"] = subject
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        if message_id:
+            msg["Message-ID"] = message_id
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+        if references:
+            msg["References"] = references
         msg.attach(MIMEText(body_text, "plain"))
         msg.attach(MIMEText(body_html, "html"))
+
+        recipients = to if isinstance(to, list) else [to]
 
         try:
             tls_context = self._get_tls_context()
@@ -84,10 +124,10 @@ class EmailService:
                 start_tls=self.use_tls,
                 tls_context=tls_context,
             )
-            logger.info(f"Email sent to {to}: {subject}")
+            logger.info(f"Email sent to {recipients}: {subject}")
             return True
         except Exception as e:
-            logger.error(f"Failed to send email to {to}: {e}")
+            logger.error(f"Failed to send email to {recipients}: {e}")
             return False
 
     async def send_agent_message(
@@ -101,7 +141,7 @@ class EmailService:
         config_name: str,
         phase_number: int | None = None,
         thread_id: str | None = None,
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Send an agent message email to a human.
 
         Wraps the agent's markdown message in a branded HTML template
@@ -119,9 +159,22 @@ class EmailService:
             thread_id: Thread ID for reply deep link (optional)
 
         Returns:
-            True if sent successfully, False otherwise
+            Tuple of (success: bool, email_message_id: str | None).
+            The message_id is the RFC822 Message-ID set on the outbound email,
+            returned so the caller can store it for IMAP reply correlation.
         """
         full_subject = f"[SRW] {subject}"
+
+        # Generate RFC822 Message-ID for reply correlation
+        domain = self.mail_domain or "srw.local"
+        email_msg_id = f"<{uuid_mod.uuid4().hex}@{domain}>"
+
+        # Build Reply-To with + sub-addressing for IMAP routing
+        reply_to_addr = None
+        if self.reply_routing_configured and thread_id:
+            agent_local = self.agent_email.split("@")[0]
+            job_short = job_id[:8]
+            reply_to_addr = f"{agent_local}+{job_short}+{thread_id}@{self.mail_domain}"
 
         # Build cockpit link
         cockpit_link = f"{self.cockpit_url}/jobs/{job_id}"
@@ -140,6 +193,8 @@ class EmailService:
             f"{'=' * 50}\n"
             f"Reply in Cockpit: {cockpit_link}\n"
         )
+        if reply_to_addr:
+            body_text += "Or reply directly to this email.\n"
 
         # HTML version
         # Escape basic HTML entities in the message
@@ -149,6 +204,12 @@ class EmailService:
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace("\n", "<br>")
+        )
+
+        reply_hint = (
+            '<p style="margin: 12px 0 0 0; color: #6c7086; font-size: 12px;">or reply directly to this email</p>'
+            if reply_to_addr
+            else ""
         )
 
         body_html = f"""\
@@ -167,12 +228,20 @@ class EmailService:
     </div>
     <div style="background: #181825; padding: 16px 20px; border-top: 1px solid #313244; text-align: center;">
       <a href="{cockpit_link}" style="display: inline-block; background: #cba6f7; color: #1e1e2e; padding: 10px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px;">Reply in Cockpit</a>
-      <p style="margin: 12px 0 0 0; color: #6c7086; font-size: 12px;">or reply directly to this email</p>
+      {reply_hint}
     </div>
   </div>
 </div>"""
 
-        return await self._send(to, full_subject, body_text, body_html)
+        success = await self._send(
+            to,
+            full_subject,
+            body_text,
+            body_html,
+            reply_to=reply_to_addr,
+            message_id=email_msg_id,
+        )
+        return success, email_msg_id if success else None
 
 
 # Module-level singleton

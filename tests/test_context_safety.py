@@ -50,15 +50,21 @@ def mock_llm():
 
     llm = MagicMock()
 
-    # Mock the with_structured_output method
-    structured_llm = AsyncMock()
-    structured_llm.ainvoke = AsyncMock(return_value=ConversationSummary(
+    # Mock the with_structured_output method (include_raw=True format)
+    parsed_value = ConversationSummary(
         summary="Test summary of the conversation.",
         tasks_completed="- Task 1 completed\n- Task 2 completed",
         key_decisions="Decision to use approach A",
         current_state="Ready for next phase",
         blockers="",
-    ))
+    )
+    raw_response = AIMessage(content="structured output")
+    structured_llm = AsyncMock()
+    structured_llm.ainvoke = AsyncMock(return_value={
+        "raw": raw_response,
+        "parsed": parsed_value,
+        "parsing_error": None,
+    })
     llm.with_structured_output = MagicMock(return_value=structured_llm)
 
     return AuxiliaryLLM(llm=llm)

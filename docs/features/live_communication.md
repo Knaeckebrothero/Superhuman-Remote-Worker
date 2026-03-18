@@ -20,7 +20,7 @@ related:
 
 Bidirectional email communication between agents and humans, with a filesystem-native message store that integrates naturally into the workspace, git versioning, and phase-based review cycle.
 
-**Status:** Phase 1 implemented and tested. Phase 2 in progress.
+**Status:** Phase 1 and Phase 2 implemented. Phase 3 planned.
 **Parent design:** `docs/email_and_mobile.md`
 
 ## Motivation
@@ -347,7 +347,7 @@ Subject: [SRW] {subject}
 └─────────────────────────────────────────┘
 ```
 
-Phase 1 uses `SMTP_FROM` (noreply) as `Reply-To` with a prominent cockpit link. Phase 2 switches `Reply-To` to `AGENT_EMAIL` with `+` addressing for IMAP routing.
+When `AGENT_EMAIL` and `MAIL_DOMAIN` are configured, outbound emails use `Reply-To: agent+{job_short}+{thread_id}@{MAIL_DOMAIN}` with `+` sub-addressing for IMAP routing. The "reply directly to this email" hint is shown only when reply routing is configured. When unconfigured, only the cockpit deep link is shown.
 
 ## Database Schema
 
@@ -514,16 +514,42 @@ Agent sends messages, user replies via cockpit, messages stored on filesystem, o
 
 **Not in Phase 1:** IMAP reply routing, AuxiliaryLLM triage, delivery preferences UI, multi-recipient.
 
-### Phase 2 — Email Replies + Multi-Recipient
+### Phase 2 — Email Replies + Multi-Recipient [IMPLEMENTED]
 
-All infrastructure exists. This phase is pure code.
+Native email reply routing, multi-recipient messaging, and delivery preferences.
 
-- Dedicated agent address + IMAP poller (`orchestrator/services/imap_poller.py`)
-- `Reply-To` with `+` sub-addressing for reply routing
-- Email signature/quote stripping
-- Multi-recipient via project members
-- Delivery preference UI in cockpit settings
-- AuxiliaryLLM triage for unprompted user messages
+**Scope:** IMAP poller with `+` sub-addressing, multi-recipient via project members, email signature stripping, queued reply consumer at phase boundaries, user delivery preferences backend.
+
+**Created:**
+
+| File | Purpose |
+|------|---------|
+| `orchestrator/services/imap_poller.py` | IMAP inbox poller with `+` sub-address parsing, MIME body extraction, graceful degradation (NatsBridge pattern) |
+| `orchestrator/services/reply_parser.py` | Email signature/quote stripping — `email-reply-parser` library + regex fallback |
+
+**Modified:**
+
+| File | Change |
+|------|--------|
+| `orchestrator/services/email.py` | Added `AGENT_EMAIL`, `MAIL_DOMAIN` env vars, `reply_routing_configured` property, `Reply-To` with `+` sub-addressing, `Message-ID` generation. Return type changed to `tuple[bool, str | None]`. |
+| `orchestrator/main.py` | Extracted `_route_inbound_reply()` shared helper (cockpit + IMAP). Added IMAP poller lifecycle to `lifespan()`. Multi-recipient resolution via `get_project_members()`. User delivery preferences lookup. Added `project_id` to `MessageSendRequest`. |
+| `orchestrator/database/schema.sql` | Added `email_message_id TEXT` column + partial index on `message_log` |
+| `orchestrator/database/postgres.py` | Added `email_message_id` param to `log_message()`. New methods: `message_exists_by_email_id()`, `get_thread_email_message_id()`, `get_job_by_short_id()` |
+| `orchestrator/requirements.txt` | Added `email-reply-parser>=0.5.0` |
+| `.env.example` | Added SMTP, IMAP, `AGENT_EMAIL`, `MAIL_DOMAIN` env var documentation |
+| `src/tools/communication/messaging.py` | Removed Phase 1 `to != "user"` guard. Added `allowed_recipients` config check. Passes `project_id` in API call. |
+| `src/graph.py` | Added `_process_queued_replies()` helper. Called from `handle_transition` at tactical→strategic boundaries to write queued async replies to workspace. |
+| `config/defaults.yaml` | Changed `allowed_recipients: owner` → `allowed_recipients: project` |
+
+**Key design decisions:**
+- IMAP uses stdlib `imaplib` (no new dependency) wrapped in `asyncio.to_thread()` for async execution
+- Reply routing via `+` sub-addressing: `agent+{job_id[:8]}+{thread_id}@{MAIL_DOMAIN}`
+- Reply handler callback pattern avoids circular imports between IMAP poller and main.py
+- Queued replies consumed at tactical→strategic boundary so they appear in `git_diff` during strategic review
+- Delivery preferences stored in `users.settings.communication.delivery` JSONB, respecting `async_reply` and `urgent_override` settings
+- Multi-recipient validates against project members — display name or email, case-insensitive
+
+**Not in Phase 2:** AuxiliaryLLM message triage (deferred to Phase 3), cockpit delivery preferences UI (backend ready), webhook transports, quiet hours enforcement.
 
 ### Phase 3 — Extended Channels
 

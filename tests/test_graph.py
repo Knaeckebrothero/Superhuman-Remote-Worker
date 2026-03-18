@@ -1341,16 +1341,22 @@ class TestEnsureWithinLimits:
     def mock_auxiliary(self):
         """Create a mock AuxiliaryLLM that returns a summary."""
         from src.services.auxiliary import AuxiliaryLLM
+        from langchain_core.messages import AIMessage
         llm = MagicMock()
-        # with_structured_output returns an LLM that can be awaited
-        structured_llm = MagicMock()
-        structured_llm.ainvoke = AsyncMock(return_value=MagicMock(
+        # with_structured_output(include_raw=True) returns dict with raw/parsed/parsing_error
+        parsed = MagicMock(
             summary="Test summary",
             tasks_completed="- Task 1",
             key_decisions="- Decision 1",
             current_state="In progress",
             blockers="",
-        ))
+        )
+        structured_llm = MagicMock()
+        structured_llm.ainvoke = AsyncMock(return_value={
+            "raw": AIMessage(content="structured output"),
+            "parsed": parsed,
+            "parsing_error": None,
+        })
         llm.with_structured_output = MagicMock(return_value=structured_llm)
         return AuxiliaryLLM(llm=llm)
 

@@ -62,6 +62,8 @@ export interface Expert {
 export interface ExpertDetail extends Expert {
   config: Record<string, unknown>;
   instructions: string | null;
+  /** Tool lists from defaults.yaml, used to re-enable expert-disabled categories. */
+  defaults_tools?: Record<string, string[]>;
 }
 
 // =============================================================================

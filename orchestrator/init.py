@@ -228,10 +228,8 @@ async def init_postgres(force_reset: bool = False) -> bool:
         # Seed default datasources from environment variables
         await _seed_default_datasources(db)
 
-        # Seed default users
-        await _seed_default_users(db)
-
         # Seed default projects for users without one
+        # (handles JIT-provisioned users who lack a default project)
         await _seed_default_projects(db)
 
         # Enforce NOT NULL constraint on default_project_id
@@ -700,39 +698,6 @@ async def _seed_default_datasources(db) -> None:
         logger.info(f"  Seeded {seeded} default datasource(s)")
     else:
         logger.info("  No default datasources configured (DEFAULT_DS_* env vars not set)")
-
-
-# =============================================================================
-# Default User Seeding
-# =============================================================================
-
-async def _seed_default_users(db) -> None:
-    """Seed default users so the system is usable on first deploy.
-
-    Creates only if no user with the same display_name exists (idempotent).
-    The admin user is pre-registered in Keycloak (admin/admin); this seeds the
-    local row for app-specific data (avatar_color, default_project_id). The
-    keycloak_sub gets linked on first OIDC login via JIT provisioning.
-    """
-    ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@srw.dev")
-    ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Admin")
-
-    default_users = [
-        {
-            "display_name": ADMIN_DISPLAY_NAME,
-            "avatar_color": "#f38ba8",
-            "email": ADMIN_EMAIL,
-            "is_admin": True,
-        },
-        {
-            "display_name": "Default",
-            "avatar_color": "#89b4fa",
-            "email": "default@cockpit.local",
-        },
-    ]
-    for user in default_users:
-        await db.upsert_default_user(**user)
-    logger.info(f"  Seeded {len(default_users)} default user(s)")
 
 
 # =============================================================================
