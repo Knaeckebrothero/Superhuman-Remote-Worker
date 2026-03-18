@@ -79,6 +79,7 @@ from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.email import email_service  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
+from services.notification_service import notification_service  # noqa: E402
 import httpx  # noqa: E402
 from graph_routes import router as graph_router, set_mongodb  # noqa: E402
 from uploads import router as uploads_router  # noqa: E402
@@ -382,6 +383,51 @@ async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
             pass
 
     logger.info("Snapshot GC sweeper stopped")
+
+
+async def quiet_hours_digest_loop(shutdown_event: asyncio.Event) -> None:
+    """Background task that flushes queued notifications when quiet hours end.
+
+    Runs every 5 minutes. For each user whose quiet hours have ended and
+    who has pending notifications, sends a batched digest.
+    """
+    while not shutdown_event.is_set():
+        try:
+            users = await postgres_db.get_users_exiting_quiet_hours(check_window_minutes=5)
+            for user_data in users:
+                user_id = str(user_data["user_id"])
+                user_settings = user_data.get("settings") or {}
+
+                # Only process if quiet hours actually ended (not still in them)
+                if notification_service._is_in_quiet_hours(user_settings):
+                    continue
+
+                pending = await postgres_db.get_pending_notifications(user_id)
+                if not pending:
+                    continue
+
+                await notification_service.dispatch_digest(
+                    user_id=user_id,
+                    notifications=[dict(n) for n in pending],
+                )
+
+                ids = [str(n["id"]) for n in pending]
+                await postgres_db.mark_notifications_delivered(ids)
+
+                logger.info(
+                    "Digest sent to user %s: %d notification(s)",
+                    user_id[:8], len(pending),
+                )
+        except Exception as e:
+            logger.error(f"Quiet hours digest loop error: {e}")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=300)  # 5 minutes
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Quiet hours digest loop stopped")
 
 
 async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
@@ -1342,6 +1388,16 @@ async def lifespan(app: FastAPI):
         gitea_client=gitea_client,
     )
 
+    # Initialize notification feed (SSE broadcast for cockpit)
+    from services.notification_feed import notification_feed
+
+    # Initialize notification service (unified dispatcher for email + webhooks)
+    notification_service.connect(
+        db=postgres_db,
+        email_service=email_service,
+        notification_feed=notification_feed,
+    )
+
     # Initialize IMAP poller for email reply routing (graceful if unconfigured)
     async def _imap_reply_handler(
         job_id: str, thread_id: str, message: str,
@@ -1366,6 +1422,7 @@ async def lifespan(app: FastAPI):
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     imap_task = asyncio.create_task(imap_poll_loop(_shutdown_event))
+    digest_task = asyncio.create_task(quiet_hours_digest_loop(_shutdown_event))
 
     yield
 
@@ -1378,6 +1435,7 @@ async def lifespan(app: FastAPI):
     await ide_sweeper_task
     await gc_sweeper_task
     await imap_task
+    await digest_task
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -2140,19 +2198,34 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
                     match = m
                     break
             if not match:
-                available = ", ".join(
-                    m.get("display_name", "?") for m in members
+                # Fallback: try external contacts for this project
+                ext_contact = await postgres_db.resolve_external_contact(
+                    project_id, request.to,
                 )
-                raise HTTPException(
-                    status_code=404,
-                    detail=(
-                        f"Recipient '{request.to}' not found among project members. "
-                        f"Available: {available}"
-                    ),
-                )
-            recipient_email = match["email"]
-            recipient_name = match.get("display_name", "User")
-            user_id = str(match["user_id"])
+                if ext_contact:
+                    recipient_email = ext_contact["email"]
+                    recipient_name = ext_contact.get("display_name", "Contact")
+                    # External contacts don't have a user_id — keep job owner's
+                else:
+                    available = ", ".join(
+                        m.get("display_name", "?") for m in members
+                    )
+                    # Also list external contacts
+                    ext_contacts = await postgres_db.get_external_contacts(project_id)
+                    if ext_contacts:
+                        ext_names = ", ".join(c.get("display_name", "?") for c in ext_contacts)
+                        available += f" | External: {ext_names}"
+                    raise HTTPException(
+                        status_code=404,
+                        detail=(
+                            f"Recipient '{request.to}' not found among project members or external contacts. "
+                            f"Available: {available}"
+                        ),
+                    )
+            else:
+                recipient_email = match["email"]
+                recipient_name = match.get("display_name", "User")
+                user_id = str(match["user_id"])
 
         # Check rate limits
         limits = await postgres_db.check_message_rate_limit(job_id, user_id)
@@ -2204,20 +2277,23 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
         # Get sequence number
         sequence = await postgres_db.get_message_sequence(job_id, thread_id)
 
-        # Send email (graceful if SMTP not configured)
-        email_sent, email_msg_id = await email_service.send_agent_message(
-            to=recipient_email,
-            to_name=recipient_name,
+        # Dispatch to all configured notification channels
+        dispatch_results = await notification_service.dispatch(
+            user_id=user_id,
+            job_id=job_id,
             subject=request.subject,
             message_md=request.message,
-            job_id=job_id,
             job_description=job.get("description", "")[:100],
             config_name=job.get("config_name", "default"),
             thread_id=thread_id,
+            recipient_email=recipient_email,
+            recipient_name=recipient_name,
         )
 
-        status = "sent" if email_sent else "sent"  # Message logged even if email fails
-        error_msg = None if email_sent else "SMTP not configured or send failed"
+        email_sent = dispatch_results.get("email", False)
+        email_msg_id = dispatch_results.get("email_message_id")
+        status = "sent"  # Message logged even if delivery fails
+        error_msg = None if email_sent else "Email not configured or send failed"
 
         # Log to message_log
         log_entry = await postgres_db.log_message(
@@ -2260,6 +2336,7 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
             "recipient": _mask_email(recipient_email),
             "to_name": recipient_name,
             "email_delivered": email_sent,
+            "channels": dispatch_results,
         }
 
     except HTTPException:
@@ -2366,6 +2443,27 @@ async def _route_inbound_reply(
         await _internal_resume_job(job_id, feedback=message)
         return "immediate_interrupt", sequence
 
+    # LLM triage: let auxiliary model decide interrupt vs queue
+    if async_pref == "llm_triage" and job.get("status") == "processing":
+        try:
+            from services.message_triage import triage_message
+
+            decision = await triage_message(
+                message=message,
+                job_status=job.get("status", ""),
+                job_description=job.get("description", ""),
+                phase_number=job.get("phase_number"),
+            )
+            if decision.get("action") == "interrupt":
+                await _internal_resume_job(job_id, feedback=message)
+                logger.info(
+                    "LLM triage: interrupt job %s — %s",
+                    job_id[:8], decision.get("reason", ""),
+                )
+                return "llm_triage_interrupt", sequence
+        except Exception as e:
+            logger.warning("LLM triage failed, falling through to queue: %s", e)
+
     # Default: queue for next strategic phase
     job_context = job.get("context") or {}
     if isinstance(job_context, str):
@@ -2381,6 +2479,20 @@ async def _route_inbound_reply(
     })
     job_context["queued_replies"] = queued_replies
     await postgres_db.update_job_context(job_id, job_context)
+
+    # Broadcast reply_delivered to cockpit SSE
+    try:
+        from services.notification_feed import notification_feed
+        job_owner_id = str(job.get("user_id", "")) if job.get("user_id") else None
+        if job_owner_id:
+            notification_feed.broadcast(
+                user_id=job_owner_id,
+                event_type="reply_delivered",
+                data={"job_id": job_id, "thread_id": thread_id},
+            )
+    except Exception:
+        pass  # Non-critical
+
     return "next_strategic_phase", sequence
 
 
@@ -2456,6 +2568,192 @@ async def list_message_threads(job_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.exception(f"Failed to list message threads for job {job_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# External Contacts Endpoints (Phase 3 Live Communication)
+# =============================================================================
+
+
+class ExternalContactCreate(BaseModel):
+    """Request body for adding an external contact."""
+
+    display_name: str = Field(..., max_length=200)
+    email: str = Field(..., max_length=320)
+
+
+@app.post("/api/projects/{project_id}/contacts")
+async def add_external_contact(
+    project_id: str,
+    request: ExternalContactCreate,
+) -> dict[str, Any]:
+    """Add an external contact to a project."""
+    try:
+        # Basic email format validation
+        if "@" not in request.email or "." not in request.email.split("@")[-1]:
+            raise HTTPException(status_code=400, detail="Invalid email format")
+
+        contact = await postgres_db.add_external_contact(
+            project_id=project_id,
+            display_name=request.display_name,
+            email=request.email,
+        )
+        return {
+            "status": "created",
+            "contact": {
+                "id": str(contact["id"]),
+                "display_name": contact["display_name"],
+                "email": _mask_email(contact["email"]),
+                "created_at": contact["created_at"].isoformat() if contact.get("created_at") else None,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to add external contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/projects/{project_id}/contacts")
+async def list_external_contacts(project_id: str) -> dict[str, Any]:
+    """List external contacts for a project."""
+    try:
+        contacts = await postgres_db.get_external_contacts(project_id)
+        return {
+            "contacts": [
+                {
+                    "id": str(c["id"]),
+                    "display_name": c["display_name"],
+                    "email": _mask_email(c["email"]),
+                    "created_at": c["created_at"].isoformat() if c.get("created_at") else None,
+                }
+                for c in contacts
+            ],
+        }
+    except Exception as e:
+        logger.exception(f"Failed to list external contacts: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.delete("/api/projects/{project_id}/contacts/{contact_id}")
+async def delete_external_contact(project_id: str, contact_id: str) -> dict[str, str]:
+    """Delete an external contact."""
+    try:
+        deleted = await postgres_db.delete_external_contact(contact_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Contact not found")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to delete external contact: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Notification Feed Endpoints (Phase 3 Live Communication)
+# =============================================================================
+
+
+@app.get("/api/notifications")
+async def list_notifications(
+    request: Request,
+    limit: int = Query(50, le=200),
+    unread_only: bool = Query(False),
+) -> dict[str, Any]:
+    """List notifications for the current user."""
+    try:
+        user = await get_current_user(request, postgres_db)
+        user_id = str(user["id"])
+        notifications = await postgres_db.get_user_notifications(
+            user_id, limit=limit, unread_only=unread_only,
+        )
+        unread_count = await postgres_db.get_unread_count(user_id)
+
+        return {
+            "notifications": [
+                {
+                    "id": str(n["id"]),
+                    "job_id": str(n["job_id"]) if n.get("job_id") else None,
+                    "thread_id": n.get("thread_id"),
+                    "subject": n.get("subject"),
+                    "message": (n.get("message") or "")[:200],
+                    "job_description": (n.get("job_description") or "")[:80],
+                    "config_name": n.get("config_name"),
+                    "status": n.get("status"),
+                    "read_at": n["read_at"].isoformat() if n.get("read_at") else None,
+                    "created_at": n["created_at"].isoformat() if n.get("created_at") else None,
+                }
+                for n in notifications
+            ],
+            "unread_count": unread_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to list notifications: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.patch("/api/notifications/{notification_id}")
+async def mark_notification_read(
+    notification_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Mark a notification as read."""
+    try:
+        user = await get_current_user(request, postgres_db)
+        user_id = str(user["id"])
+        updated = await postgres_db.mark_notification_read(notification_id, user_id)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Notification not found or already read")
+        return {"status": "read"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to mark notification read: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/notifications/events")
+async def notification_sse_events(request: Request) -> StreamingResponse:
+    """SSE endpoint for real-time notification updates.
+
+    Clients connect via EventSource to receive live notification events.
+    Events: new_message, reply_delivered.
+    """
+    from services.notification_feed import notification_feed
+
+    try:
+        user = await get_current_user(request, postgres_db)
+        user_id = str(user["id"])
+    except Exception:
+        # Allow unauthenticated connections for development
+        user_id = "anonymous"
+
+    queue = notification_feed.subscribe_sse(user_id)
+
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                except asyncio.CancelledError:
+                    break
+        finally:
+            notification_feed.unsubscribe_sse(user_id, queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # =============================================================================

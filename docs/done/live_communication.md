@@ -20,7 +20,7 @@ related:
 
 Bidirectional email communication between agents and humans, with a filesystem-native message store that integrates naturally into the workspace, git versioning, and phase-based review cycle.
 
-**Status:** Phase 1 and Phase 2 implemented. Phase 3 planned.
+**Status:** Complete (all 3 phases implemented).
 **Parent design:** `docs/email_and_mobile.md`
 
 ## Motivation
@@ -551,13 +551,44 @@ Native email reply routing, multi-recipient messaging, and delivery preferences.
 
 **Not in Phase 2:** AuxiliaryLLM message triage (deferred to Phase 3), cockpit delivery preferences UI (backend ready), webhook transports, quiet hours enforcement.
 
-### Phase 3 — Extended Channels
+### Phase 3 — Extended Channels [IMPLEMENTED]
 
-- Webhook transport (Slack, Discord, Ntfy)
-- MCP integration (messaging as MCP tool for builder chat)
-- Cockpit in-app notification feed
-- User-introduced external contacts
-- Notification digest, quiet hours
+Webhook notification transports, MCP messaging tools, cockpit notification feed, external contacts, quiet hours with notification digest, AuxiliaryLLM message triage, and cockpit delivery preferences UI.
+
+**Created:**
+
+| File | Purpose |
+|------|---------|
+| `orchestrator/services/webhook_transports.py` | Ntfy, Slack, Discord webhook transports with graceful degradation |
+| `orchestrator/services/notification_service.py` | Unified dispatcher: email + webhooks + SSE, quiet hours queuing |
+| `orchestrator/services/notification_feed.py` | Per-user SSE broadcast for real-time cockpit notification updates |
+| `orchestrator/services/message_triage.py` | AuxiliaryLLM triage for inbound message interrupt/queue decision |
+| `cockpit/src/app/core/services/notification.service.ts` | Angular SSE notification client |
+| `cockpit/src/app/shared/components/notification-bell/notification-bell.component.ts` | Header notification bell with unread badge + dropdown |
+
+**Modified:**
+
+| File | Change |
+|------|--------|
+| `orchestrator/main.py` | Replaced direct email dispatch with `notification_service.dispatch()`. Added external contacts endpoints (`POST/GET/DELETE /api/projects/{id}/contacts`). Added notification feed endpoints (`GET /api/notifications`, `PATCH /api/notifications/{id}`, `GET /api/notifications/events` SSE). Added `quiet_hours_digest_loop` background task. Wired notification feed SSE broadcast into `send_agent_message()` and `_route_inbound_reply()`. Added LLM triage in `_route_inbound_reply()` for `async_reply: "llm_triage"` preference. |
+| `orchestrator/database/schema.sql` | Added `external_contacts` table, `notification_queue` table, `read_at` column migration on `message_log` |
+| `orchestrator/database/postgres.py` | Added external contacts CRUD methods, notification queue methods, notification read tracking methods |
+| `orchestrator/mcp/server.py` | Added 3 messaging MCP tools: `list_message_threads`, `send_message_to_job`, `get_message_thread` |
+| `orchestrator/mcp/client.py` | Added `list_message_threads()`, `reply_to_message()` client methods |
+| `orchestrator/services/formatters.py` | Added `format_message_threads()`, `format_thread_messages()` |
+| `.env.example` | Added Ntfy, Slack, Discord webhook env vars |
+| `cockpit/src/app/core/models/api.model.ts` | Added `CommunicationSettings`, `AppNotification`, `ExternalContact` interfaces; extended `UserSettings` |
+| `cockpit/src/app/pages/settings/settings.component.ts` | Added Communication Preferences section (delivery, channels, quiet hours) |
+| `cockpit/src/app/layout/sidebar/sidebar.component.ts` | Added notification bell to sidebar footer |
+
+**Key design decisions:**
+- Unified `NotificationService` sits between send endpoint and all delivery channels (email, Ntfy, Slack, Discord, SSE)
+- Each webhook transport follows NatsBridge graceful degradation — independently optional, no-op when unconfigured
+- Quiet hours check user timezone via `zoneinfo.ZoneInfo` (stdlib), queues to `notification_queue` table, digest sent when quiet hours end
+- External contacts scoped to projects, validated by email format, agents never see raw emails (same masking)
+- Cockpit notification feed uses SSE (clones `SudoGateService` pattern) with per-user queues
+- LLM triage uses lightweight OpenAI-compatible API call with `json_object` response format, falls back to "queue" on failure
+- MCP messaging tools are thin wrappers around existing REST endpoints via `AsyncCockpitClient`
 
 ## Relationship to Parent Design
 

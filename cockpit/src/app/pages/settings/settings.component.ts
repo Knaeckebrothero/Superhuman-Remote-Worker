@@ -5,7 +5,7 @@ import { McpTokenService } from '../../core/services/mcp-token.service';
 import { UserService } from '../../core/services/user.service';
 import { ApiService } from '../../core/services/api.service';
 import { SettingsService } from '../../core/services/settings.service';
-import { McpTokenCreateResponse, Project, ApiKeyProvider } from '../../core/models/api.model';
+import { McpTokenCreateResponse, Project, ApiKeyProvider, CommunicationSettings } from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -152,6 +152,82 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
               {{ savingPrefs() ? 'Saving...' : 'Save Preferences' }}
             </button>
             @if (prefsSaved()) {
+              <span class="save-feedback">Saved</span>
+            }
+          </div>
+        </section>
+
+        <!-- Communication Preferences Section -->
+        <section class="settings-section" style="margin-top: 24px;">
+          <h2 class="section-title">Communication</h2>
+          <p class="section-desc">
+            Configure how agent messages are delivered and when to suppress notifications.
+          </p>
+
+          <div class="create-form" style="border-top: none; padding-top: 0;">
+            <div class="form-row">
+              <label class="field-label">Reply Delivery</label>
+              <select class="form-input" [(ngModel)]="commDelivery">
+                <option value="next_strategic_phase">Next strategic phase (default)</option>
+                <option value="immediate_interrupt">Immediate interrupt</option>
+                <option value="llm_triage">LLM triage (auto-decide)</option>
+              </select>
+            </div>
+
+            <div class="form-row">
+              <label class="field-label">Notification Channels</label>
+              <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-top: 4px;">
+                <label class="checkbox-label">
+                  <input type="checkbox" [(ngModel)]="commChannelEmail" /> Email
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" [(ngModel)]="commChannelNtfy" /> Ntfy
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" [(ngModel)]="commChannelSlack" /> Slack
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" [(ngModel)]="commChannelDiscord" /> Discord
+                </label>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <label class="field-label">
+                <input type="checkbox" [(ngModel)]="commQuietEnabled" style="margin-right: 6px;" />
+                Quiet Hours
+              </label>
+            </div>
+            @if (commQuietEnabled) {
+              <div class="form-row two-col">
+                <div>
+                  <label class="field-label">Start</label>
+                  <input type="time" class="form-input" [(ngModel)]="commQuietStart" />
+                </div>
+                <div>
+                  <label class="field-label">End</label>
+                  <input type="time" class="form-input" [(ngModel)]="commQuietEnd" />
+                </div>
+              </div>
+              <div class="form-row">
+                <label class="field-label">Timezone</label>
+                <input
+                  type="text"
+                  class="form-input"
+                  placeholder="e.g. Europe/Berlin"
+                  [(ngModel)]="commQuietTimezone"
+                />
+              </div>
+            }
+
+            <button
+              class="create-btn"
+              (click)="saveCommunication()"
+              [disabled]="savingComm()"
+            >
+              {{ savingComm() ? 'Saving...' : 'Save Communication Settings' }}
+            </button>
+            @if (commSaved()) {
               <span class="save-feedback">Saved</span>
             }
           </div>
@@ -518,6 +594,19 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       font-weight: 600;
     }
 
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--text-secondary, #a6adc8);
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .checkbox-label input[type="checkbox"] {
+      accent-color: var(--accent-color, #cba6f7);
+    }
+
     /* Instructions */
     .instructions {
       border-top: 1px solid var(--border-color, #313244);
@@ -571,6 +660,19 @@ export class SettingsComponent implements OnInit {
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
+  // Communication form state
+  commDelivery = 'next_strategic_phase';
+  commChannelEmail = true;
+  commChannelNtfy = false;
+  commChannelSlack = false;
+  commChannelDiscord = false;
+  commQuietEnabled = false;
+  commQuietStart = '22:00';
+  commQuietEnd = '08:00';
+  commQuietTimezone = '';
+  readonly savingComm = signal(false);
+  readonly commSaved = signal(false);
+
   constructor() {
     // Reactively sync preference form fields when the preferences signal updates.
     effect(() => {
@@ -580,6 +682,20 @@ export class SettingsComponent implements OnInit {
         this.prefAuxModel = prefs.default_auxiliary_model || '';
         this.prefAutonomy = prefs.default_autonomy || '';
         this.prefReasoning = prefs.default_reasoning_level || '';
+
+        // Sync communication preferences
+        const comm = prefs.communication;
+        if (comm) {
+          this.commDelivery = comm.delivery?.async_reply || 'next_strategic_phase';
+          this.commChannelEmail = comm.channels?.email ?? true;
+          this.commChannelNtfy = comm.channels?.ntfy ?? false;
+          this.commChannelSlack = comm.channels?.slack_webhook ?? false;
+          this.commChannelDiscord = comm.channels?.discord_webhook ?? false;
+          this.commQuietEnabled = comm.quiet_hours?.enabled ?? false;
+          this.commQuietStart = comm.quiet_hours?.start || '22:00';
+          this.commQuietEnd = comm.quiet_hours?.end || '08:00';
+          this.commQuietTimezone = comm.quiet_hours?.timezone || '';
+        }
       }
     });
   }
@@ -682,6 +798,42 @@ export class SettingsComponent implements OnInit {
         setTimeout(() => this.prefsSaved.set(false), 2000);
       },
       error: () => this.savingPrefs.set(false),
+    });
+  }
+
+  // ── Communication Settings ──────────────────────────────────────
+
+  saveCommunication(): void {
+    this.savingComm.set(true);
+    this.commSaved.set(false);
+
+    const communication: CommunicationSettings = {
+      delivery: {
+        async_reply: this.commDelivery as 'immediate_interrupt' | 'next_strategic_phase' | 'llm_triage',
+        urgent_override: true,
+      },
+      channels: {
+        email: this.commChannelEmail,
+        cockpit: true,
+        ntfy: this.commChannelNtfy,
+        slack_webhook: this.commChannelSlack,
+        discord_webhook: this.commChannelDiscord,
+      },
+      quiet_hours: {
+        enabled: this.commQuietEnabled,
+        start: this.commQuietStart,
+        end: this.commQuietEnd,
+        timezone: this.commQuietTimezone || undefined,
+      },
+    };
+
+    this.settingsService.updatePreferences({ communication }).subscribe({
+      next: () => {
+        this.savingComm.set(false);
+        this.commSaved.set(true);
+        setTimeout(() => this.commSaved.set(false), 2000);
+      },
+      error: () => this.savingComm.set(false),
     });
   }
 

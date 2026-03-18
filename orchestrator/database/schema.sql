@@ -788,6 +788,49 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_message_log_email_msgid
     ON message_log(email_message_id) WHERE email_message_id IS NOT NULL;
 
+-- Migration: Add read_at for notification read tracking (Phase 3)
+DO $$ BEGIN
+    ALTER TABLE message_log ADD COLUMN read_at TIMESTAMPTZ;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- ============================================================================
+-- 9b. EXTERNAL CONTACTS (Phase 3 Live Communication)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS external_contacts (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id       UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    display_name     TEXT NOT NULL,
+    email            TEXT NOT NULL,
+    added_by         UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ext_contact_project_email
+    ON external_contacts(project_id, email);
+CREATE INDEX IF NOT EXISTS idx_ext_contacts_project
+    ON external_contacts(project_id);
+
+-- ============================================================================
+-- 9c. NOTIFICATION QUEUE (Phase 3 Live Communication)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS notification_queue (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    job_id           UUID REFERENCES jobs(id) ON DELETE CASCADE,
+    thread_id        VARCHAR(12),
+    subject          TEXT NOT NULL,
+    message          TEXT NOT NULL,
+    channels         JSONB NOT NULL DEFAULT '{}',
+    queued_at        TIMESTAMPTZ DEFAULT NOW(),
+    delivered_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_queue_pending
+    ON notification_queue(user_id, queued_at) WHERE delivered_at IS NULL;
+
 -- ============================================================================
 -- 10. VIEWS
 -- ============================================================================

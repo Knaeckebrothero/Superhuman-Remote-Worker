@@ -2245,3 +2245,47 @@ class AsyncCockpitClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    # =========================================================================
+    # Messaging
+    # =========================================================================
+
+    @_create_retry_decorator()
+    async def list_message_threads(self, job_id: str) -> dict[str, Any]:
+        """List message threads for a job.
+
+        Args:
+            job_id: Job UUID.
+
+        Returns:
+            Dict with ``threads`` list.
+        """
+        resp = await self._client.get(f"/api/jobs/{job_id}/messages")
+        resp.raise_for_status()
+        return resp.json()
+
+    @_create_retry_decorator()
+    async def reply_to_message(
+        self,
+        job_id: str,
+        thread_id: str,
+        message: str,
+        urgent: bool = False,
+    ) -> dict[str, Any]:
+        """Send a reply to an agent message thread.
+
+        Args:
+            job_id: Job UUID.
+            thread_id: Thread ID.
+            message: Reply body.
+            urgent: Whether to deliver as immediate interrupt.
+
+        Returns:
+            Dict with delivery strategy and sequence.
+        """
+        resp = await self._client.post(
+            f"/api/jobs/{job_id}/messages/{thread_id}/reply",
+            json={"message": message, "urgent": urgent},
+        )
+        resp.raise_for_status()
+        return resp.json()

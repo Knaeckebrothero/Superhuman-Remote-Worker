@@ -4163,6 +4163,234 @@ class PostgresDB:
         return (count or 0) + 1
 
     # =========================================================================
+    # External Contacts (Phase 3 Live Communication)
+    # =========================================================================
+
+    async def add_external_contact(
+        self,
+        project_id: str,
+        display_name: str,
+        email: str,
+        added_by: str | None = None,
+    ) -> Dict[str, Any]:
+        """Add an external contact to a project.
+
+        Args:
+            project_id: Project UUID
+            display_name: Contact display name
+            email: Contact email address
+            added_by: User UUID who added the contact
+
+        Returns:
+            Created contact record.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO external_contacts (project_id, display_name, email, added_by)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (project_id, email) DO UPDATE
+                    SET display_name = EXCLUDED.display_name
+                RETURNING id, project_id, display_name, email, added_by, created_at
+                """,
+                UUID(project_id),
+                display_name,
+                email,
+                UUID(added_by) if added_by else None,
+            )
+        return dict(row)
+
+    async def get_external_contacts(self, project_id: str) -> List[Dict[str, Any]]:
+        """Get all external contacts for a project."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, project_id, display_name, email, added_by, created_at
+                FROM external_contacts
+                WHERE project_id = $1
+                ORDER BY display_name
+                """,
+                UUID(project_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def delete_external_contact(self, contact_id: str) -> bool:
+        """Delete an external contact by ID. Returns True if deleted."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM external_contacts WHERE id = $1",
+                UUID(contact_id),
+            )
+        return result == "DELETE 1"
+
+    async def resolve_external_contact(
+        self, project_id: str, name_or_email: str,
+    ) -> Dict[str, Any] | None:
+        """Resolve an external contact by display name or email (case-insensitive).
+
+        Args:
+            project_id: Project UUID
+            name_or_email: Display name or email to match
+
+        Returns:
+            Contact dict or None if not found.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, project_id, display_name, email, added_by, created_at
+                FROM external_contacts
+                WHERE project_id = $1
+                    AND (LOWER(display_name) = LOWER($2) OR LOWER(email) = LOWER($2))
+                LIMIT 1
+                """,
+                UUID(project_id),
+                name_or_email,
+            )
+        return dict(row) if row else None
+
+    # =========================================================================
+    # Notification Queue (Phase 3 Live Communication)
+    # =========================================================================
+
+    async def queue_notification(
+        self,
+        user_id: str,
+        job_id: str,
+        thread_id: str | None,
+        subject: str,
+        message: str,
+        channels: dict,
+    ) -> Dict[str, Any]:
+        """Queue a notification for later digest delivery (quiet hours)."""
+        import json as _json
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO notification_queue
+                    (user_id, job_id, thread_id, subject, message, channels)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                RETURNING id, user_id, job_id, thread_id, subject, queued_at
+                """,
+                UUID(user_id),
+                UUID(job_id) if job_id else None,
+                thread_id,
+                subject,
+                message,
+                _json.dumps(channels),
+            )
+        return dict(row)
+
+    async def get_pending_notifications(self, user_id: str) -> List[Dict[str, Any]]:
+        """Get undelivered notifications for a user."""
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, user_id, job_id, thread_id, subject, message, channels,
+                       queued_at
+                FROM notification_queue
+                WHERE user_id = $1 AND delivered_at IS NULL
+                ORDER BY queued_at
+                """,
+                UUID(user_id),
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_notifications_delivered(self, ids: List[str]) -> int:
+        """Mark notifications as delivered. Returns count updated."""
+        if not ids:
+            return 0
+        uuids = [UUID(i) for i in ids]
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE notification_queue
+                SET delivered_at = NOW()
+                WHERE id = ANY($1::uuid[])
+                """,
+                uuids,
+            )
+        # result is like "UPDATE N"
+        return int(result.split()[-1]) if result else 0
+
+    async def get_users_exiting_quiet_hours(
+        self, check_window_minutes: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Find users whose quiet hours ended within the check window
+        and who have pending notifications.
+
+        Returns list of dicts with user_id and settings.
+        """
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT u.id AS user_id, u.settings
+                FROM users u
+                JOIN notification_queue nq ON nq.user_id = u.id AND nq.delivered_at IS NULL
+                WHERE u.settings->'communication'->'quiet_hours'->>'enabled' = 'true'
+                """,
+            )
+        return [dict(r) for r in rows]
+
+    # =========================================================================
+    # Notification Read Tracking (Phase 3)
+    # =========================================================================
+
+    async def get_user_notifications(
+        self,
+        user_id: str,
+        limit: int = 50,
+        unread_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Get notifications (outbound messages) for a user."""
+        where = "WHERE ml.user_id = $1 AND ml.direction = 'outbound'"
+        if unread_only:
+            where += " AND ml.read_at IS NULL"
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT ml.id, ml.job_id, ml.thread_id, ml.subject, ml.message,
+                       ml.status, ml.created_at, ml.read_at,
+                       j.description AS job_description, j.config_name
+                FROM message_log ml
+                LEFT JOIN jobs j ON j.id = ml.job_id
+                {where}
+                ORDER BY ml.created_at DESC
+                LIMIT $2
+                """,
+                UUID(user_id),
+                limit,
+            )
+        return [dict(r) for r in rows]
+
+    async def mark_notification_read(self, message_id: str, user_id: str) -> bool:
+        """Mark a notification as read. Returns True if updated."""
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE message_log SET read_at = NOW()
+                WHERE id = $1 AND user_id = $2 AND read_at IS NULL
+                """,
+                UUID(message_id),
+                UUID(user_id),
+            )
+        return result == "UPDATE 1"
+
+    async def get_unread_count(self, user_id: str) -> int:
+        """Count unread notifications for a user."""
+        async with self.acquire() as conn:
+            count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM message_log
+                WHERE user_id = $1 AND direction = 'outbound' AND read_at IS NULL
+                """,
+                UUID(user_id),
+            )
+        return count or 0
+
+    # =========================================================================
     # SYNC WRAPPERS (for scripts and other sync contexts)
     # =========================================================================
 

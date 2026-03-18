@@ -257,9 +257,12 @@ function getNestedValue(obj: unknown, path: string): unknown {
           @if (node.type === 'string' && node.enumValues?.length) {
             <select
               class="form-input"
-              [ngModel]="getDisplayValue(node.path, node.defaultValue)"
-              (ngModelChange)="setSmartOverride(node.path, $event, node.defaultValue)"
+              [ngModel]="getDisplayValue(node.path, node.defaultValue) ?? '__null__'"
+              (ngModelChange)="setSmartOverride(node.path, $event === '__null__' ? null : $event, node.defaultValue)"
             >
+              @if (node.nullable || node.defaultValue === undefined) {
+                <option value="__null__">Default{{ node.nullable ? ' (auto-detect)' : '' }}</option>
+              }
               @for (opt of node.enumValues; track opt) {
                 <option [value]="opt">{{ opt }}</option>
               }
@@ -276,8 +279,8 @@ function getNestedValue(obj: unknown, path: string): unknown {
             />
           }
 
-          <!-- Number/integer with slider (min+max defined, range ≤ 10) -->
-          @else if ((node.type === 'number' || node.type === 'integer') && node.minimum != null && node.maximum != null && (node.maximum - node.minimum) <= 10) {
+          <!-- Number/integer with slider (min+max defined, range ≤ 10, NOT nullable, has default) -->
+          @else if ((node.type === 'number' || node.type === 'integer') && node.minimum != null && node.maximum != null && (node.maximum - node.minimum) <= 10 && !node.nullable && node.defaultValue !== undefined) {
             <div class="slider-row">
               <input
                 type="range"
