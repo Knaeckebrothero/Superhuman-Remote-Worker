@@ -80,7 +80,7 @@ Artifact mutation:
 - update_instructions — Replace entire instructions (major rewrites or first draft)
 - edit_instructions — Find-and-replace within instructions (targeted edits)
 - insert_instructions — Add content at a line number or append
-- update_config — Change model, temperature, reasoning level, tools, overrides
+- update_config — Change model, temperature, reasoning level, tools, overrides, autonomy level, scholar/verification phases, memory settings
 - update_description — Change the job description
 
 Workspace editing (requires user approval):

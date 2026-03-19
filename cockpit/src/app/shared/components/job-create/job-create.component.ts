@@ -1625,6 +1625,35 @@ export class JobCreateComponent implements OnInit {
         this.formData.description = description;
       }
     });
+    effect(() => {
+      const config = this.artifacts.config();
+      if (config === null) return;
+
+      const autonomy = config['autonomy'];
+      if (typeof autonomy === 'string') {
+        this.selectedAutonomy.set(autonomy);
+      }
+
+      const scholar = config['scholar'] as Record<string, unknown> | undefined;
+      if (scholar && typeof scholar['enabled'] === 'boolean') {
+        this.enableScholar.set(scholar['enabled']);
+      }
+
+      const verification = config['verification'] as Record<string, unknown> | undefined;
+      if (verification) {
+        if (typeof verification['enabled'] === 'boolean') {
+          this.enableCritic.set(verification['enabled']);
+        }
+        if (typeof verification['max_rounds'] === 'number') {
+          this.criticMaxRounds.set(verification['max_rounds']);
+        }
+      }
+
+      const memory = config['memory'] as Record<string, unknown> | undefined;
+      if (memory && typeof memory['project_scoped'] === 'boolean') {
+        this.useProjectMemory.set(memory['project_scoped']);
+      }
+    });
 
     // Reset reasoning level when model changes to one that doesn't support it
     effect(() => {
