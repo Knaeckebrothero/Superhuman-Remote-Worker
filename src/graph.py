@@ -2494,12 +2494,13 @@ def create_audited_tool_node(
             freeze_req = tool_context.consume_freeze_request()
             if freeze_req:
                 try:
-                    workspace.write_file(
+                    ws = tool_context.workspace_manager
+                    ws.write_file(
                         "output/job_frozen.json",
                         json.dumps(freeze_req, indent=2, ensure_ascii=False),
                     )
-                    if workspace.git_manager and workspace.git_manager.is_active:
-                        workspace.git_manager.commit("Job frozen: waiting for reply")
+                    if ws.git_manager and ws.git_manager.is_active:
+                        ws.git_manager.commit("Job frozen: waiting for reply")
                     result["should_stop"] = True
                     logger.info(
                         f"[{job_id}] Freeze requested by tool: "
