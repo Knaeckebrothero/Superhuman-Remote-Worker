@@ -53,6 +53,7 @@ class PredefinedTodo:
 
 def get_initial_strategic_todos(
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[PredefinedTodo]:
     """Get todos for the first strategic phase (job start).
 
@@ -65,6 +66,7 @@ def get_initial_strategic_todos(
     Args:
         config: Agent configuration for deployment directory. If None, uses
                framework defaults only.
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of PredefinedTodo items for job initialization
@@ -72,7 +74,7 @@ def get_initial_strategic_todos(
     from ..core.loader import get_initial_strategic_todos_from_config
 
     # Try to load from template
-    todo_list = get_initial_strategic_todos_from_config(config)
+    todo_list = get_initial_strategic_todos_from_config(config, tool_names=tool_names)
 
     if todo_list:
         # Convert from TodoManager format to PredefinedTodo
@@ -121,6 +123,7 @@ def get_initial_strategic_todos(
 
 def get_transition_strategic_todos(
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[PredefinedTodo]:
     """Get todos for strategic phases between tactical phases.
 
@@ -133,6 +136,7 @@ def get_transition_strategic_todos(
     Args:
         config: Agent configuration for deployment directory. If None, uses
                framework defaults only.
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of PredefinedTodo items for phase transitions
@@ -140,7 +144,7 @@ def get_transition_strategic_todos(
     from ..core.loader import get_transition_strategic_todos_from_config
 
     # Try to load from template
-    todo_list = get_transition_strategic_todos_from_config(config)
+    todo_list = get_transition_strategic_todos_from_config(config, tool_names=tool_names)
 
     if todo_list:
         # Convert from TodoManager format to PredefinedTodo
@@ -188,6 +192,7 @@ def get_transition_strategic_todos(
 
 def get_resume_strategic_todos(
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[PredefinedTodo]:
     """Get todos for the resume-from-feedback strategic phase.
 
@@ -200,6 +205,7 @@ def get_resume_strategic_todos(
     Args:
         config: Agent configuration for deployment directory. If None, uses
                framework defaults only.
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of PredefinedTodo items for feedback-driven resume
@@ -207,7 +213,7 @@ def get_resume_strategic_todos(
     from ..core.loader import get_resume_strategic_todos_from_config
 
     # Try to load from template
-    todo_list = get_resume_strategic_todos_from_config(config)
+    todo_list = get_resume_strategic_todos_from_config(config, tool_names=tool_names)
 
     if todo_list:
         # Convert from TodoManager format to PredefinedTodo
@@ -1136,6 +1142,7 @@ def on_tactical_phase_complete(
     workspace: "WorkspaceManager",
     todo_manager: "TodoManager",
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> TransitionResult:
     """Handle transition from tactical phase to strategic phase.
 
@@ -1180,7 +1187,7 @@ def on_tactical_phase_complete(
         return freeze_for_review(state, workspace, todo_manager, "tactical", phase_number)
 
     # Load predefined strategic todos (from config template or defaults)
-    strategic_todos = get_transition_strategic_todos(config)
+    strategic_todos = get_transition_strategic_todos(config, tool_names=tool_names)
     todo_list = [todo.to_dict() for todo in strategic_todos]
     todo_manager.set_todos_from_list(todo_list)
 
@@ -1222,6 +1229,7 @@ def handle_phase_transition(
     min_todos: int = 5,
     max_todos: int = 20,
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> TransitionResult:
     """Route to the appropriate phase transition handler.
 
@@ -1246,4 +1254,4 @@ def handle_phase_transition(
             state, workspace, todo_manager, min_todos, max_todos, config=config
         )
     else:
-        return on_tactical_phase_complete(state, workspace, todo_manager, config)
+        return on_tactical_phase_complete(state, workspace, todo_manager, config, tool_names=tool_names)

@@ -36,6 +36,7 @@ todos:
 
   - id: 2
     content: >-
+      {% if has_tool("kb_write") -%}
       REFLECT on project knowledge: Review and update the knowledge base.
 
       After the retrospective, update the project knowledge base:
@@ -53,6 +54,22 @@ todos:
 
       INSTEAD OF: Creating notes for information already captured — search first.
       Instead of skipping failed approaches — they are critical for preventing loops.
+      {% else -%}
+      REFLECT on project context: Review and update workspace.md.
+
+      After the retrospective, update workspace.md with learnings:
+      (1) Review existing notes in workspace.md for relevance.
+      (2) Record new decisions with reasoning in notes/decisions.md.
+      (3) Record discovered facts (IDs, paths, configurations) in workspace.md under "## Facts".
+      (4) Record failed approaches in workspace.md under "## Failed Approaches"
+          with the reason they failed — this prevents retrying the same strategy.
+      (5) If any existing notes in workspace.md are now outdated, update or remove them.
+
+      COMPLETION CRITERIA: workspace.md updated with decisions, facts, and failed
+      approaches from the completed phase.
+
+      INSTEAD OF: Skipping failed approaches — they are critical for preventing loops.
+      {% endif -%}
 
   - id: 3
     content: >-

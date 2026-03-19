@@ -17,6 +17,7 @@ todos:
       (4) Categorize each feedback item as: content issue, structural issue, missing
           deliverable, quality concern, or factual error.
 
+      {% if has_tool("kb_write") -%}
       Record feedback analysis using kb_write(type="state", tag="feedback-summary"):
       - Each categorized feedback item (one bullet per item)
       - Severity assessment (critical / important / minor) for each
@@ -24,6 +25,15 @@ todos:
 
       COMPLETION CRITERIA: Feedback analysis note created in the knowledge base
       that categorizes all feedback items with severity and affected files.
+      {% else -%}
+      Record feedback analysis in notes/feedback_analysis.md:
+      - Each categorized feedback item (one bullet per item)
+      - Severity assessment (critical / important / minor) for each
+      - Which output file(s) each item affects
+
+      COMPLETION CRITERIA: Feedback analysis written to notes/feedback_analysis.md
+      that categorizes all feedback items with severity and affected files.
+      {% endif -%}
 
       INSTEAD OF: Starting to modify output files now — this todo is analysis only.
       Instead of dismissing feedback items — treat them all as actionable.
@@ -38,10 +48,17 @@ todos:
           relevant sections.
       (3) Assess the severity of each issue per file — how much rework is needed?
 
+      {% if has_tool("kb_write") -%}
       Update the feedback state note (kb_update) with evaluation results:
       - Which files need minor edits vs major rework vs complete rewrite
       - Specific sections or content that must change
       - Any feedback items that are already addressed (explain why)
+      {% else -%}
+      Update notes/feedback_analysis.md with evaluation results:
+      - Which files need minor edits vs major rework vs complete rewrite
+      - Specific sections or content that must change
+      - Any feedback items that are already addressed (explain why)
+      {% endif -%}
 
       COMPLETION CRITERIA: Each feedback item has been checked against actual
       output files, with specific assessment of what needs to change.
@@ -77,8 +94,13 @@ todos:
       IMPORTANT: You MUST read_file('todo_guide.md') BEFORE calling next_phase_todos.
 
       Create todos that:
+      {% if has_tool("kb_search") -%}
       - Target specific feedback items from the feedback analysis note (use kb_search
         to find it)
+      {% else -%}
+      - Target specific feedback items from notes/feedback_analysis.md (use read_file
+        to review it)
+      {% endif -%}
       - Name exact files, sections, and changes needed
       - Are completable in 1-3 tool calls each
       - Include a verification todo that checks the corrected output against

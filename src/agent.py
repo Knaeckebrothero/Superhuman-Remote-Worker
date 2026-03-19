@@ -1048,12 +1048,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             # Fall back to template if upload failed
             if not instructions_written:
-                instructions = load_instructions(self.config, model=self.config.llm.model)
-                self._workspace_manager.write_file("instructions.md", instructions)
+                pass  # Template-based fallback handled by _deploy_instruction_files()
         else:
-            # Use template-based instructions
-            instructions = load_instructions(self.config, model=self.config.llm.model)
-            self._workspace_manager.write_file("instructions.md", instructions)
+            pass  # Template-based instructions handled by _deploy_instruction_files()
 
         # Write task brief to workspace (description + optional kickoff message)
         description = metadata.get("description", "")
@@ -1289,45 +1286,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Create todo manager for this workspace
         self._todo_manager = TodoManager(workspace=self._workspace_manager)
 
-        # Copy todo crafting guide to workspace via instruction matrix
-        from .core.loader import InstructionMatrixResolver, FileResolver, detect_model_family
-        model_family = detect_model_family(self.config.llm.model)
-        instr_resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
-        try:
-            # Check for pre-resolved content first
-            resolved = self.config.extra.get("_resolved_instructions", {})
-            todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
-            self._workspace_manager.write_file("todo_guide.md", todo_guide)
-            logger.debug("Copied todo_guide.md to workspace")
-        except FileNotFoundError:
-            logger.warning("todo_guide.md not found via instruction matrix")
-
-        # Copy instruction files to workspace (config-driven)
-        if self.config.instruction_files:
-            templates_dir = get_project_root() / "config" / "templates"
-            file_resolver = FileResolver(
-                deployment_dir=self.config._deployment_dir,
-                framework_dir=templates_dir,
-            )
-            resolved_instructions = self.config.extra.get("_resolved_instructions", {})
-            for entry in self.config.instruction_files:
-                try:
-                    # Skip todo_guide.md — already handled above via matrix
-                    if entry.file == "todo_guide.md":
-                        continue
-                    # Check resolved config first (resumed jobs)
-                    basename = Path(entry.file).stem
-                    content = resolved_instructions.get(basename)
-                    if not content:
-                        # Resolve from filesystem
-                        content = file_resolver.load(Path(entry.file).name)
-                    # Ensure parent directory exists
-                    target_path = self._workspace_manager.get_path(entry.file)
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    self._workspace_manager.write_file(entry.file, content)
-                    logger.debug(f"Copied instruction file to workspace: {entry.file}")
-                except FileNotFoundError:
-                    logger.warning(f"Instruction file not found: {entry.file}")
+        # Instruction files (todo_guide.md, instruction_files, template-based instructions.md)
+        # are deployed in _deploy_instruction_files() after tools are loaded, so that
+        # Jinja2 conditionals can reference which tools are actually available.
 
         logger.debug(f"Workspace created at {self._workspace_manager.path}")
 
@@ -1489,7 +1450,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         def _write_tool_doc(rel_path: str, content: str) -> None:
             self._workspace_manager.write_file(f"tools/{rel_path}", content)
 
-        generate_workspace_tool_docs(tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc)
+        loaded_tool_names = [t.name for t in self._tools]
+        generate_workspace_tool_docs(loaded_tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc)
+
+        # Deploy instruction files with Jinja2 rendering (after tools loaded)
+        self._deploy_instruction_files(loaded_tool_names)
 
         # Apply description overrides for deferred tools
         # Domain tools get short descriptions; agent reads full docs from workspace
@@ -1518,6 +1483,69 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._doc_registration_task = asyncio.create_task(
             self._register_initial_documents_background(context)
         )
+
+    def _deploy_instruction_files(self, loaded_tool_names: List[str]) -> None:
+        """Deploy instruction files to workspace with Jinja2 rendering.
+
+        Called after tools are loaded so that template conditionals like
+        ``{% if has_tool("kb_write") %}`` resolve correctly.
+
+        Deploys:
+        - instructions.md (from template, only if not already written from upload/inline)
+        - todo_guide.md (via instruction matrix)
+        - Additional instruction_files from config
+        """
+        from .core.loader import (
+            InstructionMatrixResolver, FileResolver, detect_model_family,
+            render_instruction_content, load_instructions,
+        )
+
+        # instructions.md — only deploy template if not already present (upload/inline)
+        instructions_path = self._workspace_manager.get_path("instructions.md")
+        if not instructions_path.exists():
+            instructions = load_instructions(self.config, model=self.config.llm.model)
+            instructions = render_instruction_content(instructions, loaded_tool_names)
+            self._workspace_manager.write_file("instructions.md", instructions)
+            logger.debug("Deployed template-based instructions.md to workspace")
+
+        # todo_guide.md — via instruction matrix
+        model_family = detect_model_family(self.config.llm.model)
+        instr_resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
+        try:
+            resolved = self.config.extra.get("_resolved_instructions", {})
+            todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
+            todo_guide = render_instruction_content(todo_guide, loaded_tool_names)
+            self._workspace_manager.write_file("todo_guide.md", todo_guide)
+            logger.debug("Deployed todo_guide.md to workspace")
+        except FileNotFoundError:
+            logger.warning("todo_guide.md not found via instruction matrix")
+
+        # Additional instruction files (config-driven)
+        if self.config.instruction_files:
+            templates_dir = get_project_root() / "config" / "templates"
+            file_resolver = FileResolver(
+                deployment_dir=self.config._deployment_dir,
+                framework_dir=templates_dir,
+            )
+            resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            for entry in self.config.instruction_files:
+                try:
+                    # Skip todo_guide.md — already handled above via matrix
+                    if entry.file == "todo_guide.md":
+                        continue
+                    # Check resolved config first (resumed jobs)
+                    basename = Path(entry.file).stem
+                    content = resolved_instructions.get(basename)
+                    if not content:
+                        content = file_resolver.load(Path(entry.file).name)
+                    content = render_instruction_content(content, loaded_tool_names)
+                    # Ensure parent directory exists
+                    target_path = self._workspace_manager.get_path(entry.file)
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    self._workspace_manager.write_file(entry.file, content)
+                    logger.debug(f"Deployed instruction file to workspace: {entry.file}")
+                except FileNotFoundError:
+                    logger.warning(f"Instruction file not found: {entry.file}")
 
     async def _register_initial_documents_background(self, context: "ToolContext") -> None:
         """Background async wrapper for parallel document registration.

@@ -58,6 +58,8 @@ claude-agent-sdk>=0.1.35
 # Fedora: sudo dnf install tmux
 # Debian/Ubuntu: sudo apt-get install tmux
 libtmux>=0.50.0
+# Template rendering for instruction files (conditional tool references)
+Jinja2>=3.1
 # Remote workspace backend (SSH/SFTP to VM)
 paramiko>=3.4.0
 # Optional: NATS for cross-cluster VM lifecycle management

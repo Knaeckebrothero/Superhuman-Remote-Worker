@@ -501,7 +501,9 @@ async def _assign_job(args: dict) -> tuple[str, str | None]:
     ), None
 
 
-async def _create_job(args: dict) -> tuple[str, str | None]:
+async def _create_job(
+    args: dict, *, user_id: str | None = None, project_id: str | None = None,
+) -> tuple[str, str | None]:
     client = _get_client()
     result = await client.create_job(
         description=args["description"],
@@ -510,6 +512,8 @@ async def _create_job(args: dict) -> tuple[str, str | None]:
         instructions=args.get("instructions"),
         config_override=args.get("config_override"),
         context=args.get("context"),
+        project_id=args.get("project_id", project_id),
+        user_id=user_id,
     )
     return fmt.format_created_job(result, args.get("config_name", "default")), None
 
@@ -1068,6 +1072,8 @@ async def execute_server_tool(
     args: dict,
     *,
     tavily_search_fn: Any | None = None,
+    user_id: str | None = None,
+    active_project_id: str | None = None,
 ) -> tuple[str, str | None]:
     """Execute a server-side builder tool.
 
@@ -1076,6 +1082,8 @@ async def execute_server_tool(
         args: Tool arguments dict
         tavily_search_fn: Async callable for web_search (injected from main.py
                          to avoid circular imports with builder_search)
+        user_id: Session user ID (used for default project fallback on job creation)
+        active_project_id: Active project context from the cockpit UI
 
     Returns:
         Tuple of (result_text, full_content).
@@ -1096,6 +1104,11 @@ async def execute_server_tool(
         return f"Error: Unknown server tool: {tool_name}", None
 
     try:
+        # Pass user/project context to job-creation handlers
+        if tool_name in ("create_job", "create_follow_up_job"):
+            return await handler(
+                args, user_id=user_id, project_id=active_project_id,
+            )
         return await handler(args)
     except Exception as e:
         error_msg = str(e)[:300]

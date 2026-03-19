@@ -16,6 +16,7 @@ todos:
       (4) Use list_files on documents/ to inventory all input materials.
       (5) Use list_files on reference/ to check for domain-specific reference material.
 
+      {% if has_tool("kb_write") -%}
       Then persist critical rules as knowledge notes using kb_write:
       - Required output files (exact paths and formats) → kb_write with type="goal", tag="deliverable"
       - Style/language constraints (tone, formatting, language) → kb_write with type="decision", tag="constraint"
@@ -27,6 +28,18 @@ todos:
 
       COMPLETION CRITERIA: Knowledge notes created for all four categories above
       (verify with kb_list). instructions.md and task_brief.md have been read in full.
+      {% else -%}
+      Then persist critical rules in workspace files:
+      - Required output files (exact paths and formats) → note in workspace.md under "## Deliverables"
+      - Style/language constraints (tone, formatting, language) → note in workspace.md under "## Constraints"
+      - Hard rules (things explicitly forbidden or required) → note in workspace.md under "## Hard Rules"
+      - Delivery expectations (what "done" looks like) → note in workspace.md under "## Acceptance Criteria"
+
+      These notes persist in workspace.md across context compaction.
+
+      COMPLETION CRITERIA: Critical rules recorded in workspace.md under the four
+      categories above. instructions.md and task_brief.md have been read in full.
+      {% endif -%}
 
       INSTEAD OF: Starting to write output files now — this phase is read-only exploration.
       Instead of skimming instructions.md — read every line, since every task failure
@@ -73,6 +86,7 @@ todos:
 
   - id: 3
     content: >-
+      {% if has_tool("kb_search") -%}
       REVIEW PROJECT KNOWLEDGE: Check the project knowledge base for existing context.
 
       Search the knowledge base for existing notes from prior jobs in this project:
@@ -93,6 +107,22 @@ todos:
 
       INSTEAD OF: Skipping this step — prior knowledge from the same project can save
       significant work. Instead of creating notes that duplicate existing ones — search first.
+      {% else -%}
+      REVIEW PROJECT CONTEXT: Check workspace.md and plan.md for existing context.
+
+      Review any prior context available in the workspace:
+      (1) Read workspace.md for any existing decisions or constraints.
+      (2) Read plan.md if it exists from a prior phase.
+      (3) Check archive/ for any retrospectives from previous phases.
+
+      Record initial state in workspace.md if not already present:
+      - The current job's objective under "## Goal"
+      - Any facts discovered during exploration (IDs, paths, configurations) under "## Facts"
+
+      COMPLETION CRITERIA: workspace.md reviewed and updated with goal and discovered facts.
+
+      INSTEAD OF: Skipping this step — prior context can save significant work.
+      {% endif -%}
 
   - id: 4
     content: >-

@@ -792,6 +792,8 @@ class AsyncCockpitClient:
         config_override: dict[str, Any] | None = None,
         context: dict[str, Any] | None = None,
         parent_job_id: str | None = None,
+        project_id: str | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a new job.
 
@@ -803,6 +805,8 @@ class AsyncCockpitClient:
             config_override: Per-job config overrides
             context: Additional context dictionary
             parent_job_id: Parent job UUID for verification/follow-up jobs
+            project_id: Project UUID to associate this job with
+            user_id: User UUID who created this job
 
         Returns:
             Created job record with ID
@@ -821,6 +825,10 @@ class AsyncCockpitClient:
             body["context"] = context
         if parent_job_id:
             body["parent_job_id"] = parent_job_id
+        if project_id:
+            body["project_id"] = project_id
+        if user_id:
+            body["user_id"] = user_id
         resp = await self._client.post("/api/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
