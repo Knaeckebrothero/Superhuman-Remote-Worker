@@ -194,6 +194,28 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
             f"Removed {orphaned_count} orphaned ToolMessages from message history"
         )
 
+    # Fix consecutive AIMessages at the end of the list.
+    # Some LLM APIs (e.g., vLLM) reject requests with 2+ assistant messages
+    # at the end. This can happen when orphaned ToolMessages that separated
+    # AIMessages are removed above, or from synthetic AIMessages injected by
+    # archive_phase/handle_transition nodes.
+    if len(result) >= 2:
+        trailing_ai_count = 0
+        for msg in reversed(result):
+            if isinstance(msg, AIMessage):
+                trailing_ai_count += 1
+            else:
+                break
+        if trailing_ai_count >= 2:
+            # Insert a separator HumanMessage before the last AIMessage
+            insert_pos = len(result) - 1  # before the final AIMessage
+            separator = HumanMessage(content="Continue.")
+            result.insert(insert_pos, separator)
+            logger.warning(
+                f"Inserted separator between {trailing_ai_count} consecutive "
+                f"trailing AIMessages to satisfy LLM API constraints"
+            )
+
     return result
 
 

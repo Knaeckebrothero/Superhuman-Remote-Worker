@@ -40,11 +40,6 @@ async def get_current_user(request: Request, db) -> dict:
 
     # JIT provision: find or create local user from Keycloak sub
     sub = claims["sub"]
-    user = await db.get_user_by_keycloak_sub(sub)
-    if user:
-        return user
-
-    # First login — create local user row
     email = claims.get("email", "")
     display_name = (
         claims.get("name")
@@ -55,6 +50,29 @@ async def get_current_user(request: Request, db) -> dict:
     realm_roles = claims.get("realm_access", {}).get("roles", [])
     is_admin = "admin" in realm_roles
 
+    user = await db.get_user_by_keycloak_sub(sub)
+    if user:
+        # Sync fields that may have changed in Keycloak (e.g. email added later)
+        needs_update = {}
+        if email and (not user.get("email") or user["email"] != email):
+            needs_update["email"] = email
+        if user.get("display_name") != display_name:
+            needs_update["display_name"] = display_name
+        if user.get("is_admin") != is_admin:
+            needs_update["is_admin"] = is_admin
+        if needs_update:
+            async with db.acquire() as conn:
+                set_clause = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(needs_update))
+                await conn.execute(
+                    f"UPDATE users SET {set_clause} WHERE id = $1",
+                    user["id"],
+                    *needs_update.values(),
+                )
+            user.update(needs_update)
+            logger.info("Updated user %s from OIDC claims: %s", sub, list(needs_update.keys()))
+        return user
+
+    # First login — create local user row
     user = await db.upsert_user_from_oidc(
         sub=sub,
         email=email,

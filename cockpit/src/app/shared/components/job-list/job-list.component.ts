@@ -148,15 +148,13 @@ interface JobRow {
                       View
                     </button>
                     @if (getWorkspaceUrl(row.job)) {
-                      <a
+                      <button
                         class="action-btn workspace"
-                        [href]="getWorkspaceUrl(row.job)"
-                        target="_blank"
-                        (click)="$event.stopPropagation()"
+                        (click)="openWorkspace(row.job); $event.stopPropagation()"
                         title="Browse workspace in Gitea"
                       >
                         Workspace
-                      </a>
+                      </button>
                     }
                     @if (canOpenIde(row.job)) {
                       @if (ideLoadingJobIds().has(row.job.id)) {
@@ -1057,6 +1055,16 @@ export class JobListComponent implements OnInit, OnDestroy {
       return `${giteaUrl}/${repoName}/src/branch/${job.branch_name}`;
     }
     return `${giteaUrl}/${repoName}`;
+  }
+
+  openWorkspace(job: JobSummary): void {
+    const url = this.getWorkspaceUrl(job);
+    if (!url) return;
+    // Ensure Gitea access is granted (may have been skipped at job creation
+    // if user hadn't logged into Gitea yet), then navigate.
+    this.api.ensureWorkspaceAccess(job.id).subscribe(() => {
+      window.open(url, '_blank');
+    });
   }
 
   hasLiveVm(job: JobSummary): boolean {

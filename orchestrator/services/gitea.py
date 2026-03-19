@@ -983,17 +983,29 @@ class GiteaClient:
         client = self._get_client()
 
         try:
-            resp = await client.get(
-                f"{self._url}/api/v1/users/search",
-                params={"q": email, "limit": 50},
-            )
-            if resp.status_code != 200:
-                logger.debug(f"Gitea user search failed (status {resp.status_code})")
-                return None
+            # Admin API lists all users with full email — the public /users/search
+            # endpoint only matches on username/full-name, not email.
+            page = 1
+            while True:
+                resp = await client.get(
+                    f"{self._url}/api/v1/admin/users",
+                    params={"page": page, "limit": 50},
+                )
+                if resp.status_code != 200:
+                    logger.debug(f"Gitea admin user list failed (status {resp.status_code})")
+                    return None
 
-            for user in resp.json().get("data", []):
-                if user.get("email", "").lower() == email.lower():
-                    return user["login"]
+                users = resp.json()
+                if not users:
+                    break
+
+                for user in users:
+                    if user.get("email", "").lower() == email.lower():
+                        return user["login"]
+
+                if len(users) < 50:
+                    break
+                page += 1
 
             return None
 

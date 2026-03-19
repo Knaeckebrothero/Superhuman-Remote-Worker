@@ -606,15 +606,19 @@ def reject_transition(
     Returns:
         TransitionResult with success=False and error message
     """
-    from langchain_core.messages import ToolMessage
+    from langchain_core.messages import HumanMessage
 
     logger.warning(f"Phase transition rejected: {reason}")
 
-    # Create error message for the conversation
-    error_msg = ToolMessage(
+    # Create error message for the conversation as HumanMessage.
+    # Previously this was a ToolMessage with a synthetic tool_call_id, but
+    # sanitize_message_history() would remove it as an orphan (no parent
+    # AIMessage), which could leave consecutive AIMessages in the history
+    # and trigger "Cannot have 2+ assistant messages at the end" errors
+    # from strict LLM APIs (e.g., vLLM).
+    error_msg = HumanMessage(
         content=f"[TRANSITION_REJECTED] Phase transition rejected: {reason}\n\n"
         "Please fix the issue and try again.",
-        tool_call_id="phase_transition",
     )
 
     return TransitionResult(
