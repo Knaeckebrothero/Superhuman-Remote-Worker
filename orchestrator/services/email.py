@@ -176,10 +176,11 @@ class EmailService:
             job_short = job_id[:8]
             reply_to_addr = f"{agent_local}+{job_short}+{thread_id}@{self.mail_domain}"
 
-        # Build cockpit link
-        cockpit_link = f"{self.cockpit_url}/jobs/{job_id}"
+        # Build cockpit link (deep-link into action center inbox)
         if thread_id:
-            cockpit_link += f"/messages/{thread_id}"
+            cockpit_link = f"{self.cockpit_url}/inbox?job={job_id}&thread={thread_id}"
+        else:
+            cockpit_link = f"{self.cockpit_url}/jobs/{job_id}"
 
         phase_str = f"Phase {phase_number}" if phase_number is not None else "—"
 

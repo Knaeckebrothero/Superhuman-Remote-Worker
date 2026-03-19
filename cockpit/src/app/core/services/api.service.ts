@@ -50,6 +50,7 @@ import {
 import { LLMRequest } from '../../debug/request.model';
 import { GraphChangeResponse, GraphDelta } from '../../debug/graph.model';
 import { ChatEntry, ChatHistoryResponse } from '../models/chat.model';
+import { ThreadDetail, PendingActionCounts } from '../models/action.model';
 import { environment } from '../environment';
 
 /**
@@ -896,6 +897,56 @@ export class ApiService {
     return this.http.get<Record<string, unknown>>(`${this.baseUrl}/jobs/${jobId}/frozen`).pipe(
       catchError((error) => {
         console.error(`Failed to fetch frozen data for job ${jobId}:`, error);
+        return of(null);
+      }),
+    );
+  }
+
+  /**
+   * Get full thread messages for a job's message thread.
+   */
+  getThreadMessages(jobId: string, threadId: string): Observable<ThreadDetail | null> {
+    return this.http
+      .get<ThreadDetail>(`${this.baseUrl}/jobs/${jobId}/messages/${threadId}`)
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to fetch thread ${threadId} for job ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Reply to an agent message thread.
+   */
+  replyToThread(
+    jobId: string,
+    threadId: string,
+    message: string,
+    urgent = false,
+  ): Observable<{ status: string; sequence: number } | null> {
+    return this.http
+      .post<{ status: string; sequence: number }>(
+        `${this.baseUrl}/jobs/${jobId}/messages/${threadId}/reply`,
+        { message, urgent },
+      )
+      .pipe(
+        tap(() => this.toast.success('Reply sent')),
+        catchError((error) => {
+          console.error(`Failed to reply to thread ${threadId}:`, error);
+          this.toast.error('Failed to send reply');
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Get pending action counts across all types.
+   */
+  getPendingActions(): Observable<PendingActionCounts | null> {
+    return this.http.get<PendingActionCounts>(`${this.baseUrl}/actions/pending`).pipe(
+      catchError((error) => {
+        console.error('Failed to fetch pending actions:', error);
         return of(null);
       }),
     );

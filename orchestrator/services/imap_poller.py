@@ -130,19 +130,29 @@ class ImapPoller:
 
         # Process each email asynchronously
         processed = 0
+        duplicates = 0
         mark_seen = []
         mark_unseen = []
 
         for msg_num, raw_email in raw_emails:
             try:
-                routed = await self._process_email(raw_email)
-                if routed:
+                result = await self._process_email(raw_email)
+                if result == "routed":
                     mark_seen.append(msg_num)
                     processed += 1
+                elif result == "duplicate":
+                    mark_seen.append(msg_num)
+                    duplicates += 1
                 else:
                     mark_unseen.append(msg_num)
             except Exception as e:
                 logger.warning(f"Failed to process IMAP message {msg_num}: {e}")
+
+        skipped = len(mark_unseen)
+        logger.debug(
+            "Poll: %d checked, %d routed, %d duplicate, %d skipped",
+            len(raw_emails), processed, duplicates, skipped,
+        )
 
         # Update flags in a thread (blocking I/O)
         if mark_seen or mark_unseen:
@@ -247,18 +257,17 @@ class ImapPoller:
                 except Exception:
                     pass
 
-    async def _process_email(self, raw_email: bytes) -> bool:
+    async def _process_email(self, raw_email: bytes) -> str:
         """Parse one email, extract reply, route to job/thread.
 
-        Returns True if the email was successfully routed, False otherwise.
+        Returns ``"routed"``, ``"duplicate"``, or ``"skipped"``.
         """
         msg = email_lib.message_from_bytes(raw_email)
 
         # Check email_message_id for dedup
         email_msg_id = msg.get("Message-ID", "")
         if email_msg_id and await self._db.message_exists_by_email_id(email_msg_id):
-            logger.debug(f"Skipping already-processed email: {email_msg_id}")
-            return True  # Already processed, mark as seen
+            return "duplicate"
 
         # Parse + sub-address from recipient headers
         routing = None
@@ -285,8 +294,7 @@ class ImapPoller:
             routing = await self._resolve_via_in_reply_to(msg)
 
         if not routing:
-            logger.debug(f"No routing info found in email {email_msg_id} — skipping")
-            return False
+            return "skipped"
 
         job_short_id, thread_id = routing
 
@@ -297,7 +305,7 @@ class ImapPoller:
                 f"IMAP reply: no job found for short ID '{job_short_id}' "
                 f"(email {email_msg_id})"
             )
-            return False
+            return "skipped"
 
         job_id = str(job["id"])
 
@@ -310,7 +318,7 @@ class ImapPoller:
         body = self._extract_text_body(msg)
         if not body:
             logger.warning(f"IMAP reply: empty body in email {email_msg_id}")
-            return False
+            return "skipped"
 
         cleaned_body = parse_reply(body)
         if not cleaned_body:
@@ -325,7 +333,7 @@ class ImapPoller:
             f"IMAP reply routed: job={job_id[:8]}, thread={thread_id}, "
             f"sender={sender}, strategy={strategy}"
         )
-        return True
+        return "routed"
 
     async def _resolve_via_in_reply_to(
         self, msg: email_lib.message.Message
