@@ -28,6 +28,7 @@ import { InstructionBuilderComponent } from './shared/components/instruction-bui
 import { ProjectListPageComponent } from './shared/pages/project-list.component';
 import { MemoryPanelComponent } from './debug/components/memory-panel/memory-panel.component';
 import { InboxPageComponent } from './simple/pages/inbox/inbox-page.component';
+import { ConfigEditorComponent } from './shared/components/config-editor/config-editor.component';
 
 @Component({
   selector: 'app-root',
@@ -195,6 +196,12 @@ export class App implements OnInit {
       type: 'action-center',
       displayName: 'Action Center',
       component: InboxPageComponent,
+    });
+
+    this.registry.register({
+      type: 'config-editor',
+      displayName: 'Config Editor',
+      component: ConfigEditorComponent,
     });
   }
 }
