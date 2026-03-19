@@ -148,10 +148,11 @@ class NotificationService:
 
         results["queued"] = False
 
-        # Build cockpit deep link
-        cockpit_link = f"{self._cockpit_url}/jobs/{job_id}"
+        # Build cockpit deep link (into action center inbox)
         if thread_id:
-            cockpit_link += f"/messages/{thread_id}"
+            cockpit_link = f"{self._cockpit_url}/inbox?job={job_id}&thread={thread_id}"
+        else:
+            cockpit_link = f"{self._cockpit_url}/jobs/{job_id}"
 
         # Dispatch to email
         if user_channels.get("email", True) and self._email_service:

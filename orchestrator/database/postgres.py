@@ -4135,6 +4135,117 @@ class PostgresDB:
 
         return [dict(row) for row in rows]
 
+    async def get_thread_messages(
+        self, job_id: str, thread_id: str
+    ) -> Dict[str, Any] | None:
+        """Get full ordered messages within a thread.
+
+        Args:
+            job_id: Job UUID
+            thread_id: Thread identifier
+
+        Returns:
+            Dict with thread metadata and ordered messages, or None if empty.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return None
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, direction, subject, message, mode,
+                    read_at, created_at
+                FROM message_log
+                WHERE job_id = $1 AND thread_id = $2
+                ORDER BY created_at ASC
+                """,
+                job_uuid,
+                thread_id,
+            )
+
+        if not rows:
+            return None
+
+        messages = []
+        for row in rows:
+            messages.append({
+                "id": str(row["id"]),
+                "direction": row["direction"],
+                "subject": row["subject"],
+                "message": row["message"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "read_at": row["read_at"].isoformat() if row["read_at"] else None,
+            })
+
+        # Thread metadata from first outbound message
+        first_outbound = next(
+            (r for r in rows if r["direction"] == "outbound"), rows[0]
+        )
+
+        return {
+            "thread_id": thread_id,
+            "subject": first_outbound["subject"],
+            "mode": first_outbound.get("mode") or "async",
+            "messages": messages,
+        }
+
+    async def get_pending_action_counts(self) -> Dict[str, Any]:
+        """Get counts of pending actions across all types.
+
+        Returns:
+            Dict with sudo, messages, reviews counts and most_urgent info.
+        """
+        async with self.acquire() as conn:
+            sudo_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM sudo_approval_requests WHERE status = 'pending'"
+            ) or 0
+
+            message_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
+            ) or 0
+
+            review_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
+            ) or 0
+
+            # Find most urgent sudo request (lowest TTL)
+            most_urgent_sudo = await conn.fetchrow(
+                """
+                SELECT id, command, expires_at
+                FROM sudo_approval_requests
+                WHERE status = 'pending' AND expires_at > NOW()
+                ORDER BY expires_at ASC
+                LIMIT 1
+                """
+            )
+
+        total = sudo_count + message_count + review_count
+
+        most_urgent = None
+        if most_urgent_sudo:
+            expires_at = most_urgent_sudo["expires_at"]
+            expires_in = (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if expires_in > 0:
+                most_urgent = {
+                    "type": "sudo",
+                    "id": str(most_urgent_sudo["id"]),
+                    "title": most_urgent_sudo["command"],
+                    "expires_in_seconds": int(expires_in),
+                }
+
+        return {
+            "counts": {
+                "sudo": sudo_count,
+                "messages": message_count,
+                "reviews": review_count,
+                "total": total,
+            },
+            "most_urgent": most_urgent,
+        }
+
     async def get_message_sequence(self, job_id: str, thread_id: str) -> int:
         """Get the next sequence number for a thread.
 
