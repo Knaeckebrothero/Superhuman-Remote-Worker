@@ -2328,7 +2328,7 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
         error_msg = None if email_sent else "Email not configured or send failed"
 
         # Log to message_log
-        log_entry = await postgres_db.log_message(
+        await postgres_db.log_message(
             job_id=job_id,
             user_id=user_id,
             thread_id=thread_id,

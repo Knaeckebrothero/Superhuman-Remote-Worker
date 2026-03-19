@@ -2310,7 +2310,6 @@ def format_thread_messages(messages: list[dict[str, Any]], thread_id: str) -> st
         created = m.get("created_at", "")
         subject = m.get("subject", "")
         body = m.get("message", "")
-        sender = m.get("recipient_email", "") if direction == "outbound" else "(human)"
 
         lines.append(f"  {icon} [{created}] {subject}")
         if body:

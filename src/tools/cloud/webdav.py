@@ -92,7 +92,6 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
                     continue  # Skip the directory itself
                 is_dir = item.get("isdir", False)
                 size = item.get("size", "")
-                modified = item.get("modified", "")
                 type_icon = "[DIR]" if is_dir else "[FILE]"
                 size_str = f"  {_human_size(int(size))}" if size and not is_dir else ""
                 lines.append(f"  {type_icon} {name}{size_str}")
