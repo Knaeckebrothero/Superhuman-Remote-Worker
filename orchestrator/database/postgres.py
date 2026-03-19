@@ -2649,33 +2649,51 @@ class PostgresDB:
                 return dict(existing_sub)
 
             # Create new user + project atomically (constraint requires default_project_id)
-            row = await conn.fetchrow(
-                """
-                WITH new_project AS (
-                    INSERT INTO projects (name, description, is_default)
-                    VALUES ($1 || '''s Project', 'Default project', true)
-                    RETURNING id
-                ),
-                new_user AS (
-                    INSERT INTO users (display_name, avatar_color, email, is_admin,
-                                      keycloak_sub, default_project_id)
-                    VALUES ($1, '#89b4fa', $2, $3, $4, (SELECT id FROM new_project))
-                    RETURNING id, display_name, avatar_color, email, default_project_id,
-                              is_admin, keycloak_sub, created_at
-                ),
-                membership AS (
-                    INSERT INTO project_members (project_id, user_id, role)
-                    SELECT (SELECT id FROM new_project), id, 'owner'
-                    FROM new_user
+            try:
+                row = await conn.fetchrow(
+                    """
+                    WITH new_project AS (
+                        INSERT INTO projects (name, description, is_default)
+                        VALUES ($1 || '''s Project', 'Default project', true)
+                        RETURNING id
+                    ),
+                    new_user AS (
+                        INSERT INTO users (display_name, avatar_color, email, is_admin,
+                                          keycloak_sub, default_project_id)
+                        VALUES ($1, '#89b4fa', $2, $3, $4, (SELECT id FROM new_project))
+                        RETURNING id, display_name, avatar_color, email, default_project_id,
+                                  is_admin, keycloak_sub, created_at
+                    ),
+                    membership AS (
+                        INSERT INTO project_members (project_id, user_id, role)
+                        SELECT (SELECT id FROM new_project), id, 'owner'
+                        FROM new_user
+                    )
+                    SELECT * FROM new_user
+                    """,
+                    display_name,
+                    email,
+                    is_admin,
+                    sub,
                 )
-                SELECT * FROM new_user
-                """,
-                display_name,
-                email,
-                is_admin,
-                sub,
-            )
-            return dict(row)
+                return dict(row)
+            except Exception as e:
+                if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+                    # Race condition: concurrent request already created this user.
+                    # Retry lookup by keycloak_sub or email.
+                    retry = await conn.fetchrow(
+                        """
+                        SELECT id, display_name, avatar_color, email, default_project_id,
+                               is_admin, keycloak_sub, created_at
+                        FROM users WHERE keycloak_sub = $1 OR LOWER(email) = LOWER($2)
+                        LIMIT 1
+                        """,
+                        sub,
+                        email,
+                    )
+                    if retry:
+                        return dict(retry)
+                raise
 
     async def get_user_by_email(self, email: str) -> Dict[str, Any] | None:
         """Get a user by email (case-insensitive).

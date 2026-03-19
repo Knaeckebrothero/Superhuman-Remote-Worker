@@ -165,6 +165,12 @@ async def init_all(
                 return False
             logger.info("")
 
+            # Reset SSO databases on force-reset (Keycloak re-imports realm-export.json)
+            if force_reset:
+                from orchestrator.init import reset_sso_databases
+                logger.info("  Resetting SSO databases (Keycloak, Nextcloud)...")
+                await reset_sso_databases()
+
             # Create Keycloak/Nextcloud databases on the same PostgreSQL instance
             from orchestrator.init import ensure_sso_databases
             logger.info("  Creating SSO databases (Keycloak, Nextcloud)...")
