@@ -27,6 +27,7 @@ import { WorkspaceBrowserComponent } from './shared/components/workspace-browser
 import { InstructionBuilderComponent } from './shared/components/instruction-builder/instruction-builder.component';
 import { ProjectListPageComponent } from './shared/pages/project-list.component';
 import { MemoryPanelComponent } from './debug/components/memory-panel/memory-panel.component';
+import { InboxPageComponent } from './simple/pages/inbox/inbox-page.component';
 
 @Component({
   selector: 'app-root',
@@ -188,6 +189,12 @@ export class App implements OnInit {
       type: 'memory-panel',
       displayName: 'Memory Panel',
       component: MemoryPanelComponent,
+    });
+
+    this.registry.register({
+      type: 'action-center',
+      displayName: 'Action Center',
+      component: InboxPageComponent,
     });
   }
 }

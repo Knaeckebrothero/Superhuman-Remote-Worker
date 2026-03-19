@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -38,6 +39,9 @@ else:
         level=_log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+# Suppress uvicorn's shallow access log — replaced by request logging middleware below.
+logging.getLogger("uvicorn.access").disabled = True
 
 from datetime import date, datetime, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
@@ -1469,7 +1473,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# CSRF middleware — validates X-CSRF-Token header on mutating requests
+# Request logging middleware — replaces uvicorn's shallow access log with
+# app-level logging that includes response timing and error tracebacks.
+_SILENT_PATHS = {"/api/health"}
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in _SILENT_PATHS:
+        return await call_next(request)
+
+    method = request.method
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed = (time.perf_counter() - start) * 1000
+        logger.exception("%s %s 500 (%dms) — unhandled exception", method, path, elapsed)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+    elapsed = (time.perf_counter() - start) * 1000
+    status = response.status_code
+    if status >= 500:
+        logger.warning("%s %s %d (%dms)", method, path, status, elapsed)
+    else:
+        logger.info("%s %s %d (%dms)", method, path, status, elapsed)
+    return response
+
+
 # Include routers
 app.include_router(graph_router)
 app.include_router(uploads_router)
@@ -2567,6 +2599,79 @@ async def list_message_threads(job_id: str) -> dict[str, Any]:
         raise
     except Exception as e:
         logger.exception(f"Failed to list message threads for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# Thread Detail & Action Center Endpoints
+# =============================================================================
+
+
+@app.get("/api/jobs/{job_id}/messages/{thread_id}")
+async def get_thread_detail(job_id: str, thread_id: str) -> dict[str, Any]:
+    """Get full ordered messages within a thread."""
+    try:
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        thread = await postgres_db.get_thread_messages(job_id, thread_id)
+        if not thread:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Thread '{thread_id}' not found for job '{job_id}'",
+            )
+
+        # Enrich with job freeze status
+        freeze_data = job.get("freeze_data")
+        if isinstance(freeze_data, str):
+            try:
+                freeze_data = json.loads(freeze_data)
+            except json.JSONDecodeError:
+                freeze_data = None
+
+        if (
+            job.get("status") == "waiting_for_reply"
+            and freeze_data
+            and freeze_data.get("thread_id") == thread_id
+        ):
+            thread["status"] = "waiting_for_reply"
+        else:
+            thread["status"] = "active"
+
+        return thread
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(
+            f"Failed to get thread detail for job {job_id} thread {thread_id}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+_pending_actions_cache: dict[str, Any] = {"data": None, "expires_at": 0.0}
+
+
+@app.get("/api/actions/pending")
+async def get_pending_actions() -> dict[str, Any]:
+    """Get counts of all pending actions across types. Cached for 5 seconds."""
+    import time
+
+    now = time.monotonic()
+    if (
+        _pending_actions_cache["data"] is not None
+        and now < _pending_actions_cache["expires_at"]
+    ):
+        return _pending_actions_cache["data"]
+
+    try:
+        data = await postgres_db.get_pending_action_counts()
+        _pending_actions_cache["data"] = data
+        _pending_actions_cache["expires_at"] = now + 5.0
+        return data
+    except Exception as e:
+        logger.exception(f"Failed to get pending action counts: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

@@ -31,7 +31,8 @@ export type ComponentType =
   | 'workspace-browser'
   | 'instruction-builder'
   | 'project-list'
-  | 'memory-panel';
+  | 'memory-panel'
+  | 'action-center';
 
 /**
  * Layout configuration for the tiling system.
