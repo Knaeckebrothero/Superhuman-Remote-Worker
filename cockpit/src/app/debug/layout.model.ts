@@ -32,7 +32,8 @@ export type ComponentType =
   | 'instruction-builder'
   | 'project-list'
   | 'memory-panel'
-  | 'action-center';
+  | 'action-center'
+  | 'config-editor';
 
 /**
  * Layout configuration for the tiling system.

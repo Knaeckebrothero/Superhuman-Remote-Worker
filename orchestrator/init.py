@@ -167,6 +167,49 @@ async def ensure_sso_databases() -> bool:
         return False
 
 
+async def reset_sso_databases() -> bool:
+    """Drop Keycloak and Nextcloud databases so they re-initialize from config.
+
+    Keycloak imports realm-export.json only on first startup (empty DB).
+    Dropping the database forces a clean re-import on next container restart.
+    """
+    import psycopg
+    from psycopg import sql
+
+    connection_string = get_postgres_connection_string()
+    parsed = _parse_connection_string(connection_string)
+    maint_url = f"postgresql://{parsed['user']}:{parsed['password']}@{parsed['host']}:{parsed['port']}/postgres"
+
+    sso_databases = ["keycloak", "nextcloud"]
+
+    try:
+        conn = await psycopg.AsyncConnection.connect(maint_url, autocommit=True)
+        try:
+            for db_name in sso_databases:
+                result = await conn.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = %s",
+                    (db_name,),
+                )
+                if await result.fetchone():
+                    # Terminate active connections before dropping
+                    await conn.execute(
+                        sql.SQL(
+                            "SELECT pg_terminate_backend(pid) "
+                            "FROM pg_stat_activity WHERE datname = {}"
+                        ).format(sql.Literal(db_name))
+                    )
+                    await conn.execute(
+                        sql.SQL("DROP DATABASE {}").format(sql.Identifier(db_name))
+                    )
+                    logger.info(f"    Dropped SSO database: {db_name}")
+        finally:
+            await conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"    Could not reset SSO databases: {e}")
+        return False
+
+
 async def init_postgres(force_reset: bool = False) -> bool:
     """Initialize PostgreSQL database.
 
