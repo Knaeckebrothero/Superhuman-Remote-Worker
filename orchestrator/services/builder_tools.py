@@ -230,7 +230,8 @@ BUILDER_TOOLS = [
             "name": "update_config",
             "description": (
                 "Update the agent configuration. Objects merge recursively, arrays replace entirely. "
-                "Use this to change the model, temperature, reasoning level, or tool availability."
+                "Use this to change the model, temperature, reasoning level, tool availability, "
+                "autonomy level, scholar/verification phases, or memory settings."
             ),
             "parameters": {
                 "type": "object",
@@ -268,6 +269,51 @@ BUILDER_TOOLS = [
                         "additionalProperties": {
                             "type": "array",
                             "items": {"type": "string"},
+                        },
+                    },
+                    "scholar": {
+                        "type": "object",
+                        "description": "Scholar (research phase) settings. The scholar runs before the main job to gather background information.",
+                        "properties": {
+                            "enabled": {
+                                "type": "boolean",
+                                "description": "Enable/disable the scholar research phase (default: true)",
+                            },
+                        },
+                    },
+                    "verification": {
+                        "type": "object",
+                        "description": "Verification (critic) phase settings. The critic reviews deliverables after job completion.",
+                        "properties": {
+                            "enabled": {
+                                "type": "boolean",
+                                "description": "Enable/disable the critic verification phase (default: true)",
+                            },
+                            "max_rounds": {
+                                "type": "integer",
+                                "description": "Max feedback round-trips before auto-accepting (0 = unlimited, default: 5)",
+                            },
+                        },
+                    },
+                    "autonomy": {
+                        "type": "string",
+                        "enum": ["full", "review", "partial", "guided", "dependent"],
+                        "description": (
+                            "Controls when the agent pauses for human review. "
+                            "full=never pauses, review=pauses at completion, "
+                            "partial=pauses at phase boundaries + completion, "
+                            "guided=pauses after every tactical phase, "
+                            "dependent=pauses after every phase"
+                        ),
+                    },
+                    "memory": {
+                        "type": "object",
+                        "description": "Memory settings for cross-context recall",
+                        "properties": {
+                            "project_scoped": {
+                                "type": "boolean",
+                                "description": "When true, memories are shared with other jobs in the same project",
+                            },
                         },
                     },
                 },

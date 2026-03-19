@@ -88,7 +88,7 @@ The agent uses a **phase alternation model**:
 - `update_instructions` — Replace entire instructions (for major rewrites or first draft)
 - `edit_instructions` — Find-and-replace within instructions (for targeted edits)
 - `insert_instructions` — Add content at a line number or append
-- `update_config` — Change model, temperature, reasoning level, tools, strategic/tactical overrides
+- `update_config` — Change model, temperature, reasoning level, tools, strategic/tactical overrides, autonomy level, scholar/verification phases, memory settings
 - `update_description` — Change the job description
 
 **Workspace editing** (requires user approval):
