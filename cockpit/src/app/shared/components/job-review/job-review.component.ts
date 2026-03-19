@@ -129,9 +129,9 @@ interface FrozenJobData {
           @if (getWorkspaceUrl() || hasSnapshot()) {
             <div class="section workspace-links">
               @if (getWorkspaceUrl()) {
-                <a class="workspace-link" [href]="getWorkspaceUrl()" target="_blank">
+                <button class="workspace-link" (click)="openWorkspace()">
                   Browse workspace in Gitea
-                </a>
+                </button>
               }
               @if (hasSnapshot()) {
                 @if (ideLoading()) {
@@ -679,6 +679,16 @@ export class JobReviewComponent {
       return `${giteaUrl}/${repoName}/src/branch/${currentJob.branch_name}`;
     }
     return `${giteaUrl}/${repoName}`;
+  }
+
+  openWorkspace(): void {
+    const currentJob = this.job();
+    if (!currentJob) return;
+    const url = this.getWorkspaceUrl();
+    if (!url) return;
+    this.api.ensureWorkspaceAccess(currentJob.id).subscribe(() => {
+      window.open(url, '_blank');
+    });
   }
 
   hasSnapshot(): boolean {

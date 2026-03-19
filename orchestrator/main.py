@@ -4450,6 +4450,40 @@ async def stop_ide_session(job_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.post("/api/jobs/{job_id}/ensure-workspace-access")
+async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, Any]:
+    """Ensure the current user has Gitea access to the job's workspace repo.
+
+    Called by the cockpit before navigating to the Gitea workspace URL.
+    Re-attempts the access grant that may have been skipped at job creation
+    time (if the user hadn't logged into Gitea yet via OIDC).
+    """
+    try:
+        user = await get_current_user(request, postgres_db)
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        repo_name = job.get("repo_name")
+        if not repo_name:
+            return {"granted": False, "reason": "no_repo"}
+
+        if not gitea_client.is_initialized:
+            return {"granted": False, "reason": "gitea_unavailable"}
+
+        email = user.get("email")
+        if not email:
+            return {"granted": False, "reason": "no_email"}
+
+        granted = await gitea_client.grant_user_repo_access(email, repo_name)
+        return {"granted": granted, "reason": "ok" if granted else "user_not_in_gitea"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to ensure workspace access for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/api/jobs/{job_id}/requirements")
 async def get_job_requirements(
     job_id: str,
