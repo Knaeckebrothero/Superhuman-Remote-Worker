@@ -158,10 +158,14 @@ services:
       GITEA__security__INSTALL_LOCK: "true"
       GITEA__server__DISABLE_SSH: "true"
       GITEA__service__DISABLE_REGISTRATION: "false"
+      GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"
+      GITEA__service__SHOW_REGISTRATION_BUTTON: "false"
       GITEA__service__REQUIRE_SIGNIN_VIEW: "false"
       GITEA__service__ENABLE_CAPTCHA: "false"
       GITEA__service__AUTO_WATCH_NEW_REPOS: "false"
       GITEA__oauth2_client__ENABLE_AUTO_REGISTRATION: "true"
+      GITEA__oauth2_client__USERNAME: preferred_username
+      GITEA__oauth2_client__UPDATE_EXISTING: "true"
       GITEA__repository__DEFAULT_PRIVATE: private
       GITEA__repository__ENABLE_PUSH_CREATE_USER: "true"
     volumes:

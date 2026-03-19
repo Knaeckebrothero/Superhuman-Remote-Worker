@@ -805,6 +805,21 @@ export class ApiService {
   }
 
   /**
+   * Ensure the current user has Gitea access to a job's workspace repo.
+   * Called before navigating to the workspace URL.
+   */
+  ensureWorkspaceAccess(jobId: string): Observable<{ granted: boolean } | null> {
+    return this.http
+      .post<{ granted: boolean }>(`${this.baseUrl}/jobs/${jobId}/ensure-workspace-access`, {})
+      .pipe(
+        catchError((error) => {
+          console.error(`Failed to ensure workspace access for ${jobId}:`, error);
+          return of(null);
+        }),
+      );
+  }
+
+  /**
    * Start an IDE session for a job (restores snapshot into a fresh VM).
    */
   startIdeSession(jobId: string): Observable<IdeSessionStatus | null> {
