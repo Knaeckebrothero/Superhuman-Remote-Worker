@@ -41,7 +41,11 @@ Every todo must be specific enough that you know exactly when it's done.
 |---|---|
 | "Check all citations" | "Verify citations 1-10 against source documents in documents/" |
 | "Write the analysis" | "Write section 2.1: Market Overview (600-800 words) using findings from phase 2 research" |
+{% if has_tool("kb_write") -%}
 | "Research the topic" | "Web search for 'renewable energy policy EU 2025', record key findings using kb_write" |
+{% else -%}
+| "Research the topic" | "Web search for 'renewable energy policy EU 2025', record key findings in notes/research_notes.md" |
+{% endif -%}
 | "Process the documents" | "Extract text from documents/report.pdf pages 1-15 using read_file" |
 | "Review the output" | "Read output/chapter3.md, verify it has 1000+ words, all claims cited, no placeholder text" |
 
@@ -60,9 +64,15 @@ Every todo must be specific enough that you know exactly when it's done.
 ### 1. Research Phase (first, for unfamiliar topics)
 
 Example todos:
+{% if has_tool("kb_write") -%}
 - "Web search for 'topic X state of the art 2025' and record key findings using kb_write(type='learning')"
 - "Read documents/brief.pdf pages 1-10 and record key themes using kb_write(type='learning')"
 - "Record research findings as knowledge notes using kb_write"
+{% else -%}
+- "Web search for 'topic X state of the art 2025' and record key findings in notes/research_notes.md"
+- "Read documents/brief.pdf pages 1-10 and record key themes in notes/research_notes.md"
+- "Record research findings in notes/research_notes.md"
+{% endif -%}
 
 ### 2. Execution Phase (produce one section or artifact)
 

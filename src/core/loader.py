@@ -364,6 +364,34 @@ class FileResolver:
 PromptResolver = FileResolver
 
 
+def render_instruction_content(content: str, tool_names: List[str]) -> str:
+    """Render Jinja2 template markers in instruction file content.
+
+    Supports ``{% if has_tool("kb_write") %}`` conditionals and
+    ``{{ tools }}`` variable access.  Non-templated content (no ``{%``
+    or ``{{`` markers) passes through unchanged with zero overhead.
+
+    Args:
+        content: Raw instruction file content (may contain Jinja2 markers).
+        tool_names: List of actually-loaded tool names for this job.
+
+    Returns:
+        Rendered content with conditionals resolved.
+    """
+    if "{%" not in content and "{{" not in content:
+        return content  # Fast path: no template markers
+
+    from jinja2 import Environment
+
+    env = Environment(keep_trailing_newline=True)
+    template = env.from_string(content)
+    tool_set = set(tool_names)
+    return template.render(
+        tools=tool_names,
+        has_tool=lambda name: name in tool_set,
+    )
+
+
 class MatrixResolver:
     """Base class for matrix-based file resolution.
 
@@ -2528,6 +2556,7 @@ def load_strategic_todos_template(
     deployment_dir: Optional[str] = None,
     model: str = "",
     resolved_content: Optional[str] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Load a strategic todos template with deployment override support.
 
@@ -2540,6 +2569,7 @@ def load_strategic_todos_template(
                        If None, only framework templates are used.
         model: Model name for instruction matrix resolution.
         resolved_content: Pre-resolved YAML content (from resolved_config JSONB).
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of todo dicts with 'id' and 'content' keys
@@ -2551,6 +2581,8 @@ def load_strategic_todos_template(
     # Check for pre-resolved content first
     if resolved_content and isinstance(resolved_content, str):
         logger.debug("Loading strategic todos from resolved content")
+        if tool_names:
+            resolved_content = render_instruction_content(resolved_content, tool_names)
         return _parse_strategic_todos_yaml_from_string(resolved_content)
 
     # Use InstructionMatrixResolver for 4-level fallback
@@ -2563,6 +2595,11 @@ def load_strategic_todos_template(
     try:
         path = resolver._file_resolver.resolve(resolver.resolve_filename(instruction_type))
         logger.debug(f"Loading strategic todos from: {path}")
+        # Render Jinja2 templates before YAML parsing
+        if tool_names:
+            raw_content = path.read_text(encoding="utf-8")
+            rendered = render_instruction_content(raw_content, tool_names)
+            return _parse_strategic_todos_yaml_from_string(rendered)
         return _parse_strategic_todos_yaml(path)
     except FileNotFoundError:
         raise FileNotFoundError(
@@ -2573,6 +2610,7 @@ def load_strategic_todos_template(
 
 def get_initial_strategic_todos_from_config(
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Get initial strategic todos for job start.
 
@@ -2581,6 +2619,7 @@ def get_initial_strategic_todos_from_config(
     Args:
         config: Agent configuration (for deployment directory). If None, uses
                framework defaults only.
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
@@ -2601,6 +2640,7 @@ def get_initial_strategic_todos_from_config(
             deployment_dir=deployment_dir,
             model=model,
             resolved_content=resolved_content,
+            tool_names=tool_names,
         )
     except FileNotFoundError:
         logger.warning(
@@ -2623,6 +2663,7 @@ def get_initial_strategic_todos_from_config(
 
 def get_transition_strategic_todos_from_config(
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Get strategic todos for phase transitions.
 
@@ -2631,6 +2672,7 @@ def get_transition_strategic_todos_from_config(
     Args:
         config: Agent configuration (for deployment directory). If None, uses
                framework defaults only.
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
@@ -2651,6 +2693,7 @@ def get_transition_strategic_todos_from_config(
             deployment_dir=deployment_dir,
             model=model,
             resolved_content=resolved_content,
+            tool_names=tool_names,
         )
     except FileNotFoundError:
         logger.warning(
@@ -2673,6 +2716,7 @@ def get_transition_strategic_todos_from_config(
 
 def get_resume_strategic_todos_from_config(
     config: Optional["AgentConfig"] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Get strategic todos for resuming a frozen job with feedback.
 
@@ -2681,6 +2725,7 @@ def get_resume_strategic_todos_from_config(
     Args:
         config: Agent configuration (for deployment directory). If None, uses
                framework defaults only.
+        tool_names: List of loaded tool names for Jinja2 template rendering.
 
     Returns:
         List of todo dicts ready for TodoManager.set_todos_from_list():
@@ -2701,6 +2746,7 @@ def get_resume_strategic_todos_from_config(
             deployment_dir=deployment_dir,
             model=model,
             resolved_content=resolved_content,
+            tool_names=tool_names,
         )
     except FileNotFoundError:
         logger.warning(

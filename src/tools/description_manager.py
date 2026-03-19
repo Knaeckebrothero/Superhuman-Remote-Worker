@@ -120,7 +120,11 @@ class DescriptionManager:
         ]
 
         # Category order (matches src/tools/ packages)
-        category_order = ["workspace", "core", "document", "research", "citation", "graph", "other"]
+        category_order = [
+            "workspace", "core", "document", "research", "citation",
+            "graph", "sql", "mongodb", "knowledge", "git", "coding",
+            "evaluation", "communication", "other",
+        ]
 
         for category in category_order:
             if category not in categories:
