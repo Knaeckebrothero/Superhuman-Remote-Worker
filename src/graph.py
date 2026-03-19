@@ -315,6 +315,7 @@ def create_init_strategic_todos_node(
     workspace: WorkspaceManager,
     todo_manager: TodoManager,
     config: AgentConfig,
+    tool_names: Optional[List[str]] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the init_strategic_todos node for phase alternation.
 
@@ -344,7 +345,7 @@ def create_init_strategic_todos_node(
             logger.warning(f"[{job_id}] instructions.md not found")
 
         # Load predefined strategic todos from config template
-        strategic_todos = get_initial_strategic_todos(config)
+        strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)
         todo_list = [todo.to_dict() for todo in strategic_todos]
         todo_manager.set_todos_from_list(todo_list)
 
@@ -1342,6 +1343,7 @@ def create_execute_node(
 def create_check_todos_node(
     todo_manager: TodoManager,
     config: AgentConfig,
+    tool_names: Optional[List[str]] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the check_todos node.
 
@@ -1369,10 +1371,10 @@ def create_check_todos_node(
             phase_number = state.get("phase_number", 0)
             if phase_number == 0:
                 # Initial strategic phase
-                strategic_todos = get_initial_strategic_todos(config)
+                strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)
             else:
                 # Transition strategic phase (between tactical phases)
-                strategic_todos = get_transition_strategic_todos(config)
+                strategic_todos = get_transition_strategic_todos(config, tool_names=tool_names)
 
             if strategic_todos:
                 todo_list = [todo.to_dict() for todo in strategic_todos]
@@ -1685,6 +1687,7 @@ def create_handle_transition_node(
     min_todos: int = 5,
     max_todos: int = 20,
     postgres_db: Optional[Any] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the handle_transition node.
 
@@ -1728,6 +1731,7 @@ def create_handle_transition_node(
             min_todos=min_todos,
             max_todos=max_todos,
             config=config,
+            tool_names=tool_names,
         )
 
         # If the job was stopped, update DB status and store freeze_data.
@@ -2115,6 +2119,7 @@ def create_restore_from_feedback_node(
     context_mgr: ContextManager,
     auxiliary_llm,
     summarization_prompt: str,
+    tool_names: Optional[List[str]] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create node that handles resume-from-feedback flow.
 
@@ -2223,7 +2228,7 @@ def create_restore_from_feedback_node(
         )
 
         # Step 4: Load resume-specific strategic todos
-        resume_todos = get_resume_strategic_todos(config)
+        resume_todos = get_resume_strategic_todos(config, tool_names=tool_names)
         todo_list = [todo.to_dict() for todo in resume_todos]
         todo_manager.set_todos_from_list(todo_list)
         todo_manager.is_strategic_phase = True
@@ -2634,13 +2639,17 @@ def build_phase_alternation_graph(
     # Create graph
     workflow = StateGraph(UniversalAgentState)
 
+    # Extract tool names for Jinja2 rendering of instruction templates
+    _tool_names = [t.name for t in tools] if tools else None
+
     # Create nodes
     init_workspace = create_init_workspace_node(memory_manager, workspace_template, config)
-    init_strategic_todos = create_init_strategic_todos_node(workspace, todo_manager, config)
+    init_strategic_todos = create_init_strategic_todos_node(workspace, todo_manager, config, tool_names=_tool_names)
     restore_todo_state = create_restore_todo_state_node(todo_manager)
     restore_from_feedback = create_restore_from_feedback_node(
         workspace, todo_manager, config,
         context_mgr, auxiliary_llm, summarization_prompt,
+        tool_names=_tool_names,
     )
 
     execute = create_execute_node(
@@ -2658,7 +2667,7 @@ def build_phase_alternation_graph(
         memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
     )
-    check_todos = create_check_todos_node(todo_manager, config)
+    check_todos = create_check_todos_node(todo_manager, config, tool_names=_tool_names)
     archive_phase = create_archive_phase_node(
         todo_manager, plan_manager, config,
         context_mgr, auxiliary_llm, summarization_prompt,
@@ -2675,6 +2684,7 @@ def build_phase_alternation_graph(
         min_todos=config.phase_settings.min_todos,
         max_todos=config.phase_settings.max_todos,
         postgres_db=postgres_db,
+        tool_names=_tool_names,
     )
 
     check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)

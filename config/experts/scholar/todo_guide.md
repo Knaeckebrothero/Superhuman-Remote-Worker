@@ -40,14 +40,22 @@ Every todo must be specific enough that you know *exactly* when it's done.
 
 1. **Names the specific question** — "What are the tradeoffs of X?" not "Look into X"
 2. **Names the exploration mode** — web search, codebase read, log query, or experiment
+{% if has_tool("kb_write") -%}
 3. **Names the output** — idea artifact, experiment result, note file, or knowledge note (kb_write)
+{% else -%}
+3. **Names the output** — idea artifact, experiment result, or note file (e.g., notes/research_log.md)
+{% endif -%}
 4. **Completable in 2-4 tool calls** — search, read results, write finding
 
 ### The Completion Test
 
 Before finalizing each todo, ask: "What artifact does this produce?"
 - "Research error handling" → No artifact named. Too vague.
+{% if has_tool("kb_write") -%}
 - "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end using kb_write(type='learning', tag='dead-end')" → Clear artifact. Specific.
+{% else -%}
+- "Search for error handling patterns in src/tools/, write idea to output/ideas/005_error_patterns.md if gaps found, or record dead end to notes/dead_ends.md" → Clear artifact. Specific.
+{% endif -%}
 
 ---
 
@@ -63,7 +71,11 @@ Example todos:
 - "Search papers for 'retrieval augmented generation optimization' — download top 2 to documents/"
 - "Extract full content from [specific URL found in prior search] — summarize key techniques"
 - "Write idea artifacts for any actionable findings from web research"
+{% if has_tool("kb_write") -%}
 - "Record sources discovered using kb_write(type='source') and dead ends using kb_write(type='learning', tag='dead-end')"
+{% else -%}
+- "Record sources discovered to notes/research_log.md and dead ends to notes/dead_ends.md"
+{% endif -%}
 
 ### 2. Codebase Archaeology Phase
 
@@ -83,7 +95,11 @@ Purpose: Mine job execution data for patterns and failure modes.
 
 Example todos:
 - "Query orchestrator API for recent failed jobs — categorize failure reasons"
+{% if has_tool("kb_search") -%}
 - "Search knowledge base (kb_search) for patterns across recent jobs — look for common decisions and learnings"
+{% else -%}
+- "Review notes/ and archive/ for patterns across recent phases — look for common decisions and learnings"
+{% endif -%}
 - "Use SQL tools to query citation success/failure rates across jobs"
 - "Analyze token usage patterns — which tool categories consume the most context?"
 - "Write idea artifacts for operational improvements based on data patterns"
@@ -107,8 +123,16 @@ Example todos:
 - "Review notes/ for findings not yet written as idea artifacts — write remaining ideas"
 - "Cross-reference ideas in output/ideas/ against task description — identify coverage gaps"
 - "Check for related ideas that could be combined into a single stronger proposal"
+{% if has_tool("kb_write") -%}
 - "Record final coverage assessment using kb_write(type='state', tag='coverage')"
+{% else -%}
+- "Record final coverage assessment to notes/coverage.md"
+{% endif -%}
+{% if has_tool("kb_write") -%}
 - "Self-assess: list aspects of the task not yet explored, record as open questions using kb_write(type='question')"
+{% else -%}
+- "Self-assess: list aspects of the task not yet explored, record as open questions to notes/open_questions.md"
+{% endif -%}
 
 ---
 

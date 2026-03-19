@@ -8101,6 +8101,10 @@ async def send_builder_message(
         summary=session.get("summary"),
     )
 
+    # Extract session user_id once for tool dispatch (default project fallback)
+    _session_user_id = session.get("user_id")
+    _session_user_id = str(_session_user_id) if _session_user_id else None
+
     async def event_stream():
         """Generate SSE events from LLM streaming response with agentic tool loop.
 
@@ -8194,7 +8198,11 @@ async def send_builder_message(
                     tool_results = []
                     for tc in turn_tool_calls:
                         if tc["name"] in SERVER_SIDE_TOOLS:
-                            result, full_content = await _execute_server_tool(tc["name"], tc["args"])
+                            result, full_content = await _execute_server_tool(
+                                tc["name"], tc["args"],
+                                user_id=_session_user_id,
+                                active_project_id=body.active_project_id,
+                            )
                             evt_data: dict[str, Any] = {"tool": tc["name"], "summary": result[:200]}
                             if full_content is not None:
                                 evt_data["content"] = full_content
@@ -8235,7 +8243,11 @@ async def send_builder_message(
                     # Execute server-side tools and append tool results
                     for tc in turn_tool_calls:
                         if tc["name"] in SERVER_SIDE_TOOLS:
-                            result, full_content = await _execute_server_tool(tc["name"], tc["args"])
+                            result, full_content = await _execute_server_tool(
+                                tc["name"], tc["args"],
+                                user_id=_session_user_id,
+                                active_project_id=body.active_project_id,
+                            )
                             evt_data_oai: dict[str, Any] = {"tool": tc["name"], "summary": result[:200]}
                             if full_content is not None:
                                 evt_data_oai["content"] = full_content
@@ -8293,10 +8305,19 @@ async def send_builder_message(
     )
 
 
-async def _execute_server_tool(tool_name: str, args: dict) -> tuple[str, str | None]:
+async def _execute_server_tool(
+    tool_name: str,
+    args: dict,
+    *,
+    user_id: str | None = None,
+    active_project_id: str | None = None,
+) -> tuple[str, str | None]:
     """Execute a server-side builder tool via the shared dispatch module."""
     return await _dispatch_server_tool(
-        tool_name, args, tavily_search_fn=tavily_search,
+        tool_name, args,
+        tavily_search_fn=tavily_search,
+        user_id=user_id,
+        active_project_id=active_project_id,
     )
 
 
