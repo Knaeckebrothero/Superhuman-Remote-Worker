@@ -8484,7 +8484,7 @@ async def _stream_openai_responses(
             if settings.get("top_p") is not None:
                 create_kwargs["top_p"] = settings["top_p"]
             if settings.get("max_tokens") is not None:
-                create_kwargs["max_tokens"] = settings["max_tokens"]
+                create_kwargs["max_output_tokens"] = settings["max_tokens"]
 
         stream = await client.responses.create(**create_kwargs)
 
