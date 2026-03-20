@@ -24,7 +24,12 @@ async def get_current_user(request: Request, db) -> dict:
     then looks up (or JIT-provisions) the local user row.
 
     Returns the full user record (id, display_name, avatar_color, email,
-    default_project_id, is_admin, keycloak_sub, created_at).
+    default_project_id, is_admin, is_approved, keycloak_sub, created_at).
+
+    The ``is_approved`` flag is derived from the Keycloak token's realm roles
+    (``user`` or ``admin``).  It is NOT stored in the database — it is
+    recomputed on every request so that granting/revoking the role in Keycloak
+    takes effect immediately.
 
     Raises:
         HTTPException 401 if not authenticated or token is invalid
@@ -49,6 +54,7 @@ async def get_current_user(request: Request, db) -> dict:
     )
     realm_roles = claims.get("realm_access", {}).get("roles", [])
     is_admin = "admin" in realm_roles
+    is_approved = "user" in realm_roles or is_admin
 
     user = await db.get_user_by_keycloak_sub(sub)
     if user:
@@ -70,6 +76,8 @@ async def get_current_user(request: Request, db) -> dict:
                 )
             user.update(needs_update)
             logger.info("Updated user %s from OIDC claims: %s", sub, list(needs_update.keys()))
+        # Attach transient approval flag (not stored in DB)
+        user["is_approved"] = is_approved
         return user
 
     # First login — create local user row
@@ -79,7 +87,25 @@ async def get_current_user(request: Request, db) -> dict:
         display_name=display_name,
         is_admin=is_admin,
     )
-    logger.info("JIT-provisioned user %s (sub=%s, admin=%s)", display_name, sub, is_admin)
+    logger.info("JIT-provisioned user %s (sub=%s, admin=%s, approved=%s)", display_name, sub, is_admin, is_approved)
+    # Attach transient approval flag (not stored in DB)
+    user["is_approved"] = is_approved
+    return user
+
+
+async def require_approved_user(request: Request, db) -> dict:
+    """Like get_current_user but raises 403 if the user lacks the 'user' role.
+
+    Use this for all endpoints that require an approved account.
+    /api/auth/me should use get_current_user directly so the cockpit can
+    display a "pending approval" message.
+    """
+    user = await get_current_user(request, db)
+    if not user.get("is_approved"):
+        raise HTTPException(
+            status_code=403,
+            detail="Account pending approval. An administrator must assign you the 'user' role.",
+        )
     return user
 
 

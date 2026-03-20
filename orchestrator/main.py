@@ -57,7 +57,7 @@ from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
-from security.auth import get_current_user, cleanup_expired_tokens  # noqa: E402
+from security.auth import get_current_user, require_approved_user, cleanup_expired_tokens  # noqa: E402
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -1376,6 +1376,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize Gitea workspace delivery (graceful if unavailable)
     await gitea_client.ensure_initialized()
+
+    # Configure Gitea OIDC auth source (graceful if unconfigured)
+    await gitea_client.ensure_oidc_configured()
 
     # Initialize Keycloak group sync (graceful if unavailable)
     await keycloak_groups.ensure_initialized()
@@ -2773,7 +2776,7 @@ async def list_notifications(
 ) -> dict[str, Any]:
     """List notifications for the current user."""
     try:
-        user = await get_current_user(request, postgres_db)
+        user = await require_approved_user(request, postgres_db)
         user_id = str(user["id"])
         notifications = await postgres_db.get_user_notifications(
             user_id, limit=limit, unread_only=unread_only,
@@ -2812,7 +2815,7 @@ async def mark_notification_read(
 ) -> dict[str, Any]:
     """Mark a notification as read."""
     try:
-        user = await get_current_user(request, postgres_db)
+        user = await require_approved_user(request, postgres_db)
         user_id = str(user["id"])
         updated = await postgres_db.mark_notification_read(notification_id, user_id)
         if not updated:
@@ -2835,7 +2838,7 @@ async def notification_sse_events(request: Request) -> StreamingResponse:
     from services.notification_feed import notification_feed
 
     try:
-        user = await get_current_user(request, postgres_db)
+        user = await require_approved_user(request, postgres_db)
         user_id = str(user["id"])
     except Exception:
         # Allow unauthenticated connections for development
@@ -4464,7 +4467,7 @@ async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, An
     time (if the user hadn't logged into Gitea yet via OIDC).
     """
     try:
-        user = await get_current_user(request, postgres_db)
+        user = await require_approved_user(request, postgres_db)
         job = await postgres_db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
@@ -6674,6 +6677,7 @@ def _user_dict(user: dict) -> dict:
         "email": user.get("email"),
         "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
         "is_admin": user.get("is_admin", False),
+        "is_approved": user.get("is_approved", False),
         "created_at": user["created_at"],
     }
 
@@ -6698,7 +6702,11 @@ async def _create_gitea_repo_for_project(user: dict, project: dict) -> None:
 
 @app.get("/api/auth/me")
 async def auth_me(request: Request) -> dict[str, Any]:
-    """Get current user from Bearer token (OIDC)."""
+    """Get current user from Bearer token (OIDC).
+
+    Always returns the user record (even if not yet approved) so the cockpit
+    can display a "pending approval" message instead of a blank screen.
+    """
     user = await get_current_user(request, postgres_db)
     return {"user": _user_dict(user)}
 
@@ -6713,7 +6721,7 @@ _MCP_INTERNAL_KEY = os.environ.get("MCP_INTERNAL_KEY", "")
 @app.post("/api/mcp-tokens")
 async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, Any]:
     """Generate a new MCP API token. Returns the plaintext token once."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
 
     # Validate scope
     scope = body.scope.strip()
@@ -6755,7 +6763,7 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
 @app.get("/api/mcp-tokens")
 async def list_mcp_tokens(request: Request) -> list[dict[str, Any]]:
     """List the current user's MCP tokens (no plaintext or hashes)."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     rows = await postgres_db.list_mcp_tokens(str(user["id"]))
     return [
         {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in r.items()}
@@ -6766,7 +6774,7 @@ async def list_mcp_tokens(request: Request) -> list[dict[str, Any]]:
 @app.delete("/api/mcp-tokens/{token_id}")
 async def revoke_mcp_token(request: Request, token_id: str) -> dict[str, str]:
     """Revoke an MCP token (soft delete)."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     revoked = await postgres_db.revoke_mcp_token(token_id, str(user["id"]))
     if not revoked:
         raise HTTPException(status_code=404, detail="Token not found or already revoked")
@@ -6805,7 +6813,7 @@ async def internal_mcp_token_verify(request: Request, body: McpTokenVerifyReques
 @app.get("/api/settings/api-keys")
 async def list_user_api_keys(request: Request) -> list[dict[str, Any]]:
     """List the current user's API keys (prefix only, no full keys)."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     rows = await postgres_db.list_user_api_keys(str(user["id"]))
     return [
         {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in r.items()}
@@ -6816,7 +6824,7 @@ async def list_user_api_keys(request: Request) -> list[dict[str, Any]]:
 @app.put("/api/settings/api-keys/{provider}")
 async def set_user_api_key(request: Request, provider: str, body: ApiKeySet) -> dict[str, Any]:
     """Set (create or replace) an API key for a provider."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     if provider not in VALID_API_KEY_PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}")
 
@@ -6834,7 +6842,7 @@ async def set_user_api_key(request: Request, provider: str, body: ApiKeySet) -> 
 @app.delete("/api/settings/api-keys/{provider}")
 async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]:
     """Delete the current user's API key for a provider."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     deleted = await postgres_db.delete_user_api_key(str(user["id"]), provider)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No API key for provider '{provider}'")
@@ -6844,14 +6852,14 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
 @app.get("/api/settings/preferences")
 async def get_user_preferences(request: Request) -> dict[str, Any]:
     """Get the current user's preference settings."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     return await postgres_db.get_user_settings(str(user["id"]))
 
 
 @app.patch("/api/settings/preferences")
 async def update_user_preferences(request: Request, body: UserSettingsUpdate) -> dict[str, str]:
     """Update the current user's preference settings (patch-merge)."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     settings = {k: v for k, v in body.model_dump().items() if v is not None or k in body.model_fields_set}
     if not settings:
         raise HTTPException(status_code=400, detail="No settings provided")
@@ -6867,7 +6875,7 @@ async def update_user_preferences(request: Request, body: UserSettingsUpdate) ->
 @app.get("/api/projects/{project_id}/api-keys")
 async def list_project_api_keys(request: Request, project_id: str) -> list[dict[str, Any]]:
     """List a project's API keys (prefix only). Requires project membership."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     members = await postgres_db.get_project_members(project_id)
     if not any(str(m["user_id"]) == str(user["id"]) for m in members):
         raise HTTPException(status_code=403, detail="Not a member of this project")
@@ -6884,7 +6892,7 @@ async def set_project_api_key(
     request: Request, project_id: str, provider: str, body: ApiKeySet
 ) -> dict[str, Any]:
     """Set (create or replace) a project API key. Requires owner or editor role."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     if provider not in VALID_API_KEY_PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}")
 
@@ -6909,7 +6917,7 @@ async def delete_project_api_key(
     request: Request, project_id: str, provider: str
 ) -> dict[str, str]:
     """Delete a project's API key for a provider. Requires owner or editor role."""
-    user = await get_current_user(request, postgres_db)
+    user = await require_approved_user(request, postgres_db)
     members = await postgres_db.get_project_members(project_id)
     member = next((m for m in members if str(m["user_id"]) == str(user["id"])), None)
     if not member or member["role"] not in ("owner", "editor"):
@@ -6929,7 +6937,7 @@ async def delete_project_api_key(
 @app.get("/api/users")
 async def list_users(request: Request) -> list[dict[str, Any]]:
     """List all users (requires authentication)."""
-    await get_current_user(request, postgres_db)
+    await require_approved_user(request, postgres_db)
     try:
         return await postgres_db.list_users()
     except Exception as e:
@@ -6939,7 +6947,7 @@ async def list_users(request: Request) -> list[dict[str, Any]]:
 @app.get("/api/users/{user_id}")
 async def get_user(user_id: str, request: Request) -> dict[str, Any]:
     """Get a single user by ID (requires authentication)."""
-    await get_current_user(request, postgres_db)
+    await require_approved_user(request, postgres_db)
     user = await postgres_db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -6949,7 +6957,7 @@ async def get_user(user_id: str, request: Request) -> dict[str, Any]:
 @app.post("/api/users")
 async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
     """Create a new user with a default project (requires authentication)."""
-    await get_current_user(request, postgres_db)
+    await require_approved_user(request, postgres_db)
     try:
         user, project = await postgres_db.create_user_with_default_project(
             display_name=body.display_name,
@@ -6965,7 +6973,7 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
 @app.put("/api/users/{user_id}")
 async def update_user(user_id: str, body: UserUpdate, request: Request) -> dict[str, str]:
     """Update a user (requires authentication)."""
-    await get_current_user(request, postgres_db)
+    await require_approved_user(request, postgres_db)
     success = await postgres_db.update_user(
         user_id=user_id,
         display_name=body.display_name,
@@ -6980,7 +6988,7 @@ async def update_user(user_id: str, body: UserUpdate, request: Request) -> dict[
 @app.delete("/api/users/{user_id}")
 async def delete_user(user_id: str, request: Request) -> dict[str, str]:
     """Delete a user (requires authentication)."""
-    await get_current_user(request, postgres_db)
+    await require_approved_user(request, postgres_db)
     success = await postgres_db.delete_user(user_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
