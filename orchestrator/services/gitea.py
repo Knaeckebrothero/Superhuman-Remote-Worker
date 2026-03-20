@@ -150,6 +150,111 @@ class GiteaClient:
             logger.warning(f"Gitea auth verification failed: {e}")
             return False
 
+    async def ensure_oidc_configured(self) -> bool:
+        """Register Keycloak as OIDC auth source in Gitea if not already present.
+
+        Reads configuration from environment variables:
+            GITEA_OIDC_CLIENT_SECRET: OIDC client secret (required — skips if absent)
+            KEYCLOAK_URL: Internal Keycloak URL for server-to-server calls
+            KEYCLOAK_ISSUER_URL: Public/browser-facing Keycloak URL
+            KEYCLOAK_REALM: Keycloak realm name (default: srw)
+
+        The auth URL uses the public URL (browser navigates to it).
+        Token/profile/discovery URLs use the internal URL (server-to-server).
+
+        Returns:
+            True if OIDC is configured (or was already), False if skipped/failed.
+        """
+        if not self._initialized:
+            return False
+
+        client_secret = os.environ.get("GITEA_OIDC_CLIENT_SECRET", "")
+        if not client_secret:
+            logger.info("GITEA_OIDC_CLIENT_SECRET not set, skipping Gitea OIDC setup")
+            return False
+
+        keycloak_internal = os.environ.get("KEYCLOAK_URL", "").rstrip("/")
+        keycloak_public = os.environ.get("KEYCLOAK_ISSUER_URL", "").rstrip("/")
+        realm = os.environ.get("KEYCLOAK_REALM", "srw")
+
+        if not keycloak_internal or not keycloak_public:
+            logger.warning("KEYCLOAK_URL or KEYCLOAK_ISSUER_URL not set, skipping Gitea OIDC setup")
+            return False
+
+        provider_name = "Keycloak"
+        client = self._get_client()
+
+        # Check if already configured
+        try:
+            resp = await client.get(f"{self._url}/api/v1/admin/auths")
+            if resp.status_code == 200:
+                sources = resp.json()
+                for src in sources:
+                    if src.get("name") == provider_name:
+                        logger.info(f"Gitea OIDC auth source '{provider_name}' already configured")
+                        return True
+            else:
+                logger.warning(f"Failed to list Gitea auth sources (status {resp.status_code})")
+                return False
+        except (httpx.HTTPError, Exception) as e:
+            logger.warning(f"Failed to check Gitea auth sources: {e}")
+            return False
+
+        # Build OIDC URLs (split: public for browser, internal for server-to-server)
+        base_internal = f"{keycloak_internal}/realms/{realm}/protocol/openid-connect"
+        base_public = f"{keycloak_public}/realms/{realm}/protocol/openid-connect"
+
+        payload = {
+            "type": 6,
+            "name": provider_name,
+            "is_active": True,
+            "oauth2_config": {
+                "provider": "openidConnect",
+                "client_id": "gitea",
+                "client_secret": client_secret,
+                "open_id_connect_auto_discovery_url": (
+                    f"{keycloak_internal}/realms/{realm}/.well-known/openid-configuration"
+                ),
+                "custom_url_mapping": {
+                    "auth_url": f"{base_public}/auth",
+                    "token_url": f"{base_internal}/token",
+                    "profile_url": f"{base_internal}/userinfo",
+                },
+                "group_claim_name": "groups",
+                "admin_group": "admin",
+                "skip_local_2fa": True,
+            },
+        }
+
+        try:
+            resp = await client.post(
+                f"{self._url}/api/v1/admin/auths",
+                json=payload,
+            )
+            if resp.status_code in (200, 201):
+                logger.info(f"Gitea OIDC auth source '{provider_name}' created")
+                return True
+
+            # type=6 might be wrong for this Gitea version — retry with type=5
+            if resp.status_code == 422:
+                payload["type"] = 5
+                resp = await client.post(
+                    f"{self._url}/api/v1/admin/auths",
+                    json=payload,
+                )
+                if resp.status_code in (200, 201):
+                    logger.info(f"Gitea OIDC auth source '{provider_name}' created (type=5)")
+                    return True
+
+            logger.warning(
+                f"Failed to create Gitea OIDC auth source "
+                f"(status {resp.status_code}): {resp.text[:300]}"
+            )
+            return False
+        except (httpx.HTTPError, Exception) as e:
+            logger.warning(f"Failed to create Gitea OIDC auth source: {e}")
+            return False
+
     async def create_repo(self, name: str) -> Optional[str]:
         """Create a repository and return the authenticated clone URL.
 

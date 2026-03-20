@@ -3,6 +3,11 @@
 # Register Keycloak as OAuth2 provider in Gitea
 # =============================================================================
 #
+# DEPRECATED: OIDC registration is now automated.
+#   The orchestrator configures Gitea OIDC via REST API on startup when
+#   GITEA_OIDC_CLIENT_SECRET is set. This script is retained for manual
+#   troubleshooting or environments where the orchestrator is not running.
+#
 # Run this ONCE after both Keycloak and Gitea containers are up.
 # Requires: podman (or docker) with the srw-gitea container running.
 #

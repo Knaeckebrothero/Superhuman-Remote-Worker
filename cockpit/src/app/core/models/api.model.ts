@@ -137,6 +137,7 @@ export interface User {
   email?: string | null;
   default_project_id?: string | null;
   is_admin?: boolean;
+  is_approved?: boolean;
   created_at: string;
 }
 
