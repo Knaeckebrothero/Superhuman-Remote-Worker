@@ -19,11 +19,14 @@ class OIDCValidator:
     def __init__(self) -> None:
         self.keycloak_url = os.getenv("KEYCLOAK_URL", "http://localhost:8180")
         self.realm = os.getenv("KEYCLOAK_REALM", "srw")
+        # Public-facing URL for token issuer validation — KC_HOSTNAME sets this
+        # in tokens. Falls back to KEYCLOAK_URL for local dev where internal = external.
+        self._issuer_url = os.getenv("KEYCLOAK_ISSUER_URL", self.keycloak_url)
         self._jwks_client: jwt.PyJWKClient | None = None
 
     @property
     def issuer(self) -> str:
-        return f"{self.keycloak_url}/realms/{self.realm}"
+        return f"{self._issuer_url}/realms/{self.realm}"
 
     @property
     def is_configured(self) -> bool:
@@ -32,7 +35,8 @@ class OIDCValidator:
     @property
     def jwks_client(self) -> jwt.PyJWKClient:
         if self._jwks_client is None:
-            jwks_uri = f"{self.issuer}/protocol/openid-connect/certs"
+            # Fetch JWKS via internal URL (backchannel, fast)
+            jwks_uri = f"{self.keycloak_url}/realms/{self.realm}/protocol/openid-connect/certs"
             self._jwks_client = jwt.PyJWKClient(jwks_uri, cache_keys=True)
         return self._jwks_client
 
