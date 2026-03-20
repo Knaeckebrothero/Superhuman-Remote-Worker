@@ -1366,6 +1366,11 @@ async def lifespan(app: FastAPI):
     await vector_db.connect()
     await mongodb.connect()
 
+    # Ensure database schemas exist (idempotent — safe on every restart)
+    await postgres_db.ensure_schema()
+    await vector_db.ensure_schema()
+    logger.info("Database schemas verified")
+
     # Share MongoDB instance with graph_routes
     set_mongodb(mongodb)
 
