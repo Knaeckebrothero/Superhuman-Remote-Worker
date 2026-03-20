@@ -39,7 +39,19 @@ import { ConfigEditorComponent } from './shared/components/config-editor/config-
         <app-sidebar [class.collapsed]="sidebar.collapsed()" />
       }
       <div class="content-area">
-        <router-outlet />
+        @if (pendingApproval()) {
+          <div class="pending-approval">
+            <div class="pending-approval-card">
+              <span class="pending-icon">hourglass_empty</span>
+              <h2>Account Pending Approval</h2>
+              <p>Your account has been created but an administrator needs to approve it before you can access the system.</p>
+              <p class="pending-detail">You'll get full access once an admin assigns you the <strong>user</strong> role in Keycloak.</p>
+              <button class="pending-logout" (click)="userService.logout()">Logout</button>
+            </div>
+          </div>
+        } @else {
+          <router-outlet />
+        }
       </div>
     </div>
     <app-toast-container />
@@ -60,17 +72,83 @@ import { ConfigEditorComponent } from './shared/components/config-editor/config-
         position: relative;
       }
 
+      .pending-approval {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        padding: 2rem;
+        background: var(--bg-primary, #1e1e2e);
+      }
+
+      .pending-approval-card {
+        text-align: center;
+        max-width: 480px;
+        padding: 3rem 2.5rem;
+        border-radius: 16px;
+        background: var(--bg-secondary, #313244);
+        border: 1px solid var(--border-color, #45475a);
+      }
+
+      .pending-icon {
+        font-family: 'Material Symbols Rounded';
+        font-size: 3rem;
+        color: var(--text-tertiary, #a6adc8);
+        display: block;
+        margin-bottom: 1rem;
+      }
+
+      .pending-approval-card h2 {
+        margin: 0 0 1rem;
+        color: var(--text-primary, #cdd6f4);
+        font-size: 1.5rem;
+        font-weight: 600;
+      }
+
+      .pending-approval-card p {
+        margin: 0 0 0.75rem;
+        color: var(--text-secondary, #bac2de);
+        line-height: 1.6;
+      }
+
+      .pending-detail {
+        font-size: 0.875rem;
+        color: var(--text-tertiary, #a6adc8);
+      }
+
+      .pending-logout {
+        margin-top: 1.5rem;
+        padding: 0.625rem 2rem;
+        border: 1px solid var(--border-color, #45475a);
+        border-radius: 8px;
+        background: transparent;
+        color: var(--text-secondary, #bac2de);
+        font-size: 0.875rem;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+
+      .pending-logout:hover {
+        background: var(--bg-tertiary, #45475a);
+        color: var(--text-primary, #cdd6f4);
+      }
+
     `,
   ],
 })
 export class App implements OnInit {
   private readonly viewport = inject(ViewportService);
-  private readonly userService = inject(UserService);
+  readonly userService = inject(UserService);
   private readonly registry = inject(ComponentRegistryService);
   readonly sidebar = inject(SidebarService);
 
   readonly showSidebar = computed(
-    () => !this.viewport.isMobile() && this.userService.isAuthenticated(),
+    () => !this.viewport.isMobile() && this.userService.isAuthenticated() && this.userService.isApproved(),
+  );
+
+  /** Show the pending-approval screen when authenticated but not yet approved. */
+  readonly pendingApproval = computed(
+    () => this.userService.isAuthenticated() && !this.userService.isApproved(),
   );
 
   ngOnInit(): void {
