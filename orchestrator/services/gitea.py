@@ -68,9 +68,10 @@ class GiteaClient:
 
         client = self._get_client()
 
-        # Check if Gitea is reachable
+        # Check if Gitea is reachable (unauthenticated — avoids 401 when user doesn't exist yet)
         try:
-            resp = await client.get(f"{self._url}/api/v1/version")
+            async with httpx.AsyncClient(timeout=30.0) as anon:
+                resp = await anon.get(f"{self._url}/api/v1/version")
             if resp.status_code != 200:
                 logger.warning(f"Gitea not reachable (status {resp.status_code})")
                 return False
@@ -184,9 +185,17 @@ class GiteaClient:
         provider_name = "Keycloak"
         client = self._get_client()
 
-        # Check if already configured
+        # Check if already configured via admin auth API (Gitea 1.23+)
+        # Older versions (1.22) don't expose this endpoint — auth sources are
+        # managed via CLI initContainer in the K8s deployment instead.
         try:
             resp = await client.get(f"{self._url}/api/v1/admin/auths")
+            if resp.status_code == 404:
+                logger.info(
+                    "Gitea admin auth API not available (version <1.23), "
+                    "OIDC setup handled by deployment initContainer"
+                )
+                return False
             if resp.status_code == 200:
                 sources = resp.json()
                 for src in sources:
@@ -232,7 +241,7 @@ class GiteaClient:
                 json=payload,
             )
             if resp.status_code in (200, 201):
-                logger.info(f"Gitea OIDC auth source '{provider_name}' created")
+                logger.info(f"Gitea OIDC auth source '{provider_name}' created via API")
                 return True
 
             # type=6 might be wrong for this Gitea version — retry with type=5
@@ -243,7 +252,7 @@ class GiteaClient:
                     json=payload,
                 )
                 if resp.status_code in (200, 201):
-                    logger.info(f"Gitea OIDC auth source '{provider_name}' created (type=5)")
+                    logger.info(f"Gitea OIDC auth source '{provider_name}' created via API (type=5)")
                     return True
 
             logger.warning(
