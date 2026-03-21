@@ -170,15 +170,10 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                     "to finish the job."
                 )
 
-            # Check if there are staged todos (shouldn't call job_complete if planning more work)
+            # Auto-clear stale staged todos — the agent explicitly decided the job is done.
             if context.has_todo() and context.todo_manager.has_staged_todos():
-                logger.warning("job_complete rejected: staged todos exist")
-                return (
-                    "ERROR: Cannot mark job as complete - you have staged todos for the next phase.\n\n"
-                    "Either:\n"
-                    "1. Clear the staged todos and call job_complete again, or\n"
-                    "2. Continue with next_phase_todos to execute the staged work"
-                )
+                context.todo_manager.clear_staged_todos()
+                logger.info("job_complete: cleared stale staged todos")
 
             # Validate confidence
             confidence = max(0.0, min(1.0, confidence))
