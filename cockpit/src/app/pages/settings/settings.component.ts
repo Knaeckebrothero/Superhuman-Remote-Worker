@@ -5,7 +5,7 @@ import { McpTokenService } from '../../core/services/mcp-token.service';
 import { UserService } from '../../core/services/user.service';
 import { ApiService } from '../../core/services/api.service';
 import { SettingsService } from '../../core/services/settings.service';
-import { McpTokenCreateResponse, Project, ApiKeyProvider, CommunicationSettings } from '../../core/models/api.model';
+import { McpTokenCreateResponse, Project, ApiKeyProvider, CommunicationSettings, CodexStatus } from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -334,6 +334,77 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             <pre class="code-block">{{mcpJsonSnippet()}}</pre>
           </div>
         </section>
+
+        <!-- Codex Proxy Section (Admin Only) -->
+        @if (userService.currentUser()?.is_admin) {
+          <section class="settings-section" style="margin-top: 24px;">
+            <h2 class="section-title">Codex Proxy</h2>
+            <p class="section-desc">
+              Manage the Codex OAuth proxy for ChatGPT subscription-backed models
+              (<code>codex/*</code>).
+            </p>
+
+            <!-- Status -->
+            <div class="codex-status-card">
+              @if (codexLoading()) {
+                <span class="codex-status-text">Checking proxy...</span>
+              } @else {
+                <span class="codex-status-dot" [class.connected]="codexStatus().connected"></span>
+                <span class="codex-status-text">
+                  {{ codexStatus().connected ? 'Connected' : 'Not connected' }}
+                  @if (codexStatus().model_count > 0) {
+                    &mdash; {{ codexStatus().model_count }} model(s) available
+                  }
+                </span>
+                <button class="refresh-btn" (click)="loadCodexStatus()" title="Refresh status">&#x21bb;</button>
+              }
+            </div>
+
+            <!-- Accounts -->
+            @if (codexStatus().accounts.length > 0) {
+              <div class="codex-accounts">
+                @for (acct of codexStatus().accounts; track acct.name) {
+                  <div class="codex-account-row">
+                    <span class="mono">{{ acct.name }}</span>
+                    <span class="codex-account-status">{{ acct.status }}</span>
+                    <button
+                      class="revoke-btn"
+                      (click)="disconnectCodexAccount(acct.name)"
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                }
+              </div>
+            }
+
+            <!-- Models -->
+            @if (codexModels().length > 0) {
+              <div class="codex-models">
+                <h3 class="form-title">Available Models</h3>
+                <div class="codex-model-chips">
+                  @for (m of codexModels(); track m) {
+                    <span class="codex-model-chip">{{ m }}</span>
+                  }
+                </div>
+              </div>
+            }
+
+            <!-- Connect -->
+            <div class="create-form">
+              <button
+                class="create-btn"
+                (click)="connectCodexAccount()"
+                [disabled]="codexConnecting()"
+              >
+                {{ codexConnecting() ? 'Waiting for OAuth...' : 'Connect ChatGPT Account' }}
+              </button>
+              @if (codexConnecting()) {
+                <span class="save-feedback">Complete sign-in in the opened tab</span>
+              }
+            </div>
+          </section>
+        }
       </div>
     </div>
   `,
@@ -625,6 +696,93 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
       overflow-x: auto;
       white-space: pre;
     }
+
+    /* Codex Proxy */
+    .codex-status-card {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 16px;
+      background: var(--surface-0, #313244);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+
+    .codex-status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--red, #f38ba8);
+      flex-shrink: 0;
+    }
+
+    .codex-status-dot.connected {
+      background: var(--green, #a6e3a1);
+    }
+
+    .codex-status-text {
+      font-size: 13px;
+      color: var(--text-secondary, #a6adc8);
+      flex: 1;
+    }
+
+    .refresh-btn {
+      background: transparent;
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 6px;
+      color: var(--text-muted, #6c7086);
+      font-size: 16px;
+      padding: 4px 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .refresh-btn:hover {
+      border-color: var(--accent-color, #cba6f7);
+      color: var(--accent-color, #cba6f7);
+    }
+
+    .codex-accounts {
+      margin-bottom: 16px;
+    }
+
+    .codex-account-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 14px;
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 8px;
+      margin-bottom: 6px;
+    }
+
+    .codex-account-row .mono { flex: 1; }
+
+    .codex-account-status {
+      font-size: 12px;
+      color: var(--text-muted, #6c7086);
+    }
+
+    .codex-models {
+      margin-bottom: 16px;
+    }
+
+    .codex-model-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .codex-model-chip {
+      padding: 4px 10px;
+      background: var(--surface-0, #313244);
+      border: 1px solid var(--border-color, #313244);
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      font-size: 12px;
+      color: var(--text-secondary, #a6adc8);
+    }
   `],
 })
 export class SettingsComponent implements OnInit {
@@ -673,6 +831,13 @@ export class SettingsComponent implements OnInit {
   readonly savingComm = signal(false);
   readonly commSaved = signal(false);
 
+  // Codex proxy state (admin-only)
+  readonly codexStatus = signal<CodexStatus>({ connected: false, accounts: [], model_count: 0 });
+  readonly codexModels = signal<string[]>([]);
+  readonly codexLoading = signal(false);
+  readonly codexConnecting = signal(false);
+  private codexPollTimer: ReturnType<typeof setInterval> | null = null;
+
   constructor() {
     // Reactively sync preference form fields when the preferences signal updates.
     effect(() => {
@@ -712,6 +877,10 @@ export class SettingsComponent implements OnInit {
       .getProjects(this.userService.currentUserId() ?? undefined)
       .subscribe((p) => this.projects.set(p));
 
+    // Load Codex proxy status for admins
+    if (this.userService.currentUser()?.is_admin) {
+      this.loadCodexStatus();
+    }
   }
 
   providerLabel(provider: string): string {
@@ -870,5 +1039,50 @@ export class SettingsComponent implements OnInit {
       this.copied.set(true);
       setTimeout(() => this.copied.set(false), 2000);
     });
+  }
+
+  // ── Codex Proxy Management ──────────────────────────────────
+
+  loadCodexStatus(): void {
+    this.codexLoading.set(true);
+    this.settingsService.getCodexStatus().subscribe((status) => {
+      this.codexStatus.set(status);
+      this.codexLoading.set(false);
+    });
+    this.settingsService.getCodexModels().subscribe((res) => {
+      this.codexModels.set(res.models);
+    });
+  }
+
+  connectCodexAccount(): void {
+    this.codexConnecting.set(true);
+    this.settingsService.startCodexLogin().subscribe({
+      next: (res) => {
+        window.open(res.auth_url, '_blank');
+        this.codexPollTimer = setInterval(() => {
+          this.settingsService.pollCodexLogin(res.state).subscribe((poll) => {
+            if (poll.status !== 'wait') {
+              this.stopCodexPoll();
+              this.codexConnecting.set(false);
+              this.loadCodexStatus();
+            }
+          });
+        }, 2000);
+      },
+      error: () => this.codexConnecting.set(false),
+    });
+  }
+
+  disconnectCodexAccount(name: string): void {
+    this.settingsService.deleteCodexCredential(name).subscribe(() => {
+      this.loadCodexStatus();
+    });
+  }
+
+  private stopCodexPoll(): void {
+    if (this.codexPollTimer) {
+      clearInterval(this.codexPollTimer);
+      this.codexPollTimer = null;
+    }
   }
 }

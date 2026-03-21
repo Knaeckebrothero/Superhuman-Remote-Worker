@@ -17,6 +17,9 @@ tags:
 
 llm: {}
 
+scholar:
+  enabled: false
+
 workspace:
   structure:
     - archive/

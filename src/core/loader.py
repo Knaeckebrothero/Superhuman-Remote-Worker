@@ -759,6 +759,8 @@ class LimitsConfig:
     summarization_safe_limit: int = 90000
     summarization_chunk_size: int = 80000
     response_validation: ResponseValidationConfig = field(default_factory=ResponseValidationConfig)
+    progress_stall_threshold: int = 15     # tool calls without progress before stuck detection
+    max_tool_calls_per_phase: int = 100    # absolute max tool calls per phase before freeze
 
 
 @dataclass
@@ -1135,6 +1137,8 @@ def load_agent_config(
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
         response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
+        progress_stall_threshold=limits_data.get("progress_stall_threshold", 15),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 100),
     )
 
     context_data = data.get("context_management", {})
@@ -1285,6 +1289,8 @@ def load_agent_config_from_dict(
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
         response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
+        progress_stall_threshold=limits_data.get("progress_stall_threshold", 15),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 100),
     )
 
     context_data = data.get("context_management", {})
@@ -1435,6 +1441,8 @@ def _detect_provider(model: str, explicit_provider: Optional[str] = None) -> str
         return "openrouter"
     if model_lower.startswith("groq/"):
         return "groq"
+    if model_lower.startswith("codex/"):
+        return "codex"
     if model_lower.startswith("claude"):
         return "anthropic"
     if model_lower.startswith("gemini"):
@@ -1458,7 +1466,7 @@ def detect_model_family(model: str) -> str:
     name = model.lower()
 
     # Strip provider prefixes to get the actual model name
-    for prefix in ("openrouter/", "groq/"):
+    for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):
             name = name[len(prefix):]
             # Strip second-level provider prefix (e.g., "anthropic/" in "openrouter/anthropic/claude-opus-4")
@@ -1603,6 +1611,8 @@ def create_llm(
         return _create_groq_llm(config, limits)
     elif provider == "openrouter":
         return _create_openrouter_llm(config, limits)
+    elif provider == "codex":
+        return _create_codex_llm(config, limits)
     else:
         return _create_openai_llm(config, limits)
 
@@ -1995,6 +2005,106 @@ def _create_openrouter_llm(
     return llm
 
 
+def _create_codex_llm(
+    config: LLMConfig,
+    limits: Optional[LimitsConfig] = None,
+) -> BaseChatModel:
+    """Create Codex LLM (ChatGPT Plus/Pro subscription via CLIProxyAPI OAuth proxy).
+
+    Routes through CLIProxyAPI at localhost:8317/v1 (configurable via CODEX_BASE_URL
+    env var or config.base_url). The proxy handles OAuth authentication for ChatGPT
+    Plus/Pro subscriptions, providing API access through the subscription.
+
+    Model names are specified as codex/<model>, e.g.:
+    - codex/gpt-5.4-pro
+    - codex/o3-pro
+    - codex/gpt-4o
+
+    The codex/ prefix is stripped before sending to the proxy API.
+
+    Configuration resolution (project → user → fallback):
+    - Base URL: config.base_url → CODEX_BASE_URL env → http://localhost:8317/v1
+    - API key:  config.api_key  → CODEX_API_KEY env  → "not-needed"
+
+    Multiple API keys can be provided as a comma-separated string in
+    CODEX_API_KEY for automatic fallback rotation (though typically
+    not needed as CLIProxyAPI handles auth).
+    """
+    from src.llm.key_ring import parse_key_string, get_or_create_key_ring
+
+    # Parse API keys — CLIProxyAPI handles OAuth, so "not-needed" is the default
+    raw_key = config.api_key or os.getenv("CODEX_API_KEY", "not-needed")
+    keys = parse_key_string(raw_key) or ["not-needed"]
+    cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
+    key_ring = get_or_create_key_ring(keys, provider="codex", cooldown_seconds=cooldown)
+
+    # SDK gets the first key; KeyRing overrides the header in send()
+    api_key = keys[0]
+
+    # Strip codex/ prefix — the proxy expects bare model names
+    model = config.model
+    if model.lower().startswith("codex/"):
+        model = model[len("codex/"):]
+
+    # Base URL: explicit config → env var → default localhost proxy
+    base_url = config.base_url or os.getenv("CODEX_BASE_URL", "http://localhost:8317/v1")
+
+    # Build model kwargs
+    model_kwargs = {}
+    if config.top_k is not None:
+        model_kwargs["top_k"] = config.top_k
+
+    # Build kwargs for ReasoningChatOpenAI
+    llm_kwargs = {
+        "model": model,
+        "temperature": config.temperature,
+        "api_key": api_key,
+        "base_url": base_url,
+        "max_retries": config.max_retries,
+    }
+    if config.top_p is not None:
+        llm_kwargs["top_p"] = config.top_p
+
+    # Add reasoning parameters — proxy forwards to real OpenAI which supports them.
+    # Use Chat Completions API path (reasoning_effort in model_kwargs) since the
+    # proxy is an intermediary.
+    reasoning_mode = "none"
+    if config.reasoning_level and config.reasoning_level != "none":
+        level = _clamp_reasoning_level(config.reasoning_level, _OPENAI_REASONING_LEVELS)
+        model_kwargs["reasoning_effort"] = level
+        reasoning_mode = f"chat_completions(effort={level})"
+
+    if config.timeout is not None:
+        llm_kwargs["timeout"] = config.timeout
+
+    if model_kwargs:
+        llm_kwargs["model_kwargs"] = model_kwargs
+
+    if config.max_output_tokens is not None:
+        llm_kwargs["max_tokens"] = config.max_output_tokens
+
+    # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
+    # Prefer per-model config value, fall back to global limits
+    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
+    if max_context_tokens:
+        llm_kwargs["max_context_tokens"] = max_context_tokens
+
+    # Pass KeyRing for automatic key rotation
+    llm_kwargs["key_ring"] = key_ring
+
+    llm = ReasoningChatOpenAI(**llm_kwargs)
+
+    key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
+    logger.info(
+        f"Created Codex LLM: model={model}, temp={config.temperature}, "
+        f"base_url={base_url}, timeout={config.timeout}s, "
+        f"max_retries={config.max_retries}, max_context_tokens={max_context_tokens or 'default'}, "
+        f"reasoning={reasoning_mode}, keys={key_info}"
+    )
+
+    return llm
+
+
 # =============================================================================
 # Phase-Aware System Prompts
 # =============================================================================
@@ -2040,6 +2150,7 @@ def get_phase_system_prompt(
     is_strategic: bool,
     phase_number: int = 0,
     model: str = "",
+    tool_names: Optional[List[str]] = None,
 ) -> str:
     """Get the complete system prompt for the current phase.
 
@@ -2050,6 +2161,7 @@ def get_phase_system_prompt(
     3. Render phase component's {phase_number} placeholder
     4. Inject rendered component into base template's {prompt_content}
     5. Render remaining placeholders ({agent_display_name}, etc.)
+    6. Render Jinja2 conditionals ({% if has_tool("kb_write") %} etc.)
 
     Note: workspace.md and todos are injected as transient messages
     in graph.py, not included in the system prompt.
@@ -2059,6 +2171,7 @@ def get_phase_system_prompt(
         is_strategic: True for strategic phase, False for tactical
         phase_number: Current phase number
         model: Model name for prompt matrix resolution.
+        tool_names: List of loaded tool names for Jinja2 conditionals.
 
     Returns:
         Fully rendered system prompt string
@@ -2070,6 +2183,7 @@ def get_phase_system_prompt(
             is_strategic=True,
             phase_number=1,
             model="claude-opus-4-6",
+            tool_names=["kb_write", "todo_complete"],
         )
         ```
     """
@@ -2097,7 +2211,13 @@ def get_phase_system_prompt(
     # 4. Render phase component's {phase_number} placeholder
     rendered_component = phase_component.format(phase_number=phase_number)
 
-    # 5. Inject all components and render remaining placeholders
+    # 5. Render Jinja2 conditionals FIRST (e.g., {% if has_tool("kb_write") %})
+    # Must happen before .format() because Python's str.format() chokes on {%..%} blocks.
+    # Jinja2 leaves single-brace {agent_display_name} placeholders untouched.
+    if tool_names is not None:
+        base_template = render_instruction_content(base_template, tool_names)
+
+    # 6. Inject all components and render remaining placeholders
     rendered = base_template.format(
         agent_display_name=config.display_name,
         expert_identity=expert_identity,

@@ -25,6 +25,10 @@
 # Start only databases + MCP:
 #   podman-compose -f docker-compose.dev.yaml up -d postgres mongodb mcp
 #
+# Start Codex OAuth proxy (for codex/* models via ChatGPT subscription):
+#   podman-compose -f docker-compose.dev.yaml up -d codex-proxy
+#   # First run: authenticate via SSH tunnel + browser (see docs)
+#
 # Run application components locally:
 #   cd orchestrator && uvicorn main:app --reload --port 8085
 #   python agent.py --config defaults --port 8001
@@ -383,6 +387,25 @@ services:
   #   Rootless Podman: /run/user/<UID>/podman/podman.sock  (default below)
   #   Rootful Podman:  /run/podman/podman.sock
   #   Docker:          /var/run/docker.sock
+  codex-proxy:
+    image: docker.io/eceasy/cli-proxy-api:latest
+    container_name: srw-codex-proxy
+    environment:
+      MANAGEMENT_PASSWORD: ${CODEX_MANAGEMENT_KEY:-}
+    ports:
+      - "${CODEX_PROXY_PORT:-8317}:8317"
+      - "${CODEX_OAUTH_PORT:-1455}:1455"
+    volumes:
+      - ./docker/codex-proxy/config.yaml:/CLIProxyAPI/config.yaml:Z
+      - codex_proxy_auths:/root/.cli-proxy-api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8317/v1/models", "||", "exit", "1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
   dozzle:
     image: docker.io/amir20/dozzle:latest
     container_name: srw-dozzle
@@ -413,3 +436,5 @@ volumes:
     name: srw_nextcloud_dev_data
   minio_dev_data:
     name: srw_minio_dev_data
+  codex_proxy_auths:
+    name: srw_codex_proxy_auths

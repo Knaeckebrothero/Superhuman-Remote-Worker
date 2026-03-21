@@ -6930,6 +6930,152 @@ async def delete_project_api_key(
 
 
 # =============================================================================
+# Codex Proxy Management Endpoints (Admin-only)
+# =============================================================================
+
+
+async def _require_admin(request: Request) -> dict[str, Any]:
+    """Require authenticated admin user."""
+    user = await require_approved_user(request, postgres_db)
+    if not user.get("is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+
+async def _codex_proxy_request(
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    """Make a request to the CLIProxyAPI management API.
+
+    Reads CODEX_PROXY_URL and CODEX_MANAGEMENT_KEY from environment.
+    Raises HTTPException on connection or upstream errors.
+    """
+    proxy_url = os.getenv("CODEX_PROXY_URL", "http://localhost:8317")
+    mgmt_key = os.getenv("CODEX_MANAGEMENT_KEY", "")
+
+    headers = kwargs.pop("headers", {})
+    if mgmt_key:
+        headers["Authorization"] = f"Bearer {mgmt_key}"
+
+    timeout = kwargs.pop("timeout", 10.0)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(
+                method,
+                f"{proxy_url}{path}",
+                headers=headers,
+                **kwargs,
+            )
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Codex proxy returned {response.status_code}: {response.text[:200]}",
+            )
+        return response
+    except HTTPException:
+        raise
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Codex proxy unreachable at {proxy_url}: {e}",
+        ) from e
+
+
+@app.get("/api/codex/status")
+async def codex_status(request: Request) -> dict[str, Any]:
+    """Get Codex proxy health and authentication status (admin-only)."""
+    await _require_admin(request)
+
+    try:
+        auth_resp = await _codex_proxy_request("GET", "/v0/management/auth-files")
+        auth_files = auth_resp.json()
+    except HTTPException:
+        return {"connected": False, "accounts": [], "model_count": 0}
+
+    # Normalize: auth-files may return a list or a dict with a key
+    accounts = auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
+    active = [a for a in accounts if not a.get("disabled") and not a.get("unavailable")]
+
+    model_count = 0
+    try:
+        models_resp = await _codex_proxy_request("GET", "/v1/models")
+        models_data = models_resp.json()
+        model_count = len(models_data.get("data", []))
+    except HTTPException:
+        pass
+
+    return {
+        "connected": len(active) > 0,
+        "accounts": [
+            {
+                "name": a.get("name", "unknown"),
+                "status": a.get("status", "unknown"),
+                "status_message": a.get("status_message"),
+            }
+            for a in accounts
+        ],
+        "model_count": model_count,
+    }
+
+
+@app.get("/api/codex/models")
+async def codex_models(request: Request) -> dict[str, Any]:
+    """List models available through the Codex proxy (admin-only)."""
+    await _require_admin(request)
+
+    resp = await _codex_proxy_request("GET", "/v1/models")
+    data = resp.json()
+    models = [m.get("id", m) for m in data.get("data", [])]
+    return {"models": models}
+
+
+@app.post("/api/codex/login")
+async def codex_login(request: Request) -> dict[str, Any]:
+    """Initiate Codex OAuth login flow (admin-only).
+
+    Returns an auth URL to open in the browser and a state token for polling.
+    """
+    await _require_admin(request)
+
+    resp = await _codex_proxy_request(
+        "GET",
+        "/v0/management/codex-auth-url",
+        params={"is_webui": "true"},
+        timeout=15.0,
+    )
+    return resp.json()
+
+
+@app.get("/api/codex/login/poll")
+async def codex_login_poll(request: Request, state: str) -> dict[str, Any]:
+    """Poll Codex OAuth login status (admin-only)."""
+    await _require_admin(request)
+
+    resp = await _codex_proxy_request(
+        "GET",
+        "/v0/management/get-auth-status",
+        params={"state": state},
+    )
+    return resp.json()
+
+
+@app.delete("/api/codex/credentials/{name}")
+async def codex_delete_credential(name: str, request: Request) -> dict[str, str]:
+    """Remove a Codex proxy credential file (admin-only)."""
+    await _require_admin(request)
+
+    await _codex_proxy_request(
+        "DELETE",
+        "/v0/management/auth-files",
+        params={"name": name},
+    )
+    return {"status": "deleted"}
+
+
+# =============================================================================
 # User Endpoints
 # =============================================================================
 
@@ -8345,6 +8491,8 @@ def _detect_provider(model: str) -> str:
     """Detect LLM provider from model name."""
     if model.startswith("claude-"):
         return "anthropic"
+    if model.startswith("codex/"):
+        return "openai"  # Codex proxy is OpenAI-compatible
     return "openai"
 
 
@@ -8362,6 +8510,7 @@ def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]
 
     Handles model routing for different providers:
     - ``openrouter/`` prefix → OpenRouter API
+    - ``codex/`` prefix → CLIProxyAPI OAuth proxy (CODEX_BASE_URL)
     - ``openai/`` prefix → local vLLM at BUILDER_BASE_URL / OPENAI_BASE_URL / LLM_BASE_URL
     - ``claude-`` prefix → Anthropic (base_url/api_key left to Anthropic client)
     - No prefix → default OpenAI provider
@@ -8370,6 +8519,11 @@ def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]
         model_name = raw_model[len("openrouter/"):]
         base_url = "https://openrouter.ai/api/v1"
         api_key = os.getenv("OPENROUTER_API_KEY")
+        return model_name, base_url, api_key
+    if raw_model.startswith("codex/"):
+        model_name = raw_model[len("codex/"):]
+        base_url = os.getenv("CODEX_BASE_URL", "http://localhost:8317/v1")
+        api_key = os.getenv("CODEX_API_KEY", "not-needed")
         return model_name, base_url, api_key
     if raw_model.startswith("openai/"):
         model_name = raw_model[len("openai/"):]

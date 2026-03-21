@@ -110,7 +110,7 @@ KNOWLEDGE_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "description": "Export knowledge base as Obsidian-compatible markdown files",
         "category": "knowledge",
         "short_description": "Export knowledge base to Obsidian .md files.",
-        "phases": ["strategic"],
+        "phases": ["strategic", "tactical"],
     },
 }
 
