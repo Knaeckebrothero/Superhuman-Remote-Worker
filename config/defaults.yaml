@@ -160,6 +160,8 @@ limits:
     max_tag_repetitions: 50     # same closing tag repeated this many times
     max_token_repetitions: 20   # same word/token repeated consecutively
     max_line_repetitions: 10    # same line repeated in output
+  progress_stall_threshold: 15     # tool calls without progress before stuck detection
+  max_tool_calls_per_phase: 100    # absolute max tool calls per phase before freeze
 
 context_management:
   compact_on_archive: true

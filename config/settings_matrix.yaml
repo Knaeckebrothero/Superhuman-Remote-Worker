@@ -58,6 +58,16 @@ gemini:
     summarization_chunk_size: 120000
     message_count_min_tokens: 100000
 
+gpt-5:
+  temperature: 1.0
+  model_max_context_tokens: 1050000  # gpt-5.4: 1.05M, gpt-5.3-codex: 400K, spark: 128K
+  limits:
+    model_max_context_tokens: 200000
+    context_threshold_tokens: 150000
+    summarization_safe_limit: 180000
+    summarization_chunk_size: 120000
+    message_count_min_tokens: 100000
+
 gpt-oss:
   temperature: 1.0  # OpenAI official: use 1.0 for full reasoning capability
   top_p: 1.0        # OpenAI official: do not restrict vocabulary distribution

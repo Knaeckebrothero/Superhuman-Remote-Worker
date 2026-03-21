@@ -2796,4 +2796,6 @@ def get_builder_provider() -> str:
     model = get_builder_model()
     if model.startswith("claude-"):
         return "anthropic"
+    if model.startswith("codex/"):
+        return "openai"  # Codex proxy is OpenAI-compatible
     return "openai"

@@ -182,6 +182,15 @@ export interface UserSettings {
 }
 
 /**
+ * Codex proxy status (admin-only, from CLIProxyAPI management API).
+ */
+export interface CodexStatus {
+  connected: boolean;
+  accounts: { name: string; status: string; status_message?: string }[];
+  model_count: number;
+}
+
+/**
  * Communication delivery preferences (Phase 3 Live Communication).
  */
 export interface CommunicationSettings {

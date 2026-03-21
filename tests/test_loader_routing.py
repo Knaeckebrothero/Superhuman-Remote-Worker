@@ -13,6 +13,8 @@ from src.core.loader import (
     _OPENAI_REASONING_LEVELS,
     _create_openai_llm,
     _create_openrouter_llm,
+    _create_codex_llm,
+    detect_model_family,
 )
 
 
@@ -420,3 +422,155 @@ class TestOpenRouterReasoningFormat:
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "minimal"}
+
+
+class TestDetectProviderCodex:
+    """Unit tests for codex/ prefix detection in _detect_provider."""
+
+    def test_codex_prefix(self):
+        assert _detect_provider("codex/gpt-5.4-pro") == "codex"
+
+    def test_codex_prefix_case_insensitive(self):
+        assert _detect_provider("Codex/o3-pro") == "codex"
+        assert _detect_provider("CODEX/gpt-4o") == "codex"
+
+    def test_codex_various_models(self):
+        assert _detect_provider("codex/gpt-4o") == "codex"
+        assert _detect_provider("codex/o3-pro") == "codex"
+        assert _detect_provider("codex/gpt-5.4-pro") == "codex"
+        assert _detect_provider("codex/o4-mini") == "codex"
+
+    def test_explicit_provider_overrides_codex_prefix(self):
+        """Explicit provider should always win over prefix detection."""
+        assert _detect_provider("codex/some-model", "openai") == "openai"
+
+    def test_other_providers_unchanged(self):
+        """Ensure codex detection doesn't break existing providers."""
+        assert _detect_provider("claude-sonnet-4-20250514") == "anthropic"
+        assert _detect_provider("gemini-2.0-flash") == "google"
+        assert _detect_provider("groq/llama-3") == "groq"
+        assert _detect_provider("openrouter/openai/gpt-4o") == "openrouter"
+        assert _detect_provider("gpt-4o") == "openai"
+
+
+class TestCodexModelFamilyDetection:
+    """Verify detect_model_family strips codex/ prefix correctly."""
+
+    def test_codex_gpt5_family(self):
+        assert detect_model_family("codex/gpt-5.4-pro") == "gpt-5"
+
+    def test_codex_o_series_family(self):
+        assert detect_model_family("codex/o3-pro") == "o-series"
+        assert detect_model_family("codex/o4-mini") == "o-series"
+
+    def test_codex_gpt4o_family(self):
+        assert detect_model_family("codex/gpt-4o") == "gpt-4o"
+
+    def test_codex_does_not_affect_other_prefixes(self):
+        """Existing prefix stripping should still work."""
+        assert detect_model_family("openrouter/openai/gpt-4o") == "gpt-4o"
+        assert detect_model_family("groq/llama-3.3-70b") == "llama"
+        assert detect_model_family("openai/gpt-oss-120b") == "gpt-oss"
+
+
+class TestCodexLLMCreation:
+    """Integration tests for _create_codex_llm."""
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_strips_prefix_and_sets_default_base_url(self, mock_chat):
+        """Should strip codex/ prefix and use default CLIProxyAPI base URL."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-5.4-pro")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model"] == "gpt-5.4-pro"
+        assert call_kwargs["base_url"] == "http://localhost:8317/v1"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_explicit_base_url_overrides(self, mock_chat):
+        """Explicit config.base_url should override env and default."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="codex/gpt-4o",
+            base_url="http://custom-proxy:9000/v1",
+        )
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["base_url"] == "http://custom-proxy:9000/v1"
+
+    @patch.dict(os.environ, {"CODEX_BASE_URL": "http://remote:8317/v1"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_env_base_url_overrides_default(self, mock_chat):
+        """CODEX_BASE_URL env var should override the default."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-4o")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["base_url"] == "http://remote:8317/v1"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_default_api_key_is_not_needed(self, mock_chat):
+        """When no env var set, API key should default to 'not-needed'."""
+        mock_chat.return_value = MagicMock()
+        env = os.environ.copy()
+        env.pop("CODEX_API_KEY", None)
+
+        with patch.dict(os.environ, env, clear=True):
+            config = _make_config(model="codex/gpt-5.4-pro")
+            _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["api_key"] == "not-needed"
+
+    @patch.dict(os.environ, {"CODEX_API_KEY": "sk-codex-test"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_explicit_api_key_from_env(self, mock_chat):
+        """CODEX_API_KEY env var should be used when set."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-4o")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["api_key"] == "sk-codex-test"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_reasoning_uses_chat_completions(self, mock_chat):
+        """Reasoning should use model_kwargs.reasoning_effort for proxy."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/o3-pro", reasoning_level="high")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert "reasoning" not in call_kwargs
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_reasoning_clamped(self, mock_chat):
+        """xhigh should be clamped to high for Codex (OpenAI limits)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-5.4-pro", reasoning_level="xhigh")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
+
+    @patch.dict(os.environ, {"CODEX_API_KEY": "sk-key1,sk-key2"}, clear=False)
+    @patch("src.core.loader.ReasoningChatOpenAI")
+    def test_multiple_keys(self, mock_chat):
+        """Should support comma-separated keys for rotation."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="codex/gpt-4o")
+
+        _create_codex_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["api_key"] == "sk-key1"

@@ -52,7 +52,7 @@ def detect_model_family(model: str) -> str:
     name = model.lower()
 
     # Strip provider prefixes
-    for prefix in ("openrouter/", "groq/"):
+    for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):
             name = name[len(prefix):]
             if "/" in name:

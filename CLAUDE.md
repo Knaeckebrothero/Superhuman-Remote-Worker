@@ -479,6 +479,8 @@ Required in `.env`:
 - `OPENROUTER_API_KEY` - For OpenRouter (openrouter/* models, 300+ models via unified API)
 - `OPENROUTER_REFERER` - Optional: your site URL for OpenRouter leaderboard
 - `OPENROUTER_TITLE` - Optional: your app name for OpenRouter leaderboard
+- `CODEX_API_KEY` - For Codex OAuth proxy (codex/* models, ChatGPT Plus/Pro via CLIProxyAPI)
+- `CODEX_BASE_URL` - Codex proxy endpoint (default: `http://localhost:8317/v1`). Models: `codex/gpt-5.4` (1.05M ctx, vision), `codex/gpt-5.3-codex` (400K ctx, vision), `codex/gpt-5.3-codex-spark` (128K ctx, text-only, Pro exclusive)
 - `TAVILY_API_KEY` - Web search
 - `VECTOR_DB_URL` - Vector DB connection (required, pgvector instance for citations + memories + knowledge)
 - `MONGODB_URL` - LLM request archiving (audit trail)
@@ -531,6 +533,8 @@ Required in `.env`:
 | VPN Workstation forward | 8090 (host) → 8080 (container) |
 | MinIO API (S3) | 9000 |
 | MinIO Console | 9001 |
+| Codex OAuth Proxy (CLIProxyAPI) | 8317 |
+| Codex OAuth Callback | 1455 |
 | Dozzle (container logs) | 9999 |
 
 ## Debugging

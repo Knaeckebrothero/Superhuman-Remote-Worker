@@ -54,13 +54,13 @@
         "model": {
           "type": "string",
           "description": "Default model identifier (used when no phase override)",
-          "examples": ["gpt-oss-120b", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash"]
+          "examples": ["gpt-oss-120b", "gpt-4o", "claude-sonnet-4-20250514", "gemini-2.0-flash", "codex/gpt-5.4", "codex/gpt-5.3-codex", "codex/gpt-5.3-codex-spark"]
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", "codex", null],
           "default": null,
-          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, default → openai). Groq requires explicit setting."
+          "description": "LLM provider. Auto-detected from model name if null (claude-* → anthropic, gemini-* → google, codex/* → codex, default → openai). Groq requires explicit setting."
         },
         "temperature": {
           "type": "number",
@@ -421,6 +421,18 @@
             }
           },
           "additionalProperties": false
+        },
+        "progress_stall_threshold": {
+          "type": "integer",
+          "minimum": 5,
+          "default": 15,
+          "description": "Tool calls without progress before stuck detection triggers"
+        },
+        "max_tool_calls_per_phase": {
+          "type": "integer",
+          "minimum": 20,
+          "default": 100,
+          "description": "Absolute maximum tool calls per phase before forced freeze"
         }
       }
     },
@@ -637,7 +649,7 @@
         },
         "provider": {
           "type": ["string", "null"],
-          "enum": ["openai", "anthropic", "google", "groq", "openrouter", null],
+          "enum": ["openai", "anthropic", "google", "groq", "openrouter", "codex", null],
           "description": "LLM provider override"
         },
         "temperature": {

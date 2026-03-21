@@ -421,6 +421,7 @@ def create_execute_node(
     memory_extraction_prompt: str = "",
     memory_assembler_prompt: str = "",
     tool_context: Optional[ToolContext] = None,
+    tool_names: Optional[List[str]] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
     """Create the execute node with phase-specific LLM selection.
 
@@ -440,6 +441,7 @@ def create_execute_node(
         summarization_prompt: Prompt template for summarization
         memory_extraction_prompt: Prompt for memory extraction task
         memory_assembler_prompt: Prompt for memory assembler task
+        tool_names: List of loaded tool names for system prompt conditionals
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
@@ -513,6 +515,7 @@ def create_execute_node(
             is_strategic=is_strategic,
             phase_number=phase_number,
             model=phase_llm_config.model,
+            tool_names=tool_names,
         )
         context_mgr.set_current_phase(phase_name)
         logger.debug(
@@ -2334,10 +2337,17 @@ def create_audited_tool_node(
     recall_store=None,
     tool_context: Optional[ToolContext] = None,
 ) -> Callable[[UniversalAgentState], Dict[str, Any]]:
-    """Create a tool node with audit logging and loop detection.
+    """Create a tool node with audit logging, stuck detection, and tool masking.
 
-    This wraps LangGraph's ToolNode to add MongoDB audit logging for
-    tool calls and results, plus loop detection (P8 mitigation).
+    This wraps LangGraph's ToolNode to add:
+    - MongoDB audit logging for tool calls and results
+    - Fingerprint-based loop detection → tool masking
+    - Progress-based stuck detection → diagnostic messages → freeze
+    - Category failure tracking → category-wide masking
+    - Hard budget caps per phase
+    - Tool-not-found enrichment with actionable guidance
+
+    See docs/features/stuck_agent_recovery.md for full design rationale.
 
     Args:
         tools: List of tool objects
@@ -2354,15 +2364,53 @@ def create_audited_tool_node(
     import hashlib
     from collections import deque
     _tool_call_history: deque = deque(maxlen=30)
-    _LOOP_WARNING_THRESHOLD = 3  # warn after 3 identical calls
+    _LOOP_WARNING_THRESHOLD = 10  # warn after 10 identical calls in last 30
 
-    # Strategic phase budget counter (P6 mitigation)
-    _strategic_tool_calls = [0]
+    # Progress-based stuck detection
+    _calls_since_progress = [0]
+    _reflection_injected = [False]
+    _phase_tool_call_count = [0]
     _last_phase_number = [-1]
-    _STRATEGIC_BUDGET_WARNING = 10  # warn after this many tool calls in strategic mode
+
+    # Loop warning state: signatures that have triggered warnings
+    _warned_signatures: set = set()  # set of (name, args_hash) tuples
+    _category_failures: dict = {}  # category -> set of failed tool names
+
+    # Config-driven thresholds
+    _PROGRESS_THRESHOLD = config.limits.progress_stall_threshold  # default 15
+    _HARD_CAP = config.limits.max_tool_calls_per_phase  # default 100
+
+    # Tools that indicate forward progress (reset stuck counter)
+    PROGRESS_TOOLS = {
+        "todo_complete", "write_file", "next_phase_todos",
+        "job_complete", "mark_complete", "kb_write", "kb_update",
+    }
+
+    TOOL_NOT_FOUND_PATTERN = "is not a valid tool"
+
+    def _get_tool_category(tool_name: str) -> Optional[str]:
+        from .tools.registry import TOOL_REGISTRY
+        return TOOL_REGISTRY.get(tool_name, {}).get("category")
+
+    def _get_category_tool_names(category: str) -> List[str]:
+        from .tools.registry import TOOL_REGISTRY
+        return [name for name, meta in TOOL_REGISTRY.items()
+                if meta.get("category") == category]
+
+    # Build phase-allowed tool sets for defense-in-depth validation.
+    # Primary enforcement is LLM schema binding; this catches hallucinated calls.
+    from .tools.registry import filter_tools_by_phase as _filter_phase, TOOL_REGISTRY as _TOOL_REG
+    _all_tool_names = [t.name for t in tools]
+    _phase_allowed: Dict[str, set] = {
+        "strategic": set(_filter_phase(_all_tool_names, "strategic")),
+        "tactical": set(_filter_phase(_all_tool_names, "tactical")),
+    }
+    # Only gate tools that have phase metadata in the registry.
+    # Unregistered tools (dynamic, test) have no phase restriction.
+    _phase_gated_names = set(n for n in _all_tool_names if n in _TOOL_REG)
 
     async def audited_tools(state: UniversalAgentState) -> Dict[str, Any]:
-        """Execute tools with audit logging."""
+        """Execute tools with audit logging and stuck detection."""
         job_id = state.get("job_id", "unknown")
         iteration = state.get("iteration", 0)
         messages = state.get("messages", [])
@@ -2382,42 +2430,96 @@ def create_audited_tool_node(
                         "args": tc.get("args", {}),
                     })
 
-        # Loop detection: check for repetitive tool calls
-        loop_warnings = []
+        # Defense-in-depth: reject tool calls not declared for the current phase.
+        # LLM schema binding is the primary gate; this catches hallucinated calls.
+        # ToolNode can't selectively skip calls, so if any call violates the
+        # phase gate we reject the entire batch with explicit error messages.
+        allowed = _phase_allowed.get(phase_str, set())
+        phase_violations = [
+            tc for tc in tool_calls_info
+            if tc["name"] in _phase_gated_names and tc["name"] not in allowed
+        ]
+        if phase_violations:
+            violated_names = [tc["name"] for tc in phase_violations]
+            logger.warning(
+                f"[{job_id}] Phase gate: {violated_names} not available "
+                f"in {phase_str} phase — rejecting entire batch"
+            )
+            return {"messages": [
+                ToolMessage(
+                    content=(
+                        f"Error: '{tc['name']}' is not available in the "
+                        f"{phase_str} phase. Use tools appropriate for "
+                        f"this phase."
+                    ),
+                    tool_call_id=tc["call_id"],
+                    name=tc["name"],
+                )
+                for tc in tool_calls_info  # respond to ALL calls so LangGraph is happy
+            ]}
+
+        # Phase change: reset all detection state
+        if phase_number != _last_phase_number[0]:
+            _last_phase_number[0] = phase_number
+            _tool_call_history.clear()
+            _calls_since_progress[0] = 0
+            _reflection_injected[0] = False
+            _phase_tool_call_count[0] = 0
+            _warned_signatures.clear()
+            _category_failures.clear()
+
+        # Hard cap check (absolute last resort)
+        _phase_tool_call_count[0] += len(tool_calls_info)
+        if _phase_tool_call_count[0] > _HARD_CAP:
+            logger.error(
+                f"[{job_id}] Hard cap: {_phase_tool_call_count[0]} calls "
+                f"in phase {phase_number} ({phase_str})"
+            )
+            freeze_data = {
+                "freeze_type": "budget_exceeded",
+                "phase": phase_str,
+                "phase_number": phase_number,
+                "reason": f"Hard cap of {_HARD_CAP} tool calls per phase exceeded",
+                "tool_calls_this_phase": _phase_tool_call_count[0],
+                "warned_signatures": len(_warned_signatures),
+            }
+            if tool_context and tool_context.workspace_manager:
+                try:
+                    tool_context.workspace_manager.write_file(
+                        "output/job_frozen.json",
+                        json.dumps(freeze_data, indent=2, ensure_ascii=False),
+                    )
+                except Exception as e:
+                    logger.error(f"[{job_id}] Failed to write freeze file: {e}")
+            freeze_msgs = [
+                ToolMessage(
+                    content=(
+                        f"Execution halted: phase budget of {_HARD_CAP} "
+                        "tool calls exceeded. Job frozen for human review."
+                    ),
+                    tool_call_id=tc["call_id"],
+                    name=tc["name"],
+                ) for tc in tool_calls_info
+            ]
+            return {"should_stop": True, "messages": freeze_msgs}
+
+        # Fingerprint-based loop detection -> track signatures for warnings
+        _loop_warned_call_ids: set = set()  # call_ids to warn about after execution
         for tc_info in tool_calls_info:
             args_str = json.dumps(tc_info["args"], sort_keys=True, default=str)
             args_hash = hashlib.md5(args_str.encode()).hexdigest()[:12]
             call_sig = (tc_info["name"], args_hash)
             _tool_call_history.append(call_sig)
 
-            # Count identical calls in recent history
             identical_count = sum(1 for c in _tool_call_history if c == call_sig)
             if identical_count >= _LOOP_WARNING_THRESHOLD:
-                loop_warnings.append(
-                    f"⚠ Loop detected: you have called '{tc_info['name']}' with the same "
-                    f"arguments {identical_count} times recently. Try a different approach."
-                )
-                logger.warning(
-                    f"[{job_id}] Loop detected: {tc_info['name']} called {identical_count}x "
-                    f"with args hash {args_hash}"
-                )
-
-        # Strategic phase budget: reset on phase change, warn when over budget
-        if phase_number != _last_phase_number[0]:
-            _strategic_tool_calls[0] = 0
-            _last_phase_number[0] = phase_number
-            _tool_call_history.clear()
-
-        if is_strategic:
-            _strategic_tool_calls[0] += len(tool_calls_info)
-            if _strategic_tool_calls[0] > _STRATEGIC_BUDGET_WARNING and _strategic_tool_calls[0] % 5 == 0:
-                budget_warning = (
-                    f"⚠ You have made {_strategic_tool_calls[0]} tool calls in strategic mode. "
-                    "Strategic review should be shorter than tactical execution. "
-                    "Transition to tactical phase now."
-                )
-                loop_warnings.append(budget_warning)
-                logger.warning(f"[{job_id}] Strategic budget exceeded: {_strategic_tool_calls[0]} calls")
+                _loop_warned_call_ids.add(tc_info["call_id"])
+                if call_sig not in _warned_signatures:
+                    _warned_signatures.add(call_sig)
+                    logger.warning(
+                        f"[{job_id}] Loop detected: '{tc_info['name']}' called "
+                        f"{identical_count} times with same args (hash {args_hash})"
+                    )
 
         # Audit tool calls before execution (will be updated with results via update_tool_result)
         auditor = get_archiver()
@@ -2438,10 +2540,24 @@ def create_audited_tool_node(
                 if doc_id:
                     audit_ids[tc_info["call_id"]] = doc_id
 
-        # Execute tools with timing (use ainvoke for async tool support)
+        # Execute all tools (loop detection is advisory, never blocks execution)
         start_time = time.time()
         result = await tool_node.ainvoke(state)
         execution_time_ms = int((time.time() - start_time) * 1000)
+
+        # Append loop warnings to tool results for flagged calls
+        if _loop_warned_call_ids and "messages" in result:
+            for msg in result["messages"]:
+                if (isinstance(msg, ToolMessage)
+                        and msg.tool_call_id in _loop_warned_call_ids):
+                    msg.content = (
+                        (msg.content or "") +
+                        "\n\n[LOOP WARNING] You have called this tool with the "
+                        "same arguments multiple times. You may be stuck in a "
+                        "loop. Consider a different approach: try different "
+                        "arguments, use a different tool, or mark the current "
+                        "todo as blocked and move on."
+                    )
 
         # Check for workspace unavailable errors (VM connection lost).
         # ToolNode catches all exceptions and turns them into error messages,
@@ -2455,6 +2571,135 @@ def create_audited_tool_node(
                             f"VM workspace connection lost during tool execution: "
                             f"{msg.content[:300]}"
                         )
+
+        # Enrich tool-not-found errors with actionable guidance
+        if "messages" in result:
+            for msg in result["messages"]:
+                if (isinstance(msg, ToolMessage)
+                        and msg.content
+                        and TOOL_NOT_FOUND_PATTERN in msg.content):
+                    msg.content += (
+                        "\n\nIf your current todo requires this tool, mark it "
+                        "as blocked using todo_complete with a note explaining "
+                        "which tool is needed, and proceed with the next todo."
+                    )
+
+        # Track category failures for logging
+        if "messages" in result:
+            for msg in result["messages"]:
+                if isinstance(msg, ToolMessage) and _is_tool_error(msg.content or ""):
+                    tool_name = None
+                    for tc in tool_calls_info:
+                        if tc["call_id"] == getattr(msg, "tool_call_id", ""):
+                            tool_name = tc["name"]
+                            break
+                    if tool_name:
+                        category = _get_tool_category(tool_name)
+                        if category:
+                            _category_failures.setdefault(category, set()).add(tool_name)
+                            if len(_category_failures[category]) >= 3:
+                                logger.warning(
+                                    f"[{job_id}] Multiple failures in category "
+                                    f"'{category}': {_category_failures[category]}"
+                                )
+
+        # Progress tracking
+        progress_made = False
+        executed_names = {tc["name"] for tc in tool_calls_info}
+        if executed_names & PROGRESS_TOOLS:
+            for msg in result.get("messages", []):
+                if isinstance(msg, ToolMessage) and not _is_tool_error(msg.content or ""):
+                    for tc in tool_calls_info:
+                        if (tc["call_id"] == getattr(msg, "tool_call_id", "")
+                                and tc["name"] in PROGRESS_TOOLS):
+                            progress_made = True
+                            break
+                if progress_made:
+                    break
+
+        if progress_made:
+            _calls_since_progress[0] = 0
+            _reflection_injected[0] = False
+        else:
+            _calls_since_progress[0] += len(tool_calls_info)
+
+        # todo_rewind is a deliberate re-plan: reset loop detection state
+        if "todo_rewind" in {tc["name"] for tc in tool_calls_info}:
+            for msg in result.get("messages", []):
+                if (isinstance(msg, ToolMessage)
+                        and not _is_tool_error(msg.content or "")
+                        and any(tc["name"] == "todo_rewind"
+                                and tc["call_id"] == msg.tool_call_id
+                                for tc in tool_calls_info)):
+                    _tool_call_history.clear()
+                    _warned_signatures.clear()
+                    _calls_since_progress[0] = 0
+                    _reflection_injected[0] = False
+                    logger.info(
+                        f"[{job_id}] Loop detection reset after todo_rewind"
+                    )
+                    break
+
+        # Stuck detection: reflect once, then freeze
+        if _calls_since_progress[0] >= _PROGRESS_THRESHOLD:
+            if not _reflection_injected[0]:
+                # One-shot diagnostic message
+                _reflection_injected[0] = True
+                available = [t.name for t in tools]
+                diagnostic = SystemMessage(content=(
+                    f"[STUCK DETECTION] You have made "
+                    f"{_calls_since_progress[0]} tool calls without completing "
+                    "a todo or writing output. Before your next action, "
+                    "identify what is blocking progress. "
+                    f"Available tools: {', '.join(available[:25])}. "
+                    "If your current todo is blocked, mark it as blocked "
+                    "using todo_complete with a note, and proceed. "
+                    "If strategic work is complete, call next_phase_todos."
+                ))
+                result.setdefault("messages", []).append(diagnostic)
+                logger.warning(
+                    f"[{job_id}] Stuck: {_calls_since_progress[0]} calls "
+                    f"without progress (phase {phase_number} {phase_str}), "
+                    "injecting reflection"
+                )
+            else:
+                # Already reflected, still stuck -> freeze
+                logger.error(
+                    f"[{job_id}] Stuck after reflection: freezing "
+                    f"(phase {phase_number} {phase_str})"
+                )
+                freeze_data = {
+                    "freeze_type": "stuck_loop",
+                    "phase": phase_str,
+                    "phase_number": phase_number,
+                    "reason": "No progress after reflection",
+                    "iterations_since_progress": _calls_since_progress[0],
+                    "warned_signatures": len(_warned_signatures),
+                    "category_failures": {
+                        k: list(v) for k, v in _category_failures.items()
+                    },
+                    "suggested_resolution": (
+                        "Review current todo requirements. The agent may need "
+                        "tools that aren't available, or the task needs "
+                        "reformulation."
+                    ),
+                }
+                if tool_context and tool_context.workspace_manager:
+                    try:
+                        tool_context.workspace_manager.write_file(
+                            "output/job_frozen.json",
+                            json.dumps(freeze_data, indent=2, ensure_ascii=False),
+                        )
+                        ws = tool_context.workspace_manager
+                        if ws.git_manager and ws.git_manager.is_active:
+                            ws.git_manager.commit(
+                                "Job frozen: stuck loop detected"
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"[{job_id}] Failed to write freeze file: {e}"
+                        )
+                result["should_stop"] = True
 
         # Update tool audit documents with results
         if auditor and "messages" in result:
@@ -2473,18 +2718,6 @@ def create_audited_tool_node(
                             latency_ms=execution_time_ms // max(len(tool_calls_info), 1),
                             error=content[:500] if is_error else None,
                         )
-
-        # Inject loop detection warnings into tool result messages
-        if loop_warnings and "messages" in result:
-            warning_text = "\n".join(loop_warnings)
-            for i, msg in enumerate(result["messages"]):
-                if isinstance(msg, ToolMessage):
-                    result["messages"][i] = ToolMessage(
-                        content=f"{warning_text}\n\n{msg.content}",
-                        tool_call_id=msg.tool_call_id,
-                        name=getattr(msg, "name", None),
-                    )
-                    break  # inject into first tool message only
 
         # Memory Light: flush queued memories from sync tool functions
         if recall_store and tool_context:
@@ -2666,6 +2899,7 @@ def build_phase_alternation_graph(
         memory_extraction_prompt=memory_extraction_prompt,
         memory_assembler_prompt=memory_assembler_prompt,
         tool_context=tool_context,
+        tool_names=_tool_names,
     )
     check_todos = create_check_todos_node(todo_manager, config, tool_names=_tool_names)
     archive_phase = create_archive_phase_node(

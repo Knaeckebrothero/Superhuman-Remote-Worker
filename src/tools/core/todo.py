@@ -343,6 +343,13 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             # Archive with failure note
             result = todo_mgr.archive_with_failure_note(issue.strip())
 
+            # Clear any staged todos from a prior next_phase_todos call —
+            # the agent is abandoning the current approach, stale staged
+            # todos should not block job_complete or re-planning.
+            if todo_mgr.has_staged_todos():
+                todo_mgr.clear_staged_todos()
+                result += "\n(Cleared previously staged todos.)"
+
             # Return with re-planning instructions
             return (
                 f"{result}\n\n"

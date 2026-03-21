@@ -1,7 +1,7 @@
 import { Injectable, inject, signal } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable, catchError, of, tap } from 'rxjs';
-import { ApiKeyEntry, ApiKeySetRequest, UserSettings } from '../models/api.model';
+import { ApiKeyEntry, ApiKeySetRequest, UserSettings, CodexStatus } from '../models/api.model';
 import { environment } from '../environment';
 
 @Injectable({ providedIn: 'root' })
@@ -67,5 +67,34 @@ export class SettingsService {
   deleteProjectApiKey(projectId: string, provider: string): Observable<{ status: string }> {
     return this.http
       .delete<{ status: string }>(`${this.baseUrl}/projects/${projectId}/api-keys/${provider}`);
+  }
+
+  // ── Codex Proxy (Admin) ───────────────────────────────────────
+
+  getCodexStatus(): Observable<CodexStatus> {
+    return this.http
+      .get<CodexStatus>(`${this.baseUrl}/codex/status`)
+      .pipe(catchError(() => of({ connected: false, accounts: [], model_count: 0 })));
+  }
+
+  getCodexModels(): Observable<{ models: string[] }> {
+    return this.http
+      .get<{ models: string[] }>(`${this.baseUrl}/codex/models`)
+      .pipe(catchError(() => of({ models: [] })));
+  }
+
+  startCodexLogin(): Observable<{ auth_url: string; state: string }> {
+    return this.http
+      .post<{ auth_url: string; state: string }>(`${this.baseUrl}/codex/login`, {});
+  }
+
+  pollCodexLogin(state: string): Observable<{ status: string }> {
+    return this.http
+      .get<{ status: string }>(`${this.baseUrl}/codex/login/poll`, { params: { state } });
+  }
+
+  deleteCodexCredential(name: string): Observable<{ status: string }> {
+    return this.http
+      .delete<{ status: string }>(`${this.baseUrl}/codex/credentials/${encodeURIComponent(name)}`);
   }
 }

@@ -1,0 +1,8 @@
+# CLIProxyAPI configuration for SRW deployment.
+# See https://help.router-for.me/configuration/basic for full reference.
+
+port: 8317
+auth-dir: /root/.cli-proxy-api
+
+remote-management:
+  allow-remote: true

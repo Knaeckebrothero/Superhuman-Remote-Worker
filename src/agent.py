@@ -1471,13 +1471,28 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if not model_name.startswith(("o1", "o3", "o4")):
             bind_kwargs["parallel_tool_calls"] = self.config.llm.parallel_tool_calls
 
-        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(self._tools, **bind_kwargs)
-        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(self._tools, **bind_kwargs)
+        # Phase-filter tools: each LLM only sees tools declared for its phase.
+        # The ToolNode keeps the full list (LLM schema binding is primary enforcement).
+        from .tools.registry import filter_tools_by_phase
+        strategic_names = set(filter_tools_by_phase(
+            [t.name for t in self._tools], "strategic"
+        ))
+        tactical_names = set(filter_tools_by_phase(
+            [t.name for t in self._tools], "tactical"
+        ))
+        strategic_tools = [t for t in self._tools if t.name in strategic_names]
+        tactical_tools = [t for t in self._tools if t.name in tactical_names]
+
+        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(strategic_tools, **bind_kwargs)
+        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(tactical_tools, **bind_kwargs)
 
         # Keep _llm_with_tools for backwards compatibility
         self._llm_with_tools = self._strategic_llm_with_tools
 
-        logger.debug(f"Loaded {len(self._tools)} tools")
+        logger.info(
+            f"Loaded {len(self._tools)} tools "
+            f"(strategic: {len(strategic_tools)}, tactical: {len(tactical_tools)})"
+        )
 
         # Auto-register input documents as CitationEngine sources (background)
         self._doc_registration_task = asyncio.create_task(

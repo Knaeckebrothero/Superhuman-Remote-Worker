@@ -370,6 +370,34 @@ services:
   # Container log viewer (Dozzle)
   # ---------------------------------------------------------------------------
   # Socket path varies by runtime:
+  # ---------------------------------------------------------------------------
+  # Codex OAuth Proxy (optional — for codex/* models via ChatGPT subscription)
+  # ---------------------------------------------------------------------------
+  # Provides OpenAI-compatible API backed by ChatGPT Plus/Pro subscription.
+  # First run: authenticate via SSH tunnel + browser:
+  #   podman exec -it srw-codex-proxy ./CLIProxyAPI --codex-login
+  codex-proxy:
+    image: docker.io/eceasy/cli-proxy-api:latest
+    container_name: srw-codex-proxy
+    environment:
+      MANAGEMENT_PASSWORD: ${CODEX_MANAGEMENT_KEY:-}
+    ports:
+      - "${CODEX_PROXY_PORT:-8317}:8317"
+      - "${CODEX_OAUTH_PORT:-1455}:1455"
+    volumes:
+      - ./docker/codex-proxy/config.yaml:/CLIProxyAPI/config.yaml:Z
+      - codex_proxy_auths:/root/.cli-proxy-api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8317/v1/models", "||", "exit", "1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Container log viewer (optional)
+  # ---------------------------------------------------------------------------
   #   Rootless Podman: /run/user/<UID>/podman/podman.sock  (default below)
   #   Rootful Podman:  /run/podman/podman.sock
   #   Docker:          /var/run/docker.sock
@@ -402,3 +430,5 @@ volumes:
     name: srw_gitea_data
   workspace_data:
     name: srw_workspace_data
+  codex_proxy_auths:
+    name: srw_codex_proxy_auths
