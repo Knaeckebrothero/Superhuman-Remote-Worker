@@ -420,17 +420,8 @@ class UniversalAgent:
                     # Remove the frozen marker so the graph can continue
                     frozen_path.unlink()
                     logger.info("Removed job_frozen.json to allow continuation")
-
-                    # Update database status back to processing
-                    if self.postgres_conn:
-                        try:
-                            await self.postgres_conn.execute(
-                                "UPDATE jobs SET status = 'processing' WHERE id = $1::uuid",
-                                job_id
-                            )
-                            logger.info("Updated job status to 'processing' for resumed frozen job")
-                        except Exception as e:
-                            logger.warning(f"Failed to update job status: {e}")
+                    # NOTE: Status is set to 'processing' by the orchestrator
+                    # when it dispatches/resumes the job — no DB write needed here.
 
             # Load tools for this job
             await self._setup_job_tools()
@@ -2226,11 +2217,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         This method is called when a human operator reviews a frozen job
         and decides it is ready to be marked as completed.
 
-        It performs the following:
-        1. Reads the frozen job data from job_frozen.json
-        2. Converts it to job_completion.json (marks as truly completed)
-        3. Removes the job_frozen.json file
-        4. Updates the database status to 'completed'
+        Delegates to the orchestrator's approve endpoint, which handles
+        all DB writes (status, completed_at, freeze_data) and workspace
+        file management (job_frozen.json → job_completion.json).
 
         Args:
             job_id: The job ID to approve
@@ -2239,94 +2228,29 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             Dict with approval result
 
         Raises:
-            ValueError: If job is not frozen or workspace doesn't exist
+            ValueError: If approval fails
         """
-        import json
-        from datetime import datetime
+        import os
+        from .api.orchestrator_client import OrchestratorClient
 
-        # Set up workspace for this job (existing workspace)
-        workspace_manager = WorkspaceManager(
-            job_id=job_id,
-            config=WorkspaceManagerConfig(
-                structure=self.config.workspace.structure,
-                git_versioning=self.config.workspace.git_versioning,
-            )
+        orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
+        client = OrchestratorClient(
+            orchestrator_url=orchestrator_url,
+            pod_ip="", pod_port=0, hostname="", config_name="",
         )
 
-        if not workspace_manager.path.exists():
-            raise ValueError(f"Workspace for job {job_id} does not exist")
-
-        frozen_path = workspace_manager.get_path("output/job_frozen.json")
-        completion_path = workspace_manager.get_path("output/job_completion.json")
-
-        if not frozen_path.exists():
-            raise ValueError(f"Job {job_id} is not frozen (no job_frozen.json found)")
-
-        # Read frozen data
-        frozen_data = json.loads(frozen_path.read_text())
-
-        # Determine freeze type (backward compat: missing = job_complete)
-        freeze_type = frozen_data.get("freeze_type", "job_complete")
-
-        if freeze_type == "phase_boundary":
-            # Phase boundary freeze: resume execution, don't complete
-            frozen_path.unlink()
-            logger.info(f"Removed job_frozen.json for phase boundary approval on job {job_id}")
-
-            # Update database status back to processing
-            if self.postgres_conn:
-                try:
-                    await self.postgres_conn.execute(
-                        "UPDATE jobs SET status = 'processing' WHERE id = $1::uuid",
-                        job_id
-                    )
-                    logger.info(f"Updated job {job_id} status to 'processing' in database")
-                except Exception as e:
-                    logger.warning(f"Failed to update job status in database: {e}")
+        try:
+            await client.connect()
+            success = await client.approve_job(job_id)
+            if not success:
+                raise ValueError(f"Orchestrator failed to approve job {job_id}")
 
             return {
                 "job_id": job_id,
-                "status": "approved_continue",
-                "freeze_type": freeze_type,
-                "phase_type": frozen_data.get("phase_type"),
-                "phase_number": frozen_data.get("phase_number"),
+                "status": "approved",
             }
-
-        # job_complete freeze (or backward compat): mark as truly completed
-        completion_data = {
-            **frozen_data,
-            "status": "job_completed",
-            "approved_at": datetime.now().isoformat(),
-            "approved_by": "human_operator",
-        }
-
-        # Write completion file
-        completion_path.parent.mkdir(parents=True, exist_ok=True)
-        completion_path.write_text(json.dumps(completion_data, indent=2, ensure_ascii=False))
-        logger.info(f"Wrote job_completion.json for job {job_id}")
-
-        # Remove frozen file
-        frozen_path.unlink()
-        logger.info(f"Removed job_frozen.json for job {job_id}")
-
-        # Update database status to completed
-        if self.postgres_conn:
-            try:
-                await self.postgres_conn.execute(
-                    "UPDATE jobs SET status = 'completed', completed_at = NOW() WHERE id = $1::uuid",
-                    job_id
-                )
-                logger.info(f"Updated job {job_id} status to 'completed' in database")
-            except Exception as e:
-                logger.warning(f"Failed to update job status in database: {e}")
-
-        return {
-            "job_id": job_id,
-            "status": "approved",
-            "summary": completion_data.get("summary", ""),
-            "deliverables": completion_data.get("deliverables", []),
-            "approved_at": completion_data["approved_at"],
-        }
+        finally:
+            await client.close()
 
     async def shutdown(self) -> None:
         """Shutdown the agent and cleanup resources."""

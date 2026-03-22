@@ -20,7 +20,7 @@
     { group: 'Anthropic', models: ['claude-sonnet-4-5-20250929', 'claude-opus-4-6'] },
     { group: 'Google', models: ['gemini-2.5-pro', 'gemini-2.5-flash'] },
     { group: 'Groq', models: ['groq/moonshotai/kimi-k2-instruct-0905', 'groq/gpt-oss-120b'] },
-    { group: 'OpenRouter', models: ['openrouter/minimax/minimax-m2.5'] },
+    { group: 'OpenRouter', models: ['openrouter/minimax/minimax-m2.7'] },
   ];
 
   // Quick-select presets for strategic + tactical model combinations.
@@ -35,7 +35,7 @@
   // Models available in the instruction builder chat.
   window['env']['builderModels'] = [
     { label: 'GPT OSS 120B (Local)', id: 'openai/gpt-oss-120b' },
-    { label: 'MiniMax M2.5', id: 'openrouter/minimax/minimax-m2.5' },
+    { label: 'MiniMax M2.7', id: 'openrouter/minimax/minimax-m2.7' },
     { label: 'GPT-5.2 Pro', id: 'gpt-5.2-pro' },
     { label: 'Claude Opus 4.6', id: 'claude-opus-4-6' },
   ];

@@ -1641,11 +1641,9 @@ async def _process_queued_replies(
     if not queued:
         return 0
 
-    # Atomically clear queued_replies from context
-    await postgres_db.execute(
-        "UPDATE jobs SET context = context - 'queued_replies' WHERE id = $1::uuid",
-        job_id,
-    )
+    # NOTE: queued_replies are cleared from DB context by the orchestrator
+    # when the agent reports completion with consumed_reply_threads=True.
+    # We only write the replies to workspace files here.
 
     # Write each reply as a workspace file
     for reply in queued:
@@ -1737,52 +1735,10 @@ def create_handle_transition_node(
             tool_names=tool_names,
         )
 
-        # If the job was stopped, update DB status and store freeze_data.
-        # This must happen here in the async node where we can properly
-        # await the asyncpg pool on the correct event loop.
-        if (
-            result.success
-            and result.state_updates.get("should_stop")
-            and postgres_db
-        ):
-            goal_achieved = result.state_updates.get("goal_achieved", False)
-
-            # Write freeze_data first (independent of status update).
-            # This ensures _maybe_trigger_verification can read it even if
-            # the status update below fails.
-            if result.freeze_data:
-                try:
-                    await postgres_db.execute(
-                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
-                        json.dumps(result.freeze_data), job_id,
-                    )
-                except Exception as e:
-                    logger.error(f"[{job_id}] Failed to write freeze_data: {e}")
-
-            try:
-                # Determine DB status: explicit from freeze_data, or inferred from goal_achieved
-                if result.freeze_data and result.freeze_data.get("status"):
-                    db_status = result.freeze_data["status"]
-                    # Normalize synonyms
-                    if db_status == "job_completed":
-                        db_status = "completed"
-                elif goal_achieved:
-                    db_status = "completed"
-                else:
-                    db_status = "pending_review"
-
-                await postgres_db.jobs.update_status(job_id, status=db_status)
-
-                # Set completed_at for completed jobs
-                if db_status == "completed":
-                    await postgres_db.execute(
-                        "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
-                        job_id,
-                    )
-
-                logger.info(f"[{job_id}] Updated job status to '{db_status}' in database")
-            except Exception as e:
-                logger.error(f"[{job_id}] Failed to update job status: {e}")
+        # NOTE: freeze_data and job status are NOT written to the DB here.
+        # The orchestrator is the single authority for job status. freeze_data
+        # flows through the graph state → report_completion() → orchestrator,
+        # which persists it and determines the final DB status.
 
         # Audit transition attempt
         phase_number = state.get("phase_number", 0)
@@ -2468,40 +2424,100 @@ def create_audited_tool_node(
             _warned_signatures.clear()
             _category_failures.clear()
 
-        # Hard cap check (absolute last resort)
+        # Hard cap check
         _phase_tool_call_count[0] += len(tool_calls_info)
         if _phase_tool_call_count[0] > _HARD_CAP:
-            logger.error(
-                f"[{job_id}] Hard cap: {_phase_tool_call_count[0]} calls "
-                f"in phase {phase_number} ({phase_str})"
-            )
-            freeze_data = {
-                "freeze_type": "budget_exceeded",
-                "phase": phase_str,
-                "phase_number": phase_number,
-                "reason": f"Hard cap of {_HARD_CAP} tool calls per phase exceeded",
-                "tool_calls_this_phase": _phase_tool_call_count[0],
-                "warned_signatures": len(_warned_signatures),
-            }
-            if tool_context and tool_context.workspace_manager:
-                try:
-                    tool_context.workspace_manager.write_file(
-                        "output/job_frozen.json",
-                        json.dumps(freeze_data, indent=2, ensure_ascii=False),
-                    )
-                except Exception as e:
-                    logger.error(f"[{job_id}] Failed to write freeze file: {e}")
-            freeze_msgs = [
-                ToolMessage(
-                    content=(
-                        f"Execution halted: phase budget of {_HARD_CAP} "
-                        "tool calls exceeded. Job frozen for human review."
-                    ),
-                    tool_call_id=tc["call_id"],
-                    name=tc["name"],
-                ) for tc in tool_calls_info
-            ]
-            return {"should_stop": True, "messages": freeze_msgs}
+            if phase_str == "strategic":
+                # Strategic phases should be short — freeze if budget exceeded.
+                logger.error(
+                    f"[{job_id}] Hard cap in strategic phase: "
+                    f"{_phase_tool_call_count[0]} calls "
+                    f"(phase {phase_number})"
+                )
+                freeze_data = {
+                    "freeze_type": "budget_exceeded",
+                    "phase": phase_str,
+                    "phase_number": phase_number,
+                    "reason": f"Hard cap of {_HARD_CAP} tool calls exceeded in strategic phase",
+                    "tool_calls_this_phase": _phase_tool_call_count[0],
+                    "warned_signatures": len(_warned_signatures),
+                }
+                if tool_context and tool_context.workspace_manager:
+                    try:
+                        tool_context.workspace_manager.write_file(
+                            "output/job_frozen.json",
+                            json.dumps(freeze_data, indent=2, ensure_ascii=False),
+                        )
+                    except Exception as e:
+                        logger.error(f"[{job_id}] Failed to write freeze file: {e}")
+                freeze_msgs = [
+                    ToolMessage(
+                        content=(
+                            f"PHASE FROZEN: {_phase_tool_call_count[0]} tool "
+                            "calls in strategic phase without completing "
+                            "review. Job paused for human review."
+                        ),
+                        tool_call_id=tc["call_id"],
+                        name=tc["name"],
+                    ) for tc in tool_calls_info
+                ]
+                return {"should_stop": True, "messages": freeze_msgs}
+            else:
+                # Tactical phase — don't freeze, rewind and let the agent retry.
+                logger.warning(
+                    f"[{job_id}] Hard cap in tactical phase: "
+                    f"{_phase_tool_call_count[0]} calls "
+                    f"(phase {phase_number}). Triggering rewind."
+                )
+                rewind_note = (
+                    f"Budget of {_HARD_CAP} tool calls reached in this phase"
+                )
+                # Archive current todos and clear the list
+                if tool_context and tool_context.todo_manager:
+                    try:
+                        tool_context.todo_manager.archive_with_failure_note(
+                            rewind_note
+                        )
+                        if tool_context.todo_manager.has_staged_todos():
+                            tool_context.todo_manager.clear_staged_todos()
+                    except Exception as e:
+                        logger.error(
+                            f"[{job_id}] Failed to rewind todos: {e}"
+                        )
+                # Capture count before reset for the message
+                calls_used = _phase_tool_call_count[0]
+                # Reset counters so the next phase starts fresh
+                _phase_tool_call_count[0] = 0
+                _calls_since_progress[0] = 0
+                _tool_call_history.clear()
+                _warned_signatures.clear()
+                _reflection_injected[0] = False
+
+                rewind_msg = SystemMessage(content=(
+                    f"PHASE BUDGET REACHED: "
+                    f"{calls_used}/{_HARD_CAP} tool calls "
+                    "consumed without completing this phase's objectives. "
+                    "Current todos have been archived.\n\n"
+                    "Before creating new todos:\n"
+                    "1. Review what worked and what didn't in this phase\n"
+                    "2. Update plan.md if the approach needs to change\n"
+                    "3. Create smaller, more focused todos with "
+                    "next_phase_todos()\n\n"
+                    "Do not repeat the same sequence of actions."
+                ))
+                # Return ToolMessages (to satisfy pending tool calls) + the rewind message.
+                # Don't execute the tools — skip straight to the rewind.
+                tool_msgs = [
+                    ToolMessage(
+                        content=(
+                            f"Skipped: phase budget of {_HARD_CAP} tool calls "
+                            "reached. Todos archived — rethink your approach."
+                        ),
+                        tool_call_id=tc["call_id"],
+                        name=tc["name"],
+                    ) for tc in tool_calls_info
+                ]
+                return {"messages": tool_msgs + [rewind_msg]}
 
         # Fingerprint-based loop detection -> track signatures for warnings
         _loop_warned_call_ids: set = set()  # call_ids to warn about after execution
@@ -2640,66 +2656,29 @@ def create_audited_tool_node(
                     )
                     break
 
-        # Stuck detection: reflect once, then freeze
+        # Progress nudge: periodic reminders to write findings down.
+        # Never freezes the job — the hard cap (Layer 4) is the only stop.
         if _calls_since_progress[0] >= _PROGRESS_THRESHOLD:
-            if not _reflection_injected[0]:
-                # One-shot diagnostic message
-                _reflection_injected[0] = True
-                available = [t.name for t in tools]
+            calls = _calls_since_progress[0]
+            nudge_count = (calls - _PROGRESS_THRESHOLD) // _PROGRESS_THRESHOLD + 1
+            # Inject a nudge every _PROGRESS_THRESHOLD calls without progress
+            if calls == _PROGRESS_THRESHOLD or calls % _PROGRESS_THRESHOLD == 0:
+                remaining = _HARD_CAP - _phase_tool_call_count[0]
                 diagnostic = SystemMessage(content=(
-                    f"[STUCK DETECTION] You have made "
-                    f"{_calls_since_progress[0]} tool calls without completing "
-                    "a todo or writing output. Before your next action, "
-                    "identify what is blocking progress. "
-                    f"Available tools: {', '.join(available[:25])}. "
-                    "If your current todo is blocked, mark it as blocked "
-                    "using todo_complete with a note, and proceed. "
-                    "If strategic work is complete, call next_phase_todos."
+                    f"OBSERVATION: {calls} tool calls since the last file "
+                    f"write or todo completion. Phase budget: "
+                    f"{remaining}/{_HARD_CAP} calls remaining.\n\n"
+                    "If you have gathered useful information, write it to "
+                    "a file now — findings not written to files are lost "
+                    "during context compaction. If you still need specific "
+                    "information, identify the gap and target it directly."
                 ))
                 result.setdefault("messages", []).append(diagnostic)
-                logger.warning(
-                    f"[{job_id}] Stuck: {_calls_since_progress[0]} calls "
-                    f"without progress (phase {phase_number} {phase_str}), "
-                    "injecting reflection"
-                )
-            else:
-                # Already reflected, still stuck -> freeze
-                logger.error(
-                    f"[{job_id}] Stuck after reflection: freezing "
+                logger.info(
+                    f"[{job_id}] Progress nudge #{nudge_count}: "
+                    f"{calls} calls without progress "
                     f"(phase {phase_number} {phase_str})"
                 )
-                freeze_data = {
-                    "freeze_type": "stuck_loop",
-                    "phase": phase_str,
-                    "phase_number": phase_number,
-                    "reason": "No progress after reflection",
-                    "iterations_since_progress": _calls_since_progress[0],
-                    "warned_signatures": len(_warned_signatures),
-                    "category_failures": {
-                        k: list(v) for k, v in _category_failures.items()
-                    },
-                    "suggested_resolution": (
-                        "Review current todo requirements. The agent may need "
-                        "tools that aren't available, or the task needs "
-                        "reformulation."
-                    ),
-                }
-                if tool_context and tool_context.workspace_manager:
-                    try:
-                        tool_context.workspace_manager.write_file(
-                            "output/job_frozen.json",
-                            json.dumps(freeze_data, indent=2, ensure_ascii=False),
-                        )
-                        ws = tool_context.workspace_manager
-                        if ws.git_manager and ws.git_manager.is_active:
-                            ws.git_manager.commit(
-                                "Job frozen: stuck loop detected"
-                            )
-                    except Exception as e:
-                        logger.error(
-                            f"[{job_id}] Failed to write freeze file: {e}"
-                        )
-                result["should_stop"] = True
 
         # Update tool audit documents with results
         if auditor and "messages" in result:

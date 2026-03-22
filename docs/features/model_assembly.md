@@ -104,7 +104,7 @@ Models that follow well-defined instructions, call tools reliably, and produce g
 | **o4-mini** | $1.10 | $4.40 | 200K | Strong reasoning for its price. Good for reasoning-heavy tactical tasks. |
 | **Qwen3 Coder Plus** | $0.65 | $3.25 | 1M | Coding-focused, 1M context, excellent value. Worth testing for code-heavy tactical work. |
 | **GPT-5 (low)** | $1.25 | $10.00 | 400K | 81.3% Aider at low reasoning — cheaper than high mode with good code quality. |
-| **MiniMax M2.5** | $0.30 | $0.60 | 200K | 80.2% SWE-bench, 76.8% BFCL. Cheapest model with near-frontier code quality. Known weaknesses: debugging passivity, context rot on long sessions. |
+| **MiniMax M2.7** | $0.30 | $0.60 | 200K | 80.2% SWE-bench, 76.8% BFCL. Cheapest model with near-frontier code quality. Known weaknesses: debugging passivity, context rot on long sessions. |
 
 ### Tier 3 — Auxiliary (Background Tasks)
 
@@ -170,12 +170,12 @@ For high-volume workloads where cost is the primary constraint. Trades some stra
 
 ```yaml
 llm:
-  model: minimax/MiniMax-M2.5-standard
+  model: minimax/MiniMax-M2.7-standard
   strategic:
     model: gemini-3.1-pro
     provider: google
   tactical:
-    model: minimax/MiniMax-M2.5-standard
+    model: minimax/MiniMax-M2.7-standard
 auxiliary:
   model: deepseek-v3.2
 ```
@@ -256,7 +256,7 @@ The argument for model assembly rests on one observation: **agentic SWE benchmar
 | Gemini 2.5 Pro | 83.1% | $49.88 |
 | Grok 4 (high) | 79.6% | $59.62 |
 | DeepSeek-V3.2 Reasoner | 74.2% | ~$1.30 |
-| MiniMax M2.5 | ~80% | ~$0.50 |
+| MiniMax M2.7 | ~80% | ~$0.50 |
 
 The spread from cheapest to most expensive is modest — ~14 percentage points for a 60x cost difference.
 
@@ -289,7 +289,7 @@ Our phase architecture already separates "decide what to do" (strategic) from "d
 
 ## References
 
-- `docs/model_selection.md` — Single-model selection rationale and MiniMax M2.5 decision
+- `docs/model_selection.md` — Single-model selection rationale and MiniMax M2.7 decision
 - `docs/features/auxiliary.md` — Auxiliary LLM system for background support tasks
 - `config/settings_matrix.yaml` — Model-family-specific inference params and context limits
 - `src/core/loader.py:614` — `LLMConfig` with phase override support

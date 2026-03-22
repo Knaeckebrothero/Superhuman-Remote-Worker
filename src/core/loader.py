@@ -726,6 +726,7 @@ class ToolsConfig:
     coding: List[str] = field(default_factory=list)
     evaluation: List[str] = field(default_factory=list)
     knowledge: List[str] = field(default_factory=list)
+    delegation: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -759,8 +760,8 @@ class LimitsConfig:
     summarization_safe_limit: int = 90000
     summarization_chunk_size: int = 80000
     response_validation: ResponseValidationConfig = field(default_factory=ResponseValidationConfig)
-    progress_stall_threshold: int = 15     # tool calls without progress before stuck detection
-    max_tool_calls_per_phase: int = 100    # absolute max tool calls per phase before freeze
+    progress_stall_threshold: int = 30     # tool calls without progress before nudge reminder
+    max_tool_calls_per_phase: int = 200    # max tool calls per phase before rewind (tactical) or freeze (strategic)
 
 
 @dataclass
@@ -845,6 +846,22 @@ class AuxiliaryConfig:
 
 
 @dataclass
+class DelegationConfig:
+    """Subagent delegation configuration.
+
+    Controls whether agents can spawn child jobs via the delegate_work tool.
+    Children branch off the parent workspace and work in parallel via git worktrees.
+    See docs/features/subagent_delegation.md.
+    """
+
+    enabled: bool = False
+    max_depth: int = 1                     # 1 = no grandchildren
+    default_timeout: int = 7200            # 2 hours
+    max_timeout: int = 14400               # 4 hours
+    allowed_configs: List[str] = field(default_factory=list)  # empty = any
+
+
+@dataclass
 class AgentConfig:
     """Complete agent configuration.
 
@@ -866,6 +883,7 @@ class AgentConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     auxiliary: AuxiliaryConfig = field(default_factory=AuxiliaryConfig)
     instruction_files: List[InstructionFileEntry] = field(default_factory=list)
+    delegation: DelegationConfig = field(default_factory=DelegationConfig)
     autonomy: str = "partial"
 
     # Additional agent-specific config (preserved from JSON)
@@ -1120,6 +1138,7 @@ def load_agent_config(
         coding=tools_data.get("coding", []),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
+        delegation=tools_data.get("delegation", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1137,8 +1156,8 @@ def load_agent_config(
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
         response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
-        progress_stall_threshold=limits_data.get("progress_stall_threshold", 15),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 100),
+        progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
     )
 
     context_data = data.get("context_management", {})
@@ -1177,6 +1196,16 @@ def load_agent_config(
         for entry in instruction_files_data
     ]
 
+    # Parse delegation config
+    delegation_data = data.get("delegation", {})
+    delegation_config = DelegationConfig(
+        enabled=delegation_data.get("enabled", False),
+        max_depth=delegation_data.get("max_depth", 1),
+        default_timeout=delegation_data.get("default_timeout", 7200),
+        max_timeout=delegation_data.get("max_timeout", 14400),
+        allowed_configs=delegation_data.get("allowed_configs", []),
+    )
+
     # Parse autonomy level
     autonomy = data.get("autonomy", "partial")
     if autonomy not in VALID_AUTONOMY_LEVELS:
@@ -1187,7 +1216,8 @@ def load_agent_config(
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "memory", "auxiliary", "instruction_files", "autonomy"
+        "phase_settings", "memory", "auxiliary", "instruction_files", "delegation",
+        "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1205,6 +1235,7 @@ def load_agent_config(
         memory=memory_config,
         auxiliary=auxiliary_config,
         instruction_files=instruction_files,
+        delegation=delegation_config,
         autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,
@@ -1272,6 +1303,7 @@ def load_agent_config_from_dict(
         coding=tools_data.get("coding", []),
         evaluation=tools_data.get("evaluation", []),
         knowledge=tools_data.get("knowledge", []),
+        delegation=tools_data.get("delegation", []),
     )
 
     connections_data = data.get("connections", {})
@@ -1289,8 +1321,8 @@ def load_agent_config_from_dict(
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
         response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
-        progress_stall_threshold=limits_data.get("progress_stall_threshold", 15),
-        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 100),
+        progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
+        max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
     )
 
     context_data = data.get("context_management", {})
@@ -1329,6 +1361,16 @@ def load_agent_config_from_dict(
         for entry in instruction_files_data
     ]
 
+    # Parse delegation config
+    delegation_data = data.get("delegation", {})
+    delegation_config = DelegationConfig(
+        enabled=delegation_data.get("enabled", False),
+        max_depth=delegation_data.get("max_depth", 1),
+        default_timeout=delegation_data.get("default_timeout", 7200),
+        max_timeout=delegation_data.get("max_timeout", 14400),
+        allowed_configs=delegation_data.get("allowed_configs", []),
+    )
+
     # Parse autonomy level
     autonomy = data.get("autonomy", "partial")
     if autonomy not in VALID_AUTONOMY_LEVELS:
@@ -1339,7 +1381,8 @@ def load_agent_config_from_dict(
     known_fields = {
         "$schema", "agent_id", "display_name", "description", "llm", "workspace",
         "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "memory", "auxiliary", "instruction_files", "autonomy"
+        "phase_settings", "memory", "auxiliary", "instruction_files", "delegation",
+        "autonomy"
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1357,6 +1400,7 @@ def load_agent_config_from_dict(
         memory=memory_config,
         auxiliary=auxiliary_config,
         instruction_files=instruction_files,
+        delegation=delegation_config,
         autonomy=autonomy,
         extra=extra,
         _deployment_dir=deployment_dir,

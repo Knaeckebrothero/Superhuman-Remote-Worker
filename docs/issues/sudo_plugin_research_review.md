@@ -2,7 +2,7 @@
 
 **Job ID:** `2f7d3f66-abe4-4678-a9ba-65e171f1f489` (scholar)
 **Validator:** `424437f5-997f-4c57-904a-d25d13ed9744` (critic, approved)
-**Model:** `openrouter/minimax/minimax-m2.5` (MiniMax M2.5, mid-tier)
+**Model:** `openrouter/minimax/minimax-m2.7` (MiniMax M2.7, mid-tier)
 **Date:** 2026-03-18
 **Duration:** ~109 minutes, 968 audit entries (175 tool calls, 172 LLM calls)
 **Sources archived:** 111 web pages
@@ -16,7 +16,7 @@
 
 The agent produced a structurally complete report covering all 7 required topics. It reached the correct high-level conclusions (approval plugin type 4, Go daemon, NATS request/reply, fail-closed semantics). However, when compared against the reference documents, the output has significant technical inaccuracies, shallow security analysis, and missing implementation details that would prevent a developer from building directly from it.
 
-**Context:** This was run on MiniMax M2.5 (mid-tier model via OpenRouter), not a frontier model. Some issues below may be attributable to model capability limits rather than systemic agent problems. The reference documents were produced by a frontier model with the same tooling.
+**Context:** This was run on MiniMax M2.7 (mid-tier model via OpenRouter), not a frontier model. Some issues below may be attributable to model capability limits rather than systemic agent problems. The reference documents were produced by a frontier model with the same tooling.
 
 ---
 
@@ -308,7 +308,7 @@ The reference documents avoided this by writing section-by-section with inline c
 
 ### Model Capability Factor
 
-This job ran on `openrouter/minimax/minimax-m2.5`, a mid-tier model. The reference documents were likely produced by a frontier model (based on the citation density, code quality, and analytical depth). Some issues may be inherent to the model's capability ceiling:
+This job ran on `openrouter/minimax/minimax-m2.7`, a mid-tier model. The reference documents were likely produced by a frontier model (based on the citation density, code quality, and analytical depth). Some issues may be inherent to the model's capability ceiling:
 - C code correctness (I1, I2, I3, I6) — requires precise understanding of C API contracts
 - Security depth (I5) — requires adversarial reasoning about system boundaries
 - Source curation (I15) — requires judgment about source relevance

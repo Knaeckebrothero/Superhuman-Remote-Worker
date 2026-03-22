@@ -318,8 +318,9 @@ class TestEvaluationToolMetadata:
 # =============================================================================
 
 
+@pytest.mark.skip(reason="Agent-side _handle_critic_verdict removed; logic moved to orchestrator")
 class TestRoundLimitEnforcement:
-    """Tests for round limit logic in _handle_critic_verdict."""
+    """Tests for round limit logic — now handled by orchestrator."""
 
     def test_round_under_limit(self):
         """Rounds under max should allow feedback delivery."""

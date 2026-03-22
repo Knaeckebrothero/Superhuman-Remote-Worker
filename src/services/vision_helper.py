@@ -53,7 +53,7 @@ class VisionHelper:
     Configuration is via environment variables:
     - VISION_API_KEY: API key for vision model (falls back to OPENAI_API_KEY)
     - VISION_BASE_URL: Base URL for vision API (defaults to OpenAI: https://api.openai.com/v1)
-    - VISION_MODEL: Model to use (default: gpt-4o-mini)
+    - VISION_MODEL: Model to use (default: gpt-4o)
     - VISION_TIMEOUT: Request timeout in seconds (default: 120)
 
     Example:
@@ -68,13 +68,13 @@ class VisionHelper:
         ```
     """
 
-    # Default to OpenAI API - vision models like gpt-4o-mini are only available there
+    # Default to OpenAI API - vision models like gpt-4o are only available there
     OPENAI_API_URL = "https://api.openai.com/v1"
 
     def __init__(self):
         """Initialize the Vision Helper with configuration from environment."""
         # Load vision-specific config (separate from primary LLM)
-        # This allows using OpenAI for vision tasks (e.g., gpt-4o-mini)
+        # This allows using OpenAI for vision tasks (e.g., gpt-4o)
         # while the primary agent uses a text-only model on a custom endpoint
         primary_key = os.getenv("OPENAI_API_KEY", "")
 
@@ -84,7 +84,7 @@ class VisionHelper:
         #           (NOT LLM_BASE_URL - vision models are typically only on OpenAI)
         self.api_key = os.getenv("VISION_API_KEY", primary_key)
         self.api_base = os.getenv("VISION_BASE_URL", self.OPENAI_API_URL)
-        self.model = os.getenv("VISION_MODEL", "gpt-4o-mini")
+        self.model = os.getenv("VISION_MODEL", "gpt-4o")
         self.timeout = float(os.getenv("VISION_TIMEOUT", "120"))
 
         if not self.api_key:

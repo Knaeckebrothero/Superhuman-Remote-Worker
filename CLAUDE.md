@@ -15,8 +15,8 @@ pip install -r requirements.txt
 cp .env.example .env  # Then configure API keys
 
 # System dependencies (Fedora)
-sudo dnf install poppler-utils tmux    # PDF rendering (pdf2image) + persistent shell sessions
-# Debian/Ubuntu: sudo apt-get install poppler-utils tmux
+sudo dnf install poppler-utils tmux ffmpeg    # PDF rendering + shell sessions + audio chunking
+# Debian/Ubuntu: sudo apt-get install poppler-utils tmux ffmpeg
 playwright install chromium            # Required for browser-based research tools
 ```
 
@@ -463,7 +463,7 @@ read_file(
 )
 ```
 
-Supports: PDF, PPTX, DOCX, PNG, JPG, GIF, WebP, BMP, TIFF
+Supports: PDF, PPTX, DOCX, PNG, JPG, GIF, WebP, BMP, TIFF, MP3, WAV, M4A, OGG, FLAC, OPUS
 
 ## Environment Variables
 
@@ -489,8 +489,15 @@ Required in `.env`:
 **Vision Model** (for text-only agents):
 - `VISION_API_KEY` - API key for vision model (defaults to `OPENAI_API_KEY`)
 - `VISION_BASE_URL` - Vision API endpoint (defaults to `OPENAI_BASE_URL`)
-- `VISION_MODEL` - Model to use (default: `gpt-4o-mini`)
+- `VISION_MODEL` - Model to use (default: `gpt-4o`)
 - `VISION_TIMEOUT` - Request timeout in seconds (default: `120`)
+
+**Audio Transcription** (Whisper, for audio files):
+- `WHISPER_API_KEY` - API key for Whisper model (defaults to `OPENAI_API_KEY`)
+- `WHISPER_BASE_URL` - Whisper API endpoint (defaults to OpenAI)
+- `WHISPER_MODEL` - Model to use (default: `whisper-1`)
+- `WHISPER_TIMEOUT` - Request timeout in seconds (default: `300`)
+- `WHISPER_LANGUAGE` - ISO-639-1 language hint (auto-detect if not set)
 
 **VM Lifecycle** (optional):
 - `NATS_URL` - NATS server URL for cross-cluster VM communication

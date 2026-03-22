@@ -343,11 +343,11 @@ class TestProgressTracking:
                 )
                 result = await audited(state)
 
-            # Should have triggered stuck detection (errors don't count as progress)
+            # Should have triggered progress nudge (errors don't count as progress)
             all_msgs = result.get("messages", [])
             sys_msgs = [m for m in all_msgs if isinstance(m, SystemMessage)]
             assert len(sys_msgs) == 1
-            assert "STUCK DETECTION" in sys_msgs[0].content
+            assert "OBSERVATION:" in sys_msgs[0].content
 
 
 # =============================================================================
@@ -359,8 +359,8 @@ class TestStuckDetectionEscalation:
     """Tests for the stuck detection escalation chain."""
 
     @pytest.mark.asyncio
-    async def test_reflection_injected_at_threshold(self, low_threshold_config):
-        """Stuck detection should inject a SystemMessage at threshold."""
+    async def test_nudge_injected_at_threshold(self, low_threshold_config):
+        """Progress nudge should inject a SystemMessage at threshold."""
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -382,38 +382,30 @@ class TestStuckDetectionEscalation:
                 )
                 result = await audited(state)
 
-            # 3rd call should trigger reflection
+            # 3rd call should trigger progress nudge
             all_msgs = result.get("messages", [])
             sys_msgs = [m for m in all_msgs if isinstance(m, SystemMessage)]
             assert len(sys_msgs) == 1
-            assert "STUCK DETECTION" in sys_msgs[0].content
-            assert "Available tools:" in sys_msgs[0].content
+            assert "OBSERVATION:" in sys_msgs[0].content
+            assert "write it to a file" in sys_msgs[0].content
             assert not result.get("should_stop", False)
 
     @pytest.mark.asyncio
-    async def test_freeze_after_reflection_fails(self, low_threshold_config):
-        """If agent is still stuck after reflection, job should freeze."""
+    async def test_no_freeze_after_nudge(self, low_threshold_config):
+        """Agent should never be frozen by progress nudge — only nudged repeatedly."""
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
-
-        mock_ws = MagicMock()
-        mock_ws.git_manager = MagicMock()
-        mock_ws.git_manager.is_active = False
-        mock_ctx = MagicMock()
-        mock_ctx.workspace_manager = mock_ws
-        mock_ctx.consume_freeze_request.return_value = None
-        mock_ctx.drain_pending_memories.return_value = []
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node(
-                [fake_tool], low_threshold_config, tool_context=mock_ctx
+                [fake_tool], low_threshold_config  # threshold=3
             )
 
-            # 3 calls: triggers reflection
-            for i in range(3):
+            # 6 non-progress calls (2x threshold): should get nudges but never freeze
+            for i in range(6):
                 mock_tn.ainvoke = AsyncMock(return_value={
                     "messages": [make_tool_result("read_file", f"c_{i}", f"call_{i}")]
                 })
@@ -422,32 +414,12 @@ class TestStuckDetectionEscalation:
                 )
                 result = await audited(state)
 
-            # Verify reflection was injected
-            sys_msgs = [m for m in result.get("messages", [])
-                        if isinstance(m, SystemMessage)]
-            assert len(sys_msgs) == 1
-
-            # 1 more non-progress call: should freeze
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("read_file", "still stuck", "call_4")]
-            })
-            state = make_state(
-                [make_tool_call("read_file", {"path": "f_4"}, "call_4")]
-            )
-            result = await audited(state)
-
-            assert result.get("should_stop") is True
-            # Verify freeze file was written
-            mock_ws.write_file.assert_called_once()
-            freeze_call_args = mock_ws.write_file.call_args
-            assert freeze_call_args[0][0] == "output/job_frozen.json"
-            freeze_data = json.loads(freeze_call_args[0][1])
-            assert freeze_data["freeze_type"] == "stuck_loop"
-            assert "warned_signatures" in freeze_data
+            assert not result.get("should_stop", False)
+            assert result.get("freeze_data") is None
 
     @pytest.mark.asyncio
-    async def test_progress_after_reflection_resets(self, low_threshold_config):
-        """Progress after reflection should reset stuck detection entirely."""
+    async def test_progress_after_nudge_resets(self, low_threshold_config):
+        """Progress after nudge should reset the counter."""
         fake_read = MagicMock()
         fake_read.name = "read_file"
         fake_write = MagicMock()
@@ -461,7 +433,7 @@ class TestStuckDetectionEscalation:
                 [fake_read, fake_write], low_threshold_config
             )
 
-            # 3 non-progress calls: triggers reflection
+            # 3 non-progress calls: triggers nudge
             for i in range(3):
                 mock_tn.ainvoke = AsyncMock(return_value={
                     "messages": [make_tool_result("read_file", f"c_{i}", f"call_{i}")]
@@ -481,8 +453,7 @@ class TestStuckDetectionEscalation:
             result = await audited(state)
             assert not result.get("should_stop", False)
 
-            # 3 more non-progress calls: should trigger reflection again
-            # (not immediate freeze, because progress reset the reflection flag)
+            # 3 more non-progress calls: should trigger another nudge
             for i in range(3):
                 mock_tn.ainvoke = AsyncMock(return_value={
                     "messages": [make_tool_result("read_file", f"d_{i}", f"call_d{i}")]
@@ -492,11 +463,11 @@ class TestStuckDetectionEscalation:
                 )
                 result = await audited(state)
 
-            # Should get another reflection, NOT a freeze
+            # Should get another nudge (not a freeze)
             sys_msgs = [m for m in result.get("messages", [])
                         if isinstance(m, SystemMessage)]
             assert len(sys_msgs) == 1
-            assert "STUCK DETECTION" in sys_msgs[0].content
+            assert "OBSERVATION:" in sys_msgs[0].content
             assert not result.get("should_stop", False)
 
 
@@ -509,8 +480,60 @@ class TestHardCap:
     """Tests for the hard budget cap per phase."""
 
     @pytest.mark.asyncio
-    async def test_hard_cap_freezes_job(self):
-        """Exceeding hard cap should immediately freeze with ToolMessages."""
+    async def test_hard_cap_rewinds_tactical_phase(self):
+        """Exceeding hard cap in tactical phase should rewind, not freeze."""
+        cfg = FakeConfig(
+            limits=LimitsConfig(max_tool_calls_per_phase=5)
+        )
+        fake_tool = MagicMock()
+        fake_tool.name = "read_file"
+
+        mock_todo = MagicMock()
+        mock_todo.archive_with_failure_note = MagicMock(return_value="Archived")
+        mock_todo.has_staged_todos = MagicMock(return_value=False)
+        mock_ctx = MagicMock()
+        mock_ctx.workspace_manager = MagicMock()
+        mock_ctx.todo_manager = mock_todo
+        mock_ctx.consume_freeze_request.return_value = None
+        mock_ctx.drain_pending_memories.return_value = []
+
+        with patch("src.graph.ToolNode") as MockToolNode:
+            mock_tn = AsyncMock()
+            mock_tn.ainvoke = AsyncMock(return_value={
+                "messages": [make_tool_result("read_file", "ok")]
+            })
+            MockToolNode.return_value = mock_tn
+
+            audited = create_audited_tool_node(
+                [fake_tool], cfg, tool_context=mock_ctx
+            )
+
+            # 5 calls: within cap
+            for i in range(5):
+                state = make_state(
+                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
+                )
+                result = await audited(state)
+                assert not result.get("should_stop", False)
+
+            # 6th call: exceeds cap — should rewind, NOT freeze
+            state = make_state(
+                [make_tool_call("read_file", {"path": "f_6"}, "call_6")]
+            )
+            result = await audited(state)
+            assert not result.get("should_stop", False)
+            # Should have rewind message
+            sys_msgs = [m for m in result.get("messages", [])
+                        if isinstance(m, SystemMessage)]
+            assert len(sys_msgs) == 1
+            assert "PHASE BUDGET" in sys_msgs[0].content
+            assert "next_phase_todos" in sys_msgs[0].content
+            # Todos should have been archived
+            mock_todo.archive_with_failure_note.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_hard_cap_freezes_strategic_phase(self):
+        """Exceeding hard cap in strategic phase should freeze."""
         cfg = FakeConfig(
             limits=LimitsConfig(max_tool_calls_per_phase=5)
         )
@@ -536,24 +559,18 @@ class TestHardCap:
                 [fake_tool], cfg, tool_context=mock_ctx
             )
 
-            # 5 calls: within cap
-            for i in range(5):
+            # 6 calls in strategic phase: exceeds cap
+            for i in range(6):
                 state = make_state(
-                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
+                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")],
+                    is_strategic=True,
                 )
                 result = await audited(state)
-                assert not result.get("should_stop", False)
 
-            # 6th call: exceeds cap
-            state = make_state(
-                [make_tool_call("read_file", {"path": "f_6"}, "call_6")]
-            )
-            result = await audited(state)
             assert result.get("should_stop") is True
             msgs = result.get("messages", [])
-            assert len(msgs) == 1
-            assert "budget" in msgs[0].content.lower()
-            assert isinstance(msgs[0], ToolMessage)
+            assert any("phase frozen" in m.content.lower() for m in msgs)
+            assert any(isinstance(m, ToolMessage) for m in msgs)
 
     @pytest.mark.asyncio
     async def test_hard_cap_resets_on_phase_change(self):
@@ -735,66 +752,43 @@ class TestFreezePayload:
     """Tests for the structured freeze payload content."""
 
     @pytest.mark.asyncio
-    async def test_stuck_freeze_has_required_fields(self):
-        """Freeze payload should contain diagnostic information."""
+    async def test_progress_nudge_repeats_periodically(self):
+        """Progress nudge should fire every threshold interval, never freeze."""
         cfg = FakeConfig(
             limits=LimitsConfig(progress_stall_threshold=2)
         )
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
-        mock_ws = MagicMock()
-        mock_ws.git_manager = MagicMock()
-        mock_ws.git_manager.is_active = False
-        mock_ctx = MagicMock()
-        mock_ctx.workspace_manager = mock_ws
-        mock_ctx.consume_freeze_request.return_value = None
-        mock_ctx.drain_pending_memories.return_value = []
-
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_tool], cfg, tool_context=mock_ctx
-            )
+            audited = create_audited_tool_node([fake_tool], cfg)
 
-            # Trigger reflection (2 non-progress calls)
-            for i in range(2):
+            nudge_counts = 0
+            # 6 calls = 3x threshold of 2
+            for i in range(6):
                 mock_tn.ainvoke = AsyncMock(return_value={
                     "messages": [make_tool_result("read_file", f"c_{i}", f"call_{i}")]
                 })
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
                 )
-                await audited(state)
+                result = await audited(state)
+                sys_msgs = [m for m in result.get("messages", [])
+                            if isinstance(m, SystemMessage)
+                            and "OBSERVATION:" in m.content]
+                nudge_counts += len(sys_msgs)
 
-            # Trigger freeze (1 more call)
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("read_file", "still", "call_3")]
-            })
-            state = make_state(
-                [make_tool_call("read_file", {"path": "f_3"}, "call_3")]
-            )
-            await audited(state)
-
-            # Verify freeze payload
-            mock_ws.write_file.assert_called_once()
-            freeze_json = mock_ws.write_file.call_args[0][1]
-            payload = json.loads(freeze_json)
-
-            assert payload["freeze_type"] == "stuck_loop"
-            assert "phase" in payload
-            assert "phase_number" in payload
-            assert "reason" in payload
-            assert "iterations_since_progress" in payload
-            assert "warned_signatures" in payload
-            assert "category_failures" in payload
-            assert "suggested_resolution" in payload
+            # Should have gotten nudges at calls 2, 4, 6
+            assert nudge_counts == 3
+            # Never frozen
+            assert not result.get("should_stop", False)
 
     @pytest.mark.asyncio
-    async def test_hard_cap_freeze_has_required_fields(self):
-        """Hard cap freeze should contain budget information."""
+    async def test_hard_cap_strategic_freeze_has_required_fields(self):
+        """Hard cap freeze in strategic phase should contain budget information."""
         cfg = FakeConfig(
             limits=LimitsConfig(max_tool_calls_per_phase=2)
         )
@@ -820,18 +814,13 @@ class TestFreezePayload:
                 [fake_tool], cfg, tool_context=mock_ctx
             )
 
-            # 2 calls (at limit)
-            for i in range(2):
+            # 3 calls in strategic phase: exceeds cap of 2
+            for i in range(3):
                 state = make_state(
-                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
+                    [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")],
+                    is_strategic=True,
                 )
-                await audited(state)
-
-            # 3rd call: exceeds cap
-            state = make_state(
-                [make_tool_call("read_file", {"path": "f_3"}, "call_3")]
-            )
-            result = await audited(state)
+                result = await audited(state)
 
             assert result.get("should_stop") is True
             mock_ws.write_file.assert_called_once()

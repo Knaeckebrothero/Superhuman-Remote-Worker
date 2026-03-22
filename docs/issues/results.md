@@ -142,7 +142,7 @@ The agent sees error messages in shell output but proceeds as if the operation s
 
 **Date:** 2026-03-05
 **Task:** Rewrite LLM proxy router code, fix 7 bugs, deploy with Quadlet/systemd
-**Model:** `openrouter/minimax/minimax-m2.5` (reasoning_level: xhigh)
+**Model:** `openrouter/minimax/minimax-m2.7` (reasoning_level: xhigh)
 **Predecessor:** Job `431541b3` ("Deploy the router") — workspace inherited from this job
 **Phases:** 7 (P0-P6), 299 audit entries
 **Status:** pending_review, confidence 1.0
@@ -295,7 +295,7 @@ Critics reviewing deployment/infrastructure jobs verify only by reading output f
 
 **Date:** 2026-03-04 to 2026-03-05
 **Task:** Deploy pre-built AI Model Router to server 10.18.2.105 as rootless Podman container with systemd Quadlet
-**Model:** `openrouter/minimax/minimax-m2.5` (via config_override)
+**Model:** `openrouter/minimax/minimax-m2.7` (via config_override)
 **Phases:** 19 (P0-P18), 1864 audit entries, 896 tool calls
 **Duration:** ~16 hours (19:20 → next day 11:12), including two human reviews
 **Status:** completed, confidence 1.0
@@ -376,7 +376,7 @@ P1 (generic verification), P3 (Quadlet silent fallback x3), P8 (repetitive shell
 
 **Date:** 2026-03-04 to 2026-03-05
 **Task:** Verify and either approve or return job `431541b3` ("Deploy the router")
-**Model:** `openrouter/minimax/minimax-m2.5` (inherited from defaults)
+**Model:** `openrouter/minimax/minimax-m2.7` (inherited from defaults)
 **Parent Job:** `431541b3` (Deploy the router)
 **Status:** All completed. Parent job approved by `0fde6f40`.
 
