@@ -10,8 +10,8 @@ The project needs to run agents at scale — potentially 3 simultaneous agents f
 
 | Model | Input/M | Output/M | Cache | SWE-bench Verified | Tool Calling (BFCL) | Notes |
 |---|---|---|---|---|---|---|
-| **MiniMax M2.5** | $0.30 | $0.60 | Auto, free | **80.2%** | **76.8%** | Best value for agentic work |
-| **MiniMax M2.5 Lightning** | $0.30 | $1.20 | Auto, free | 80.2% | 76.8% | 2x speed, 2x output cost |
+| **MiniMax M2.7** | $0.30 | $0.60 | Auto, free | **80.2%** | **76.8%** | Best value for agentic work |
+| **MiniMax M2.7 Lightning** | $0.30 | $1.20 | Auto, free | 80.2% | 76.8% | 2x speed, 2x output cost |
 | **DeepSeek V3.2** | $0.28 | $0.42 | $0.028 hit | 73.1% | 80.3% (Tau2) | Cheaper output, weaker SWE-bench |
 | Gemini 2.5 Flash-Lite | $0.10 | $0.40 | — | ~45%* | Limited | Too weak for agentic tasks |
 | Gemini 2.5 Flash | $0.30 | $2.50 | — | ~54% | Good | Expensive output for the quality |
@@ -25,9 +25,9 @@ The project needs to run agents at scale — potentially 3 simultaneous agents f
 | GPT-5.2 Pro | $10.00 | $30.00 | 80.0% | Similar quality, even more expensive |
 | Gemini 3 Pro | — | — | 78.0% | Competitive but priced at frontier |
 
-## Decision: MiniMax M2.5 (Standard)
+## Decision: MiniMax M2.7 (Standard)
 
-**MiniMax M2.5 standard** is the primary model for all agent work.
+**MiniMax M2.7 standard** is the primary model for all agent work.
 
 Rationale:
 - **80.2% SWE-bench** — within 0.6% of Opus 4.6, ahead of GPT-5.2 and Gemini 3 Pro
@@ -44,9 +44,9 @@ DeepSeek V3.2 ($0.28/$0.42) is the backup option. It's slightly cheaper on outpu
 - Summarization tasks
 - Fallback when MiniMax API has availability issues
 
-## Prompt Engineering for MiniMax M2.5
+## Prompt Engineering for MiniMax M2.7
 
-M2.5 was trained via large-scale RL in real coding/agentic environments. It has specific characteristics that differ from Claude or GPT models.
+M2.7 was trained via large-scale RL in real coding/agentic environments. It has specific characteristics that differ from Claude or GPT models.
 
 ### Recommended Inference Parameters
 
@@ -56,15 +56,15 @@ top_p: 0.95
 top_k: 40
 ```
 
-M2.5 was trained with these sampling parameters. Using `temperature: 0.0` fights against the trained distribution and degrades quality.
+M2.7 was trained with these sampling parameters. Using `temperature: 0.0` fights against the trained distribution and degrades quality.
 
-### What Works with M2.5
+### What Works with M2.7
 
-1. **Constraints over descriptions** — M2.5 responds to flat constraint lists ("Don't change public signatures; prefer dependency injection; show a minimal diff") better than prose explanations. Structure beats cleverness.
+1. **Constraints over descriptions** — M2.7 responds to flat constraint lists ("Don't change public signatures; prefer dependency injection; show a minimal diff") better than prose explanations. Structure beats cleverness.
 
-2. **Explain "why" before "what"** — When M2.5 understands the purpose behind a constraint, it follows it more reliably. "Your response will be evaluated by a critic agent, so ground every claim in evidence" is more effective than "Be accurate."
+2. **Explain "why" before "what"** — When M2.7 understands the purpose behind a constraint, it follows it more reliably. "Your response will be evaluated by a critic agent, so ground every claim in evidence" is more effective than "Be accurate."
 
-3. **Spec-first / acceptance criteria** — M2.5 was trained to architect before coding. Prompts that ask for explicit scope boundaries, acceptance criteria, and module relationships before implementation play to its strongest mode.
+3. **Spec-first / acceptance criteria** — M2.7 was trained to architect before coding. Prompts that ask for explicit scope boundaries, acceptance criteria, and module relationships before implementation play to its strongest mode.
 
 4. **Role-based framing** — Assigning a specific role changes tone and standards. "You are a senior code reviewer" causes it to flag type drift and naming conventions it otherwise ignores.
 
@@ -72,11 +72,11 @@ M2.5 was trained with these sampling parameters. Using `temperature: 0.0` fights
 
 6. **Mark uncertainty explicitly** — Adding "mark any uncertainty with '(?)' and keep going" surfaces weak spots without derailing output.
 
-7. **Short system prompts** — M2.5 may terminate tasks early when approaching context thresholds. Keep system prompt token count lean; move reference material to files the agent reads on demand.
+7. **Short system prompts** — M2.7 may terminate tasks early when approaching context thresholds. Keep system prompt token count lean; move reference material to files the agent reads on demand.
 
 ### Known Weaknesses to Compensate For
 
-1. **Debugging passivity** — M2.5 tends to repeatedly modify code instead of switching strategies (adding logs, writing tests, narrowing the failure). Mitigate with explicit instructions:
+1. **Debugging passivity** — M2.7 tends to repeatedly modify code instead of switching strategies (adding logs, writing tests, narrowing the failure). Mitigate with explicit instructions:
    ```
    When stuck on an error after 2 attempts:
    - STOP modifying the same code path
@@ -85,7 +85,7 @@ M2.5 was trained with these sampling parameters. Using `temperature: 0.0` fights
    - If still stuck after 3 attempts, document the blocker and move on
    ```
 
-2. **Docs-code sync drift** — M2.5 often updates implementation without updating documentation. Mitigate by pairing code tasks with explicit checklist items covering both.
+2. **Docs-code sync drift** — M2.7 often updates implementation without updating documentation. Mitigate by pairing code tasks with explicit checklist items covering both.
 
 3. **Context rot on long sessions** — Quality can degrade on very long contexts. Keep total input+output under 200K tokens per sequence. Our context compaction system (Layer 0/1/2) handles this.
 
@@ -97,7 +97,7 @@ M2.5 was trained with these sampling parameters. Using `temperature: 0.0` fights
 
 ### Prompt Optimization Checklist
 
-When writing or modifying prompts for M2.5:
+When writing or modifying prompts for M2.7:
 
 - [ ] Are constraints stated as a flat list, not buried in prose?
 - [ ] Does the prompt explain *why* before stating *what*?
@@ -113,7 +113,7 @@ When writing or modifying prompts for M2.5:
 
 | Change | Impact | Location |
 |---|---|---|
-| Set `temperature: 1.0` for M2.5 | Fighting trained distribution at 0.0 | Expert config or defaults override |
+| Set `temperature: 1.0` for M2.7 | Fighting trained distribution at 0.0 | Expert config or defaults override |
 | Add `top_p: 0.95` support | Part of official recommended params | `src/core/loader.py` if not supported |
 | Add debugging pivot to `tactical.txt` | Addresses known passivity weakness | `config/prompts/tactical.txt` |
 
@@ -121,23 +121,23 @@ When writing or modifying prompts for M2.5:
 
 | Change | Impact | Location |
 |---|---|---|
-| Create M2.5 prompt matrix entry | Model-specific prompt optimization | `config/prompt_matrix.yaml` |
+| Create M2.7 prompt matrix entry | Model-specific prompt optimization | `config/prompt_matrix.yaml` |
 | Shorten `instructions.md` by ~40% | Reduce token waste per LLM call | `config/templates/instructions.md` |
-| Rewrite system prompt constraint-first | Match M2.5's preferred prompt style | `config/prompts/systemprompt.txt` or M2.5 override |
-| Add acceptance criteria to strategic prompt | Plays to M2.5's spec-first strength | `config/prompts/strategic.txt` |
+| Rewrite system prompt constraint-first | Match M2.7's preferred prompt style | `config/prompts/systemprompt.txt` or M2.7 override |
+| Add acceptance criteria to strategic prompt | Plays to M2.7's spec-first strength | `config/prompts/strategic.txt` |
 
 ### Low Priority
 
 | Change | Impact | Location |
 |---|---|---|
 | Use DeepSeek V3.2 for observer/summarization | Minor cost savings | `config/defaults.yaml` observer_model |
-| Evaluate M2.5 standard vs Lightning empirically | Confirm standard is sufficient speed | Runtime testing |
+| Evaluate M2.7 standard vs Lightning empirically | Confirm standard is sufficient speed | Runtime testing |
 
 ## Cost Projections
 
 Based on development usage (250M tokens / ~50 EUR):
 
-| Scenario | Tokens/day (est.) | Daily Cost (M2.5 std) | Monthly Cost |
+| Scenario | Tokens/day (est.) | Daily Cost (M2.7 std) | Monthly Cost |
 |---|---|---|---|
 | 1 agent, moderate workload | ~30M | ~$13.50 | ~$405 |
 | 1 agent, heavy workload | ~80M | ~$36.00 | ~$1,080 |
@@ -149,11 +149,11 @@ For comparison, the same workloads on Opus 4.6 would cost **~40x more** ($4,320/
 
 ## Sources
 
-- [MiniMax M2.5 Official Announcement](https://www.minimax.io/news/minimax-m25)
-- [M2.5 Usage Tips — MiniMax API Docs](https://platform.minimax.io/docs/coding-plan/best-practices)
-- [M2.5 Model Card — HuggingFace](https://huggingface.co/MiniMaxAI/MiniMax-M2.5)
-- [M2.5 Practical Notes — iWeaver](https://www.iweaver.ai/blog/minimax-m2-5-highlight/)
+- [MiniMax M2.7 Official Announcement](https://www.minimax.io/news/minimax-m25)
+- [M2.7 Usage Tips — MiniMax API Docs](https://platform.minimax.io/docs/coding-plan/best-practices)
+- [M2.7 Model Card — HuggingFace](https://huggingface.co/MiniMaxAI/MiniMax-M2.7)
+- [M2.7 Practical Notes — iWeaver](https://www.iweaver.ai/blog/minimax-m2-5-highlight/)
 - [DeepSeek V3.2 Pricing](https://api-docs.deepseek.com/quick_start/pricing)
-- [M2.5 vs DeepSeek Benchmarks — DocsBot](https://docsbot.ai/models/compare/minimax-m2-5/deepseek-v3-2)
+- [M2.7 vs DeepSeek Benchmarks — DocsBot](https://docsbot.ai/models/compare/minimax-m2-5/deepseek-v3-2)
 - [LLM Pricing Comparison — TLDL](https://www.tldl.io/resources/cheapest-llm-api-2026)
 - [Gemini API Pricing](https://ai.google.dev/gemini-api/docs/pricing)

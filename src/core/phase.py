@@ -1091,8 +1091,8 @@ def on_strategic_phase_complete(
     # Get phase name from staged todos
     phase_name = todo_manager.get_staged_phase_name() or f"Phase {phase_number + 1}"
 
-    # Get count of completed todos before applying new ones
-    completed_todos = len([t for t in todo_manager.list_all() if t.status.value == "completed"])
+    # Use archived count from todo_manager (set during archive_phase, before todos were cleared)
+    completed_todos = todo_manager._last_archived_completed
 
     # Apply staged todos to the active todo list
     todo_manager.apply_staged_todos()
@@ -1169,8 +1169,8 @@ def on_tactical_phase_complete(
 
     logger.info(f"[{job_id}] Tactical phase complete, transitioning to strategic")
 
-    # Get count of completed todos before loading new ones
-    completed_todos = len([t for t in todo_manager.list_all() if t.status.value == "completed"])
+    # Use archived count from todo_manager (set during archive_phase, before todos were cleared)
+    completed_todos = todo_manager._last_archived_completed
 
     # Git operations: tag completed phase, commit
     _complete_phase_with_git(

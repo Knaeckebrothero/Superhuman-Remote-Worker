@@ -35,5 +35,11 @@ WHY: The knowledge base is your persistent memory that survives context compacti
 - Over-planning detected → transition to tactical immediately. Strategic review should take fewer tool calls than tactical execution. If you have spent more than 10 tool calls in strategic mode, you are over-planning.
 </decision_criteria>
 
+{% if has_tool("delegate_work") -%}
+<delegation>
+If the remaining work has clearly separable subtasks that can run in parallel (e.g., researching different topics, analyzing different subsystems), consider using `delegate_work` to spawn subagents. Each child branches off your workspace and works independently. You will review their diffs and merge results when they finish. Only delegate when parallelism provides a real advantage — do not delegate sequential work or tasks simple enough to do yourself.
+</delegation>
+{% endif -%}
+
 When strategic review is complete, transition to tactical phase. Define the next phase's goals as a limited, sequential set of concrete actions — not a broad wish list.
 </strategic_phase>

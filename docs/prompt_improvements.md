@@ -55,7 +55,7 @@ Research-driven improvements based on analysis of Claude Code system prompts (11
 | Where | What |
 |-------|------|
 | `config/templates/instructions.md` | Rewritten: added "Bias to Action" directive (Codex CLI pattern), "Batch Your Reads" strategy (Codex parallel-first pattern), "Check Your Plan Against Requirements" (PreFlect prospective reflection), "Escalate Rather Than Mask" (Devin error handling, addresses P3/P11), "Verify with evidence" (addresses P1). |
-| `config/templates/instructions_minimax.md` | **New file**: MiniMax-optimized instructions with XML annotation style and WHY blocks. Same improvements as base, structured with `<action_bias>`, `<batch_reads>`, `<plan_verification>`, `<stay_grounded>`, `<write_early>`, `<error_handling>`, `<context_management>` tags. Validated by MiniMax M2.5 official documentation recommending "clarity over brevity" and "explain intent." |
+| `config/templates/instructions_minimax.md` | **New file**: MiniMax-optimized instructions with XML annotation style and WHY blocks. Same improvements as base, structured with `<action_bias>`, `<batch_reads>`, `<plan_verification>`, `<stay_grounded>`, `<write_early>`, `<error_handling>`, `<context_management>` tags. Validated by MiniMax M2.7 official documentation recommending "clarity over brevity" and "explain intent." |
 | `config/instruction_matrix.yaml` | Added `minimax` entry mapping `instructions` → `instructions_minimax.md`. |
 | `config/templates/workspace_template.md` | Restructured with Facts/Status separation: `## Facts` (PROTECTED — survives rewrites), `## Failed Approaches` (PROTECTED — prevents retrying failed strategies), `## Status` (freely rewritable). Added `Verified By` column to Deliverables table. Changed line limit from 50 → 60 lines (~4000 tokens). Inspired by Manus error retention ("erasing failure removes evidence"), MemGPT tiered memory, and P5/P7 failure analysis. |
 | `config/templates/todo_guide.md` | Relaxed "5 todos per phase" to adaptive "3-7 todos" range (IFScale research shows fixed counts waste attention budget). Added Batch Processing phase pattern (addresses P6). Strengthened verification todos to require evidence. Reframed anti-patterns as positive "Guidance" section (Pink Elephant research). Added "Simple Task Shortcut" concept (Codex "skip planning for easy 25%"). |
@@ -110,7 +110,7 @@ Changes:
 
 ### 6. Model-family-specific prompt variants (partially done)
 
-**Status**: MiniMax variant implemented for the instruction matrix (`instructions_minimax.md` with XML/WHY blocks). Other model families (deepseek, gemini, claude) remain as potential future work but are lower priority since MiniMax M2.5 is used 99% of the time.
+**Status**: MiniMax variant implemented for the instruction matrix (`instructions_minimax.md` with XML/WHY blocks). Other model families (deepseek, gemini, claude) remain as potential future work but are lower priority since MiniMax M2.7 is used 99% of the time.
 
 **Remaining variants** (add as needed):
 - **`deepseek`**: Minimal system prompt, user-prompt-centric (R1 performs best with empty system prompt)
@@ -380,7 +380,7 @@ These findings informed the improvements above:
 - [When AGENTS.md Backfires](https://notchrisgroves.com/when-agents-md-backfires/) — instruction files reduce success 5/8 scenarios when duplicating accessible info
 - [Codex Prompting Guide](https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide/) — bias to action, batch reads, plan hygiene, skip planning for easy 25%
 - [Manus Context Engineering](https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus) — todo.md recitation combats lost-in-middle, error retention preserves evidence
-- [MiniMax M2.5 Best Practices](https://platform.minimax.io/docs/coding-plan/best-practices) — clarity over brevity, explain intent, sequential focus, XML-native
+- [MiniMax M2.7 Best Practices](https://platform.minimax.io/docs/coding-plan/best-practices) — clarity over brevity, explain intent, sequential focus, XML-native
 - [Context Engineering for Agents (LangChain)](https://blog.langchain.com/context-engineering-for-agents/) — write/select/compress/isolate context strategies
 - [Design Patterns for LLM Memory](https://serokell.io/blog/design-patterns-for-long-term-memory-in-llm-powered-architectures) — MemGPT tiered memory, entity memory, knowledge graphs
 - [Agent Drift: Behavioral Degradation](https://arxiv.org/html/2601.04170) — detectable after 73 interactions, -42% success at 600 turns

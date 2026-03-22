@@ -130,6 +130,9 @@ class TodoManager:
         # Staging for next phase todos
         self._staged_todos: List[TodoItem] = []
         self._staged_phase_name: str = ""
+        # Last archive counts (populated by archive(), read by phase transitions)
+        self._last_archived_total: int = 0
+        self._last_archived_completed: int = 0
         # Phase state tracking (for job_complete validation)
         self._is_strategic_phase: bool = True
         # Phase number tracking (for git versioning and archive naming)
@@ -588,6 +591,10 @@ class TodoManager:
         # Write to workspace
         self._workspace.write_file(archive_path, content)
         logger.info(f"Archived {len(self._todos)} todos to {archive_path}")
+
+        # Store count before clearing (used by phase transition git commits)
+        self._last_archived_total = len(self._todos)
+        self._last_archived_completed = len(completed)
 
         # Clear the list
         self._todos = []

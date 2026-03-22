@@ -619,6 +619,17 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     llm_override["reasoning_level"] = default_reasoning
                     logger.info(f"Dispatch: injected user default_reasoning_level: {default_reasoning}")
 
+            # Embedding provider toggle (per-account)
+            embedding_provider = user_settings.get("embedding_provider")
+            if embedding_provider:
+                config_override = config_override or {}
+                env_keys_block = config_override.setdefault("env_keys", {})
+                env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
+                # When using openrouter, inject the user's OpenRouter key
+                if embedding_provider == "openrouter" and resolved_keys and "openrouter" in resolved_keys:
+                    env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
+                logger.info(f"Dispatch: injected user embedding_provider: {embedding_provider}")
+
         # Build job start request
         job_start = JobStartRequest(
             job_id=job_id,
@@ -1116,6 +1127,9 @@ class JobCreate(BaseModel):
     project_id: str | None = Field(None, description="Project UUID to associate this job with")
     parent_job_id: str | None = Field(None, description="Parent job UUID for verification/follow-up jobs")
     priority: int = Field(5, ge=0, le=10, description="Job priority (0=low, 5=normal, 10=high)")
+    creation_order: int | None = Field(None, description="0-based index for delegation subagent merge ordering")
+    worktree_path: str | None = Field(None, description="Git worktree path for delegation subagents")
+    delegation_context: str | None = Field(None, description="Shared context string from parent delegation")
 
 
 class JobStartRequest(BaseModel):
@@ -1145,6 +1159,10 @@ class JobStartRequest(BaseModel):
     project_id: str | None = Field(
         default=None,
         description="Project ID for datasource resolution",
+    )
+    delegation_context: str | None = Field(
+        default=None,
+        description="Shared context from parent delegation",
     )
 
 
@@ -1222,6 +1240,7 @@ class UserSettingsUpdate(BaseModel):
     default_autonomy: str | None = None
     default_reasoning_level: str | None = None
     default_auxiliary_model: str | None = None
+    embedding_provider: str | None = None
 
 
 class ProjectCreate(BaseModel):
@@ -1745,6 +1764,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             project_id=project_id,
             parent_job_id=job.parent_job_id,
             priority=job.priority,
+            creation_order=job.creation_order,
+            worktree_path=job.worktree_path,
+            delegation_context=job.delegation_context,
         )
 
         # Create Gitea repo/branch for workspace delivery
@@ -3761,6 +3783,108 @@ async def _handle_scholar_completion(
     _trigger_dispatch()
 
 
+async def _handle_delegation_child_completion(
+    job: dict[str, Any],
+    actions: list[str],
+) -> None:
+    """After a delegation child completes, check if all siblings are done.
+
+    Delegation children are identified by having a non-NULL creation_order
+    (distinguishes them from critic/scholar subjobs which also use parent_job_id).
+
+    When all siblings reach a terminal status, the parent job is unblocked:
+    child results are stored in the parent's context and the parent transitions
+    from 'waiting' to 'created' so the dispatcher picks it up for resume.
+    """
+    parent_job_id = job.get("parent_job_id")
+    if parent_job_id is None:
+        return
+
+    # Only handle delegation children (have creation_order set)
+    if job.get("creation_order") is None:
+        return
+
+    job_id = str(job["id"])
+    target_id = str(parent_job_id)
+
+    all_done = await postgres_db.all_delegation_children_terminal(target_id)
+    if not all_done:
+        logger.debug(
+            f"Delegation child {job_id} done, but not all siblings terminal yet "
+            f"(parent {target_id})"
+        )
+        return
+
+    parent = await postgres_db.get_job(target_id)
+    if not parent:
+        logger.warning(f"Delegation child {job_id}: parent {target_id} not found")
+        return
+
+    if parent.get("status") != "waiting":
+        logger.debug(
+            f"Delegation child {job_id}: parent {target_id} not in 'waiting' "
+            f"(status={parent.get('status')}) — skipping unblock"
+        )
+        return
+
+    # Build results summary from children in creation order
+    children = await postgres_db.get_delegation_children(target_id)
+    child_results = []
+    for child in children:
+        child_id = str(child["id"])
+        child_status = child.get("status", "unknown")
+
+        # Parse freeze_data for summary/confidence
+        freeze = child.get("freeze_data")
+        if isinstance(freeze, str):
+            try:
+                freeze = json.loads(freeze)
+            except (json.JSONDecodeError, ValueError):
+                freeze = {}
+        freeze = freeze or {}
+
+        child_results.append({
+            "job_id": child_id,
+            "description": child.get("description", ""),
+            "status": child_status,
+            "config_name": child.get("config_name", "default"),
+            "creation_order": child.get("creation_order"),
+            "branch_name": child.get("branch_name"),
+            "worktree_path": child.get("worktree_path"),
+            "merge_status": child.get("merge_status"),
+            "summary": freeze.get("summary", ""),
+            "confidence": freeze.get("confidence", 0.0),
+            "deliverables": freeze.get("deliverables", []),
+        })
+
+    # Store results in parent context for resume injection
+    parent_ctx = parent.get("context") or {}
+    if isinstance(parent_ctx, str):
+        try:
+            parent_ctx = json.loads(parent_ctx)
+        except (json.JSONDecodeError, ValueError):
+            parent_ctx = {}
+    parent_ctx = dict(parent_ctx)
+    parent_ctx["delegation_results"] = child_results
+
+    await postgres_db.update_job_context(target_id, parent_ctx)
+
+    # Unblock parent: waiting → created (dispatcher picks it up for resume)
+    await postgres_db.update_job_status(target_id, status="created")
+    _trigger_dispatch()
+
+    completed_count = sum(1 for c in child_results if c["status"] == "completed")
+    total_count = len(child_results)
+    logger.info(
+        f"All {total_count} delegation children done for parent {target_id} "
+        f"({completed_count} completed) — parent unblocked"
+    )
+    actions.append(
+        f"delegation: all {total_count} children done, "
+        f"parent {target_id} unblocked ({completed_count} completed)"
+    )
+
+
 async def _handle_critic_verdict_on_complete(
     job: dict[str, Any],
     actions: list[str],
@@ -3999,14 +4123,14 @@ async def _trigger_verification_on_complete(
                 "evaluation": ["approve_job", "return_job_with_feedback"],
             },
             "llm": {
-                "model": "openrouter/minimax/minimax-m2.5",
+                "model": "openrouter/minimax/minimax-m2.7",
                 "reasoning_level": "xhigh",
                 "strategic": {
-                    "model": "openrouter/minimax/minimax-m2.5",
+                    "model": "openrouter/minimax/minimax-m2.7",
                     "reasoning_level": "xhigh",
                 },
                 "tactical": {
-                    "model": "openrouter/minimax/minimax-m2.5",
+                    "model": "openrouter/minimax/minimax-m2.7",
                     "reasoning_level": "xhigh",
                 },
             },
@@ -4157,18 +4281,33 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         result = request.model_dump()
         actions: list[str] = []
 
-        # Backfill freeze_data from the request if the DB doesn't have it
-        if not job.get("freeze_data") and result.get("freeze_data"):
+        # Write freeze_data from the completion report.
+        # The orchestrator is the single authority for DB writes — agents
+        # report freeze_data in the completion payload, we persist it.
+        if result.get("freeze_data"):
             job["freeze_data"] = result["freeze_data"]
             try:
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
-                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid AND freeze_data IS NULL",
+                        "UPDATE jobs SET freeze_data = $1::jsonb WHERE id = $2::uuid",
                         json.dumps(result["freeze_data"]),
                         job_id,
                     )
             except Exception as e:
-                logger.warning(f"Failed to backfill freeze_data for {job_id}: {e}")
+                logger.warning(f"Failed to write freeze_data for {job_id}: {e}")
+
+        # Clear any remaining queued_replies from job context on completion.
+        # The agent may have consumed them during phase transitions.
+        if result.get("should_stop"):
+            try:
+                async with postgres_db.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE jobs SET context = context - 'queued_replies' "
+                        "WHERE id = $1::uuid AND context ? 'queued_replies'",
+                        job_id,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to clear queued_replies for {job_id}: {e}")
 
         # 0. VM recovery: if workspace became unavailable, re-provision and re-queue
         error = result.get("error") or {}
@@ -4206,6 +4345,17 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
             actions.append(f"status -> {new_status}")
             logger.info(f"Job {job_id} status set to '{new_status}'")
 
+            # Set completed_at for terminal statuses
+            if new_status == "completed":
+                try:
+                    async with postgres_db.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE jobs SET completed_at = NOW() WHERE id = $1::uuid",
+                            job_id,
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to set completed_at for {job_id}: {e}")
+
             # Update job dict with new status for downstream checks
             job["status"] = new_status
 
@@ -4226,6 +4376,12 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
             await _handle_scholar_completion(job, actions)
         except Exception as e:
             logger.error(f"Error handling scholar completion for {job_id}: {e}", exc_info=True)
+
+        # 3c. Handle delegation child completion (resume parent when all siblings done)
+        try:
+            await _handle_delegation_child_completion(job, actions)
+        except Exception as e:
+            logger.error(f"Error handling delegation child completion for {job_id}: {e}", exc_info=True)
 
         # 4. Trigger verification (if this is a main job that completed)
         try:

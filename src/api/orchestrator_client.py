@@ -487,18 +487,16 @@ class OrchestratorClient:
     ) -> bool:
         """Report job completion to the orchestrator.
 
-        The orchestrator handles all post-completion logic: status
-        determination, critic verdict handling, verification job spawning,
-        curation final pass, and dispatch.
+        The orchestrator is the single authority for DB status. It handles
+        all post-completion logic: status determination, freeze_data persistence,
+        critic verdict handling, verification job spawning, curation, and dispatch.
 
         Args:
             job_id: UUID of the completed job
-            result: Final graph state (should_stop, goal_achieved, error)
+            result: Final graph state (should_stop, goal_achieved, error, freeze_data)
 
         Returns:
             True if the orchestrator handled completion successfully.
-            False on 404 (old orchestrator without endpoint) or failure,
-            signalling the agent should fall back to local handling.
         """
         if not self._client:
             await self.connect()
@@ -539,6 +537,43 @@ class OrchestratorClient:
             return False
         except Exception as e:
             logger.warning(f"Unexpected error reporting completion for job {job_id}: {e}")
+            return False
+
+    async def approve_job(
+        self,
+        job_id: str,
+        notes: str | None = None,
+    ) -> bool:
+        """Approve a frozen job via the orchestrator.
+
+        Args:
+            job_id: UUID of the job to approve
+            notes: Optional reviewer notes
+
+        Returns:
+            True if the orchestrator approved successfully.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/approve"
+        payload: dict[str, Any] = {}
+        if notes:
+            payload["notes"] = notes
+
+        try:
+            response = await self._client.put(url, json=payload, timeout=30.0)
+            if response.status_code == 200:
+                logger.info(f"Job {job_id} approved via orchestrator")
+                return True
+            else:
+                logger.warning(
+                    f"Approval failed for job {job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to approve job {job_id}: {e}")
             return False
 
     async def create_verification_job(
@@ -604,14 +639,14 @@ class OrchestratorClient:
                     "evaluation": ["approve_job", "return_job_with_feedback"],
                 },
                 "llm": {
-                    "model": "openrouter/minimax/minimax-m2.5",
+                    "model": "openrouter/minimax/minimax-m2.7",
                     "reasoning_level": "xhigh",
                     "strategic": {
-                        "model": "openrouter/minimax/minimax-m2.5",
+                        "model": "openrouter/minimax/minimax-m2.7",
                         "reasoning_level": "xhigh",
                     },
                     "tactical": {
-                        "model": "openrouter/minimax/minimax-m2.5",
+                        "model": "openrouter/minimax/minimax-m2.7",
                         "reasoning_level": "xhigh",
                     },
                 },

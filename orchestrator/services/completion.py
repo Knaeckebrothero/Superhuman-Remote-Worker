@@ -239,8 +239,9 @@ def determine_job_status(
 ) -> tuple[str | None, str | None]:
     """Determine the new job status from the graph execution result.
 
-    Mirrors the decision tree in ``_update_job_status_from_result()``
-    (src/api/app.py) but reads config from the DB rather than agent memory.
+    The orchestrator is the single authority for job status. Agents report
+    facts (should_stop, goal_achieved, freeze_data) and this function
+    determines the DB status.
 
     Returns:
         ``(new_status, error_message)`` — either or both may be ``None``
@@ -261,35 +262,44 @@ def determine_job_status(
     if not should_stop:
         return (None, None)  # Still running — leave as processing
 
-    # Critic jobs (have parent_job_id): graph.py / handle_transition already
-    # set the correct status (e.g. 'waiting' for returned verdicts).
+    # Resolve freeze_data from DB or request body
+    fd = _parse_freeze_data(job)
+    if not fd:
+        fd = result.get("freeze_data")
+        if not isinstance(fd, dict):
+            fd = {}
+
+    # Critic jobs (have parent_job_id): read status from freeze_data.
+    # Approved → "completed", returned → "waiting".
     if job.get("parent_job_id") is not None:
-        logger.debug(
-            "Job %s is a critic — skipping status override (handle_transition set it)",
-            job.get("id"),
-        )
-        return (None, None)
+        fd_status = fd.get("status")
+        if fd_status:
+            # Normalize synonyms
+            if fd_status == "job_completed":
+                fd_status = "completed"
+            logger.debug(
+                "Job %s is a sub-job — setting status from freeze_data: %s",
+                job.get("id"), fd_status,
+            )
+            return (fd_status, None)
+        # No explicit status in freeze_data — infer from goal_achieved
+        return ("completed" if goal_achieved else "pending_review", None)
 
     # Check if this is a job completion.
     # freeze_data may come from the DB (job dict) or from the request (result).
-    is_completion = goal_achieved or is_job_completion_freeze(job)
-    if not is_completion:
-        # Check freeze_data sent in the result (backfill from request body)
-        fd = result.get("freeze_data")
-        if isinstance(fd, dict):
-            ft = fd.get("freeze_type")
-            is_completion = (
-                ft == "job_complete"
-                or fd.get("status") == "job_completed"
-            )
+    freeze_type = fd.get("freeze_type")
+    is_completion = (
+        goal_achieved
+        or freeze_type == "job_complete"
+        or fd.get("status") == "job_completed"
+    )
 
     # Job completion (any autonomy level)
     if is_completion:
         if is_verification_enabled(job):
             return ("reviewing", None)
         elif goal_achieved:
-            # Full autonomy — graph.py already set 'completed'
-            return (None, None)
+            return ("completed", None)
         else:
             # Non-full autonomy, no verification — keep pending_review
             return ("pending_review", None)

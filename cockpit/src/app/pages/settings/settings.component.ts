@@ -144,6 +144,14 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 </select>
               </div>
             </div>
+            <div class="form-row">
+              <label class="field-label">Embedding Provider</label>
+              <select class="form-input" [(ngModel)]="prefEmbeddingProvider">
+                <option value="">Server default</option>
+                <option value="local">Local</option>
+                <option value="openrouter">OpenRouter</option>
+              </select>
+            </div>
             <button
               class="create-btn"
               (click)="savePreferences()"
@@ -815,6 +823,7 @@ export class SettingsComponent implements OnInit {
   prefAuxModel = '';
   prefAutonomy = '';
   prefReasoning = '';
+  prefEmbeddingProvider = '';
   readonly savingPrefs = signal(false);
   readonly prefsSaved = signal(false);
 
@@ -847,6 +856,7 @@ export class SettingsComponent implements OnInit {
         this.prefAuxModel = prefs.default_auxiliary_model || '';
         this.prefAutonomy = prefs.default_autonomy || '';
         this.prefReasoning = prefs.default_reasoning_level || '';
+        this.prefEmbeddingProvider = prefs.embedding_provider || '';
 
         // Sync communication preferences
         const comm = prefs.communication;
@@ -959,6 +969,7 @@ export class SettingsComponent implements OnInit {
     settings['default_auxiliary_model'] = this.prefAuxModel.trim() || null;
     settings['default_autonomy'] = this.prefAutonomy || null;
     settings['default_reasoning_level'] = this.prefReasoning || null;
+    settings['embedding_provider'] = this.prefEmbeddingProvider || null;
 
     this.settingsService.updatePreferences(settings).subscribe({
       next: () => {

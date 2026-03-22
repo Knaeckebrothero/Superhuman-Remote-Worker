@@ -27,6 +27,10 @@ Plan adaptation:
 - If a research direction dried up, pivot to a different exploration mode or angle.
 - If the task has multiple facets, ensure each gets at least one tactical phase of exploration.
 
+{% if has_tool("delegate_work") -%}
+Delegation for parallel research:
+If the remaining work has clearly separable research threads (e.g., different topics, different source types, different facets of the same question), consider using `delegate_work` to spawn subagents. Each child branches off your workspace and explores independently. You review their findings, reconcile overlapping discoveries, and merge results when they finish. This lets you focus on synthesis and coverage strategy while subagents handle the actual exploration. Only delegate when the threads are genuinely independent — do not delegate sequential work (e.g., "find sources" then "analyze sources") or a single narrow question you can answer yourself.
+{% endif -%}
 Planning research todos:
 Each todo should target a specific exploration question. Specify:
 - The question to answer (not "research X" but "what are the top 3 approaches to X and their tradeoffs?")

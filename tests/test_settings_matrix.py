@@ -36,19 +36,19 @@ def clear_settings_matrix_cache():
 
 class TestDetectModelFamilyMinimax:
     def test_bare_name(self):
-        assert detect_model_family("minimax-m2.5") == "minimax"
+        assert detect_model_family("minimax-m2.7") == "minimax"
 
     def test_with_openai_prefix(self):
-        assert detect_model_family("openai/minimax-m2.5") == "minimax"
+        assert detect_model_family("openai/minimax-m2.7") == "minimax"
 
     def test_with_openrouter_prefix(self):
         assert detect_model_family("openrouter/minimax/minimax-01") == "minimax"
 
     def test_case_insensitive(self):
-        assert detect_model_family("MiniMax-M2.5") == "minimax"
+        assert detect_model_family("MiniMax-M2.7") == "minimax"
 
     def test_reasoning_method_is_none(self):
-        assert detect_reasoning_method("minimax-m2.5") == "none"
+        assert detect_reasoning_method("minimax-m2.7") == "none"
 
 
 # =============================================================================
@@ -105,7 +105,7 @@ class TestLoadSettingsMatrix:
 class TestApplySettingsMatrix:
     def test_fills_gaps(self):
         """Settings matrix values fill in keys not set by expert."""
-        data = {"llm": {"model": "minimax-m2.5", "temperature": 0.0}}
+        data = {"llm": {"model": "minimax-m2.7", "temperature": 0.0}}
         _apply_settings_matrix(data, expert_llm_keys={"model"})
         # temperature was NOT in expert_llm_keys, so settings matrix overrides it
         assert data["llm"]["temperature"] == 1.0
@@ -114,7 +114,7 @@ class TestApplySettingsMatrix:
 
     def test_expert_wins(self):
         """Expert-set keys are NOT overridden by settings matrix."""
-        data = {"llm": {"model": "minimax-m2.5", "temperature": 0.5}}
+        data = {"llm": {"model": "minimax-m2.7", "temperature": 0.5}}
         _apply_settings_matrix(data, expert_llm_keys={"model", "temperature"})
         # temperature was in expert_llm_keys, so it stays at 0.5
         assert data["llm"]["temperature"] == 0.5
@@ -139,7 +139,7 @@ class TestApplySettingsMatrix:
 
     def test_returns_data(self):
         """Returns the mutated data dict."""
-        data = {"llm": {"model": "minimax-m2.5"}}
+        data = {"llm": {"model": "minimax-m2.7"}}
         result = _apply_settings_matrix(data, expert_llm_keys=set())
         assert result is data
 
@@ -153,7 +153,7 @@ class TestApplySettingsMatrixLimits:
     def test_limits_applied(self):
         """Settings matrix limits values are applied from default+family merge."""
         data = {
-            "llm": {"model": "minimax-m2.5"},
+            "llm": {"model": "minimax-m2.7"},
             "limits": {"message_count_threshold": 300},
         }
         _apply_settings_matrix(data, expert_llm_keys=set())
@@ -163,7 +163,7 @@ class TestApplySettingsMatrixLimits:
 
     def test_limits_key_not_leaked_to_llm(self):
         """The 'limits' sub-dict must NOT be set on data['llm']."""
-        data = {"llm": {"model": "minimax-m2.5"}}
+        data = {"llm": {"model": "minimax-m2.7"}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         assert "limits" not in data["llm"]
 
@@ -177,7 +177,7 @@ class TestApplySettingsMatrixLimits:
             "minimax": {"temperature": 1.0},
         }
         data = {
-            "llm": {"model": "minimax-m2.5"},
+            "llm": {"model": "minimax-m2.7"},
             "limits": {"message_count_threshold": 300},
         }
         _apply_settings_matrix(data, expert_llm_keys=set())
@@ -186,7 +186,7 @@ class TestApplySettingsMatrixLimits:
 
     def test_creates_limits_dict_if_missing(self):
         """If data has no 'limits' key, it gets created via setdefault."""
-        data = {"llm": {"model": "minimax-m2.5"}}
+        data = {"llm": {"model": "minimax-m2.7"}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         assert "limits" in data
         assert data["limits"]["context_threshold_tokens"] == 100000
@@ -201,7 +201,7 @@ class TestApplySettingsMatrixLimits:
 
     def test_family_overrides_default(self):
         """Family-specific values override default entry."""
-        data = {"llm": {"model": "minimax-m2.5"}, "limits": {}}
+        data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set())
         # minimax entry overrides default
         assert data["limits"]["context_threshold_tokens"] == 100000
@@ -210,7 +210,7 @@ class TestApplySettingsMatrixLimits:
     def test_matrix_is_sole_source_for_limits(self):
         """Matrix limits always win — no expert_limits_keys check."""
         data = {
-            "llm": {"model": "minimax-m2.5"},
+            "llm": {"model": "minimax-m2.7"},
             "limits": {"context_threshold_tokens": 50000},
         }
         _apply_settings_matrix(data, expert_llm_keys=set())
@@ -239,7 +239,7 @@ class TestPerExpertMatrix:
         with open(expert_matrix_path, "w") as f:
             yaml.dump(expert_matrix, f)
 
-        data = {"llm": {"model": "minimax-m2.5"}, "limits": {}}
+        data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
 
         # Expert matrix overrides temperature
@@ -252,7 +252,7 @@ class TestPerExpertMatrix:
     def test_no_expert_matrix_uses_base(self, tmp_path):
         """Missing expert settings_matrix.yaml falls back to base."""
         # tmp_path exists but has no settings_matrix.yaml
-        data = {"llm": {"model": "minimax-m2.5"}, "limits": {}}
+        data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
         _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
 
         # Values come from base matrix
@@ -342,7 +342,7 @@ class TestSettingsMatrixIntegration:
             "agent_id": "test_agent",
             "display_name": "Test Agent",
             "llm": {
-                "model": "openai/minimax-m2.5",
+                "model": "openai/minimax-m2.7",
             },
         }
         config_file = tmp_path / "config.yaml"
@@ -363,7 +363,7 @@ class TestSettingsMatrixIntegration:
             "agent_id": "test_agent",
             "display_name": "Test Agent",
             "llm": {
-                "model": "openai/minimax-m2.5",
+                "model": "openai/minimax-m2.7",
                 "temperature": 0.5,  # Expert explicitly sets temperature
             },
         }
@@ -408,7 +408,7 @@ class TestSettingsMatrixIntegration:
             "agent_id": "test_agent",
             "display_name": "Test Agent",
             "llm": {
-                "model": "openai/minimax-m2.5",
+                "model": "openai/minimax-m2.7",
             },
         }
         config_file = tmp_path / "config.yaml"
@@ -456,7 +456,7 @@ class TestSettingsMatrixIntegration:
             "$extends": "defaults",
             "agent_id": "test_agent",
             "display_name": "Test Agent",
-            "llm": {"model": "openai/minimax-m2.5"},
+            "llm": {"model": "openai/minimax-m2.7"},
         }
         config_file = expert_dir / "config.yaml"
         with open(config_file, "w") as f:
@@ -610,7 +610,7 @@ class TestApplySettingsMatrixEdgeCases:
     def test_preserves_non_model_dependent_limits(self):
         """Behavioral limits (message_count_threshold, tool_retry_count) not overwritten."""
         data = {
-            "llm": {"model": "minimax-m2.5"},
+            "llm": {"model": "minimax-m2.7"},
             "limits": {
                 "message_count_threshold": 300,
                 "tool_retry_count": 5,
@@ -731,7 +731,7 @@ class TestRealMatrixFamilies:
     @pytest.mark.parametrize(
         "model,expected_ctx,expected_max",
         [
-            ("minimax-m2.5", 100000, 150000),  # Updated minimax limits
+            ("minimax-m2.7", 100000, 150000),  # Updated minimax limits
             ("o3-mini", 130000, 170000),
             ("deepseek-r1", 40000, 55000),
             ("gemini-2.0-flash", 150000, 200000),
@@ -748,7 +748,7 @@ class TestRealMatrixFamilies:
     @pytest.mark.parametrize(
         "model,expected_temp",
         [
-            ("minimax-m2.5", 1.0),
+            ("minimax-m2.7", 1.0),
             ("o3-mini", 1.0),
         ],
     )
@@ -797,7 +797,7 @@ class TestUploadedConfigMatrix:
         uploaded = {
             "agent_id": "uploaded_agent",
             "display_name": "Uploaded Agent",
-            "llm": {"model": "minimax-m2.5", "temperature": 0.3},
+            "llm": {"model": "minimax-m2.7", "temperature": 0.3},
         }
         config_file = tmp_path / "uploaded.yaml"
         with open(config_file, "w") as f:

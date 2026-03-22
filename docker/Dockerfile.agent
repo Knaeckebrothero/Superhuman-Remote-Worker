@@ -87,6 +87,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     poppler-utils \
+    ffmpeg \
     ripgrep \
     jq \
     nodejs \

@@ -54,4 +54,4 @@ The second critic (7ddf958a) read the first critic's (7a7625f0) verification rep
 
 **File:** `src/api/orchestrator_client.py` — `create_verification_job()`
 
-Verification jobs now override the LLM to `openrouter/minimax/minimax-m2.5` with `reasoning_level: xhigh` for both strategic and tactical phases via `config_override`. This ensures a capable model is always used for quality gating regardless of the critic's default config.
+Verification jobs now override the LLM to `openrouter/minimax/minimax-m2.7` with `reasoning_level: xhigh` for both strategic and tactical phases via `config_override`. This ensures a capable model is always used for quality gating regardless of the critic's default config.
