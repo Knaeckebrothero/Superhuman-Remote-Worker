@@ -3,17 +3,20 @@ Embedding Service for Citation Engine
 ======================================
 OpenAI-compatible embedding API client for vector search.
 
-Supports any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, LiteLLM).
+Supports multiple providers selected via ``EMBEDDING_PROVIDER``:
+- ``local`` (default): Custom endpoint or OpenAI, configured via
+  ``CITATION_EMBEDDING_URL`` / ``CITATION_EMBEDDING_KEY``
+- ``openrouter``: OpenRouter API, configured via ``OPENROUTER_API_KEY``
 
-Fallback: When OPENROUTER_API_KEY is set and the primary embedding server
-is unreachable, requests automatically fall back to OpenRouter using the
-same model (prefixed with ``qwen/``).
+Per-account provider override is injected by the orchestrator dispatcher.
 
 Environment Variables:
+    EMBEDDING_PROVIDER: Provider ("local" or "openrouter", default: "local")
     CITATION_EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
-    CITATION_EMBEDDING_URL: API base URL (default: https://api.openai.com/v1)
-    CITATION_EMBEDDING_KEY: API key (defaults to OPENAI_API_KEY)
+    CITATION_EMBEDDING_URL: API base URL for local provider
+    CITATION_EMBEDDING_KEY: API key for local provider (defaults to OPENAI_API_KEY)
     CITATION_EMBEDDING_BATCH_SIZE: Max texts per API batch (default: 2048)
+    OPENROUTER_API_KEY: API key for OpenRouter provider
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ _KNOWN_DIMENSIONS: dict[str, int] = {
     "bge-small-en-v1.5": 384,
 }
 
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1"
+
 
 class EmbeddingServiceError(Exception):
     """Raised when the embedding service encounters an error."""
@@ -52,20 +57,15 @@ class EmbeddingServiceNotConfigured(EmbeddingServiceError):
 
 class EmbeddingService:
     """
-    OpenAI-compatible embedding API client.
+    OpenAI-compatible embedding API client with configurable providers.
 
-    Works with OpenAI, Ollama, vLLM, LiteLLM, and any other
-    service that implements the /v1/embeddings endpoint.
+    Supports ``local`` (any OpenAI-compatible endpoint) and ``openrouter``
+    providers, selected via the ``EMBEDDING_PROVIDER`` environment variable.
 
     Usage:
         service = EmbeddingService()  # Uses env vars
         vector = service.embed("Hello world")
         vectors = service.embed_batch(["Hello", "World"])
-
-    Environment Variables:
-        CITATION_EMBEDDING_MODEL: Model name (default: qwen3-embedding-8b)
-        CITATION_EMBEDDING_URL: Base URL (default: https://api.openai.com/v1)
-        CITATION_EMBEDDING_KEY: API key (defaults to OPENAI_API_KEY)
     """
 
     def __init__(
@@ -78,22 +78,37 @@ class EmbeddingService:
         max_tokens_per_text: int = 8191,
         timeout: float = 60.0,
     ):
-        self.model = model or os.getenv(
+        base_model = model or os.getenv(
             "CITATION_EMBEDDING_MODEL", "qwen3-embedding-8b"
         )
-        self.api_url = (
-            api_url
-            or os.getenv("CITATION_EMBEDDING_URL")
-            or "https://api.openai.com/v1"
-        )
-        self.api_key = (
-            api_key
-            or os.getenv("CITATION_EMBEDDING_KEY")
-            or os.getenv("OPENAI_API_KEY")
-        )
 
-        # Strip trailing slash from URL
-        self.api_url = self.api_url.rstrip("/")
+        # Explicit constructor args bypass provider logic (direct instantiation)
+        if api_url:
+            self.provider = "explicit"
+            self.model = base_model
+            self.api_url = api_url.rstrip("/")
+            self.api_key = api_key or os.getenv("CITATION_EMBEDDING_KEY") or os.getenv("OPENAI_API_KEY")
+        else:
+            self.provider = os.getenv("EMBEDDING_PROVIDER", "local").lower()
+
+            if self.provider == "openrouter":
+                self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+                self.api_url = OPENROUTER_API_URL
+                self.model = f"qwen/{base_model}" if "/" not in base_model else base_model
+            else:
+                # "local" provider (default)
+                self.api_url = (
+                    os.getenv("CITATION_EMBEDDING_URL")
+                    or "https://api.openai.com/v1"
+                )
+                self.api_key = (
+                    api_key
+                    or os.getenv("CITATION_EMBEDDING_KEY")
+                    or os.getenv("OPENAI_API_KEY")
+                )
+                self.model = base_model
+
+            self.api_url = self.api_url.rstrip("/")
 
         # Validate configuration
         if not self.api_key and "api.openai.com" in self.api_url:
@@ -119,25 +134,13 @@ class EmbeddingService:
         except (ImportError, KeyError):
             log.debug(f"tiktoken unavailable for model {self.model}, using heuristic")
 
-        self._dimension: int | None = _KNOWN_DIMENSIONS.get(self.model)
-
-        # Fallback: OpenRouter (same model, different endpoint)
-        self._fallback_url: str | None = None
-        self._fallback_key: str | None = None
-        self._fallback_model: str | None = None
-        _openrouter_key = os.getenv("OPENROUTER_API_KEY")
-        if _openrouter_key and "openrouter.ai" not in self.api_url:
-            self._fallback_url = "https://openrouter.ai/api/v1"
-            self._fallback_key = _openrouter_key
-            self._fallback_model = f"qwen/{self.model}"
-            log.info(
-                f"EmbeddingService fallback configured: "
-                f"model={self._fallback_model}, url={self._fallback_url}"
-            )
+        # Dimension lookup uses the unprefixed model name
+        self._dimension: int | None = _KNOWN_DIMENSIONS.get(base_model)
 
         log.info(
-            f"EmbeddingService configured: model={self.model}, "
-            f"url={self.api_url}, dimension={self._dimension or 'unknown'}"
+            f"EmbeddingService configured: provider={self.provider}, "
+            f"model={self.model}, url={self.api_url}, "
+            f"dimension={self._dimension or 'unknown'}"
         )
 
     @property
@@ -232,9 +235,6 @@ class EmbeddingService:
         """
         Send a single embedding API request for a batch of texts.
 
-        Falls back to OpenRouter when the primary server is unreachable
-        and OPENROUTER_API_KEY is configured.
-
         Returns:
             List of embedding vectors in input order.
         """
@@ -253,13 +253,6 @@ class EmbeddingService:
             raise EmbeddingServiceError(
                 f"Embedding API returned {e.response.status_code}: {e.response.text[:500]}"
             ) from e
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-            # Primary server unreachable — try fallback
-            if not self._fallback_url:
-                raise EmbeddingServiceError(
-                    f"Embedding API request failed: {e}"
-                ) from e
-            return self._embed_single_batch_fallback(texts, client, e)
         except httpx.RequestError as e:
             raise EmbeddingServiceError(
                 f"Embedding API request failed: {e}"
@@ -272,56 +265,6 @@ class EmbeddingService:
             )
 
         # Sort by index to ensure correct order
-        embeddings_data.sort(key=lambda x: x.get("index", 0))
-        return [item["embedding"] for item in embeddings_data]
-
-    def _embed_single_batch_fallback(
-        self,
-        texts: list[str],
-        client: httpx.Client,
-        original_error: Exception,
-    ) -> list[list[float]]:
-        """Retry a batch against the OpenRouter fallback endpoint."""
-        import httpx
-
-        log.warning(
-            f"Primary embedding server unreachable "
-            f"({type(original_error).__name__}), "
-            f"falling back to OpenRouter ({len(texts)} texts)"
-        )
-
-        fallback_url = f"{self._fallback_url}/embeddings"
-        fallback_headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._fallback_key}",
-        }
-        payload = {
-            "model": self._fallback_model,
-            "input": texts,
-        }
-
-        try:
-            response = client.post(
-                fallback_url, json=payload, headers=fallback_headers
-            )
-            response.raise_for_status()
-            data = response.json()
-        except httpx.HTTPStatusError as e:
-            raise EmbeddingServiceError(
-                f"Fallback embedding API returned {e.response.status_code}: "
-                f"{e.response.text[:500]}"
-            ) from e
-        except httpx.RequestError as e:
-            raise EmbeddingServiceError(
-                f"Fallback embedding API request also failed: {e}"
-            ) from e
-
-        embeddings_data = data.get("data", [])
-        if len(embeddings_data) != len(texts):
-            raise EmbeddingServiceError(
-                f"Expected {len(texts)} embeddings, got {len(embeddings_data)}"
-            )
-
         embeddings_data.sort(key=lambda x: x.get("index", 0))
         return [item["embedding"] for item in embeddings_data]
 
