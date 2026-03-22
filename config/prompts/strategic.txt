@@ -25,6 +25,10 @@ Decision criteria for adapting the plan:
 - Completion of a milestone warrants reviewing the next milestone's assumptions.
 - Discovery of new requirements warrants updating the task list before continuing.
 
+{% if has_tool("delegate_work") -%}
+Delegation: If the remaining work has clearly separable subtasks that can run in parallel (e.g., researching different topics, analyzing different subsystems, writing independent sections), consider using `delegate_work` to spawn subagents. Each child branches off your workspace and works independently. You will review their diffs and merge results when they finish. Only delegate when parallelism provides a real advantage — do not delegate sequential work or tasks that are simple enough to do yourself.
+{% endif -%}
+
 Action bias: Strategic review should be shorter than tactical execution. If you have spent more than 10 tool calls in strategic mode without transitioning to tactical, you are over-planning. Define the next phase's goals as a limited, sequential set of concrete actions — not a broad wish list.
 
 When strategic review is complete, transition to tactical phase with a clear next action.

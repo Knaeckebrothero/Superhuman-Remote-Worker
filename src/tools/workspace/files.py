@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 # Supported image file extensions
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif"}
 
+# Supported audio file extensions (matching Whisper API supported formats)
+AUDIO_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm",
+    ".mp4", ".mpeg", ".mpga", ".oga", ".opus",
+}
+
 # Document extensions that support visual rendering
 VISUAL_DOCUMENT_EXTENSIONS = {".pdf", ".pptx", ".docx"}
 
@@ -64,6 +70,11 @@ def _get_mime_type(file_path: Path) -> str:
 def _is_image_file(file_path: Path) -> bool:
     """Check if file is a supported image format."""
     return file_path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _is_audio_file(file_path: Path) -> bool:
+    """Check if file is a supported audio format."""
+    return file_path.suffix.lower() in AUDIO_EXTENSIONS
 
 
 def _is_visual_document(file_path: Path) -> bool:
@@ -212,6 +223,108 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             except Exception as e:
                 logger.error(f"Error describing image {full_path}: {e}")
                 return f"[IMAGE: {full_path.name}]\n(Error generating description: {str(e)})"
+
+    def _handle_audio_file(
+        full_path: Path,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> str:
+        """Handle audio files via Whisper transcription with line-numbered paging.
+
+        Transcribes audio to text using AudioHelper (large files are
+        transparently chunked). Results are cached via DescriptionCache.
+        Output is line-numbered with offset/limit paging, matching text files.
+        """
+        try:
+            from src.services.audio_helper import get_audio_helper, split_transcript_into_lines
+            from src.services.description_cache import get_description_cache
+
+            cache = get_description_cache()
+
+            # Get transcript from cache or via transcription
+            cached = cache.get(full_path)
+            if cached:
+                logger.debug(f"Cache hit for audio: {full_path.name}")
+                transcript = cached
+            else:
+                audio = get_audio_helper()
+                transcript = audio.transcribe_sync(
+                    full_path,
+                    job_id=context.job_id,
+                )
+
+                # Don't cache error results
+                if not transcript.startswith("[Error"):
+                    cache.set(full_path, transcript)
+
+            # Return errors directly (no line numbering)
+            if transcript.startswith("[Error"):
+                return f"[AUDIO: {full_path.name}]\n\n{transcript}"
+
+            # Split into lines for paging
+            lines = split_transcript_into_lines(transcript)
+            total_lines = len(lines)
+
+            if total_lines == 0:
+                return f"[AUDIO: {full_path.name}]\n\n(No speech content detected)"
+
+            # Apply offset/limit defaults (same as text files)
+            start_line = offset if offset is not None else 1
+            line_count = limit if limit is not None else DEFAULT_LINE_LIMIT
+            line_count = min(line_count, MAX_LINE_LIMIT)
+
+            if start_line < 1:
+                return "Error: offset must be >= 1 (line numbers are 1-indexed)"
+
+            if start_line > total_lines:
+                return f"Error: offset ({start_line}) exceeds total lines ({total_lines})"
+
+            # Extract requested range
+            end_line = min(start_line + line_count - 1, total_lines)
+            selected_lines = lines[start_line - 1:end_line]
+
+            # Format with line numbers (cat -n style)
+            output_lines = []
+            for i, line in enumerate(selected_lines, start=start_line):
+                if len(line) > MAX_LINE_LENGTH:
+                    line = line[:MAX_LINE_LENGTH] + "..."
+                output_lines.append(f"{i:6}\t{line}")
+
+            result = f"[AUDIO: {full_path.name}]\n\n" + "\n".join(output_lines)
+
+            # Word count cap (same as text files)
+            word_count = len(result.split())
+            if word_count > max_read_words:
+                words = result.split()
+                truncated_text = " ".join(words[:max_read_words])
+                last_newline = truncated_text.rfind("\n")
+                if last_newline > 0:
+                    truncated_text = truncated_text[:last_newline]
+                kept_lines = truncated_text.count("\n")  # -1 for header line
+                actual_end = start_line + kept_lines - 1
+                result = truncated_text
+                result += (
+                    f"\n\n[TRUNCATED at word limit ({max_read_words:,} words). "
+                    f"Showing lines {start_line}-{actual_end} of {total_lines}. "
+                    f"Use offset={actual_end + 1} to continue.]"
+                )
+            elif end_line < total_lines:
+                result += (
+                    f"\n\n[Lines {start_line}-{end_line} of {total_lines}. "
+                    f"Use offset={end_line + 1} to continue.]"
+                )
+
+            return result
+
+        except ImportError as e:
+            logger.warning(f"Audio services not available: {e}")
+            return (
+                f"[AUDIO: {full_path.name}]\n"
+                f"(Transcription not available - audio services not configured)"
+            )
+        except Exception as e:
+            logger.error(f"Error transcribing audio {full_path}: {e}")
+            return f"[AUDIO: {full_path.name}]\n(Error transcribing: {str(e)})"
 
     def _get_visual_content(
         full_path: Path,
@@ -469,6 +582,11 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         For image files (PNG, JPG, etc.):
         - Returns image data or AI-generated description
 
+        For audio files (MP3, WAV, M4A, OGG, FLAC, etc.):
+        - Returns line-numbered text transcription via Whisper
+        - Supports offset/limit paging like text files
+        - Large files are automatically chunked for transcription
+
         Args:
             path: Relative path to the file (e.g., "workspace.md")
             offset: For text files: starting line number (1-indexed, default: 1)
@@ -481,6 +599,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             File content with line numbers, or error message.
             For documents: includes text + visual content descriptions.
             For images: includes image data or description.
+            For audio: includes text transcription of spoken content.
         """
         try:
             # Check file exists
@@ -494,6 +613,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Handle image files
             if _is_image_file(full_path):
                 result = _handle_image_file(full_path, describe)
+                if not result.startswith("Error:"):
+                    context.record_file_read(path)
+                return result
+
+            # Handle audio files (transcribe via Whisper, line-numbered paging)
+            if _is_audio_file(full_path):
+                result = _handle_audio_file(full_path, offset=offset, limit=limit)
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result

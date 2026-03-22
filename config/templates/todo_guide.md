@@ -148,6 +148,24 @@ Example todos:
 record what was checked and what the outcome was. "Verified — looks good" is not evidence.
 "Ran curl http://host:8090/health — returned 200 OK with body {status: ok}" is evidence.
 
+{% if has_tool("delegate_work") -%}
+### 7. Delegation Phase (parallel independent subtasks)
+
+Purpose: Split work across subagents when tasks are independent and benefit from parallelism.
+
+Example todos:
+- "Delegate parallel research: delegate_work with 3 tasks — topic A (scholar), topic B (scholar), topic C (scholar)"
+- "Review delegation results: check each child's git diff, approve or send feedback"
+- "Merge and reconcile: resolve any conflicts between child outputs, update plan.md"
+
+When to delegate vs. do it yourself:
+- **Delegate**: 2+ independent research topics, analyzing separate subsystems, writing unrelated sections
+- **Do it yourself**: Sequential work, tightly coupled tasks, anything with fewer than 2 parallel tracks
+
+A delegation todo should describe WHAT to delegate and WHY parallel execution helps.
+The review + merge step is always a separate todo — you need to inspect each child's work.
+{% endif -%}
+
 ---
 
 ## Web Search Mandate
@@ -270,6 +288,9 @@ Follow these patterns to create effective todos:
 | Batch Processing | 5-7 | Repetitive operations on multiple items |
 | Integration | 5 | Combining separately-produced parts |
 | Verification | 3-5 | Quality check before completion |
+{% if has_tool("delegate_work") -%}
+| Delegation | 2-3 | Independent subtasks that benefit from parallel execution |
+{% endif -%}
 
 **Default to 5 todos.** Go lower (3-4) for focused phases like verification of a small
 section. Go higher (6-7) for batch processing of similar items. If you need more than 7,

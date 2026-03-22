@@ -178,6 +178,7 @@ export interface UserSettings {
   default_autonomy?: string | null;
   default_reasoning_level?: string | null;
   default_auxiliary_model?: string | null;
+  embedding_provider?: string | null;
   communication?: CommunicationSettings | null;
 }
 

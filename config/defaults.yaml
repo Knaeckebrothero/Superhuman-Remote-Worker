@@ -129,6 +129,9 @@ tools:
   # Communication tools - agent-human messaging via email (src/tools/communication/)
   communication:
     - send_message
+  # Delegation tools - spawn child jobs as workspace branches (src/tools/delegation/)
+  # Not in defaults — opt-in per expert config (e.g. tools.delegation: [delegate_work])
+  delegation: []
   # Git tools - workspace version control (src/tools/git/)
   git:
     - git_log
@@ -160,8 +163,8 @@ limits:
     max_tag_repetitions: 50     # same closing tag repeated this many times
     max_token_repetitions: 20   # same word/token repeated consecutively
     max_line_repetitions: 10    # same line repeated in output
-  progress_stall_threshold: 15     # tool calls without progress before stuck detection
-  max_tool_calls_per_phase: 100    # absolute max tool calls per phase before freeze
+  progress_stall_threshold: 30     # tool calls without progress before nudge reminder
+  max_tool_calls_per_phase: 200    # max tool calls per phase before rewind (tactical) or freeze (strategic)
 
 context_management:
   compact_on_archive: true
@@ -241,6 +244,14 @@ curator:
 scholar:
   enabled: true            # Spawn a scholar job before main job starts
   scholar_config: scholar   # Which expert config to use
+
+# Subagent delegation — let agents spawn child jobs that branch off the workspace
+delegation:
+  enabled: false             # Opt-in: agent gets delegate_work tool
+  max_depth: 1               # Nesting depth (1 = no grandchildren)
+  default_timeout: 7200      # Default timeout per delegation in seconds (2h)
+  max_timeout: 14400          # Maximum allowed timeout (4h)
+  allowed_configs: []        # Which configs children can use (empty = any)
 
 # Autonomy level — controls when the agent pauses for human review
 # full | review | partial | guided | dependent

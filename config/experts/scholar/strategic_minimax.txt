@@ -38,6 +38,13 @@ WHY: Plans that are not updated after each phase accumulate drift. If you don't 
 - If the task has multiple facets, ensure each gets at least one tactical phase of exploration.
 </plan_adaptation>
 
+{% if has_tool("delegate_work") -%}
+<delegation>
+WHY: Research tasks often have naturally parallel threads — different topics, source types, or facets of the same question. Doing them sequentially wastes phases. Subagents let you run multiple exploration threads at once while you focus on synthesis and coverage strategy.
+
+If the remaining work has clearly separable research threads, consider using `delegate_work` to spawn subagents. Each child branches off your workspace and explores independently. You review their findings, reconcile overlapping discoveries, and merge results when they finish. Only delegate when the threads are genuinely independent — do not delegate sequential work (e.g., "find sources" then "analyze sources") or a single narrow question you can answer yourself.
+</delegation>
+{% endif -%}
 <research_ready_todos>
 WHY: Vague todos produce vague exploration which produces vague ideas. Every todo must specify a question, a mode, and an expected output.
 

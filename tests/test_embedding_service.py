@@ -136,3 +136,72 @@ class TestEmbeddingServiceEmbed:
         service = EmbeddingService()
         result = await service.embed_batch([])
         assert result == []
+
+
+class TestEmbeddingProviders:
+    """Test provider-based initialization."""
+
+    def test_local_provider_default(self, mock_env, mock_openai_client):
+        """Default provider is 'local'."""
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        assert service.provider == "local"
+        assert service.model == "qwen3-embedding-8b"
+        assert service.base_url == "https://api.openai.com/v1"
+
+    def test_openrouter_provider(self, monkeypatch, mock_openai_client):
+        """OpenRouter provider uses correct URL and prefixed model."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        assert service.provider == "openrouter"
+        assert service.api_key == "or-key-123"
+        assert service.base_url == "https://openrouter.ai/api/v1"
+        assert service.model == "qwen/qwen3-embedding-8b"
+
+    def test_openrouter_provider_custom_model(self, monkeypatch, mock_openai_client):
+        """OpenRouter auto-prefixes model name with qwen/."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123")
+        monkeypatch.setenv("EMBEDDING_MODEL", "qwen3-embedding-0.6b")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        assert service.model == "qwen/qwen3-embedding-0.6b"
+
+    def test_openrouter_provider_full_model_name(self, monkeypatch, mock_openai_client):
+        """OpenRouter skips prefix when model already contains /."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "openrouter")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123")
+        monkeypatch.setenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        assert service.model == "openai/text-embedding-3-small"
+
+    def test_explicit_local_provider(self, mock_env, monkeypatch, mock_openai_client):
+        """Explicit EMBEDDING_PROVIDER=local works."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        assert service.provider == "local"
+        assert service.api_key == "test-key-123"
+
+    def test_unknown_provider_falls_back_to_local(self, mock_env, monkeypatch, mock_openai_client):
+        """Unknown provider name falls back to local behavior."""
+        monkeypatch.setenv("EMBEDDING_PROVIDER", "nonexistent")
+
+        from src.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService()
+        # Unknown provider goes through the else (local) branch
+        assert service.provider == "nonexistent"
+        assert service.base_url == "https://api.openai.com/v1"

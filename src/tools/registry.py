@@ -67,6 +67,16 @@ TOOL_REGISTRY.update(get_evaluation_metadata())
 TOOL_REGISTRY.update(get_knowledge_metadata())
 TOOL_REGISTRY.update(get_communication_metadata())
 
+# Register delegation tool (placeholder — implementation in Phase 2)
+TOOL_REGISTRY["delegate_work"] = {
+    "module": "core.delegation",
+    "function": "delegate_work",
+    "description": "Delegate work to 1-5 subagent jobs that branch off your workspace",
+    "category": "delegation",
+    "phases": ["strategic", "tactical"],
+    "placeholder": True,  # Removed in Phase 2 when tool is implemented
+}
+
 
 def get_available_tools() -> Dict[str, Dict[str, Any]]:
     """Get all registered tools with their metadata.
@@ -451,6 +461,21 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
                     logger.debug(f"Loaded communication tool: {tool.name}")
         except Exception as e:
             logger.warning(f"Could not load communication tools: {e}")
+
+    # Delegation tools (subagent spawning)
+    if "delegation" in tools_by_category:
+        try:
+            from .delegation import create_delegation_tools, get_delegation_metadata  # noqa: F401
+            delegation_tools = create_delegation_tools(context)
+            requested = set(tools_by_category["delegation"])
+            for tool in delegation_tools:
+                if tool.name in requested:
+                    all_tools.append(tool)
+                    logger.debug(f"Loaded delegation tool: {tool.name}")
+        except ImportError:
+            logger.debug("Delegation tools not yet implemented (Phase 2)")
+        except Exception as e:
+            logger.warning(f"Could not load delegation tools: {e}")
 
     logger.info(f"Loaded {len(all_tools)} tools: {[t.name for t in all_tools]}")
     return all_tools

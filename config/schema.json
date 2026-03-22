@@ -325,6 +325,14 @@
           },
           "description": "Knowledge base tools: project knowledge CRUD + search (src/tools/knowledge/)",
           "examples": [["kb_write", "kb_update", "kb_read", "kb_list", "kb_search", "kb_related"]]
+        },
+        "delegation": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Delegation tools: spawn child jobs that branch off the workspace (src/tools/delegation/)",
+          "examples": [["delegate_work"]]
         }
       }
     },
@@ -425,14 +433,14 @@
         "progress_stall_threshold": {
           "type": "integer",
           "minimum": 5,
-          "default": 15,
-          "description": "Tool calls without progress before stuck detection triggers"
+          "default": 30,
+          "description": "Tool calls without progress before nudge reminder is injected"
         },
         "max_tool_calls_per_phase": {
           "type": "integer",
           "minimum": 20,
-          "default": 100,
-          "description": "Absolute maximum tool calls per phase before forced freeze"
+          "default": 200,
+          "description": "Max tool calls per phase before rewind (tactical) or freeze (strategic)"
         }
       }
     },
@@ -626,6 +634,43 @@
           "type": "string",
           "default": "scholar",
           "description": "Expert config name to use for the research job"
+        }
+      },
+      "additionalProperties": false
+    },
+    "delegation": {
+      "type": "object",
+      "description": "Subagent delegation: let agents spawn child jobs that branch off the workspace. Children inherit the parent's workspace as a git branch and work in parallel via git worktrees. See docs/features/subagent_delegation.md.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Opt-in: agent gets the delegate_work tool to spawn child jobs"
+        },
+        "max_depth": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 3,
+          "description": "Maximum nesting depth (1 = no grandchildren)"
+        },
+        "default_timeout": {
+          "type": "integer",
+          "default": 7200,
+          "description": "Default timeout per delegation in seconds (2 hours)"
+        },
+        "max_timeout": {
+          "type": "integer",
+          "default": 14400,
+          "description": "Maximum allowed timeout in seconds (4 hours)"
+        },
+        "allowed_configs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Which expert configs children can use (empty array = any config allowed)"
         }
       },
       "additionalProperties": false

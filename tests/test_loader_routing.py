@@ -416,7 +416,7 @@ class TestOpenRouterReasoningFormat:
     def test_minimal_not_clamped(self, mock_chat):
         """OpenRouter should pass minimal through without clamping."""
         mock_chat.return_value = MagicMock()
-        config = _make_config(model="openrouter/minimax/minimax-m2.5", reasoning_level="minimal")
+        config = _make_config(model="openrouter/minimax/minimax-m2.7", reasoning_level="minimal")
 
         _create_openrouter_llm(config, limits=None)
 

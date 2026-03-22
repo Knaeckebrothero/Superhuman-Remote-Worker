@@ -505,6 +505,7 @@ class PostgresDB:
                        project_id, parent_job_id, priority,
                        branch_name, repo_name, merge_status, repo_merge_statuses,
                        freeze_data,
+                       creation_order, worktree_path, delegation_context,
                        created_at, updated_at, description, context
                 FROM jobs
                 WHERE id = $1
@@ -528,6 +529,9 @@ class PostgresDB:
         parent_job_id: str | None = None,
         priority: int = 5,
         repo_name: str | None = None,
+        creation_order: int | None = None,
+        worktree_path: str | None = None,
+        delegation_context: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new job.
 
@@ -544,6 +548,9 @@ class PostgresDB:
             parent_job_id: Optional parent job UUID (for verification/follow-up jobs)
             priority: Job priority (0=low, 5=normal, 10=high). Default: 5
             repo_name: Optional Gitea repo name (e.g. "job-ec38de5d")
+            creation_order: Optional 0-based index for delegation subagent merge ordering
+            worktree_path: Optional git worktree path for delegation subagents
+            delegation_context: Optional shared context string from parent delegation
 
         Returns:
             Created job dict with id
@@ -555,9 +562,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name, parent_job_id, priority, repo_name)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path
                 """,
                 description,
                 document_path or document_dir,
@@ -573,6 +580,9 @@ class PostgresDB:
                 parent_uuid,
                 priority,
                 repo_name,
+                creation_order,
+                worktree_path,
+                delegation_context,
             )
 
         return dict(row)
@@ -786,6 +796,72 @@ class PostgresDB:
             result = await conn.execute(query, *values)
 
         return result == "UPDATE 1"
+
+    async def get_delegation_children(self, parent_job_id: str) -> list[Dict[str, Any]]:
+        """Get delegation child jobs ordered by creation_order.
+
+        Delegation children are distinguished from critic/scholar subjobs
+        by having a non-NULL creation_order.
+
+        Args:
+            parent_job_id: Parent job UUID as string
+
+        Returns:
+            List of child job dicts, ordered by creation_order ASC
+        """
+        try:
+            uuid_val = UUID(parent_job_id)
+        except ValueError:
+            return []
+
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT *
+                FROM jobs
+                WHERE parent_job_id = $1 AND creation_order IS NOT NULL
+                ORDER BY creation_order ASC
+                """,
+                uuid_val,
+            )
+
+        return [dict(row) for row in rows]
+
+    async def all_delegation_children_terminal(self, parent_job_id: str) -> bool:
+        """Check if all delegation children have reached a terminal status.
+
+        Returns True only if there is at least one delegation child AND all
+        of them are in a terminal state (completed, failed, cancelled, or
+        pending_review).
+
+        Args:
+            parent_job_id: Parent job UUID as string
+
+        Returns:
+            True if all delegation children are terminal, False otherwise
+        """
+        try:
+            uuid_val = UUID(parent_job_id)
+        except ValueError:
+            return False
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('completed', 'failed', 'cancelled', 'pending_review')
+                    ) as terminal
+                FROM jobs
+                WHERE parent_job_id = $1 AND creation_order IS NOT NULL
+                """,
+                uuid_val,
+            )
+
+        if not row:
+            return False
+        return row["total"] > 0 and row["total"] == row["terminal"]
 
     async def update_job_context(self, job_id: str, context: Dict[str, Any]) -> bool:
         """Update the context JSONB column for a job.

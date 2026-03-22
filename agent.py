@@ -523,9 +523,6 @@ async def approve_frozen_job(config_path: str, job_id: str):
         print("=" * 60)
         print(f"Job ID:       {result['job_id']}")
         print(f"Status:       {result['status']}")
-        print(f"Summary:      {result['summary']}")
-        print(f"Deliverables: {len(result['deliverables'])} files")
-        print(f"Approved at:  {result['approved_at']}")
         print("=" * 60)
 
     except ValueError as e:

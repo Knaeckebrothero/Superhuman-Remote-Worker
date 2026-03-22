@@ -384,6 +384,25 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
+-- Migration: Add creation_order to jobs table (subagent delegation merge ordering)
+-- 0-based index within sibling group; NULL for non-delegation jobs (critic/scholar).
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN creation_order SMALLINT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Add worktree_path to jobs table (git worktree location for delegation subagents)
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN worktree_path VARCHAR(500);
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
+-- Migration: Add delegation_context to jobs table (shared context string from parent)
+DO $$ BEGIN
+    ALTER TABLE jobs ADD COLUMN delegation_context TEXT;
+EXCEPTION WHEN duplicate_column THEN null;
+END $$;
+
 -- Migration: Add 'reviewing' and 'waiting' statuses for critic feedback loop
 -- reviewing = main job actively being reviewed by critic
 -- waiting = critic job waiting for main job to address feedback

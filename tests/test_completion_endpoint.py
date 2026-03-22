@@ -249,12 +249,34 @@ class TestDetermineJobStatus:
         assert status is None
         assert err is None
 
-    def test_critic_job_skipped(self):
-        """Critic jobs (with parent_job_id) should not have status overridden."""
+    def test_critic_job_approved(self):
+        """Critic jobs with approved verdict get status from freeze_data."""
+        job = make_job(
+            parent_job_id="parent-1",
+            freeze_data={"status": "completed", "freeze_type": "verdict", "verdict": "approved"},
+        )
+        result = {"should_stop": True, "goal_achieved": True}
+        status, err = determine_job_status(job, result)
+        assert status == "completed"
+        assert err is None
+
+    def test_critic_job_returned(self):
+        """Critic jobs with returned verdict get 'waiting' status from freeze_data."""
+        job = make_job(
+            parent_job_id="parent-1",
+            freeze_data={"status": "waiting", "freeze_type": "verdict", "verdict": "returned"},
+        )
+        result = {"should_stop": True, "goal_achieved": False}
+        status, err = determine_job_status(job, result)
+        assert status == "waiting"
+        assert err is None
+
+    def test_critic_job_no_freeze_data(self):
+        """Critic jobs without freeze_data infer from goal_achieved."""
         job = make_job(parent_job_id="parent-1")
         result = {"should_stop": True, "goal_achieved": True}
         status, err = determine_job_status(job, result)
-        assert status is None
+        assert status == "completed"
         assert err is None
 
     def test_goal_achieved_verification_enabled(self):
@@ -267,11 +289,11 @@ class TestDetermineJobStatus:
         assert status == "reviewing"
 
     def test_goal_achieved_verification_disabled(self):
-        """Full autonomy, no verification — graph already set completed."""
+        """Full autonomy, no verification — orchestrator sets completed."""
         job = make_job(verification_enabled=False)
         result = {"should_stop": True, "goal_achieved": True}
         status, err = determine_job_status(job, result)
-        assert status is None  # No change needed
+        assert status == "completed"
 
     def test_job_completion_freeze_verification_enabled(self):
         """Non-full autonomy, freeze_type=job_complete, verification enabled."""
@@ -436,10 +458,10 @@ class TestResolveScholarConfigFromDisk:
         assert sc.get("enabled") is True  # From defaults.yaml
 
     def test_scholar_config_reads_scholar_expert(self):
-        """The scholar expert config should not have its own scholar section
-        (would cause recursion), so it should just get defaults."""
+        """The scholar expert config disables scholar spawning to prevent
+        recursive scholar-of-scholar jobs."""
         sc = resolve_scholar_config_from_disk("scholar")
-        assert sc.get("enabled") is True
+        assert sc.get("enabled") is False
 
 
 class TestFormatScholarInstructions:

@@ -36,6 +36,18 @@ You alternate between two phases:
 - Write results to workspace files (typically `output/`)
 - When all todos are done, return to strategic phase
 
+{% if has_tool("delegate_work") -%}
+### Delegation
+
+You can use `delegate_work` to spawn 1-5 subagent jobs that branch off your workspace and run in parallel.
+
+**When to delegate**: Clearly separable subtasks that don't depend on each other, different subtasks benefiting from different expertise, parallel execution provides real time advantage.
+
+**How it works**: Call `delegate_work(tasks=[...], context="...")`. Each child gets a git branch of your workspace. You suspend while they work. When all finish, you resume to review diffs, approve (squash merge), or send feedback. Children merge in creation order.
+
+**Do not delegate**: Sequential work, simple tasks, tightly coupled subtasks.
+{% endif -%}
+
 ### Key Files
 
 - `plan.md` - Execution plan and progress tracker
