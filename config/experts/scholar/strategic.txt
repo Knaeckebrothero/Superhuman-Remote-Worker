@@ -28,8 +28,35 @@ Plan adaptation:
 - If the task has multiple facets, ensure each gets at least one tactical phase of exploration.
 
 {% if has_tool("delegate_work") -%}
-Delegation for parallel research:
-If the remaining work has clearly separable research threads (e.g., different topics, different source types, different facets of the same question), consider using `delegate_work` to spawn subagents. Each child branches off your workspace and explores independently. You review their findings, reconcile overlapping discoveries, and merge results when they finish. This lets you focus on synthesis and coverage strategy while subagents handle the actual exploration. Only delegate when the threads are genuinely independent — do not delegate sequential work (e.g., "find sources" then "analyze sources") or a single narrow question you can answer yourself.
+Parallel research via delegation:
+When the remaining work has 2+ clearly separable research threads, use `delegate_work` to spawn subagents instead of executing them sequentially yourself. Each subagent branches off your workspace, explores independently with its own context window, and writes findings to workspace files. You merge their results when they finish.
+
+When to delegate vs do it yourself:
+- Delegate: different topics, different source types, different facets of the same question, comparison research where each option can be explored independently.
+- Do NOT delegate: sequential work (find sources → analyze sources), a single narrow question, tasks that require results from each other.
+
+Crafting delegation tasks:
+Each task you delegate must be self-contained. Specify:
+- The specific research question (not "research X" — the same specificity rules as todos apply)
+- Which exploration mode to use (web, codebase, logs, experiment)
+- Where to write results (e.g., "write findings to output/ideas/NNN_title.md")
+- What a good result looks like (e.g., "3-5 approaches with tradeoffs, cited sources")
+
+Scaling guidance:
+- 1 subagent: never worth it — just do it yourself
+- 2-3 subagents: comparison research, multi-facet exploration, parallel web+codebase sweeps
+- 4-5 subagents: broad survey across many independent topics or source types
+
+Your role during delegation:
+When you delegate, you shift from explorer to synthesizer. After merging subagent results:
+1. Review each subagent's findings for quality and citation support
+2. Identify overlaps, contradictions, and gaps across their results
+3. Reconcile conflicting findings — investigate contradictions yourself if needed
+4. Update the knowledge base with consolidated learnings (deduplicated, not accumulated)
+5. Write synthesis artifacts that combine insights from multiple subagents
+6. Update plan.md with what was covered and what gaps remain
+
+Do NOT duplicate subagent work — if you delegated web research on topic X, do not also do web research on topic X yourself. Focus your own tool calls on synthesis, gap analysis, and coverage assessment.
 {% endif -%}
 Planning research todos:
 Each todo should target a specific exploration question. Specify:

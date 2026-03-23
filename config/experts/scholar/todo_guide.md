@@ -115,7 +115,36 @@ Example todos:
 - "Document results with actual numbers — include commands.sh for reproducibility"
 - "Write idea artifact if experiment supports the hypothesis, or note dead end if not"
 
-### 5. Synthesis Phase
+{% if has_tool("delegate_work") -%}
+### 5. Delegated Parallel Research Phase
+
+Purpose: Fan out independent research threads to subagents, then synthesize their findings.
+
+This phase has a different structure: instead of 5-7 exploration todos, you create 1-2 delegation
+todos followed by 3-4 synthesis todos that process the subagent results.
+
+Example delegation todo:
+- "Delegate parallel research: (1) web search for Redis caching patterns in Python agent systems — write findings to output/ideas/010_redis_caching.md, (2) web search for in-memory caching with LRU/TTL strategies — write findings to output/ideas/011_inmemory_caching.md, (3) codebase search for existing caching in src/ — write findings to output/ideas/012_current_caching.md"
+
+Example synthesis todos (executed after delegation completes):
+- "Review subagent outputs in output/ideas/010-012 — identify overlapping recommendations and contradictions"
+- "Write synthesis artifact output/ideas/013_caching_comparison.md combining subagent findings with tradeoff matrix"
+- "Update knowledge base: consolidated caching learnings (kb_write), record dead ends from subagent results"
+- "Update plan.md with coverage assessment — which caching aspects still need exploration?"
+
+Rules for delegation todos:
+- Each delegated task needs: specific question, exploration mode, output path, quality bar
+- Tasks must be independent — no task should need another task's results
+- 2-5 tasks per delegation call (never 1 — just do it yourself)
+- Write the delegation todo FIRST in the phase, synthesis todos AFTER
+
+When NOT to use a delegated phase:
+- The research threads depend on each other (use sequential todos instead)
+- You only have one topic to explore (use a normal exploration phase)
+- You need to experiment iteratively (delegation is for parallel exploration, not sequential experimentation)
+{% endif -%}
+
+### {% if has_tool("delegate_work") %}6{% else %}5{% endif %}. Synthesis Phase
 
 Purpose: Review accumulated findings and generate remaining idea artifacts.
 
@@ -153,6 +182,9 @@ Every factual claim in an idea artifact must cite a source:
 | Codebase Archaeology | 5-7 | Examining repository for patterns and gaps |
 | Log & Data Analysis | 4-6 | Mining execution data for operational insights |
 | Experiment | 3-5 | Validating a hypothesis with a benchmark or PoC |
+{% if has_tool("delegate_work") -%}
+| Delegated Research | 1-2 delegation + 3-4 synthesis | Multiple independent topics to explore in parallel |
+{% endif -%}
 | Synthesis | 4-6 | Reviewing findings, writing remaining ideas |
 
 **Default to 5 todos.** Go higher (6-7) for broad web exploration sweeps. Go lower

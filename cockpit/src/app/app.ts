@@ -91,7 +91,7 @@ import { ConfigEditorComponent } from './shared/components/config-editor/config-
       }
 
       .pending-icon {
-        font-family: 'Material Symbols Rounded';
+        font-family: 'Material Symbols Outlined';
         font-size: 3rem;
         color: var(--text-tertiary, #a6adc8);
         display: block;

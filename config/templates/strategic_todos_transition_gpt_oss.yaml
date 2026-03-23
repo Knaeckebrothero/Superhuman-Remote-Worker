@@ -16,8 +16,8 @@ todos:
       (4) CONTENT CHECK: For every file in output/ that was created or modified,
           use read_file to examine its actual content. Check specifically:
           - Does it contain substantive prose/content, or just headings and placeholders?
-          - Is the file size reasonable for the deliverable? (A chapter should be 2000+ bytes,
-            a section 500+ bytes. A file under 200 bytes is almost certainly empty scaffolding.)
+          - Is the word count reasonable for the deliverable? (A chapter should be 400+ words,
+            a section 100+ words. A file under 50 words is almost certainly empty scaffolding.)
           - Does it contain any "*Placeholder:*" text or "[TODO:" markers?
 
       Then write archive/phase_N_retrospective.md with these sections:
@@ -29,10 +29,10 @@ todos:
       4. **Failed Approaches**: What was tried and did NOT work, with the reason.
       5. **Todo Stats**: Completed vs planned (e.g., "4/5 completed").
       6. **Deliverable Quality**: For each deliverable from plan.md, report:
-         file path, byte count, content assessment (substantive/skeleton/placeholder/missing).
+         file path, word count, content assessment (substantive/skeleton/placeholder/missing).
 
       COMPLETION CRITERIA: Retrospective written with all 6 sections. Section 6 must
-      include byte counts and content assessments for every output file, not just "exists."
+      include word counts and content assessments for every output file, not just "exists."
 
   - id: 2
     content: >-
