@@ -151,6 +151,8 @@ class VMController:
             "description": "Task description"
         }
         """
+        from kubernetes.client.exceptions import ApiException
+
         try:
             job_config = json.loads(msg.data.decode())
             job_id = job_config.get("job_id", "unknown")
@@ -159,13 +161,33 @@ class VMController:
             manifest = self.render_template(job_config)
             vm_name = manifest["metadata"]["name"]
 
-            self.k8s_client.create_namespaced_custom_object(
-                group=KUBEVIRT_GROUP,
-                version=KUBEVIRT_VERSION,
-                namespace=VM_NAMESPACE,
-                plural=KUBEVIRT_PLURAL,
-                body=manifest,
-            )
+            # Retry loop: if the old VM is still being deleted (409 Conflict),
+            # wait for the finalizer to clear before creating the new one.
+            max_retries = 12  # ~60s total
+            for attempt in range(max_retries + 1):
+                try:
+                    self.k8s_client.create_namespaced_custom_object(
+                        group=KUBEVIRT_GROUP,
+                        version=KUBEVIRT_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=KUBEVIRT_PLURAL,
+                        body=manifest,
+                    )
+                    break  # Success
+                except ApiException as e:
+                    if e.status == 409 and "is being deleted" in (e.body or ""):
+                        if attempt < max_retries:
+                            log.info(
+                                "VM %s still being deleted, waiting... (attempt %d/%d)",
+                                vm_name, attempt + 1, max_retries,
+                            )
+                            await asyncio.sleep(5)
+                            continue
+                        log.error(
+                            "VM %s still being deleted after %d retries, giving up",
+                            vm_name, max_retries,
+                        )
+                    raise
 
             log.info("VM created: %s (job %s)", vm_name, job_id)
 
@@ -202,19 +224,27 @@ class VMController:
             "job_id": "uuid"
         }
         """
+        from kubernetes.client.exceptions import ApiException
+
         try:
             data = json.loads(msg.data.decode())
             job_id = data["job_id"]
             vm_name = f"agent-vm-{job_id}"
             log.info("Deleting VM %s (job %s)", vm_name, job_id)
 
-            self.k8s_client.delete_namespaced_custom_object(
-                group=KUBEVIRT_GROUP,
-                version=KUBEVIRT_VERSION,
-                namespace=VM_NAMESPACE,
-                plural=KUBEVIRT_PLURAL,
-                name=vm_name,
-            )
+            try:
+                self.k8s_client.delete_namespaced_custom_object(
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                    name=vm_name,
+                )
+            except ApiException as e:
+                if e.status == 404:
+                    log.info("VM %s already gone (404), treating as deleted", vm_name)
+                else:
+                    raise
 
             # Clean up the SSH NodePort Service
             self._delete_ssh_service(vm_name, job_id)
