@@ -852,10 +852,15 @@ class DelegationConfig:
     Controls whether agents can spawn child jobs via the delegate_work tool.
     Children branch off the parent workspace and work in parallel via git worktrees.
     See docs/features/subagent_delegation.md.
+
+    Depth is computed by counting delegation links (creation_order IS NOT NULL)
+    in the ancestor chain.  Lifecycle links (scholar/critic with creation_order
+    IS NULL) do not increment depth.  A job can delegate when its delegation
+    depth is strictly less than max_depth.
     """
 
     enabled: bool = False
-    max_depth: int = 1                     # 1 = no grandchildren
+    max_depth: int = 1  # Max delegation nesting; only delegation links count (lifecycle links are depth-transparent)
     default_timeout: int = 7200            # 2 hours
     max_timeout: int = 14400               # 4 hours
     allowed_configs: List[str] = field(default_factory=list)  # empty = any
@@ -2252,14 +2257,14 @@ def get_phase_system_prompt(
     prompt_type = "strategic" if is_strategic else "tactical"
     phase_component = resolved_prompts.get(prompt_type) or load_phase_component(is_strategic, resolver)
 
-    # 4. Render phase component's {phase_number} placeholder
-    rendered_component = phase_component.format(phase_number=phase_number)
-
-    # 5. Render Jinja2 conditionals FIRST (e.g., {% if has_tool("kb_write") %})
-    # Must happen before .format() because Python's str.format() chokes on {%..%} blocks.
-    # Jinja2 leaves single-brace {agent_display_name} placeholders untouched.
+    # 4. Render Jinja2 conditionals BEFORE .format() — Python's str.format()
+    # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
     if tool_names is not None:
+        phase_component = render_instruction_content(phase_component, tool_names)
         base_template = render_instruction_content(base_template, tool_names)
+
+    # 5. Render phase component's {phase_number} placeholder
+    rendered_component = phase_component.format(phase_number=phase_number)
 
     # 6. Inject all components and render remaining placeholders
     rendered = base_template.format(
@@ -2449,7 +2454,8 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         config.tools.git +
         config.tools.coding +
         config.tools.evaluation +
-        config.tools.knowledge
+        config.tools.knowledge +
+        config.tools.delegation
     )
 
     # Shell mode aliasing for backward compatibility

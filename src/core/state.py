@@ -121,6 +121,11 @@ class UniversalAgentState(TypedDict):
     staged_todos: Optional[List[Dict[str, Any]]]
     todo_next_id: Optional[int]
 
+    # Freeze/completion data for orchestrator
+    # Set by handle_transition when finalize_job/freeze_for_review produces freeze_data.
+    # Flows through the graph state → report_completion() → orchestrator.
+    freeze_data: Optional[Dict[str, Any]]
+
     # Resume from feedback
     # Set via aupdate_state when resuming a frozen job with --feedback
     # Consumed by restore_from_feedback node, then cleared
@@ -200,6 +205,9 @@ def create_initial_state(
         todos=None,
         staged_todos=None,
         todo_next_id=1,
+
+        # Freeze/completion data
+        freeze_data=None,
 
         # Resume from feedback
         resume_feedback=None,

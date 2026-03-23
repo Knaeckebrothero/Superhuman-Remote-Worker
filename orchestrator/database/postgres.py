@@ -863,6 +863,52 @@ class PostgresDB:
             return False
         return row["total"] > 0 and row["total"] == row["terminal"]
 
+    async def get_delegation_depth(self, job_id: str) -> int:
+        """Compute the delegation depth of a job.
+
+        Walks the parent_job_id chain upward and counts only delegation
+        links (jobs with creation_order IS NOT NULL).  Lifecycle links
+        (scholar/critic with creation_order IS NULL) contribute zero depth.
+
+        This implements "Option C": critics and scholars can delegate
+        because they don't increase the depth counter.
+
+        Args:
+            job_id: Job UUID as string
+
+        Returns:
+            Number of delegation links in the ancestor chain (0 for root
+            jobs and lifecycle-only subjobs like scholar/critic)
+        """
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return 0
+
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                WITH RECURSIVE ancestors AS (
+                    SELECT id, parent_job_id, creation_order, 0 AS walk_depth
+                    FROM jobs
+                    WHERE id = $1
+
+                    UNION ALL
+
+                    SELECT j.id, j.parent_job_id, j.creation_order, a.walk_depth + 1
+                    FROM jobs j
+                    JOIN ancestors a ON j.id = a.parent_job_id
+                    WHERE a.walk_depth < 20
+                )
+                SELECT COUNT(*) FILTER (WHERE creation_order IS NOT NULL)
+                    AS delegation_depth
+                FROM ancestors
+                """,
+                uuid_val,
+            )
+
+        return int(row["delegation_depth"]) if row else 0
+
     async def update_job_context(self, job_id: str, context: Dict[str, Any]) -> bool:
         """Update the context JSONB column for a job.
 

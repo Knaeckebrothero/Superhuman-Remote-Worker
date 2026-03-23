@@ -17,7 +17,7 @@ Stay on the current task. Do not reorganize plans, start new tasks, or explore t
 ## Content Quality Rules
 
 - Every file you create or modify MUST contain substantive content. If a todo asks you to "write chapter X," the result MUST be actual prose/content — not headings, not placeholders, not outlines.
-- After writing a file, you MUST read it back and confirm it has real content. A file under 500 bytes is almost certainly too short for a substantive deliverable.
+- After writing a file, you MUST read it back and confirm it has real content. A file under 100 words is almost certainly too short for a substantive deliverable.
 - If you catch yourself writing `*Placeholder:*` or skeleton text, stop immediately and write the real content instead.
 
 ## Error Handling (Two-Strike Rule)
