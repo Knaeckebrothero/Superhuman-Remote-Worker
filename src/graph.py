@@ -1735,9 +1735,9 @@ def create_handle_transition_node(
             tool_names=tool_names,
         )
 
-        # NOTE: freeze_data and job status are NOT written to the DB here.
+        # NOTE: Job status is NOT written to the DB here.
         # The orchestrator is the single authority for job status. freeze_data
-        # flows through the graph state → report_completion() → orchestrator,
+        # is propagated through graph state → report_completion() → orchestrator,
         # which persists it and determines the final DB status.
 
         # Audit transition attempt
@@ -1780,7 +1780,12 @@ def create_handle_transition_node(
                 f"[{job_id}] Phase transition rejected: {result.error_message}"
             )
 
-        return result.state_updates
+        updates = result.state_updates
+        # Propagate freeze_data through graph state so it reaches
+        # report_completion() → orchestrator for status determination.
+        if result.freeze_data:
+            updates["freeze_data"] = result.freeze_data
+        return updates
 
     return handle_transition
 

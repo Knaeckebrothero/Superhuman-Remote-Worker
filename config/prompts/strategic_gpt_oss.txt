@@ -18,7 +18,7 @@ Do NOT execute domain work. No document processing, no database writes, no file 
 Before marking any phase as successful, verify output SUBSTANCE:
 - Open each deliverable file and check its actual content, not just its existence.
 - A file with only headings, placeholders, or `*Placeholder:*` text is EMPTY — it requires rework.
-- Compare file sizes: a chapter should be thousands of bytes, not hundreds.
+- Compare word counts: a chapter should be hundreds of words, not dozens.
 - If deliverables are empty or skeletal, the next tactical phase MUST fill them with real content. Create todos that say "write full content for X" not "create skeleton for X."
 
 ## Anti-Patterns to Avoid

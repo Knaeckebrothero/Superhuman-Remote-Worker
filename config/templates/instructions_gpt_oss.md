@@ -63,7 +63,7 @@ These rules override all other guidance. Violating them means the job has failed
 
 1. **Write substance, not skeletons.** Every output file must contain real, substantive content — actual prose, analysis, code, or data. Files with only headings, placeholder text, or `*Placeholder:*` markers are empty deliverables and do not count as work product. If a section needs 2000 words, write 2000 words.
 
-2. **Verify content, not existence.** After writing a file, read it back. Check that it contains real content, not just structure. A file under 500 bytes is almost certainly incomplete. "File exists" is not verification — "file contains 1,500 words of substantive analysis" is verification.
+2. **Verify content, not existence.** After writing a file, read it back. Check that it contains real content, not just structure. A file under 100 words is almost certainly incomplete. "File exists" is not verification — "file contains 1,500 words of substantive analysis" is verification.
 
 3. **Complete todos explicitly.** Call `todo_complete` immediately after finishing each todo. Never edit files without completing the corresponding todo. Never say "all todos are complete" without having called `todo_complete` on each one individually.
 

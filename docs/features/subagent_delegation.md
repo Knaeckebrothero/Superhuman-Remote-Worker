@@ -517,8 +517,28 @@ After all children are merged (or skipped due to failure):
 
 If the parent fails during the merge phase, worktrees persist on disk. A cleanup routine (or the next `init.py` run) should detect orphaned worktrees.
 
-### Nesting
-For v1, `max_depth: 1` is enforced. If a child tries to call `delegate_work`, the tool returns an error: "Subagent nesting is not supported (max_depth=1)." The orchestrator checks the parent chain: if the job's `parent_job_id` is non-null, delegation is blocked.
+### Nesting (Option C — Delegation-Only Depth)
+
+The delegation depth of a job is the count of **delegation links** in its ancestor chain. A delegation link is a `parent_job_id` relationship where the child has `creation_order IS NOT NULL`. Lifecycle links (scholar/critic jobs with `creation_order IS NULL`) contribute zero to the depth count.
+
+A job can call `delegate_work` when its delegation depth is strictly less than `max_depth` (default: 1). If blocked, the tool returns: "Delegation depth limit reached (depth={d}, max_depth={m})."
+
+**Depth examples (max_depth=1):**
+
+| Job | Relationship | Delegation Depth | Can Delegate? |
+|-----|-------------|-----------------|---------------|
+| Main job | root (`parent_job_id` NULL) | 0 | Yes |
+| Scholar of main | lifecycle link (`creation_order` NULL) | 0 | Yes |
+| Critic of main | lifecycle link (`creation_order` NULL) | 0 | Yes |
+| Delegation child of main | delegation link (`creation_order` 0-4) | 1 | No |
+| Delegation child of critic | delegation link, parent is lifecycle | 1 | No |
+| Delegation child of scholar | delegation link, parent is lifecycle | 1 | No |
+
+**Enforcement:** Depth is computed server-side via `get_delegation_depth()` in `orchestrator/database/postgres.py` using a recursive CTE. The `delegate_work` tool queries this before creating children.
+
+**Why lifecycle links are excluded:** Scholars and critics are orchestrator-managed lifecycle hooks (pre-research, post-verification), not agent-spawned parallel work. Blocking them from delegating would prevent a critic from parallelizing verification streams or a scholar from fanning out research threads — both are high-value use cases.
+
+**Lifecycle recursion guards (separate concern):** The guards in `_spawn_scholar_subjob` (`if job.get("parent_job_id"): return None`) and `_trigger_verification_on_complete` (`if job.get("parent_job_id") is not None: return`) prevent lifecycle recursion (scholar spawning scholar, critic spawning critic). These are orthogonal to delegation depth and must not be changed.
 
 ### Git Versioning Required
 Delegation requires `workspace.git_versioning: true` in the agent config. If git versioning is disabled, `delegate_work` returns an error explaining the requirement.

@@ -29,7 +29,7 @@ These patterns produce empty output. Never create todos like these:
 | "Draft initial structure" | "Write first draft of [deliverable] with all required content" |
 | "Verify files exist in output/" | "Read output/chapter3.md and verify it contains 1000+ words of prose, not just headings" |
 
-**The test**: If completing a todo could result in a file under 500 bytes, the todo is wrong. Rewrite it to require substantive content.
+**The test**: If completing a todo could result in a file under 100 words, the todo is wrong. Rewrite it to require substantive content.
 
 ---
 
@@ -87,7 +87,7 @@ Example todos:
 Example todos:
 - "Process documents/input_01.pdf through input_05.pdf: extract key findings to output/findings.md"
 - "Apply formatting template to output/chapter_01.md through output/chapter_05.md"
-- "Verify all 5 processed items: read each file, confirm content exceeds 500 bytes and contains real analysis"
+- "Verify all 5 processed items: read each file, confirm content exceeds 100 words and contains real analysis"
 
 ### 4. Integration Phase (combine and cross-reference)
 
@@ -135,7 +135,7 @@ Before finalizing any phase's todos, verify each todo passes ALL of these:
 
 - [ ] Does this todo produce real content (not just headings or placeholders)?
 - [ ] Is the expected output measurable (word count, specific content, verification criteria)?
-- [ ] Could the completed todo result in a file under 500 bytes? If yes, the todo is wrong.
+- [ ] Could the completed todo result in a file under 100 words? If yes, the todo is wrong.
 - [ ] Does the verification todo check content substance, not just file existence?
 
 ---

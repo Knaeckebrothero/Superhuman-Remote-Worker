@@ -49,6 +49,8 @@ tools:
     - git_diff
     - git_status
     - git_tags
+  delegation:
+    - delegate_work
   # SQL injected when system datasource attached (for querying job data)
   sql: []
   # Not needed
@@ -57,3 +59,6 @@ tools:
   citation: []
   graph: []
   mongodb: []
+
+delegation:
+  enabled: true
