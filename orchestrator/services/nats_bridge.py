@@ -350,6 +350,7 @@ class NatsBridge:
                 "ssh_port": ssh_port,
                 "hostname": data.get("hostname"),
                 "daemon_pid": data.get("pid"),
+                "recovering": False,  # Clear recovery guard
             })
 
             # Trigger callback (e.g. dispatch)

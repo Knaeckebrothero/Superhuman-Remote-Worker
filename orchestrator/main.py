@@ -4312,19 +4312,36 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         # 0. VM recovery: if workspace became unavailable, re-provision and re-queue
         error = result.get("error") or {}
         if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+            # Guard: skip if recovery is already in progress (prevents double-dispatch loop)
+            vm_ctx = _get_vm_context(job)
+            if vm_ctx and vm_ctx.get("recovering"):
+                logger.info(
+                    f"Job {job_id}: VM recovery already in progress, skipping duplicate"
+                )
+                return {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "paused",
+                    "actions": ["vm recovery: duplicate skipped"],
+                }
+
             logger.warning(
                 f"Job {job_id}: workspace unavailable — attempting VM recovery"
             )
-            vm_ctx = _get_vm_context(job)
-            # Delete the old (crashed) VM
-            if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
-                await vm_provisioner.delete_vm(job_id)
-            # Reset VM context to trigger auto-provisioning on next dispatch
+            # Set recovering flag *before* issuing delete to prevent re-entry
             ctx = job.get("context") or {}
             if isinstance(ctx, str):
                 ctx = json.loads(ctx)
-            ctx["vm"] = {"requested": True, "previous_error": "workspace_unavailable"}
+            ctx["vm"] = {
+                "requested": True,
+                "recovering": True,
+                "previous_error": "workspace_unavailable",
+            }
             await postgres_db.update_job_context(job_id, ctx)
+
+            # Delete the old (crashed) VM
+            if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
+                await vm_provisioner.delete_vm(job_id)
             # Put job back in queue as paused (dispatchable, clears assigned_agent_id)
             await postgres_db.pause_job(job_id)
             _trigger_dispatch()
