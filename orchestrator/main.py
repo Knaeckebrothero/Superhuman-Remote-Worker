@@ -8684,7 +8684,14 @@ def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]
     if raw_model.startswith("openai/"):
         model_name = raw_model[len("openai/"):]
         base_url = os.getenv("BUILDER_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
-        api_key = get_builder_api_key("openai")
+        # Use provider-specific key only — skip generic BUILDER_API_KEY which
+        # may contain a key for a different provider (e.g. Anthropic key when
+        # the default builder model is Claude but user selects a local model)
+        api_key = (
+            os.getenv("BUILDER_OPENAI_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or "not-needed"
+        )
         return model_name, base_url, api_key
     # No prefix — use existing defaults
     return raw_model, get_builder_base_url(), None
