@@ -2,8 +2,12 @@ defaultNamespace: agent-vms
 helm:
   takeOwnership: true
 dependsOn: []
-# Override GitRepo-level target — deploy to the VMs cluster, not main
+# Deploy only to the VMs cluster — targetRestrictions prevents GitRepo default merge
 targets:
+  - clusterSelector:
+      matchLabels:
+        management.cattle.io/cluster-display-name: vms
+targetRestrictions:
   - clusterSelector:
       matchLabels:
         management.cattle.io/cluster-display-name: vms
