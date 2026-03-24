@@ -74,7 +74,10 @@ data:
         fi
         echo "Auto-login: authenticating as $PROTON_USER ..."
         find /data -name "*.lock" -delete 2>/dev/null || true
-        printf 'login\n%s\n%s\nexit\n' "$PROTON_USER" "$PROTON_PASS" | \
+        # Send credentials, wait for sync to complete, then exit.
+        # The sleep gives the bridge time to finish its initial mail sync —
+        # exiting too early aborts the sync and corrupts address state.
+        (echo "login"; sleep 1; echo "$PROTON_USER"; sleep 1; echo "$PROTON_PASS"; sleep 45; echo "exit") | \
             timeout 120 protonmail-bridge --cli 2>&1 || true
         find /data -name "*.lock" -delete 2>/dev/null || true
         echo "Auto-login complete."
@@ -199,7 +202,7 @@ spec:
           livenessProbe:
             tcpSocket:
               port: 2143
-            initialDelaySeconds: 90
+            initialDelaySeconds: 120
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 5
