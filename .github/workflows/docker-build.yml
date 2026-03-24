@@ -543,3 +543,79 @@ jobs:
         run: |
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-vm-controller:latest" | tr '[:upper:]' '[:lower:]')
           docker buildx imagetools inspect "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # Update deployment manifests with new image SHA tags
+  # Fleet detects the git change and rolls out updated pods automatically
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: [build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-vm-controller, build-agent-vm-base]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: deploy-manifests
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Compute image tag
+        id: tag
+        run: echo "sha=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Update orchestrator image tag
+        if: needs.build-orchestrator.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-orchestrator:[a-zA-Z0-9_.-]*|superhuman-remote-worker-orchestrator:${{ steps.tag.outputs.sha }}|g' \
+            deployment/20-orchestrator.yaml
+
+      - name: Update agent image tag
+        if: needs.build-agent.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-agent:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent:${{ steps.tag.outputs.sha }}|g' \
+            deployment/21-agent.yaml
+
+      - name: Update cockpit image tag
+        if: needs.build-cockpit.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-cockpit:[a-zA-Z0-9_.-]*|superhuman-remote-worker-cockpit:${{ steps.tag.outputs.sha }}|g' \
+            deployment/22-cockpit.yaml
+
+      - name: Update MCP image tag
+        if: needs.build-mcp.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-mcp:[a-zA-Z0-9_.-]*|superhuman-remote-worker-mcp:${{ steps.tag.outputs.sha }}|g' \
+            deployment/23-mcp.yaml
+
+      - name: Update VPN image tag
+        if: needs.build-vpn.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-vpn:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vpn:${{ steps.tag.outputs.sha }}|g' \
+            deployment/15-vpn.yaml
+
+      - name: Update VM controller image tag
+        if: needs.build-vm-controller.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-vm-controller:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vm-controller:${{ steps.tag.outputs.sha }}|g' \
+            deployment/srw-vm-controller/vm-controller.yaml
+
+      - name: Update agent VM base image tag
+        if: needs.build-agent-vm-base.result == 'success'
+        run: |
+          sed -i 's|superhuman-remote-worker-agent-vm-base:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}|g' \
+            deployment/srw-vm-controller/vm-controller.yaml
+
+      - name: Commit and push updated manifests
+        run: |
+          git diff --quiet && { echo "No manifest changes to commit"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deployment/
+          git commit -m "deploy: update image tags to ${{ steps.tag.outputs.sha }}"
+          git push
