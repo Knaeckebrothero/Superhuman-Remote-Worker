@@ -380,7 +380,8 @@ data:
         "from": "noreply@superhuman-remote-worker.com",
         "fromDisplayName": "Superhuman Remote Worker",
         "ssl": "false",
-        "starttls": "false",
+        "starttls": "true",
+        "envelopeFrom": "noreply@superhuman-remote-worker.com",
         "auth": "true",
         "user": "superhuman-remote-worker@protonmail.com",
         "password": "${env.SMTP_PASSWORD}"
