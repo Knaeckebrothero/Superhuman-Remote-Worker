@@ -39,7 +39,6 @@ tools:
     - list_files
     - search_files
     - file_exists
-    - get_workspace_summary
     - get_document_info
   coding:
     - run_command

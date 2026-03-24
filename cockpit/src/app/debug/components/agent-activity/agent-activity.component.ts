@@ -769,7 +769,6 @@ export class AgentActivityComponent {
     move_file: 'workspace',
     rename_file: 'workspace',
     copy_file: 'workspace',
-    get_workspace_summary: 'workspace',
     get_document_info: 'workspace',
     // Core tools
     next_phase_todos: 'core',

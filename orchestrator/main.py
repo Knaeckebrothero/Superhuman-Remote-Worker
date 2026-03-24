@@ -3646,6 +3646,10 @@ async def _spawn_scholar_subjob(
         "autonomy": "full",
     }
 
+    # Propagate parent's LLM override so the scholar uses the same model
+    if config_override and isinstance(config_override.get("llm"), dict):
+        scholar_override["llm"] = config_override["llm"]
+
     project_id = str(job["project_id"]) if job.get("project_id") else None
 
     logger.info(
