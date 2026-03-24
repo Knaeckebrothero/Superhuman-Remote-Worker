@@ -1,0 +1,33 @@
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: srw-secrets
+  namespace: superhuman-remote-worker
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: srw-secrets
+    creationPolicy: Owner
+  dataFrom:
+    - extract:
+        key: homelab/superhuman-remote-worker/srw-secrets
+---
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: vm-ssh-key
+  namespace: superhuman-remote-worker
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: ClusterSecretStore
+  target:
+    name: vm-ssh-key
+    creationPolicy: Owner
+  dataFrom:
+    - extract:
+        key: homelab/superhuman-remote-worker/vm-ssh-key

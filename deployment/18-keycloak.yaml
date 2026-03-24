@@ -1,0 +1,528 @@
+# Keycloak SSO — Identity provider for all SRW services
+#
+# Secrets injected via env vars (Vault → ESO → srw-secrets):
+#   GITEA_OIDC_CLIENT_SECRET, NEXTCLOUD_OIDC_CLIENT_SECRET,
+#   PGADMIN_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
+#
+# The realm-export.json uses ${env.VAR} placeholders — Keycloak resolves
+# them at import time from the container's environment.
+#
+# Post-deploy:
+#   - Run keycloak/setup-gitea-oidc.sh to configure Gitea as OIDC client
+#   - Run keycloak/setup-nextcloud-oidc.sh if deploying Nextcloud
+#
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srw-keycloak-realm
+  namespace: superhuman-remote-worker
+data:
+  srw-realm.json: |
+    {
+      "realm": "srw",
+      "enabled": true,
+      "displayName": "Superhuman Remote Worker",
+      "displayNameHtml": "<strong>Superhuman Remote Worker</strong>",
+      "registrationAllowed": true,
+      "registrationEmailAsUsername": false,
+      "verifyEmail": true,
+      "loginWithEmailAllowed": true,
+      "duplicateEmailsAllowed": false,
+      "resetPasswordAllowed": true,
+      "editUsernameAllowed": false,
+      "sslRequired": "none",
+      "bruteForceProtected": true,
+      "permanentLockout": false,
+      "maxFailureWaitSeconds": 900,
+      "maxDeltaTimeSeconds": 43200,
+      "failureFactor": 5,
+      "roles": {
+        "realm": [
+          {
+            "name": "admin",
+            "description": "Full system access, user management",
+            "composite": false
+          },
+          {
+            "name": "user",
+            "description": "Standard access to cockpit, Gitea repos, own project files",
+            "composite": false
+          },
+          {
+            "name": "viewer",
+            "description": "Read-only access for stakeholder dashboards",
+            "composite": false
+          }
+        ]
+      },
+      "clients": [
+        {
+          "clientId": "cockpit",
+          "name": "SRW Cockpit",
+          "description": "Angular frontend (SPA, public client with PKCE)",
+          "enabled": true,
+          "publicClient": true,
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "redirectUris": [
+            "http://localhost:4200/*",
+            "http://localhost:4000/*",
+            "https://superhuman-remote-worker.com/*"
+          ],
+          "webOrigins": [
+            "http://localhost:4200",
+            "http://localhost:4000",
+            "https://superhuman-remote-worker.com"
+          ],
+          "protocol": "openid-connect",
+          "attributes": {
+            "pkce.code.challenge.method": "S256",
+            "post.logout.redirect.uris": "http://localhost:4200/*##http://localhost:4000/*##https://superhuman-remote-worker.com/*"
+          },
+          "defaultClientScopes": [
+            "openid",
+            "profile",
+            "email",
+            "roles"
+          ],
+          "optionalClientScopes": [
+            "offline_access"
+          ],
+          "protocolMappers": [
+            {
+              "name": "sub",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-sub-mapper",
+              "config": {
+                "introspection.token.claim": "true",
+                "access.token.claim": "true"
+              }
+            }
+          ]
+        },
+        {
+          "clientId": "orchestrator-api",
+          "name": "SRW Orchestrator API",
+          "description": "FastAPI backend — validates tokens, never initiates login",
+          "enabled": true,
+          "bearerOnly": true,
+          "publicClient": false,
+          "protocol": "openid-connect",
+          "defaultClientScopes": [
+            "openid",
+            "profile",
+            "email",
+            "roles"
+          ]
+        },
+        {
+          "clientId": "gitea",
+          "name": "Gitea",
+          "description": "Git repository service (confidential client)",
+          "enabled": true,
+          "publicClient": false,
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "secret": "${env.GITEA_OIDC_CLIENT_SECRET}",
+          "redirectUris": [
+            "http://localhost:3000/user/oauth2/Keycloak/callback",
+            "https://git.superhuman-remote-worker.com/user/oauth2/Keycloak/callback"
+          ],
+          "webOrigins": [
+            "http://localhost:3000",
+            "https://git.superhuman-remote-worker.com"
+          ],
+          "protocol": "openid-connect",
+          "defaultClientScopes": [
+            "openid",
+            "email",
+            "groups"
+          ],
+          "protocolMappers": [
+            {
+              "name": "gitea-username",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "gitea_username",
+                "claim.name": "preferred_username",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "given-name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "firstName",
+                "claim.name": "given_name",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "family-name",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "lastName",
+                "claim.name": "family_name",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            }
+          ]
+        },
+        {
+          "clientId": "nextcloud",
+          "name": "Nextcloud",
+          "description": "Cloud storage",
+          "enabled": true,
+          "publicClient": false,
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "secret": "${env.NEXTCLOUD_OIDC_CLIENT_SECRET}",
+          "redirectUris": [
+            "http://localhost:8800/apps/user_oidc/code",
+            "https://cloud.superhuman-remote-worker.com/apps/user_oidc/code"
+          ],
+          "webOrigins": [
+            "http://localhost:8800",
+            "https://cloud.superhuman-remote-worker.com"
+          ],
+          "protocol": "openid-connect",
+          "defaultClientScopes": [
+            "openid",
+            "profile",
+            "email",
+            "groups"
+          ]
+        },
+        {
+          "clientId": "pgadmin",
+          "name": "pgAdmin",
+          "description": "Database administration UI (optional)",
+          "enabled": true,
+          "publicClient": false,
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "directAccessGrantsEnabled": false,
+          "serviceAccountsEnabled": false,
+          "secret": "${env.PGADMIN_OIDC_CLIENT_SECRET}",
+          "redirectUris": [
+            "http://localhost:5050/oauth2/authorize",
+            "https://pgadmin.superhuman-remote-worker.com/oauth2/authorize"
+          ],
+          "webOrigins": [
+            "http://localhost:5050",
+            "https://pgadmin.superhuman-remote-worker.com"
+          ],
+          "protocol": "openid-connect",
+          "defaultClientScopes": [
+            "openid",
+            "profile",
+            "email"
+          ]
+        }
+      ],
+      "users": [
+        {
+          "username": "admin",
+          "email": "admin@superhuman-remote-worker.com",
+          "emailVerified": true,
+          "enabled": true,
+          "firstName": "SRW",
+          "lastName": "Admin",
+          "attributes": {
+            "gitea_username": ["srw-admin"]
+          },
+          "realmRoles": [
+            "admin",
+            "user",
+            "default-roles-srw"
+          ],
+          "credentials": [
+            {
+              "type": "password",
+              "value": "${env.KC_REALM_ADMIN_PASSWORD}",
+              "temporary": false
+            }
+          ]
+        }
+      ],
+      "scopeMappings": [
+        {
+          "clientScope": "roles",
+          "roles": [
+            "admin",
+            "user",
+            "viewer"
+          ]
+        }
+      ],
+      "clientScopes": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "description": "OpenID Connect built-in scope: email",
+          "attributes": {
+            "include.in.token.scope": "true",
+            "display.on.consent.screen": "true",
+            "consent.screen.text": "Your email address"
+          },
+          "protocolMappers": [
+            {
+              "name": "email",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "email",
+                "claim.name": "email",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "email verified",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-attribute-mapper",
+              "config": {
+                "user.attribute": "emailVerified",
+                "claim.name": "email_verified",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "boolean"
+              }
+            }
+          ]
+        },
+        {
+          "name": "roles",
+          "protocol": "openid-connect",
+          "description": "Realm and client role mappings",
+          "attributes": {
+            "include.in.token.scope": "false",
+            "display.on.consent.screen": "false"
+          },
+          "protocolMappers": [
+            {
+              "name": "realm roles",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-realm-role-mapper",
+              "config": {
+                "multivalued": "true",
+                "claim.name": "realm_access.roles",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            },
+            {
+              "name": "client roles",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-usermodel-client-role-mapper",
+              "config": {
+                "multivalued": "true",
+                "claim.name": "resource_access.${client_id}.roles",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "jsonType.label": "String"
+              }
+            }
+          ]
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "description": "User group memberships for project access control",
+          "attributes": {
+            "include.in.token.scope": "true",
+            "display.on.consent.screen": "true",
+            "consent.screen.text": "Your group memberships"
+          },
+          "protocolMappers": [
+            {
+              "name": "groups",
+              "protocol": "openid-connect",
+              "protocolMapper": "oidc-group-membership-mapper",
+              "config": {
+                "full.path": "false",
+                "id.token.claim": "true",
+                "access.token.claim": "true",
+                "userinfo.token.claim": "true",
+                "claim.name": "groups"
+              }
+            }
+          ]
+        }
+      ],
+      "smtpServer": {
+        "host": "srw-protonmail-bridge",
+        "port": "1025",
+        "from": "noreply@superhuman-remote-worker.com",
+        "fromDisplayName": "Superhuman Remote Worker",
+        "ssl": "false",
+        "starttls": "false",
+        "auth": "true",
+        "user": "superhuman-remote-worker@protonmail.com",
+        "password": "${env.SMTP_PASSWORD}"
+      },
+      "internationalizationEnabled": false,
+      "loginTheme": "keycloak",
+      "accountTheme": "keycloak.v3"
+    }
+---
+# Keycloak SSO — Deployment
+#
+# The 'keycloak' database must exist on srw-postgres. This is handled
+# automatically by ensure_sso_databases() in orchestrator/init.py,
+# or by init_sso_dbs.sh on fresh postgres starts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-keycloak
+  namespace: superhuman-remote-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: srw-keycloak
+  template:
+    metadata:
+      labels:
+        app: srw-keycloak
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-postgres 5432; do sleep 2; done"]
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.2
+          args:
+            - start-dev
+            - --import-realm
+            - --health-enabled=true
+          ports:
+            - containerPort: 8080
+          env:
+            # Database
+            - name: KC_DB
+              value: "postgres"
+            - name: KC_DB_URL
+              value: "jdbc:postgresql://srw-postgres:5432/keycloak"
+            - name: KC_DB_USERNAME
+              value: "keycloak"
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KC_DB_PASSWORD
+            # Hostname — must match what the browser sees
+            - name: KC_HOSTNAME
+              value: "https://auth.superhuman-remote-worker.com"
+            - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
+              value: "true"
+            - name: KC_HTTP_ENABLED
+              value: "true"
+            # Admin credentials (Keycloak server admin)
+            - name: KEYCLOAK_ADMIN
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KEYCLOAK_ADMIN_USER
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KEYCLOAK_ADMIN_PASSWORD
+            # Realm import secrets (resolved via ${env.VAR} in realm JSON)
+            - name: KC_REALM_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KC_REALM_ADMIN_PASSWORD
+            - name: GITEA_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: GITEA_OIDC_CLIENT_SECRET
+            - name: NEXTCLOUD_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEXTCLOUD_OIDC_CLIENT_SECRET
+            - name: PGADMIN_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: PGADMIN_OIDC_CLIENT_SECRET
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: SMTP_PASSWORD
+          volumeMounts:
+            - name: realm-import
+              mountPath: /opt/keycloak/data/import
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 9000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 5
+          startupProbe:
+            httpGet:
+              path: /health/started
+              port: 9000
+            failureThreshold: 30
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+      volumes:
+        - name: realm-import
+          configMap:
+            name: srw-keycloak-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srw-keycloak
+  namespace: superhuman-remote-worker
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+  selector:
+    app: srw-keycloak

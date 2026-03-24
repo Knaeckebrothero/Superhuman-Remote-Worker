@@ -1,0 +1,14 @@
+defaultNamespace: superhuman-remote-worker
+helm:
+  takeOwnership: true
+dependsOn: []
+ignorePaths:
+  - "**/*secret*"
+  - "*secret*"
+  - "**/*secrets*"
+  - "*secrets*"
+  - "README.md"
+  - "deploy.sh"
+  - "fleet-gitrepo.yaml"
+  - "nats/"
+  - "srw-vm-controller/"
