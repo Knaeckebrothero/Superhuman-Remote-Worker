@@ -55,7 +55,6 @@ tools:
     - move_file
     - rename_file
     - copy_file
-    - get_workspace_summary
     - get_document_info
     - create_directory
     - delete_directory

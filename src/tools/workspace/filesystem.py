@@ -118,14 +118,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },
-    "get_workspace_summary": {
-        "module": "workspace.filesystem",
-        "function": "get_workspace_summary",
-        "description": "Get a summary of workspace contents",
-        "category": "workspace",
-        "phases": ["strategic", "tactical"],
-    },
-    "get_document_info": {
+"get_document_info": {
         "module": "workspace.filesystem",
         "function": "get_document_info",
         "description": "Get document metadata (page count, size) for planning access",
@@ -504,45 +497,6 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error copying file: {str(e)}"
 
     @tool
-    def get_workspace_summary() -> str:
-        """Get a summary of the current workspace state.
-
-        Returns information about the workspace including:
-        - Job ID
-        - Directory structure
-        - File counts per directory
-        - Total size
-
-        Use this to understand what's in your workspace.
-
-        Returns:
-            Workspace summary
-        """
-        try:
-            summary = workspace.get_summary()
-
-            lines = [
-                "Workspace Summary",
-                "================",
-                f"Job ID: {summary['job_id']}",
-                f"Total Files: {summary['total_files']}",
-                f"Total Size: {summary['total_size_bytes']:,} bytes",
-                "",
-                "Directories:",
-            ]
-
-            for dir_name, info in sorted(summary["directories"].items()):
-                count = info.get("file_count", 0)
-                size = info.get("size_bytes", 0)
-                lines.append(f"  {dir_name}/: {count} files ({size:,} bytes)")
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.error(f"get_workspace_summary error: {e}")
-            return f"Error getting summary: {str(e)}"
-
-    @tool
     def get_document_info(path: str) -> str:
         """Get metadata about a document without reading its full content.
 
@@ -686,7 +640,6 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         move_file,
         rename_file,
         copy_file,
-        get_workspace_summary,
         get_document_info,
         create_directory,
         delete_directory,
