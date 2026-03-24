@@ -97,7 +97,7 @@ data:
   # Notification — SMTP (via Proton Bridge)
   SMTP_HOST: "srw-protonmail-bridge"
   SMTP_PORT: "1025"
-  SMTP_USE_TLS: "false"
+  SMTP_USE_TLS: "true"
   SMTP_TRUST_SELF_SIGNED: "true"
   SMTP_FROM: "noreply@superhuman-remote-worker.com"
 

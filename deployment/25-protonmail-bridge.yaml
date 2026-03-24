@@ -1,17 +1,132 @@
 # Proton Mail Bridge — SMTP/IMAP for agent email (superhuman-remote-worker.com)
 #
-# Credentials (GPG keyring, password-store, bridge config) are stored as a
-# base64 tarball in Vault at srw-secrets/PROTONMAIL_BRIDGE_CREDS.
-# An init container unpacks them into an emptyDir before the bridge starts.
+# Credentials persist on PVC (srw-protonmail-bridge-data). On first run, the
+# init container seeds the PVC from a Vault tarball. After that, the bridge
+# maintains its own OAuth refresh tokens on disk.
 #
-# To update credentials after re-authentication:
+# If the refresh token expires (password change, session revoke), the entrypoint
+# auto-re-authenticates using PROTON_USER / PROTON_PASS from Vault — no manual
+# intervention needed (account has no 2FA).
+#
+# Manual re-seed (only if PVC is lost):
 #   1. Run locally with Podman, authenticate, then:
 #      tar czf /tmp/creds.tar.gz --exclude='S.gpg-agent*' -C /data .gnupg .password-store .config
-#      base64 /tmp/creds.tar.gz > /tmp/creds.b64
+#      base64 -w0 /tmp/creds.tar.gz > /tmp/creds.b64
 #   2. Update Vault:
 #      vault kv patch secret/homelab/superhuman-remote-worker/srw-secrets \
 #        PROTONMAIL_BRIDGE_CREDS="$(cat /tmp/creds.b64)"
+#   3. Delete the PVC and restart:
+#      kubectl delete pvc srw-protonmail-bridge-data -n superhuman-remote-worker
+#      kubectl rollout restart deployment/srw-protonmail-bridge -n superhuman-remote-worker
 #
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: srw-protonmail-bridge-data
+  namespace: superhuman-remote-worker
+  labels:
+    app: srw-protonmail-bridge
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Auto-login entrypoint — overrides the baked-in entrypoint via ConfigMap mount.
+# Adds session health check + automatic re-authentication on token expiry.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: srw-protonmail-bridge-entrypoint
+  namespace: superhuman-remote-worker
+data:
+  entrypoint.sh: |
+    #!/bin/bash
+    set -e
+
+    export HOME=/data
+    export GNUPGHOME=/data/.gnupg
+    export PASSWORD_STORE_DIR=/data/.password-store
+
+    # Initialize GPG key and pass store on first run
+    if [ ! -d "$GNUPGHOME" ]; then
+        echo "First run: initializing credential store..."
+        mkdir -p "$GNUPGHOME"
+        chmod 700 "$GNUPGHOME"
+        gpg --batch --passphrase '' --quick-gen-key 'ProtonMail Bridge' default default never
+        KEY_ID=$(gpg --list-keys --with-colons 2>/dev/null | grep fpr | head -1 | cut -d: -f10)
+        pass init "$KEY_ID"
+        echo "Credential store initialized."
+    fi
+
+    # CLI mode (for manual debugging: kubectl exec ... -- bash -c 'entrypoint.sh cli')
+    if [ "${1}" = "cli" ]; then
+        exec protonmail-bridge --cli
+    fi
+
+    # --- Auto-login helper (no 2FA) ---
+    auto_login() {
+        if [ -z "$PROTON_USER" ] || [ -z "$PROTON_PASS" ]; then
+            echo "WARNING: PROTON_USER/PROTON_PASS not set — cannot auto-login."
+            return 1
+        fi
+        echo "Auto-login: authenticating as $PROTON_USER ..."
+        find /data -name "*.lock" -delete 2>/dev/null || true
+        printf 'login\n%s\n%s\nexit\n' "$PROTON_USER" "$PROTON_PASS" | \
+            timeout 120 protonmail-bridge --cli 2>&1 || true
+        find /data -name "*.lock" -delete 2>/dev/null || true
+        echo "Auto-login complete."
+    }
+
+    # --- Session health check ---
+    # Start bridge briefly to check if the OAuth refresh token is valid.
+    # The token refresh happens within the first few seconds of startup.
+    echo "Checking Proton session validity..."
+    timeout 15 protonmail-bridge --noninteractive > /tmp/bridge-check.log 2>&1 || true
+    find /data -name "*.lock" -delete 2>/dev/null || true
+
+    if grep -q "Invalid refresh token\|Failed to load connected user\|no credentials available" /tmp/bridge-check.log 2>/dev/null; then
+        echo "Session expired or missing."
+        cat /tmp/bridge-check.log
+        auto_login
+    else
+        echo "Session valid."
+    fi
+    rm -f /tmp/bridge-check.log
+
+    # --- Start bridge for real ---
+    cleanup() {
+        kill "$BRIDGE_PID" 2>/dev/null
+        wait "$BRIDGE_PID" 2>/dev/null
+    }
+    trap cleanup SIGTERM SIGINT
+
+    protonmail-bridge --noninteractive &
+    BRIDGE_PID=$!
+
+    echo "Waiting for Proton Bridge to start..."
+    for i in $(seq 1 30); do
+        if ss -tlnp 2>/dev/null | grep -q ":1143"; then
+            break
+        fi
+        if ! kill -0 "$BRIDGE_PID" 2>/dev/null; then
+            echo "Bridge process exited unexpectedly."
+            exit 1
+        fi
+        sleep 2
+    done
+
+    # Bridge only binds 127.0.0.1 — socat exposes on all interfaces
+    socat TCP-LISTEN:2143,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1143 &
+    socat TCP-LISTEN:2025,bind=0.0.0.0,reuseaddr,fork TCP:127.0.0.1:1025 &
+
+    echo "Proton Bridge ready."
+    echo "  IMAP: 0.0.0.0:2143 -> 127.0.0.1:1143"
+    echo "  SMTP: 0.0.0.0:2025 -> 127.0.0.1:1025"
+
+    wait $BRIDGE_PID
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -31,22 +146,32 @@ spec:
         app: srw-protonmail-bridge
     spec:
       initContainers:
-        - name: unpack-creds
+        # Seed PVC on first run only — if .gnupg already exists, skip.
+        - name: seed-creds
           image: alpine:3.20
           command:
             - sh
             - -c
             - |
+              if [ -d /data/.gnupg ]; then
+                echo "PVC already seeded — skipping."
+                exit 0
+              fi
+              if [ -z "$PROTONMAIL_BRIDGE_CREDS" ]; then
+                echo "No seed tarball and PVC is empty — entrypoint will auto-login."
+                exit 0
+              fi
               echo "$PROTONMAIL_BRIDGE_CREDS" | base64 -d | tar xzf - -C /data
               chown -R 1000:1000 /data
               chmod 700 /data/.gnupg
-              echo "Bridge credentials unpacked"
+              echo "Bridge credentials seeded from Vault."
           env:
             - name: PROTONMAIL_BRIDGE_CREDS
               valueFrom:
                 secretKeyRef:
                   name: srw-secrets
                   key: PROTONMAIL_BRIDGE_CREDS
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data
@@ -54,6 +179,7 @@ spec:
         - name: protonmail-bridge
           image: knaeckebrothero/protonmail-bridge:latest
           imagePullPolicy: Always
+          command: ["/bin/bash", "/entrypoint-override/entrypoint.sh"]
           ports:
             - containerPort: 2143
               name: imap
@@ -61,20 +187,36 @@ spec:
             - containerPort: 2025
               name: smtp
               protocol: TCP
+          env:
+            - name: PROTON_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: PROTON_USER
+                  optional: true
+            - name: PROTON_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: PROTON_PASS
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: entrypoint
+              mountPath: /entrypoint-override
+              readOnly: true
           livenessProbe:
             tcpSocket:
               port: 2143
-            initialDelaySeconds: 60
+            initialDelaySeconds: 90
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 5
           readinessProbe:
             tcpSocket:
               port: 2025
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
@@ -87,7 +229,12 @@ spec:
               cpu: "500m"
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: srw-protonmail-bridge-data
+        - name: entrypoint
+          configMap:
+            name: srw-protonmail-bridge-entrypoint
+            defaultMode: 0755
 ---
 apiVersion: v1
 kind: Service
