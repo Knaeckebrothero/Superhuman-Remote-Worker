@@ -7,15 +7,8 @@
 # Prerequisites:
 #   - NATS leaf deployed on agent cluster (see deployment/nats/nats-leaf-values.yaml)
 #   - KubeVirt installed on agent cluster (see docs/features/vm_agent_cluster_setup.md)
-#   - agent-vms namespace exists (kubectl create namespace agent-vms)
 #
-# Deploy:
-#   # Create the vm-template ConfigMap from your VM template YAML:
-#   kubectl create configmap vm-template -n agent-vms \
-#     --from-file=vm-template.yaml=<your-vm-template.yaml> \
-#     --dry-run=client -o yaml | kubectl apply -f -
-#
-#   kubectl apply -f deployment/25-vm-controller.yaml
+# The vm-template ConfigMap is defined below and managed by Fleet.
 #
 # Image build:
 #   cd vm-controller
@@ -71,6 +64,91 @@ roleRef:
   kind: Role
   name: vm-controller
   apiGroup: rbac.authorization.k8s.io
+
+---
+# VM template — loaded by controller's render_template() for string substitution
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vm-template
+  namespace: agent-vms
+data:
+  vm-template.yaml: |
+    apiVersion: kubevirt.io/v1
+    kind: VirtualMachine
+    metadata:
+      name: agent-vm-${JOB_ID}
+      labels:
+        vm.kubevirt.io/name: agent-vm-${JOB_ID}
+        job-id: ${JOB_ID}
+    spec:
+      runStrategy: RerunOnFailure
+      template:
+        metadata:
+          labels:
+            vm.kubevirt.io/name: agent-vm-${JOB_ID}
+            job-id: ${JOB_ID}
+        spec:
+          domain:
+            cpu:
+              cores: ${CPU_CORES}
+            memory:
+              guest: ${MEMORY}
+            devices:
+              disks:
+                - name: rootdisk
+                  disk:
+                    bus: virtio
+                - name: cloud-init
+                  disk:
+                    bus: virtio
+              interfaces:
+                - name: default
+                  masquerade: {}
+            machine:
+              type: q35
+          networks:
+            - name: default
+              pod: {}
+          volumes:
+            - name: rootdisk
+              containerDisk:
+                image: ${VM_IMAGE}
+            - name: cloud-init
+              cloudInitNoCloud:
+                userData: |
+                  #cloud-config
+                  write_files:
+                    - path: /etc/default/management-daemon
+                      permissions: '0644'
+                      content: |
+                        NATS_URL=${NATS_URL}
+                        JOB_ID=${JOB_ID}
+                    - path: /run/agent/job-config.json
+                      permissions: '0644'
+                      content: |
+                        {
+                          "job_id": "${JOB_ID}",
+                          "agent_config": "${AGENT_CONFIG}",
+                          "vm_image": "${VM_IMAGE}",
+                          "cpu_cores": ${CPU_CORES},
+                          "memory": "${MEMORY}",
+                          "description": "${DESCRIPTION}",
+                          "nats_url": "${NATS_URL}"
+                        }
+                    - path: /etc/default/sudo-gated
+                      permissions: '0644'
+                      content: |
+                        NATS_URL=${NATS_URL}
+                        JOB_ID=${JOB_ID}
+                        VM_ID=agent-vm-${JOB_ID}
+                  runcmd:
+                    - mkdir -p /run/agent
+                    - chmod 755 /run/agent
+                    - systemctl daemon-reload
+                    - systemctl enable management-daemon.service
+                    - systemctl start management-daemon.service
+                    - systemctl restart sudo-gated.socket
 
 ---
 # Deployment
