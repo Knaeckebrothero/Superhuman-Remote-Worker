@@ -1,23 +1,25 @@
 # Proton Mail Bridge — SMTP/IMAP for agent email (superhuman-remote-worker.com)
 #
-# Credentials persist on PVC (srw-protonmail-bridge-data). On first run, the
-# init container seeds the PVC from a Vault tarball. After that, the bridge
-# maintains its own OAuth refresh tokens on disk.
+# Credentials persist on PVC (srw-protonmail-bridge-data). The bridge maintains
+# its own OAuth refresh tokens on disk across pod restarts.
 #
-# If the refresh token expires (password change, session revoke), the entrypoint
-# auto-re-authenticates using PROTON_USER / PROTON_PASS from Vault — no manual
-# intervention needed (account has no 2FA).
-#
-# Manual re-seed (only if PVC is lost):
-#   1. Run locally with Podman, authenticate, then:
-#      tar czf /tmp/creds.tar.gz --exclude='S.gpg-agent*' -C /data .gnupg .password-store .config
-#      base64 -w0 /tmp/creds.tar.gz > /tmp/creds.b64
-#   2. Update Vault:
+# First-time setup (or after PVC loss):
+#   1. Wait for pod to start (entrypoint initializes GPG + pass store)
+#   2. Login interactively:
+#      kubectl exec -it -n superhuman-remote-worker deploy/srw-protonmail-bridge \
+#        -- /bin/bash /entrypoint-override/entrypoint.sh cli
+#      > login
+#      > <email>
+#      > <password>
+#      > info           # note the SMTP/IMAP bridge password
+#      > exit
+#   3. Update Vault with the bridge password:
 #      vault kv patch secret/homelab/superhuman-remote-worker/srw-secrets \
-#        PROTONMAIL_BRIDGE_CREDS="$(cat /tmp/creds.b64)"
-#   3. Delete the PVC and restart:
-#      kubectl delete pvc srw-protonmail-bridge-data -n superhuman-remote-worker
-#      kubectl rollout restart deployment/srw-protonmail-bridge -n superhuman-remote-worker
+#        PROTON_BRIDGE_PASSWORD="<bridge-password-from-info>"
+#   4. Restart consumers (Keycloak, orchestrator) to pick up new password.
+#
+# If the refresh token expires (password change, session revoke):
+#   Repeat the login steps above — the PVC retains everything else.
 #
 ---
 apiVersion: v1
@@ -34,8 +36,7 @@ spec:
     requests:
       storage: 1Gi
 ---
-# Auto-login entrypoint — overrides the baked-in entrypoint via ConfigMap mount.
-# Adds session health check + automatic re-authentication on token expiry.
+# Entrypoint — initializes credential store on first run, then starts bridge + socat.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -59,37 +60,19 @@ data:
         KEY_ID=$(gpg --list-keys --with-colons 2>/dev/null | grep fpr | head -1 | cut -d: -f10)
         pass init "$KEY_ID"
         echo "Credential store initialized."
+        echo ""
+        echo "*** No account configured. Login manually: ***"
+        echo "  kubectl exec -it -n superhuman-remote-worker deploy/srw-protonmail-bridge \\"
+        echo "    -- /bin/bash /entrypoint-override/entrypoint.sh cli"
     fi
 
-    # CLI mode (for manual debugging: kubectl exec ... -- bash -c 'entrypoint.sh cli')
+    # CLI mode (for manual login: kubectl exec ... -- /bin/bash /entrypoint-override/entrypoint.sh cli)
     if [ "${1}" = "cli" ]; then
+        find /data -name "*.lock" -delete 2>/dev/null || true
         exec protonmail-bridge --cli
     fi
 
-    # --- Auto-login helper (no 2FA) ---
-    auto_login() {
-        if [ -z "$PROTON_USER" ] || [ -z "$PROTON_PASS" ]; then
-            echo "WARNING: PROTON_USER/PROTON_PASS not set — cannot auto-login."
-            return 1
-        fi
-        echo "Auto-login: authenticating as $PROTON_USER ..."
-        find /data -name "*.lock" -delete 2>/dev/null || true
-        # Send credentials, wait for sync to complete, then exit.
-        # The sleep gives the bridge time to finish its initial mail sync —
-        # exiting too early aborts the sync and corrupts address state.
-        (echo "login"; sleep 1; echo "$PROTON_USER"; sleep 1; echo "$PROTON_PASS"; sleep 45; echo "exit") | \
-            timeout 120 protonmail-bridge --cli 2>&1 || true
-        find /data -name "*.lock" -delete 2>/dev/null || true
-        echo "Auto-login complete."
-    }
-
-    # --- Ensure session is active ---
-    # Always attempt login on startup. This is idempotent — if the user is
-    # already logged in the CLI prints "already logged in" and exits cleanly.
-    # Covers both fresh installs (no user) and expired refresh tokens.
-    auto_login
-
-    # --- Start bridge for real ---
+    # --- Start bridge ---
     cleanup() {
         kill "$BRIDGE_PID" 2>/dev/null
         wait "$BRIDGE_PID" 2>/dev/null
@@ -138,36 +121,6 @@ spec:
       labels:
         app: srw-protonmail-bridge
     spec:
-      initContainers:
-        # Seed PVC on first run only — if .gnupg already exists, skip.
-        - name: seed-creds
-          image: alpine:3.20
-          command:
-            - sh
-            - -c
-            - |
-              if [ -d /data/.gnupg ]; then
-                echo "PVC already seeded — skipping."
-                exit 0
-              fi
-              if [ -z "$PROTONMAIL_BRIDGE_CREDS" ]; then
-                echo "No seed tarball and PVC is empty — entrypoint will auto-login."
-                exit 0
-              fi
-              echo "$PROTONMAIL_BRIDGE_CREDS" | base64 -d | tar xzf - -C /data
-              chown -R 1000:1000 /data
-              chmod 700 /data/.gnupg
-              echo "Bridge credentials seeded from Vault."
-          env:
-            - name: PROTONMAIL_BRIDGE_CREDS
-              valueFrom:
-                secretKeyRef:
-                  name: srw-secrets
-                  key: PROTONMAIL_BRIDGE_CREDS
-                  optional: true
-          volumeMounts:
-            - name: data
-              mountPath: /data
       containers:
         - name: protonmail-bridge
           image: knaeckebrothero/protonmail-bridge:latest
@@ -180,19 +133,6 @@ spec:
             - containerPort: 2025
               name: smtp
               protocol: TCP
-          env:
-            - name: PROTON_USER
-              valueFrom:
-                secretKeyRef:
-                  name: srw-secrets
-                  key: PROTON_USER
-                  optional: true
-            - name: PROTON_PASS
-              valueFrom:
-                secretKeyRef:
-                  name: srw-secrets
-                  key: PROTON_PASS
-                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data
@@ -202,14 +142,14 @@ spec:
           livenessProbe:
             tcpSocket:
               port: 2143
-            initialDelaySeconds: 120
+            initialDelaySeconds: 60
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 5
           readinessProbe:
             tcpSocket:
               port: 2025
-            initialDelaySeconds: 60
+            initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
