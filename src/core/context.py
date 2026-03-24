@@ -311,13 +311,13 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
             msg_tokens = 0
             # Count message content
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            content_tokens = len(enc.encode(content))
+            content_tokens = len(enc.encode(content, disallowed_special=()))
             msg_tokens += content_tokens
 
             # Count tool calls if present
             tool_call_tokens = 0
             if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tool_call_tokens = len(enc.encode(str(msg.tool_calls)))
+                tool_call_tokens = len(enc.encode(str(msg.tool_calls), disallowed_special=()))
                 msg_tokens += tool_call_tokens
 
             # Add overhead for message structure (role, etc.)
