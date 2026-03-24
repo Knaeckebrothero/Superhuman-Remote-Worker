@@ -15,7 +15,6 @@ spec:
   branch: main
   paths:
     - deployment
-    - deployment/srw-vm-controller
   # Target the downstream (main) cluster by default
   # Per-directory fleet.yaml can override (e.g. srw-vm-controller → vms cluster)
   targets:
