@@ -1,0 +1,91 @@
+# Vector Database (pgvector) — Citations, Embeddings, Memories, Knowledge Index
+#
+# Separate PostgreSQL instance with pgvector extension for all vector operations.
+# Schema is applied by the orchestrator on startup (vector_schema.sql), not by initdb.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: srw-postgres-vector-data
+  namespace: superhuman-remote-worker
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: srw-postgres-vector
+  namespace: superhuman-remote-worker
+spec:
+  serviceName: srw-postgres-vector
+  replicas: 1
+  selector:
+    matchLabels:
+      app: srw-postgres-vector
+  template:
+    metadata:
+      labels:
+        app: srw-postgres-vector
+    spec:
+      containers:
+        - name: postgres-vector
+          image: pgvector/pgvector:pg15
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: VECTOR_POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: VECTOR_POSTGRES_DB
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "srw"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: srw-postgres-vector-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srw-postgres-vector
+  namespace: superhuman-remote-worker
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: srw-postgres-vector

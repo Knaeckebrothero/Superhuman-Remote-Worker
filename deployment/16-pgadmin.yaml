@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-pgadmin
+  namespace: superhuman-remote-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: srw-pgadmin
+  template:
+    metadata:
+      labels:
+        app: srw-pgadmin
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-postgres 5432; do sleep 2; done"]
+      containers:
+        - name: pgadmin
+          image: dpage/pgadmin4:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: PGADMIN_DEFAULT_EMAIL
+              value: "admin@srw.dev"
+            - name: PGADMIN_DEFAULT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGADMIN_CONFIG_SERVER_MODE
+              value: "False"
+          startupProbe:
+            httpGet:
+              path: /misc/ping
+              port: 80
+            failureThreshold: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /misc/ping
+              port: 80
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /misc/ping
+              port: 80
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "250m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srw-pgadmin
+  namespace: superhuman-remote-worker
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5050
+      targetPort: 80
+  selector:
+    app: srw-pgadmin
