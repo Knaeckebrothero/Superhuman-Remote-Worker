@@ -2,6 +2,8 @@ defaultNamespace: agent-vms
 helm:
   takeOwnership: true
 dependsOn: []
+ignorePaths:
+  - "vm-template.yaml"
 # Deploy only to the VMs cluster — targetRestrictions prevents GitRepo default merge
 targets:
   - clusterSelector:
