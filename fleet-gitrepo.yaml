@@ -1,7 +1,7 @@
 # Apply this to the Rancher cluster to register the SRW repo with Fleet
 #
 # Usage:
-#   kubectl apply -f deployment/fleet-gitrepo.yaml --context local
+#   kubectl apply -f fleet-gitrepo.yaml --context local
 #
 # No auth needed — public GitHub repo
 ---
