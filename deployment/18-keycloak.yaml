@@ -470,6 +470,9 @@ spec:
             # Trust ProtonMail Bridge self-signed cert for SMTP STARTTLS
             - name: KC_TRUSTSTORE_PATHS
               value: "/opt/keycloak/certs/bridge-cert.pem"
+            # Bridge cert has CN=127.0.0.1 — skip hostname check for SMTP
+            - name: JAVA_OPTS_APPEND
+              value: "-Dmail.smtp.ssl.trust=srw-protonmail-bridge"
             # Admin credentials (Keycloak server admin)
             - name: KEYCLOAK_ADMIN
               valueFrom:
