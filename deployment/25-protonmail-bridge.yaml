@@ -80,21 +80,11 @@ data:
         echo "Auto-login complete."
     }
 
-    # --- Session health check ---
-    # Start bridge briefly to check if the OAuth refresh token is valid.
-    # The token refresh happens within the first few seconds of startup.
-    echo "Checking Proton session validity..."
-    timeout 15 protonmail-bridge --noninteractive > /tmp/bridge-check.log 2>&1 || true
-    find /data -name "*.lock" -delete 2>/dev/null || true
-
-    if grep -q "Invalid refresh token\|Failed to load connected user\|no credentials available" /tmp/bridge-check.log 2>/dev/null; then
-        echo "Session expired or missing."
-        cat /tmp/bridge-check.log
-        auto_login
-    else
-        echo "Session valid."
-    fi
-    rm -f /tmp/bridge-check.log
+    # --- Ensure session is active ---
+    # Always attempt login on startup. This is idempotent — if the user is
+    # already logged in the CLI prints "already logged in" and exits cleanly.
+    # Covers both fresh installs (no user) and expired refresh tokens.
+    auto_login
 
     # --- Start bridge for real ---
     cleanup() {
