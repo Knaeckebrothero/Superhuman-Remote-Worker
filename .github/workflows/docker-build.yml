@@ -603,19 +603,19 @@ jobs:
         if: needs.build-vm-controller.result == 'success'
         run: |
           sed -i 's|superhuman-remote-worker-vm-controller:[a-zA-Z0-9_.-]*|superhuman-remote-worker-vm-controller:${{ steps.tag.outputs.sha }}|g' \
-            deployment/srw-vm-controller/vm-controller.yaml
+            deployment-vms/srw-vm-controller/vm-controller.yaml
 
       - name: Update agent VM base image tag
         if: needs.build-agent-vm-base.result == 'success'
         run: |
           sed -i 's|superhuman-remote-worker-agent-vm-base:[a-zA-Z0-9_.-]*|superhuman-remote-worker-agent-vm-base:${{ steps.tag.outputs.sha }}|g' \
-            deployment/srw-vm-controller/vm-controller.yaml
+            deployment-vms/srw-vm-controller/vm-controller.yaml
 
       - name: Commit and push updated manifests
         run: |
           git diff --quiet && { echo "No manifest changes to commit"; exit 0; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deployment/
+          git add deployment/ deployment-vms/
           git commit -m "deploy: update image tags to ${{ steps.tag.outputs.sha }}"
           git push
