@@ -6,8 +6,6 @@ output/*
 orchestrator/workspace/*
 project_documentation/*
 certs/*
-deployment/*
-Advanced-LLM-Chat
 
 # VPN credentials (config.example is tracked, config is not)
 docker/vpn/config

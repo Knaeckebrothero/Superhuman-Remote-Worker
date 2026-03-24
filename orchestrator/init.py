@@ -1359,7 +1359,15 @@ def restore_mongodb(backup_dir: Path) -> bool:
 # Uploads Directory Management
 # =============================================================================
 
-UPLOADS_DIR = Path(__file__).resolve().parent.parent / "workspace" / "uploads"
+def _resolve_uploads_dir() -> Path:
+    """Resolve uploads directory, respecting WORKSPACE_PATH env var."""
+    env_path = os.getenv("WORKSPACE_PATH")
+    if env_path:
+        return Path(env_path) / "uploads"
+    return Path(__file__).resolve().parent.parent / "workspace" / "uploads"
+
+
+UPLOADS_DIR = _resolve_uploads_dir()
 
 
 def get_uploads_path() -> Path:

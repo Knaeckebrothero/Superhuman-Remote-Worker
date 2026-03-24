@@ -1,0 +1,14 @@
+# Shared workspace volume between orchestrator and agent(s)
+# Uses ReadWriteMany so both pods can mount it simultaneously
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: srw-workspace
+  namespace: superhuman-remote-worker
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 20Gi

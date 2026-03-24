@@ -1,0 +1,129 @@
+# Proton Mail Bridge — SMTP/IMAP for agent email (superhuman-remote-worker.com)
+#
+# Initial setup (one-time, interactive):
+#   1. Run locally with Podman to authenticate:
+#      podman run -it -v srw-bridge-data:/data --entrypoint bash \
+#        knaeckebrothero/protonmail-bridge:latest
+#
+#   2. Inside container, initialize credential store:
+#      export HOME=/data GNUPGHOME=/data/.gnupg PASSWORD_STORE_DIR=/data/.password-store
+#      mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+#      gpg --batch --passphrase '' --quick-gen-key 'ProtonMail Bridge' default default never
+#      KEY_ID=$(gpg --list-keys --with-colons 2>/dev/null | grep fpr | head -1 | cut -d: -f10)
+#      pass init "$KEY_ID"
+#
+#   3. Login and note the bridge-generated password:
+#      protonmail-bridge --cli
+#      >>> login
+#      # Enter agent@superhuman-remote-worker.com credentials + 2FA
+#      >>> info
+#      # Note the bridge password → put in 01-secrets.yaml as SMTP_PASSWORD + IMAP_PASSWORD
+#      >>> exit
+#
+#   4. Copy credentials to cluster PVC:
+#      kubectl scale deployment/srw-protonmail-bridge -n superhuman-remote-worker --replicas=0
+#      VOLPATH=$(podman volume inspect srw-bridge-data --format '{{.Mountpoint}}')
+#      tar czf /tmp/srw-bridge-data.tar.gz --exclude='S.gpg-agent*' -C "$VOLPATH" .
+#      kubectl run -n superhuman-remote-worker bridge-copy --rm -i \
+#        --image=alpine --restart=Never \
+#        --overrides='{
+#          "spec": {
+#            "containers": [{"name": "copy", "image": "alpine",
+#              "command": ["sh", "-c", "tar xzf - -C /data && echo DONE"],
+#              "stdin": true,
+#              "volumeMounts": [{"name": "data", "mountPath": "/data"}]
+#            }],
+#            "volumes": [{"name": "data",
+#              "persistentVolumeClaim": {"claimName": "srw-protonmail-bridge-data"}}]
+#          }
+#        }' < /tmp/srw-bridge-data.tar.gz
+#      kubectl scale deployment/srw-protonmail-bridge -n superhuman-remote-worker --replicas=1
+#
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: srw-protonmail-bridge-data
+  namespace: superhuman-remote-worker
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-protonmail-bridge
+  namespace: superhuman-remote-worker
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: srw-protonmail-bridge
+  template:
+    metadata:
+      labels:
+        app: srw-protonmail-bridge
+    spec:
+      containers:
+        - name: protonmail-bridge
+          image: knaeckebrothero/protonmail-bridge:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 2143
+              name: imap
+              protocol: TCP
+            - containerPort: 2025
+              name: smtp
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            tcpSocket:
+              port: 2143
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            tcpSocket:
+              port: 2025
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: srw-protonmail-bridge-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srw-protonmail-bridge
+  namespace: superhuman-remote-worker
+spec:
+  type: ClusterIP
+  ports:
+    - port: 1143
+      targetPort: 2143
+      protocol: TCP
+      name: imap
+    - port: 1025
+      targetPort: 2025
+      protocol: TCP
+      name: smtp
+  selector:
+    app: srw-protonmail-bridge

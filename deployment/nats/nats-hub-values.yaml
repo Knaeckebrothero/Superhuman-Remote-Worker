@@ -1,0 +1,61 @@
+# NATS Hub — Main k3s Cluster
+#
+# 3-node NATS cluster with JetStream for message persistence.
+# The agent cluster's leaf node dials into this hub via NodePort 30742.
+#
+# Deploy:
+#   helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+#   helm install nats nats/nats -n nats --create-namespace -f nats-hub-values.yaml
+#
+# After deploy, create JetStream streams:
+#   ./setup-streams.sh
+#
+# Verify:
+#   kubectl get pods -n nats
+#   kubectl logs -n nats -l app.kubernetes.io/name=nats | grep -i leaf
+#
+# See docs/features/nats.md for the full design.
+
+config:
+  cluster:
+    enabled: true
+    replicas: 3
+
+  jetstream:
+    enabled: true
+    fileStore:
+      pvc:
+        size: 2Gi
+        storageClassName: longhorn
+
+  leafnodes:
+    enabled: true
+    # No auth for home lab. For beyond-LAN, add NKey auth:
+    # authorization:
+    #   users:
+    #     - nkey: UABC...  # leaf node's public NKey
+
+  monitor:
+    enabled: true
+    port: 8222
+
+container:
+  env:
+    GOMEMLIMIT: "256MiB"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+service:
+  enabled: true
+  ports:
+    leafnode:
+      enabled: true
+
+# NOTE: The leafnode NodePort service (nats-leafnode-external, port 30742) is
+# created separately via nats-leafnode-external.yaml because the NATS Helm chart
+# does not support extraServices. Apply it after helm install:
+#   kubectl apply -f nats-leafnode-external.yaml

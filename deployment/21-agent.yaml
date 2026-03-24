@@ -1,0 +1,290 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-agent
+  namespace: superhuman-remote-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: srw-agent
+  template:
+    metadata:
+      labels:
+        app: srw-agent
+    spec:
+      initContainers:
+        - name: wait-for-orchestrator
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-orchestrator 8085; do sleep 2; done"]
+      containers:
+        - name: agent
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8001
+          env:
+            # Core config
+            - name: AGENT_CONFIG
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: AGENT_CONFIG
+            - name: AGENT_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: AGENT_PORT
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: DATABASE_URL
+            - name: VECTOR_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: VECTOR_DB_URL
+            - name: MONGODB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: MONGODB_URL
+            - name: ORCHESTRATOR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: ORCHESTRATOR_URL
+            - name: WORKSPACE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: WORKSPACE_PATH
+            # LLM routing (via VPN sidecar)
+            - name: LLM_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: LLM_BASE_URL
+            - name: KEY_COOLDOWN_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: KEY_COOLDOWN_SECONDS
+            # LLM provider keys
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: OPENAI_API_KEY
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: GROQ_API_KEY
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: OPENROUTER_API_KEY
+            - name: GOOGLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: GOOGLE_API_KEY
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: TAVILY_API_KEY
+            - name: SEMANTIC_SCHOLAR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: SEMANTIC_SCHOLAR_API_KEY
+            # Vision model
+            - name: VISION_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: VISION_API_KEY
+            - name: VISION_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: VISION_MODEL
+            # Whisper
+            - name: WHISPER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: WHISPER_API_KEY
+            # Browser automation (via VPN sidecar)
+            - name: BROWSER_LLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: BROWSER_LLM_MODEL
+            - name: BROWSER_LLM_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: BROWSER_LLM_BASE_URL
+            # Research proxy (via VPN sidecar SOCKS5)
+            - name: RESEARCH_PROXY_TYPE
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: RESEARCH_PROXY_TYPE
+            - name: RESEARCH_PROXY_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: RESEARCH_PROXY_HOST
+            - name: RESEARCH_PROXY_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: RESEARCH_PROXY_PORT
+            # Citation Engine (via VPN sidecar)
+            - name: CITATION_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: CITATION_DB_URL
+            - name: CITATION_LLM_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CITATION_LLM_URL
+            - name: CITATION_LLM_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CITATION_LLM_MODEL
+            - name: CITATION_REASONING_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CITATION_REASONING_LEVEL
+            - name: CITATION_EMBEDDING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CITATION_EMBEDDING_MODEL
+            - name: CITATION_EMBEDDING_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CITATION_EMBEDDING_URL
+            - name: EMBEDDING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: EMBEDDING_MODEL
+            - name: EMBEDDING_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: EMBEDDING_BASE_URL
+            - name: EMBEDDING_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: EMBEDDING_API_KEY
+            - name: CITATION_EMBEDDING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: CITATION_EMBEDDING_KEY
+            # Research
+            - name: UNPAYWALL_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: UNPAYWALL_EMAIL
+            # Neo4j (local instance)
+            - name: NEO4J_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NEO4J_URL
+            - name: NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEO4J_USERNAME
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEO4J_PASSWORD
+            # Claude Code CLI auth
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: CLAUDE_CODE_OAUTH_TOKEN
+            # Workstation API (embeddings, vision)
+            - name: WORKSTATION_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: WORKSTATION_BASE_URL
+            # Gitea (for workspace git operations)
+            - name: GITEA_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: GITEA_URL
+            # Logging
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: LOG_LEVEL
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            failureThreshold: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: srw-workspace
+        - name: vm-ssh-key
+          secret:
+            secretName: vm-ssh-key
+            defaultMode: 0400

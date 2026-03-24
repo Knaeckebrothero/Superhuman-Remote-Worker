@@ -1,0 +1,45 @@
+# NATS Leaf — Agent k3s Cluster
+#
+# Single-node NATS relay. No JetStream, no local storage.
+# Dials out to the hub on the main cluster via NodePort 30742.
+#
+# VMs and the VM controller connect to this leaf via:
+#   nats://nats-leaf.nats.svc.cluster.local:4222
+#
+# Deploy:
+#   helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+#   helm install nats-leaf nats/nats -n nats --create-namespace -f nats-leaf-values.yaml
+#
+# Verify:
+#   kubectl logs -n nats deploy/nats-leaf | grep "Leafnode connection"
+#
+# See docs/features/nats.md for the full design.
+
+config:
+  cluster:
+    enabled: false
+
+  jetstream:
+    enabled: false
+
+  leafnodes:
+    enabled: true
+    # Use merge to inject remotes into the generated nats.conf
+    # (the chart doesn't have a native remotes key)
+    merge:
+      remotes:
+        # Any main cluster node IP (NodePort is available on all nodes)
+        # Main cluster nodes: 10.0.0.101, 10.0.0.102, 10.0.0.103
+        - url: "nats-leaf://10.0.0.101:30742"
+
+replicaCount: 1
+
+container:
+  env:
+    GOMEMLIMIT: "58MiB"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi

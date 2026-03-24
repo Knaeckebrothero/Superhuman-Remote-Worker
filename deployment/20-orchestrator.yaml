@@ -1,0 +1,435 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: srw-orchestrator
+  namespace: superhuman-remote-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: srw-orchestrator
+  template:
+    metadata:
+      labels:
+        app: srw-orchestrator
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-postgres 5432; do sleep 2; done"]
+        - name: wait-for-postgres-vector
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-postgres-vector 5432; do sleep 2; done"]
+        - name: wait-for-mongodb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-mongodb 27017; do sleep 2; done"]
+        - name: wait-for-gitea
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-gitea 3000; do sleep 2; done"]
+        - name: wait-for-keycloak
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z srw-keycloak 8080; do sleep 2; done"]
+      containers:
+        - name: orchestrator
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-orchestrator:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8085
+          env:
+            - name: PORT
+              value: "8085"
+            # Core databases
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: DATABASE_URL
+            - name: VECTOR_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: VECTOR_DB_URL
+            - name: MONGODB_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: MONGODB_URL
+            - name: WORKSPACE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: WORKSPACE_PATH
+            # Gitea
+            - name: GITEA_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: GITEA_URL
+            - name: GITEA_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: GITEA_ADMIN_USER
+            - name: GITEA_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: GITEA_ADMIN_PASSWORD
+            - name: GITEA_INTERNAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: GITEA_INTERNAL_URL
+            - name: GITEA_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: GITEA_OIDC_CLIENT_SECRET
+                  optional: true
+            # Keycloak SSO
+            - name: KEYCLOAK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: KEYCLOAK_URL
+            - name: KEYCLOAK_ISSUER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: KEYCLOAK_ISSUER_URL
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: KEYCLOAK_REALM
+            - name: KEYCLOAK_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KEYCLOAK_ADMIN_USER
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: KEYCLOAK_ADMIN_PASSWORD
+            # MCP auth
+            - name: MCP_INTERNAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: MCP_INTERNAL_KEY
+            # CORS
+            - name: CORS_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CORS_ORIGINS
+            # Cockpit external URL (deep links in notifications)
+            - name: COCKPIT_EXTERNAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: COCKPIT_EXTERNAL_URL
+            # Instruction Builder
+            - name: BUILDER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: BUILDER_API_KEY
+            - name: BUILDER_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: BUILDER_MODEL
+            - name: BUILDER_LLM_PROVIDER
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: BUILDER_LLM_PROVIDER
+            # Default Neo4j datasource (local instance)
+            - name: DEFAULT_DS_NEO4J_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEFAULT_DS_NEO4J_URL
+            - name: DEFAULT_DS_NEO4J_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: DEFAULT_DS_NEO4J_USERNAME
+            - name: DEFAULT_DS_NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEO4J_PASSWORD
+            - name: DEFAULT_DS_NEO4J_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEFAULT_DS_NEO4J_NAME
+            - name: DEFAULT_DS_NEO4J_READ_ONLY
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEFAULT_DS_NEO4J_READ_ONLY
+            # Default WebDAV datasource (Nextcloud)
+            - name: DEFAULT_DS_WEBDAV_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEFAULT_DS_WEBDAV_URL
+            - name: DEFAULT_DS_WEBDAV_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: DEFAULT_DS_WEBDAV_USERNAME
+            - name: DEFAULT_DS_WEBDAV_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: DEFAULT_DS_WEBDAV_PASSWORD
+            - name: DEFAULT_DS_WEBDAV_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEFAULT_DS_WEBDAV_NAME
+            - name: DEFAULT_DS_WEBDAV_READ_ONLY
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: DEFAULT_DS_WEBDAV_READ_ONLY
+            # S3 / MinIO (snapshots + IDE sessions)
+            - name: S3_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: S3_ENDPOINT
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: S3_ACCESS_KEY
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: S3_SECRET_KEY
+            - name: S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: S3_BUCKET
+            - name: S3_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: S3_REGION
+            - name: SNAPSHOT_MAX_SIZE_GB
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SNAPSHOT_MAX_SIZE_GB
+            - name: SNAPSHOT_RETENTION_DAYS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SNAPSHOT_RETENTION_DAYS
+            # IDE sessions
+            - name: IDE_SESSION_IDLE_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IDE_SESSION_IDLE_TIMEOUT
+            - name: IDE_SESSION_MAX_LIFETIME
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IDE_SESSION_MAX_LIFETIME
+            - name: IDE_MAX_CONCURRENT_PER_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IDE_MAX_CONCURRENT_PER_USER
+            - name: CODE_SERVER_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: CODE_SERVER_IMAGE
+            # Notification — SMTP
+            - name: SMTP_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SMTP_HOST
+            - name: SMTP_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SMTP_PORT
+            - name: SMTP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: SMTP_USER
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: SMTP_PASSWORD
+            - name: SMTP_USE_TLS
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SMTP_USE_TLS
+            - name: SMTP_TRUST_SELF_SIGNED
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SMTP_TRUST_SELF_SIGNED
+            - name: SMTP_FROM
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SMTP_FROM
+            # Notification — IMAP (inbound email replies)
+            - name: IMAP_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IMAP_HOST
+            - name: IMAP_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IMAP_PORT
+            - name: IMAP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: IMAP_USER
+            - name: IMAP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: IMAP_PASSWORD
+            - name: IMAP_USE_SSL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IMAP_USE_SSL
+            - name: IMAP_TRUST_SELF_SIGNED
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IMAP_TRUST_SELF_SIGNED
+            - name: IMAP_POLL_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IMAP_POLL_INTERVAL
+            - name: AGENT_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: AGENT_EMAIL
+            - name: MAIL_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: MAIL_DOMAIN
+            # Notification — Webhooks
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: SLACK_WEBHOOK_URL
+            - name: DISCORD_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: DISCORD_WEBHOOK_URL
+            - name: NTFY_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NTFY_URL
+            - name: NTFY_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NTFY_TOPIC
+            - name: NTFY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NTFY_TOKEN
+            # VM lifecycle (optional)
+            - name: NATS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: NATS_URL
+                  optional: true
+            - name: VM_TEMPLATE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: VM_TEMPLATE_PATH
+                  optional: true
+            - name: VM_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: VM_NAMESPACE
+                  optional: true
+            # Orchestrator settings
+            - name: AUTO_ASSIGN_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: AUTO_ASSIGN_ENABLED
+            # Logging
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: LOG_LEVEL
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8085
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8085
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: srw-workspace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: srw-orchestrator
+  namespace: superhuman-remote-worker
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8085
+      targetPort: 8085
+  selector:
+    app: srw-orchestrator

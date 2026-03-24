@@ -1,0 +1,23 @@
+# NodePort service exposing the leafnode port for cross-cluster leaf connections.
+# The agent cluster's NATS leaf dials into this on any main cluster node at port 30742.
+#
+# Applied separately because the NATS Helm chart doesn't support extraServices.
+# Apply after helm install: kubectl apply -f nats-leafnode-external.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-leafnode-external
+  namespace: nats
+  labels:
+    app.kubernetes.io/part-of: superhuman-remote-worker
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/component: nats
+  ports:
+    - name: leafnode
+      port: 7422
+      targetPort: 7422
+      nodePort: 30742
+      protocol: TCP
