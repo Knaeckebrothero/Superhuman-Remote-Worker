@@ -24,7 +24,7 @@ if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
 
 from src.graph import create_audited_tool_node  # noqa: E402
-from src.core.loader import LimitsConfig, ResponseValidationConfig  # noqa: E402
+from src.core.loader import LimitsConfig  # noqa: E402
 
 
 # =============================================================================
@@ -718,7 +718,7 @@ class TestCategoryFailureTracking:
                     mock_tn.ainvoke = AsyncMock(return_value={
                         "messages": [make_tool_result(
                             name,
-                            f"Error: knowledge store not configured",
+                            "Error: knowledge store not configured",
                             f"call_{name}",
                         )]
                     })
