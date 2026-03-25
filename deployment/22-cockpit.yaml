@@ -8,7 +8,7 @@ data:
     (function(window) {
       window['env'] = window['env'] || {};
       window['env']['apiUrl'] = 'https://api.superhuman-remote-worker.com/api';
-      window['env']['giteaUrl'] = 'https://git.superhuman-remote-worker.com';
+      window['env']['giteaUrl'] = 'https://git.superhuman-remote-worker.com/srw';
       window['env']['dozzleUrl'] = 'https://dozzle.superhuman-remote-worker.com';
       window['env']['minioConsoleUrl'] = 'https://minio.superhuman-remote-worker.com';
       window['env']['neo4jUrl'] = 'https://neo4j.superhuman-remote-worker.com';

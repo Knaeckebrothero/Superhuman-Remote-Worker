@@ -1919,6 +1919,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 config_name = project["default_config_name"]
             project_default_override = project.get("default_config_override")
             if project_default_override:
+                # asyncpg may return JSONB as a string — parse it
+                if isinstance(project_default_override, str):
+                    project_default_override = json.loads(project_default_override)
                 if config_override:
                     # Deep merge: project defaults as base, job overrides on top
                     config_override = _deep_merge_dicts(
@@ -2147,6 +2150,7 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to create job: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
