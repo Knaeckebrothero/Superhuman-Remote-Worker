@@ -375,7 +375,7 @@ data:
         }
       ],
       "smtpServer": {
-        "host": "protonmail-bridge.protonmail-bridge.svc",
+        "host": "127.0.0.1",
         "port": "1025",
         "from": "noreply@superhuman-remote-worker.com",
         "fromDisplayName": "Superhuman Remote Worker",
@@ -561,6 +561,20 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "1000m"
+        # Sidecar: TCP proxy so Keycloak connects to 127.0.0.1:1025.
+        # The bridge cert has CN=127.0.0.1 — this makes hostname verification pass.
+        - name: smtp-proxy
+          image: alpine/socat:1.8
+          args:
+            - TCP-LISTEN:1025,bind=127.0.0.1,reuseaddr,fork
+            - TCP:protonmail-bridge.protonmail-bridge.svc:1025
+          resources:
+            requests:
+              memory: "16Mi"
+              cpu: "10m"
+            limits:
+              memory: "32Mi"
+              cpu: "50m"
       volumes:
         - name: realm-import
           configMap:
