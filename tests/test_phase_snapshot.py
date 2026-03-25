@@ -93,6 +93,7 @@ class TestSnapshotCreation:
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
         mgr._workspace_path = tmp_path / f"job_{job_id}"
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
+        mgr._backend = None
         return mgr
 
     def _setup_workspace(self, tmp_path, job_id="test-job"):
@@ -222,6 +223,7 @@ class TestGetSnapshot:
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
         mgr._workspace_path = tmp_path / f"job_{job_id}"
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
+        mgr._backend = None
         return mgr
 
     def test_get_existing_snapshot(self, tmp_path):
@@ -257,6 +259,7 @@ class TestRecoverToPhase:
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
         mgr._workspace_path = tmp_path / f"job_{job_id}"
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
+        mgr._backend = None
         return mgr
 
     def test_recover_restores_files(self, tmp_path):
@@ -366,6 +369,7 @@ class TestDeletionAndCleanup:
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
         mgr._workspace_path = tmp_path / f"job_{job_id}"
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
+        mgr._backend = None
         return mgr
 
     def test_delete_after_removes_later_phases(self, tmp_path):
@@ -446,6 +450,7 @@ class TestGetLatestSnapshot:
         mgr._snapshots_dir = tmp_path / "phase_snapshots" / f"job_{job_id}"
         mgr._workspace_path = tmp_path / f"job_{job_id}"
         mgr._checkpoint_path = tmp_path / "checkpoints" / f"job_{job_id}.db"
+        mgr._backend = None
         return mgr
 
     def test_returns_last_snapshot(self, tmp_path):
