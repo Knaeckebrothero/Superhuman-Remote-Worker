@@ -94,15 +94,15 @@ data:
   IDE_MAX_CONCURRENT_PER_USER: "2"
   CODE_SERVER_IMAGE: "codercom/code-server:latest"
 
-  # Notification — SMTP (via Proton Bridge)
-  SMTP_HOST: "srw-protonmail-bridge"
+  # Notification — SMTP (via shared Proton Bridge in protonmail-bridge namespace)
+  SMTP_HOST: "protonmail-bridge.protonmail-bridge.svc"
   SMTP_PORT: "1025"
   SMTP_USE_TLS: "true"
   SMTP_TRUST_SELF_SIGNED: "true"
   SMTP_FROM: "noreply@superhuman-remote-worker.com"
 
-  # Notification — IMAP (via Proton Bridge, same namespace)
-  IMAP_HOST: "srw-protonmail-bridge"
+  # Notification — IMAP (via shared Proton Bridge)
+  IMAP_HOST: "protonmail-bridge.protonmail-bridge.svc"
   IMAP_PORT: "1143"
   IMAP_USE_SSL: "false"
   IMAP_TRUST_SELF_SIGNED: "true"
