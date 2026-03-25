@@ -7,7 +7,7 @@ and async job status updates.
 
 import pytest
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from src.tools.context import ToolContext
 
