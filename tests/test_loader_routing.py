@@ -427,7 +427,7 @@ class TestOpenRouterReasoningFormat:
         _create_openrouter_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "xhigh"}
+        assert call_kwargs["reasoning"] == {"effort": "xhigh"}
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
     @patch("src.core.loader.ReasoningChatOpenAI")
@@ -441,7 +441,7 @@ class TestOpenRouterReasoningFormat:
         _create_openrouter_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "minimal"}
+        assert call_kwargs["reasoning"] == {"effort": "minimal"}
 
 
 class TestDetectProviderCodex:
