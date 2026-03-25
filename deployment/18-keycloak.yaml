@@ -564,7 +564,7 @@ spec:
         # Sidecar: TCP proxy so Keycloak connects to 127.0.0.1:1025.
         # The bridge cert has CN=127.0.0.1 — this makes hostname verification pass.
         - name: smtp-proxy
-          image: alpine/socat:1.8
+          image: alpine/socat:1.8.0.3
           args:
             - TCP-LISTEN:1025,bind=127.0.0.1,reuseaddr,fork
             - TCP:protonmail-bridge.protonmail-bridge.svc:1025
