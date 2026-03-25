@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.14.10
       - name: Ruff lint
         run: ruff check src/ orchestrator/ tests/
       - name: Ruff format check
