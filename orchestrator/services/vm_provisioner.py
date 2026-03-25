@@ -35,7 +35,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# KubeVirt API coordinates (same as vm-controller/controller.py)
+# KubeVirt API coordinates (same as vm/controller/controller.py)
 KUBEVIRT_GROUP = "kubevirt.io"
 KUBEVIRT_VERSION = "v1"
 KUBEVIRT_PLURAL = "virtualmachines"
@@ -146,7 +146,7 @@ class VMProvisioner:
     def _render_template(self, job_config: dict) -> dict:
         """Render the VM template with job-specific values.
 
-        Same string substitution as vm-controller/controller.py.
+        Same string substitution as vm/controller/controller.py.
         """
         replacements = {
             "${JOB_ID}": job_config["job_id"],

@@ -8,8 +8,8 @@
 # them at import time from the container's environment.
 #
 # Post-deploy:
-#   - Run keycloak/setup-gitea-oidc.sh to configure Gitea as OIDC client
-#   - Run keycloak/setup-nextcloud-oidc.sh if deploying Nextcloud
+#   - Run docker/keycloak/setup-gitea-oidc.sh to configure Gitea as OIDC client
+#   - Run docker/keycloak/setup-nextcloud-oidc.sh if deploying Nextcloud
 #
 apiVersion: v1
 kind: ConfigMap

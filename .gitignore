@@ -5,7 +5,7 @@ workspace/*
 output/*
 orchestrator/workspace/*
 project_documentation/*
-certs/*
+docker/certs/*
 
 # VPN credentials (config.example is tracked, config is not)
 docker/vpn/config
@@ -13,7 +13,7 @@ docker/vpn/cluster.conf
 docker/vpn/research.conf
 
 # Keycloak realm config (contains credentials; .example is tracked)
-keycloak/realm-export.json
+docker/keycloak/realm-export.json
 
 # MCP configuration files
 .mcp.json

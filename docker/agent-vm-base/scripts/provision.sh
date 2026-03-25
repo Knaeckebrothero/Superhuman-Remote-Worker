@@ -175,8 +175,8 @@ EOF
 #
 # The sudo approval gate intercepts every sudo invocation and forwards it
 # to the orchestrator for human approval. Components:
-#   - sudo_gate.so    — C plugin loaded by sudo (compiled from sudo-gate-plugin/)
-#   - sudo-gated      — Go daemon bridging plugin to orchestrator via NATS
+#   - sudo_gate.so    — C plugin loaded by sudo (compiled from vm/sudo-plugin/)
+#   - sudo-gated      — Go daemon bridging plugin to orchestrator via NATS (vm/sudo-daemon/)
 #
 # Compiled binaries are expected at /tmp/ (placed by Packer file provisioner
 # from CI artifacts, or compiled during an earlier build step).
