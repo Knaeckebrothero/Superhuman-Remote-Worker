@@ -53,6 +53,7 @@ class FakeToolsConfig:
 @dataclass
 class FakeConfig:
     """Minimal config matching what create_audited_tool_node reads."""
+
     agent_id: str = "test_agent"
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     tools: FakeToolsConfig = field(default_factory=FakeToolsConfig)
@@ -142,9 +143,11 @@ class TestFingerPrintWarning:
             # All calls should execute — loop detection is advisory.
             for i in range(9):
                 call_id = f"call_{i}"
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("some_tool", "ok", call_id)]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [make_tool_result("some_tool", "ok", call_id)]
+                    }
+                )
                 state = make_state([make_tool_call("some_tool", {}, call_id)])
                 result = await audited(state)
                 msgs = result.get("messages", [])
@@ -155,9 +158,11 @@ class TestFingerPrintWarning:
                 assert not any("LOOP WARNING" in (m.content or "") for m in tool_msgs)
 
             # Call 10: hits threshold (>= 10), should have LOOP WARNING appended
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("some_tool", "ok", "call_9")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [make_tool_result("some_tool", "ok", "call_9")]
+                }
+            )
             state = make_state([make_tool_call("some_tool", {}, "call_9")])
             result = await audited(state)
             msgs = result.get("messages", [])
@@ -175,21 +180,25 @@ class TestFingerPrintWarning:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("search", "results")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("search", "results")]}
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], config)
 
             # 15 calls with different args: no warnings
             for i in range(15):
-                state = make_state([
-                    make_tool_call("search", {"query": f"query_{i}"}, f"call_{i}")
-                ])
+                state = make_state(
+                    [make_tool_call("search", {"query": f"query_{i}"}, f"call_{i}")]
+                )
                 result = await audited(state)
-                msgs = [m for m in result.get("messages", [])
-                        if isinstance(m, ToolMessage) and "LOOP WARNING" in (m.content or "")]
+                msgs = [
+                    m
+                    for m in result.get("messages", [])
+                    if isinstance(m, ToolMessage)
+                    and "LOOP WARNING" in (m.content or "")
+                ]
                 assert len(msgs) == 0
 
     @pytest.mark.asyncio
@@ -200,9 +209,9 @@ class TestFingerPrintWarning:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("some_tool", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("some_tool", "ok")]}
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], config)
@@ -278,38 +287,52 @@ class TestProgressTracking:
 
             # 2 non-progress calls (different args to avoid fingerprint warnings)
             for i in range(2):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"content_{i}", f"call_{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"content_{i}", f"call_{i}")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f{i}"}, f"call_{i}")]
                 )
                 await audited(state)
 
             # 1 progress call (todo_complete) — resets counter.
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("todo_complete", "Done", "call_p")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [make_tool_result("todo_complete", "Done", "call_p")]
+                }
+            )
             state = make_state(
                 [make_tool_call("todo_complete", {"notes": "done"}, "call_p")]
             )
             result = await audited(state)
             # No stuck detection should have fired
-            sys_msgs = [m for m in result.get("messages", [])
-                        if isinstance(m, SystemMessage)]
+            sys_msgs = [
+                m for m in result.get("messages", []) if isinstance(m, SystemMessage)
+            ]
             assert len(sys_msgs) == 0
 
             # 2 more non-progress calls — still under threshold (3)
             for i in range(2):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"more_{i}", f"call_g{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"more_{i}", f"call_g{i}")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"g{i}"}, f"call_g{i}")]
                 )
                 result = await audited(state)
-                sys_msgs = [m for m in result.get("messages", [])
-                            if isinstance(m, SystemMessage)]
+                sys_msgs = [
+                    m
+                    for m in result.get("messages", [])
+                    if isinstance(m, SystemMessage)
+                ]
                 assert len(sys_msgs) == 0  # Not stuck yet
 
     @pytest.mark.asyncio
@@ -322,24 +345,28 @@ class TestProgressTracking:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_complete], low_threshold_config
-            )
+            audited = create_audited_tool_node([fake_complete], low_threshold_config)
 
             # 3 calls to todo_complete that all error (threshold = 3).
             # Use different args each time to avoid fingerprint warnings.
             for i in range(3):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result(
-                        "todo_complete",
-                        f"Error: todo_{i} not found",
-                        f"call_tc{i}",
-                    )]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result(
+                                "todo_complete",
+                                f"Error: todo_{i} not found",
+                                f"call_tc{i}",
+                            )
+                        ]
+                    }
+                )
                 state = make_state(
-                    [make_tool_call(
-                        "todo_complete", {"notes": f"attempt_{i}"}, f"call_tc{i}"
-                    )]
+                    [
+                        make_tool_call(
+                            "todo_complete", {"notes": f"attempt_{i}"}, f"call_tc{i}"
+                        )
+                    ]
                 )
                 result = await audited(state)
 
@@ -369,16 +396,25 @@ class TestStuckDetectionEscalation:
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node(
-                [fake_tool], low_threshold_config  # threshold=3
+                [fake_tool],
+                low_threshold_config,  # threshold=3
             )
 
             # 3 non-progress calls (different args to avoid fingerprint warnings)
             for i in range(3):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"content_{i}", f"call_{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"content_{i}", f"call_{i}")
+                        ]
+                    }
+                )
                 state = make_state(
-                    [make_tool_call("read_file", {"path": f"file_{i}.txt"}, f"call_{i}")]
+                    [
+                        make_tool_call(
+                            "read_file", {"path": f"file_{i}.txt"}, f"call_{i}"
+                        )
+                    ]
                 )
                 result = await audited(state)
 
@@ -401,14 +437,19 @@ class TestStuckDetectionEscalation:
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node(
-                [fake_tool], low_threshold_config  # threshold=3
+                [fake_tool],
+                low_threshold_config,  # threshold=3
             )
 
             # 6 non-progress calls (2x threshold): should get nudges but never freeze
             for i in range(6):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"c_{i}", f"call_{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"c_{i}", f"call_{i}")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
                 )
@@ -435,18 +476,24 @@ class TestStuckDetectionEscalation:
 
             # 3 non-progress calls: triggers nudge
             for i in range(3):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"c_{i}", f"call_{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"c_{i}", f"call_{i}")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
                 )
                 await audited(state)
 
             # Now make progress with write_file
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("write_file", "Written", "call_w")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [make_tool_result("write_file", "Written", "call_w")]
+                }
+            )
             state = make_state(
                 [make_tool_call("write_file", {"path": "out.md"}, "call_w")]
             )
@@ -455,17 +502,22 @@ class TestStuckDetectionEscalation:
 
             # 3 more non-progress calls: should trigger another nudge
             for i in range(3):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"d_{i}", f"call_d{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"d_{i}", f"call_d{i}")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"g_{i}"}, f"call_d{i}")]
                 )
                 result = await audited(state)
 
             # Should get another nudge (not a freeze)
-            sys_msgs = [m for m in result.get("messages", [])
-                        if isinstance(m, SystemMessage)]
+            sys_msgs = [
+                m for m in result.get("messages", []) if isinstance(m, SystemMessage)
+            ]
             assert len(sys_msgs) == 1
             assert "OBSERVATION:" in sys_msgs[0].content
             assert not result.get("should_stop", False)
@@ -482,9 +534,7 @@ class TestHardCap:
     @pytest.mark.asyncio
     async def test_hard_cap_rewinds_tactical_phase(self):
         """Exceeding hard cap in tactical phase should rewind, not freeze."""
-        cfg = FakeConfig(
-            limits=LimitsConfig(max_tool_calls_per_phase=5)
-        )
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -499,14 +549,12 @@ class TestHardCap:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("read_file", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_tool], cfg, tool_context=mock_ctx
-            )
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
 
             # 5 calls: within cap
             for i in range(5):
@@ -517,14 +565,13 @@ class TestHardCap:
                 assert not result.get("should_stop", False)
 
             # 6th call: exceeds cap — should rewind, NOT freeze
-            state = make_state(
-                [make_tool_call("read_file", {"path": "f_6"}, "call_6")]
-            )
+            state = make_state([make_tool_call("read_file", {"path": "f_6"}, "call_6")])
             result = await audited(state)
             assert not result.get("should_stop", False)
             # Should have rewind message
-            sys_msgs = [m for m in result.get("messages", [])
-                        if isinstance(m, SystemMessage)]
+            sys_msgs = [
+                m for m in result.get("messages", []) if isinstance(m, SystemMessage)
+            ]
             assert len(sys_msgs) == 1
             assert "PHASE BUDGET" in sys_msgs[0].content
             assert "next_phase_todos" in sys_msgs[0].content
@@ -534,9 +581,7 @@ class TestHardCap:
     @pytest.mark.asyncio
     async def test_hard_cap_freezes_strategic_phase(self):
         """Exceeding hard cap in strategic phase should freeze."""
-        cfg = FakeConfig(
-            limits=LimitsConfig(max_tool_calls_per_phase=5)
-        )
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -550,14 +595,12 @@ class TestHardCap:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("read_file", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_tool], cfg, tool_context=mock_ctx
-            )
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
 
             # 6 calls in strategic phase: exceeds cap
             for i in range(6):
@@ -575,17 +618,15 @@ class TestHardCap:
     @pytest.mark.asyncio
     async def test_hard_cap_resets_on_phase_change(self):
         """Hard cap counter should reset when phase changes."""
-        cfg = FakeConfig(
-            limits=LimitsConfig(max_tool_calls_per_phase=5)
-        )
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=5))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("read_file", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], cfg)
@@ -625,21 +666,23 @@ class TestToolNotFoundEnrichment:
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
             # Simulate ToolNode's response for unknown tool
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [ToolMessage(
-                    content="Error: kb_list is not a valid tool, try one of [read_file].",
-                    tool_call_id="call_kb",
-                    name="kb_list",
-                    status="error",
-                )]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        ToolMessage(
+                            content="Error: kb_list is not a valid tool, try one of [read_file].",
+                            tool_call_id="call_kb",
+                            name="kb_list",
+                            status="error",
+                        )
+                    ]
+                }
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], config)
 
-            state = make_state(
-                [make_tool_call("kb_list", {}, "call_kb")]
-            )
+            state = make_state([make_tool_call("kb_list", {}, "call_kb")])
             result = await audited(state)
 
             msgs = result.get("messages", [])
@@ -656,11 +699,15 @@ class TestToolNotFoundEnrichment:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result(
-                    "read_file", "Error: file not found: missing.txt"
-                )]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        make_tool_result(
+                            "read_file", "Error: file not found: missing.txt"
+                        )
+                    ]
+                }
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], config)
@@ -710,30 +757,36 @@ class TestCategoryFailureTracking:
             audited = create_audited_tool_node(fake_tools, config)
 
             # Patch the registry lookups inside the closure helpers
-            with patch(
-                "src.tools.registry.TOOL_REGISTRY", mock_registry
-            ):
+            with patch("src.tools.registry.TOOL_REGISTRY", mock_registry):
                 # 3 different kb tools all fail
                 for i, name in enumerate(["kb_read", "kb_write", "kb_search"]):
-                    mock_tn.ainvoke = AsyncMock(return_value={
-                        "messages": [make_tool_result(
-                            name,
-                            "Error: knowledge store not configured",
-                            f"call_{name}",
-                        )]
-                    })
+                    mock_tn.ainvoke = AsyncMock(
+                        return_value={
+                            "messages": [
+                                make_tool_result(
+                                    name,
+                                    "Error: knowledge store not configured",
+                                    f"call_{name}",
+                                )
+                            ]
+                        }
+                    )
                     state = make_state(
                         [make_tool_call(name, {"id": f"note_{i}"}, f"call_{name}")]
                     )
                     await audited(state)
 
                 # Now kb_list (same category) should still execute (no masking)
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("kb_list", "Error: not configured", "call_kl")]
-                })
-                state = make_state(
-                    [make_tool_call("kb_list", {}, "call_kl")]
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result(
+                                "kb_list", "Error: not configured", "call_kl"
+                            )
+                        ]
+                    }
                 )
+                state = make_state([make_tool_call("kb_list", {}, "call_kl")])
                 result = await audited(state)
                 msgs = result.get("messages", [])
                 tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
@@ -754,9 +807,7 @@ class TestFreezePayload:
     @pytest.mark.asyncio
     async def test_progress_nudge_repeats_periodically(self):
         """Progress nudge should fire every threshold interval, never freeze."""
-        cfg = FakeConfig(
-            limits=LimitsConfig(progress_stall_threshold=2)
-        )
+        cfg = FakeConfig(limits=LimitsConfig(progress_stall_threshold=2))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -769,16 +820,22 @@ class TestFreezePayload:
             nudge_counts = 0
             # 6 calls = 3x threshold of 2
             for i in range(6):
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", f"c_{i}", f"call_{i}")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", f"c_{i}", f"call_{i}")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {"path": f"f_{i}"}, f"call_{i}")]
                 )
                 result = await audited(state)
-                sys_msgs = [m for m in result.get("messages", [])
-                            if isinstance(m, SystemMessage)
-                            and "OBSERVATION:" in m.content]
+                sys_msgs = [
+                    m
+                    for m in result.get("messages", [])
+                    if isinstance(m, SystemMessage) and "OBSERVATION:" in m.content
+                ]
                 nudge_counts += len(sys_msgs)
 
             # Should have gotten nudges at calls 2, 4, 6
@@ -789,9 +846,7 @@ class TestFreezePayload:
     @pytest.mark.asyncio
     async def test_hard_cap_strategic_freeze_has_required_fields(self):
         """Hard cap freeze in strategic phase should contain budget information."""
-        cfg = FakeConfig(
-            limits=LimitsConfig(max_tool_calls_per_phase=2)
-        )
+        cfg = FakeConfig(limits=LimitsConfig(max_tool_calls_per_phase=2))
         fake_tool = MagicMock()
         fake_tool.name = "read_file"
 
@@ -805,14 +860,12 @@ class TestFreezePayload:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("read_file", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("read_file", "ok")]}
+            )
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_tool], cfg, tool_context=mock_ctx
-            )
+            audited = create_audited_tool_node([fake_tool], cfg, tool_context=mock_ctx)
 
             # 3 calls in strategic phase: exceeds cap of 2
             for i in range(3):
@@ -829,7 +882,9 @@ class TestFreezePayload:
 
             assert payload["freeze_type"] == "budget_exceeded"
             assert "tool_calls_this_phase" in payload
-            assert payload["tool_calls_this_phase"] > cfg.limits.max_tool_calls_per_phase
+            assert (
+                payload["tool_calls_this_phase"] > cfg.limits.max_tool_calls_per_phase
+            )
 
 
 # =============================================================================
@@ -852,36 +907,38 @@ class TestTodoRewindReset:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_tool, fake_rewind], config
-            )
+            audited = create_audited_tool_node([fake_tool, fake_rewind], config)
 
             # Build up 9 identical calls (just under threshold of 10)
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("some_tool", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("some_tool", "ok")]}
+            )
             for i in range(9):
                 state = make_state([make_tool_call("some_tool", {}, f"call_{i}")])
                 await audited(state)
 
             # Rewind — should reset loop detection
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result(
-                    "todo_rewind",
-                    "Archived 5 todos. To recover...",
-                    "call_rw",
-                )]
-            })
-            state = make_state([make_tool_call(
-                "todo_rewind", {"issue": "approach broken"}, "call_rw"
-            )])
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        make_tool_result(
+                            "todo_rewind",
+                            "Archived 5 todos. To recover...",
+                            "call_rw",
+                        )
+                    ]
+                }
+            )
+            state = make_state(
+                [make_tool_call("todo_rewind", {"issue": "approach broken"}, "call_rw")]
+            )
             await audited(state)
 
             # Now 9 more identical calls should NOT trigger warning
             # (because rewind cleared the history)
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("some_tool", "ok again")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("some_tool", "ok again")]}
+            )
             for i in range(9):
                 state = make_state([make_tool_call("some_tool", {}, f"call_post_{i}")])
                 result = await audited(state)
@@ -901,35 +958,41 @@ class TestTodoRewindReset:
             mock_tn = AsyncMock()
             MockToolNode.return_value = mock_tn
 
-            audited = create_audited_tool_node(
-                [fake_tool, fake_rewind], config
-            )
+            audited = create_audited_tool_node([fake_tool, fake_rewind], config)
 
             # Build up 9 identical calls
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("some_tool", "ok")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={"messages": [make_tool_result("some_tool", "ok")]}
+            )
             for i in range(9):
                 state = make_state([make_tool_call("some_tool", {}, f"call_{i}")])
                 await audited(state)
 
             # Failed rewind — should NOT reset
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result(
-                    "todo_rewind",
-                    "Error: You must provide an 'issue' describing why",
-                    "call_rw",
-                )]
-            })
-            state = make_state([make_tool_call(
-                "todo_rewind", {"issue": ""}, "call_rw"
-            )])
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        make_tool_result(
+                            "todo_rewind",
+                            "Error: You must provide an 'issue' describing why",
+                            "call_rw",
+                        )
+                    ]
+                }
+            )
+            state = make_state(
+                [make_tool_call("todo_rewind", {"issue": ""}, "call_rw")]
+            )
             await audited(state)
 
             # 1 more identical call should now trigger warning (9+1 = 10 = threshold)
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("some_tool", "ok still", "call_extra")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        make_tool_result("some_tool", "ok still", "call_extra")
+                    ]
+                }
+            )
             state = make_state([make_tool_call("some_tool", {}, "call_extra")])
             result = await audited(state)
             msgs = result.get("messages", [])
@@ -964,7 +1027,13 @@ class TestPhaseGate:
 
             # Call in tactical phase — should be rejected by phase gate
             state = make_state(
-                [make_tool_call("job_complete", {"summary": "done", "deliverables": []}, "call_jc")],
+                [
+                    make_tool_call(
+                        "job_complete",
+                        {"summary": "done", "deliverables": []},
+                        "call_jc",
+                    )
+                ],
                 is_strategic=False,
             )
             result = await audited(state)
@@ -986,9 +1055,11 @@ class TestPhaseGate:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("job_complete", "ok", "call_jc")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [make_tool_result("job_complete", "ok", "call_jc")]
+                }
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], config)
@@ -1038,9 +1109,13 @@ class TestPhaseGate:
 
         with patch("src.graph.ToolNode") as MockToolNode:
             mock_tn = AsyncMock()
-            mock_tn.ainvoke = AsyncMock(return_value={
-                "messages": [make_tool_result("custom_dynamic_tool", "executed", "call_cd")]
-            })
+            mock_tn.ainvoke = AsyncMock(
+                return_value={
+                    "messages": [
+                        make_tool_result("custom_dynamic_tool", "executed", "call_cd")
+                    ]
+                }
+            )
             MockToolNode.return_value = mock_tn
 
             audited = create_audited_tool_node([fake_tool], config)
@@ -1101,13 +1176,19 @@ class TestPhaseGate:
             audited = create_audited_tool_node([fake_tool], config)
 
             for is_strategic in [True, False]:
-                mock_tn.ainvoke = AsyncMock(return_value={
-                    "messages": [make_tool_result("read_file", "content", "call_rf")]
-                })
+                mock_tn.ainvoke = AsyncMock(
+                    return_value={
+                        "messages": [
+                            make_tool_result("read_file", "content", "call_rf")
+                        ]
+                    }
+                )
                 state = make_state(
                     [make_tool_call("read_file", {}, "call_rf")],
                     is_strategic=is_strategic,
                 )
                 result = await audited(state)
-                tool_msgs = [m for m in result.get("messages", []) if isinstance(m, ToolMessage)]
+                tool_msgs = [
+                    m for m in result.get("messages", []) if isinstance(m, ToolMessage)
+                ]
                 assert tool_msgs[0].content == "content"

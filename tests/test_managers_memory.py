@@ -193,7 +193,9 @@ Some notes
 """
         memory_manager.write(content)
 
-        result = memory_manager.update_section("Current State", "Phase: 2\nStatus: In progress")
+        result = memory_manager.update_section(
+            "Current State", "Phase: 2\nStatus: In progress"
+        )
 
         assert result is True
         updated = memory_manager.read()

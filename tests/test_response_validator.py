@@ -3,7 +3,6 @@
 Tests each detection pattern and the overall validate_response function.
 """
 
-
 from src.core.response_validator import (
     ValidationResult,
     validate_response,
@@ -65,7 +64,10 @@ class TestTokenRepetition:
     """Tests for consecutive token repetition detection."""
 
     def test_normal_text(self):
-        assert _detect_token_repetition("This is a normal sentence with varied words.") is None
+        assert (
+            _detect_token_repetition("This is a normal sentence with varied words.")
+            is None
+        )
 
     def test_short_content(self):
         assert _detect_token_repetition("word word word") is None
@@ -148,7 +150,9 @@ class TestSpecialTokenLeakage:
     """Tests for special/control token leakage detection."""
 
     def test_no_special_tokens(self):
-        assert _detect_special_token_leakage("Normal text with no special tokens.") is None
+        assert (
+            _detect_special_token_leakage("Normal text with no special tokens.") is None
+        )
 
     def test_few_special_tokens_ok(self):
         content = "Some text <|endoftext|> and </s> more text"
@@ -202,7 +206,7 @@ class TestForeignToolSyntax:
         assert result is not None
 
     def test_multiple_providers(self):
-        content = '<minimax:call> <anthropic:invoke>'
+        content = "<minimax:call> <anthropic:invoke>"
         result = _detect_foreign_tool_syntax(content)
         assert result is not None
 
@@ -253,7 +257,9 @@ class TestExcessiveLength:
 
     def test_long_but_has_tool_calls(self):
         content = "x" * 60000
-        assert _detect_excessive_length(content, tool_calls=[{"name": "search"}]) is None
+        assert (
+            _detect_excessive_length(content, tool_calls=[{"name": "search"}]) is None
+        )
 
     def test_excessive_no_tool_calls(self):
         content = "x" * 60000
@@ -354,11 +360,10 @@ class TestValidateResponse:
     def test_real_world_minimax_degeneration(self):
         """Simulate the actual Minimax degeneration case that motivated this feature."""
         content = (
-            'I\'ll search for the document.\n\n'
+            "I'll search for the document.\n\n"
             '<tool_call>\n<invoke name="search_files">\n'
             '<parameter name="query">requirements</parameter>\n'
-            '</invoke>\n'
-            + '</invoke>\n' * 500
+            "</invoke>\n" + "</invoke>\n" * 500
         )
         result = validate_response(content)
         assert result.is_degenerate

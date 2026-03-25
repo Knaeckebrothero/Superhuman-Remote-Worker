@@ -275,23 +275,36 @@ class TestAuxiliaryMemoryExtraction:
 
     def test_should_extract_at_interval(self):
         from src.services.auxiliary import _should_extract_memories
+
         assert _should_extract_memories(turn_count=5, interval=5, last_observed_turn=0)
         assert _should_extract_memories(turn_count=10, interval=5, last_observed_turn=5)
 
     def test_should_not_extract_between_intervals(self):
         from src.services.auxiliary import _should_extract_memories
-        assert not _should_extract_memories(turn_count=3, interval=5, last_observed_turn=0)
-        assert not _should_extract_memories(turn_count=7, interval=5, last_observed_turn=5)
+
+        assert not _should_extract_memories(
+            turn_count=3, interval=5, last_observed_turn=0
+        )
+        assert not _should_extract_memories(
+            turn_count=7, interval=5, last_observed_turn=5
+        )
 
     def test_should_not_extract_at_zero(self):
         from src.services.auxiliary import _should_extract_memories
-        assert not _should_extract_memories(turn_count=0, interval=5, last_observed_turn=0)
+
+        assert not _should_extract_memories(
+            turn_count=0, interval=5, last_observed_turn=0
+        )
 
     def test_should_not_re_extract_same_turn(self):
         from src.services.auxiliary import _should_extract_memories
-        assert not _should_extract_memories(turn_count=5, interval=5, last_observed_turn=5)
+
+        assert not _should_extract_memories(
+            turn_count=5, interval=5, last_observed_turn=5
+        )
 
     def test_observation_window_caps_messages(self):
         """extract_and_store_memories should cap at _MAX_OBSERVATION_WINDOW."""
         from src.services.auxiliary import _MAX_OBSERVATION_WINDOW
+
         assert _MAX_OBSERVATION_WINDOW == 40  # Same as old MemoryObserver

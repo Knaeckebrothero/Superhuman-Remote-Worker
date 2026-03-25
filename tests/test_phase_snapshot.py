@@ -119,7 +119,9 @@ class TestSnapshotCreation:
         mgr = self._make_manager(tmp_path)
 
         snap = mgr.create_snapshot(
-            phase_number=1, iteration=50, message_count=20,
+            phase_number=1,
+            iteration=50,
+            message_count=20,
         )
         assert snap is not None
         assert snap.phase_number == 1
@@ -162,7 +164,9 @@ class TestSnapshotCreation:
         mgr = self._make_manager(tmp_path)
 
         snap = mgr.create_snapshot(
-            phase_number=1, iteration=10, thread_id="thread-xyz",
+            phase_number=1,
+            iteration=10,
+            thread_id="thread-xyz",
         )
         assert snap.thread_id == "thread-xyz"
 
@@ -480,8 +484,11 @@ class TestFormatSnapshotsTable:
     def test_formats_strategic_type(self):
         """Should show 'strategic' for is_strategic_phase=True."""
         snap = PhaseSnapshot(
-            phase_number=1, is_strategic_phase=True, iteration=50,
-            message_count=20, timestamp="2026-01-01T10:00:00",
+            phase_number=1,
+            is_strategic_phase=True,
+            iteration=50,
+            message_count=20,
+            timestamp="2026-01-01T10:00:00",
         )
         result = format_snapshots_table([snap])
         assert "strategic" in result
@@ -489,8 +496,11 @@ class TestFormatSnapshotsTable:
     def test_formats_tactical_type(self):
         """Should show 'tactical' for is_strategic_phase=False."""
         snap = PhaseSnapshot(
-            phase_number=2, is_strategic_phase=False, iteration=100,
-            message_count=30, timestamp="2026-01-01T12:00:00",
+            phase_number=2,
+            is_strategic_phase=False,
+            iteration=100,
+            message_count=30,
+            timestamp="2026-01-01T12:00:00",
         )
         result = format_snapshots_table([snap])
         assert "tactical" in result
@@ -498,8 +508,11 @@ class TestFormatSnapshotsTable:
     def test_shows_todos_dash_when_zero(self):
         """Should show '-' when todos_total is 0."""
         snap = PhaseSnapshot(
-            phase_number=1, is_strategic_phase=True, iteration=50,
-            message_count=20, timestamp="2026-01-01T10:00:00",
+            phase_number=1,
+            is_strategic_phase=True,
+            iteration=50,
+            message_count=20,
+            timestamp="2026-01-01T10:00:00",
             todos_total=0,
         )
         result = format_snapshots_table([snap])
@@ -508,9 +521,13 @@ class TestFormatSnapshotsTable:
     def test_shows_todo_fraction(self):
         """Should show completed/total for non-zero todos."""
         snap = PhaseSnapshot(
-            phase_number=1, is_strategic_phase=True, iteration=50,
-            message_count=20, timestamp="2026-01-01T10:00:00",
-            todos_completed=5, todos_total=10,
+            phase_number=1,
+            is_strategic_phase=True,
+            iteration=50,
+            message_count=20,
+            timestamp="2026-01-01T10:00:00",
+            todos_completed=5,
+            todos_total=10,
         )
         result = format_snapshots_table([snap])
         assert "5/10" in result
@@ -518,8 +535,13 @@ class TestFormatSnapshotsTable:
     def test_shows_total_count(self):
         """Should show total count at bottom."""
         snaps = [
-            PhaseSnapshot(phase_number=i, is_strategic_phase=True, iteration=i*10,
-                          message_count=i*5, timestamp="2026-01-01T00:00:00")
+            PhaseSnapshot(
+                phase_number=i,
+                is_strategic_phase=True,
+                iteration=i * 10,
+                message_count=i * 5,
+                timestamp="2026-01-01T00:00:00",
+            )
             for i in range(1, 4)
         ]
         result = format_snapshots_table(snaps)
@@ -537,7 +559,8 @@ class TestDiscoverThreadId:
     def test_returns_none_for_missing_file(self, tmp_path):
         """Should return None when file doesn't exist."""
         result = discover_thread_id_from_checkpoint(
-            tmp_path / "nonexistent.db", "job-1",
+            tmp_path / "nonexistent.db",
+            "job-1",
         )
         assert result is None
 
@@ -545,18 +568,10 @@ class TestDiscoverThreadId:
         """Should find thread_id matching the job_id."""
         db_path = tmp_path / "checkpoint.db"
         conn = sqlite3.connect(db_path)
-        conn.execute(
-            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES ('thread_job-1_abc', 'cp1')"
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES ('thread_job-1_abc', 'cp2')"
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES ('unrelated', 'cp3')"
-        )
+        conn.execute("CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)")
+        conn.execute("INSERT INTO checkpoints VALUES ('thread_job-1_abc', 'cp1')")
+        conn.execute("INSERT INTO checkpoints VALUES ('thread_job-1_abc', 'cp2')")
+        conn.execute("INSERT INTO checkpoints VALUES ('unrelated', 'cp3')")
         conn.commit()
         conn.close()
 
@@ -567,12 +582,8 @@ class TestDiscoverThreadId:
         """Should return None when no thread matches job_id."""
         db_path = tmp_path / "checkpoint.db"
         conn = sqlite3.connect(db_path)
-        conn.execute(
-            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)"
-        )
-        conn.execute(
-            "INSERT INTO checkpoints VALUES ('thread_other_job', 'cp1')"
-        )
+        conn.execute("CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)")
+        conn.execute("INSERT INTO checkpoints VALUES ('thread_other_job', 'cp1')")
         conn.commit()
         conn.close()
 
@@ -583,9 +594,7 @@ class TestDiscoverThreadId:
         """Should return None for empty checkpoints table."""
         db_path = tmp_path / "checkpoint.db"
         conn = sqlite3.connect(db_path)
-        conn.execute(
-            "CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)"
-        )
+        conn.execute("CREATE TABLE checkpoints (thread_id TEXT, checkpoint_id TEXT)")
         conn.commit()
         conn.close()
 

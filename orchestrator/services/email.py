@@ -37,13 +37,17 @@ class EmailService:
         self.user = os.getenv("SMTP_USER", "")
         self.password = os.getenv("SMTP_PASSWORD", "")
         self.use_tls = os.getenv("SMTP_USE_TLS", "true").lower() in ("true", "1", "yes")
-        self.trust_self_signed = os.getenv("SMTP_TRUST_SELF_SIGNED", "false").lower() in (
+        self.trust_self_signed = os.getenv(
+            "SMTP_TRUST_SELF_SIGNED", "false"
+        ).lower() in (
             "true",
             "1",
             "yes",
         )
         self.from_address = os.getenv("SMTP_FROM", "noreply@example.com")
-        self.cockpit_url = os.getenv("COCKPIT_EXTERNAL_URL", "http://localhost:4200").rstrip("/")
+        self.cockpit_url = os.getenv(
+            "COCKPIT_EXTERNAL_URL", "http://localhost:4200"
+        ).rstrip("/")
         self.agent_email = os.getenv("AGENT_EMAIL", "")
         self.mail_domain = os.getenv("MAIL_DOMAIN", "")
 
@@ -200,8 +204,7 @@ class EmailService:
         # HTML version
         # Escape basic HTML entities in the message
         message_html = (
-            message_md
-            .replace("&", "&amp;")
+            message_md.replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace("\n", "<br>")

@@ -60,17 +60,21 @@ def mock_llm():
     )
     raw_response = AIMessage(content="structured output")
     structured_llm = AsyncMock()
-    structured_llm.ainvoke = AsyncMock(return_value={
-        "raw": raw_response,
-        "parsed": parsed_value,
-        "parsing_error": None,
-    })
+    structured_llm.ainvoke = AsyncMock(
+        return_value={
+            "raw": raw_response,
+            "parsed": parsed_value,
+            "parsing_error": None,
+        }
+    )
     llm.with_structured_output = MagicMock(return_value=structured_llm)
 
     return AuxiliaryLLM(llm=llm)
 
 
-def create_large_message_history(num_messages: int, chars_per_message: int = 500) -> list:
+def create_large_message_history(
+    num_messages: int, chars_per_message: int = 500
+) -> list:
     """Create a list of messages with specified total size."""
     messages = []
     for i in range(num_messages):
@@ -154,10 +158,11 @@ class TestFormatMessagesForSummary:
 
     def test_formats_tool_calls(self, context_manager):
         """AI messages with tool calls should show tool names."""
-        messages = [AIMessage(
-            content="",
-            tool_calls=[{"name": "read_file", "id": "1", "args": {}}]
-        )]
+        messages = [
+            AIMessage(
+                content="", tool_calls=[{"name": "read_file", "id": "1", "args": {}}]
+            )
+        ]
         parts = context_manager._format_messages_for_summary(messages)
 
         assert len(parts) == 1
@@ -196,8 +201,7 @@ class TestFormatMessagesForSummary:
     def test_recency_marker_inserted_when_enough_tool_messages(self, context_manager):
         """Recency marker should appear when there are >10 tool messages."""
         messages = [
-            ToolMessage(content=f"result_{i}", tool_call_id=str(i))
-            for i in range(15)
+            ToolMessage(content=f"result_{i}", tool_call_id=str(i)) for i in range(15)
         ]
         parts = context_manager._format_messages_for_summary(messages)
 
@@ -208,8 +212,7 @@ class TestFormatMessagesForSummary:
     def test_no_recency_marker_when_few_tool_messages(self, context_manager):
         """No recency marker when all tool messages fit in the recent window."""
         messages = [
-            ToolMessage(content=f"result_{i}", tool_call_id=str(i))
-            for i in range(5)
+            ToolMessage(content=f"result_{i}", tool_call_id=str(i)) for i in range(5)
         ]
         parts = context_manager._format_messages_for_summary(messages)
 
@@ -307,7 +310,10 @@ class TestFormatMessagesForSummary:
         messages = (
             [ai_msg]
             + [ToolMessage(content="x_data value", tool_call_id="pair_x")]
-            + [ToolMessage(content=f"fill_{i}" * 20, tool_call_id=f"fl_{i}") for i in range(10)]
+            + [
+                ToolMessage(content=f"fill_{i}" * 20, tool_call_id=f"fl_{i}")
+                for i in range(10)
+            ]
             + [ToolMessage(content="y_data value", tool_call_id="pair_y")]
         )
         parts = context_manager._format_messages_for_summary(messages)
@@ -315,7 +321,9 @@ class TestFormatMessagesForSummary:
         # pair_x should show content (pulled in by pair_y), not be masked
         x_parts = [p for p in parts if "x_data" in p]
         assert len(x_parts) == 1
-        assert "omitted" not in x_parts[0], "pair_x should be pulled into recent by sibling pair_y"
+        assert "omitted" not in x_parts[0], (
+            "pair_x should be pulled into recent by sibling pair_y"
+        )
 
         # pair_y should also show content (it's naturally in the window)
         y_parts = [p for p in parts if "y_data" in p]
@@ -372,13 +380,15 @@ class TestFormatMessagesForSummary:
 
     def test_ai_reasoning_with_tool_calls_preserved(self, context_manager):
         """AIMessage with both reasoning content and tool_calls should show both."""
-        messages = [AIMessage(
-            content="I need to check the auth module because the JWT validation is failing",
-            tool_calls=[
-                {"name": "read_file", "id": "tc1", "args": {"path": "auth.py"}},
-                {"name": "web_search", "id": "tc2", "args": {"query": "JWT"}},
-            ],
-        )]
+        messages = [
+            AIMessage(
+                content="I need to check the auth module because the JWT validation is failing",
+                tool_calls=[
+                    {"name": "read_file", "id": "tc1", "args": {"path": "auth.py"}},
+                    {"name": "web_search", "id": "tc2", "args": {"query": "JWT"}},
+                ],
+            )
+        ]
         parts = context_manager._format_messages_for_summary(messages)
 
         assert len(parts) == 1
@@ -389,10 +399,12 @@ class TestFormatMessagesForSummary:
 
     def test_ai_reasoning_with_tool_calls_empty_content(self, context_manager):
         """AIMessage with tool_calls but empty content should only show tool names."""
-        messages = [AIMessage(
-            content="",
-            tool_calls=[{"name": "read_file", "id": "tc1", "args": {}}],
-        )]
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "read_file", "id": "tc1", "args": {}}],
+            )
+        ]
         parts = context_manager._format_messages_for_summary(messages)
 
         assert len(parts) == 1
@@ -415,7 +427,6 @@ class TestSinglePassSummarize:
             conversation_text="User: Hello\nAssistant: Hi",
             auxiliary=mock_llm,
             summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-
             max_summary_length=10000,
         )
 
@@ -432,7 +443,6 @@ class TestSinglePassSummarize:
             conversation_text="test",
             auxiliary=mock_llm,
             summarization_prompt=custom_prompt,
-
             max_summary_length=10000,
         )
 
@@ -457,7 +467,6 @@ class TestSinglePassSummarize:
             conversation_text="test",
             auxiliary=aux,
             summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-
             max_summary_length=10000,
         )
 
@@ -482,7 +491,6 @@ class TestRecursiveSummarize:
             formatted_parts=parts,
             auxiliary=mock_llm,
             summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-
             max_summary_length=5000,
         )
 
@@ -501,7 +509,6 @@ class TestRecursiveSummarize:
             formatted_parts=parts,
             auxiliary=mock_llm,
             summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-
             max_summary_length=1000,
         )
 
@@ -516,7 +523,6 @@ class TestRecursiveSummarize:
             formatted_parts=parts,
             auxiliary=mock_llm,
             summarization_prompt="Summarize this conversation.\n\nConversation:\n\n{conversation}\n\nKeep under {max_summary_length} tokens.",
-
             max_summary_length=10000,
         )
 
@@ -652,7 +658,9 @@ class TestContextSafetyIntegration:
         mgr = ContextManager(config=config)
 
         # Create very large message history
-        messages = create_large_message_history(num_messages=100, chars_per_message=1000)
+        messages = create_large_message_history(
+            num_messages=100, chars_per_message=1000
+        )
 
         # Should complete without error
         result = await mgr.summarize_conversation(messages=messages, auxiliary=mock_llm)

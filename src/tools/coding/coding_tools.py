@@ -38,7 +38,7 @@ def _truncate_output(text: str, max_chars: int, label: str = "output") -> str:
     # Try to start at a line boundary
     first_newline = truncated.find("\n")
     if first_newline > 0 and first_newline < 200:
-        truncated = truncated[first_newline + 1:]
+        truncated = truncated[first_newline + 1 :]
 
     chars_removed = len(text) - len(truncated)
     return f"[{label} truncated: {chars_removed} chars removed from start]\n{truncated}"

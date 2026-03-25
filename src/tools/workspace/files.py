@@ -27,8 +27,17 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", "
 
 # Supported audio file extensions (matching Whisper API supported formats)
 AUDIO_EXTENSIONS = {
-    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm",
-    ".mp4", ".mpeg", ".mpga", ".oga", ".opus",
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".ogg",
+    ".flac",
+    ".webm",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".oga",
+    ".opus",
 }
 
 # Document extensions that support visual rendering
@@ -103,7 +112,9 @@ def create_file_tools(context: ToolContext) -> List[Any]:
     max_read_words = context.get_config("max_read_words")
     if max_read_words is None:
         # Fall back to legacy bytes limit, convert to words
-        max_read_size_legacy = context.get_config("max_read_size", 137_500)  # ~25k words
+        max_read_size_legacy = context.get_config(
+            "max_read_size", 137_500
+        )  # ~25k words
         max_read_words = int(max_read_size_legacy / 5.5)
 
     # Initialize PDF reader with word limit
@@ -118,7 +129,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         full_path,
         relative_path: str,
         page_start: Optional[int],
-        page_end: Optional[int]
+        page_end: Optional[int],
     ) -> str:
         """Internal helper to read PDF files with page support."""
         if not pdf_reader.is_available():
@@ -126,9 +137,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         try:
             text, read_info = pdf_reader.read_pages(
-                full_path,
-                page_start=page_start,
-                page_end=page_end
+                full_path, page_start=page_start, page_end=page_end
             )
 
             # Build header showing what was read
@@ -178,7 +187,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                     f"[IMAGE: {full_path.name}]\n"
                     f"Type: {mime_type}\n"
                     f"Size: {len(image_data):,} bytes\n\n"
-                    f"<image_data mime_type=\"{mime_type}\">\n"
+                    f'<image_data mime_type="{mime_type}">\n'
                     f"{base64_image}\n"
                     f"</image_data>"
                 )
@@ -236,7 +245,10 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         Output is line-numbered with offset/limit paging, matching text files.
         """
         try:
-            from src.services.audio_helper import get_audio_helper, split_transcript_into_lines
+            from src.services.audio_helper import (
+                get_audio_helper,
+                split_transcript_into_lines,
+            )
             from src.services.description_cache import get_description_cache
 
             cache = get_description_cache()
@@ -277,11 +289,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 return "Error: offset must be >= 1 (line numbers are 1-indexed)"
 
             if start_line > total_lines:
-                return f"Error: offset ({start_line}) exceeds total lines ({total_lines})"
+                return (
+                    f"Error: offset ({start_line}) exceeds total lines ({total_lines})"
+                )
 
             # Extract requested range
             end_line = min(start_line + line_count - 1, total_lines)
-            selected_lines = lines[start_line - 1:end_line]
+            selected_lines = lines[start_line - 1 : end_line]
 
             # Format with line numbers (cat -n style)
             output_lines = []
@@ -347,14 +361,16 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             try:
                 page_image = renderer.render_page(full_path, page_num)
             except Exception as e:
-                logger.warning(f"Could not render page {page_num} of {full_path.name}: {e}")
+                logger.warning(
+                    f"Could not render page {page_num} of {full_path.name}: {e}"
+                )
                 return ""  # No visual content available
 
             if context.get_phase_multimodal():
                 # Return base64 image for multimodal model
                 base64_image = base64.b64encode(page_image).decode()
                 return (
-                    f"\n<page_image page=\"{page_num}\" mime_type=\"image/png\">\n"
+                    f'\n<page_image page="{page_num}" mime_type="image/png">\n'
                     f"{base64_image}\n"
                     f"</page_image>"
                 )
@@ -381,7 +397,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 cache.set(full_path, description, page=page_num, query=describe)
 
                 if describe:
-                    return f"\n[PAGE {page_num} - VISUAL CONTENT (Query: \"{describe[:50]}...\")]\n{description}"
+                    return f'\n[PAGE {page_num} - VISUAL CONTENT (Query: "{describe[:50]}...")]\n{description}'
                 else:
                     return f"\n[PAGE {page_num} - VISUAL CONTENT]\n{description}"
 
@@ -416,6 +432,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Get page range that was read
             try:
                 from src.services.document_renderer import get_document_renderer
+
                 renderer = get_document_renderer()
                 total_pages = renderer.get_page_count(full_path)
 
@@ -439,9 +456,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
         # For PPTX and DOCX, we need different text extraction
         elif suffix == ".pptx":
-            return _read_pptx_file(full_path, relative_path, page_start, page_end, describe)
+            return _read_pptx_file(
+                full_path, relative_path, page_start, page_end, describe
+            )
         elif suffix == ".docx":
-            return _read_docx_file(full_path, relative_path, page_start, page_end, describe)
+            return _read_docx_file(
+                full_path, relative_path, page_start, page_end, describe
+            )
         else:
             return f"Error: Unsupported visual document type: {suffix}"
 
@@ -519,7 +540,9 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Also extract text from tables
             for table in doc.tables:
                 for row in table.rows:
-                    row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    row_text = [
+                        cell.text.strip() for cell in row.cells if cell.text.strip()
+                    ]
                     if row_text:
                         text_parts.append(" | ".join(row_text))
 
@@ -528,13 +551,18 @@ def create_file_tools(context: ToolContext) -> List[Any]:
             # Try to get page count and visual content
             try:
                 from src.services.document_renderer import get_document_renderer
+
                 renderer = get_document_renderer()
                 total_pages = renderer.get_page_count(full_path)
 
                 start = page_start or 1
                 end = min(page_end or total_pages, total_pages)
 
-                result_parts = [f"[Pages {start}-{end} of {total_pages}]", "", text_content]
+                result_parts = [
+                    f"[Pages {start}-{end} of {total_pages}]",
+                    "",
+                    text_content,
+                ]
 
                 # Add visual content for requested pages
                 visual_parts = []
@@ -626,14 +654,18 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             # Handle visual documents (PDF, PPTX, DOCX) with page-based reading + visual content
             if _is_visual_document(full_path):
-                result = _read_visual_document(full_path, path, page_start, page_end, describe)
+                result = _read_visual_document(
+                    full_path, path, page_start, page_end, describe
+                )
                 if not result.startswith("Error:"):
                     context.record_file_read(path)
                 return result
 
             # For non-document files, page parameters are ignored
             if page_start is not None or page_end is not None:
-                logger.warning(f"page_start/page_end ignored for non-document file: {path}")
+                logger.warning(
+                    f"page_start/page_end ignored for non-document file: {path}"
+                )
 
             # Apply line-based reading defaults
             start_line = offset if offset is not None else 1
@@ -650,11 +682,13 @@ def create_file_tools(context: ToolContext) -> List[Any]:
 
             # Validate offset
             if start_line > total_lines:
-                return f"Error: offset ({start_line}) exceeds total lines ({total_lines})"
+                return (
+                    f"Error: offset ({start_line}) exceeds total lines ({total_lines})"
+                )
 
             # Extract requested range (convert to 0-indexed internally)
             end_line = min(start_line + line_count - 1, total_lines)
-            selected_lines = lines[start_line - 1:end_line]
+            selected_lines = lines[start_line - 1 : end_line]
 
             # Format with line numbers (cat -n style) and truncate long lines
             output_lines = []
@@ -727,13 +761,35 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         """
         # Block binary file extensions — write_file is text-only
         BINARY_EXTENSIONS = {
-            ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-            ".exe", ".dll", ".so", ".dylib",
-            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
-            ".pdf", ".docx", ".xlsx", ".pptx",
-            ".db", ".sqlite", ".pickle", ".pkl",
+            ".zip",
+            ".tar",
+            ".gz",
+            ".bz2",
+            ".xz",
+            ".7z",
+            ".rar",
+            ".exe",
+            ".dll",
+            ".so",
+            ".dylib",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".tiff",
+            ".pdf",
+            ".docx",
+            ".xlsx",
+            ".pptx",
+            ".db",
+            ".sqlite",
+            ".pickle",
+            ".pkl",
         }
         from pathlib import Path as _P
+
         if _P(path).suffix.lower() in BINARY_EXTENSIONS:
             return (
                 f"Error: Cannot write binary file '{path}'. "
@@ -761,7 +817,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
                 )
 
             workspace.write_file(path, content)
-            size = len(content.encode('utf-8'))
+            size = len(content.encode("utf-8"))
 
             return f"Written: {path} ({size:,} bytes)"
 
@@ -776,7 +832,7 @@ def create_file_tools(context: ToolContext) -> List[Any]:
         path: str,
         old_string: str = "",
         new_string: str = "",
-        position: Optional[str] = None
+        position: Optional[str] = None,
     ) -> str:
         """Edit a file by replacing text or inserting at start/end.
 

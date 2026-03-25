@@ -277,11 +277,13 @@ class CurateKnowledgeTask(AuxAgentTask):
             self.plan_md,
         ]
         if self.existing_notes:
-            parts.extend([
-                "",
-                "## Existing Knowledge (check before writing duplicates)",
-                "\n".join(self.existing_notes),
-            ])
+            parts.extend(
+                [
+                    "",
+                    "## Existing Knowledge (check before writing duplicates)",
+                    "\n".join(self.existing_notes),
+                ]
+            )
         return "\n".join(parts)
 
     @property
@@ -495,14 +497,14 @@ class AuxiliaryLLM:
                     tool_calls_made += 1
                 except Exception as e:
                     result = f"Error executing {tool_name}: {e}"
-                    logger.warning(
-                        f"AuxiliaryLLM.agent: tool {tool_name} failed: {e}"
-                    )
+                    logger.warning(f"AuxiliaryLLM.agent: tool {tool_name} failed: {e}")
 
-                messages.append(ToolMessage(
-                    content=result,
-                    tool_call_id=tool_id,
-                ))
+                messages.append(
+                    ToolMessage(
+                        content=result,
+                        tool_call_id=tool_id,
+                    )
+                )
 
         iterations_used = iteration + 1
 
@@ -515,9 +517,11 @@ class AuxiliaryLLM:
         structured_llm = self.llm.with_structured_output(
             task.output_schema, include_raw=True
         )
-        messages.append(HumanMessage(
-            content="Summarize what you accomplished in the required output format."
-        ))
+        messages.append(
+            HumanMessage(
+                content="Summarize what you accomplished in the required output format."
+            )
+        )
 
         raw_result = await asyncio.wait_for(
             structured_llm.ainvoke(messages),
@@ -529,7 +533,10 @@ class AuxiliaryLLM:
         raw_response = raw_result["raw"]
 
         self._archive_call(
-            task, messages, raw_response, latency_ms,
+            task,
+            messages,
+            raw_response,
+            latency_ms,
             auxiliary_metadata={
                 "iterations": iterations_used,
                 "tool_calls_made": tool_calls_made,
@@ -569,7 +576,9 @@ class AuxiliaryLLM:
                 auxiliary_metadata=meta,
             )
         except Exception as e:
-            logger.warning(f"Failed to archive auxiliary call ({task.__class__.__name__}): {e}")
+            logger.warning(
+                f"Failed to archive auxiliary call ({task.__class__.__name__}): {e}"
+            )
 
 
 # =============================================================================
@@ -614,7 +623,9 @@ async def extract_and_store_memories(
         if not messages:
             return 0
 
-        task = ExtractMemoriesTask(messages=messages, prompt=memory_extraction_prompt, phase=phase)
+        task = ExtractMemoriesTask(
+            messages=messages, prompt=memory_extraction_prompt, phase=phase
+        )
         result = await auxiliary_llm.chain(task)
 
         stored_count = 0
@@ -693,6 +704,7 @@ async def curate_and_store_knowledge(
 
         # Create KB tools for the curation agent
         from src.tools.knowledge.knowledge_tools import create_kb_tools
+
         kb_tools = create_kb_tools(tool_context)
 
         task = CurateKnowledgeTask(
@@ -797,6 +809,7 @@ async def assemble_memories(
         recent_context = _format_messages_for_extraction(messages)
 
         from src.services.assembler_tools import create_assembler_tools
+
         assembler_tools = create_assembler_tools(recall_store)
 
         task = AssembleMemoriesTask(

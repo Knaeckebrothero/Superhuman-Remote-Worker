@@ -26,7 +26,9 @@ class TestContextOverflowError:
     """Tests for the ContextOverflowError exception."""
 
     def test_stores_attributes(self):
-        err = ContextOverflowError(token_count=150_000, limit=100_000, request_size_bytes=500_000)
+        err = ContextOverflowError(
+            token_count=150_000, limit=100_000, request_size_bytes=500_000
+        )
         assert err.token_count == 150_000
         assert err.limit == 100_000
         assert err.request_size_bytes == 500_000
@@ -78,8 +80,17 @@ class TestCountRequestTokens:
         with_tools = {
             "messages": [{"role": "user", "content": "test"}],
             "tools": [
-                {"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}},
-                {"type": "function", "function": {"name": "write_file", "parameters": {"type": "object"}}},
+                {
+                    "type": "function",
+                    "function": {"name": "read_file", "parameters": {"type": "object"}},
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "parameters": {"type": "object"},
+                    },
+                },
             ],
         }
         assert count_request_tokens(with_tools) > count_request_tokens(without_tools)
@@ -88,9 +99,17 @@ class TestCountRequestTokens:
         """Should count tokens in assistant tool_calls."""
         body = {
             "messages": [
-                {"role": "assistant", "content": "", "tool_calls": [
-                    {"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
-                ]},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
             ]
         }
         result = count_request_tokens(body)
@@ -99,13 +118,18 @@ class TestCountRequestTokens:
     def test_counts_multimodal_text_parts(self):
         """Should count text in multimodal content parts."""
         body = {
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Describe this image " * 50},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
-                ],
-            }]
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image " * 50},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,abc"},
+                        },
+                    ],
+                }
+            ]
         }
         result = count_request_tokens(body)
         assert result > 50
@@ -148,7 +172,10 @@ class TestExtractResponsesApiReasoning:
         """Should extract reasoning from typed blocks."""
         msg = MagicMock()
         msg.content = [
-            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking..."}]},
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "thinking..."}],
+            },
             {"type": "output_text", "text": "Final answer"},
         ]
         msg.additional_kwargs = {}
@@ -225,7 +252,9 @@ class TestIsQuotaError:
     def test_short_retry_after_is_rate_limit(self):
         """Short retry-after without quota signal -> rate limit (not quota)."""
         client = ReasoningCapturingClient()
-        resp = self._make_response(text='{"error": "too many requests"}', headers={"retry-after": "5"})
+        resp = self._make_response(
+            text='{"error": "too many requests"}', headers={"retry-after": "5"}
+        )
         assert client._is_quota_error(resp) is False
 
     def test_no_signals_defaults_to_quota(self):
@@ -246,6 +275,7 @@ class TestHelperFunctions:
     def test_is_debug_stream_default(self):
         """Should return False when env not set."""
         import os
+
         old = os.environ.pop("DEBUG_LLM_STREAM", None)
         try:
             assert _is_debug_stream() is False
@@ -256,6 +286,7 @@ class TestHelperFunctions:
     def test_get_debug_tail_default(self):
         """Should return 500 by default."""
         import os
+
         old = os.environ.pop("DEBUG_LLM_TAIL", None)
         try:
             assert _get_debug_tail_chars() == 500
@@ -278,7 +309,9 @@ class TestExtractReasoningFromResponse:
 
     def test_deepseek_format(self):
         """Should extract reasoning_content (DeepSeek R1 format)."""
-        data = self._make_response({"reasoning_content": "Let me think step by step..."})
+        data = self._make_response(
+            {"reasoning_content": "Let me think step by step..."}
+        )
         assert _extract_reasoning_from_response(data) == "Let me think step by step..."
 
     def test_openrouter_string_format(self):
@@ -288,20 +321,24 @@ class TestExtractReasoningFromResponse:
 
     def test_openrouter_details_format(self):
         """Should extract and join reasoning_details (OpenRouter array format)."""
-        data = self._make_response({
-            "reasoning_details": [
-                {"type": "thinking", "text": "First step."},
-                {"type": "thinking", "text": "Second step."},
-            ]
-        })
+        data = self._make_response(
+            {
+                "reasoning_details": [
+                    {"type": "thinking", "text": "First step."},
+                    {"type": "thinking", "text": "Second step."},
+                ]
+            }
+        )
         assert _extract_reasoning_from_response(data) == "First step.\nSecond step."
 
     def test_deepseek_priority_over_openrouter(self):
         """DeepSeek format should win when both are present."""
-        data = self._make_response({
-            "reasoning_content": "DeepSeek thinking",
-            "reasoning": "OpenRouter thinking",
-        })
+        data = self._make_response(
+            {
+                "reasoning_content": "DeepSeek thinking",
+                "reasoning": "OpenRouter thinking",
+            }
+        )
         assert _extract_reasoning_from_response(data) == "DeepSeek thinking"
 
     def test_no_reasoning_returns_none(self):
@@ -322,12 +359,14 @@ class TestExtractReasoningFromResponse:
 
     def test_malformed_reasoning_details(self):
         """Should skip non-dict items and items without text."""
-        data = self._make_response({
-            "reasoning_details": [
-                "not a dict",
-                {"type": "thinking"},  # no text key
-                {"type": "thinking", "text": ""},  # empty text (falsy)
-                {"type": "thinking", "text": "Valid part"},
-            ]
-        })
+        data = self._make_response(
+            {
+                "reasoning_details": [
+                    "not a dict",
+                    {"type": "thinking"},  # no text key
+                    {"type": "thinking", "text": ""},  # empty text (falsy)
+                    {"type": "thinking", "text": "Valid part"},
+                ]
+            }
+        )
         assert _extract_reasoning_from_response(data) == "Valid part"

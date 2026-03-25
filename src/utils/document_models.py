@@ -16,8 +16,10 @@ from typing import Optional, List, Dict, Any, Tuple
 # Enums
 # =============================================================================
 
+
 class DocumentType(Enum):
     """Supported document types for processing."""
+
     PDF = "pdf"
     DOCX = "docx"
     TXT = "txt"
@@ -26,6 +28,7 @@ class DocumentType(Enum):
 
 class DocumentCategory(Enum):
     """Categories of documents based on content type."""
+
     LEGAL = "legal"
     TECHNICAL = "technical"
     POLICY = "policy"
@@ -34,6 +37,7 @@ class DocumentCategory(Enum):
 
 class RequirementType(Enum):
     """Classification of requirement types."""
+
     FUNCTIONAL = "functional"
     NON_FUNCTIONAL = "non_functional"
     CONSTRAINT = "constraint"
@@ -42,6 +46,7 @@ class RequirementType(Enum):
 
 class ValidationStatus(Enum):
     """Status of requirement validation."""
+
     ACCEPTED = "accepted"
     NEEDS_REVIEW = "needs_review"
     REJECTED = "rejected"
@@ -49,6 +54,7 @@ class ValidationStatus(Enum):
 
 class PipelineStage(Enum):
     """Stages of the document ingestion pipeline."""
+
     DOCUMENT_PROCESSING = "document_processing"
     EXTRACTION = "extraction"
     VALIDATION = "validation"
@@ -57,6 +63,7 @@ class PipelineStage(Enum):
 
 class PipelineStatus(Enum):
     """Overall pipeline execution status."""
+
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
@@ -66,6 +73,7 @@ class PipelineStatus(Enum):
 
 class ProcessingStatus(Enum):
     """Status for individual processing stages."""
+
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
@@ -76,9 +84,11 @@ class ProcessingStatus(Enum):
 # Document Processing Models
 # =============================================================================
 
+
 @dataclass
 class DocumentMetadata:
     """Metadata extracted from a document."""
+
     title: str
     source: str  # Filename or URL
     document_type: DocumentCategory
@@ -107,6 +117,7 @@ class DocumentMetadata:
 @dataclass
 class DocumentChunk:
     """A chunk of text from a processed document."""
+
     chunk_id: str  # Unique identifier
     text: str  # Chunk content
     start_position: int  # Character offset in original document
@@ -136,9 +147,11 @@ class DocumentChunk:
 # Requirement Extraction Models
 # =============================================================================
 
+
 @dataclass
 class RequirementCandidate:
     """A potential requirement extracted from document text."""
+
     candidate_id: str  # Generated ID
     text: str  # Extracted requirement text
     source_chunk_id: str  # Provenance tracking
@@ -150,12 +163,20 @@ class RequirementCandidate:
 
     # GoBD-specific
     gobd_relevant: bool = False
-    gobd_indicators: List[str] = field(default_factory=list)  # Keywords that triggered GoBD flag
+    gobd_indicators: List[str] = field(
+        default_factory=list
+    )  # Keywords that triggered GoBD flag
 
     # Extracted entities
-    mentioned_objects: List[str] = field(default_factory=list)  # Potential BusinessObject references
-    mentioned_messages: List[str] = field(default_factory=list)  # Potential Message references
-    mentioned_requirements: List[str] = field(default_factory=list)  # References to other requirements
+    mentioned_objects: List[str] = field(
+        default_factory=list
+    )  # Potential BusinessObject references
+    mentioned_messages: List[str] = field(
+        default_factory=list
+    )  # Potential Message references
+    mentioned_requirements: List[str] = field(
+        default_factory=list
+    )  # References to other requirements
 
     # Context
     section_context: str = ""  # Section where found
@@ -183,6 +204,7 @@ class RequirementCandidate:
 @dataclass
 class ExtractionStats:
     """Statistics from requirement extraction phase."""
+
     total_chunks: int = 0
     processed_chunks: int = 0
     candidates_found: int = 0
@@ -208,9 +230,11 @@ class ExtractionStats:
 # Validation Models
 # =============================================================================
 
+
 @dataclass
 class EntityMatch:
     """A matched entity from the graph."""
+
     entity_id: str  # boid or mid
     name: str
     match_type: str  # exact, fuzzy, semantic
@@ -220,6 +244,7 @@ class EntityMatch:
 @dataclass
 class SimilarRequirement:
     """A similar requirement found in the graph."""
+
     rid: str
     name: str
     text: str
@@ -229,6 +254,7 @@ class SimilarRequirement:
 @dataclass
 class ValidatedRequirement:
     """A requirement candidate after validation against the graph."""
+
     candidate: RequirementCandidate
 
     # Validation results
@@ -284,6 +310,7 @@ class ValidatedRequirement:
 @dataclass
 class RejectedCandidate:
     """A candidate that was rejected during validation."""
+
     candidate: RequirementCandidate
     rejection_reason: str  # duplicate, low_confidence, invalid_structure
     rejection_details: str
@@ -301,9 +328,11 @@ class RejectedCandidate:
 # Integration Models
 # =============================================================================
 
+
 @dataclass
 class IntegrationResult:
     """Result of integrating a requirement into the graph."""
+
     requirement: ValidatedRequirement
     success: bool
     created_node: bool = False
@@ -325,6 +354,7 @@ class IntegrationResult:
 @dataclass
 class HumanDecision:
     """A decision made by a human during review."""
+
     candidate_id: str
     decision: str  # accept, reject, modify
     modified_text: Optional[str] = None
@@ -336,9 +366,11 @@ class HumanDecision:
 # Pipeline Configuration
 # =============================================================================
 
+
 @dataclass
 class ProcessingOptions:
     """User-configurable options for the pipeline."""
+
     extraction_mode: str = "balanced"  # strict, balanced, permissive
     min_confidence: float = 0.6
     auto_integrate: bool = False  # If False, pause for review
@@ -374,9 +406,11 @@ class ProcessingOptions:
 # Pipeline Report
 # =============================================================================
 
+
 @dataclass
 class PipelineReport:
     """Final report from the document ingestion pipeline."""
+
     document_path: str
     started_at: datetime
     completed_at: Optional[datetime] = None
@@ -399,14 +433,18 @@ class PipelineReport:
         return {
             "document_path": self.document_path,
             "started_at": self.started_at.isoformat(),
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "completed_at": self.completed_at.isoformat()
+            if self.completed_at
+            else None,
             "total_chunks": self.total_chunks,
             "total_candidates": self.total_candidates,
             "accepted_count": self.accepted_count,
             "rejected_count": self.rejected_count,
             "needs_review_count": self.needs_review_count,
             "integrated_count": self.integrated_count,
-            "extraction_stats": self.extraction_stats.to_dict() if self.extraction_stats else None,
+            "extraction_stats": self.extraction_stats.to_dict()
+            if self.extraction_stats
+            else None,
             "stage_timings": self.stage_timings,
             "errors": self.errors,
         }
@@ -434,10 +472,12 @@ class PipelineReport:
         ]
 
         if self.errors:
-            lines.extend([
-                "",
-                "Errors:",
-            ])
+            lines.extend(
+                [
+                    "",
+                    "Errors:",
+                ]
+            )
             for error in self.errors[:5]:
                 lines.append(f"  - {error}")
             if len(self.errors) > 5:

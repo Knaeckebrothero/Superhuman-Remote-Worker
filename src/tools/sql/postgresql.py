@@ -177,13 +177,16 @@ def create_postgresql_tools(context: ToolContext) -> List[Any]:
                         schema, tbl = "public", table_name
 
                     # Columns
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT column_name, data_type, is_nullable,
                                column_default, character_maximum_length
                         FROM information_schema.columns
                         WHERE table_schema = %s AND table_name = %s
                         ORDER BY ordinal_position
-                    """, (schema, tbl))
+                    """,
+                        (schema, tbl),
+                    )
                     columns = cur.fetchall()
 
                     if not columns:
@@ -196,10 +199,13 @@ def create_postgresql_tools(context: ToolContext) -> List[Any]:
                             type_str += f"({max_len})"
                         null_str = "NULL" if nullable == "YES" else "NOT NULL"
                         default_str = f" DEFAULT {default}" if default else ""
-                        result += f"  - {col_name}: {type_str} {null_str}{default_str}\n"
+                        result += (
+                            f"  - {col_name}: {type_str} {null_str}{default_str}\n"
+                        )
 
                     # Constraints (primary key, foreign keys, unique)
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT tc.constraint_name, tc.constraint_type,
                                kcu.column_name,
                                ccu.table_schema AS ref_schema,
@@ -214,23 +220,35 @@ def create_postgresql_tools(context: ToolContext) -> List[Any]:
                             AND tc.table_schema = ccu.table_schema
                         WHERE tc.table_schema = %s AND tc.table_name = %s
                         ORDER BY tc.constraint_type, tc.constraint_name
-                    """, (schema, tbl))
+                    """,
+                        (schema, tbl),
+                    )
                     constraints = cur.fetchall()
 
                     if constraints:
                         result += f"\nConstraints ({len(constraints)}):\n"
-                        for cname, ctype, col, ref_schema, ref_table, ref_col in constraints:
+                        for (
+                            cname,
+                            ctype,
+                            col,
+                            ref_schema,
+                            ref_table,
+                            ref_col,
+                        ) in constraints:
                             if ctype == "FOREIGN KEY":
                                 result += f"  - {cname} ({ctype}): {col} -> {ref_schema}.{ref_table}.{ref_col}\n"
                             else:
                                 result += f"  - {cname} ({ctype}): {col}\n"
 
                     # Indexes
-                    cur.execute("""
+                    cur.execute(
+                        """
                         SELECT indexname, indexdef
                         FROM pg_indexes
                         WHERE schemaname = %s AND tablename = %s
-                    """, (schema, tbl))
+                    """,
+                        (schema, tbl),
+                    )
                     indexes = cur.fetchall()
 
                     if indexes:

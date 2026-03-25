@@ -57,7 +57,11 @@ class ProxyConfig:
     @property
     def is_configured(self) -> bool:
         """Check if a proxy is actually configured and usable."""
-        return self.type != ProxyType.NONE and self.host is not None and self.port is not None
+        return (
+            self.type != ProxyType.NONE
+            and self.host is not None
+            and self.port is not None
+        )
 
     @classmethod
     def from_env(cls) -> "ProxyConfig":
@@ -273,9 +277,7 @@ async def research_request(
                 )
 
         try:
-            session = aiohttp.ClientSession(
-                connector=connector, timeout=client_timeout
-            )
+            session = aiohttp.ClientSession(connector=connector, timeout=client_timeout)
             resp = await session.request(method, url, **request_kwargs)
             # Connection succeeded — yield response to caller
             try:

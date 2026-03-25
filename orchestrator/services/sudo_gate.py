@@ -74,7 +74,10 @@ class SudoGateService:
 
         logger.info(
             "Sudo request: job=%s vm=%s user=%s cmd=%s",
-            job_id, vm_id, command, " ".join(argv),
+            job_id,
+            vm_id,
+            command,
+            " ".join(argv),
         )
 
         # Store the request with the NATS reply subject.
@@ -103,12 +106,19 @@ class SudoGateService:
         if auto_result == "approve":
             logger.info("Auto-approved: %s (request %s)", cmd_string, request_id)
             await self._finalize_request(
-                request_id, "auto_approved", "auto-approval rule", "system",
+                request_id,
+                "auto_approved",
+                "auto-approval rule",
+                "system",
                 reply_subject,
             )
             # Also respond directly via msg for immediate delivery
             try:
-                await msg.respond(json.dumps({"approved": True, "reason": "auto-approval rule"}).encode())
+                await msg.respond(
+                    json.dumps(
+                        {"approved": True, "reason": "auto-approval rule"}
+                    ).encode()
+                )
             except Exception:
                 pass
             return
@@ -116,11 +126,18 @@ class SudoGateService:
         if auto_result == "deny":
             logger.info("Auto-denied: %s (request %s)", cmd_string, request_id)
             await self._finalize_request(
-                request_id, "auto_denied", "auto-denial rule", "system",
+                request_id,
+                "auto_denied",
+                "auto-denial rule",
+                "system",
                 reply_subject,
             )
             try:
-                await msg.respond(json.dumps({"approved": False, "reason": "auto-denial rule"}).encode())
+                await msg.respond(
+                    json.dumps(
+                        {"approved": False, "reason": "auto-denial rule"}
+                    ).encode()
+                )
             except Exception:
                 pass
             return
@@ -158,23 +175,32 @@ class SudoGateService:
 
         reply_subject = row.get("nats_reply_subject")
         await self._finalize_request(
-            request_id, "approved", reason, decided_by, reply_subject,
+            request_id,
+            "approved",
+            reason,
+            decided_by,
+            reply_subject,
         )
 
         # Respond via the stored NATS msg object (most reliable for cross-leaf)
         msg = self._pending_msgs.pop(request_id, None)
         if msg:
             try:
-                await msg.respond(json.dumps({"approved": True, "reason": reason}).encode())
+                await msg.respond(
+                    json.dumps({"approved": True, "reason": reason}).encode()
+                )
                 logger.info("Responded via msg.respond() for request %s", request_id)
             except Exception as e:
                 logger.warning("msg.respond() failed for %s: %s", request_id, e)
 
-        await self._broadcast_sse("request_decided", {
-            "id": str(request_id),
-            "status": "approved",
-            "decided_by": decided_by,
-        })
+        await self._broadcast_sse(
+            "request_decided",
+            {
+                "id": str(request_id),
+                "status": "approved",
+                "decided_by": decided_by,
+            },
+        )
 
         return {"id": str(request_id), "status": "approved"}
 
@@ -190,24 +216,33 @@ class SudoGateService:
 
         reply_subject = row.get("nats_reply_subject")
         await self._finalize_request(
-            request_id, "denied", reason, decided_by, reply_subject,
+            request_id,
+            "denied",
+            reason,
+            decided_by,
+            reply_subject,
         )
 
         # Respond via the stored NATS msg object
         msg = self._pending_msgs.pop(request_id, None)
         if msg:
             try:
-                await msg.respond(json.dumps({"approved": False, "reason": reason}).encode())
+                await msg.respond(
+                    json.dumps({"approved": False, "reason": reason}).encode()
+                )
                 logger.info("Responded via msg.respond() for request %s", request_id)
             except Exception as e:
                 logger.warning("msg.respond() failed for %s: %s", request_id, e)
 
-        await self._broadcast_sse("request_decided", {
-            "id": str(request_id),
-            "status": "denied",
-            "decided_by": decided_by,
-            "reason": reason,
-        })
+        await self._broadcast_sse(
+            "request_decided",
+            {
+                "id": str(request_id),
+                "status": "denied",
+                "decided_by": decided_by,
+                "reason": reason,
+            },
+        )
 
         return {"id": str(request_id), "status": "denied"}
 
@@ -245,18 +280,27 @@ class SudoGateService:
                 msg = self._pending_msgs.pop(req_id, None)
                 if msg:
                     try:
-                        await msg.respond(json.dumps({"approved": False, "reason": "approval timed out"}).encode())
+                        await msg.respond(
+                            json.dumps(
+                                {"approved": False, "reason": "approval timed out"}
+                            ).encode()
+                        )
                     except Exception:
-                        await self._nats_reply(reply_subject, False, "approval timed out")
+                        await self._nats_reply(
+                            reply_subject, False, "approval timed out"
+                        )
                 else:
                     await self._nats_reply(reply_subject, False, "approval timed out")
                 count += 1
 
-                await self._broadcast_sse("request_decided", {
-                    "id": str(row["id"]),
-                    "status": "expired",
-                    "decided_by": "system",
-                })
+                await self._broadcast_sse(
+                    "request_decided",
+                    {
+                        "id": str(row["id"]),
+                        "status": "expired",
+                        "decided_by": "system",
+                    },
+                )
 
             if count > 0:
                 logger.info("Expired %d sudo approval request(s)", count)
@@ -279,7 +323,9 @@ class SudoGateService:
 
         # Shell metacharacter check — always require human review.
         if _SHELL_META_RE.search(command):
-            logger.debug("Shell metacharacters in '%s' — skipping auto-approval", command)
+            logger.debug(
+                "Shell metacharacters in '%s' — skipping auto-approval", command
+            )
             return None
 
         try:
@@ -337,7 +383,11 @@ class SudoGateService:
                     VALUES ($1, $2, $3, $4, $5)
                     RETURNING *
                     """,
-                    pattern, action, priority, description, created_by,
+                    pattern,
+                    action,
+                    priority,
+                    description,
+                    created_by,
                 )
             return dict(row) if row else None
         except Exception as e:
@@ -401,7 +451,8 @@ class SudoGateService:
                     ORDER BY requested_at DESC
                     LIMIT ${idx}
                     """,
-                    *params, limit,
+                    *params,
+                    limit,
                 )
             return [dict(r) for r in rows]
         except Exception as e:
@@ -475,8 +526,14 @@ class SudoGateService:
                             NOW() + INTERVAL '300 seconds')
                     RETURNING id
                     """,
-                    job_id, vm_name, command, arguments, cwd,
-                    requesting_user, target_user, nats_reply_subject,
+                    job_id,
+                    vm_name,
+                    command,
+                    arguments,
+                    cwd,
+                    requesting_user,
+                    target_user,
+                    nats_reply_subject,
                     json.dumps(metadata),
                 )
             return str(row["id"]) if row else None
@@ -517,7 +574,10 @@ class SudoGateService:
                             decided_by = $3, decision_reason = $4
                         WHERE id = $1 AND status = 'pending'
                         """,
-                        request_id, status, decided_by, reason,
+                        request_id,
+                        status,
+                        decided_by,
+                        reason,
                     )
             except Exception as e:
                 logger.error("Failed to finalize sudo request %s: %s", request_id, e)

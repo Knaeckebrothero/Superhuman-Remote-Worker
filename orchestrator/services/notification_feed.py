@@ -31,8 +31,11 @@ class NotificationFeedService:
         if user_id not in self._user_queues:
             self._user_queues[user_id] = []
         self._user_queues[user_id].append(q)
-        logger.debug("SSE subscriber added for user %s (total: %d)",
-                      user_id, len(self._user_queues[user_id]))
+        logger.debug(
+            "SSE subscriber added for user %s (total: %d)",
+            user_id,
+            len(self._user_queues[user_id]),
+        )
         return q
 
     def unsubscribe_sse(self, user_id: str, q: asyncio.Queue) -> None:

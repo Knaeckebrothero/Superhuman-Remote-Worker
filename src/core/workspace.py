@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class WorkspaceManagerConfig:
     """Configuration for WorkspaceManager.
@@ -46,14 +47,16 @@ class WorkspaceManagerConfig:
     base_path: Optional[str] = None
 
     # Standard subdirectories to create for each job
-    structure: List[str] = field(default_factory=lambda: [
-        "archive",
-        "documents",
-        "chunks",
-        "candidates",
-        "requirements",
-        "output",
-    ])
+    structure: List[str] = field(
+        default_factory=lambda: [
+            "archive",
+            "documents",
+            "chunks",
+            "candidates",
+            "requirements",
+            "output",
+        ]
+    )
 
     # Git versioning settings
     git_versioning: bool = True  # Enable git versioning for workspace history
@@ -70,7 +73,9 @@ class WorkspaceManagerConfig:
         """Create config from dictionary."""
         return cls(
             base_path=data.get("base_path"),
-            structure=data.get("structure", cls.__dataclass_fields__["structure"].default_factory()),
+            structure=data.get(
+                "structure", cls.__dataclass_fields__["structure"].default_factory()
+            ),
             git_versioning=data.get("git_versioning", True),
             git_remote_url=data.get("git_remote_url"),
             branch_name=data.get("branch_name"),
@@ -101,6 +106,7 @@ def get_workspace_base_path() -> Path:
 
     # Development mode: use ./workspace relative to project root
     from src.utils.config import get_project_root
+
     return get_project_root() / "workspace"
 
 
@@ -297,9 +303,7 @@ class WorkspaceManager:
 
         if self.config.git_remote_url:
             # Clone from remote so histories stay connected.
-            git_mgr = GitManager.clone(
-                self.config.git_remote_url, self._workspace_path
-            )
+            git_mgr = GitManager.clone(self.config.git_remote_url, self._workspace_path)
             if git_mgr:
                 self._git_manager = git_mgr
                 # Checkout job branch if specified
@@ -338,7 +342,9 @@ class WorkspaceManager:
         5. Update .gitignore to exclude cloned repos
         """
         if not self.config.repositories:
-            logger.warning("initialize_project_workspace called without repositories, falling back")
+            logger.warning(
+                "initialize_project_workspace called without repositories, falling back"
+            )
             self.initialize()
             return
 
@@ -348,7 +354,9 @@ class WorkspaceManager:
             None,
         )
         if not jobs_repo or not jobs_repo.get("repo_url"):
-            logger.warning("No jobs repo found in repositories, falling back to standard init")
+            logger.warning(
+                "No jobs repo found in repositories, falling back to standard init"
+            )
             self.initialize()
             return
 
@@ -374,7 +382,9 @@ class WorkspaceManager:
             if success:
                 logger.info(f"Checked out branch: {branch}")
             else:
-                logger.warning(f"Failed to checkout branch {branch}, continuing on default")
+                logger.warning(
+                    f"Failed to checkout branch {branch}, continuing on default"
+                )
 
         # 3. Create subdirectories
         for subdir in self.config.structure:
@@ -611,7 +621,9 @@ class WorkspaceManager:
         """
         return self._backend.list_dir(relative_path, pattern)
 
-    def search_files(self, query: str, path: str = "", case_sensitive: bool = False) -> List[dict]:
+    def search_files(
+        self, query: str, path: str = "", case_sensitive: bool = False
+    ) -> List[dict]:
         """Search for text in workspace files.
 
         Args:
@@ -686,4 +698,6 @@ class WorkspaceManager:
         return summary
 
     def __repr__(self) -> str:
-        return f"WorkspaceManager(job_id='{self.job_id}', path='{self._workspace_path}')"
+        return (
+            f"WorkspaceManager(job_id='{self.job_id}', path='{self._workspace_path}')"
+        )

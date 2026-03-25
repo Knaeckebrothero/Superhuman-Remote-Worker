@@ -36,6 +36,7 @@ def run_async(coro):
         # We're already in an async context - use nest_asyncio pattern
         # or run in a thread. For simplicity, create new loop in thread.
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(asyncio.run, coro)
             return future.result()
@@ -99,8 +100,12 @@ class VisionHelper:
         )
 
         # Log configuration (hiding API key)
-        key_source = "VISION_API_KEY" if os.getenv("VISION_API_KEY") else "OPENAI_API_KEY"
-        base_source = "VISION_BASE_URL" if os.getenv("VISION_BASE_URL") else "default (OpenAI)"
+        key_source = (
+            "VISION_API_KEY" if os.getenv("VISION_API_KEY") else "OPENAI_API_KEY"
+        )
+        base_source = (
+            "VISION_BASE_URL" if os.getenv("VISION_BASE_URL") else "default (OpenAI)"
+        )
         logger.info(
             f"VisionHelper initialized: model={self.model}, "
             f"base_url={self.api_base} (from {base_source}), "
@@ -138,6 +143,7 @@ class VisionHelper:
 
         try:
             import time as _time
+
             start = _time.monotonic()
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -229,6 +235,7 @@ class VisionHelper:
 
         try:
             import time as _time
+
             start = _time.monotonic()
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -309,10 +316,7 @@ class VisionHelper:
                 return
 
             # Build synthetic LangChain messages (image data replaced with placeholder)
-            human_content = (
-                f"{prompt_text}\n\n"
-                f"[image: {mime_type}, {image_size} bytes]"
-            )
+            human_content = f"{prompt_text}\n\n[image: {mime_type}, {image_size} bytes]"
             messages = [_HM(content=human_content)]
             response = _AI(content=response_text)
 

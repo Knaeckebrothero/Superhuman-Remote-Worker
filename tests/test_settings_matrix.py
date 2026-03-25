@@ -240,7 +240,9 @@ class TestPerExpertMatrix:
             yaml.dump(expert_matrix, f)
 
         data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
-        _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
+        _apply_settings_matrix(
+            data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
+        )
 
         # Expert matrix overrides temperature
         assert data["llm"]["temperature"] == 0.7
@@ -253,7 +255,9 @@ class TestPerExpertMatrix:
         """Missing expert settings_matrix.yaml falls back to base."""
         # tmp_path exists but has no settings_matrix.yaml
         data = {"llm": {"model": "minimax-m2.7"}, "limits": {}}
-        _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
+        _apply_settings_matrix(
+            data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
+        )
 
         # Values come from base matrix
         assert data["llm"]["temperature"] == 1.0
@@ -472,7 +476,9 @@ class TestSettingsMatrixIntegration:
         with open(expert_dir / "settings_matrix.yaml", "w") as f:
             yaml.dump(expert_matrix, f)
 
-        config = loader.load_agent_config(str(config_file), deployment_dir=str(expert_dir))
+        config = loader.load_agent_config(
+            str(config_file), deployment_dir=str(expert_dir)
+        )
 
         # Expert matrix overrides this one limit
         assert config.limits.context_threshold_tokens == 95000
@@ -658,7 +664,9 @@ class TestPerExpertMatrixExtended:
             yaml.dump(expert_matrix, f)
 
         data = {"llm": {"model": "some-unknown-model"}, "limits": {}}
-        _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
+        _apply_settings_matrix(
+            data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
+        )
 
         # Expert overrode default entry
         assert data["llm"]["model_max_context_tokens"] == 256000
@@ -694,7 +702,9 @@ class TestPerExpertMatrixExtended:
         # Since detect_model_family won't know "my_custom_model", it returns "default"
         # So this tests that the default entry is used (expert's new family ignored
         # unless detect_model_family returns it)
-        _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
+        _apply_settings_matrix(
+            data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
+        )
         assert data["limits"]["context_threshold_tokens"] == 80000
 
     def test_expert_partial_limits_merge(self, tmp_path):
@@ -711,7 +721,9 @@ class TestPerExpertMatrixExtended:
             yaml.dump(expert_matrix, f)
 
         data = {"llm": {"model": "deepseek-r1"}, "limits": {}}
-        _apply_settings_matrix(data, expert_llm_keys=set(), deployment_dir=str(tmp_path))
+        _apply_settings_matrix(
+            data, expert_llm_keys=set(), deployment_dir=str(tmp_path)
+        )
 
         # Expert override for this one key
         assert data["limits"]["context_threshold_tokens"] == 42000

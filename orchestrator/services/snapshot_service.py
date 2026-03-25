@@ -144,7 +144,11 @@ class SnapshotService:
             return False
 
         prefix = f"jobs/{job_id}"
-        phase_prefix = f"{prefix}/phases/phase_{phase_number}" if phase_number is not None else None
+        phase_prefix = (
+            f"{prefix}/phases/phase_{phase_number}"
+            if phase_number is not None
+            else None
+        )
 
         try:
             # Compute checksum
@@ -185,14 +189,19 @@ class SnapshotService:
             )
 
             # Update job context
-            await self._set_snapshot_context(job_id, {
-                "status": "available",
-                "source_type": manifest.get("source_type", "vm"),
-                "created_at": manifest.get("created_at", datetime.now(timezone.utc).isoformat()),
-                "size_compressed_bytes": manifest.get("size_compressed_bytes", 0),
-                "phase_number": phase_number,
-                "checksum_sha256": sha256,
-            })
+            await self._set_snapshot_context(
+                job_id,
+                {
+                    "status": "available",
+                    "source_type": manifest.get("source_type", "vm"),
+                    "created_at": manifest.get(
+                        "created_at", datetime.now(timezone.utc).isoformat()
+                    ),
+                    "size_compressed_bytes": manifest.get("size_compressed_bytes", 0),
+                    "phase_number": phase_number,
+                    "checksum_sha256": sha256,
+                },
+            )
 
             logger.info(
                 "Snapshot uploaded: job=%s phase=%s size=%s",
@@ -204,10 +213,13 @@ class SnapshotService:
 
         except Exception as e:
             logger.error("Snapshot upload failed for job %s: %s", job_id, e)
-            await self._set_snapshot_context(job_id, {
-                "status": "capture_failed",
-                "error": str(e),
-            })
+            await self._set_snapshot_context(
+                job_id,
+                {
+                    "status": "capture_failed",
+                    "error": str(e),
+                },
+            )
             return False
 
     async def capture_vm_snapshot(
@@ -271,16 +283,22 @@ class SnapshotService:
             )
             ssh_cmd = [
                 "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=10",
-                "-p", str(ssh_port),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(ssh_port),
                 f"agent-host@{ssh_host}",
                 tar_cmd,
             ]
 
             # Run SSH tar → local file
-            max_size = int(os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10")) * 1024 * 1024 * 1024
+            max_size = (
+                int(os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10")) * 1024 * 1024 * 1024
+            )
             process = await asyncio.create_subprocess_exec(
                 *ssh_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -301,10 +319,13 @@ class SnapshotService:
                             job_id,
                             os.environ.get("SNAPSHOT_MAX_SIZE_GB", "10"),
                         )
-                        await self._set_snapshot_context(job_id, {
-                            "status": "capture_failed",
-                            "error": "Snapshot exceeds size limit",
-                        })
+                        await self._set_snapshot_context(
+                            job_id,
+                            {
+                                "status": "capture_failed",
+                                "error": "Snapshot exceeds size limit",
+                            },
+                        )
                         return False
                     f.write(chunk)
 
@@ -313,10 +334,13 @@ class SnapshotService:
             if process.returncode != 0 and total_bytes == 0:
                 stderr = (await process.stderr.read()).decode(errors="replace")
                 logger.error("SSH tar failed for job %s: %s", job_id, stderr[:500])
-                await self._set_snapshot_context(job_id, {
-                    "status": "capture_failed",
-                    "error": f"SSH tar failed (rc={process.returncode})",
-                })
+                await self._set_snapshot_context(
+                    job_id,
+                    {
+                        "status": "capture_failed",
+                        "error": f"SSH tar failed (rc={process.returncode})",
+                    },
+                )
                 return False
 
             # Collect package manifests via SSH
@@ -354,11 +378,16 @@ class SnapshotService:
             )
 
         except Exception as e:
-            logger.error("Snapshot capture failed for job %s: %s", job_id, e, exc_info=True)
-            await self._set_snapshot_context(job_id, {
-                "status": "capture_failed",
-                "error": str(e),
-            })
+            logger.error(
+                "Snapshot capture failed for job %s: %s", job_id, e, exc_info=True
+            )
+            await self._set_snapshot_context(
+                job_id,
+                {
+                    "status": "capture_failed",
+                    "error": str(e),
+                },
+            )
             return False
         finally:
             # Clean up temp file
@@ -388,10 +417,14 @@ class SnapshotService:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "ssh",
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    "-o", "ConnectTimeout=5",
-                    "-p", str(ssh_port),
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "UserKnownHostsFile=/dev/null",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-p",
+                    str(ssh_port),
                     f"agent-host@{ssh_host}",
                     cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -761,7 +794,10 @@ class SnapshotService:
             objects_to_purge = []
             for page in await asyncio.to_thread(lambda: list(pages)):
                 for obj in page.get("Contents", []):
-                    if obj.get("LastModified") and obj["LastModified"].replace(tzinfo=timezone.utc) < cutoff:
+                    if (
+                        obj.get("LastModified")
+                        and obj["LastModified"].replace(tzinfo=timezone.utc) < cutoff
+                    ):
                         objects_to_purge.append({"Key": obj["Key"]})
 
             if not objects_to_purge:
@@ -811,10 +847,13 @@ class SnapshotService:
                     )
 
             # Update job context
-            await self._set_snapshot_context(job_id, {
-                "status": "gc_deleted",
-                "gc_deleted_at": now.isoformat(),
-            })
+            await self._set_snapshot_context(
+                job_id,
+                {
+                    "status": "gc_deleted",
+                    "gc_deleted_at": now.isoformat(),
+                },
+            )
 
             logger.info("Soft-deleted snapshot for job %s", job_id)
 
@@ -850,7 +889,10 @@ class SnapshotService:
             pages = paginator.paginate(Bucket=self._bucket, Prefix="jobs/")
             for page in await asyncio.to_thread(lambda: list(pages)):
                 for obj in page.get("Contents", []):
-                    if obj["Key"].endswith("/manifest.json") and "/phases/" not in obj["Key"]:
+                    if (
+                        obj["Key"].endswith("/manifest.json")
+                        and "/phases/" not in obj["Key"]
+                    ):
                         stats["total_snapshots"] += 1
                     stats["total_size_bytes"] += obj.get("Size", 0)
 

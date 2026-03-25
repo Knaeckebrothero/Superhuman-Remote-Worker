@@ -76,21 +76,21 @@ class UniversalAgentState(TypedDict):
     workspace_path: str
 
     # Loop control (nested loop architecture)
-    initialized: bool                    # Has initialization completed
-    phase_complete: bool                 # Inner loop exit: all todos done
-    goal_achieved: bool                  # Outer loop exit: plan complete
-    iteration: int                       # Current iteration count
+    initialized: bool  # Has initialization completed
+    phase_complete: bool  # Inner loop exit: all todos done
+    goal_achieved: bool  # Outer loop exit: plan complete
+    iteration: int  # Current iteration count
 
     # Phase alternation (strategic/tactical mode)
-    is_strategic_phase: bool             # True = strategic mode, False = tactical mode
-    phase_number: int                    # Increments at each phase transition
-    is_final_phase: bool                 # True when job_complete called, awaiting todo completion
-    turn_count: int                      # LLM call counter (for memory extraction interval)
-    last_observed_turn: int              # Last turn when memory extraction ran
-    last_assembled_turn: int             # Last turn when memory assembler ran
+    is_strategic_phase: bool  # True = strategic mode, False = tactical mode
+    phase_number: int  # Increments at each phase transition
+    is_final_phase: bool  # True when job_complete called, awaiting todo completion
+    turn_count: int  # LLM call counter (for memory extraction interval)
+    last_observed_turn: int  # Last turn when memory extraction ran
+    last_assembled_turn: int  # Last turn when memory assembler ran
 
     # File-based context (read from workspace into state)
-    workspace_memory: str                # Contents of workspace.md
+    workspace_memory: str  # Contents of workspace.md
 
     # Execution control
     error: Optional[Dict[str, Any]]
@@ -168,13 +168,11 @@ def create_initial_state(
         messages=[],
         job_id=job_id,
         workspace_path=workspace_path,
-
         # Loop control
         initialized=False,
         phase_complete=False,
         goal_achieved=False,
         iteration=0,
-
         # Phase alternation (start in strategic mode)
         is_strategic_phase=True,
         phase_number=1,
@@ -182,33 +180,25 @@ def create_initial_state(
         turn_count=0,
         last_observed_turn=0,
         last_assembled_turn=0,
-
         # File-based context
         workspace_memory="",
-
         # Execution control
         error=None,
         should_stop=False,
         consecutive_llm_errors=0,
-
         # Metadata
         metadata=metadata or {},
-
         # Context management
         context_stats=None,
         tool_retry_state=None,
-
         # Legacy
         phase_transition=None,
-
         # Todo persistence
         todos=None,
         staged_todos=None,
         todo_next_id=1,
-
         # Freeze/completion data
         freeze_data=None,
-
         # Resume from feedback
         resume_feedback=None,
     )

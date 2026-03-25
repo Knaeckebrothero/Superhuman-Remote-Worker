@@ -36,13 +36,17 @@ class TestExecuteNodeExtractionTrigger:
         new_turn_count = state_turn_count + 1
         last_observed = 0
 
-        assert _should_extract_memories(new_turn_count, interval=5, last_observed_turn=last_observed)
+        assert _should_extract_memories(
+            new_turn_count, interval=5, last_observed_turn=last_observed
+        )
 
     def test_not_triggered_between_intervals(self):
         state_turn_count = 2
         new_turn_count = state_turn_count + 1  # = 3
 
-        assert not _should_extract_memories(new_turn_count, interval=5, last_observed_turn=0)
+        assert not _should_extract_memories(
+            new_turn_count, interval=5, last_observed_turn=0
+        )
 
     def test_turn_count_increments_from_state(self):
         """Verify the increment pattern used in graph.py."""
@@ -52,8 +56,12 @@ class TestExecuteNodeExtractionTrigger:
 
     def test_last_observed_prevents_re_extraction(self):
         """When last_observed_turn equals turn_count, should not extract again."""
-        assert not _should_extract_memories(turn_count=10, interval=5, last_observed_turn=10)
-        assert _should_extract_memories(turn_count=15, interval=5, last_observed_turn=10)
+        assert not _should_extract_memories(
+            turn_count=10, interval=5, last_observed_turn=10
+        )
+        assert _should_extract_memories(
+            turn_count=15, interval=5, last_observed_turn=10
+        )
 
 
 class TestExecuteNodeTurnCountReturn:
@@ -116,22 +124,26 @@ class TestExtractAndStoreMemories:
     @pytest.mark.asyncio
     async def test_extracts_and_stores(self):
         """Should extract via chain() and store each memory."""
-        memories = ExtractedMemories(memories=[
-            ExtractedMemory(
-                content="Test insight",
-                summary="Test",
-                keywords=["test"],
-                importance=0.8,
-                type="factual",
-            ),
-        ])
+        memories = ExtractedMemories(
+            memories=[
+                ExtractedMemory(
+                    content="Test insight",
+                    summary="Test",
+                    keywords=["test"],
+                    importance=0.8,
+                    type="factual",
+                ),
+            ]
+        )
         mock_llm = MagicMock()
         structured = AsyncMock()
-        structured.ainvoke = AsyncMock(return_value={
-            "raw": AIMessage(content="structured output"),
-            "parsed": memories,
-            "parsing_error": None,
-        })
+        structured.ainvoke = AsyncMock(
+            return_value={
+                "raw": AIMessage(content="structured output"),
+                "parsed": memories,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
@@ -176,11 +188,13 @@ class TestExtractAndStoreMemories:
         memories = ExtractedMemories(memories=[])
         mock_llm = MagicMock()
         structured = AsyncMock()
-        structured.ainvoke = AsyncMock(return_value={
-            "raw": AIMessage(content="structured output"),
-            "parsed": memories,
-            "parsing_error": None,
-        })
+        structured.ainvoke = AsyncMock(
+            return_value={
+                "raw": AIMessage(content="structured output"),
+                "parsed": memories,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
@@ -203,23 +217,33 @@ class TestExtractAndStoreMemories:
     @pytest.mark.asyncio
     async def test_store_failure_continues(self):
         """Store failure for one memory shouldn't block others."""
-        memories = ExtractedMemories(memories=[
-            ExtractedMemory(
-                content="mem1", summary="m1",
-                keywords=["a"], importance=0.5, type="factual",
-            ),
-            ExtractedMemory(
-                content="mem2", summary="m2",
-                keywords=["b"], importance=0.6, type="factual",
-            ),
-        ])
+        memories = ExtractedMemories(
+            memories=[
+                ExtractedMemory(
+                    content="mem1",
+                    summary="m1",
+                    keywords=["a"],
+                    importance=0.5,
+                    type="factual",
+                ),
+                ExtractedMemory(
+                    content="mem2",
+                    summary="m2",
+                    keywords=["b"],
+                    importance=0.6,
+                    type="factual",
+                ),
+            ]
+        )
         mock_llm = MagicMock()
         structured = AsyncMock()
-        structured.ainvoke = AsyncMock(return_value={
-            "raw": AIMessage(content="structured output"),
-            "parsed": memories,
-            "parsing_error": None,
-        })
+        structured.ainvoke = AsyncMock(
+            return_value={
+                "raw": AIMessage(content="structured output"),
+                "parsed": memories,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured)
 
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)

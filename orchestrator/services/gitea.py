@@ -63,7 +63,9 @@ class GiteaClient:
             True if Gitea is ready, False if unavailable or setup failed.
         """
         if not self.is_configured:
-            logger.info("Gitea not configured (GITEA_URL not set), workspace delivery disabled")
+            logger.info(
+                "Gitea not configured (GITEA_URL not set), workspace delivery disabled"
+            )
             return False
 
         client = self._get_client()
@@ -110,7 +112,9 @@ class GiteaClient:
                 if resp.status_code in (201, 422):
                     # 201 = created, 422 = already exists
                     if resp.status_code == 422:
-                        logger.info("Admin user creation returned 422 (may already exist)")
+                        logger.info(
+                            "Admin user creation returned 422 (may already exist)"
+                        )
                     else:
                         logger.info(f"Created Gitea admin user '{self._user}'")
                 else:
@@ -125,7 +129,9 @@ class GiteaClient:
                         },
                     )
                     if resp.status_code in (200, 302, 303):
-                        logger.info(f"Registered Gitea user '{self._user}' via sign-up form")
+                        logger.info(
+                            f"Registered Gitea user '{self._user}' via sign-up form"
+                        )
                     else:
                         logger.warning(
                             f"Failed to create Gitea user (status {resp.status_code}): "
@@ -145,7 +151,9 @@ class GiteaClient:
                 logger.info("Gitea workspace delivery initialized")
                 return True
             else:
-                logger.warning(f"Gitea auth verification failed (status {resp.status_code})")
+                logger.warning(
+                    f"Gitea auth verification failed (status {resp.status_code})"
+                )
                 return False
         except httpx.HTTPError as e:
             logger.warning(f"Gitea auth verification failed: {e}")
@@ -179,7 +187,9 @@ class GiteaClient:
         realm = os.environ.get("KEYCLOAK_REALM", "srw")
 
         if not keycloak_internal or not keycloak_public:
-            logger.warning("KEYCLOAK_URL or KEYCLOAK_ISSUER_URL not set, skipping Gitea OIDC setup")
+            logger.warning(
+                "KEYCLOAK_URL or KEYCLOAK_ISSUER_URL not set, skipping Gitea OIDC setup"
+            )
             return False
 
         provider_name = "Keycloak"
@@ -200,10 +210,14 @@ class GiteaClient:
                 sources = resp.json()
                 for src in sources:
                     if src.get("name") == provider_name:
-                        logger.info(f"Gitea OIDC auth source '{provider_name}' already configured")
+                        logger.info(
+                            f"Gitea OIDC auth source '{provider_name}' already configured"
+                        )
                         return True
             else:
-                logger.warning(f"Failed to list Gitea auth sources (status {resp.status_code})")
+                logger.warning(
+                    f"Failed to list Gitea auth sources (status {resp.status_code})"
+                )
                 return False
         except (httpx.HTTPError, Exception) as e:
             logger.warning(f"Failed to check Gitea auth sources: {e}")
@@ -252,7 +266,9 @@ class GiteaClient:
                     json=payload,
                 )
                 if resp.status_code in (200, 201):
-                    logger.info(f"Gitea OIDC auth source '{provider_name}' created via API (type=5)")
+                    logger.info(
+                        f"Gitea OIDC auth source '{provider_name}' created via API (type=5)"
+                    )
                     return True
 
             logger.warning(
@@ -322,9 +338,7 @@ class GiteaClient:
         client = self._get_client()
 
         try:
-            resp = await client.delete(
-                f"{self._url}/api/v1/repos/{self._user}/{name}"
-            )
+            resp = await client.delete(f"{self._url}/api/v1/repos/{self._user}/{name}")
             if resp.status_code == 204:
                 logger.info(f"Deleted Gitea repo '{name}'")
                 return True
@@ -352,7 +366,9 @@ class GiteaClient:
         if "://" in url:
             scheme, rest = url.split("://", 1)
             return f"{scheme}://{self._user}:{self._password}@{rest}/{self._user}/{repo_name}.git"
-        return f"http://{self._user}:{self._password}@{url}/{self._user}/{repo_name}.git"
+        return (
+            f"http://{self._user}:{self._password}@{url}/{self._user}/{repo_name}.git"
+        )
 
     @staticmethod
     def mask_credentials(url: str) -> str:
@@ -366,7 +382,9 @@ class GiteaClient:
         """
         return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", url)
 
-    async def get_file(self, repo_name: str, file_path: str, ref: str | None = None) -> dict | None:
+    async def get_file(
+        self, repo_name: str, file_path: str, ref: str | None = None
+    ) -> dict | None:
         """Read a file from a repository via Gitea API.
 
         Args:
@@ -404,6 +422,7 @@ class GiteaClient:
             decoded = base64.b64decode(content_b64).decode("utf-8")
 
             import json
+
             return json.loads(decoded)
 
         except Exception as e:
@@ -411,7 +430,11 @@ class GiteaClient:
             return None
 
     async def create_or_update_file(
-        self, repo_name: str, file_path: str, content: str, message: str,
+        self,
+        repo_name: str,
+        file_path: str,
+        content: str,
+        message: str,
         branch: str | None = None,
     ) -> bool:
         """Create or update a file in a repository via Gitea API.
@@ -474,7 +497,10 @@ class GiteaClient:
             return False
 
     async def delete_file(
-        self, repo_name: str, file_path: str, message: str,
+        self,
+        repo_name: str,
+        file_path: str,
+        message: str,
         branch: str | None = None,
     ) -> bool:
         """Delete a file from a repository via Gitea API.
@@ -788,8 +814,7 @@ class GiteaClient:
                 return None
             if resp.status_code != 200:
                 logger.warning(
-                    f"Failed to list tags for {repo_name} "
-                    f"(status {resp.status_code})"
+                    f"Failed to list tags for {repo_name} (status {resp.status_code})"
                 )
                 return None
 
@@ -852,7 +877,9 @@ class GiteaClient:
                 return False
 
         except httpx.HTTPError as e:
-            logger.warning(f"Failed to create branch '{new_branch}' in {repo_name}: {e}")
+            logger.warning(
+                f"Failed to create branch '{new_branch}' in {repo_name}: {e}"
+            )
             return False
 
     async def list_branches(self, repo_name: str) -> list[dict] | None:
@@ -969,9 +996,7 @@ class GiteaClient:
 
             if resp.status_code in (200, 201):
                 data = resp.json()
-                logger.info(
-                    f"Created PR #{data.get('number')} in {repo_name}: {title}"
-                )
+                logger.info(f"Created PR #{data.get('number')} in {repo_name}: {title}")
                 return {
                     "number": data["number"],
                     "url": data.get("html_url", ""),
@@ -1106,7 +1131,9 @@ class GiteaClient:
                     params={"page": page, "limit": 50},
                 )
                 if resp.status_code != 200:
-                    logger.debug(f"Gitea admin user list failed (status {resp.status_code})")
+                    logger.debug(
+                        f"Gitea admin user list failed (status {resp.status_code})"
+                    )
                     return None
 
                 users = resp.json()
@@ -1168,7 +1195,9 @@ class GiteaClient:
                 return False
 
         except httpx.HTTPError as e:
-            logger.warning(f"Failed to add collaborator '{username}' on '{repo_name}': {e}")
+            logger.warning(
+                f"Failed to add collaborator '{username}' on '{repo_name}': {e}"
+            )
             return False
 
     async def remove_collaborator(self, repo_name: str, username: str) -> bool:

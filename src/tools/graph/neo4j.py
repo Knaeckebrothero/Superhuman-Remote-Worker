@@ -64,7 +64,11 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
     def get_schema() -> Dict:
         nonlocal _schema_cache
         if _schema_cache is None and neo4j:
-            _schema_cache = neo4j.get_schema() if hasattr(neo4j, 'get_schema') else neo4j.get_database_schema()
+            _schema_cache = (
+                neo4j.get_schema()
+                if hasattr(neo4j, "get_schema")
+                else neo4j.get_database_schema()
+            )
         return _schema_cache or {}
 
     @tool
@@ -116,18 +120,20 @@ def create_neo4j_tools(context: ToolContext) -> List[Any]:
 
         schema_str = "Neo4j Database Schema:\n\n"
         schema_str += f"Node Labels ({len(schema.get('node_labels', []))}):\n"
-        for label in schema.get('node_labels', []):
+        for label in schema.get("node_labels", []):
             schema_str += f"  - {label}\n"
 
-        schema_str += f"\nRelationship Types ({len(schema.get('relationship_types', []))}):\n"
-        for rel_type in schema.get('relationship_types', []):
+        schema_str += (
+            f"\nRelationship Types ({len(schema.get('relationship_types', []))}):\n"
+        )
+        for rel_type in schema.get("relationship_types", []):
             schema_str += f"  - {rel_type}\n"
 
         schema_str += f"\nProperty Keys ({len(schema.get('property_keys', []))}):\n"
-        for prop in schema.get('property_keys', [])[:30]:
+        for prop in schema.get("property_keys", [])[:30]:
             schema_str += f"  - {prop}\n"
 
-        if len(schema.get('property_keys', [])) > 30:
+        if len(schema.get("property_keys", [])) > 30:
             schema_str += f"  ... and {len(schema['property_keys']) - 30} more\n"
 
         return schema_str

@@ -105,9 +105,7 @@ class KeyRing:
                 f"Active: {_mask_key(keys[0])}"
             )
         else:
-            logger.debug(
-                f"KeyRing[{provider}]: single key mode ({_mask_key(keys[0])})"
-            )
+            logger.debug(f"KeyRing[{provider}]: single key mode ({_mask_key(keys[0])})")
 
     @property
     def current_key(self) -> str:
@@ -239,12 +237,14 @@ class KeyRing:
                     status = "cooldown"
                     remaining = expiry - now
 
-                key_statuses.append({
-                    "key": _mask_key(key),
-                    "status": status,
-                    "active": i == self._current_index,
-                    "cooldown_remaining_s": round(remaining, 1),
-                })
+                key_statuses.append(
+                    {
+                        "key": _mask_key(key),
+                        "status": status,
+                        "active": i == self._current_index,
+                        "cooldown_remaining_s": round(remaining, 1),
+                    }
+                )
 
             return {
                 "provider": self._provider,

@@ -210,24 +210,30 @@ class IdeSessionService:
         now = datetime.now(timezone.utc).isoformat()
 
         # Mark session as restoring
-        await self._set_session_context(job_id, {
-            "status": "restoring",
-            "source": source,
-            "snapshot_type": snapshot_type if source == "snapshot" else "gitea",
-            "started_at": now,
-            "code_server_url": None,
-            "last_activity": None,
-            "idle_timeout_minutes": timeout,
-            "max_lifetime_minutes": self.max_lifetime_minutes,
-            "estimated_seconds": estimated_seconds,
-            "cpu_cores": cpu_cores,
-            "memory": memory,
-        })
+        await self._set_session_context(
+            job_id,
+            {
+                "status": "restoring",
+                "source": source,
+                "snapshot_type": snapshot_type if source == "snapshot" else "gitea",
+                "started_at": now,
+                "code_server_url": None,
+                "last_activity": None,
+                "idle_timeout_minutes": timeout,
+                "max_lifetime_minutes": self.max_lifetime_minutes,
+                "estimated_seconds": estimated_seconds,
+                "cpu_cores": cpu_cores,
+                "memory": memory,
+            },
+        )
 
         # Start async restore (VM provisioning + snapshot extraction)
         # This runs in the background — the cockpit polls GET /ide for updates
         import asyncio
-        asyncio.create_task(self._restore_session(job_id, job, source, cpu_cores, memory))
+
+        asyncio.create_task(
+            self._restore_session(job_id, job, source, cpu_cores, memory)
+        )
 
         return {
             "status": "restoring",
@@ -266,11 +272,14 @@ class IdeSessionService:
                 except Exception as e:
                     logger.warning("Failed to delete IDE VM %s: %s", vm_name, e)
 
-        await self._set_session_context(job_id, {
-            "status": "expired",
-            "code_server_url": None,
-            "stopped_at": datetime.now(timezone.utc).isoformat(),
-        })
+        await self._set_session_context(
+            job_id,
+            {
+                "status": "expired",
+                "code_server_url": None,
+                "stopped_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         return {"status": "stopped", "job_id": job_id}
 
@@ -300,7 +309,11 @@ class IdeSessionService:
             now = datetime.now(timezone.utc)
             for row in rows:
                 job_id = str(row["id"])
-                ctx = row["context"] if isinstance(row["context"], dict) else json.loads(row["context"] or "{}")
+                ctx = (
+                    row["context"]
+                    if isinstance(row["context"], dict)
+                    else json.loads(row["context"] or "{}")
+                )
                 session = ctx.get("ide_session", {})
 
                 should_expire = False
@@ -308,7 +321,9 @@ class IdeSessionService:
 
                 # Check max lifetime
                 started_at = session.get("started_at")
-                max_lifetime = session.get("max_lifetime_minutes", self.max_lifetime_minutes)
+                max_lifetime = session.get(
+                    "max_lifetime_minutes", self.max_lifetime_minutes
+                )
                 if started_at:
                     start = datetime.fromisoformat(started_at)
                     if now - start > timedelta(minutes=max_lifetime):
@@ -318,7 +333,9 @@ class IdeSessionService:
                 # Check idle timeout (only for "idle" status)
                 if not should_expire and session.get("status") == "idle":
                     last_activity = session.get("last_activity")
-                    idle_timeout = session.get("idle_timeout_minutes", self.idle_timeout_minutes)
+                    idle_timeout = session.get(
+                        "idle_timeout_minutes", self.idle_timeout_minutes
+                    )
                     if last_activity:
                         last = datetime.fromisoformat(last_activity)
                         if now - last > timedelta(minutes=idle_timeout):
@@ -373,10 +390,13 @@ class IdeSessionService:
 
         except Exception as e:
             logger.exception("IDE session restore failed for job %s", job_id)
-            await self._set_session_context(job_id, {
-                "status": "failed",
-                "error": str(e),
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": str(e),
+                },
+            )
 
     async def _restore_vm_session(
         self,
@@ -388,10 +408,13 @@ class IdeSessionService:
     ) -> None:
         """Restore an IDE session via a full KubeVirt VM."""
         if not self._vm_provisioner or not self._vm_provisioner.is_available:
-            await self._set_session_context(job_id, {
-                "status": "failed",
-                "error": "VM provisioner not available",
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "VM provisioner not available",
+                },
+            )
             return
 
         # Provision a fresh VM for the IDE session
@@ -407,24 +430,33 @@ class IdeSessionService:
         )
 
         if not ok:
-            await self._set_session_context(job_id, {
-                "status": "failed",
-                "error": "VM provisioning failed",
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "VM provisioning failed",
+                },
+            )
             return
 
-        await self._set_session_context(job_id, {
-            "vm_name": vm_name,
-            "restore_type": "vm",
-        })
+        await self._set_session_context(
+            job_id,
+            {
+                "vm_name": vm_name,
+                "restore_type": "vm",
+            },
+        )
 
         # Wait for VM to become ready (poll context.vm.status)
         ssh_host, ssh_port = await self._wait_for_vm_ready(job_id, timeout=120)
         if not ssh_host:
-            await self._set_session_context(job_id, {
-                "status": "failed",
-                "error": "VM did not become ready within timeout",
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "VM did not become ready within timeout",
+                },
+            )
             return
 
         # Extract snapshot into the VM
@@ -436,12 +468,15 @@ class IdeSessionService:
         # Code-server should already be running from base image
         code_server_url = f"http://{ssh_host}:8080/?folder=/home/agent-host/workspace"
 
-        await self._set_session_context(job_id, {
-            "status": "active",
-            "code_server_url": code_server_url,
-            "restore_type": "vm",
-            "last_activity": datetime.now(timezone.utc).isoformat(),
-        })
+        await self._set_session_context(
+            job_id,
+            {
+                "status": "active",
+                "code_server_url": code_server_url,
+                "restore_type": "vm",
+                "last_activity": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
         logger.info("IDE session active (VM) for job %s: %s", job_id, code_server_url)
 
@@ -461,10 +496,13 @@ class IdeSessionService:
         repo_name = job.get("repo_name")
         branch = job.get("branch_name") or "main"
         if not repo_name:
-            await self._set_session_context(job_id, {
-                "status": "failed",
-                "error": "No Gitea repo available",
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "No Gitea repo available",
+                },
+            )
             return
 
         container_name = f"srw-ide-{job_id[:12]}"
@@ -475,10 +513,13 @@ class IdeSessionService:
             "CODE_SERVER_IMAGE", "docker.io/codercom/code-server:latest"
         )
 
-        await self._set_session_context(job_id, {
-            "container_name": container_name,
-            "restore_type": "container",
-        })
+        await self._set_session_context(
+            job_id,
+            {
+                "container_name": container_name,
+                "restore_type": "container",
+            },
+        )
 
         try:
             # Determine container runtime (podman preferred, fallback to docker)
@@ -492,15 +533,24 @@ class IdeSessionService:
             )
 
             cmd = [
-                runtime, "run", "-d",
-                "--name", container_name,
-                "--network", "host",
-                "-e", f"PORT={host_port}",
-                "--label", f"srw.job_id={job_id}",
-                "--label", "srw.type=ide-session",
-                "--entrypoint", "sh",
+                runtime,
+                "run",
+                "-d",
+                "--name",
+                container_name,
+                "--network",
+                "host",
+                "-e",
+                f"PORT={host_port}",
+                "--label",
+                f"srw.job_id={job_id}",
+                "--label",
+                "srw.type=ide-session",
+                "--entrypoint",
+                "sh",
                 code_server_image,
-                "-c", entrypoint_script,
+                "-c",
+                entrypoint_script,
             ]
 
             proc = await asyncio.create_subprocess_exec(
@@ -514,46 +564,64 @@ class IdeSessionService:
                 error_msg = stderr.decode(errors="replace")[:500]
                 logger.error(
                     "Failed to start IDE container for job %s: %s",
-                    job_id, error_msg,
+                    job_id,
+                    error_msg,
                 )
-                await self._set_session_context(job_id, {
-                    "status": "failed",
-                    "error": f"Container start failed: {error_msg}",
-                })
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": f"Container start failed: {error_msg}",
+                    },
+                )
                 return
 
             # Wait for code-server to become ready
-            ready = await self._wait_for_code_server(f"http://localhost:{host_port}", timeout=30)
+            ready = await self._wait_for_code_server(
+                f"http://localhost:{host_port}", timeout=30
+            )
             if not ready:
-                await self._set_session_context(job_id, {
-                    "status": "failed",
-                    "error": "Code-server did not start within timeout",
-                })
+                await self._set_session_context(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "error": "Code-server did not start within timeout",
+                    },
+                )
                 # Clean up the container
                 await self._remove_container(runtime, container_name)
                 return
 
-            code_server_url = f"http://localhost:{host_port}/?folder=/home/coder/workspace"
+            code_server_url = (
+                f"http://localhost:{host_port}/?folder=/home/coder/workspace"
+            )
 
-            await self._set_session_context(job_id, {
-                "status": "active",
-                "code_server_url": code_server_url,
-                "restore_type": "container",
-                "host_port": host_port,
-                "last_activity": datetime.now(timezone.utc).isoformat(),
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "active",
+                    "code_server_url": code_server_url,
+                    "restore_type": "container",
+                    "host_port": host_port,
+                    "last_activity": datetime.now(timezone.utc).isoformat(),
+                },
+            )
 
             logger.info(
                 "IDE session active (container) for job %s: %s",
-                job_id, code_server_url,
+                job_id,
+                code_server_url,
             )
 
         except Exception as e:
             logger.exception("Container IDE session failed for job %s", job_id)
-            await self._set_session_context(job_id, {
-                "status": "failed",
-                "error": str(e),
-            })
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": str(e),
+                },
+            )
             # Best-effort cleanup
             try:
                 runtime = await self._detect_container_runtime()
@@ -613,10 +681,14 @@ class IdeSessionService:
             # Extract into VM via SSH
             ssh_cmd = [
                 "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=10",
-                "-p", str(ssh_port),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(ssh_port),
                 f"agent-host@{ssh_host}",
                 "zstd -d | tar -xf - -C /",
             ]
@@ -661,10 +733,14 @@ class IdeSessionService:
 
         ssh_cmd = [
             "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=10",
-            "-p", str(ssh_port),
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=10",
+            "-p",
+            str(ssh_port),
             f"agent-host@{ssh_host}",
             cmd,
         ]
@@ -723,7 +799,9 @@ class IdeSessionService:
             logger.info("Snapshot restored for job resume: %s", job_id)
             return True
         except Exception as e:
-            logger.warning("Snapshot restore failed for resume of job %s: %s", job_id, e)
+            logger.warning(
+                "Snapshot restore failed for resume of job %s: %s", job_id, e
+            )
             return False
 
     # =========================================================================
@@ -830,7 +908,11 @@ class IdeSessionService:
                     resp = await client.get(url)
                     if resp.status_code < 500:
                         return True
-                except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError):
+                except (
+                    httpx.ConnectError,
+                    httpx.ReadTimeout,
+                    httpx.RemoteProtocolError,
+                ):
                     pass
                 await asyncio.sleep(1)
         return False
@@ -842,7 +924,9 @@ class IdeSessionService:
 
         # Stop (ignore errors if already stopped)
         proc = await asyncio.create_subprocess_exec(
-            runtime, "stop", container_name,
+            runtime,
+            "stop",
+            container_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -850,7 +934,10 @@ class IdeSessionService:
 
         # Remove
         proc = await asyncio.create_subprocess_exec(
-            runtime, "rm", "-f", container_name,
+            runtime,
+            "rm",
+            "-f",
+            container_name,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )

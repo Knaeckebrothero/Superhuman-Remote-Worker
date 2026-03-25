@@ -27,9 +27,7 @@ def small_request_body():
     """Create a small request body that won't trigger overflow."""
     return {
         "model": "gpt-4",
-        "messages": [
-            {"role": "user", "content": "Hello, world!"}
-        ]
+        "messages": [{"role": "user", "content": "Hello, world!"}],
     }
 
 
@@ -38,12 +36,7 @@ def large_request_body():
     """Create a large request body that will trigger overflow."""
     # Create a message with ~50k characters (~12.5k tokens)
     large_content = "x" * 50000
-    return {
-        "model": "gpt-4",
-        "messages": [
-            {"role": "user", "content": large_content}
-        ]
-    }
+    return {"model": "gpt-4", "messages": [{"role": "user", "content": large_content}]}
 
 
 @pytest.fixture
@@ -51,9 +44,7 @@ def request_with_tools():
     """Create a request with tool definitions."""
     return {
         "model": "gpt-4",
-        "messages": [
-            {"role": "user", "content": "What's the weather?"}
-        ],
+        "messages": [{"role": "user", "content": "What's the weather?"}],
         "tools": [
             {
                 "type": "function",
@@ -64,13 +55,16 @@ def request_with_tools():
                         "type": "object",
                         "properties": {
                             "location": {"type": "string", "description": "City name"},
-                            "units": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                            "units": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
                         },
-                        "required": ["location"]
-                    }
-                }
+                        "required": ["location"],
+                    },
+                },
             }
-        ]
+        ],
     }
 
 
@@ -132,9 +126,12 @@ class TestCountRequestTokens:
                         {
                             "id": "call_123",
                             "type": "function",
-                            "function": {"name": "get_weather", "arguments": '{"location": "NYC"}'}
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location": "NYC"}',
+                            },
                         }
-                    ]
+                    ],
                 }
             ]
         }
@@ -148,7 +145,7 @@ class TestCountRequestTokens:
                 {
                     "role": "tool",
                     "content": "The weather is sunny.",
-                    "tool_call_id": "call_123"
+                    "tool_call_id": "call_123",
                 }
             ]
         }
@@ -168,8 +165,11 @@ class TestCountRequestTokens:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "What's in this image?"},
-                        {"type": "image_url", "image_url": {"url": "http://example.com/img.png"}}
-                    ]
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "http://example.com/img.png"},
+                        },
+                    ],
                 }
             ]
         }
@@ -233,8 +233,8 @@ class TestReasoningCapturingClient:
         request.content = json.dumps(large_request_body).encode()
 
         # Mock the parent send method
-        with patch.object(client.__class__.__bases__[0], 'send') as mock_send:
-            mock_send.return_value = MagicMock(content=b'{}')
+        with patch.object(client.__class__.__bases__[0], "send") as mock_send:
+            mock_send.return_value = MagicMock(content=b"{}")
             # Should not raise even with tiny limit
             client.send(request)
             mock_send.assert_called_once()
@@ -277,10 +277,11 @@ class TestReasoningCapturingClient:
         request.content = json.dumps(body).encode()
 
         # Mock parent send to avoid actual HTTP call
-        with patch.object(client.__class__.__bases__[0], 'send') as mock_send:
+        with patch.object(client.__class__.__bases__[0], "send") as mock_send:
             mock_send.return_value = MagicMock(content=b'{"choices":[{"message":{}}]}')
 
             import logging
+
             with caplog.at_level(logging.WARNING):
                 client.send(request)
 
@@ -347,8 +348,14 @@ class TestIntegration:
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant." * 10},
                 {"role": "user", "content": "Hello, I need help with something."},
-                {"role": "assistant", "content": "Of course! What do you need help with?"},
-                {"role": "user", "content": "Can you explain how context windows work?"},
+                {
+                    "role": "assistant",
+                    "content": "Of course! What do you need help with?",
+                },
+                {
+                    "role": "user",
+                    "content": "Can you explain how context windows work?",
+                },
             ],
             "tools": [
                 {
@@ -356,10 +363,11 @@ class TestIntegration:
                     "function": {
                         "name": "search_docs",
                         "description": "Search documentation",
-                        "parameters": {"type": "object", "properties": {}}
-                    }
+                        "parameters": {"type": "object", "properties": {}},
+                    },
                 }
-            ] * 5  # 5 tools
+            ]
+            * 5,  # 5 tools
         }
 
         count = count_request_tokens(body)
@@ -375,7 +383,7 @@ class TestIntegration:
 
         body = {
             "model": "gpt-4",
-            "messages": [{"role": "user", "content": huge_content}]
+            "messages": [{"role": "user", "content": huge_content}],
         }
 
         count = count_request_tokens(body)
@@ -414,7 +422,9 @@ class TestAsyncReasoningCapturingClient:
         request.url = "https://api.openai.com/v1/embeddings"
         request.content = json.dumps(large_request_body).encode()
 
-        with patch.object(httpx.AsyncClient, "send", new_callable=AsyncMock) as mock_send:
+        with patch.object(
+            httpx.AsyncClient, "send", new_callable=AsyncMock
+        ) as mock_send:
             mock_send.return_value = MagicMock(content=b"{}")
             await client.send(request)
             mock_send.assert_called_once()
@@ -437,7 +447,9 @@ class TestAsyncReasoningCapturingClient:
         request.content = json.dumps(body).encode()
         request.headers = {}
 
-        with patch.object(httpx.AsyncClient, "send", new_callable=AsyncMock) as mock_send:
+        with patch.object(
+            httpx.AsyncClient, "send", new_callable=AsyncMock
+        ) as mock_send:
             mock_send.return_value = MagicMock(content=b'{"choices":[{"message":{}}]}')
             await client.send(request)
 

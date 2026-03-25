@@ -22,6 +22,7 @@ _CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep merge two dicts. Objects merge recursively, null clears a key.
 
@@ -31,10 +32,7 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     for key, value in override.items():
         if value is None:
             result.pop(key, None)
-        elif (
-            isinstance(value, dict)
-            and isinstance(result.get(key), dict)
-        ):
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = deep_merge(result[key], value)
         else:
             result[key] = value
@@ -54,13 +52,13 @@ def detect_model_family(model: str) -> str:
     # Strip provider prefixes
     for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):
-            name = name[len(prefix):]
+            name = name[len(prefix) :]
             if "/" in name:
                 name = name.split("/", 1)[1]
             break
 
     if name.startswith("openai/"):
-        name = name[len("openai/"):]
+        name = name[len("openai/") :]
 
     # Pattern match
     if name.startswith("claude-opus"):
@@ -127,6 +125,7 @@ def clear_cache() -> None:
 # Settings Matrix
 # ---------------------------------------------------------------------------
 
+
 def resolve_builder_settings(model: str) -> dict[str, Any]:
     """Resolve builder inference settings for a model.
 
@@ -150,6 +149,7 @@ def resolve_builder_settings(model: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Prompt Matrix
 # ---------------------------------------------------------------------------
+
 
 def resolve_builder_prompt(model: str, prompt_type: str = "system_prompt") -> str:
     """Resolve and load a builder prompt for a model.

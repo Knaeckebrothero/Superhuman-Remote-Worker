@@ -144,7 +144,9 @@ def get_transition_strategic_todos(
     from ..core.loader import get_transition_strategic_todos_from_config
 
     # Try to load from template
-    todo_list = get_transition_strategic_todos_from_config(config, tool_names=tool_names)
+    todo_list = get_transition_strategic_todos_from_config(
+        config, tool_names=tool_names
+    )
 
     if todo_list:
         # Convert from TodoManager format to PredefinedTodo
@@ -393,10 +395,12 @@ def validate_todos_yaml(
 
         # If valid so far, add to validated list
         if todo_id is not None and content_val is not None:
-            validated_todos.append({
-                "id": todo_id,
-                "content": content_val.strip(),
-            })
+            validated_todos.append(
+                {
+                    "id": todo_id,
+                    "content": content_val.strip(),
+                }
+            )
 
     if errors:
         raise TodosYamlValidationError(
@@ -452,8 +456,9 @@ def load_todos_from_yaml(
 # =============================================================================
 
 
-
-def should_freeze_at_boundary(config: "AgentConfig", is_strategic: bool, phase_number: int) -> bool:
+def should_freeze_at_boundary(
+    config: "AgentConfig", is_strategic: bool, phase_number: int
+) -> bool:
     """Determine whether the agent should freeze at a phase boundary.
 
     Checks the autonomy level from config and the current phase context
@@ -522,13 +527,11 @@ def freeze_for_review(
     # Write to output/job_frozen.json
     output_path = "output/job_frozen.json"
     workspace.write_file(
-        output_path,
-        json.dumps(freeze_data, indent=2, ensure_ascii=False)
+        output_path, json.dumps(freeze_data, indent=2, ensure_ascii=False)
     )
 
     logger.info(
-        f"[{job_id}] JOB FROZEN at phase boundary: "
-        f"{phase_type} phase {phase_number}"
+        f"[{job_id}] JOB FROZEN at phase boundary: {phase_type} phase {phase_number}"
     )
 
     # Git commit and push
@@ -813,11 +816,18 @@ def finalize_job(
         implicit_verdict = {
             "_verdict": "approved",
             "_target_job_id": target_job_id,
-            "report": (final_data or {}).get("summary", "Critic completed without explicit verdict — implicit approval."),
+            "report": (final_data or {}).get(
+                "summary",
+                "Critic completed without explicit verdict — implicit approval.",
+            ),
             "strengths": [],
-            "minor_notes": ["Critic used job_complete instead of approve_job — treated as implicit approval."],
+            "minor_notes": [
+                "Critic used job_complete instead of approve_job — treated as implicit approval."
+            ],
         }
-        return _finalize_with_verdict(state, workspace, todo_manager, implicit_verdict, job_id)
+        return _finalize_with_verdict(
+            state, workspace, todo_manager, implicit_verdict, job_id
+        )
 
     # Get the final phase data (set by job_complete tool)
     final_data = get_final_phase_data(job_id)
@@ -850,11 +860,12 @@ def finalize_job(
 
         output_path = "output/job_completion.json"
         workspace.write_file(
-            output_path,
-            json.dumps(completion_data, indent=2, ensure_ascii=False)
+            output_path, json.dumps(completion_data, indent=2, ensure_ascii=False)
         )
 
-        logger.info(f"[{job_id}] JOB AUTO-COMPLETED (autonomy=full): {completion_data['summary']}")
+        logger.info(
+            f"[{job_id}] JOB AUTO-COMPLETED (autonomy=full): {completion_data['summary']}"
+        )
         logger.info(f"[{job_id}] Deliverables: {completion_data['deliverables']}")
 
         # Final git commit and push
@@ -864,7 +875,10 @@ def finalize_job(
                 git_mgr.commit("Job completed (autonomy=full)", allow_empty=True)
                 phase_num = state.get("phase_number", 0)
                 short_id = job_id[:8]
-                git_mgr.tag(f"{short_id}-job-completed-phase-{phase_num}", "Job auto-completed (full autonomy)")
+                git_mgr.tag(
+                    f"{short_id}-job-completed-phase-{phase_num}",
+                    "Job auto-completed (full autonomy)",
+                )
                 git_mgr.push()
             except Exception as e:
                 logger.warning(f"[{job_id}] Final git push failed: {e}")
@@ -911,8 +925,7 @@ def finalize_job(
     # Write to output/job_frozen.json
     output_path = "output/job_frozen.json"
     workspace.write_file(
-        output_path,
-        json.dumps(freeze_data, indent=2, ensure_ascii=False)
+        output_path, json.dumps(freeze_data, indent=2, ensure_ascii=False)
     )
 
     logger.info(f"[{job_id}] JOB FROZEN for review: {freeze_data['summary']}")
@@ -929,7 +942,10 @@ def finalize_job(
             git_mgr.commit("Job frozen for review", allow_empty=True)
             phase_num = state.get("phase_number", 0)
             short_id = job_id[:8]
-            git_mgr.tag(f"{short_id}-job-frozen-phase-{phase_num}", "Job frozen for human review")
+            git_mgr.tag(
+                f"{short_id}-job-frozen-phase-{phase_num}",
+                "Job frozen for human review",
+            )
             git_mgr.push()
         except Exception as e:
             logger.warning(f"[{job_id}] Final git push failed: {e}")
@@ -1067,15 +1083,22 @@ def on_strategic_phase_complete(
 
     # Check for deferred verdict data (critic evaluation tools)
     from ..tools.evaluation.evaluation_tools import get_verdict_data
+
     verdict_data = get_verdict_data(job_id)
     if verdict_data:
         logger.info(f"[{job_id}] Verdict detected, finalizing critic job")
         return finalize_job(state, workspace, todo_manager, config=config)
 
     # Check autonomy level for phase boundary freeze
-    if config and should_freeze_at_boundary(config, is_strategic=True, phase_number=phase_number):
-        logger.info(f"[{job_id}] Autonomy freeze at strategic phase {phase_number} boundary")
-        return freeze_for_review(state, workspace, todo_manager, "strategic", phase_number)
+    if config and should_freeze_at_boundary(
+        config, is_strategic=True, phase_number=phase_number
+    ):
+        logger.info(
+            f"[{job_id}] Autonomy freeze at strategic phase {phase_number} boundary"
+        )
+        return freeze_for_review(
+            state, workspace, todo_manager, "strategic", phase_number
+        )
 
     logger.info(f"[{job_id}] Strategic phase complete, checking for staged todos")
 
@@ -1111,8 +1134,7 @@ def on_strategic_phase_complete(
     )
 
     logger.info(
-        f"[{job_id}] Transitioning to tactical phase: {phase_name} "
-        f"({todo_count} todos)"
+        f"[{job_id}] Transitioning to tactical phase: {phase_name} ({todo_count} todos)"
     )
 
     phase_marker = HumanMessage(
@@ -1182,9 +1204,15 @@ def on_tactical_phase_complete(
     )
 
     # Check autonomy level for phase boundary freeze (before loading new todos)
-    if config and should_freeze_at_boundary(config, is_strategic=False, phase_number=phase_number):
-        logger.info(f"[{job_id}] Autonomy freeze at tactical phase {phase_number} boundary")
-        return freeze_for_review(state, workspace, todo_manager, "tactical", phase_number)
+    if config and should_freeze_at_boundary(
+        config, is_strategic=False, phase_number=phase_number
+    ):
+        logger.info(
+            f"[{job_id}] Autonomy freeze at tactical phase {phase_number} boundary"
+        )
+        return freeze_for_review(
+            state, workspace, todo_manager, "tactical", phase_number
+        )
 
     # Load predefined strategic todos (from config template or defaults)
     strategic_todos = get_transition_strategic_todos(config, tool_names=tool_names)
@@ -1254,4 +1282,6 @@ def handle_phase_transition(
             state, workspace, todo_manager, min_todos, max_todos, config=config
         )
     else:
-        return on_tactical_phase_complete(state, workspace, todo_manager, config, tool_names=tool_names)
+        return on_tactical_phase_complete(
+            state, workspace, todo_manager, config, tool_names=tool_names
+        )

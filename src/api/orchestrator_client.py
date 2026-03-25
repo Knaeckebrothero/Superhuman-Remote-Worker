@@ -236,7 +236,9 @@ class OrchestratorClient:
                 return True
             elif response.status_code == 404:
                 # Agent not found - might have been cleaned up, try to re-register
-                logger.warning("Agent not found during heartbeat, attempting re-registration")
+                logger.warning(
+                    "Agent not found during heartbeat, attempting re-registration"
+                )
                 if await self.register():
                     # Retry heartbeat after re-registration
                     return await self.heartbeat(status, job_id, metrics)
@@ -280,9 +282,13 @@ class OrchestratorClient:
                 if not self.agent_id:
                     # Not registered yet — keep trying
                     if await self.register():
-                        logger.info("Registration succeeded, switching to heartbeat mode")
+                        logger.info(
+                            "Registration succeeded, switching to heartbeat mode"
+                        )
                     else:
-                        logger.warning("Registration attempt failed, will retry next interval")
+                        logger.warning(
+                            "Registration attempt failed, will retry next interval"
+                        )
                 else:
                     status = get_status()
                     job_id = get_job_id()
@@ -375,12 +381,12 @@ class OrchestratorClient:
                     )
                     return content
                 elif response.status_code == 404:
-                    logger.debug(f"File not found on orchestrator: {upload_id}/{filename}")
+                    logger.debug(
+                        f"File not found on orchestrator: {upload_id}/{filename}"
+                    )
                     return None
                 else:
-                    logger.warning(
-                        f"Failed to download file: {response.status_code}"
-                    )
+                    logger.warning(f"Failed to download file: {response.status_code}")
                     return None
 
         except httpx.RequestError as e:
@@ -389,7 +395,6 @@ class OrchestratorClient:
         except Exception as e:
             logger.warning(f"Unexpected error downloading file: {e}")
             return None
-
 
     async def resume_job(
         self,
@@ -423,10 +428,18 @@ class OrchestratorClient:
             response = await self._client.post(url, json=payload)
 
             if response.status_code in (200, 202):
-                data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+                data = (
+                    response.json()
+                    if response.headers.get("content-type", "").startswith(
+                        "application/json"
+                    )
+                    else {}
+                )
                 status = data.get("status", "resumed")
                 if status == "queued":
-                    logger.info(f"Job {job_id} queued for auto-dispatch (no agents available)")
+                    logger.info(
+                        f"Job {job_id} queued for auto-dispatch (no agents available)"
+                    )
                 else:
                     logger.info(f"Resumed job {job_id} via orchestrator")
                 return True
@@ -536,7 +549,9 @@ class OrchestratorClient:
             logger.warning(f"Failed to report completion for job {job_id}: {e}")
             return False
         except Exception as e:
-            logger.warning(f"Unexpected error reporting completion for job {job_id}: {e}")
+            logger.warning(
+                f"Unexpected error reporting completion for job {job_id}: {e}"
+            )
             return False
 
     async def approve_job(
@@ -607,10 +622,15 @@ class OrchestratorClient:
 
         # Load and format the verification instructions template
         instructions = self._format_verification_instructions(
-            job_id, description, freeze_data, config_name,
+            job_id,
+            description,
+            freeze_data,
+            config_name,
         )
         if not instructions:
-            logger.error(f"Failed to load verification instructions template for job {job_id}")
+            logger.error(
+                f"Failed to load verification instructions template for job {job_id}"
+            )
             return None
 
         # Build the job creation payload
@@ -707,8 +727,15 @@ class OrchestratorClient:
         # Look for template in critic expert directory, then fall back to config/templates
         template_path = None
         search_paths = [
-            Path(__file__).parent.parent.parent / "config" / "experts" / "critic" / "verification_instructions.md",
-            Path(__file__).parent.parent.parent / "config" / "templates" / "verification_instructions.md",
+            Path(__file__).parent.parent.parent
+            / "config"
+            / "experts"
+            / "critic"
+            / "verification_instructions.md",
+            Path(__file__).parent.parent.parent
+            / "config"
+            / "templates"
+            / "verification_instructions.md",
         ]
 
         for path in search_paths:
@@ -737,7 +764,11 @@ class OrchestratorClient:
             deliverables_list = "- *(no deliverables listed)*"
 
         confidence = freeze_data.get("confidence", 0)
-        confidence_str = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else str(confidence)
+        confidence_str = (
+            f"{confidence:.0%}"
+            if isinstance(confidence, (int, float))
+            else str(confidence)
+        )
 
         try:
             return template.format(

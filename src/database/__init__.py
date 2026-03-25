@@ -31,7 +31,9 @@ from pathlib import Path
 # Schema files
 SCHEMA_DIR = Path(__file__).parent
 SCHEMA_FILE = SCHEMA_DIR / "queries" / "postgres" / "schema.sql"
-SCHEMA_VECTOR_FILE = SCHEMA_DIR / "schema_vector.sql"  # TODO: Move to queries/ if exists
+SCHEMA_VECTOR_FILE = (
+    SCHEMA_DIR / "schema_vector.sql"
+)  # TODO: Move to queries/ if exists
 
 # Database classes
 from .postgres_db import PostgresDB  # noqa: E402
@@ -40,11 +42,11 @@ from .mongo_db import MongoDB  # noqa: E402
 
 __all__ = [
     # Database classes
-    'PostgresDB',
-    'Neo4jDB',
-    'MongoDB',
+    "PostgresDB",
+    "Neo4jDB",
+    "MongoDB",
     # Schema paths
-    'SCHEMA_DIR',
-    'SCHEMA_FILE',
-    'SCHEMA_VECTOR_FILE',
+    "SCHEMA_DIR",
+    "SCHEMA_FILE",
+    "SCHEMA_VECTOR_FILE",
 ]

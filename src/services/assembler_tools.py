@@ -131,9 +131,7 @@ def create_assembler_tools(recall_store: Any) -> List[Any]:
             # Cap at 7 to avoid excessive embedding costs
             phrases = messages[:7]
             count = await recall_store.store_retrieval_messages(mem_uuid, phrases)
-            return (
-                f"Added {count} retrieval trigger phrases to memory {memory_id}."
-            )
+            return f"Added {count} retrieval trigger phrases to memory {memory_id}."
         except ValueError:
             return f"Invalid UUID: {memory_id}"
         except Exception as e:

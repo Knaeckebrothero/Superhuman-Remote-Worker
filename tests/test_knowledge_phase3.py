@@ -23,16 +23,19 @@ if str(project_root) not in sys.path:
 # Workspace Converter Tests
 # =========================================================================
 
+
 class TestWorkspaceConverter:
     """Tests for workspace.md → knowledge notes conversion."""
 
     def test_convert_empty_content(self):
         from src.tools.knowledge.workspace_converter import convert_workspace
+
         assert convert_workspace("") == []
         assert convert_workspace("   \n  ") == []
 
     def test_convert_no_headings(self):
         from src.tools.knowledge.workspace_converter import convert_workspace
+
         notes = convert_workspace("Some text without any headings at all.")
         assert len(notes) == 1
         assert notes[0]["title"] == "Workspace Notes"
@@ -73,7 +76,9 @@ We need to investigate caching strategy.
         from src.tools.knowledge.workspace_converter import convert_workspace
 
         content = "## Some Finding\nWe discovered a performance issue."
-        notes = convert_workspace(content, job_id="test-job-123", config_name="developer")
+        notes = convert_workspace(
+            content, job_id="test-job-123", config_name="developer"
+        )
         assert len(notes) == 1
         assert "migrated-from-workspace" in notes[0]["tags"]
         assert "agent-developer" in notes[0]["tags"]
@@ -113,7 +118,9 @@ Second status section with same heading.
     def test_tag_extraction(self):
         from src.tools.knowledge.workspace_converter import convert_workspace
 
-        content = "## Code Module\nImplemented `AuthController` using JWT tokens via Express."
+        content = (
+            "## Code Module\nImplemented `AuthController` using JWT tokens via Express."
+        )
         notes = convert_workspace(content)
         assert len(notes) == 1
         tags = notes[0]["tags"]
@@ -147,6 +154,7 @@ Second status section with same heading.
 # Memory Migrator Tests
 # =========================================================================
 
+
 class TestMemoryMigrator:
     """Tests for Memory Light → knowledge notes migration."""
 
@@ -163,8 +171,14 @@ class TestMemoryMigrator:
     def test_map_todo_completion_code(self):
         from src.tools.knowledge.memory_migrator import _map_memory_type
 
-        assert _map_memory_type("todo_completion", "Implemented the AuthController class") == "code"
-        assert _map_memory_type("todo_completion", "Wrote documentation for users") == "learning"
+        assert (
+            _map_memory_type("todo_completion", "Implemented the AuthController class")
+            == "code"
+        )
+        assert (
+            _map_memory_type("todo_completion", "Wrote documentation for users")
+            == "learning"
+        )
 
     def test_generate_tags(self):
         from src.tools.knowledge.memory_migrator import _generate_tags
@@ -214,28 +228,30 @@ class TestMemoryMigrator:
         from src.tools.knowledge.memory_migrator import migrate_memories
 
         mock_db = AsyncMock()
-        mock_db.fetch = AsyncMock(return_value=[
-            {
-                "id": uuid.uuid4(),
-                "job_id": uuid.uuid4(),
-                "content": "Important finding about caching.",
-                "memory_type": "observer",
-                "importance": 0.8,
-                "keywords": ["caching"],
-                "created_at": None,
-                "phase": 2,
-            },
-            {
-                "id": uuid.uuid4(),
-                "job_id": uuid.uuid4(),
-                "content": "",  # Empty — should be skipped
-                "memory_type": "free",
-                "importance": 0.5,
-                "keywords": [],
-                "created_at": None,
-                "phase": None,
-            },
-        ])
+        mock_db.fetch = AsyncMock(
+            return_value=[
+                {
+                    "id": uuid.uuid4(),
+                    "job_id": uuid.uuid4(),
+                    "content": "Important finding about caching.",
+                    "memory_type": "observer",
+                    "importance": 0.8,
+                    "keywords": ["caching"],
+                    "created_at": None,
+                    "phase": 2,
+                },
+                {
+                    "id": uuid.uuid4(),
+                    "job_id": uuid.uuid4(),
+                    "content": "",  # Empty — should be skipped
+                    "memory_type": "free",
+                    "importance": 0.5,
+                    "keywords": [],
+                    "created_at": None,
+                    "phase": None,
+                },
+            ]
+        )
 
         mock_kg = MagicMock()
         mock_ks = AsyncMock()
@@ -252,7 +268,7 @@ class TestMemoryMigrator:
         )
 
         assert stats["migrated"] == 1  # One non-empty memory
-        assert stats["skipped"] == 1   # One empty content
+        assert stats["skipped"] == 1  # One empty content
         mock_kg.create_note.assert_not_called()  # Dry run
 
     @pytest.mark.asyncio
@@ -261,18 +277,20 @@ class TestMemoryMigrator:
 
         job_id = uuid.uuid4()
         mock_db = AsyncMock()
-        mock_db.fetch = AsyncMock(return_value=[
-            {
-                "id": uuid.uuid4(),
-                "job_id": job_id,
-                "content": "Discovered that GIN indexes improve JSONB query performance by 60x.",
-                "memory_type": "observer",
-                "importance": 0.9,
-                "keywords": ["postgresql", "gin", "performance"],
-                "created_at": None,
-                "phase": 3,
-            },
-        ])
+        mock_db.fetch = AsyncMock(
+            return_value=[
+                {
+                    "id": uuid.uuid4(),
+                    "job_id": job_id,
+                    "content": "Discovered that GIN indexes improve JSONB query performance by 60x.",
+                    "memory_type": "observer",
+                    "importance": 0.9,
+                    "keywords": ["postgresql", "gin", "performance"],
+                    "created_at": None,
+                    "phase": 3,
+                },
+            ]
+        )
 
         mock_kg = MagicMock()
         mock_kg.create_note = MagicMock(return_value="gin-indexes-improve-jsonb")
@@ -323,6 +341,7 @@ class TestMemoryMigrator:
 # Orchestrator Knowledge API Tests (model/contract tests)
 # =========================================================================
 
+
 class TestKnowledgeAPIModels:
     """Tests for the Pydantic models used by knowledge API endpoints."""
 
@@ -331,6 +350,7 @@ class TestKnowledgeAPIModels:
         sys.path.insert(0, str(project_root / "orchestrator"))
         try:
             from main import KnowledgeSearchRequest
+
             req = KnowledgeSearchRequest(query="test query", limit=5)
             assert req.query == "test query"
             assert req.limit == 5
@@ -341,6 +361,7 @@ class TestKnowledgeAPIModels:
         sys.path.insert(0, str(project_root / "orchestrator"))
         try:
             from main import KnowledgeNoteUpdate
+
             update = KnowledgeNoteUpdate(status="superseded", add_tags=["deprecated"])
             assert update.status == "superseded"
             assert update.add_tags == ["deprecated"]
@@ -353,16 +374,22 @@ class TestKnowledgeAPIModels:
 # Phase 3 Integration Smoke Tests
 # =========================================================================
 
+
 class TestPhase3Integration:
     """Smoke tests verifying the Phase 3 components wire together."""
 
     def test_workspace_converter_importable(self):
-        from src.tools.knowledge.workspace_converter import convert_workspace, convert_and_write
+        from src.tools.knowledge.workspace_converter import (
+            convert_workspace,
+            convert_and_write,
+        )
+
         assert callable(convert_workspace)
         assert callable(convert_and_write)
 
     def test_memory_migrator_importable(self):
         from src.tools.knowledge.memory_migrator import migrate_memories
+
         assert callable(migrate_memories)
 
     def test_knowledge_note_type_coverage(self):
@@ -382,8 +409,9 @@ class TestPhase3Integration:
         for content, expected_type in test_cases:
             notes = convert_workspace(content)
             assert len(notes) == 1, f"Expected 1 note for: {content}"
-            assert notes[0]["note_type"] == expected_type, \
+            assert notes[0]["note_type"] == expected_type, (
                 f"Expected type '{expected_type}' for: {content}, got '{notes[0]['note_type']}'"
+            )
 
     def test_memory_type_coverage(self):
         """Verify migrator maps all memory types correctly."""
@@ -399,8 +427,9 @@ class TestPhase3Integration:
 
         for mem_type, expected_note_type in expected.items():
             result = _map_memory_type(mem_type, "generic content")
-            assert result == expected_note_type, \
+            assert result == expected_note_type, (
                 f"Expected '{expected_note_type}' for memory type '{mem_type}', got '{result}'"
+            )
 
     def test_angular_model_exports(self):
         """Verify the Angular model file contains the expected KB interfaces."""
@@ -441,7 +470,10 @@ class TestPhase3Integration:
 
     def test_project_detail_has_knowledge_tab(self):
         """Verify the project detail component has the Knowledge tab."""
-        component_path = project_root / "cockpit/src/app/pages/project-detail/project-detail.component.ts"
+        component_path = (
+            project_root
+            / "cockpit/src/app/pages/project-detail/project-detail.component.ts"
+        )
         content = component_path.read_text()
 
         assert "'knowledge'" in content, "Missing 'knowledge' tab type"

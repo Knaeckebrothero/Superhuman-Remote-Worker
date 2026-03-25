@@ -20,9 +20,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
 def _get_default_cache_dir() -> Path:
     """Resolve default cache directory using workspace base path."""
     from src.core.workspace import get_workspace_base_path
+
     return get_workspace_base_path() / ".vision_cache"
 
 
@@ -114,9 +116,7 @@ class DescriptionCache:
             "query": query or "",
         }
 
-        return hashlib.sha256(
-            json.dumps(key_data, sort_keys=True).encode()
-        ).hexdigest()
+        return hashlib.sha256(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
 
     def get(
         self,

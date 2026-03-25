@@ -146,7 +146,9 @@ def create_paper_tools(context: ToolContext) -> List[Any]:
         if identifier_type == "doi":
             doi = DOI_PATTERN.search(identifier)
             if doi:
-                result = await _try_unpaywall_download(doi.group(), dest_dir, proxy=proxy)
+                result = await _try_unpaywall_download(
+                    doi.group(), dest_dir, proxy=proxy
+                )
                 if result.success:
                     _register_downloaded_paper(context, result)
                     return (
@@ -240,9 +242,7 @@ async def _search_arxiv(query: str, max_results: int) -> str:
     return "\n".join(lines)
 
 
-async def _search_semantic_scholar(
-    query: str, max_results: int, *, proxy=None
-) -> str:
+async def _search_semantic_scholar(query: str, max_results: int, *, proxy=None) -> str:
     """Search Semantic Scholar and format results."""
     import os
 
@@ -318,7 +318,9 @@ async def _try_arxiv_download(identifier: str, dest_dir: Path) -> "DownloadResul
     return await client.download(arxiv_id, dest_dir)
 
 
-async def _try_unpaywall_download(doi: str, dest_dir: Path, *, proxy=None) -> "DownloadResult":
+async def _try_unpaywall_download(
+    doi: str, dest_dir: Path, *, proxy=None
+) -> "DownloadResult":
     """Try downloading via Unpaywall."""
     from .utils.paper_types import DownloadResult
     from .utils.unpaywall_client import UnpaywallClient
@@ -378,7 +380,12 @@ async def _try_browser_download(
         Success message string, or None if browser download failed/unavailable
     """
     try:
-        from .browser import _get_browser_config, _get_browser_llm, _find_new_files, _register_downloaded_file
+        from .browser import (
+            _get_browser_config,
+            _get_browser_llm,
+            _find_new_files,
+            _register_downloaded_file,
+        )
         from browser_use import Agent, Browser
     except ImportError:
         logger.debug("browser-use not available for fallback download")

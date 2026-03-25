@@ -31,18 +31,24 @@ Example:
     ```
 """
 
-from .postgres import PostgresDB, ALLOWED_TABLES, PG_TYPE_MAP, SCHEMA_FILE, REQUIRED_TABLES
+from .postgres import (
+    PostgresDB,
+    ALLOWED_TABLES,
+    PG_TYPE_MAP,
+    SCHEMA_FILE,
+    REQUIRED_TABLES,
+)
 from .mongodb import MongoDB, FILTER_MAPPINGS, FilterCategory
 
 __all__ = [
     # PostgreSQL
-    'PostgresDB',
-    'ALLOWED_TABLES',
-    'PG_TYPE_MAP',
-    'SCHEMA_FILE',
-    'REQUIRED_TABLES',
+    "PostgresDB",
+    "ALLOWED_TABLES",
+    "PG_TYPE_MAP",
+    "SCHEMA_FILE",
+    "REQUIRED_TABLES",
     # MongoDB
-    'MongoDB',
-    'FILTER_MAPPINGS',
-    'FilterCategory',
+    "MongoDB",
+    "FILTER_MAPPINGS",
+    "FilterCategory",
 ]

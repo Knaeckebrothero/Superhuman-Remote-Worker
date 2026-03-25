@@ -57,7 +57,9 @@ class EmbeddingService:
             self.model = f"qwen/{base_model}" if "/" not in base_model else base_model
         else:
             # "local" provider (default) — custom endpoint or OpenAI
-            self.api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+            self.api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv(
+                "OPENAI_API_KEY", ""
+            )
             self.base_url = os.getenv("EMBEDDING_BASE_URL", self.OPENAI_API_URL)
             self.model = base_model
 

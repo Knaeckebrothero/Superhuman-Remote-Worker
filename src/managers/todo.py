@@ -369,7 +369,9 @@ class TodoManager:
         phase_type = "Strategic" if self._is_strategic_phase else "Tactical"
         phase_name = self._current_phase_name or self._staged_phase_name
         if phase_name:
-            lines = [f"Current Tasks — Phase {self._phase_number} ({phase_type}): {phase_name}"]
+            lines = [
+                f"Current Tasks — Phase {self._phase_number} ({phase_type}): {phase_name}"
+            ]
         else:
             lines = [f"Current Tasks — Phase {self._phase_number} ({phase_type})"]
 
@@ -404,8 +406,8 @@ class TodoManager:
         # Tool usage guide
         lines.append("")
         lines.append(
-            "Tools: Use `todo_complete(todo_id=\"<id>\")` when a task is finished. "
-            "Use `todo_rewind(todo_id=\"<id>\")` to revisit a completed task. "
+            'Tools: Use `todo_complete(todo_id="<id>")` when a task is finished. '
+            'Use `todo_rewind(todo_id="<id>")` to revisit a completed task. '
             "Use `mark_complete` to signal the current phase is done."
         )
 
@@ -548,7 +550,11 @@ class TodoManager:
         timestamp = datetime.now(timezone.utc)
 
         # Header with phase info
-        header_name = phase_name or phase_info["phase_name"] or f"Phase {phase_num} {phase_type.title()}"
+        header_name = (
+            phase_name
+            or phase_info["phase_name"]
+            or f"Phase {phase_num} {phase_type.title()}"
+        )
         lines.append(f"# Archived Todos: {header_name}")
         lines.append(f"Phase: {phase_num} ({phase_type})")
         lines.append(f"Archived: {timestamp.isoformat()}")
@@ -712,7 +718,9 @@ class TodoManager:
         self._staged_todos = []
         self._staged_phase_name = ""
 
-        logger.info(f"Applied {count} staged todos" + (f" ({phase_name})" if phase_name else ""))
+        logger.info(
+            f"Applied {count} staged todos" + (f" ({phase_name})" if phase_name else "")
+        )
 
     def clear_staged_todos(self) -> None:
         """Clear staged todos without applying them."""
@@ -726,7 +734,9 @@ class TodoManager:
         """Log current todo state for monitoring."""
         total = len(self._todos)
         completed = len([t for t in self._todos if t.status == TodoStatus.COMPLETED])
-        in_progress = len([t for t in self._todos if t.status == TodoStatus.IN_PROGRESS])
+        in_progress = len(
+            [t for t in self._todos if t.status == TodoStatus.IN_PROGRESS]
+        )
         pending = len([t for t in self._todos if t.status == TodoStatus.PENDING])
 
         logger.info(
@@ -872,8 +882,7 @@ class TodoManager:
             next_task = self.list_pending()[0] if remaining > 0 else None
             next_str = f"\nNext: {next_task.content}" if next_task else ""
             message = (
-                f"Completed: {target.content}\n"
-                f"Remaining: {remaining} tasks{next_str}"
+                f"Completed: {target.content}\nRemaining: {remaining} tasks{next_str}"
             )
 
         return {
@@ -898,7 +907,9 @@ class TodoManager:
         bar = "█" * filled + "░" * (bar_len - filled)
 
         lines.append(f"Progress: [{bar}] {progress['percentage']}%")
-        lines.append(f"Total: {progress['total']} | Completed: {progress['completed']} | Pending: {progress['pending']}")
+        lines.append(
+            f"Total: {progress['total']} | Completed: {progress['completed']} | Pending: {progress['pending']}"
+        )
         lines.append("")
 
         # Group by status
@@ -1044,4 +1055,3 @@ class TodoManager:
             f"{len(self._staged_todos)} staged, next_id={self._next_id}, "
             f"phase={self._phase_number} ({('strategic' if self._is_strategic_phase else 'tactical')})"
         )
-

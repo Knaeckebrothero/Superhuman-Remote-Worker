@@ -97,8 +97,7 @@ def get_tools_by_category(category: str) -> List[str]:
         List of tool names in the category
     """
     return [
-        name for name, meta in TOOL_REGISTRY.items()
-        if meta.get("category") == category
+        name for name, meta in TOOL_REGISTRY.items() if meta.get("category") == category
     ]
 
 
@@ -144,7 +143,8 @@ def get_tools_for_phase(phase: str) -> List[str]:
         List of tool names available in the phase
     """
     return [
-        name for name, meta in TOOL_REGISTRY.items()
+        name
+        for name, meta in TOOL_REGISTRY.items()
         if phase in meta.get("phases", ["strategic", "tactical"])
         and not meta.get("placeholder", False)
     ]
@@ -245,14 +245,12 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     if unknown_tools:
         available = ", ".join(sorted(TOOL_REGISTRY.keys()))
         raise ValueError(
-            f"Unknown tools: {unknown_tools}. "
-            f"Available tools: {available}"
+            f"Unknown tools: {unknown_tools}. Available tools: {available}"
         )
 
     # Check for placeholder tools
     placeholder_tools = [
-        name for name in tool_names
-        if TOOL_REGISTRY[name].get("placeholder", False)
+        name for name in tool_names if TOOL_REGISTRY[name].get("placeholder", False)
     ]
     if placeholder_tools:
         raise ValueError(
@@ -438,7 +436,9 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     # Knowledge tools
     if "knowledge" in tools_by_category:
         if not context.has_knowledge():
-            logger.warning("Knowledge tools require knowledge_graph and knowledge_store in ToolContext")
+            logger.warning(
+                "Knowledge tools require knowledge_graph and knowledge_store in ToolContext"
+            )
         else:
             try:
                 knowledge_tools = create_knowledge_tools(context)
@@ -466,6 +466,7 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
     if "delegation" in tools_by_category:
         try:
             from .delegation import create_delegation_tools, get_delegation_metadata  # noqa: F401
+
             delegation_tools = create_delegation_tools(context)
             requested = set(tools_by_category["delegation"])
             for tool in delegation_tools:
@@ -499,8 +500,7 @@ def load_tools_by_category(category: str, context: ToolContext) -> List[Any]:
     tool_names = get_tools_by_category(category)
     # Filter out placeholder tools
     tool_names = [
-        name for name in tool_names
-        if not TOOL_REGISTRY[name].get("placeholder", False)
+        name for name in tool_names if not TOOL_REGISTRY[name].get("placeholder", False)
     ]
     return load_tools(tool_names, context)
 
@@ -511,7 +511,7 @@ def register_tool(
     function: str,
     description: str,
     category: str = "custom",
-    **kwargs
+    **kwargs,
 ) -> None:
     """Register a custom tool in the registry.
 
@@ -533,7 +533,7 @@ def register_tool(
         "function": function,
         "description": description,
         "category": category,
-        **kwargs
+        **kwargs,
     }
     logger.info(f"Registered tool: {name} ({category})")
 
@@ -597,6 +597,7 @@ def apply_instruction_enforcement(
         @functools.wraps(original_func)
         def make_wrapper(orig, name, files):
             """Create enforcement wrapper closure."""
+
             def wrapper(*args, **kwargs):
                 for file_path in files:
                     if not context.was_recently_read(file_path):
@@ -606,18 +607,16 @@ def apply_instruction_enforcement(
                             f"operation. Read it first, then call {name} again."
                         )
                 return orig(*args, **kwargs)
+
             return wrapper
 
         tool.func = make_wrapper(original_func, tool_name, required_files)
         logger.debug(
-            f"Applied instruction enforcement to {tool_name}: "
-            f"requires {required_files}"
+            f"Applied instruction enforcement to {tool_name}: requires {required_files}"
         )
 
     wrapped_count = sum(1 for t in tools if t.name in enforcement_map)
     if wrapped_count:
-        logger.info(
-            f"Applied instruction enforcement to {wrapped_count} tools"
-        )
+        logger.info(f"Applied instruction enforcement to {wrapped_count} tools")
 
     return tools

@@ -59,7 +59,9 @@ class PhaseSnapshot:
         return asdict(self)
 
 
-def discover_thread_id_from_checkpoint(checkpoint_path: Path, job_id: str) -> Optional[str]:
+def discover_thread_id_from_checkpoint(
+    checkpoint_path: Path, job_id: str
+) -> Optional[str]:
     """Discover the thread_id used in a checkpoint database.
 
     For backward compatibility with old snapshots that don't store thread_id,
@@ -249,9 +251,13 @@ class PhaseSnapshotManager:
                     try:
                         content = self._backend.read_file(filename)
                         (snapshot_dir / filename).write_text(content, encoding="utf-8")
-                        logger.debug(f"[{self.job_id}] Snapshot: pulled {filename} from VM")
+                        logger.debug(
+                            f"[{self.job_id}] Snapshot: pulled {filename} from VM"
+                        )
                     except Exception as e:
-                        logger.debug(f"[{self.job_id}] Snapshot: {filename} not on VM: {e}")
+                        logger.debug(
+                            f"[{self.job_id}] Snapshot: {filename} not on VM: {e}"
+                        )
             else:
                 for filename in files_to_copy:
                     src = workspace_path / filename
@@ -274,7 +280,9 @@ class PhaseSnapshotManager:
                                 (archive_dst / af).write_text(content, encoding="utf-8")
                             except Exception:
                                 pass  # Skip binary or unreadable files
-                        logger.debug(f"[{self.job_id}] Snapshot: pulled archive/ from VM")
+                        logger.debug(
+                            f"[{self.job_id}] Snapshot: pulled archive/ from VM"
+                        )
                 except Exception as e:
                     logger.debug(f"[{self.job_id}] Snapshot: archive/ not on VM: {e}")
             else:
@@ -403,12 +411,16 @@ class PhaseSnapshotManager:
                 if checkpoint_path.exists():
                     backup_path = checkpoint_path.with_suffix(".db.backup")
                     shutil.copy2(checkpoint_path, backup_path)
-                    logger.info(f"[{self.job_id}] Backed up current checkpoint to {backup_path}")
+                    logger.info(
+                        f"[{self.job_id}] Backed up current checkpoint to {backup_path}"
+                    )
 
                 # Ensure checkpoints directory exists
                 checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(snapshot_checkpoint, checkpoint_path)
-                logger.info(f"[{self.job_id}] Restored checkpoint.db from phase {phase_number}")
+                logger.info(
+                    f"[{self.job_id}] Restored checkpoint.db from phase {phase_number}"
+                )
             else:
                 logger.warning(
                     f"[{self.job_id}] No checkpoint.db in phase {phase_number} snapshot"
@@ -426,7 +438,9 @@ class PhaseSnapshotManager:
                             self._backend.write_file(filename, content)
                             logger.debug(f"[{self.job_id}] Pushed {filename} to VM")
                         except Exception as e:
-                            logger.warning(f"[{self.job_id}] Failed to push {filename} to VM: {e}")
+                            logger.warning(
+                                f"[{self.job_id}] Failed to push {filename} to VM: {e}"
+                            )
             else:
                 for filename in files_to_restore:
                     src = snapshot_dir / filename
@@ -466,7 +480,9 @@ class PhaseSnapshotManager:
                     # Clear archive if snapshot has no archive
                     shutil.rmtree(archive_dst)
                     archive_dst.mkdir()
-                    logger.debug(f"[{self.job_id}] Cleared archive/ (empty in snapshot)")
+                    logger.debug(
+                        f"[{self.job_id}] Cleared archive/ (empty in snapshot)"
+                    )
 
             logger.info(
                 f"[{self.job_id}] Successfully recovered to phase {phase_number} "
@@ -475,7 +491,9 @@ class PhaseSnapshotManager:
             return True
 
         except Exception as e:
-            logger.error(f"[{self.job_id}] Failed to recover to phase {phase_number}: {e}")
+            logger.error(
+                f"[{self.job_id}] Failed to recover to phase {phase_number}: {e}"
+            )
             return False
 
     def delete_snapshots_after(self, phase_number: int) -> int:

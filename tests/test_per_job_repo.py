@@ -71,10 +71,12 @@ class TestResolveJobRepo:
         parent = {"repo_name": "job-parent12", "branch_name": None}
 
         with patch(f"{MODULE}.postgres_db") as mock_db:
-            mock_db.get_job = AsyncMock(side_effect=lambda jid: {
-                "sub12345-xxxx": subjob,
-                "parent-uuid": parent,
-            }.get(jid))
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "sub12345-xxxx": subjob,
+                    "parent-uuid": parent,
+                }.get(jid)
+            )
 
             repo, branch = await orch_main.resolve_job_repo("sub12345-xxxx")
             assert repo == "job-parent12"
@@ -190,10 +192,12 @@ class TestSquashMergeSubjob:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
         ):
-            mock_db.get_job = AsyncMock(side_effect=lambda jid: {
-                "subjob-uuid": subjob,
-                "parent-uuid": parent,
-            }.get(jid))
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "subjob-uuid": subjob,
+                    "parent-uuid": parent,
+                }.get(jid)
+            )
             mock_db.update_job_merge_status = AsyncMock()
 
             mock_gitea.is_initialized = True
@@ -211,12 +215,15 @@ class TestSquashMergeSubjob:
             }
 
             # Verify cleanup files were deleted
-            assert mock_gitea.delete_file.await_count == len(orch_main.SUBJOB_CLEANUP_FILES)
+            assert mock_gitea.delete_file.await_count == len(
+                orch_main.SUBJOB_CLEANUP_FILES
+            )
 
             # Verify PR created with squash
             mock_gitea.create_pr.assert_awaited_once()
             mock_gitea.merge_pr.assert_awaited_once_with(
-                "job-parent12", 42,
+                "job-parent12",
+                42,
                 merge_strategy="squash",
                 delete_branch_after_merge=True,
             )
@@ -242,10 +249,12 @@ class TestSquashMergeSubjob:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
         ):
-            mock_db.get_job = AsyncMock(side_effect=lambda jid: {
-                "subjob-uuid": subjob,
-                "parent-uuid": parent,
-            }.get(jid))
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "subjob-uuid": subjob,
+                    "parent-uuid": parent,
+                }.get(jid)
+            )
             mock_db.update_job_merge_status = AsyncMock()
 
             mock_gitea.is_initialized = True
@@ -278,10 +287,12 @@ class TestSquashMergeSubjob:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
         ):
-            mock_db.get_job = AsyncMock(side_effect=lambda jid: {
-                "sub-id": subjob,
-                "parent-id": parent,
-            }.get(jid))
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "sub-id": subjob,
+                    "parent-id": parent,
+                }.get(jid)
+            )
             mock_db.update_job_merge_status = AsyncMock()
 
             mock_gitea.is_initialized = True
@@ -320,17 +331,21 @@ class TestSquashMergeSubjob:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
         ):
-            mock_db.get_job = AsyncMock(side_effect=lambda jid: {
-                "sub-id": subjob,
-                "parent-id": parent,
-            }.get(jid))
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "sub-id": subjob,
+                    "parent-id": parent,
+                }.get(jid)
+            )
             mock_db.update_job_merge_status = AsyncMock()
 
             mock_gitea.is_initialized = True
             mock_gitea.delete_file = AsyncMock()
             # Return dir_entries only for "archive", empty for other dirs
             mock_gitea.list_contents = AsyncMock(
-                side_effect=lambda repo, path, ref=None: dir_entries if path == "archive" else []
+                side_effect=lambda repo, path, ref=None: dir_entries
+                if path == "archive"
+                else []
             )
             mock_gitea.create_pr = AsyncMock(return_value={"number": 1})
             mock_gitea.merge_pr = AsyncMock(return_value=True)
@@ -358,10 +373,12 @@ class TestSquashMergeSubjob:
             patch(f"{MODULE}.postgres_db") as mock_db,
             patch(f"{MODULE}.gitea_client") as mock_gitea,
         ):
-            mock_db.get_job = AsyncMock(side_effect=lambda jid: {
-                "sub-id": subjob,
-                "parent-id": parent,
-            }.get(jid))
+            mock_db.get_job = AsyncMock(
+                side_effect=lambda jid: {
+                    "sub-id": subjob,
+                    "parent-id": parent,
+                }.get(jid)
+            )
             mock_db.update_job_merge_status = AsyncMock()
 
             mock_gitea.is_initialized = True
@@ -554,7 +571,9 @@ class TestSubjobMergeEndpoint:
 
         with (
             patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}._squash_merge_subjob", new_callable=AsyncMock) as mock_merge,
+            patch(
+                f"{MODULE}._squash_merge_subjob", new_callable=AsyncMock
+            ) as mock_merge,
         ):
             mock_db.get_job = AsyncMock(return_value=job)
             mock_merge.return_value = {

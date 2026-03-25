@@ -31,6 +31,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # Config helpers — read from resolved_config JSONB
 # ---------------------------------------------------------------------------
 
+
 def _parse_resolved_config(job: dict[str, Any]) -> dict[str, Any]:
     """Parse resolved_config from a job dict (handles str or dict)."""
     rc = job.get("resolved_config")
@@ -97,8 +98,9 @@ def is_verification_enabled(job: dict[str, Any]) -> bool:
         except (json.JSONDecodeError, ValueError):
             config_override = None
     return bool(
-        _resolve_config_section_from_disk("verification", config_name, config_override)
-        .get("enabled", False)
+        _resolve_config_section_from_disk(
+            "verification", config_name, config_override
+        ).get("enabled", False)
     )
 
 
@@ -125,6 +127,7 @@ def is_scholar_enabled(job: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------
 # Disk-based config readers (for creation-time decisions)
 # ---------------------------------------------------------------------------
+
 
 def _resolve_config_section_from_disk(
     section: str,
@@ -199,6 +202,7 @@ def get_autonomy_level(job: dict[str, Any]) -> str:
 # Freeze data helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_freeze_data(job: dict[str, Any]) -> dict[str, Any] | None:
     """Parse freeze_data from a job dict (handles str or dict)."""
     fd = job.get("freeze_data")
@@ -223,15 +227,13 @@ def is_job_completion_freeze(job: dict[str, Any]) -> bool:
     if not freeze_data:
         return False
     freeze_type = freeze_data.get("freeze_type")
-    return (
-        freeze_type == "job_complete"
-        or freeze_data.get("status") == "job_completed"
-    )
+    return freeze_type == "job_complete" or freeze_data.get("status") == "job_completed"
 
 
 # ---------------------------------------------------------------------------
 # Status determination
 # ---------------------------------------------------------------------------
+
 
 def determine_job_status(
     job: dict[str, Any],
@@ -253,9 +255,7 @@ def determine_job_status(
 
     if error:
         error_msg = (
-            error.get("message", str(error))
-            if isinstance(error, dict)
-            else str(error)
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
         )
         return ("failed", error_msg)
 
@@ -279,7 +279,8 @@ def determine_job_status(
                 fd_status = "completed"
             logger.debug(
                 "Job %s is a sub-job — setting status from freeze_data: %s",
-                job.get("id"), fd_status,
+                job.get("id"),
+                fd_status,
             )
             return (fd_status, None)
         # No explicit status in freeze_data — infer from goal_achieved
@@ -311,6 +312,7 @@ def determine_job_status(
 # ---------------------------------------------------------------------------
 # Template formatting
 # ---------------------------------------------------------------------------
+
 
 def format_verification_instructions(
     job_id: str,
@@ -452,7 +454,11 @@ def format_scholar_instructions(
     with fallback to ``config/templates/scholar_subjob_instructions.md``.
     """
     search_paths = [
-        _REPO_ROOT / "config" / "experts" / "scholar" / "scholar_subjob_instructions.md",
+        _REPO_ROOT
+        / "config"
+        / "experts"
+        / "scholar"
+        / "scholar_subjob_instructions.md",
         _REPO_ROOT / "config" / "templates" / "scholar_subjob_instructions.md",
     ]
 
@@ -476,10 +482,7 @@ def format_scholar_instructions(
         return None
 
     if instructions:
-        parent_instructions_section = (
-            "## Additional Instructions\n\n"
-            f"{instructions}"
-        )
+        parent_instructions_section = f"## Additional Instructions\n\n{instructions}"
     else:
         parent_instructions_section = ""
 

@@ -27,7 +27,11 @@ import aiosqlite
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from .core.workspace import WorkspaceManager, WorkspaceManagerConfig, get_checkpoints_path
+from .core.workspace import (
+    WorkspaceManager,
+    WorkspaceManagerConfig,
+    get_checkpoints_path,
+)
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.loader import get_project_root
 from .managers import TodoManager
@@ -43,7 +47,10 @@ from .core.loader import (
     resolve_config_path,
     resolve_model_settings,
 )
-from .tools.description_manager import generate_workspace_tool_docs, apply_description_overrides
+from .tools.description_manager import (
+    generate_workspace_tool_docs,
+    apply_description_overrides,
+)
 from .graph import build_phase_alternation_graph, run_graph_with_streaming
 
 
@@ -83,6 +90,7 @@ class UniversalAgent:
     - Context Management: Automatic compaction and summarization
     - Tool Loading: Dynamic based on config.tools
     """
+
     def __init__(
         self,
         config: AgentConfig,
@@ -126,7 +134,9 @@ class UniversalAgent:
         self._current_job_id: Optional[str] = None
         self._job_metadata: Optional[Dict[str, Any]] = None
         self._datasource_connections: Dict[str, Any] = {}
-        self._datasource_clients: Dict[str, Any] = {}  # Parent clients for cleanup (e.g. MongoClient)
+        self._datasource_clients: Dict[
+            str, Any
+        ] = {}  # Parent clients for cleanup (e.g. MongoClient)
 
         # Persistent shell sessions (tmux-backed)
         self._shell_manager = None
@@ -145,9 +155,7 @@ class UniversalAgent:
         self._jobs_processed = 0
         self._start_time = datetime.utcnow()
 
-        logger.info(
-            f"Created {config.display_name} (agent_id={config.agent_id})"
-        )
+        logger.info(f"Created {config.display_name} (agent_id={config.agent_id})")
 
     @property
     def agent_id(self) -> str:
@@ -232,7 +240,9 @@ class UniversalAgent:
             # Optimization: reuse LLM if fully identical config (not just model name)
             if tactical_config == strategic_config:
                 self._tactical_llm = self._strategic_llm
-                logger.info(f"Tactical LLM: reusing strategic ({tactical_config.model})")
+                logger.info(
+                    f"Tactical LLM: reusing strategic ({tactical_config.model})"
+                )
             else:
                 self._tactical_llm = create_llm(tactical_config, limits=limits)
                 logger.info(f"Created tactical LLM: {tactical_config.model}")
@@ -241,15 +251,23 @@ class UniversalAgent:
                 # No explicit summarization override — reuse strategic LLM
                 # (avoids creating a separate LLM with potentially unreachable base config)
                 self._summarization_llm = self._strategic_llm
-                logger.info(f"Summarization LLM: reusing strategic ({strategic_config.model}) (no override)")
+                logger.info(
+                    f"Summarization LLM: reusing strategic ({strategic_config.model}) (no override)"
+                )
             elif summarization_config == strategic_config:
                 self._summarization_llm = self._strategic_llm
-                logger.info(f"Summarization LLM: reusing strategic ({summarization_config.model})")
+                logger.info(
+                    f"Summarization LLM: reusing strategic ({summarization_config.model})"
+                )
             elif summarization_config == tactical_config:
                 self._summarization_llm = self._tactical_llm
-                logger.info(f"Summarization LLM: reusing tactical ({summarization_config.model})")
+                logger.info(
+                    f"Summarization LLM: reusing tactical ({summarization_config.model})"
+                )
             else:
-                self._summarization_llm = create_llm(summarization_config, limits=limits)
+                self._summarization_llm = create_llm(
+                    summarization_config, limits=limits
+                )
                 logger.info(f"Created summarization LLM: {summarization_config.model}")
 
             # Base LLM defaults to strategic for backwards compatibility
@@ -400,6 +418,7 @@ class UniversalAgent:
         # Wire archiver + job context into AuxiliaryLLM for auxiliary call logging
         if self._auxiliary_llm:
             from src.core.archiver import get_archiver as _get_archiver_for_aux
+
             self._auxiliary_llm.set_job_context(
                 archiver=_get_archiver_for_aux(),
                 job_id=job_id,
@@ -410,7 +429,9 @@ class UniversalAgent:
             # Create workspace for this job
             # Base path comes from WORKSPACE_PATH env var or defaults
             # This also copies documents to workspace and returns updated metadata
-            updated_metadata = await self._setup_job_workspace(job_id, metadata, resume=resume)
+            updated_metadata = await self._setup_job_workspace(
+                job_id, metadata, resume=resume
+            )
 
             # Handle frozen job resume
             if resume:
@@ -436,7 +457,9 @@ class UniversalAgent:
 
             # Create snapshot manager for phase recovery
             # Pass workspace backend so snapshots are extracted from VM to pod-local storage
-            ws_backend = self._workspace_manager.backend if self._workspace_manager else None
+            ws_backend = (
+                self._workspace_manager.backend if self._workspace_manager else None
+            )
             snapshot_manager = PhaseSnapshotManager(
                 job_id,
                 workspace_backend=ws_backend,
@@ -482,8 +505,16 @@ class UniversalAgent:
                         f"(skipping snapshot recovery to preserve in-progress todos)"
                     )
                     # Use checkpoint.db as-is — discover thread_id and verify checkpoint exists
-                    graph_input, thread_id, thread_config = await self._resume_from_checkpoint(
-                        job_id, thread_id, thread_config, original_config_name, updated_metadata
+                    (
+                        graph_input,
+                        thread_id,
+                        thread_config,
+                    ) = await self._resume_from_checkpoint(
+                        job_id,
+                        thread_id,
+                        thread_config,
+                        original_config_name,
+                        updated_metadata,
                     )
                     if graph_input is not None:
                         # Checkpoint lookup failed — fall back to snapshot recovery
@@ -491,17 +522,35 @@ class UniversalAgent:
                             f"No valid checkpoint found for graceful resume from '{previous_status}', "
                             f"falling back to snapshot recovery"
                         )
-                        graph_input, thread_id, thread_config = await self._resume_from_snapshot(
-                            job_id, snapshot_manager, thread_id, thread_config,
-                            original_config_name, updated_metadata,
+                        (
+                            graph_input,
+                            thread_id,
+                            thread_config,
+                        ) = await self._resume_from_snapshot(
+                            job_id,
+                            snapshot_manager,
+                            thread_id,
+                            thread_config,
+                            original_config_name,
+                            updated_metadata,
                         )
                 else:
                     # Crash/failure recovery — use snapshot (more reliable than potentially corrupted checkpoint)
                     if previous_status:
-                        logger.info(f"Crash recovery from '{previous_status}' — using snapshot recovery")
-                    graph_input, thread_id, thread_config = await self._resume_from_snapshot(
-                        job_id, snapshot_manager, thread_id, thread_config,
-                        original_config_name, updated_metadata,
+                        logger.info(
+                            f"Crash recovery from '{previous_status}' — using snapshot recovery"
+                        )
+                    (
+                        graph_input,
+                        thread_id,
+                        thread_config,
+                    ) = await self._resume_from_snapshot(
+                        job_id,
+                        snapshot_manager,
+                        thread_id,
+                        thread_config,
+                        original_config_name,
+                        updated_metadata,
                     )
             else:
                 # Fresh start - create initial state
@@ -546,6 +595,7 @@ class UniversalAgent:
         except Exception as e:
             # Detect workspace unavailable errors (VM connection lost)
             from .core.workspace_backend import WorkspaceUnavailableError
+
             is_vm_error = isinstance(e, WorkspaceUnavailableError)
 
             if is_vm_error:
@@ -592,7 +642,9 @@ class UniversalAgent:
                 pass
             self._shell_manager = None
 
-    async def _yield_error_state(self, error_state: Dict[str, Any]) -> AsyncIterator[Dict[str, Any]]:
+    async def _yield_error_state(
+        self, error_state: Dict[str, Any]
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Yield a single error state for streaming mode."""
         yield error_state
 
@@ -640,9 +692,7 @@ class UniversalAgent:
         resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
         return resolver.load("workspace_template")
 
-    def _inject_repo_context_to_workspace(
-        self, git_url: str, git_branch: str
-    ) -> None:
+    def _inject_repo_context_to_workspace(self, git_url: str, git_branch: str) -> None:
         """Append repository context to workspace.md after clone.
 
         This gives the agent persistent knowledge of the git remote URL,
@@ -727,29 +777,44 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             try:
                 from .core.loader import load_config_from_resolved
                 import uuid as _uuid
-                resolved = await self.postgres_conn.jobs.get_resolved_config(_uuid.UUID(job_id))
+
+                resolved = await self.postgres_conn.jobs.get_resolved_config(
+                    _uuid.UUID(job_id)
+                )
                 if resolved:
                     self.config = load_config_from_resolved(resolved)
                     self._create_phase_llms()
                     _config_from_db = True
                     logger.info(f"Loaded frozen config for resumed job {job_id}")
             except Exception as e:
-                logger.warning(f"Failed to load frozen config, falling back to disk: {e}")
+                logger.warning(
+                    f"Failed to load frozen config, falling back to disk: {e}"
+                )
 
         # Handle expert config name - load the named config (tools, prompts, workspace settings)
         # This must happen before config_upload_id and config_override so those can further override
         if not _config_from_db and metadata.get("config_name"):
-            from .core.loader import load_and_merge_config, load_agent_config_from_dict, resolve_config_path
+            from .core.loader import (
+                load_and_merge_config,
+                load_agent_config_from_dict,
+                resolve_config_path,
+            )
 
             expert_name = metadata["config_name"]
             try:
                 config_path, deployment_dir = resolve_config_path(expert_name)
                 logger.info(f"Loading expert config '{expert_name}' from {config_path}")
                 merged_config_data = load_and_merge_config(config_path)
-                self.config = load_agent_config_from_dict(merged_config_data, deployment_dir=deployment_dir)
-                logger.info(f"Applied expert config '{expert_name}' (tools: {list(self.config.tools.__dict__.keys())})")
+                self.config = load_agent_config_from_dict(
+                    merged_config_data, deployment_dir=deployment_dir
+                )
+                logger.info(
+                    f"Applied expert config '{expert_name}' (tools: {list(self.config.tools.__dict__.keys())})"
+                )
             except Exception as e:
-                logger.warning(f"Failed to load expert config '{expert_name}': {e}. Continuing with current config.")
+                logger.warning(
+                    f"Failed to load expert config '{expert_name}': {e}. Continuing with current config."
+                )
 
         # Handle config upload - load and merge with defaults BEFORE workspace setup
         # This must happen first since config affects workspace settings
@@ -775,7 +840,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     )
                     if yaml_files:
                         uploaded_config_path = yaml_files[0]
-                        logger.info(f"Loading uploaded config (HTTP): {uploaded_config_path.name}")
+                        logger.info(
+                            f"Loading uploaded config (HTTP): {uploaded_config_path.name}"
+                        )
 
                         # Load and merge with defaults
                         merged_config_data = load_uploaded_config(uploaded_config_path)
@@ -787,7 +854,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
             # Fall back to local filesystem
             if not config_loaded:
-                config_uploads_dir = get_workspace_base_path() / "uploads" / config_upload_id
+                config_uploads_dir = (
+                    get_workspace_base_path() / "uploads" / config_upload_id
+                )
 
                 if config_uploads_dir.exists():
                     # Find the YAML file
@@ -796,7 +865,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     )
                     if yaml_files:
                         uploaded_config_path = yaml_files[0]
-                        logger.info(f"Loading uploaded config (local): {uploaded_config_path.name}")
+                        logger.info(
+                            f"Loading uploaded config (local): {uploaded_config_path.name}"
+                        )
 
                         # Load and merge with defaults
                         merged_config_data = load_uploaded_config(uploaded_config_path)
@@ -809,7 +880,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                             f"No YAML files found in config upload: {config_upload_id}"
                         )
                 else:
-                    logger.warning(f"Config upload directory not found: {config_uploads_dir}")
+                    logger.warning(
+                        f"Config upload directory not found: {config_uploads_dir}"
+                    )
 
         # Handle inline config override - merge on top of current config
         if not _config_from_db and metadata.get("config_override"):
@@ -817,26 +890,35 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             import dataclasses
 
             config_override = metadata["config_override"]
-            logger.info(f"Applying inline config override: {list(config_override.keys())}")
+            logger.info(
+                f"Applying inline config override: {list(config_override.keys())}"
+            )
 
             # Convert current config to dict, merge, and reload
             # Preserve _deployment_dir so instruction file resolution still works
             prev_deployment_dir = self.config._deployment_dir
             current_config_dict = dataclasses.asdict(self.config)
             merged_config_data = deep_merge(current_config_dict, config_override)
-            self.config = load_agent_config_from_dict(merged_config_data, deployment_dir=prev_deployment_dir)
+            self.config = load_agent_config_from_dict(
+                merged_config_data, deployment_dir=prev_deployment_dir
+            )
             logger.info("Applied inline config overrides")
 
         # Apply env_keys overrides (user/project API keys for non-LLM providers)
         env_keys = (metadata.get("config_override") or {}).get("env_keys")
         if env_keys:
             import os as _os
+
             for k, v in env_keys.items():
                 _os.environ[k] = v
             logger.info(f"Applied {len(env_keys)} env key override(s)")
 
         # Recreate LLMs if config was modified for this job (skip if already loaded from DB)
-        if not _config_from_db and (metadata.get("config_name") or metadata.get("config_upload_id") or metadata.get("config_override")):
+        if not _config_from_db and (
+            metadata.get("config_name")
+            or metadata.get("config_upload_id")
+            or metadata.get("config_override")
+        ):
             logger.info("Config changed for this job — recreating LLMs")
             self._create_phase_llms()
 
@@ -845,8 +927,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             try:
                 from .core.loader import serialize_resolved_config
                 import uuid as _uuid
-                resolved = serialize_resolved_config(self.config, model=self.config.llm.model)
-                await self.postgres_conn.jobs.store_resolved_config(_uuid.UUID(job_id), resolved)
+
+                resolved = serialize_resolved_config(
+                    self.config, model=self.config.llm.model
+                )
+                await self.postgres_conn.jobs.store_resolved_config(
+                    _uuid.UUID(job_id), resolved
+                )
                 logger.info(f"Froze resolved config for job {job_id}")
             except Exception as e:
                 logger.warning(f"Failed to freeze resolved config: {e}")
@@ -856,21 +943,32 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if self.config.workspace.backend == "remote" and self.config.workspace.remote:
             try:
                 from .core.backends.remote import RemoteBackend
+
                 remote_cfg = self.config.workspace.remote
                 workspace_backend = RemoteBackend(
                     host=remote_cfg["host"],
                     port=remote_cfg.get("port", 22),
                     username=remote_cfg.get("username", "agent-host"),
                     key_path=remote_cfg.get("key_path"),
-                    workspace_path=remote_cfg.get("workspace_path", "/home/agent-host/workspace"),
+                    workspace_path=remote_cfg.get(
+                        "workspace_path", "/home/agent-host/workspace"
+                    ),
                     job_id=job_id,
-                    scrollback_limit=self.config.extra.get("shell", {}).get("scrollback_limit", 5000),
-                    default_timeout=self.config.extra.get("shell", {}).get("default_timeout", 120),
+                    scrollback_limit=self.config.extra.get("shell", {}).get(
+                        "scrollback_limit", 5000
+                    ),
+                    default_timeout=self.config.extra.get("shell", {}).get(
+                        "default_timeout", 120
+                    ),
                     max_tabs=self.config.extra.get("shell", {}).get("max_tabs", 15),
-                    blocked_commands=self.config.extra.get("shell", {}).get("blocked_commands"),
+                    blocked_commands=self.config.extra.get("shell", {}).get(
+                        "blocked_commands"
+                    ),
                 )
                 workspace_backend.connect()
-                logger.info(f"Remote workspace backend connected to {remote_cfg['host']}")
+                logger.info(
+                    f"Remote workspace backend connected to {remote_cfg['host']}"
+                )
             except Exception as e:
                 logger.error(f"Failed to create remote backend: {e}")
                 raise
@@ -892,8 +990,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if resume and workspace_backend and workspace_backend.supports_shell:
             try:
                 if not workspace_backend.exists("workspace.md"):
-                    logger.info(f"VM workspace is fresh — seeding from last snapshot for job {job_id}")
+                    logger.info(
+                        f"VM workspace is fresh — seeding from last snapshot for job {job_id}"
+                    )
                     from .core.phase_snapshot import PhaseSnapshotManager
+
                     recovery_mgr = PhaseSnapshotManager(
                         job_id, workspace_backend=workspace_backend
                     )
@@ -919,10 +1020,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.warning(f"VM workspace seeding failed: {e}")
 
         # Pod handoff: clone workspace from Gitea if resuming on a new pod
-        if resume and not self._workspace_manager.path.exists() and metadata.get("git_remote_url"):
+        if (
+            resume
+            and not self._workspace_manager.path.exists()
+            and metadata.get("git_remote_url")
+        ):
             from .managers.git_manager import GitManager
+
             logger.info(f"Pod handoff: cloning workspace for job {job_id}")
-            git_mgr = GitManager.clone(metadata["git_remote_url"], self._workspace_manager.path)
+            git_mgr = GitManager.clone(
+                metadata["git_remote_url"], self._workspace_manager.path
+            )
             if git_mgr:
                 # Checkout the correct branch for project jobs
                 branch = metadata.get("branch_name")
@@ -939,7 +1047,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 self._todo_manager = TodoManager(workspace=self._workspace_manager)
                 logger.info(f"Pod handoff complete for job {job_id}")
                 return metadata or {}
-            logger.warning(f"Pod handoff clone failed for job {job_id}, falling through to normal init")
+            logger.warning(
+                f"Pod handoff clone failed for job {job_id}, falling through to normal init"
+            )
 
         # Check if resuming an existing workspace
         if resume and self._workspace_manager.path.exists():
@@ -948,18 +1058,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             instructions_path = self._workspace_manager.path / "instructions.md"
             if not instructions_path.exists():
                 # Only write instructions if missing
-                instructions = load_instructions(self.config, model=self.config.llm.model)
+                instructions = load_instructions(
+                    self.config, model=self.config.llm.model
+                )
                 self._workspace_manager.write_file("instructions.md", instructions)
                 logger.debug("Wrote missing instructions.md to workspace")
 
             # Initialize git manager if git versioning is enabled (safe on existing repos)
-            if self._workspace_manager.config.git_versioning and self._workspace_manager.git_manager is None:
+            if (
+                self._workspace_manager.config.git_versioning
+                and self._workspace_manager.git_manager is None
+            ):
                 self._workspace_manager._initialize_git()
                 self._workspace_manager._initialized = True
 
             # Ensure git remote is configured for workspace delivery
             if metadata.get("git_remote_url") and self._workspace_manager.git_manager:
-                self._workspace_manager.git_manager.add_remote("origin", metadata["git_remote_url"])
+                self._workspace_manager.git_manager.add_remote(
+                    "origin", metadata["git_remote_url"]
+                )
 
             # Ensure correct branch for project jobs
             if metadata.get("branch_name") and self._workspace_manager.git_manager:
@@ -984,7 +1101,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Copy instructions to workspace (priority: inline > upload > template)
         if metadata.get("instructions"):
             # Use inline instructions (from job creation form or builder)
-            self._workspace_manager.write_file("instructions.md", metadata["instructions"])
+            self._workspace_manager.write_file(
+                "instructions.md", metadata["instructions"]
+            )
             logger.info("Using inline instructions from job metadata")
         elif metadata.get("instructions_upload_id"):
             # Use uploaded instructions
@@ -1010,12 +1129,16 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         uploaded_instr_path = instr_files[0]
                         content = uploaded_instr_path.read_text(encoding="utf-8")
                         self._workspace_manager.write_file("instructions.md", content)
-                        logger.info(f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}")
+                        logger.info(
+                            f"Copied uploaded instructions (HTTP): {uploaded_instr_path.name}"
+                        )
                         instructions_written = True
 
             # Fall back to local filesystem
             if not instructions_written:
-                instr_uploads_dir = get_workspace_base_path() / "uploads" / instr_upload_id
+                instr_uploads_dir = (
+                    get_workspace_base_path() / "uploads" / instr_upload_id
+                )
 
                 if instr_uploads_dir.exists():
                     # Find the instructions file (.md or .txt)
@@ -1026,7 +1149,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         uploaded_instr_path = instr_files[0]
                         content = uploaded_instr_path.read_text(encoding="utf-8")
                         self._workspace_manager.write_file("instructions.md", content)
-                        logger.info(f"Copied uploaded instructions (local): {uploaded_instr_path.name}")
+                        logger.info(
+                            f"Copied uploaded instructions (local): {uploaded_instr_path.name}"
+                        )
                         instructions_written = True
                     else:
                         logger.warning(
@@ -1064,9 +1189,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     if source_full.exists():
                         content = source_full.read_text(encoding="utf-8")
                         self._workspace_manager.write_file(dest_path, content)
-                        logger.debug(f"Initialized file: {dest_path} from {source_path}")
+                        logger.debug(
+                            f"Initialized file: {dest_path} from {source_path}"
+                        )
                     else:
-                        logger.warning(f"Initial file template not found: {source_path}")
+                        logger.warning(
+                            f"Initial file template not found: {source_path}"
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to initialize {dest_path}: {e}")
 
@@ -1075,13 +1204,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             git_url = metadata["git_url"]
             git_branch = metadata.get("git_branch", "main")
             repo_dir = self._workspace_manager.get_path("repo")
-            logger.info(f"Cloning {git_url} (branch: {git_branch}) into workspace/repo/")
+            logger.info(
+                f"Cloning {git_url} (branch: {git_branch}) into workspace/repo/"
+            )
             try:
                 import subprocess
+
                 # Clone the repository
                 clone_result = subprocess.run(
                     ["git", "clone", "--branch", git_branch, git_url, str(repo_dir)],
-                    capture_output=True, text=True, timeout=300,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
                 )
                 if clone_result.returncode == 0:
                     logger.info(f"Repository cloned successfully into {repo_dir}")
@@ -1089,13 +1223,17 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     # Try cloning without --branch (branch might not exist yet)
                     clone_result2 = subprocess.run(
                         ["git", "clone", git_url, str(repo_dir)],
-                        capture_output=True, text=True, timeout=300,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
                     )
                     if clone_result2.returncode == 0:
                         # Create and checkout the branch
                         subprocess.run(
                             ["git", "checkout", "-b", git_branch],
-                            cwd=str(repo_dir), capture_output=True, text=True,
+                            cwd=str(repo_dir),
+                            capture_output=True,
+                            text=True,
                         )
                         logger.info(f"Repository cloned, created branch: {git_branch}")
                     else:
@@ -1142,9 +1280,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 local_uploads_dir = get_workspace_base_path() / "uploads" / upload_id
                 if local_uploads_dir.exists():
                     upload_source_dir = local_uploads_dir
-                    logger.info(f"Processing documents from local path: {local_uploads_dir}")
+                    logger.info(
+                        f"Processing documents from local path: {local_uploads_dir}"
+                    )
                 else:
-                    logger.warning(f"Upload directory not found locally or via HTTP: {upload_id}")
+                    logger.warning(
+                        f"Upload directory not found locally or via HTTP: {upload_id}"
+                    )
 
             if upload_source_dir:
                 for file_path in sorted(upload_source_dir.iterdir()):
@@ -1153,13 +1295,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                         continue
                     if file_path.is_file():
                         # Check if zip - extract instead of copy
-                        if file_path.suffix.lower() == '.zip':
+                        if file_path.suffix.lower() == ".zip":
                             extracted = self._extract_zip(
                                 file_path, documents_dir, logger
                             )
                             copied_paths.extend(extracted)
                             original_paths.extend([str(file_path)] * len(extracted))
-                            logger.info(f"Processed zip file: {file_path.name} ({len(extracted)} files extracted)")
+                            logger.info(
+                                f"Processed zip file: {file_path.name} ({len(extracted)} files extracted)"
+                            )
                         else:
                             # Regular file - copy with conflict handling
                             dest_path = documents_dir / file_path.name
@@ -1172,7 +1316,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
                             shutil.copy2(file_path, dest_path)
                             dest_relative = f"documents/{dest_path.name}"
-                            logger.info(f"Copied uploaded file to workspace: {dest_relative}")
+                            logger.info(
+                                f"Copied uploaded file to workspace: {dest_relative}"
+                            )
 
                             copied_paths.append(dest_relative)
                             original_paths.append(str(file_path))
@@ -1200,13 +1346,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 source_path = Path(doc_path)
                 if source_path.exists():
                     # Check if zip - extract instead of copy
-                    if source_path.suffix.lower() == '.zip':
+                    if source_path.suffix.lower() == ".zip":
                         extracted = self._extract_zip(
                             source_path, documents_dir, logger
                         )
                         copied_paths.extend(extracted)
                         original_paths.extend([str(source_path)] * len(extracted))
-                        logger.info(f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)")
+                        logger.info(
+                            f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)"
+                        )
                     else:
                         # Regular file - copy with conflict handling
                         dest_path = documents_dir / source_path.name
@@ -1242,16 +1390,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 documents_dir.mkdir(parents=True, exist_ok=True)
 
                 # Check if zip - extract instead of copy
-                if source_path.suffix.lower() == '.zip':
-                    extracted = self._extract_zip(
-                        source_path, documents_dir, logger
-                    )
+                if source_path.suffix.lower() == ".zip":
+                    extracted = self._extract_zip(source_path, documents_dir, logger)
                     if extracted:
                         updated_metadata["document_paths"] = extracted
-                        updated_metadata["original_document_paths"] = [str(source_path)] * len(extracted)
+                        updated_metadata["original_document_paths"] = [
+                            str(source_path)
+                        ] * len(extracted)
                         updated_metadata["document_path"] = extracted[0]
                         updated_metadata["original_document_path"] = str(source_path)
-                    logger.info(f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)")
+                    logger.info(
+                        f"Processed zip file: {source_path.name} ({len(extracted)} files extracted)"
+                    )
                 else:
                     # Regular file - copy to documents/ folder
                     dest_filename = source_path.name
@@ -1271,7 +1421,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if metadata.get("requirement_data"):
             req = metadata["requirement_data"]
             requirement_md = self._format_requirement_as_markdown(req)
-            self._workspace_manager.write_file("analysis/requirement_input.md", requirement_md)
+            self._workspace_manager.write_file(
+                "analysis/requirement_input.md", requirement_md
+            )
             logger.info("Wrote requirement to analysis/requirement_input.md")
 
         # Create todo manager for this workspace
@@ -1296,7 +1448,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         """
         # Create datasource connections from job metadata (sent by orchestrator)
         datasources_dict: Dict[str, Any] = {}
-        ds_configs = self._job_metadata.get("datasources", []) if self._job_metadata else []
+        ds_configs = (
+            self._job_metadata.get("datasources", []) if self._job_metadata else []
+        )
         for ds in ds_configs:
             ds_type = ds.get("type")
             if not ds_type:
@@ -1305,7 +1459,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 conn = self._create_datasource_connection(ds)
                 datasources_dict[ds_type] = conn
                 self._datasource_connections[ds_type] = conn
-                logger.info(f"Connected to {ds_type} datasource: {ds.get('name', 'unnamed')}")
+                logger.info(
+                    f"Connected to {ds_type} datasource: {ds.get('name', 'unnamed')}"
+                )
             except Exception as e:
                 logger.warning(f"Failed to connect to {ds_type} datasource: {e}")
 
@@ -1344,8 +1500,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     scrollback_limit=shell_config.get("scrollback_limit", 5000),
                     default_timeout=shell_config.get("default_timeout", 120),
                     blocked_commands=shell_config.get("blocked_commands"),
-                    sandbox_cwd=str(self._workspace_manager.path) if shell_config.get("sandbox", True) else None,
-                    auto_start_claude_code=shell_config.get("auto_start_claude_code", False) if not use_remote_shell else False,
+                    sandbox_cwd=str(self._workspace_manager.path)
+                    if shell_config.get("sandbox", True)
+                    else None,
+                    auto_start_claude_code=shell_config.get(
+                        "auto_start_claude_code", False
+                    )
+                    if not use_remote_shell
+                    else False,
                     claude_code_model=cc_config.get("model", "claude-opus-4-6"),
                     backend=ws_backend if use_remote_shell else None,
                 )
@@ -1367,7 +1529,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 # Resolve project_id for project-scoped memory sharing
                 project_id_for_memory = None
                 if self.config.memory.project_scoped:
-                    raw_pid = self._job_metadata.get("project_id") if self._job_metadata else None
+                    raw_pid = (
+                        self._job_metadata.get("project_id")
+                        if self._job_metadata
+                        else None
+                    )
                     if raw_pid:
                         project_id_for_memory = _uuid.UUID(str(raw_pid))
 
@@ -1384,7 +1550,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     archiver=_get_archiver(),
                 )
                 context.recall_store = recall_store
-                scope_msg = f"project {project_id_for_memory}" if project_id_for_memory else f"job {self._current_job_id}"
+                scope_msg = (
+                    f"project {project_id_for_memory}"
+                    if project_id_for_memory
+                    else f"job {self._current_job_id}"
+                )
                 logger.info(f"RecallStore initialized (scope: {scope_msg})")
                 # Memory extraction is now handled by AuxiliaryLLM in the graph
                 # (see extract_and_store_memories in src/services/auxiliary.py)
@@ -1393,7 +1563,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.warning(f"Failed to initialize RecallStore (non-fatal): {e}")
 
         # Initialize KnowledgeGraphDB + KnowledgeStore for project knowledge base
-        project_id = self._job_metadata.get("project_id") if self._job_metadata else None
+        project_id = (
+            self._job_metadata.get("project_id") if self._job_metadata else None
+        )
         if project_id:
             try:
                 from src.services.knowledge_graph import KnowledgeGraphDB
@@ -1413,7 +1585,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     self._knowledge_graph = kg  # Track for cleanup
                     logger.info(f"Knowledge base initialized for project {project_id}")
                 else:
-                    logger.warning("Failed to connect to Neo4j — inline curation disabled")
+                    logger.warning(
+                        "Failed to connect to Neo4j — inline curation disabled"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to initialize knowledge base (non-fatal): {e}")
 
@@ -1442,7 +1616,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             self._workspace_manager.write_file(f"tools/{rel_path}", content)
 
         loaded_tool_names = [t.name for t in self._tools]
-        generate_workspace_tool_docs(loaded_tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc)
+        generate_workspace_tool_docs(
+            loaded_tool_names, tools_dir, tools=self._tools, write_fn=_write_tool_doc
+        )
 
         # Deploy instruction files with Jinja2 rendering (after tools loaded)
         self._deploy_instruction_files(loaded_tool_names)
@@ -1465,17 +1641,22 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Phase-filter tools: each LLM only sees tools declared for its phase.
         # The ToolNode keeps the full list (LLM schema binding is primary enforcement).
         from .tools.registry import filter_tools_by_phase
-        strategic_names = set(filter_tools_by_phase(
-            [t.name for t in self._tools], "strategic"
-        ))
-        tactical_names = set(filter_tools_by_phase(
-            [t.name for t in self._tools], "tactical"
-        ))
+
+        strategic_names = set(
+            filter_tools_by_phase([t.name for t in self._tools], "strategic")
+        )
+        tactical_names = set(
+            filter_tools_by_phase([t.name for t in self._tools], "tactical")
+        )
         strategic_tools = [t for t in self._tools if t.name in strategic_names]
         tactical_tools = [t for t in self._tools if t.name in tactical_names]
 
-        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(strategic_tools, **bind_kwargs)
-        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(tactical_tools, **bind_kwargs)
+        self._strategic_llm_with_tools = self._strategic_llm.bind_tools(
+            strategic_tools, **bind_kwargs
+        )
+        self._tactical_llm_with_tools = self._tactical_llm.bind_tools(
+            tactical_tools, **bind_kwargs
+        )
 
         # Keep _llm_with_tools for backwards compatibility
         self._llm_with_tools = self._strategic_llm_with_tools
@@ -1502,8 +1683,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         - Additional instruction_files from config
         """
         from .core.loader import (
-            InstructionMatrixResolver, FileResolver, detect_model_family,
-            render_instruction_content, load_instructions,
+            InstructionMatrixResolver,
+            FileResolver,
+            detect_model_family,
+            render_instruction_content,
+            load_instructions,
         )
 
         # instructions.md — only deploy template if not already present (upload/inline)
@@ -1516,7 +1700,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # todo_guide.md — via instruction matrix
         model_family = detect_model_family(self.config.llm.model)
-        instr_resolver = InstructionMatrixResolver(self.config._deployment_dir, model_family)
+        instr_resolver = InstructionMatrixResolver(
+            self.config._deployment_dir, model_family
+        )
         try:
             resolved = self.config.extra.get("_resolved_instructions", {})
             todo_guide = resolved.get("todo_guide") or instr_resolver.load("todo_guide")
@@ -1549,11 +1735,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     target_path = self._workspace_manager.get_path(entry.file)
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     self._workspace_manager.write_file(entry.file, content)
-                    logger.debug(f"Deployed instruction file to workspace: {entry.file}")
+                    logger.debug(
+                        f"Deployed instruction file to workspace: {entry.file}"
+                    )
                 except FileNotFoundError:
                     logger.warning(f"Instruction file not found: {entry.file}")
 
-    async def _register_initial_documents_background(self, context: "ToolContext") -> None:
+    async def _register_initial_documents_background(
+        self, context: "ToolContext"
+    ) -> None:
         """Background async wrapper for parallel document registration.
 
         Runs the synchronous _register_initial_documents in a thread executor
@@ -1585,8 +1775,18 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return
 
         SUPPORTED_EXTENSIONS = {
-            ".pdf", ".txt", ".md", ".docx", ".doc", ".pptx",
-            ".html", ".htm", ".csv", ".json", ".xml", ".rtf",
+            ".pdf",
+            ".txt",
+            ".md",
+            ".docx",
+            ".doc",
+            ".pptx",
+            ".html",
+            ".htm",
+            ".csv",
+            ".json",
+            ".xml",
+            ".rtf",
         }
 
         try:
@@ -1617,7 +1817,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 return
 
             start_time = time.monotonic()
-            logger.info(f"Starting background registration of {len(files)} document(s)...")
+            logger.info(
+                f"Starting background registration of {len(files)} document(s)..."
+            )
 
             # Process in parallel — each thread gets its own CitationEngine
             max_workers = min(len(files), 4)
@@ -1651,7 +1853,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 )
 
         except Exception as e:
-            logger.warning(f"Auto-registration of input documents failed (non-fatal): {e}")
+            logger.warning(
+                f"Auto-registration of input documents failed (non-fatal): {e}"
+            )
 
     def _process_single_document(
         self,
@@ -1715,6 +1919,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         if ds_type == "neo4j":
             from src.database.neo4j_db import Neo4jDB
+
             db = Neo4jDB(
                 uri=url,
                 username=creds.get("username", "neo4j"),
@@ -1725,6 +1930,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         elif ds_type == "postgresql":
             import psycopg
+
             conn = psycopg.connect(url, autocommit=False)
             # Test connection
             conn.execute("SELECT 1")
@@ -1734,6 +1940,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         elif ds_type == "mongodb":
             from pymongo import MongoClient
             from urllib.parse import urlparse
+
             client = MongoClient(url, serverSelectionTimeoutMS=5000)
             client.admin.command("ping")
             # Extract database name from URL path
@@ -1746,11 +1953,14 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         elif ds_type == "webdav":
             from webdav3.client import Client
-            client = Client({
-                "webdav_hostname": url,
-                "webdav_login": creds.get("username"),
-                "webdav_password": creds.get("password"),
-            })
+
+            client = Client(
+                {
+                    "webdav_hostname": url,
+                    "webdav_login": creds.get("username"),
+                    "webdav_password": creds.get("password"),
+                }
+            )
             client.list("/")  # Connection test
             return client
 
@@ -1770,7 +1980,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         for ds_type, conn in self._datasource_connections.items():
             try:
-                if hasattr(conn, 'close'):
+                if hasattr(conn, "close"):
                     conn.close()
                     logger.debug(f"Closed {ds_type} datasource connection")
             except Exception as e:
@@ -1779,7 +1989,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Close parent clients (e.g. MongoClient) that aren't in _datasource_connections
         for ds_type, client in self._datasource_clients.items():
             try:
-                if hasattr(client, 'close'):
+                if hasattr(client, "close"):
                     client.close()
                     logger.debug(f"Closed {ds_type} datasource client")
             except Exception as e:
@@ -1807,7 +2017,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         # Try to discover the correct thread_id from checkpoint DB
         checkpoint_path = self._get_checkpoint_path(job_id)
-        discovered_thread_id = discover_thread_id_from_checkpoint(checkpoint_path, job_id)
+        discovered_thread_id = discover_thread_id_from_checkpoint(
+            checkpoint_path, job_id
+        )
         if discovered_thread_id:
             logger.info(f"Discovered thread_id from checkpoint: {discovered_thread_id}")
             thread_id = discovered_thread_id
@@ -1895,7 +2107,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         # Delete any stale snapshots from failed runs after this phase
         deleted = snapshot_manager.delete_snapshots_after(latest_snapshot.phase_number)
         if deleted:
-            logger.info(f"Deleted {deleted} stale snapshot(s) after phase {latest_snapshot.phase_number}")
+            logger.info(
+                f"Deleted {deleted} stale snapshot(s) after phase {latest_snapshot.phase_number}"
+            )
 
         # Determine the correct thread_id for checkpoint lookup
         # Priority: 1) snapshot.thread_id, 2) discover from checkpoint DB, 3) try known formats
@@ -1906,10 +2120,15 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             logger.info(f"Using thread_id from snapshot: {discovered_thread_id}")
         else:
             from .core.phase_snapshot import discover_thread_id_from_checkpoint
+
             checkpoint_path = self._get_checkpoint_path(job_id)
-            discovered_thread_id = discover_thread_id_from_checkpoint(checkpoint_path, job_id)
+            discovered_thread_id = discover_thread_id_from_checkpoint(
+                checkpoint_path, job_id
+            )
             if discovered_thread_id:
-                logger.info(f"Discovered thread_id from checkpoint: {discovered_thread_id}")
+                logger.info(
+                    f"Discovered thread_id from checkpoint: {discovered_thread_id}"
+                )
 
         if discovered_thread_id:
             thread_id = discovered_thread_id
@@ -1922,7 +2141,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.info(f"Found checkpoint with thread_id: {thread_id}")
                 return None, thread_id, thread_config
             else:
-                logger.warning(f"Discovered thread_id {thread_id} has no checkpoint data, starting fresh")
+                logger.warning(
+                    f"Discovered thread_id {thread_id} has no checkpoint data, starting fresh"
+                )
                 graph_input = create_initial_state(
                     job_id=job_id,
                     workspace_path=str(self._workspace_manager.path),
@@ -1947,7 +2168,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     logger.info(f"Using legacy thread_id format: {legacy_thread_id}")
                     return None, legacy_thread_id, legacy_config
                 else:
-                    logger.warning("No checkpoint found with any thread_id format, starting fresh")
+                    logger.warning(
+                        "No checkpoint found with any thread_id format, starting fresh"
+                    )
                     graph_input = create_initial_state(
                         job_id=job_id,
                         workspace_path=str(self._workspace_manager.path),
@@ -1980,13 +2203,20 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         if "text" in job and "prompt" not in job:
             # This is a requirement row from polling - wrap it as requirement_data
             metadata["requirement_data"] = job
-            logger.debug(f"Extracted requirement data: {job.get('name', job.get('id', 'unknown'))}")
+            logger.debug(
+                f"Extracted requirement data: {job.get('name', job.get('id', 'unknown'))}"
+            )
             return metadata
 
         # Otherwise, handle as jobs table row
         metadata_fields = [
-            "document_path", "prompt", "requirement_id", "requirement_data",
-            "source_document", "config", "options",
+            "document_path",
+            "prompt",
+            "requirement_id",
+            "requirement_data",
+            "source_document",
+            "config",
+            "options",
         ]
 
         for field in metadata_fields:
@@ -2021,7 +2251,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             "",
             "## Text",
             "",
-            req.get('text', '(No text provided)'),
+            req.get("text", "(No text provided)"),
             "",
             "## Metadata",
             "",
@@ -2037,7 +2267,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         ]
 
         # Handle source_location which may be JSON string or dict
-        source_location = req.get('source_location')
+        source_location = req.get("source_location")
         if source_location:
             if isinstance(source_location, str):
                 try:
@@ -2050,21 +2280,25 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
         lines.append("")
 
-        if req.get('reasoning'):
-            lines.extend([
-                "## Extraction Reasoning",
-                "",
-                req['reasoning'],
-                "",
-            ])
+        if req.get("reasoning"):
+            lines.extend(
+                [
+                    "## Extraction Reasoning",
+                    "",
+                    req["reasoning"],
+                    "",
+                ]
+            )
 
-        if req.get('research_notes'):
-            lines.extend([
-                "## Research Notes",
-                "",
-                req['research_notes'],
-                "",
-            ])
+        if req.get("research_notes"):
+            lines.extend(
+                [
+                    "## Research Notes",
+                    "",
+                    req["research_notes"],
+                    "",
+                ]
+            )
 
         return "\n".join(lines)
 
@@ -2089,7 +2323,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         extracted_paths = []
 
         try:
-            with zipfile.ZipFile(zip_path, 'r') as zf:
+            with zipfile.ZipFile(zip_path, "r") as zf:
                 for zip_info in zf.infolist():
                     # Skip directories (created implicitly)
                     if zip_info.is_dir():
@@ -2099,9 +2333,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     relative_path = Path(zip_info.filename)
 
                     # Skip hidden files and macOS metadata
-                    if any(part.startswith('.') for part in relative_path.parts):
+                    if any(part.startswith(".") for part in relative_path.parts):
                         continue
-                    if '__MACOSX' in zip_info.filename:
+                    if "__MACOSX" in zip_info.filename:
                         continue
 
                     # Skip empty filenames
@@ -2119,9 +2353,13 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     # Return path relative to workspace
                     rel_to_workspace = dest_path.relative_to(dest_dir.parent)
                     extracted_paths.append(str(rel_to_workspace))
-                    job_logger.debug(f"Extracted: {zip_info.filename} -> {rel_to_workspace}")
+                    job_logger.debug(
+                        f"Extracted: {zip_info.filename} -> {rel_to_workspace}"
+                    )
 
-            job_logger.info(f"Extracted {len(extracted_paths)} files from {zip_path.name}")
+            job_logger.info(
+                f"Extracted {len(extracted_paths)} files from {zip_path.name}"
+            )
 
         except zipfile.BadZipFile as e:
             job_logger.error(f"Invalid zip file {zip_path.name}: {e}")
@@ -2206,7 +2444,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             return downloaded_files
 
         except Exception as e:
-            job_logger.warning(f"HTTP download failed for {upload_id}: {e}, will try local")
+            job_logger.warning(
+                f"HTTP download failed for {upload_id}: {e}, will try local"
+            )
             return None
         finally:
             await client.close()
@@ -2236,7 +2476,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         orchestrator_url = os.getenv("ORCHESTRATOR_URL", "http://localhost:8085")
         client = OrchestratorClient(
             orchestrator_url=orchestrator_url,
-            pod_ip="", pod_port=0, hostname="", config_name="",
+            pod_ip="",
+            pod_port=0,
+            hostname="",
+            config_name="",
         )
 
         try:
@@ -2258,7 +2501,11 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         self._shutdown_requested = True
 
         # Close database connections
-        if hasattr(self, 'vector_conn') and self.vector_conn and self.vector_conn is not self.postgres_conn:
+        if (
+            hasattr(self, "vector_conn")
+            and self.vector_conn
+            and self.vector_conn is not self.postgres_conn
+        ):
             try:
                 await self.vector_conn.close()
             except Exception as e:
@@ -2293,4 +2540,3 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 "model": self.config.llm.model,
             },
         }
-

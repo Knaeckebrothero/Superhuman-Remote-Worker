@@ -42,6 +42,7 @@ from .document import create_document_tools, get_document_metadata
 from .research import create_research_tools, get_research_metadata
 
 from .citation import create_citation_tools, get_citation_metadata
+
 # Note: cache_tools removed (deprecated, not used in configs)
 from .graph import create_graph_tools, get_graph_metadata
 from .sql import create_sql_tools, get_sql_metadata

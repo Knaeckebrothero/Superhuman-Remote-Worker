@@ -58,14 +58,41 @@ def _scan_for_error_patterns(output: str) -> Optional[str]:
         return f"⚠ Possible error in output: {', '.join(found)}. Read the output carefully before proceeding."
     return None
 
+
 # Tmux special key names that should NOT get Enter appended in keys mode
-TMUX_SPECIAL_KEYS = frozenset({
-    "Up", "Down", "Left", "Right",
-    "Enter", "Tab", "Escape", "Space", "BSpace",
-    "Home", "End", "PageUp", "PageDown", "NPage", "PPage",
-    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
-    "IC", "DC",  # Insert, Delete
-})
+TMUX_SPECIAL_KEYS = frozenset(
+    {
+        "Up",
+        "Down",
+        "Left",
+        "Right",
+        "Enter",
+        "Tab",
+        "Escape",
+        "Space",
+        "BSpace",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+        "NPage",
+        "PPage",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10",
+        "F11",
+        "F12",
+        "IC",
+        "DC",  # Insert, Delete
+    }
+)
 
 # Tool metadata for registry
 SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
@@ -126,15 +153,19 @@ def _apply_tail(output: str, tail: int) -> str:
         # No separator (e.g. "(no output)" or short messages)
         return output
 
-    header = lines[:separator_idx + 1]  # "Exit code: N" + "--- stdout ---"
-    body = lines[separator_idx + 1:]
+    header = lines[: separator_idx + 1]  # "Exit code: N" + "--- stdout ---"
+    body = lines[separator_idx + 1 :]
 
     if len(body) <= tail:
         return output
 
     truncated_body = body[-tail:]
     skipped = len(body) - tail
-    return "\n".join(header) + f"\n[...{skipped} lines truncated...]\n" + "\n".join(truncated_body)
+    return (
+        "\n".join(header)
+        + f"\n[...{skipped} lines truncated...]\n"
+        + "\n".join(truncated_body)
+    )
 
 
 def create_shell_tools(context: ToolContext) -> List[Any]:
@@ -162,7 +193,11 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
     # Determine shell mode from config
     shell_config = context.get_config("shell", {})
-    mode = shell_config.get("mode", "stateless") if isinstance(shell_config, dict) else "stateless"
+    mode = (
+        shell_config.get("mode", "stateless")
+        if isinstance(shell_config, dict)
+        else "stateless"
+    )
 
     @tool
     def run_command(
@@ -216,7 +251,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             output = sm.run_sync(command, tab_name="default", timeout=min(timeout, 600))
 
             # Interactive prompt → error (model should use non-interactive alternatives)
-            if "Interactive prompt detected" in output or "Command appears to be waiting for input" in output:
+            if (
+                "Interactive prompt detected" in output
+                or "Command appears to be waiting for input" in output
+            ):
                 return (
                     f"Error: Command requires interactive input.\n"
                     f"Use non-interactive alternatives (sshpass, -y flags, etc.).\n"
@@ -303,7 +341,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
 
             if keys:
                 # Keys mode: text input auto-submits with Enter, control keys sent as-is
-                is_special = command in TMUX_SPECIAL_KEYS or command.startswith(("C-", "M-"))
+                is_special = command in TMUX_SPECIAL_KEYS or command.startswith(
+                    ("C-", "M-")
+                )
                 sm.send(name, command, enter=not is_special)
                 time.sleep(0.5)
                 text, metadata = sm.read_with_offset(name, lines=tail)
@@ -369,7 +409,9 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             sm.ensure_tab(name)
             tab_header = sm.format_tab_header()
 
-            text, metadata = sm.read_with_offset(name, lines=capped_lines, offset=offset)
+            text, metadata = sm.read_with_offset(
+                name, lines=capped_lines, offset=offset
+            )
             text = _truncate_output(text, max_output_chars, "shell output")
             info = f"({metadata['mode']}) {metadata['lines_returned']}/{metadata['total_lines']} lines"
             return f"{tab_header}\n{info}\n{text}"

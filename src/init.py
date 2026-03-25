@@ -23,6 +23,7 @@ Usage:
     python -m src.init --backup /path/to/backup
     python -m src.init --restore /path/to/backup
 """
+
 import argparse
 import logging
 import os
@@ -36,6 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv  # noqa: E402
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,7 @@ def get_workspace_base_path() -> Path:
 # =============================================================================
 # Workspace Initialization
 # =============================================================================
+
 
 def init_workspace() -> bool:
     """Initialize workspace directory structure.
@@ -253,7 +256,9 @@ def backup_workspace(backup_dir: Path) -> bool:
         if (dest_workspace / "checkpoints").exists():
             checkpoint_count = len(list((dest_workspace / "checkpoints").glob("*.db")))
 
-        logger.info(f"  Backed up workspace: {job_count} jobs, {checkpoint_count} checkpoints")
+        logger.info(
+            f"  Backed up workspace: {job_count} jobs, {checkpoint_count} checkpoints"
+        )
         return True
 
     except Exception as e:
@@ -310,6 +315,7 @@ def restore_workspace(backup_dir: Path) -> bool:
 # CLI
 # =============================================================================
 
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -345,7 +351,8 @@ Examples:
         help="Restore from backup directory",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose output",
     )
@@ -374,7 +381,7 @@ def main() -> int:
             logger.info(f"  Checkpoints: {result['checkpoint_count']}")
             logger.info(f"  Logs: {result['log_count']}")
 
-            size_mb = result['total_size_bytes'] / (1024 * 1024)
+            size_mb = result["total_size_bytes"] / (1024 * 1024)
             logger.info(f"  Total size: {size_mb:.2f} MB")
 
             # Check standard directories
@@ -424,7 +431,9 @@ def main() -> int:
     logger.info("=" * 60)
 
     if args.force_reset:
-        logger.warning("WARNING: Force reset mode - all workspace data will be deleted!")
+        logger.warning(
+            "WARNING: Force reset mode - all workspace data will be deleted!"
+        )
         logger.info("")
         logger.info("Cleaning workspace...")
         if not cleanup_workspace():

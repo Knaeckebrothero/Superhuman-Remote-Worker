@@ -64,109 +64,170 @@ class TestShouldFreezeAtBoundary:
 
     def test_full_strategic_phase_1(self):
         config = make_config("full")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1)
+            is False
+        )
 
     def test_full_strategic_phase_3(self):
         config = make_config("full")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=3) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=3)
+            is False
+        )
 
     def test_full_tactical_phase_2(self):
         config = make_config("full")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=2) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=2)
+            is False
+        )
 
     # --- review: never freezes at boundaries (only at job_complete, handled separately) ---
 
     def test_review_strategic_phase_1(self):
         config = make_config("review")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1)
+            is False
+        )
 
     def test_review_strategic_phase_5(self):
         config = make_config("review")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=5) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=5)
+            is False
+        )
 
     def test_review_tactical_phase_2(self):
         config = make_config("review")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=2) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=2)
+            is False
+        )
 
     # --- partial: freezes only at first strategic phase boundary ---
 
     def test_partial_strategic_phase_0(self):
         """phase_number=0 is the actual first strategic phase (set by init_workspace)."""
         config = make_config("partial")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=0) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=0) is True
+        )
 
     def test_partial_strategic_phase_1(self):
         config = make_config("partial")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        )
 
     def test_partial_strategic_phase_2(self):
         config = make_config("partial")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=2) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=2)
+            is False
+        )
 
     def test_partial_strategic_phase_3(self):
         config = make_config("partial")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=3) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=3)
+            is False
+        )
 
     def test_partial_tactical_phase_1(self):
         config = make_config("partial")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=1) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=1)
+            is False
+        )
 
     def test_partial_tactical_phase_2(self):
         config = make_config("partial")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=2) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=2)
+            is False
+        )
 
     # --- guided: freezes at every strategic phase boundary ---
 
     def test_guided_strategic_phase_1(self):
         config = make_config("guided")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        )
 
     def test_guided_strategic_phase_2(self):
         config = make_config("guided")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=2) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=2) is True
+        )
 
     def test_guided_strategic_phase_5(self):
         config = make_config("guided")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=5) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=5) is True
+        )
 
     def test_guided_tactical_phase_1(self):
         config = make_config("guided")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=1) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=1)
+            is False
+        )
 
     def test_guided_tactical_phase_3(self):
         config = make_config("guided")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=3) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=3)
+            is False
+        )
 
     # --- dependent: freezes at every phase boundary ---
 
     def test_dependent_strategic_phase_1(self):
         config = make_config("dependent")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        )
 
     def test_dependent_strategic_phase_3(self):
         config = make_config("dependent")
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=3) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=3) is True
+        )
 
     def test_dependent_tactical_phase_1(self):
         config = make_config("dependent")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=1) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=1)
+            is True
+        )
 
     def test_dependent_tactical_phase_2(self):
         config = make_config("dependent")
-        assert should_freeze_at_boundary(config, is_strategic=False, phase_number=2) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=False, phase_number=2)
+            is True
+        )
 
     # --- Edge cases ---
 
     def test_missing_autonomy_attribute(self):
         """Config without autonomy attr defaults to partial behavior."""
         config = MagicMock(spec=[])  # No attributes
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is True
+        )
 
     def test_unknown_autonomy_value(self):
         """Unknown autonomy value returns False (safe fallback)."""
         config = MagicMock()
         config.autonomy = "unknown_value"
-        assert should_freeze_at_boundary(config, is_strategic=True, phase_number=1) is False
+        assert (
+            should_freeze_at_boundary(config, is_strategic=True, phase_number=1)
+            is False
+        )
 
 
 # =============================================================================
@@ -279,6 +340,7 @@ class TestConfigParsing:
     def test_autonomy_survives_dataclass_asdict(self):
         """Autonomy field is captured by dataclasses.asdict()."""
         import dataclasses
+
         config = AgentConfig(
             agent_id="test",
             display_name="Test",
@@ -307,9 +369,10 @@ class TestSerializationRoundTrip:
         )
 
         # serialize_resolved_config needs prompt files, so we mock the resolvers
-        with patch("src.core.loader.PromptMatrixResolver") as mock_prompt, \
-             patch("src.core.loader.InstructionMatrixResolver") as mock_instr:
-
+        with (
+            patch("src.core.loader.PromptMatrixResolver") as mock_prompt,
+            patch("src.core.loader.InstructionMatrixResolver") as mock_instr,
+        ):
             # Mock resolver to return dummy content
             mock_prompt_instance = MagicMock()
             mock_prompt_instance.load.return_value = "dummy prompt"
@@ -373,39 +436,42 @@ class TestAutonomyMatrix:
     | dependent  | freeze | freeze | freeze | freeze       |
     """
 
-    @pytest.mark.parametrize("level,is_strategic,phase_number,expected", [
-        # full: never freeze at boundaries
-        ("full", True, 0, False),
-        ("full", True, 1, False),
-        ("full", True, 2, False),
-        ("full", True, 5, False),
-        ("full", False, 1, False),
-        ("full", False, 3, False),
-        # review: never freeze at boundaries
-        ("review", True, 1, False),
-        ("review", True, 3, False),
-        ("review", False, 1, False),
-        ("review", False, 2, False),
-        # partial: only first strategic (phase_number 0 or 1)
-        ("partial", True, 0, True),   # init_workspace sets phase_number=0
-        ("partial", True, 1, True),   # state default is phase_number=1
-        ("partial", True, 2, False),
-        ("partial", True, 5, False),
-        ("partial", False, 0, False),
-        ("partial", False, 1, False),
-        ("partial", False, 3, False),
-        # guided: all strategic
-        ("guided", True, 1, True),
-        ("guided", True, 2, True),
-        ("guided", True, 5, True),
-        ("guided", False, 1, False),
-        ("guided", False, 3, False),
-        # dependent: all phases
-        ("dependent", True, 1, True),
-        ("dependent", True, 3, True),
-        ("dependent", False, 1, True),
-        ("dependent", False, 3, True),
-    ])
+    @pytest.mark.parametrize(
+        "level,is_strategic,phase_number,expected",
+        [
+            # full: never freeze at boundaries
+            ("full", True, 0, False),
+            ("full", True, 1, False),
+            ("full", True, 2, False),
+            ("full", True, 5, False),
+            ("full", False, 1, False),
+            ("full", False, 3, False),
+            # review: never freeze at boundaries
+            ("review", True, 1, False),
+            ("review", True, 3, False),
+            ("review", False, 1, False),
+            ("review", False, 2, False),
+            # partial: only first strategic (phase_number 0 or 1)
+            ("partial", True, 0, True),  # init_workspace sets phase_number=0
+            ("partial", True, 1, True),  # state default is phase_number=1
+            ("partial", True, 2, False),
+            ("partial", True, 5, False),
+            ("partial", False, 0, False),
+            ("partial", False, 1, False),
+            ("partial", False, 3, False),
+            # guided: all strategic
+            ("guided", True, 1, True),
+            ("guided", True, 2, True),
+            ("guided", True, 5, True),
+            ("guided", False, 1, False),
+            ("guided", False, 3, False),
+            # dependent: all phases
+            ("dependent", True, 1, True),
+            ("dependent", True, 3, True),
+            ("dependent", False, 1, True),
+            ("dependent", False, 3, True),
+        ],
+    )
     def test_autonomy_decision(self, level, is_strategic, phase_number, expected):
         config = make_config(level)
         result = should_freeze_at_boundary(config, is_strategic, phase_number)

@@ -103,10 +103,12 @@ class TestMatrixResolver:
     def test_shared_load_matrix_from_path(self, tmp_path):
         """_load_matrix_from_path is inherited and works for both subclasses."""
         matrix_path = tmp_path / "test_matrix.yaml"
-        matrix_path.write_text(textwrap.dedent("""\
+        matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               foo: bar.txt
-        """))
+        """)
+        )
 
         # Both subclasses can use the static method
         result_prompt = PromptMatrixResolver._load_matrix_from_path(matrix_path)
@@ -129,19 +131,26 @@ class TestInstructionMatrixResolver:
             model_family="claude-opus",
         )
         assert resolver.resolve_filename("instructions") == "instructions.md"
-        assert resolver.resolve_filename("strategic_todos_initial") == "strategic_todos_initial.yaml"
-        assert resolver.resolve_filename("workspace_template") == "workspace_template.md"
+        assert (
+            resolver.resolve_filename("strategic_todos_initial")
+            == "strategic_todos_initial.yaml"
+        )
+        assert (
+            resolver.resolve_filename("workspace_template") == "workspace_template.md"
+        )
         assert resolver.resolve_filename("todo_guide") == "todo_guide.md"
 
     def test_base_matrix_default_resolution(self, tmp_path):
         """Base instruction matrix default entries are used."""
         base_matrix = tmp_path / "config" / "instruction_matrix.yaml"
         base_matrix.parent.mkdir(parents=True)
-        base_matrix.write_text(textwrap.dedent("""\
+        base_matrix.write_text(
+            textwrap.dedent("""\
             default:
               instructions: custom_instructions.md
               workspace_template: custom_workspace.md
-        """))
+        """)
+        )
 
         with patch.object(MatrixResolver, "__init__", lambda self, *a, **kw: None):
             resolver = InstructionMatrixResolver.__new__(InstructionMatrixResolver)
@@ -149,7 +158,9 @@ class TestInstructionMatrixResolver:
             resolver.model_family = "default"
             resolver._file_resolver = FileResolver(framework_dir=tmp_path)
             resolver._expert_matrix = {}
-            resolver._base_matrix = InstructionMatrixResolver._load_matrix_from_path(base_matrix)
+            resolver._base_matrix = InstructionMatrixResolver._load_matrix_from_path(
+                base_matrix
+            )
 
         assert resolver.resolve_filename("instructions") == "custom_instructions.md"
         assert resolver.resolve_filename("workspace_template") == "custom_workspace.md"
@@ -159,17 +170,21 @@ class TestInstructionMatrixResolver:
     def test_expert_override(self, tmp_path):
         """Expert instruction matrix entries override base matrix entries."""
         base_matrix_path = tmp_path / "base_matrix.yaml"
-        base_matrix_path.write_text(textwrap.dedent("""\
+        base_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               instructions: base_instructions.md
               workspace_template: base_workspace.md
-        """))
+        """)
+        )
 
         expert_matrix_path = tmp_path / "expert_matrix.yaml"
-        expert_matrix_path.write_text(textwrap.dedent("""\
+        expert_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               instructions: expert_instructions.md
-        """))
+        """)
+        )
 
         with patch.object(MatrixResolver, "__init__", lambda self, *a, **kw: None):
             resolver = InstructionMatrixResolver.__new__(InstructionMatrixResolver)
@@ -179,8 +194,12 @@ class TestInstructionMatrixResolver:
                 deployment_dir=str(tmp_path),
                 framework_dir=tmp_path,
             )
-            resolver._expert_matrix = InstructionMatrixResolver._load_matrix_from_path(expert_matrix_path)
-            resolver._base_matrix = InstructionMatrixResolver._load_matrix_from_path(base_matrix_path)
+            resolver._expert_matrix = InstructionMatrixResolver._load_matrix_from_path(
+                expert_matrix_path
+            )
+            resolver._base_matrix = InstructionMatrixResolver._load_matrix_from_path(
+                base_matrix_path
+            )
 
         # Expert overrides instructions
         assert resolver.resolve_filename("instructions") == "expert_instructions.md"
@@ -190,12 +209,14 @@ class TestInstructionMatrixResolver:
     def test_model_specific_entry(self, tmp_path):
         """Model-specific entries take priority over default entries."""
         base_matrix_path = tmp_path / "base_matrix.yaml"
-        base_matrix_path.write_text(textwrap.dedent("""\
+        base_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               instructions: default_instructions.md
             claude-opus:
               instructions: claude_instructions.md
-        """))
+        """)
+        )
 
         with patch.object(MatrixResolver, "__init__", lambda self, *a, **kw: None):
             resolver = InstructionMatrixResolver.__new__(InstructionMatrixResolver)
@@ -203,7 +224,9 @@ class TestInstructionMatrixResolver:
             resolver.model_family = "claude-opus"
             resolver._file_resolver = FileResolver(framework_dir=tmp_path)
             resolver._expert_matrix = {}
-            resolver._base_matrix = InstructionMatrixResolver._load_matrix_from_path(base_matrix_path)
+            resolver._base_matrix = InstructionMatrixResolver._load_matrix_from_path(
+                base_matrix_path
+            )
 
         assert resolver.resolve_filename("instructions") == "claude_instructions.md"
 
@@ -212,16 +235,20 @@ class TestInstructionMatrixResolver:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
         (expert_dir / "instructions.md").write_text("expert instructions content")
-        (expert_dir / "instruction_matrix.yaml").write_text(textwrap.dedent("""\
+        (expert_dir / "instruction_matrix.yaml").write_text(
+            textwrap.dedent("""\
             default:
               instructions: instructions.md
-        """))
+        """)
+        )
 
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             # Also create framework files
             config_templates = tmp_path / "config" / "templates"
             config_templates.mkdir(parents=True)
-            (config_templates / "instructions.md").write_text("framework instructions content")
+            (config_templates / "instructions.md").write_text(
+                "framework instructions content"
+            )
 
             resolver = InstructionMatrixResolver(
                 deployment_dir=str(expert_dir),
@@ -303,17 +330,27 @@ class TestResolvedConfigSerialization:
             (config_prompts / "systemprompt.txt").write_text("system prompt content")
             (config_prompts / "strategic.txt").write_text("strategic content")
             (config_prompts / "tactical.txt").write_text("tactical content")
-            (config_prompts / "summarization_prompt.txt").write_text("summarization content")
+            (config_prompts / "summarization_prompt.txt").write_text(
+                "summarization content"
+            )
 
             # Create instruction files
             config_templates = tmp_path / "config" / "templates"
             config_templates.mkdir(parents=True)
             (config_templates / "instructions.md").write_text("instructions content")
-            (config_templates / "workspace_template.md").write_text("workspace template")
+            (config_templates / "workspace_template.md").write_text(
+                "workspace template"
+            )
             (config_templates / "todo_guide.md").write_text("todo guide")
-            (config_templates / "strategic_todos_initial.yaml").write_text("todos:\n  - id: 1\n    content: test todo content here")
-            (config_templates / "strategic_todos_transition.yaml").write_text("todos:\n  - id: 1\n    content: transition todo content")
-            (config_templates / "strategic_todos_resume.yaml").write_text("todos:\n  - id: 1\n    content: resume todo content here")
+            (config_templates / "strategic_todos_initial.yaml").write_text(
+                "todos:\n  - id: 1\n    content: test todo content here"
+            )
+            (config_templates / "strategic_todos_transition.yaml").write_text(
+                "todos:\n  - id: 1\n    content: transition todo content"
+            )
+            (config_templates / "strategic_todos_resume.yaml").write_text(
+                "todos:\n  - id: 1\n    content: resume todo content here"
+            )
 
             result = serialize_resolved_config(config, model="gpt-4o")
 
@@ -373,8 +410,13 @@ class TestResolvedConfigSerialization:
 
         assert config.agent_id == "test"
         assert config.display_name == "Test Agent"
-        assert config.extra["_resolved_prompts"]["systemprompt"] == "frozen system prompt"
-        assert config.extra["_resolved_instructions"]["instructions"] == "frozen instructions"
+        assert (
+            config.extra["_resolved_prompts"]["systemprompt"] == "frozen system prompt"
+        )
+        assert (
+            config.extra["_resolved_instructions"]["instructions"]
+            == "frozen instructions"
+        )
 
     def test_round_trip_serialize_deserialize(self, tmp_path):
         """Serialized config can be deserialized and used."""
@@ -397,9 +439,15 @@ class TestResolvedConfigSerialization:
             (config_templates / "instructions.md").write_text("instructions")
             (config_templates / "workspace_template.md").write_text("workspace")
             (config_templates / "todo_guide.md").write_text("todo guide")
-            (config_templates / "strategic_todos_initial.yaml").write_text("todos:\n  - id: 1\n    content: initial todo content")
-            (config_templates / "strategic_todos_transition.yaml").write_text("todos:\n  - id: 1\n    content: transition todo go")
-            (config_templates / "strategic_todos_resume.yaml").write_text("todos:\n  - id: 1\n    content: resume todos content")
+            (config_templates / "strategic_todos_initial.yaml").write_text(
+                "todos:\n  - id: 1\n    content: initial todo content"
+            )
+            (config_templates / "strategic_todos_transition.yaml").write_text(
+                "todos:\n  - id: 1\n    content: transition todo go"
+            )
+            (config_templates / "strategic_todos_resume.yaml").write_text(
+                "todos:\n  - id: 1\n    content: resume todos content"
+            )
 
             serialized = serialize_resolved_config(config, model="gpt-4o")
 
@@ -407,7 +455,9 @@ class TestResolvedConfigSerialization:
         restored = load_config_from_resolved(serialized)
         assert restored.agent_id == "round_trip"
         assert restored.extra["_resolved_prompts"]["systemprompt"] is not None
-        assert restored.extra["_resolved_instructions"]["instructions"] == "instructions"
+        assert (
+            restored.extra["_resolved_instructions"]["instructions"] == "instructions"
+        )
 
         # Use with load_instructions
         result = load_instructions(restored, model="gpt-4o")

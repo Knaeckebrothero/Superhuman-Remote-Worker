@@ -129,7 +129,9 @@ class KeycloakGroupSync:
 
         # Create the group
         group_id = self._admin.create_group({"name": group_name})
-        logger.info(f"Created Keycloak group '{group_name}' for project '{project_name}'")
+        logger.info(
+            f"Created Keycloak group '{group_name}' for project '{project_name}'"
+        )
         return group_id
 
     async def add_user_to_project_group(
@@ -213,9 +215,7 @@ class KeycloakGroupSync:
         if not self._initialized:
             return False
         try:
-            return await asyncio.to_thread(
-                self._delete_group_sync, project_id
-            )
+            return await asyncio.to_thread(self._delete_group_sync, project_id)
         except Exception as e:
             logger.warning(f"Failed to delete group for project {project_id}: {e}")
             return False

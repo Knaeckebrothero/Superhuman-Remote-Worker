@@ -108,8 +108,7 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Write to output/completion.json
             output_path = "output/completion.json"
             workspace.write_file(
-                output_path,
-                json.dumps(completion_data, indent=2, ensure_ascii=False)
+                output_path, json.dumps(completion_data, indent=2, ensure_ascii=False)
             )
 
             logger.info(f"Task marked complete: {summary}")
@@ -164,7 +163,9 @@ def create_job_tools(context: ToolContext) -> List[Any]:
 
             # Check if already in final phase
             if context.job_id in _final_phase_data:
-                logger.info(f"job_complete called again for job {context.job_id} - already marked as final")
+                logger.info(
+                    f"job_complete called again for job {context.job_id} - already marked as final"
+                )
                 return (
                     "Phase is already marked as final. Complete your remaining todos\n"
                     "to finish the job."
@@ -184,7 +185,9 @@ def create_job_tools(context: ToolContext) -> List[Any]:
             # Check that listed deliverables exist and are non-empty
             for deliverable in deliverables:
                 if not workspace.exists(deliverable):
-                    validation_warnings.append(f"Deliverable '{deliverable}' does not exist")
+                    validation_warnings.append(
+                        f"Deliverable '{deliverable}' does not exist"
+                    )
                 else:
                     try:
                         content = workspace.read_file(deliverable)
@@ -193,7 +196,9 @@ def create_job_tools(context: ToolContext) -> List[Any]:
                                 f"Deliverable '{deliverable}' appears empty or trivial ({len(content)} bytes)"
                             )
                     except Exception:
-                        validation_warnings.append(f"Deliverable '{deliverable}' could not be read")
+                        validation_warnings.append(
+                            f"Deliverable '{deliverable}' could not be read"
+                        )
 
             # Reject high confidence with validation warnings
             if validation_warnings and confidence > 0.5:

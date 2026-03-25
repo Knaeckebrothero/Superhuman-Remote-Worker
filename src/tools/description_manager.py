@@ -121,9 +121,20 @@ class DescriptionManager:
 
         # Category order (matches src/tools/ packages)
         category_order = [
-            "workspace", "core", "document", "research", "citation",
-            "graph", "sql", "mongodb", "knowledge", "git", "coding",
-            "evaluation", "communication", "other",
+            "workspace",
+            "core",
+            "document",
+            "research",
+            "citation",
+            "graph",
+            "sql",
+            "mongodb",
+            "knowledge",
+            "git",
+            "coding",
+            "evaluation",
+            "communication",
+            "other",
         ]
 
         for category in category_order:
@@ -144,7 +155,9 @@ class DescriptionManager:
 
         lines.append("---")
         lines.append("")
-        lines.append("*To use a tool, read its documentation file for detailed arguments and examples.*")
+        lines.append(
+            "*To use a tool, read its documentation file for detailed arguments and examples.*"
+        )
 
         return "\n".join(lines)
 
@@ -196,7 +209,9 @@ class DescriptionManager:
             write_fn(f"{tool_name}.md", doc_content)
             files_created += 1
 
-        logger.info(f"Generated {files_created} tool documentation files in {output_dir}")
+        logger.info(
+            f"Generated {files_created} tool documentation files in {output_dir}"
+        )
 
         return files_created
 
@@ -225,7 +240,9 @@ class DescriptionManager:
                     modified_tool = self._copy_with_description(tool, short_desc)
                     modified_tools.append(modified_tool)
                     deferred_count += 1
-                    logger.debug(f"Tool '{tool_name}' using short description (deferred)")
+                    logger.debug(
+                        f"Tool '{tool_name}' using short description (deferred)"
+                    )
                 else:
                     modified_tools.append(tool)
                     logger.warning(
@@ -264,9 +281,7 @@ class DescriptionManager:
                 return tool.copy(update={"description": new_description})
             except AttributeError:
                 # Last resort: try direct attribute modification on a copy
-                logger.warning(
-                    f"Could not copy tool '{tool.name}', modifying in place"
-                )
+                logger.warning(f"Could not copy tool '{tool.name}', modifying in place")
                 tool.description = new_description
                 return tool
 

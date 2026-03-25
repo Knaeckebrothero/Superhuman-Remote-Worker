@@ -140,9 +140,7 @@ def format_audit(audit: dict[str, Any]) -> str:
     if not entries:
         return "No audit entries found."
 
-    lines = [
-        f"Audit trail (page {page}, showing {len(entries)} of {total} entries):\n"
-    ]
+    lines = [f"Audit trail (page {page}, showing {len(entries)} of {total} entries):\n"]
 
     for entry in entries:
         lines.append(_format_audit_entry(entry))
@@ -209,7 +207,11 @@ def _format_chat_entry(entry: dict[str, Any], turn_number: int) -> list[str]:
     tool_calls = response.get("tool_calls", [])
     if tool_calls:
         tool_names = ", ".join(tc.get("name", "?") for tc in tool_calls)
-        lines.append(f"[assistant]: {preview}" if preview.strip() else f"[assistant]: (tool calls: {tool_names})")
+        lines.append(
+            f"[assistant]: {preview}"
+            if preview.strip()
+            else f"[assistant]: (tool calls: {tool_names})"
+        )
     elif preview.strip():
         lines.append(f"[assistant]: {preview}")
 
@@ -255,7 +257,9 @@ def format_chat_bulk(data: dict[str, Any]) -> str:
     if not entries:
         return "No chat history found."
 
-    lines = [f"Chat history (offset {offset}, showing {len(entries)} of {total} turns):\n"]
+    lines = [
+        f"Chat history (offset {offset}, showing {len(entries)} of {total} turns):\n"
+    ]
 
     for i, entry in enumerate(entries, offset + 1):
         lines.extend(_format_chat_entry(entry, i))
@@ -286,9 +290,13 @@ def format_job_summary(
         lines.append(f"  (unavailable: {job})")
     elif job:
         status_icon = {
-            "created": "📝", "processing": "🔄", "paused": "⏸",
-            "pending_review": "👁", "completed": "✅",
-            "failed": "❌", "cancelled": "⛔",
+            "created": "📝",
+            "processing": "🔄",
+            "paused": "⏸",
+            "pending_review": "👁",
+            "completed": "✅",
+            "failed": "❌",
+            "cancelled": "⛔",
         }.get(job.get("status", ""), "❓")
         lines.append(f"  {status_icon} Status: {job.get('status', 'N/A')}")
         lines.append(f"  Config: {job.get('config', 'N/A')}")
@@ -296,7 +304,9 @@ def format_job_summary(
         lines.append(f"  Updated: {job.get('updated_at', 'N/A')}")
         desc = job.get("description", "")
         if desc:
-            lines.append(f"  Description: {desc[:200]}{'...' if len(desc) > 200 else ''}")
+            lines.append(
+                f"  Description: {desc[:200]}{'...' if len(desc) > 200 else ''}"
+            )
         if job.get("error"):
             lines.append(f"  Error: {job['error']}")
     else:
@@ -314,7 +324,9 @@ def format_job_summary(
             lines.append(f"  ETA: {progress['eta']}")
         reqs = progress.get("requirements", {})
         if reqs:
-            lines.append(f"  Requirements: {reqs.get('completed', 0)}/{reqs.get('total', 0)}")
+            lines.append(
+                f"  Requirements: {reqs.get('completed', 0)}/{reqs.get('total', 0)}"
+            )
     else:
         lines.append("  (no data)")
     lines.append("")
@@ -328,7 +340,12 @@ def format_job_summary(
         if current:
             todo_list = current.get("todos", [])
             for t in todo_list:
-                icon = {"pending": "○", "in_progress": "◐", "completed": "●", "skipped": "⊘"}.get(t.get("status", ""), "?")
+                icon = {
+                    "pending": "○",
+                    "in_progress": "◐",
+                    "completed": "●",
+                    "skipped": "⊘",
+                }.get(t.get("status", ""), "?")
                 lines.append(f"  {icon} {t.get('subject', 'Untitled')}")
         else:
             lines.append("  (no current todos)")
@@ -353,7 +370,9 @@ def format_job_summary(
                 lines.append(f"    - {name}" + (f" ({size}b)" if size else ""))
             if len(files) > 10:
                 lines.append(f"    ... and {len(files) - 10} more")
-        ws_preview = workspace.get("workspace_md", workspace.get("workspace_preview", ""))
+        ws_preview = workspace.get(
+            "workspace_md", workspace.get("workspace_preview", "")
+        )
         if ws_preview:
             lines.append(f"  workspace.md preview: {str(ws_preview)[:200]}...")
         plan_preview = workspace.get("plan_md", workspace.get("plan_preview", ""))
@@ -449,7 +468,9 @@ def format_llm_requests(job_id: str, data: dict[str, Any]) -> str:
     if not entries:
         return f"No LLM requests found for job {job_id}."
 
-    lines = [f"LLM requests for job {job_id} (offset {offset}, showing {len(entries)} of {total}):\n"]
+    lines = [
+        f"LLM requests for job {job_id} (offset {offset}, showing {len(entries)} of {total}):\n"
+    ]
 
     for i, entry in enumerate(entries, offset + 1):
         model = entry.get("model", "?")
@@ -459,10 +480,14 @@ def format_llm_requests(job_id: str, data: dict[str, Any]) -> str:
         comp_t = tokens.get("completion_tokens", tokens.get("completion", "?"))
         total_t = tokens.get("total_tokens", tokens.get("total", "?"))
         tool_calls = entry.get("tool_calls", [])
-        tool_names = ", ".join(
-            (tc.get("name", "?") if isinstance(tc, dict) else str(tc))
-            for tc in tool_calls
-        ) if tool_calls else "(none)"
+        tool_names = (
+            ", ".join(
+                (tc.get("name", "?") if isinstance(tc, dict) else str(tc))
+                for tc in tool_calls
+            )
+            if tool_calls
+            else "(none)"
+        )
         doc_id = entry.get("_id", "?")
         iteration = entry.get("iteration", "?")
 
@@ -522,7 +547,9 @@ def format_graph_changes(changes: dict[str, Any]) -> str:
     lines.append(f"  Relationships deleted: {summary.get('relationshipsDeleted', 0)}")
 
     if time_range:
-        lines.append(f"\nTime range: {time_range.get('start')} to {time_range.get('end')}")
+        lines.append(
+            f"\nTime range: {time_range.get('start')} to {time_range.get('end')}"
+        )
 
     # Recent deltas (last 10)
     if deltas:
@@ -806,7 +833,11 @@ def format_diff(
 
     if max_chars > 0 and len(diff_text) > max_chars:
         truncated = diff_text[:max_chars]
-        return header + truncated + f"\n\n[truncated — diff exceeds {max_chars} characters]"
+        return (
+            header
+            + truncated
+            + f"\n\n[truncated — diff exceeds {max_chars} characters]"
+        )
 
     return header + diff_text
 
@@ -921,7 +952,9 @@ def format_frozen_job(job_id: str, data: dict[str, Any]) -> str:
     if data.get("confidence") is not None:
         conf = data["confidence"]
         if isinstance(conf, (int, float)):
-            lines.append(f"Confidence: {conf:.0%}" if conf <= 1 else f"Confidence: {conf}")
+            lines.append(
+                f"Confidence: {conf:.0%}" if conf <= 1 else f"Confidence: {conf}"
+            )
         else:
             lines.append(f"Confidence: {conf}")
 
@@ -1111,7 +1144,14 @@ def format_job_stats(data: dict[str, Any]) -> str:
     total = data.get("total", 0)
     lines = [f"Job Statistics (total: {total})\n"]
 
-    for status in ("created", "processing", "pending_review", "completed", "failed", "cancelled"):
+    for status in (
+        "created",
+        "processing",
+        "pending_review",
+        "completed",
+        "failed",
+        "cancelled",
+    ):
         count = data.get(status, 0)
         if count or status in ("created", "processing", "completed"):
             lines.append(f"  {status}: {count}")
@@ -1175,7 +1215,9 @@ def format_stuck_jobs(data: list[dict[str, Any]], threshold: int) -> str:
     return "\n".join(lines)
 
 
-def format_agents(agents: list[dict[str, Any]], status_filter: str | None = None) -> str:
+def format_agents(
+    agents: list[dict[str, Any]], status_filter: str | None = None
+) -> str:
     """Format agent list."""
     if not agents:
         filter_msg = f" with status '{status_filter}'" if status_filter else ""
@@ -1191,8 +1233,12 @@ def format_agents(agents: list[dict[str, Any]], status_filter: str | None = None
         heartbeat = a.get("last_heartbeat", "")
 
         icon = {
-            "ready": "OK", "working": ">>", "booting": "..",
-            "offline": "--", "failed": "!!", "completed": "++",
+            "ready": "OK",
+            "working": ">>",
+            "booting": "..",
+            "offline": "--",
+            "failed": "!!",
+            "completed": "++",
         }.get(status, "??")
 
         lines.append(f"  [{icon}] {agent_id}  ({status})")
@@ -1509,7 +1555,9 @@ def format_citation_detail(data: dict[str, Any]) -> str:
         lines.append(f"Similarity score: {data['similarity_score']:.3f}")
 
     # Source info
-    lines.append(f"\nSource: [{data.get('source_id', '?')}] {data.get('source_name', 'unknown')}")
+    lines.append(
+        f"\nSource: [{data.get('source_id', '?')}] {data.get('source_name', 'unknown')}"
+    )
     lines.append(f"Source type: {data.get('source_type', 'N/A')}")
     if data.get("source_identifier"):
         lines.append(f"Source identifier: {data['source_identifier']}")
@@ -1544,7 +1592,9 @@ def format_citation_detail(data: dict[str, Any]) -> str:
         lines.append(f"\n=== Verification Notes ===\n{data['verification_notes']}")
 
     if data.get("matched_location") and isinstance(data["matched_location"], dict):
-        lines.append(f"Matched location: {json.dumps(data['matched_location'], default=str)}")
+        lines.append(
+            f"Matched location: {json.dumps(data['matched_location'], default=str)}"
+        )
 
     if data.get("relevance_reasoning"):
         reasoning = data["relevance_reasoning"]
@@ -1568,9 +1618,7 @@ def format_source_search(data: dict[str, Any]) -> str:
     if not results:
         return f"No sources matching '{query}' found."
 
-    lines = [
-        f"Search results for '{query}' (mode: {mode}, {total} match(es)):\n"
-    ]
+    lines = [f"Search results for '{query}' (mode: {mode}, {total} match(es)):\n"]
 
     for r in results:
         sid = r.get("source_id", "?")
@@ -1599,9 +1647,13 @@ def format_annotations(
     """Format source annotations."""
     if not annotations:
         filter_msg = f" of type '{type_filter}'" if type_filter else ""
-        return f"No annotations found for source {source_id} in job {job_id}{filter_msg}."
+        return (
+            f"No annotations found for source {source_id} in job {job_id}{filter_msg}."
+        )
 
-    lines = [f"Annotations for source {source_id} in job {job_id} ({len(annotations)}):\n"]
+    lines = [
+        f"Annotations for source {source_id} in job {job_id} ({len(annotations)}):\n"
+    ]
 
     for a in annotations:
         atype = a.get("annotation_type", "note")
@@ -1657,9 +1709,12 @@ def format_citation_stats(job_id: str, data: dict[str, Any]) -> str:
         for status in ("verified", "pending", "failed", "unverified"):
             count = by_status.get(status, 0)
             if count:
-                icon = {"verified": "+", "pending": "?", "failed": "x", "unverified": "~"}.get(
-                    status, " "
-                )
+                icon = {
+                    "verified": "+",
+                    "pending": "?",
+                    "failed": "x",
+                    "unverified": "~",
+                }.get(status, " ")
                 lines.append(f"    [{icon}] {status}: {count}")
 
     by_confidence = data.get("citations_by_confidence", {})
@@ -1763,18 +1818,24 @@ def format_system_info(agent_id: str, data: dict[str, Any]) -> str:
 
     # Memory
     mem = data.get("memory", {})
-    lines.append(f"Memory: {mem.get('used_mb', 0)} / {mem.get('total_mb', 0)} MB ({mem.get('percent', 0)}%)")
+    lines.append(
+        f"Memory: {mem.get('used_mb', 0)} / {mem.get('total_mb', 0)} MB ({mem.get('percent', 0)}%)"
+    )
 
     # Disk
     disk = data.get("disk", {})
-    lines.append(f"Disk: {disk.get('used_gb', 0)} / {disk.get('total_gb', 0)} GB ({disk.get('percent', 0)}%)")
+    lines.append(
+        f"Disk: {disk.get('used_gb', 0)} / {disk.get('total_gb', 0)} GB ({disk.get('percent', 0)}%)"
+    )
 
     # Listening ports
     ports = data.get("listening_ports", [])
     if ports:
         lines.append(f"\nListening ports ({len(ports)}):")
         for p in ports:
-            lines.append(f"  :{p.get('port', '?')} ({p.get('address', '*')}) pid={p.get('pid', '?')}")
+            lines.append(
+                f"  :{p.get('port', '?')} ({p.get('address', '*')}) pid={p.get('pid', '?')}"
+            )
     else:
         lines.append("\nNo listening ports detected.")
 
@@ -1798,7 +1859,9 @@ def format_system_info(agent_id: str, data: dict[str, Any]) -> str:
     if conns:
         lines.append(f"\nEstablished connections ({len(conns)}):")
         for c in conns[:10]:
-            lines.append(f"  {c.get('local', '?')} -> {c.get('remote', '?')} pid={c.get('pid', '?')}")
+            lines.append(
+                f"  {c.get('local', '?')} -> {c.get('remote', '?')} pid={c.get('pid', '?')}"
+            )
         if len(conns) > 10:
             lines.append(f"  ... and {len(conns) - 10} more")
 
@@ -1860,7 +1923,9 @@ def format_todo_archives(job_id: str, archives: list[dict[str, Any]]) -> str:
 
 
 def format_todo_archive_detail(
-    job_id: str, filename: str, data: dict[str, Any],
+    job_id: str,
+    filename: str,
+    data: dict[str, Any],
 ) -> str:
     """Format the content of a single archived todo file."""
     lines = [f"Archived todos: {filename} (job {job_id})\n"]
@@ -2156,9 +2221,7 @@ def format_created_project(result: dict[str, Any]) -> str:
 # =============================================================================
 
 
-def format_project_members(
-    project_id: str, members: list[dict[str, Any]]
-) -> str:
+def format_project_members(project_id: str, members: list[dict[str, Any]]) -> str:
     """Format project member list."""
     if not members:
         return f"No members found for project {project_id}."
@@ -2176,9 +2239,7 @@ def format_project_members(
     return "\n".join(lines)
 
 
-def format_project_experts(
-    project_id: str, experts: list[dict[str, Any]]
-) -> str:
+def format_project_experts(project_id: str, experts: list[dict[str, Any]]) -> str:
     """Format project-specific expert list."""
     if not experts:
         return f"No project-specific experts found for project {project_id}."
@@ -2200,9 +2261,7 @@ def format_project_experts(
     return "\n".join(lines)
 
 
-def format_project_expert_detail(
-    project_id: str, data: dict[str, Any]
-) -> str:
+def format_project_expert_detail(project_id: str, data: dict[str, Any]) -> str:
     """Format detailed project expert configuration."""
     eid = data.get("id", "?")
     lines = [
@@ -2261,9 +2320,7 @@ def format_created_datasource(result: dict[str, Any]) -> str:
         f"URL: {_mask_url(url)}",
     ]
 
-    lines.append(
-        "\nUse test_datasource(datasource_id) to verify connectivity."
-    )
+    lines.append("\nUse test_datasource(datasource_id) to verify connectivity.")
     return "\n".join(lines)
 
 

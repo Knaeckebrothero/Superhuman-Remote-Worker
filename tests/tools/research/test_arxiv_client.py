@@ -122,7 +122,9 @@ class TestArxivClientGetPaper:
         assert paper is None
 
     @pytest.mark.asyncio
-    async def test_get_paper_extracts_id_from_url(self, mock_arxiv_module, mock_arxiv_result):
+    async def test_get_paper_extracts_id_from_url(
+        self, mock_arxiv_module, mock_arxiv_result
+    ):
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
@@ -138,7 +140,9 @@ class TestArxivClientDownload:
     """Tests for ArxivClient.download method."""
 
     @pytest.mark.asyncio
-    async def test_download_success(self, temp_docs_dir, mock_arxiv_module, mock_arxiv_result):
+    async def test_download_success(
+        self, temp_docs_dir, mock_arxiv_module, mock_arxiv_result
+    ):
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()
@@ -170,7 +174,9 @@ class TestArxivClientDownload:
         assert "not found" in result.error
 
     @pytest.mark.asyncio
-    async def test_download_exception(self, temp_docs_dir, mock_arxiv_module, mock_arxiv_result):
+    async def test_download_exception(
+        self, temp_docs_dir, mock_arxiv_module, mock_arxiv_result
+    ):
         client = ArxivClient(rate_limit_seconds=0)
 
         mock_search = MagicMock()

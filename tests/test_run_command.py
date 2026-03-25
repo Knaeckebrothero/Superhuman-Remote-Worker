@@ -12,8 +12,7 @@ import pytest
 
 # Skip entire module if tmux is not available
 pytestmark = pytest.mark.skipif(
-    shutil.which("tmux") is None,
-    reason="tmux not installed"
+    shutil.which("tmux") is None, reason="tmux not installed"
 )
 
 from src.tools.coding.shell_manager import ShellManager  # noqa: E402
@@ -109,10 +108,12 @@ class TestRunCommand:
     def test_tail_truncation(self, manager):
         tool = self._get_run_command(manager)
         # Generate 50 lines, request tail=10
-        result = tool.invoke({
-            "command": "for i in $(seq 1 50); do echo line_$i; done",
-            "tail": 10,
-        })
+        result = tool.invoke(
+            {
+                "command": "for i in $(seq 1 50); do echo line_$i; done",
+                "tail": 10,
+            }
+        )
         assert "line_50" in result  # Last line present
         assert "line_1\n" not in result  # Early lines truncated
         assert "truncated" in result
@@ -120,9 +121,11 @@ class TestRunCommand:
     def test_default_tail_is_30(self, manager):
         tool = self._get_run_command(manager)
         # Generate 60 lines with default tail
-        result = tool.invoke({
-            "command": "for i in $(seq 1 60); do echo line_$i; done",
-        })
+        result = tool.invoke(
+            {
+                "command": "for i in $(seq 1 60); do echo line_$i; done",
+            }
+        )
         assert "line_60" in result
         assert "30 lines truncated" in result
 
@@ -133,20 +136,24 @@ class TestRunCommand:
 
     def test_timeout_parameter(self, manager):
         tool = self._get_run_command(manager)
-        result = tool.invoke({
-            "command": "sleep 30",
-            "timeout": 2,
-        })
+        result = tool.invoke(
+            {
+                "command": "sleep 30",
+                "timeout": 2,
+            }
+        )
         assert "timed out" in result.lower() or "timeout" in result.lower()
 
     def test_timeout_capped_at_600(self, manager):
         """Timeout values above 600 should be capped."""
         tool = self._get_run_command(manager)
         # Just verify it doesn't error — the cap is internal
-        result = tool.invoke({
-            "command": "echo ok",
-            "timeout": 9999,
-        })
+        result = tool.invoke(
+            {
+                "command": "echo ok",
+                "timeout": 9999,
+            }
+        )
         assert "Exit code: 0" in result
 
     def test_multiline_output(self, manager):
@@ -158,9 +165,7 @@ class TestRunCommand:
 
     def test_error_pattern_warning(self, manager):
         tool = self._get_run_command(manager)
-        result = tool.invoke({
-            "command": "echo 'Traceback (most recent call last):'"
-        })
+        result = tool.invoke({"command": "echo 'Traceback (most recent call last):'"})
         assert "Possible error" in result or "Python traceback" in result
 
     def test_no_output_command(self, manager):

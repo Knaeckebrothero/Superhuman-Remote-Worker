@@ -369,6 +369,7 @@ class TestOrchestratorClientApproveJob:
     @pytest.fixture
     def client(self):
         from src.api.orchestrator_client import OrchestratorClient
+
         return OrchestratorClient(
             orchestrator_url="http://localhost:8085",
             pod_ip="10.0.0.1",
@@ -446,6 +447,7 @@ class TestOrchestratorClientApproveJob:
             async def set_client():
                 client._client = AsyncMock()
                 client._client.put = AsyncMock(return_value=mock_response)
+
             mock_connect.side_effect = set_client
 
             result = await client.approve_job("job-123")
@@ -465,6 +467,7 @@ class TestOrchestratorClientReportCompletion:
     @pytest.fixture
     def client(self):
         from src.api.orchestrator_client import OrchestratorClient
+
         return OrchestratorClient(
             orchestrator_url="http://localhost:8085",
             pod_ip="10.0.0.1",

@@ -110,7 +110,10 @@ class SlackWebhookTransport:
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"[SRW] {payload.subject}"[:150]},
+                "text": {
+                    "type": "plain_text",
+                    "text": f"[SRW] {payload.subject}"[:150],
+                },
             },
             {
                 "type": "section",
@@ -118,23 +121,30 @@ class SlackWebhookTransport:
             },
         ]
         if payload.job_description:
-            blocks.append({
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": f"Job: {payload.job_description[:80]} • Agent: {payload.config_name}"},
-                ],
-            })
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"Job: {payload.job_description[:80]} • Agent: {payload.config_name}",
+                        },
+                    ],
+                }
+            )
         if payload.cockpit_url:
-            blocks.append({
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Open in Cockpit"},
-                        "url": payload.cockpit_url,
-                    },
-                ],
-            })
+            blocks.append(
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Open in Cockpit"},
+                            "url": payload.cockpit_url,
+                        },
+                    ],
+                }
+            )
 
         body = {"blocks": blocks}
 

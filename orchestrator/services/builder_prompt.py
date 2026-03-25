@@ -43,7 +43,9 @@ def build_system_prompt(
     try:
         base_prompt = resolve_builder_prompt(model, "system_prompt")
     except FileNotFoundError:
-        logger.warning("Failed to load builder prompt for model=%s, using default", model)
+        logger.warning(
+            "Failed to load builder prompt for model=%s, using default", model
+        )
         base_prompt = resolve_builder_prompt("default", "system_prompt")
 
     parts = [base_prompt]
@@ -53,14 +55,22 @@ def build_system_prompt(
     # Active job context
     if active_job_id:
         parts.append("### Active Job Context\n")
-        parts.append(f"The user has selected job `{active_job_id}` as the active context. ")
-        parts.append("Use this job_id by default when they ask to inspect, review, or act on a job.\n\n")
+        parts.append(
+            f"The user has selected job `{active_job_id}` as the active context. "
+        )
+        parts.append(
+            "Use this job_id by default when they ask to inspect, review, or act on a job.\n\n"
+        )
 
     # Active project context
     if active_project_id:
         parts.append("### Active Project Context\n")
-        parts.append(f"The user has selected project `{active_project_id}` as the active context. ")
-        parts.append("Use this project_id by default for knowledge base tools, project management, ")
+        parts.append(
+            f"The user has selected project `{active_project_id}` as the active context. "
+        )
+        parts.append(
+            "Use this project_id by default for knowledge base tools, project management, "
+        )
         parts.append("and project-scoped operations.\n\n")
 
     # Instructions
@@ -74,6 +84,7 @@ def build_system_prompt(
     parts.append("\n### Configuration Override\n")
     if config_settings:
         import json
+
         parts.append(f"```json\n{json.dumps(config_settings, indent=2)}\n```\n")
     else:
         parts.append("*(using expert defaults — no overrides)*\n")

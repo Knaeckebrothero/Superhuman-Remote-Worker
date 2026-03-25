@@ -170,7 +170,10 @@ class TestFinalizeWithVerdict:
         assert result.freeze_data["freeze_type"] == "verdict"
         assert result.freeze_data["verdict"] == "returned"
         assert result.freeze_data["target_job_id"] == "target-job-1"
-        assert result.freeze_data["feedback"] == "## Verification Feedback\n\nFix the tests"
+        assert (
+            result.freeze_data["feedback"]
+            == "## Verification Feedback\n\nFix the tests"
+        )
         assert len(result.freeze_data["issues"]) == 2
 
     def test_unknown_verdict_defaults_to_completed(self):
@@ -310,7 +313,9 @@ class TestEvaluationToolMetadata:
         assert EVALUATION_TOOLS_METADATA["approve_job"]["phases"] == ["strategic"]
 
     def test_return_job_is_strategic_only(self):
-        assert EVALUATION_TOOLS_METADATA["return_job_with_feedback"]["phases"] == ["strategic"]
+        assert EVALUATION_TOOLS_METADATA["return_job_with_feedback"]["phases"] == [
+            "strategic"
+        ]
 
 
 # =============================================================================
@@ -318,7 +323,9 @@ class TestEvaluationToolMetadata:
 # =============================================================================
 
 
-@pytest.mark.skip(reason="Agent-side _handle_critic_verdict removed; logic moved to orchestrator")
+@pytest.mark.skip(
+    reason="Agent-side _handle_critic_verdict removed; logic moved to orchestrator"
+)
 class TestRoundLimitEnforcement:
     """Tests for round limit logic — now handled by orchestrator."""
 
@@ -352,23 +359,33 @@ class TestRoundLimitEnforcement:
         from src.api.app import _handle_critic_verdict
 
         mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(return_value={
-            "parent_job_id": "target-job-1",
-            "freeze_data": json.dumps({
-                "verdict": "approved",
-                "target_job_id": "target-job-1",
-            }),
-            "context": json.dumps({
-                "verification_round": 0,
-                "max_verification_rounds": 3,
-            }),
-        })
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "parent_job_id": "target-job-1",
+                "freeze_data": json.dumps(
+                    {
+                        "verdict": "approved",
+                        "target_job_id": "target-job-1",
+                    }
+                ),
+                "context": json.dumps(
+                    {
+                        "verification_round": 0,
+                        "max_verification_rounds": 3,
+                    }
+                ),
+            }
+        )
 
         mock_agent = MagicMock()
         mock_agent.postgres_conn = mock_conn
 
-        with patch("src.api.app._agent", mock_agent), \
-             patch("src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock) as mock_set:
+        with (
+            patch("src.api.app._agent", mock_agent),
+            patch(
+                "src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock
+            ) as mock_set,
+        ):
             await _handle_critic_verdict("critic-1", {})
             mock_set.assert_called_once_with("target-job-1")
 
@@ -378,17 +395,23 @@ class TestRoundLimitEnforcement:
         from src.api.app import _handle_critic_verdict
 
         mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(return_value={
-            "parent_job_id": "target-job-1",
-            "freeze_data": json.dumps({
-                "verdict": "returned",
-                "feedback": "Fix the tests",
-            }),
-            "context": json.dumps({
-                "verification_round": 1,
-                "max_verification_rounds": 3,
-            }),
-        })
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "parent_job_id": "target-job-1",
+                "freeze_data": json.dumps(
+                    {
+                        "verdict": "returned",
+                        "feedback": "Fix the tests",
+                    }
+                ),
+                "context": json.dumps(
+                    {
+                        "verification_round": 1,
+                        "max_verification_rounds": 3,
+                    }
+                ),
+            }
+        )
 
         mock_agent = MagicMock()
         mock_agent.postgres_conn = mock_conn
@@ -396,8 +419,10 @@ class TestRoundLimitEnforcement:
         mock_client = MagicMock()
         mock_client.resume_job = AsyncMock(return_value=True)
 
-        with patch("src.api.app._agent", mock_agent), \
-             patch("src.api.app._orchestrator_client", mock_client):
+        with (
+            patch("src.api.app._agent", mock_agent),
+            patch("src.api.app._orchestrator_client", mock_client),
+        ):
             await _handle_critic_verdict("critic-1", {})
             mock_client.resume_job.assert_called_once_with(
                 "target-job-1", feedback="Fix the tests"
@@ -409,25 +434,35 @@ class TestRoundLimitEnforcement:
         from src.api.app import _handle_critic_verdict
 
         mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(return_value={
-            "parent_job_id": "target-job-1",
-            "freeze_data": json.dumps({
-                "verdict": "returned",
-                "feedback": "Still broken",
-            }),
-            "context": json.dumps({
-                "verification_round": 3,
-                "max_verification_rounds": 3,
-            }),
-        })
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "parent_job_id": "target-job-1",
+                "freeze_data": json.dumps(
+                    {
+                        "verdict": "returned",
+                        "feedback": "Still broken",
+                    }
+                ),
+                "context": json.dumps(
+                    {
+                        "verification_round": 3,
+                        "max_verification_rounds": 3,
+                    }
+                ),
+            }
+        )
         mock_conn.jobs = MagicMock()
         mock_conn.jobs.update_status = AsyncMock()
 
         mock_agent = MagicMock()
         mock_agent.postgres_conn = mock_conn
 
-        with patch("src.api.app._agent", mock_agent), \
-             patch("src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock) as mock_set:
+        with (
+            patch("src.api.app._agent", mock_agent),
+            patch(
+                "src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock
+            ) as mock_set,
+        ):
             await _handle_critic_verdict("critic-1", {})
 
             # Critic should be set to failed
@@ -445,17 +480,23 @@ class TestRoundLimitEnforcement:
         from src.api.app import _handle_critic_verdict
 
         mock_conn = MagicMock()
-        mock_conn.fetchrow = AsyncMock(return_value={
-            "parent_job_id": None,
-            "freeze_data": None,
-            "context": None,
-        })
+        mock_conn.fetchrow = AsyncMock(
+            return_value={
+                "parent_job_id": None,
+                "freeze_data": None,
+                "context": None,
+            }
+        )
 
         mock_agent = MagicMock()
         mock_agent.postgres_conn = mock_conn
 
-        with patch("src.api.app._agent", mock_agent), \
-             patch("src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock) as mock_set:
+        with (
+            patch("src.api.app._agent", mock_agent),
+            patch(
+                "src.api.app._set_target_to_autonomy_status", new_callable=AsyncMock
+            ) as mock_set,
+        ):
             await _handle_critic_verdict("regular-job-1", {})
             mock_set.assert_not_called()
 
