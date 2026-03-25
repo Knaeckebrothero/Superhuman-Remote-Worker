@@ -229,7 +229,7 @@ class TestSquashMergeSubjob:
                 "job-parent12",
                 42,
                 merge_strategy="squash",
-                delete_branch_after_merge=True,
+                delete_branch_after_merge=False,
             )
 
             mock_db.update_job_merge_status.assert_awaited_once_with(
