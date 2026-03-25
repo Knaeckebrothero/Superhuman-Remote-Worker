@@ -12,8 +12,8 @@
 #
 # Image build:
 #   cd vm-controller
-#   podman build -t ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:latest .
-#   podman push ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:latest
+#   podman build -t ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-bb0a4d2 .
+#   podman push ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-bb0a4d2
 
 ---
 # Namespace (idempotent — already created during agent cluster setup)
@@ -172,7 +172,7 @@ spec:
       serviceAccountName: vm-controller
       containers:
         - name: vm-controller
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:latest
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-bb0a4d2
           imagePullPolicy: Always
           env:
             - name: NATS_URL
@@ -182,7 +182,7 @@ spec:
             - name: VM_NAMESPACE
               value: "agent-vms"
             - name: DEFAULT_VM_IMAGE
-              value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest"
+              value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-bb0a4d2"
             - name: DEFAULT_CPU
               value: "2"
             - name: DEFAULT_MEMORY
