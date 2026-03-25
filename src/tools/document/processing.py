@@ -45,6 +45,7 @@ def _load_document(file_path: str) -> Dict[str, Any]:
     try:
         if suffix == ".pdf":
             from langchain_community.document_loaders import PyPDFLoader
+
             loader = PyPDFLoader(str(path))
             docs = loader.load()
             text = "\n\n".join([doc.page_content for doc in docs])
@@ -57,6 +58,7 @@ def _load_document(file_path: str) -> Dict[str, Any]:
 
         elif suffix == ".docx":
             from langchain_community.document_loaders import Docx2txtLoader
+
             loader = Docx2txtLoader(str(path))
             docs = loader.load()
             text = "\n\n".join([doc.page_content for doc in docs])
@@ -69,6 +71,7 @@ def _load_document(file_path: str) -> Dict[str, Any]:
 
         elif suffix == ".txt" or suffix == ".md":
             from langchain_community.document_loaders import TextLoader
+
             loader = TextLoader(str(path))
             docs = loader.load()
             text = "\n\n".join([doc.page_content for doc in docs])
@@ -81,6 +84,7 @@ def _load_document(file_path: str) -> Dict[str, Any]:
 
         elif suffix in [".html", ".htm"]:
             from langchain_community.document_loaders import UnstructuredHTMLLoader
+
             loader = UnstructuredHTMLLoader(str(path))
             docs = loader.load()
             text = "\n\n".join([doc.page_content for doc in docs])
@@ -107,7 +111,9 @@ def _load_document(file_path: str) -> Dict[str, Any]:
         raise
 
 
-def _chunk_text(text: str, strategy: str, max_chunk_size: int, overlap: int) -> List[Dict[str, Any]]:
+def _chunk_text(
+    text: str, strategy: str, max_chunk_size: int, overlap: int
+) -> List[Dict[str, Any]]:
     """Split text into chunks using langchain text splitters.
 
     Args:
@@ -125,11 +131,11 @@ def _chunk_text(text: str, strategy: str, max_chunk_size: int, overlap: int) -> 
     if strategy == "legal":
         separators = [
             "\n\n\n",  # Multiple paragraph breaks
-            "\n\n",    # Paragraph breaks
-            "\n",      # Line breaks
-            "§",       # Section symbols
-            "Art.",    # Article markers
-            ". ",      # Sentences
+            "\n\n",  # Paragraph breaks
+            "\n",  # Line breaks
+            "§",  # Section symbols
+            "Art.",  # Article markers
+            ". ",  # Sentences
             " ",
         ]
     elif strategy == "technical":
@@ -137,7 +143,7 @@ def _chunk_text(text: str, strategy: str, max_chunk_size: int, overlap: int) -> 
             "\n\n\n",
             "\n\n",
             "\n",
-            "# ",      # Markdown headers
+            "# ",  # Markdown headers
             "## ",
             "### ",
             ". ",
@@ -188,7 +194,7 @@ def create_processing_tools(context: ToolContext) -> List[Any]:
         file_path: str,
         strategy: str = "legal",
         max_chunk_size: int = 1000,
-        overlap: int = 200
+        overlap: int = 200,
     ) -> str:
         """Split a document into chunks for processing.
 
@@ -210,11 +216,13 @@ def create_processing_tools(context: ToolContext) -> List[Any]:
             chunk_files = []
             if workspace is not None:
                 for i, chunk in enumerate(chunks):
-                    chunk_path = f"chunks/chunk_{i+1:03d}.txt"
-                    chunk_content = chunk.get('text', '')
-                    section = chunk.get('section_hierarchy', [])
-                    section_str = ' > '.join(section) if section else 'N/A'
-                    full_chunk = f"# Chunk {i+1}\nSection: {section_str}\n\n{chunk_content}"
+                    chunk_path = f"chunks/chunk_{i + 1:03d}.txt"
+                    chunk_content = chunk.get("text", "")
+                    section = chunk.get("section_hierarchy", [])
+                    section_str = " > ".join(section) if section else "N/A"
+                    full_chunk = (
+                        f"# Chunk {i + 1}\nSection: {section_str}\n\n{chunk_content}"
+                    )
                     workspace.write_file(chunk_path, full_chunk)
                     chunk_files.append(chunk_path)
 
@@ -229,14 +237,14 @@ Overlap: {overlap}
 Chunk Statistics:
 """
             if chunks:
-                sizes = [len(c.get('text', '')) for c in chunks]
+                sizes = [len(c.get("text", "")) for c in chunks]
                 result += f"  Min Size: {min(sizes)} chars\n"
                 result += f"  Max Size: {max(sizes)} chars\n"
                 result += f"  Avg Size: {sum(sizes) // len(sizes)} chars\n"
 
             if chunk_files:
                 result += f"\nChunks written to: chunks/chunk_001.txt through chunks/chunk_{len(chunks):03d}.txt"
-                result += "\nUse read_file(\"chunks/chunk_001.txt\") to start processing."
+                result += '\nUse read_file("chunks/chunk_001.txt") to start processing.'
             else:
                 result += "\nNote: No workspace available, chunks not persisted."
 

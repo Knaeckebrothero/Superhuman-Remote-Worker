@@ -17,6 +17,7 @@ class WorkspaceUnavailableError(Exception):
     For RemoteBackend: SSH connection lost, VM unreachable, etc.
     The agent should report this to the orchestrator for VM recovery.
     """
+
     pass
 
 

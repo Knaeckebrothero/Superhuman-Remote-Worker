@@ -34,8 +34,17 @@ logger = logging.getLogger(__name__)
 
 # Supported audio file extensions
 AUDIO_EXTENSIONS = {
-    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm",
-    ".mp4", ".mpeg", ".mpga", ".oga", ".opus",
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".ogg",
+    ".flac",
+    ".webm",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".oga",
+    ".opus",
 }
 
 # Whisper API file size limit (25 MB)
@@ -64,6 +73,7 @@ def _run_async(coro):
 
     if loop and loop.is_running():
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(asyncio.run, coro)
             return future.result()
@@ -116,7 +126,7 @@ def _split_long_line(text: str, max_length: int, out: List[str]) -> None:
     while len(text) > max_length:
         # Try sentence boundary (. ? ! followed by space)
         best_pos = -1
-        for match in re.finditer(r'[.!?]\s', text[:max_length]):
+        for match in re.finditer(r"[.!?]\s", text[:max_length]):
             best_pos = match.end()
 
         if best_pos > 0:
@@ -188,8 +198,12 @@ class AudioHelper:
             timeout=self.timeout,
         )
 
-        key_source = "WHISPER_API_KEY" if os.getenv("WHISPER_API_KEY") else "OPENAI_API_KEY"
-        base_source = "WHISPER_BASE_URL" if os.getenv("WHISPER_BASE_URL") else "default (OpenAI)"
+        key_source = (
+            "WHISPER_API_KEY" if os.getenv("WHISPER_API_KEY") else "OPENAI_API_KEY"
+        )
+        base_source = (
+            "WHISPER_BASE_URL" if os.getenv("WHISPER_BASE_URL") else "default (OpenAI)"
+        )
         logger.info(
             f"AudioHelper initialized: model={self.model}, "
             f"base_url={self.api_base} (from {base_source}), "
@@ -336,7 +350,9 @@ class AudioHelper:
             return full_transcript
 
         except Exception as e:
-            logger.error(f"Error in chunked transcription of {file_path}: {e}", exc_info=True)
+            logger.error(
+                f"Error in chunked transcription of {file_path}: {e}", exc_info=True
+            )
             return f"[Error transcribing audio: {str(e)}]"
         finally:
             if temp_dir and Path(temp_dir).exists():
@@ -357,9 +373,13 @@ class AudioHelper:
         try:
             result = subprocess.run(
                 [
-                    "ffprobe", "-v", "error",
-                    "-show_entries", "format=duration",
-                    "-of", "csv=p=0",
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
                     str(file_path),
                 ],
                 capture_output=True,
@@ -377,9 +397,7 @@ class AudioHelper:
         except ValueError as e:
             raise RuntimeError(f"Could not parse duration from ffprobe output: {e}")
 
-    def _split_audio(
-        self, file_path: Path, file_size: int
-    ) -> Tuple[List[Path], str]:
+    def _split_audio(self, file_path: Path, file_size: int) -> Tuple[List[Path], str]:
         """Split an audio file into chunks under the Whisper API size limit.
 
         Uses ffmpeg stream copy (no re-encoding) for speed.
@@ -409,11 +427,16 @@ class AudioHelper:
             try:
                 result = subprocess.run(
                     [
-                        "ffmpeg", "-y",
-                        "-i", str(file_path),
-                        "-ss", str(start_time),
-                        "-t", str(segment_duration),
-                        "-c", "copy",
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(file_path),
+                        "-ss",
+                        str(start_time),
+                        "-t",
+                        str(segment_duration),
+                        "-c",
+                        "copy",
                         str(chunk_path),
                     ],
                     capture_output=True,
@@ -422,9 +445,7 @@ class AudioHelper:
                 )
 
                 if result.returncode != 0:
-                    logger.warning(
-                        f"ffmpeg chunk {i} failed: {result.stderr.strip()}"
-                    )
+                    logger.warning(f"ffmpeg chunk {i} failed: {result.stderr.strip()}")
                     continue
 
                 if chunk_path.exists() and chunk_path.stat().st_size > 0:
@@ -511,7 +532,11 @@ class AudioHelper:
                 extra_metadata=archive_metadata_extra,
             )
 
-            chunk_info = f" (chunk {chunk_index + 1}/{total_chunks})" if chunk_index is not None else ""
+            chunk_info = (
+                f" (chunk {chunk_index + 1}/{total_chunks})"
+                if chunk_index is not None
+                else ""
+            )
             logger.info(
                 f"Transcribed {archive_file_name}{chunk_info}: "
                 f"{len(text)} chars in {latency_ms}ms"

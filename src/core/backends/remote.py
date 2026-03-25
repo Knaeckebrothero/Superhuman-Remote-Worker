@@ -35,12 +35,27 @@ STALL_DETECTION_SECONDS = 5.0
 
 # Patterns that indicate the terminal is waiting for interactive input
 INTERACTIVE_PROMPT_PATTERNS = [
-    (re.compile(r"\[y/n\]|\[Y/n\]|\[y/N\]|\[N/y\]|\(yes/no\)|\(yes/no/\[fingerprint\]\)", re.IGNORECASE), "confirmation prompt"),
+    (
+        re.compile(
+            r"\[y/n\]|\[Y/n\]|\[y/N\]|\[N/y\]|\(yes/no\)|\(yes/no/\[fingerprint\]\)",
+            re.IGNORECASE,
+        ),
+        "confirmation prompt",
+    ),
     (re.compile(r"(?:password|passphrase)\s*:", re.IGNORECASE), "password prompt"),
-    (re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE), "SSH host key verification"),
-    (re.compile(r"Install package '.*?' to provide command", re.IGNORECASE), "package install prompt"),
+    (
+        re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE),
+        "SSH host key verification",
+    ),
+    (
+        re.compile(r"Install package '.*?' to provide command", re.IGNORECASE),
+        "package install prompt",
+    ),
     (re.compile(r"\[sudo\] password for", re.IGNORECASE), "sudo password prompt"),
-    (re.compile(r"press any key|press enter to continue|hit enter", re.IGNORECASE), "press key prompt"),
+    (
+        re.compile(r"press any key|press enter to continue|hit enter", re.IGNORECASE),
+        "press key prompt",
+    ),
     (re.compile(r"enter passphrase", re.IGNORECASE), "passphrase prompt"),
 ]
 
@@ -48,9 +63,15 @@ INTERACTIVE_PROMPT_PATTERNS = [
 TAB_NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,20}$")
 
 # Default blocked commands
-DEFAULT_BLOCKED_COMMANDS = frozenset([
-    "reboot", "shutdown", "poweroff", "halt", "init",
-])
+DEFAULT_BLOCKED_COMMANDS = frozenset(
+    [
+        "reboot",
+        "shutdown",
+        "poweroff",
+        "halt",
+        "init",
+    ]
+)
 
 
 class _RemoteTab:
@@ -215,7 +236,9 @@ class RemoteBackend(WorkspaceBackend):
             except WorkspaceUnavailableError:
                 if attempt == self._max_retries:
                     raise
-                logger.warning(f"Reconnect attempt {attempt} failed, retrying in {backoff}s")
+                logger.warning(
+                    f"Reconnect attempt {attempt} failed, retrying in {backoff}s"
+                )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 10.0)
 
@@ -233,7 +256,9 @@ class RemoteBackend(WorkspaceBackend):
                 err = stderr.read().decode("utf-8", errors="replace")
                 # Some commands (grep with no match, tmux has-session) use non-zero
                 # exit codes for normal conditions — callers check output.
-                logger.debug(f"Remote command exit {exit_code}: {command[:80]} | stderr: {err[:200]}")
+                logger.debug(
+                    f"Remote command exit {exit_code}: {command[:80]} | stderr: {err[:200]}"
+                )
             return output
         except (paramiko.SSHException, socket.error, EOFError, OSError) as e:
             raise WorkspaceUnavailableError(
@@ -370,7 +395,7 @@ class RemoteBackend(WorkspaceBackend):
             entry_remote = posixpath.join(remote_path, entry.filename)
             # Compute path relative to workspace root
             if entry_remote.startswith(self._remote_root + "/"):
-                rel = entry_remote[len(self._remote_root) + 1:]
+                rel = entry_remote[len(self._remote_root) + 1 :]
             else:
                 rel = entry.filename
 
@@ -421,16 +446,18 @@ class RemoteBackend(WorkspaceBackend):
 
             # Make path relative to workspace root
             if file_path.startswith(self._remote_root + "/"):
-                rel_path = file_path[len(self._remote_root) + 1:]
+                rel_path = file_path[len(self._remote_root) + 1 :]
             else:
                 rel_path = file_path
 
             try:
-                results.append({
-                    "path": rel_path,
-                    "line_number": int(line_num),
-                    "line": content.strip(),
-                })
+                results.append(
+                    {
+                        "path": rel_path,
+                        "line_number": int(line_num),
+                        "line": content.strip(),
+                    }
+                )
             except ValueError:
                 continue
 
@@ -553,8 +580,7 @@ class RemoteBackend(WorkspaceBackend):
 
         # Create new detached session
         self._exec(
-            f"tmux new-session -d -s {self._session_name} "
-            f"-x 200 -y 30 -n default"
+            f"tmux new-session -d -s {self._session_name} -x 200 -y 30 -n default"
         )
 
         # Set history limit
@@ -691,7 +717,11 @@ class RemoteBackend(WorkspaceBackend):
 
             # Change directory if needed
             if working_dir:
-                full_dir = posixpath.join(self._sandbox_cwd, working_dir) if self._sandbox_cwd else working_dir
+                full_dir = (
+                    posixpath.join(self._sandbox_cwd, working_dir)
+                    if self._sandbox_cwd
+                    else working_dir
+                )
                 self._tmux_send_keys(tab_name, f"cd {full_dir}", enter=True)
                 time.sleep(0.1)
 
@@ -752,7 +782,9 @@ class RemoteBackend(WorkspaceBackend):
                             tab_name, sentinel, pre_count
                         )
                         if working_dir and self._sandbox_cwd:
-                            self._tmux_send_keys(tab_name, f"cd {self._sandbox_cwd}", enter=True)
+                            self._tmux_send_keys(
+                                tab_name, f"cd {self._sandbox_cwd}", enter=True
+                            )
                             time.sleep(0.1)
                         tab.last_activity = datetime.now(timezone.utc)
                         return (
@@ -771,7 +803,9 @@ class RemoteBackend(WorkspaceBackend):
                                 tab_name, sentinel, pre_count
                             )
                             if working_dir and self._sandbox_cwd:
-                                self._tmux_send_keys(tab_name, f"cd {self._sandbox_cwd}", enter=True)
+                                self._tmux_send_keys(
+                                    tab_name, f"cd {self._sandbox_cwd}", enter=True
+                                )
                                 time.sleep(0.1)
                             tab.last_activity = datetime.now(timezone.utc)
                             return (
@@ -842,7 +876,9 @@ class RemoteBackend(WorkspaceBackend):
                 return blocked
 
         if tab_name not in self._tabs:
-            raise KeyError(f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}")
+            raise KeyError(
+                f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}"
+            )
 
         self._tmux_send_keys(tab_name, text, enter=enter)
         self._tabs[tab_name].last_activity = datetime.now(timezone.utc)
@@ -857,14 +893,16 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_shell()
 
         if tab_name not in self._tabs:
-            raise KeyError(f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}")
+            raise KeyError(
+                f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}"
+            )
 
         tab = self._tabs[tab_name]
         all_lines = self._tmux_capture(tab_name)
         total_lines = len(all_lines)
 
         if since_cursor:
-            new_lines = all_lines[tab.read_cursor:]
+            new_lines = all_lines[tab.read_cursor :]
             tab.read_cursor = total_lines
             text = "\n".join(new_lines) if new_lines else "(no new output)"
             metadata = {
@@ -897,7 +935,9 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_shell()
 
         if tab_name not in self._tabs:
-            raise KeyError(f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}")
+            raise KeyError(
+                f"Tab '{tab_name}' not found. Available: {', '.join(self._tabs.keys())}"
+            )
 
         all_lines = self._tmux_capture(tab_name)
         total_lines = len(all_lines)
@@ -961,14 +1001,13 @@ class RemoteBackend(WorkspaceBackend):
             tab_type = "shell"
             if command:
                 from src.tools.coding.shell_manager import COMMAND_TYPE_MAP
+
                 first_word = command.strip().split()[0]
                 base_cmd = first_word.rsplit("/", 1)[-1]
                 tab_type = COMMAND_TYPE_MAP.get(base_cmd, "process")
 
         # Create new tmux window
-        self._exec(
-            f"tmux new-window -t {self._session_name} -n {name} -d"
-        )
+        self._exec(f"tmux new-window -t {self._session_name} -n {name} -d")
 
         # Set working directory
         if self._sandbox_cwd and tab_type in ("shell", "process"):
@@ -988,7 +1027,9 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_shell()
 
         if name not in self._tabs:
-            raise KeyError(f"Tab '{name}' not found. Available: {', '.join(self._tabs.keys())}")
+            raise KeyError(
+                f"Tab '{name}' not found. Available: {', '.join(self._tabs.keys())}"
+            )
 
         self._exec(f"tmux kill-window -t {self._session_name}:{name}")
         del self._tabs[name]

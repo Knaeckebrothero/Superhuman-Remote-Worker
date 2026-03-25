@@ -26,7 +26,6 @@ class ContextOverflowError(Exception):
         self.limit = limit
         self.request_size_bytes = request_size_bytes
         self.message = message or (
-            f"Request body has {token_count:,} tokens, "
-            f"exceeds model limit of {limit:,}"
+            f"Request body has {token_count:,} tokens, exceeds model limit of {limit:,}"
         )
         super().__init__(self.message)

@@ -148,14 +148,18 @@ def _load_matrix_file(path: Path) -> Dict[str, Dict[str, Any]]:
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if not isinstance(data, dict):
-            logger.warning(f"Invalid settings matrix {path}: expected dict, got {type(data)}")
+            logger.warning(
+                f"Invalid settings matrix {path}: expected dict, got {type(data)}"
+            )
             return {}
         result = {}
         for family, params in data.items():
             if isinstance(params, dict):
                 result[family] = params
             else:
-                logger.warning(f"settings_matrix: skipping '{family}' (expected dict, got {type(params)})")
+                logger.warning(
+                    f"settings_matrix: skipping '{family}' (expected dict, got {type(params)})"
+                )
         return result
     except Exception as e:
         logger.warning(f"Failed to load {path}: {e}")
@@ -173,7 +177,9 @@ def _load_settings_matrix(deployment_dir: str = None) -> Dict[str, Dict[str, Any
         base_path = get_project_root() / "config" / "settings_matrix.yaml"
         _settings_matrix_base_cache = _load_matrix_file(base_path)
         if _settings_matrix_base_cache:
-            logger.debug(f"Loaded settings matrix: {len(_settings_matrix_base_cache)} families")
+            logger.debug(
+                f"Loaded settings matrix: {len(_settings_matrix_base_cache)} families"
+            )
 
     base = _settings_matrix_base_cache
     if not deployment_dir:
@@ -299,7 +305,9 @@ class FileResolver:
             framework_dir: Path to framework directory. Defaults to config/prompts/.
         """
         self.deployment_dir = Path(deployment_dir) if deployment_dir else None
-        self.framework_dir = framework_dir or (get_project_root() / "config" / "prompts")
+        self.framework_dir = framework_dir or (
+            get_project_root() / "config" / "prompts"
+        )
 
     def resolve(self, template_name: str) -> Path:
         """Find template file, checking deployment dir first.
@@ -599,7 +607,9 @@ class PhaseLLMOverride:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     reasoning_level: Optional[str] = None
-    reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect)
+    reasoning_method: Optional[str] = (
+        None  # "prompt", "api", "none", or None (auto-detect)
+    )
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     timeout: Optional[float] = None
@@ -632,20 +642,28 @@ class LLMConfig:
     """
 
     model: str = "gpt-4o"
-    provider: Optional[str] = None  # "openai", "anthropic", "google", "groq", "openrouter" (auto-detect if None)
+    provider: Optional[str] = (
+        None  # "openai", "anthropic", "google", "groq", "openrouter" (auto-detect if None)
+    )
     temperature: float = 0.0
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     reasoning_level: str = "high"
-    reasoning_method: Optional[str] = None  # "prompt", "api", "none", or None (auto-detect from model)
+    reasoning_method: Optional[str] = (
+        None  # "prompt", "api", "none", or None (auto-detect from model)
+    )
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     timeout: Optional[float] = 600.0  # 10 minutes default
     max_retries: int = 3
     multimodal: bool = False  # Whether model can process images directly
     parallel_tool_calls: bool = False  # Allow multiple tool calls per response
-    max_output_tokens: Optional[int] = None  # Override max output tokens (auto-detected if None)
-    model_max_context_tokens: Optional[int] = None  # Per-model context window limit (falls back to limits.model_max_context_tokens)
+    max_output_tokens: Optional[int] = (
+        None  # Override max output tokens (auto-detected if None)
+    )
+    model_max_context_tokens: Optional[int] = (
+        None  # Per-model context window limit (falls back to limits.model_max_context_tokens)
+    )
 
     # Phase-specific overrides (optional)
     strategic: Optional[PhaseLLMOverride] = None
@@ -672,20 +690,40 @@ class LLMConfig:
         # Create new config with overrides applied (don't copy phase fields)
         return LLMConfig(
             model=override.model if override.model is not None else self.model,
-            provider=override.provider if override.provider is not None else self.provider,
-            temperature=override.temperature if override.temperature is not None else self.temperature,
+            provider=override.provider
+            if override.provider is not None
+            else self.provider,
+            temperature=override.temperature
+            if override.temperature is not None
+            else self.temperature,
             top_p=override.top_p if override.top_p is not None else self.top_p,
             top_k=override.top_k if override.top_k is not None else self.top_k,
-            reasoning_level=override.reasoning_level if override.reasoning_level is not None else self.reasoning_level,
-            reasoning_method=override.reasoning_method if override.reasoning_method is not None else self.reasoning_method,
-            base_url=override.base_url if override.base_url is not None else self.base_url,
+            reasoning_level=override.reasoning_level
+            if override.reasoning_level is not None
+            else self.reasoning_level,
+            reasoning_method=override.reasoning_method
+            if override.reasoning_method is not None
+            else self.reasoning_method,
+            base_url=override.base_url
+            if override.base_url is not None
+            else self.base_url,
             api_key=override.api_key if override.api_key is not None else self.api_key,
             timeout=override.timeout if override.timeout is not None else self.timeout,
-            max_retries=override.max_retries if override.max_retries is not None else self.max_retries,
-            multimodal=override.multimodal if override.multimodal is not None else self.multimodal,
-            parallel_tool_calls=override.parallel_tool_calls if override.parallel_tool_calls is not None else self.parallel_tool_calls,
-            max_output_tokens=override.max_output_tokens if override.max_output_tokens is not None else self.max_output_tokens,
-            model_max_context_tokens=override.model_max_context_tokens if override.model_max_context_tokens is not None else self.model_max_context_tokens,
+            max_retries=override.max_retries
+            if override.max_retries is not None
+            else self.max_retries,
+            multimodal=override.multimodal
+            if override.multimodal is not None
+            else self.multimodal,
+            parallel_tool_calls=override.parallel_tool_calls
+            if override.parallel_tool_calls is not None
+            else self.parallel_tool_calls,
+            max_output_tokens=override.max_output_tokens
+            if override.max_output_tokens is not None
+            else self.max_output_tokens,
+            model_max_context_tokens=override.model_max_context_tokens
+            if override.model_max_context_tokens is not None
+            else self.model_max_context_tokens,
             # Phase overrides not inherited to resolved config
             strategic=None,
             tactical=None,
@@ -707,7 +745,9 @@ class WorkspaceConfig:
     max_read_words: int = 25000  # Maximum word count for file reads
     git_versioning: bool = True  # Enable git versioning for workspace history
     backend: str = "local"  # "local" or "remote"
-    remote: Optional[Dict[str, Any]] = None  # {host, port, username, key_path, workspace_path}
+    remote: Optional[Dict[str, Any]] = (
+        None  # {host, port, username, key_path, workspace_path}
+    )
 
 
 @dataclass
@@ -751,17 +791,27 @@ class ResponseValidationConfig:
 class LimitsConfig:
     """Execution limits configuration."""
 
-    context_threshold_tokens: int = 80000       # Safety net default; real value from settings_matrix
+    context_threshold_tokens: int = (
+        80000  # Safety net default; real value from settings_matrix
+    )
     message_count_threshold: int = 200
-    message_count_min_tokens: int = 50000      # Safety net default; real value from settings_matrix
+    message_count_min_tokens: int = (
+        50000  # Safety net default; real value from settings_matrix
+    )
     tool_retry_count: int = 3
     # Safety layer constants — real values come from settings_matrix.yaml
     model_max_context_tokens: int = 100000
     summarization_safe_limit: int = 90000
     summarization_chunk_size: int = 80000
-    response_validation: ResponseValidationConfig = field(default_factory=ResponseValidationConfig)
-    progress_stall_threshold: int = 30     # tool calls without progress before nudge reminder
-    max_tool_calls_per_phase: int = 200    # max tool calls per phase before rewind (tactical) or freeze (strategic)
+    response_validation: ResponseValidationConfig = field(
+        default_factory=ResponseValidationConfig
+    )
+    progress_stall_threshold: int = (
+        30  # tool calls without progress before nudge reminder
+    )
+    max_tool_calls_per_phase: int = (
+        200  # max tool calls per phase before rewind (tactical) or freeze (strategic)
+    )
 
 
 @dataclass
@@ -832,17 +882,19 @@ class AuxiliaryConfig:
     """
 
     enabled: bool = True
-    model: Optional[str] = None       # null = use main LLM
-    base_url: Optional[str] = None    # null = use main LLM endpoint
-    api_key: Optional[str] = None     # null = use provider env var
+    model: Optional[str] = None  # null = use main LLM
+    base_url: Optional[str] = None  # null = use main LLM endpoint
+    api_key: Optional[str] = None  # null = use provider env var
     temperature: float = 0.0
-    max_iterations: int = 15          # Cap for agent mode loops
-    timeout: float = 120.0            # Seconds per LLM call
-    tasks: Dict[str, AuxiliaryTaskConfig] = field(default_factory=lambda: {
-        "extract_memories": AuxiliaryTaskConfig(enabled=True),
-        "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
-        "assemble_memories": AuxiliaryTaskConfig(enabled=True),
-    })
+    max_iterations: int = 15  # Cap for agent mode loops
+    timeout: float = 120.0  # Seconds per LLM call
+    tasks: Dict[str, AuxiliaryTaskConfig] = field(
+        default_factory=lambda: {
+            "extract_memories": AuxiliaryTaskConfig(enabled=True),
+            "curate_knowledge": AuxiliaryTaskConfig(enabled=True),
+            "assemble_memories": AuxiliaryTaskConfig(enabled=True),
+        }
+    )
 
 
 @dataclass
@@ -861,8 +913,8 @@ class DelegationConfig:
 
     enabled: bool = False
     max_depth: int = 1  # Max delegation nesting; only delegation links count (lifecycle links are depth-transparent)
-    default_timeout: int = 7200            # 2 hours
-    max_timeout: int = 14400               # 4 hours
+    default_timeout: int = 7200  # 2 hours
+    max_timeout: int = 14400  # 4 hours
     allowed_configs: List[str] = field(default_factory=list)  # empty = any
 
 
@@ -1042,8 +1094,7 @@ def _parse_response_validation(data: Dict[str, Any]) -> ResponseValidationConfig
 
 
 def load_agent_config(
-    config_path: str,
-    deployment_dir: Optional[str] = None
+    config_path: str, deployment_dir: Optional[str] = None
 ) -> AgentConfig:
     """Load agent configuration from a JSON file.
 
@@ -1160,7 +1211,9 @@ def load_agent_config(
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
-        response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
+        response_validation=_parse_response_validation(
+            limits_data.get("response_validation", {})
+        ),
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
     )
@@ -1171,8 +1224,7 @@ def load_agent_config(
         keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
-            "summarization_template",
-            "summarization_prompt.txt"
+            "summarization_template", "summarization_prompt.txt"
         ),
         reasoning_level=context_data.get("reasoning_level", "high"),
         max_summary_length=context_data.get("max_summary_length", 10000),
@@ -1219,10 +1271,23 @@ def load_agent_config(
 
     # Collect extra fields (agent-specific config)
     known_fields = {
-        "$schema", "agent_id", "display_name", "description", "llm", "workspace",
-        "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "memory", "auxiliary", "instruction_files", "delegation",
-        "autonomy"
+        "$schema",
+        "agent_id",
+        "display_name",
+        "description",
+        "llm",
+        "workspace",
+        "tools",
+        "connections",
+        "polling",
+        "limits",
+        "context_management",
+        "phase_settings",
+        "memory",
+        "auxiliary",
+        "instruction_files",
+        "delegation",
+        "autonomy",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1248,8 +1313,7 @@ def load_agent_config(
 
 
 def load_agent_config_from_dict(
-    data: Dict[str, Any],
-    deployment_dir: Optional[str] = None
+    data: Dict[str, Any], deployment_dir: Optional[str] = None
 ) -> AgentConfig:
     """Create an AgentConfig from a pre-merged configuration dictionary.
 
@@ -1325,7 +1389,9 @@ def load_agent_config_from_dict(
         model_max_context_tokens=limits_data.get("model_max_context_tokens", 100000),
         summarization_safe_limit=limits_data.get("summarization_safe_limit", 90000),
         summarization_chunk_size=limits_data.get("summarization_chunk_size", 80000),
-        response_validation=_parse_response_validation(limits_data.get("response_validation", {})),
+        response_validation=_parse_response_validation(
+            limits_data.get("response_validation", {})
+        ),
         progress_stall_threshold=limits_data.get("progress_stall_threshold", 30),
         max_tool_calls_per_phase=limits_data.get("max_tool_calls_per_phase", 200),
     )
@@ -1336,8 +1402,7 @@ def load_agent_config_from_dict(
         keep_recent_tool_results=context_data.get("keep_recent_tool_results", 15),
         keep_recent_messages=context_data.get("keep_recent_messages", 10),
         summarization_template=context_data.get(
-            "summarization_template",
-            "summarization_prompt.txt"
+            "summarization_template", "summarization_prompt.txt"
         ),
         reasoning_level=context_data.get("reasoning_level", "high"),
         max_summary_length=context_data.get("max_summary_length", 10000),
@@ -1384,10 +1449,23 @@ def load_agent_config_from_dict(
 
     # Collect extra fields
     known_fields = {
-        "$schema", "agent_id", "display_name", "description", "llm", "workspace",
-        "tools", "connections", "polling", "limits", "context_management",
-        "phase_settings", "memory", "auxiliary", "instruction_files", "delegation",
-        "autonomy"
+        "$schema",
+        "agent_id",
+        "display_name",
+        "description",
+        "llm",
+        "workspace",
+        "tools",
+        "connections",
+        "polling",
+        "limits",
+        "context_management",
+        "phase_settings",
+        "memory",
+        "auxiliary",
+        "instruction_files",
+        "delegation",
+        "autonomy",
     }
     extra = {k: v for k, v in data.items() if k not in known_fields}
 
@@ -1517,7 +1595,7 @@ def detect_model_family(model: str) -> str:
     # Strip provider prefixes to get the actual model name
     for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):
-            name = name[len(prefix):]
+            name = name[len(prefix) :]
             # Strip second-level provider prefix (e.g., "anthropic/" in "openrouter/anthropic/claude-opus-4")
             if "/" in name:
                 name = name.split("/", 1)[1]
@@ -1525,7 +1603,7 @@ def detect_model_family(model: str) -> str:
 
     # Strip openai/ prefix for self-hosted models
     if name.startswith("openai/"):
-        name = name[len("openai/"):]
+        name = name[len("openai/") :]
 
     # Pattern match model name to family
     if name.startswith("claude-opus"):
@@ -1689,7 +1767,9 @@ def _create_openai_llm(
     raw_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
     keys = parse_key_string(raw_key) or ["not-needed"]
     cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
-    key_ring = get_or_create_key_ring(keys, provider="openai", cooldown_seconds=cooldown)
+    key_ring = get_or_create_key_ring(
+        keys, provider="openai", cooldown_seconds=cooldown
+    )
 
     # SDK gets the first key; KeyRing overrides the header in send()
     api_key = keys[0]
@@ -1752,7 +1832,9 @@ def _create_openai_llm(
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     # Prefer per-model config value, fall back to global limits
-    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
+    max_context_tokens = config.model_max_context_tokens or (
+        limits.model_max_context_tokens if limits else None
+    )
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
@@ -1809,7 +1891,9 @@ def _create_anthropic_llm(
         llm_kwargs["max_tokens"] = config.max_output_tokens
     else:
         model_lower = config.model.lower()
-        if any(x in model_lower for x in ("opus-4-6", "opus-4-5", "opus-4-1", "opus-4-0")):
+        if any(
+            x in model_lower for x in ("opus-4-6", "opus-4-5", "opus-4-1", "opus-4-0")
+        ):
             llm_kwargs["max_tokens"] = 32000
         elif any(x in model_lower for x in ("sonnet-4-5", "sonnet-4-0")):
             llm_kwargs["max_tokens"] = 16384
@@ -1895,7 +1979,7 @@ def _create_groq_llm(
     # Strip groq/ prefix — Groq API expects bare model names
     model = config.model
     if model.lower().startswith("groq/"):
-        model = model[len("groq/"):]
+        model = model[len("groq/") :]
 
     llm_kwargs = {
         "model": model,
@@ -1966,7 +2050,9 @@ def _create_openrouter_llm(
     if not keys:
         raise ValueError("OPENROUTER_API_KEY is empty after parsing.")
     cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
-    key_ring = get_or_create_key_ring(keys, provider="openrouter", cooldown_seconds=cooldown)
+    key_ring = get_or_create_key_ring(
+        keys, provider="openrouter", cooldown_seconds=cooldown
+    )
 
     # SDK gets the first key; KeyRing overrides the header in send()
     api_key = keys[0]
@@ -1974,7 +2060,7 @@ def _create_openrouter_llm(
     # Strip openrouter/ prefix — OpenRouter expects provider/model format
     model = config.model
     if model.lower().startswith("openrouter/"):
-        model = model[len("openrouter/"):]
+        model = model[len("openrouter/") :]
 
     # Base URL: explicit config wins, otherwise always OpenRouter
     base_url = config.base_url or "https://openrouter.ai/api/v1"
@@ -2033,7 +2119,9 @@ def _create_openrouter_llm(
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     # Prefer per-model config value, fall back to global limits
-    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
+    max_context_tokens = config.model_max_context_tokens or (
+        limits.model_max_context_tokens if limits else None
+    )
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
@@ -2043,7 +2131,11 @@ def _create_openrouter_llm(
     llm = ReasoningChatOpenAI(**llm_kwargs)
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
-    reasoning_mode = f"chat_completions(effort={config.reasoning_level})" if config.reasoning_level and config.reasoning_level != "none" else "none"
+    reasoning_mode = (
+        f"chat_completions(effort={config.reasoning_level})"
+        if config.reasoning_level and config.reasoning_level != "none"
+        else "none"
+    )
     logger.info(
         f"Created OpenRouter LLM: model={model}, temp={config.temperature}, "
         f"base_url={base_url}, timeout={config.timeout}s, "
@@ -2093,10 +2185,12 @@ def _create_codex_llm(
     # Strip codex/ prefix — the proxy expects bare model names
     model = config.model
     if model.lower().startswith("codex/"):
-        model = model[len("codex/"):]
+        model = model[len("codex/") :]
 
     # Base URL: explicit config → env var → default localhost proxy
-    base_url = config.base_url or os.getenv("CODEX_BASE_URL", "http://localhost:8317/v1")
+    base_url = config.base_url or os.getenv(
+        "CODEX_BASE_URL", "http://localhost:8317/v1"
+    )
 
     # Build model kwargs
     model_kwargs = {}
@@ -2134,7 +2228,9 @@ def _create_codex_llm(
 
     # Add max_context_tokens for HTTP-layer validation (Layer 0 safety)
     # Prefer per-model config value, fall back to global limits
-    max_context_tokens = config.model_max_context_tokens or (limits.model_max_context_tokens if limits else None)
+    max_context_tokens = config.model_max_context_tokens or (
+        limits.model_max_context_tokens if limits else None
+    )
     if max_context_tokens:
         llm_kwargs["max_context_tokens"] = max_context_tokens
 
@@ -2243,7 +2339,9 @@ def get_phase_system_prompt(
     resolver = PromptMatrixResolver(config._deployment_dir, model_family)
 
     # 1. Load base template
-    base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(resolver)
+    base_template = resolved_prompts.get("systemprompt") or load_base_system_prompt(
+        resolver
+    )
 
     # 2. Load expert persona (empty string if no persona file exists)
     expert_identity = resolved_prompts.get("persona") or ""
@@ -2255,7 +2353,9 @@ def get_phase_system_prompt(
 
     # 3. Load phase component
     prompt_type = "strategic" if is_strategic else "tactical"
-    phase_component = resolved_prompts.get(prompt_type) or load_phase_component(is_strategic, resolver)
+    phase_component = resolved_prompts.get(prompt_type) or load_phase_component(
+        is_strategic, resolver
+    )
 
     # 4. Render Jinja2 conditionals BEFORE .format() — Python's str.format()
     # chokes on {%..%} blocks. Jinja2 leaves single-brace placeholders untouched.
@@ -2274,7 +2374,9 @@ def get_phase_system_prompt(
     )
 
     # Prepend reasoning directive only for OSS models that need it as prompt text
-    method = detect_reasoning_method(model or config.llm.model, config.llm.reasoning_method)
+    method = detect_reasoning_method(
+        model or config.llm.model, config.llm.reasoning_method
+    )
     if method == "prompt":
         level = config.llm.reasoning_level or "high"
         rendered = f"Reasoning: {level}\n\n{rendered}"
@@ -2304,9 +2406,7 @@ def load_instructions(config: AgentConfig, model: str = "") -> str:
     try:
         return resolver.load("instructions")
     except FileNotFoundError:
-        logger.warning(
-            "Instructions template not found. Using minimal instructions."
-        )
+        logger.warning("Instructions template not found. Using minimal instructions.")
         # Build tool list from all categories
         all_tools = []
         all_tools.extend(config.tools.workspace)
@@ -2364,9 +2464,7 @@ def load_summarization_prompt(config: AgentConfig, model: str = "") -> str:
         try:
             template = resolver.load("summarization")
         except FileNotFoundError:
-            logger.warning(
-                "Summarization prompt not found. Using default prompt."
-            )
+            logger.warning("Summarization prompt not found. Using default prompt.")
             template = """Summarize this agent conversation concisely.
 Focus on:
 1. What tasks were completed
@@ -2388,13 +2486,19 @@ Conversation:
         summarization_config.reasoning_method,
     )
     if method == "prompt":
-        level = config.context_management.reasoning_level or config.llm.reasoning_level or "high"
+        level = (
+            config.context_management.reasoning_level
+            or config.llm.reasoning_level
+            or "high"
+        )
         template = f"Reasoning: {level}\n\n{template}"
 
     return template
 
 
-def load_auxiliary_prompt(config: AgentConfig, prompt_type: str, model: str = "") -> str:
+def load_auxiliary_prompt(
+    config: AgentConfig, prompt_type: str, model: str = ""
+) -> str:
     """Load an auxiliary task prompt via the prompt matrix.
 
     Uses PromptMatrixResolver for model-aware prompt resolution.
@@ -2421,7 +2525,9 @@ def load_auxiliary_prompt(config: AgentConfig, prompt_type: str, model: str = ""
         template = resolver.load(prompt_type)
 
     # Prepend reasoning directive for models that need it as prompt text (e.g. gpt-oss)
-    method = detect_reasoning_method(model or config.llm.model, config.llm.reasoning_method)
+    method = detect_reasoning_method(
+        model or config.llm.model, config.llm.reasoning_method
+    )
     if method == "prompt":
         level = config.llm.reasoning_level or "high"
         template = f"Reasoning: {level}\n\n{template}"
@@ -2443,24 +2549,28 @@ def get_all_tool_names(config: AgentConfig) -> List[str]:
         List of all configured tool names
     """
     names = (
-        config.tools.workspace +
-        config.tools.core +
-        config.tools.document +
-        config.tools.research +
-        config.tools.citation +
-        config.tools.graph +
-        config.tools.sql +
-        config.tools.mongodb +
-        config.tools.git +
-        config.tools.coding +
-        config.tools.evaluation +
-        config.tools.knowledge +
-        config.tools.delegation
+        config.tools.workspace
+        + config.tools.core
+        + config.tools.document
+        + config.tools.research
+        + config.tools.citation
+        + config.tools.graph
+        + config.tools.sql
+        + config.tools.mongodb
+        + config.tools.git
+        + config.tools.coding
+        + config.tools.evaluation
+        + config.tools.knowledge
+        + config.tools.delegation
     )
 
     # Shell mode aliasing for backward compatibility
     shell_config = config.extra.get("shell", {})
-    mode = shell_config.get("mode", "stateless") if isinstance(shell_config, dict) else "stateless"
+    mode = (
+        shell_config.get("mode", "stateless")
+        if isinstance(shell_config, dict)
+        else "stateless"
+    )
     if mode == "stateless":
         names = ["run_command" if n == "shell_execute" else n for n in names]
     elif mode == "persistent":
@@ -2590,7 +2700,9 @@ def _parse_strategic_todos_yaml(path: Path) -> List[Dict[str, Any]]:
     if "todos" not in data:
         raise StrategicTodosValidationError(
             f"Missing required 'todos' key in {path}",
-            ["Strategic todos template must have a 'todos' key with a list of todo items"],
+            [
+                "Strategic todos template must have a 'todos' key with a list of todo items"
+            ],
         )
 
     todos_raw = data["todos"]
@@ -2639,10 +2751,12 @@ def _parse_strategic_todos_yaml(path: Path) -> List[Dict[str, Any]]:
 
         # If valid so far, add to validated list
         if todo_id is not None and content_val is not None and not errors:
-            validated_todos.append({
-                "id": todo_id,
-                "content": content_val.strip(),
-            })
+            validated_todos.append(
+                {
+                    "id": todo_id,
+                    "content": content_val.strip(),
+                }
+            )
 
     if errors:
         raise StrategicTodosValidationError(
@@ -2650,7 +2764,9 @@ def _parse_strategic_todos_yaml(path: Path) -> List[Dict[str, Any]]:
             errors,
         )
 
-    logger.debug(f"Parsed strategic todos template: {len(validated_todos)} todos from {path}")
+    logger.debug(
+        f"Parsed strategic todos template: {len(validated_todos)} todos from {path}"
+    )
     return validated_todos
 
 
@@ -2716,7 +2832,8 @@ def _parse_strategic_todos_yaml_from_string(content: str) -> List[Dict[str, Any]
 
     if errors:
         raise StrategicTodosValidationError(
-            f"Strategic todos validation failed with {len(errors)} error(s)", errors,
+            f"Strategic todos validation failed with {len(errors)} error(s)",
+            errors,
         )
     return validated_todos
 
@@ -2763,7 +2880,9 @@ def load_strategic_todos_template(
     instruction_type = template_name.replace(".yaml", "")
 
     try:
-        path = resolver._file_resolver.resolve(resolver.resolve_filename(instruction_type))
+        path = resolver._file_resolver.resolve(
+            resolver.resolve_filename(instruction_type)
+        )
         logger.debug(f"Loading strategic todos from: {path}")
         # Render Jinja2 templates before YAML parsing
         if tool_names:

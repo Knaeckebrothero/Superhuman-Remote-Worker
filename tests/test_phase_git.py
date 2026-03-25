@@ -31,8 +31,7 @@ def git_available():
 
 # Skip all tests if git is not available
 pytestmark = pytest.mark.skipif(
-    not git_available(),
-    reason="Git not available on system"
+    not git_available(), reason="Git not available on system"
 )
 
 

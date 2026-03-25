@@ -72,7 +72,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
       - name: Audit Python dependencies
-        run: pip-audit --desc
+        run: pip-audit --desc --ignore-vuln CVE-2026-4539  # pygments ≤2.19.2 local-only ReDoS in AdlLexer, no fix released
       - name: Audit npm dependencies
         working-directory: cockpit
         run: npm audit --audit-level=high
@@ -89,7 +89,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt -r orchestrator/requirements.txt pytest
       - name: Run tests
         run: pytest tests/ -x -q --tb=short
 
@@ -164,7 +164,7 @@ jobs:
               - 'vm/sudo-plugin/**'
 
   build-agent:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -222,7 +222,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-orchestrator:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -272,7 +272,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-cockpit:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -322,7 +322,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-mcp:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -372,7 +372,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-vpn:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.vpn == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -422,7 +422,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE"
 
   build-sudo-gate:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -464,7 +464,7 @@ jobs:
           retention-days: 7
 
   build-agent-vm-base:
-    needs: [changes, build-sudo-gate]
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit, build-sudo-gate]
     # Rebuild when vm-base OR sudo-gate changes (sudo gate binaries are baked into the image)
     if: >-
       always() && github.event_name != 'pull_request' && (
@@ -581,7 +581,7 @@ jobs:
           echo "Pushed ${IMAGE}:latest"
 
   build-vm-controller:
-    needs: changes
+    needs: [changes, lint, dependency-audit, test-python, test-cockpit]
     if: github.event_name != 'pull_request' && (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15

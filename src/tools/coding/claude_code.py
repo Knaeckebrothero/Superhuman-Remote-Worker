@@ -50,7 +50,7 @@ def _truncate_output(text: str, max_chars: int, label: str = "output") -> str:
     truncated = text[-max_chars:]
     first_newline = truncated.find("\n")
     if 0 < first_newline < 200:
-        truncated = truncated[first_newline + 1:]
+        truncated = truncated[first_newline + 1 :]
 
     chars_removed = len(text) - len(truncated)
     return f"[{label} truncated: {chars_removed} chars removed from start]\n{truncated}"
@@ -149,8 +149,10 @@ def create_claude_code_tools(context: ToolContext) -> List[Any]:
         cmd = [
             claude_bin,
             "-p",  # Print mode (non-interactive)
-            "--output-format", "json",
-            "--model", model,
+            "--output-format",
+            "json",
+            "--model",
+            model,
             "--dangerously-skip-permissions",
         ]
         if session_id:
@@ -202,7 +204,9 @@ def create_claude_code_tools(context: ToolContext) -> List[Any]:
             try:
                 result_data = json.loads(stdout)
             except json.JSONDecodeError:
-                logger.warning("claude_code: failed to parse JSON output, returning raw")
+                logger.warning(
+                    "claude_code: failed to parse JSON output, returning raw"
+                )
 
         # Build result from parsed JSON
         if result_data:
@@ -211,7 +215,9 @@ def create_claude_code_tools(context: ToolContext) -> List[Any]:
             # Main result text
             result_text = result_data.get("result", "")
             if result_text:
-                result_text = _truncate_output(result_text, MAX_OUTPUT_CHARS, "response")
+                result_text = _truncate_output(
+                    result_text, MAX_OUTPUT_CHARS, "response"
+                )
                 output_parts.append(result_text)
 
             # Session metadata

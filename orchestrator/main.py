@@ -31,8 +31,17 @@ if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     # App namespaces (covers both `uvicorn orchestrator.main:app` and `uvicorn main:app`)
-    for _ns in ("orchestrator", "main", "database", "security", "services",
-                "uploads", "mcp", "graph_routes", "workspace"):
+    for _ns in (
+        "orchestrator",
+        "main",
+        "database",
+        "security",
+        "services",
+        "uploads",
+        "mcp",
+        "graph_routes",
+        "workspace",
+    ):
         logging.getLogger(_ns).setLevel(logging.DEBUG)
 else:
     logging.basicConfig(
@@ -57,7 +66,11 @@ from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from database import PostgresDB, MongoDB, ALLOWED_TABLES, FilterCategory  # noqa: E402
-from security.auth import get_current_user, require_approved_user, cleanup_expired_tokens  # noqa: E402
+from security.auth import (  # noqa: E402
+    get_current_user,
+    require_approved_user,
+    cleanup_expired_tokens,
+)
 from services.workspace import workspace_service  # noqa: E402
 from services.gitea import GiteaClient  # noqa: E402
 from services.keycloak_admin import KeycloakGroupSync  # noqa: E402
@@ -209,19 +222,23 @@ async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
     # Pre-merge cleanup: delete job-scoped files from subjob branch
     for file_path in SUBJOB_CLEANUP_FILES:
         await gitea_client.delete_file(
-            repo_name, file_path,
+            repo_name,
+            file_path,
             f"Pre-merge cleanup: remove {file_path}",
             branch=subjob_branch,
         )
 
     # Delete job-scoped directories (list contents then delete each file)
     for dir_path in SUBJOB_CLEANUP_DIRS:
-        entries = await gitea_client.list_contents(repo_name, dir_path, ref=subjob_branch)
+        entries = await gitea_client.list_contents(
+            repo_name, dir_path, ref=subjob_branch
+        )
         if entries:
             for entry in entries:
                 if entry.get("type") == "file":
                     await gitea_client.delete_file(
-                        repo_name, entry["path"],
+                        repo_name,
+                        entry["path"],
                         f"Pre-merge cleanup: remove {entry['path']}",
                         branch=subjob_branch,
                     )
@@ -254,7 +271,9 @@ async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
     )
 
     if not merged:
-        logger.warning(f"Squash merge failed for subjob {short_id} (PR #{pr['number']})")
+        logger.warning(
+            f"Squash merge failed for subjob {short_id} (PR #{pr['number']})"
+        )
         await postgres_db.update_job_merge_status(job_id, merge_status="conflict")
         return {"status": "conflict", "pr_number": pr["number"]}
 
@@ -279,7 +298,11 @@ async def _squash_merge_subjob(job_id: str) -> dict[str, Any] | None:
 _shutdown_event: asyncio.Event | None = None
 
 # Auto-assignment toggle (env var, default true)
-AUTO_ASSIGN_ENABLED = os.environ.get("AUTO_ASSIGN_ENABLED", "true").lower() in ("true", "1", "yes")
+AUTO_ASSIGN_ENABLED = os.environ.get("AUTO_ASSIGN_ENABLED", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # Dispatcher lock prevents concurrent dispatch (double-assignment)
 _dispatch_lock = asyncio.Lock()
@@ -299,7 +322,9 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
         try:
             count = await postgres_db.mark_stale_agents_offline(timeout_minutes=3)
             if count > 0:
-                logger.info(f"Marked {count} agent(s) as offline due to missed heartbeats")
+                logger.info(
+                    f"Marked {count} agent(s) as offline due to missed heartbeats"
+                )
         except Exception as e:
             logger.error(f"Error in stale agent detector: {e}")
 
@@ -397,7 +422,9 @@ async def quiet_hours_digest_loop(shutdown_event: asyncio.Event) -> None:
     """
     while not shutdown_event.is_set():
         try:
-            users = await postgres_db.get_users_exiting_quiet_hours(check_window_minutes=5)
+            users = await postgres_db.get_users_exiting_quiet_hours(
+                check_window_minutes=5
+            )
             for user_data in users:
                 user_id = str(user_data["user_id"])
                 user_settings = user_data.get("settings") or {}
@@ -420,7 +447,8 @@ async def quiet_hours_digest_loop(shutdown_event: asyncio.Event) -> None:
 
                 logger.info(
                     "Digest sent to user %s: %d notification(s)",
-                    user_id[:8], len(pending),
+                    user_id[:8],
+                    len(pending),
                 )
         except Exception as e:
             logger.error(f"Quiet hours digest loop error: {e}")
@@ -455,7 +483,8 @@ async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
 
         try:
             await asyncio.wait_for(
-                shutdown_event.wait(), timeout=imap_poller.poll_interval,
+                shutdown_event.wait(),
+                timeout=imap_poller.poll_interval,
             )
             break
         except asyncio.TimeoutError:
@@ -500,14 +529,24 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             config_override = json.loads(config_override)
 
         # Build remaining context (fields not extracted as dedicated params)
-        extracted_keys = {"upload_id", "config_upload_id", "instructions_upload_id", "instructions", "git_remote_url"}
-        remaining_context = {k: v for k, v in job_context.items() if k not in extracted_keys}
+        extracted_keys = {
+            "upload_id",
+            "config_upload_id",
+            "instructions_upload_id",
+            "instructions",
+            "git_remote_url",
+        }
+        remaining_context = {
+            k: v for k, v in job_context.items() if k not in extracted_keys
+        }
 
         # Resolve project repositories if this is a project job
         repositories_payload = None
         if job.get("project_id"):
             try:
-                repos = await postgres_db.get_project_repositories(str(job["project_id"]))
+                repos = await postgres_db.get_project_repositories(
+                    str(job["project_id"])
+                )
                 repositories_payload = [
                     {
                         "id": str(r["id"]),
@@ -522,11 +561,15 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                     for r in repos
                 ]
             except Exception as e:
-                logger.warning(f"Dispatch: failed to resolve project repos for job {job_id}: {e}")
+                logger.warning(
+                    f"Dispatch: failed to resolve project repos for job {job_id}: {e}"
+                )
 
             # Derive git_remote_url from jobs repo if not already set
             if repositories_payload and not git_remote_url:
-                jobs_repo = next((r for r in repositories_payload if r["role"] == "jobs"), None)
+                jobs_repo = next(
+                    (r for r in repositories_payload if r["role"] == "jobs"), None
+                )
                 if jobs_repo and jobs_repo.get("repo_url"):
                     git_remote_url = jobs_repo["repo_url"]
 
@@ -538,7 +581,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
         if resolved_ds:
-            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+            config_override = _build_datasource_tool_override(
+                resolved_ds, config_override
+            )
 
         # Inject VM workspace config if job has a ready VM
         vm_ctx = _get_vm_context(job)
@@ -567,13 +612,21 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             # Detect main LLM provider and inject key
             llm_provider = _detect_llm_provider_for_dispatch(job, config_override)
             if llm_provider and llm_provider in resolved_keys:
-                config_override.setdefault("llm", {})["api_key"] = resolved_keys[llm_provider]
+                config_override.setdefault("llm", {})["api_key"] = resolved_keys[
+                    llm_provider
+                ]
             # Inject non-LLM tool keys as env_keys
             _ENV_KEY_MAP = {"tavily": "TAVILY_API_KEY", "vision": "VISION_API_KEY"}
-            env_keys = {_ENV_KEY_MAP[p]: resolved_keys[p] for p in ("tavily", "vision") if p in resolved_keys}
+            env_keys = {
+                _ENV_KEY_MAP[p]: resolved_keys[p]
+                for p in ("tavily", "vision")
+                if p in resolved_keys
+            }
             if env_keys:
                 config_override.setdefault("env_keys", {}).update(env_keys)
-            logger.info(f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}")
+            logger.info(
+                f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
+            )
 
         # Inject user preferences as lowest-priority config overrides
         # (only fill gaps not set by per-job or project-level overrides)
@@ -600,16 +653,24 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 if "model" not in llm_override:
                     llm_override["model"] = default_model
                     model_provider = _detect_provider_from_model(default_model)
-                    if resolved_keys and model_provider in resolved_keys and "api_key" not in llm_override:
+                    if (
+                        resolved_keys
+                        and model_provider in resolved_keys
+                        and "api_key" not in llm_override
+                    ):
                         llm_override["api_key"] = resolved_keys[model_provider]
-                    logger.info(f"Dispatch: injected user default_model: {default_model}")
+                    logger.info(
+                        f"Dispatch: injected user default_model: {default_model}"
+                    )
 
             default_autonomy = user_settings.get("default_autonomy")
             if default_autonomy:
                 config_override = config_override or {}
                 if "autonomy" not in config_override:
                     config_override["autonomy"] = default_autonomy
-                    logger.info(f"Dispatch: injected user default_autonomy: {default_autonomy}")
+                    logger.info(
+                        f"Dispatch: injected user default_autonomy: {default_autonomy}"
+                    )
 
             default_reasoning = user_settings.get("default_reasoning_level")
             if default_reasoning:
@@ -617,7 +678,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 llm_override = config_override.setdefault("llm", {})
                 if "reasoning_level" not in llm_override:
                     llm_override["reasoning_level"] = default_reasoning
-                    logger.info(f"Dispatch: injected user default_reasoning_level: {default_reasoning}")
+                    logger.info(
+                        f"Dispatch: injected user default_reasoning_level: {default_reasoning}"
+                    )
 
             # Embedding provider toggle (per-account)
             embedding_provider = user_settings.get("embedding_provider")
@@ -626,9 +689,15 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 env_keys_block = config_override.setdefault("env_keys", {})
                 env_keys_block["EMBEDDING_PROVIDER"] = embedding_provider
                 # When using openrouter, inject the user's OpenRouter key
-                if embedding_provider == "openrouter" and resolved_keys and "openrouter" in resolved_keys:
+                if (
+                    embedding_provider == "openrouter"
+                    and resolved_keys
+                    and "openrouter" in resolved_keys
+                ):
                     env_keys_block["OPENROUTER_API_KEY"] = resolved_keys["openrouter"]
-                logger.info(f"Dispatch: injected user embedding_provider: {embedding_provider}")
+                logger.info(
+                    f"Dispatch: injected user embedding_provider: {embedding_provider}"
+                )
 
         # Build job start request
         job_start = JobStartRequest(
@@ -658,7 +727,9 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             )
 
         if response.status_code not in (200, 202):
-            logger.warning(f"Dispatch: agent {agent_id} rejected job {job_id}: {response.text}")
+            logger.warning(
+                f"Dispatch: agent {agent_id} rejected job {job_id}: {response.text}"
+            )
             return False
 
         # Update job status and assign to agent
@@ -676,11 +747,16 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             current_job_id=job_id,
         )
 
-        logger.info(f"Dispatch: assigned job {job_id} (priority={job.get('priority', '?')}) to agent {agent_id}")
+        logger.info(
+            f"Dispatch: assigned job {job_id} (priority={job.get('priority', '?')}) to agent {agent_id}"
+        )
         return True
 
     except Exception as e:
-        logger.error(f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}", exc_info=True)
+        logger.error(
+            f"Dispatch: failed to assign job {job_id} to agent {agent_id}: {e}",
+            exc_info=True,
+        )
         return False
 
 
@@ -705,7 +781,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
         if isinstance(config_override, str):
             config_override = json.loads(config_override)
         if resolved_ds:
-            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+            config_override = _build_datasource_tool_override(
+                resolved_ds, config_override
+            )
 
         # Inject VM workspace config if job has a ready VM
         vm_ctx = _get_vm_context(job)
@@ -743,7 +821,8 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                    json.dumps(job_context), job_id,
+                    json.dumps(job_context),
+                    job_id,
                 )
 
         agent_url = f"http://{agent['pod_ip']}:{agent['pod_port']}/job/resume"
@@ -754,7 +833,9 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             )
 
         if response.status_code not in (200, 202):
-            logger.warning(f"Dispatch: agent {agent_id} rejected resume for job {job_id}: {response.text}")
+            logger.warning(
+                f"Dispatch: agent {agent_id} rejected resume for job {job_id}: {response.text}"
+            )
             return False
 
         # Update job status and assign to agent
@@ -770,11 +851,15 @@ async def _resume_job_on_agent(job: dict, agent: dict) -> bool:
             current_job_id=job_id,
         )
 
-        logger.info(f"Dispatch: resumed job {job_id} (priority={job.get('priority', '?')}) on agent {agent_id}")
+        logger.info(
+            f"Dispatch: resumed job {job_id} (priority={job.get('priority', '?')}) on agent {agent_id}"
+        )
         return True
 
     except Exception as e:
-        logger.error(f"Dispatch: failed to resume job {job_id} on agent {agent_id}: {e}")
+        logger.error(
+            f"Dispatch: failed to resume job {job_id} on agent {agent_id}: {e}"
+        )
         return False
 
 
@@ -799,11 +884,15 @@ async def _initiate_pause(job: dict) -> None:
 
         if response.status_code in (200, 408):
             # 200 = paused, 408 = timed out but flag set (will pause after current node)
-            logger.info(f"Preempt: pause request sent for job {job_id} on agent {agent_id}")
+            logger.info(
+                f"Preempt: pause request sent for job {job_id} on agent {agent_id}"
+            )
             # DB update handled by agent + orchestrator fallback
             await postgres_db.pause_job(job_id)
         else:
-            logger.warning(f"Preempt: agent returned {response.status_code} for pause of job {job_id}")
+            logger.warning(
+                f"Preempt: agent returned {response.status_code} for pause of job {job_id}"
+            )
 
     except Exception as e:
         logger.warning(f"Preempt: failed to pause job {job_id}: {e}")
@@ -844,7 +933,9 @@ def _get_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
-def _detect_llm_provider_for_dispatch(job: dict, config_override: dict | None) -> str | None:
+def _detect_llm_provider_for_dispatch(
+    job: dict, config_override: dict | None
+) -> str | None:
     """Detect the LLM provider for a job from its config override or config name.
 
     Uses the same prefix-matching logic as src/core/loader.py:_detect_provider().
@@ -933,9 +1024,13 @@ async def _try_dispatch_pending_jobs() -> None:
                                 description=job.get("description", ""),
                             )
                             if ok:
-                                logger.info(f"Dispatcher: auto-provisioned VM for job {job_id}")
+                                logger.info(
+                                    f"Dispatcher: auto-provisioned VM for job {job_id}"
+                                )
                             else:
-                                logger.warning(f"Dispatcher: VM provisioning failed for job {job_id}")
+                                logger.warning(
+                                    f"Dispatcher: VM provisioning failed for job {job_id}"
+                                )
                         continue  # Skip this job — wait for VM to register
                     elif vm_ctx.get("status") not in ("ready",):
                         # VM is provisioning/creating — skip, wait
@@ -1055,7 +1150,9 @@ class DatasourceCreate(BaseModel):
     type: str = Field(..., description="Datasource type: postgresql, neo4j, mongodb")
     connection_url: str = Field(..., description="Full connection string")
     description: str | None = Field(None, description="What this datasource contains")
-    credentials: dict[str, Any] | None = Field(None, description="Additional auth details")
+    credentials: dict[str, Any] | None = Field(
+        None, description="Additional auth details"
+    )
     read_only: bool = Field(True, description="Whether the agent is allowed to write")
     job_id: str | None = Field(None, description="Job UUID (null for global)")
 
@@ -1110,26 +1207,62 @@ class AgentHeartbeat(BaseModel):
 class JobCreate(BaseModel):
     """Request body for creating a new job."""
 
-    description: str = Field(..., description="Job description - what the agent should accomplish")
-    upload_id: str | None = Field(None, description="Upload ID for document files (from /api/uploads)")
-    config_upload_id: str | None = Field(None, description="Upload ID for config YAML override")
-    instructions_upload_id: str | None = Field(None, description="Upload ID for instructions markdown")
-    document_path: str | None = Field(None, description="Path to a document (deprecated, use upload_id)")
-    document_dir: str | None = Field(None, description="Directory containing documents (deprecated)")
+    description: str = Field(
+        ..., description="Job description - what the agent should accomplish"
+    )
+    upload_id: str | None = Field(
+        None, description="Upload ID for document files (from /api/uploads)"
+    )
+    config_upload_id: str | None = Field(
+        None, description="Upload ID for config YAML override"
+    )
+    instructions_upload_id: str | None = Field(
+        None, description="Upload ID for instructions markdown"
+    )
+    document_path: str | None = Field(
+        None, description="Path to a document (deprecated, use upload_id)"
+    )
+    document_dir: str | None = Field(
+        None, description="Directory containing documents (deprecated)"
+    )
     config_name: str = Field("default", description="Agent configuration name")
-    config_override: dict[str, Any] | None = Field(None, description="Per-job configuration overrides")
-    context: dict[str, Any] | None = Field(None, description="Optional context dictionary")
-    instructions: str | None = Field(None, description="Additional inline instructions for the agent")
-    kickoff_message: str | None = Field(None, description="Opening message to the agent (task brief)")
-    datasource_ids: list[str] | None = Field(None, description="Global datasource IDs to clone as job-scoped")
-    builder_session_id: str | None = Field(None, description="Builder session ID to link to this job")
+    config_override: dict[str, Any] | None = Field(
+        None, description="Per-job configuration overrides"
+    )
+    context: dict[str, Any] | None = Field(
+        None, description="Optional context dictionary"
+    )
+    instructions: str | None = Field(
+        None, description="Additional inline instructions for the agent"
+    )
+    kickoff_message: str | None = Field(
+        None, description="Opening message to the agent (task brief)"
+    )
+    datasource_ids: list[str] | None = Field(
+        None, description="Global datasource IDs to clone as job-scoped"
+    )
+    builder_session_id: str | None = Field(
+        None, description="Builder session ID to link to this job"
+    )
     user_id: str | None = Field(None, description="User UUID who created this job")
-    project_id: str | None = Field(None, description="Project UUID to associate this job with")
-    parent_job_id: str | None = Field(None, description="Parent job UUID for verification/follow-up jobs")
-    priority: int = Field(5, ge=0, le=10, description="Job priority (0=low, 5=normal, 10=high)")
-    creation_order: int | None = Field(None, description="0-based index for delegation subagent merge ordering")
-    worktree_path: str | None = Field(None, description="Git worktree path for delegation subagents")
-    delegation_context: str | None = Field(None, description="Shared context string from parent delegation")
+    project_id: str | None = Field(
+        None, description="Project UUID to associate this job with"
+    )
+    parent_job_id: str | None = Field(
+        None, description="Parent job UUID for verification/follow-up jobs"
+    )
+    priority: int = Field(
+        5, ge=0, le=10, description="Job priority (0=low, 5=normal, 10=high)"
+    )
+    creation_order: int | None = Field(
+        None, description="0-based index for delegation subagent merge ordering"
+    )
+    worktree_path: str | None = Field(
+        None, description="Git worktree path for delegation subagents"
+    )
+    delegation_context: str | None = Field(
+        None, description="Shared context string from parent delegation"
+    )
 
 
 class JobStartRequest(BaseModel):
@@ -1172,7 +1305,9 @@ class JobCompleteRequest(BaseModel):
     should_stop: bool = Field(False, description="Whether the graph stopped")
     goal_achieved: bool = Field(False, description="Whether the goal was achieved")
     error: dict[str, Any] | None = Field(None, description="Error dict if job failed")
-    freeze_data: dict[str, Any] | None = Field(None, description="Freeze data from the graph state")
+    freeze_data: dict[str, Any] | None = Field(
+        None, description="Freeze data from the graph state"
+    )
 
 
 class BuilderSessionCreate(BaseModel):
@@ -1214,7 +1349,9 @@ class McpTokenCreate(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=100, description="Token label")
     scope: str = Field(default="user", description="'user', 'project:<uuid>', or 'all'")
-    expires_in_days: int | None = Field(None, description="Days until expiry (null = never)")
+    expires_in_days: int | None = Field(
+        None, description="Days until expiry (null = never)"
+    )
 
 
 class McpTokenVerifyRequest(BaseModel):
@@ -1223,14 +1360,24 @@ class McpTokenVerifyRequest(BaseModel):
     token_hash: str
 
 
-VALID_API_KEY_PROVIDERS = {"openai", "anthropic", "google", "groq", "openrouter", "tavily", "vision"}
+VALID_API_KEY_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "google",
+    "groq",
+    "openrouter",
+    "tavily",
+    "vision",
+}
 
 
 class ApiKeySet(BaseModel):
     """Request body for setting an API key for a provider."""
 
     api_key: str = Field(..., min_length=1, description="The API key value")
-    label: str | None = Field(None, description="Optional label (e.g. 'team key', 'personal')")
+    label: str | None = Field(
+        None, description="Optional label (e.g. 'team key', 'personal')"
+    )
 
 
 class UserSettingsUpdate(BaseModel):
@@ -1249,8 +1396,12 @@ class ProjectCreate(BaseModel):
     name: str = Field(..., description="Project name")
     description: str | None = Field(None, description="Project description")
     goal: str | None = Field(None, description="Project goal statement")
-    default_config_name: str | None = Field(None, description="Default agent config for new jobs")
-    default_config_override: dict[str, Any] | None = Field(None, description="Default config overrides")
+    default_config_name: str | None = Field(
+        None, description="Default agent config for new jobs"
+    )
+    default_config_override: dict[str, Any] | None = Field(
+        None, description="Default config overrides"
+    )
     user_id: str = Field(..., description="Owner user UUID")
 
 
@@ -1301,8 +1452,6 @@ class ProjectRepositoryUpdate(BaseModel):
     clone_path: str | None = None
 
 
-
-
 class PromoteRequest(BaseModel):
     """Request body for promoting a job into a dedicated project."""
 
@@ -1322,7 +1471,9 @@ class KnowledgeSearchRequest(BaseModel):
 class KnowledgeNoteUpdate(BaseModel):
     """Request body for updating a knowledge note."""
 
-    status: str | None = Field(None, description="New status: active, resolved, superseded, archived")
+    status: str | None = Field(
+        None, description="New status: active, resolved, superseded, archived"
+    )
     add_tags: list[str] | None = Field(None, description="Tags to add")
     remove_tags: list[str] | None = Field(None, description="Tags to remove")
 
@@ -1335,8 +1486,12 @@ class BuilderMessageRequest(BaseModel):
     instructions: str | None = Field(None, description="Current instructions content")
     config: dict[str, Any] | None = Field(None, description="Current config override")
     description: str | None = Field(None, description="Current job description")
-    active_job_id: str | None = Field(None, description="Active job context for inspection tools")
-    active_project_id: str | None = Field(None, description="Active project context for project-scoped tools")
+    active_job_id: str | None = Field(
+        None, description="Active job context for inspection tools"
+    )
+    active_project_id: str | None = Field(
+        None, description="Active project context for project-scoped tools"
+    )
 
 
 class CustomJSONEncoder(json.JSONEncoder):
@@ -1431,12 +1586,17 @@ async def lifespan(app: FastAPI):
 
     # Initialize IMAP poller for email reply routing (graceful if unconfigured)
     async def _imap_reply_handler(
-        job_id: str, thread_id: str, message: str,
-        sender_email: str | None = None, email_message_id: str | None = None,
+        job_id: str,
+        thread_id: str,
+        message: str,
+        sender_email: str | None = None,
+        email_message_id: str | None = None,
     ) -> str:
         """Adapter: strips sequence number from _route_inbound_reply return."""
         strategy, _seq = await _route_inbound_reply(
-            job_id, thread_id, message,
+            job_id,
+            thread_id,
+            message,
             sender_email=sender_email,
             email_message_id=email_message_id,
         )
@@ -1447,7 +1607,9 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     _shutdown_event = asyncio.Event()
     stale_detector_task = asyncio.create_task(stale_agent_detector(_shutdown_event))
-    token_cleanup_task = asyncio.create_task(cleanup_expired_tokens(postgres_db, _shutdown_event))
+    token_cleanup_task = asyncio.create_task(
+        cleanup_expired_tokens(postgres_db, _shutdown_event)
+    )
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
@@ -1494,7 +1656,8 @@ app.add_middleware(
         "http://127.0.0.1:4200",
         "http://localhost:4000",
         "http://127.0.0.1:4000",
-    ] + [o for o in os.environ.get("CORS_ORIGINS", "").split(",") if o],
+    ]
+    + [o for o in os.environ.get("CORS_ORIGINS", "").split(",") if o],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1517,8 +1680,12 @@ async def request_logging_middleware(request: Request, call_next):
         response = await call_next(request)
     except Exception:
         elapsed = (time.perf_counter() - start) * 1000
-        logger.exception("%s %s 500 (%dms) — unhandled exception", method, path, elapsed)
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        logger.exception(
+            "%s %s 500 (%dms) — unhandled exception", method, path, elapsed
+        )
+        return JSONResponse(
+            status_code=500, content={"detail": "Internal server error"}
+        )
 
     elapsed = (time.perf_counter() - start) * 1000
     status = response.status_code
@@ -1591,7 +1758,8 @@ async def workspace_status() -> dict[str, Any]:
     if is_available:
         try:
             job_dirs = [
-                d.name for d in base_path.iterdir()
+                d.name
+                for d in base_path.iterdir()
                 if d.is_dir() and d.name.startswith("job_")
             ][:10]  # Limit to 10 for display
         except Exception:
@@ -1681,7 +1849,9 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
         elif mcp_scope and mcp_scope.startswith("project:"):
             project_id = mcp_scope.split(":", 1)[1]
             if str(job.get("project_id", "")) != project_id:
-                raise HTTPException(status_code=403, detail="Access denied by token scope")
+                raise HTTPException(
+                    status_code=403, detail="Access denied by token scope"
+                )
 
         # Enrich with audit count if MongoDB is available
         if mongodb.is_available:
@@ -1731,7 +1901,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 if user and user.get("default_project_id"):
                     project_id = str(user["default_project_id"])
             except Exception as e:
-                logger.warning(f"Failed to resolve default project for user {job.user_id}: {e}")
+                logger.warning(
+                    f"Failed to resolve default project for user {job.user_id}: {e}"
+                )
 
         # Resolve project defaults (config name, config override)
         project = None
@@ -1749,7 +1921,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
             if project_default_override:
                 if config_override:
                     # Deep merge: project defaults as base, job overrides on top
-                    config_override = _deep_merge_dicts(project_default_override, config_override)
+                    config_override = _deep_merge_dicts(
+                        project_default_override, config_override
+                    )
                 else:
                     config_override = project_default_override
 
@@ -1805,13 +1979,20 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"Failed to create branch '{branch_name}' from '{from_branch}' "
                             f"in '{parent_repo_name}' for subjob {job_id_str}"
                         )
-                    await postgres_db.merge_job_context(job_id_str, {
-                        "git_remote_url": parent.get("context", {}).get("git_remote_url", ""),
-                    })
+                    await postgres_db.merge_job_context(
+                        job_id_str,
+                        {
+                            "git_remote_url": parent.get("context", {}).get(
+                                "git_remote_url", ""
+                            ),
+                        },
+                    )
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
-                            branch_name, parent_repo_name, result["id"],
+                            branch_name,
+                            parent_repo_name,
+                            result["id"],
                         )
                     result["branch_name"] = branch_name
                     result["repo_name"] = parent_repo_name
@@ -1831,13 +2012,18 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"Failed to create branch '{branch_name}' in "
                             f"'{jobs_repo['name']}' — main branch may not exist"
                         )
-                    await postgres_db.merge_job_context(job_id_str, {
-                        "git_remote_url": jobs_repo["repo_url"],
-                    })
+                    await postgres_db.merge_job_context(
+                        job_id_str,
+                        {
+                            "git_remote_url": jobs_repo["repo_url"],
+                        },
+                    )
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3",
-                            branch_name, jobs_repo["name"], result["id"],
+                            branch_name,
+                            jobs_repo["name"],
+                            result["id"],
                         )
                     result["branch_name"] = branch_name
                     result["repo_name"] = jobs_repo["name"]
@@ -1846,13 +2032,17 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                     repo_name = f"job-{short_id}"
                     git_remote_url = await gitea_client.create_repo(repo_name)
                     if git_remote_url:
-                        await postgres_db.merge_job_context(job_id_str, {
-                            "git_remote_url": git_remote_url,
-                        })
+                        await postgres_db.merge_job_context(
+                            job_id_str,
+                            {
+                                "git_remote_url": git_remote_url,
+                            },
+                        )
                         async with postgres_db.acquire() as conn:
                             await conn.execute(
                                 "UPDATE jobs SET repo_name = $1 WHERE id = $2",
-                                repo_name, result["id"],
+                                repo_name,
+                                result["id"],
                             )
                         result["repo_name"] = repo_name
             else:
@@ -1860,13 +2050,17 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 repo_name = f"job-{short_id}"
                 git_remote_url = await gitea_client.create_repo(repo_name)
                 if git_remote_url:
-                    await postgres_db.merge_job_context(job_id_str, {
-                        "git_remote_url": git_remote_url,
-                    })
+                    await postgres_db.merge_job_context(
+                        job_id_str,
+                        {
+                            "git_remote_url": git_remote_url,
+                        },
+                    )
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET repo_name = $1 WHERE id = $2",
-                            repo_name, result["id"],
+                            repo_name,
+                            result["id"],
                         )
                     result["repo_name"] = repo_name
 
@@ -1879,7 +2073,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             creator["email"], result["repo_name"]
                         )
                 except Exception as e:
-                    logger.warning(f"Failed to grant Gitea access for job {job_id_str}: {e}")
+                    logger.warning(
+                        f"Failed to grant Gitea access for job {job_id_str}: {e}"
+                    )
 
         # Clone selected global datasources as job-scoped
         if job.datasource_ids:
@@ -1911,7 +2107,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                             f"{'not found' if not ds else 'not global (already job-scoped)'}"
                         )
                 except Exception as e:
-                    logger.warning(f"Failed to clone datasource {ds_id} for job {new_job_id}: {e}")
+                    logger.warning(
+                        f"Failed to clone datasource {ds_id} for job {new_job_id}: {e}"
+                    )
 
         # Link builder session to job (if provided)
         if job.builder_session_id:
@@ -1921,7 +2119,9 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                     job_id=str(result["id"]),
                 )
             except Exception as e:
-                logger.warning(f"Failed to link builder session {job.builder_session_id}: {e}")
+                logger.warning(
+                    f"Failed to link builder session {job.builder_session_id}: {e}"
+                )
 
         # Spawn scholar subjob if enabled (root jobs only)
         if not job.parent_job_id:
@@ -1930,7 +2130,10 @@ async def create_job(job: JobCreate) -> dict[str, Any]:
                 fresh_job = await postgres_db.get_job(str(result["id"]))
                 if fresh_job:
                     scholar_result = await _spawn_scholar_subjob(
-                        fresh_job, config_name, config_override, context,
+                        fresh_job,
+                        config_name,
+                        config_override,
+                        context,
                     )
                     if scholar_result:
                         result["scholar_job_id"] = str(scholar_result["id"])
@@ -1958,7 +2161,11 @@ async def delete_job(job_id: str) -> dict[str, str]:
 
         # Clean up Gitea repo/branch
         if gitea_client.is_initialized:
-            if job.get("parent_job_id") and job.get("branch_name") and job.get("repo_name"):
+            if (
+                job.get("parent_job_id")
+                and job.get("branch_name")
+                and job.get("repo_name")
+            ):
                 # Subjob: delete the branch (no-op if already merged and deleted)
                 await gitea_client.delete_branch(job["repo_name"], job["branch_name"])
             elif job.get("repo_name"):
@@ -1970,17 +2177,31 @@ async def delete_job(job_id: str) -> dict[str, str]:
                     str(job["project_id"]), role="jobs"
                 )
                 if repos:
-                    await gitea_client.delete_branch(repos[0]["name"], job["branch_name"])
+                    await gitea_client.delete_branch(
+                        repos[0]["name"], job["branch_name"]
+                    )
 
         # Clean up vector DB tables (no FK cascade across databases)
         try:
             async with vector_db.acquire() as conn:
-                await conn.execute("DELETE FROM memories WHERE job_id = $1", UUID(job_id))
-                await conn.execute("DELETE FROM citations WHERE job_id = $1", UUID(job_id))
-                await conn.execute("DELETE FROM source_annotations WHERE job_id = $1", UUID(job_id))
-                await conn.execute("DELETE FROM source_tags WHERE job_id = $1", UUID(job_id))
-                await conn.execute("DELETE FROM source_embeddings WHERE job_id = $1", UUID(job_id))
-                await conn.execute("DELETE FROM job_sources WHERE job_id = $1", UUID(job_id))
+                await conn.execute(
+                    "DELETE FROM memories WHERE job_id = $1", UUID(job_id)
+                )
+                await conn.execute(
+                    "DELETE FROM citations WHERE job_id = $1", UUID(job_id)
+                )
+                await conn.execute(
+                    "DELETE FROM source_annotations WHERE job_id = $1", UUID(job_id)
+                )
+                await conn.execute(
+                    "DELETE FROM source_tags WHERE job_id = $1", UUID(job_id)
+                )
+                await conn.execute(
+                    "DELETE FROM source_embeddings WHERE job_id = $1", UUID(job_id)
+                )
+                await conn.execute(
+                    "DELETE FROM job_sources WHERE job_id = $1", UUID(job_id)
+                )
         except Exception as e:
             logger.warning(f"Failed to clean up vector DB tables for job {job_id}: {e}")
 
@@ -2056,11 +2277,17 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                         if response.status_code == 200:
                             resp_data = response.json()
                             if resp_data.get("graceful", True):
-                                logger.info(f"Agent confirmed graceful cancel for job {job_id}")
+                                logger.info(
+                                    f"Agent confirmed graceful cancel for job {job_id}"
+                                )
                             else:
-                                logger.warning(f"Agent hard-killed job {job_id} after cooperative timeout")
+                                logger.warning(
+                                    f"Agent hard-killed job {job_id} after cooperative timeout"
+                                )
                         elif response.status_code == 408:
-                            logger.warning(f"Agent cancel timed out for job {job_id} — may still stop after current node")
+                            logger.warning(
+                                f"Agent cancel timed out for job {job_id} — may still stop after current node"
+                            )
                         else:
                             logger.warning(
                                 f"Agent cancel returned {response.status_code}: {response.text}"
@@ -2070,7 +2297,11 @@ async def cancel_job(job_id: str) -> dict[str, str]:
                     logger.warning(f"Could not reach agent to cancel job {job_id}: {e}")
 
         # If job has a VM, send terminate and request deletion
-        vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
+        vm_ctx = (
+            (job.get("context") or {}).get("vm")
+            if isinstance(job.get("context"), dict)
+            else None
+        )
         if vm_ctx:
             await vm_provisioner.send_control(job_id, "terminate")
             if vm_ctx.get("status") not in ("deleted", "deleting"):
@@ -2141,16 +2372,24 @@ async def pause_job(job_id: str) -> dict[str, str]:
                             logger.info(f"Agent confirmed pause for job {job_id}")
                         elif response.status_code == 408:
                             # Pause timed out but flag is set — agent will pause after current node
-                            logger.warning(f"Pause timed out for job {job_id} — will pause after current node")
+                            logger.warning(
+                                f"Pause timed out for job {job_id} — will pause after current node"
+                            )
                         else:
-                            logger.warning(f"Agent pause returned {response.status_code}: {response.text}")
+                            logger.warning(
+                                f"Agent pause returned {response.status_code}: {response.text}"
+                            )
                 except httpx.TimeoutException:
                     logger.warning(f"Timeout sending pause to agent for job {job_id}")
                 except Exception as e:
                     logger.warning(f"Could not reach agent to pause job {job_id}: {e}")
 
         # If job has a VM, send freeze via NATS (requires management daemon)
-        vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
+        vm_ctx = (
+            (job.get("context") or {}).get("vm")
+            if isinstance(job.get("context"), dict)
+            else None
+        )
         if vm_ctx:
             await vm_provisioner.send_control(job_id, "freeze")
 
@@ -2176,12 +2415,19 @@ async def pause_job(job_id: str) -> dict[str, str]:
 class MessageSendRequest(BaseModel):
     """Request body for agent-initiated message send."""
 
-    to: str = Field(..., description="Recipient: 'user' for job owner, or display name / email of a project member")
+    to: str = Field(
+        ...,
+        description="Recipient: 'user' for job owner, or display name / email of a project member",
+    )
     subject: str = Field(..., max_length=200, description="Subject line")
     message: str = Field(..., max_length=5000, description="Message body (markdown)")
     mode: str = Field("async", description="'async' or 'blocking'")
-    thread_id: str | None = Field(None, description="Existing thread ID, or null for new thread")
-    project_id: str | None = Field(None, description="Project ID for member resolution (auto-filled from job)")
+    thread_id: str | None = Field(
+        None, description="Existing thread ID, or null for new thread"
+    )
+    project_id: str | None = Field(
+        None, description="Project ID for member resolution (auto-filled from job)"
+    )
 
 
 class MessageReplyRequest(BaseModel):
@@ -2200,7 +2446,9 @@ def _mask_email(email: str) -> str:
 
 
 @app.post("/api/jobs/{job_id}/messages/send")
-async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[str, Any]:
+async def send_agent_message(
+    job_id: str, request: MessageSendRequest
+) -> dict[str, Any]:
     """Send a message from an agent to a human.
 
     Agent-facing endpoint (no auth required). Resolves recipient from job
@@ -2262,20 +2510,21 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
             if not match:
                 # Fallback: try external contacts for this project
                 ext_contact = await postgres_db.resolve_external_contact(
-                    project_id, request.to,
+                    project_id,
+                    request.to,
                 )
                 if ext_contact:
                     recipient_email = ext_contact["email"]
                     recipient_name = ext_contact.get("display_name", "Contact")
                     # External contacts don't have a user_id — keep job owner's
                 else:
-                    available = ", ".join(
-                        m.get("display_name", "?") for m in members
-                    )
+                    available = ", ".join(m.get("display_name", "?") for m in members)
                     # Also list external contacts
                     ext_contacts = await postgres_db.get_external_contacts(project_id)
                     if ext_contacts:
-                        ext_names = ", ".join(c.get("display_name", "?") for c in ext_contacts)
+                        ext_names = ", ".join(
+                            c.get("display_name", "?") for c in ext_contacts
+                        )
                         available += f" | External: {ext_names}"
                     raise HTTPException(
                         status_code=404,
@@ -2293,10 +2542,14 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
         limits = await postgres_db.check_message_rate_limit(job_id, user_id)
         if limits["job_hourly"] >= 5:
             await postgres_db.log_message(
-                job_id=job_id, thread_id=request.thread_id or "?",
-                direction="outbound", subject=request.subject,
-                message=request.message, status="rate_limited",
-                user_id=user_id, mode=request.mode,
+                job_id=job_id,
+                thread_id=request.thread_id or "?",
+                direction="outbound",
+                subject=request.subject,
+                message=request.message,
+                status="rate_limited",
+                user_id=user_id,
+                mode=request.mode,
                 error_message="Rate limit: 5 per hour per job",
             )
             return JSONResponse(
@@ -2309,10 +2562,14 @@ async def send_agent_message(job_id: str, request: MessageSendRequest) -> dict[s
             )
         if limits["job_daily"] >= 15:
             await postgres_db.log_message(
-                job_id=job_id, thread_id=request.thread_id or "?",
-                direction="outbound", subject=request.subject,
-                message=request.message, status="rate_limited",
-                user_id=user_id, mode=request.mode,
+                job_id=job_id,
+                thread_id=request.thread_id or "?",
+                direction="outbound",
+                subject=request.subject,
+                message=request.message,
+                status="rate_limited",
+                user_id=user_id,
+                mode=request.mode,
                 error_message="Rate limit: 15 per day per job",
             )
             return JSONResponse(
@@ -2443,7 +2700,8 @@ async def _route_inbound_reply(
     if sender_email:
         async with postgres_db.acquire() as conn:
             user_row = await conn.fetchrow(
-                "SELECT id FROM users WHERE email = $1", sender_email,
+                "SELECT id FROM users WHERE email = $1",
+                sender_email,
             )
         if user_row:
             user_id = str(user_row["id"])
@@ -2489,7 +2747,9 @@ async def _route_inbound_reply(
     if user_id:
         try:
             user_settings = await postgres_db.get_user_settings(user_id)
-            user_prefs = (user_settings or {}).get("communication", {}).get("delivery", {})
+            user_prefs = (
+                (user_settings or {}).get("communication", {}).get("delivery", {})
+            )
         except Exception:
             pass  # Non-critical — fall back to defaults
 
@@ -2520,7 +2780,8 @@ async def _route_inbound_reply(
                 await _internal_resume_job(job_id, feedback=message)
                 logger.info(
                     "LLM triage: interrupt job %s — %s",
-                    job_id[:8], decision.get("reason", ""),
+                    job_id[:8],
+                    decision.get("reason", ""),
                 )
                 return "llm_triage_interrupt", sequence
         except Exception as e:
@@ -2534,17 +2795,20 @@ async def _route_inbound_reply(
         except json.JSONDecodeError:
             job_context = {}
     queued_replies = job_context.get("queued_replies", [])
-    queued_replies.append({
-        "thread_id": thread_id,
-        "message": message,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    queued_replies.append(
+        {
+            "thread_id": thread_id,
+            "message": message,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     job_context["queued_replies"] = queued_replies
     await postgres_db.update_job_context(job_id, job_context)
 
     # Broadcast reply_delivered to cockpit SSE
     try:
         from services.notification_feed import notification_feed
+
         job_owner_id = str(job.get("user_id", "")) if job.get("user_id") else None
         if job_owner_id:
             notification_feed.broadcast(
@@ -2592,7 +2856,9 @@ async def reply_to_agent_message(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Failed to deliver reply for job {job_id} thread {thread_id}: {e}")
+        logger.exception(
+            f"Failed to deliver reply for job {job_id} thread {thread_id}: {e}"
+        )
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -2620,7 +2886,9 @@ async def list_message_threads(job_id: str) -> dict[str, Any]:
 
         for thread in threads:
             thread["status"] = (
-                "waiting_for_reply" if thread["thread_id"] == waiting_thread else "active"
+                "waiting_for_reply"
+                if thread["thread_id"] == waiting_thread
+                else "active"
             )
 
         return {"threads": threads}
@@ -2739,7 +3007,9 @@ async def add_external_contact(
                 "id": str(contact["id"]),
                 "display_name": contact["display_name"],
                 "email": _mask_email(contact["email"]),
-                "created_at": contact["created_at"].isoformat() if contact.get("created_at") else None,
+                "created_at": contact["created_at"].isoformat()
+                if contact.get("created_at")
+                else None,
             },
         }
     except HTTPException:
@@ -2760,7 +3030,9 @@ async def list_external_contacts(project_id: str) -> dict[str, Any]:
                     "id": str(c["id"]),
                     "display_name": c["display_name"],
                     "email": _mask_email(c["email"]),
-                    "created_at": c["created_at"].isoformat() if c.get("created_at") else None,
+                    "created_at": c["created_at"].isoformat()
+                    if c.get("created_at")
+                    else None,
                 }
                 for c in contacts
             ],
@@ -2801,7 +3073,9 @@ async def list_notifications(
         user = await require_approved_user(request, postgres_db)
         user_id = str(user["id"])
         notifications = await postgres_db.get_user_notifications(
-            user_id, limit=limit, unread_only=unread_only,
+            user_id,
+            limit=limit,
+            unread_only=unread_only,
         )
         unread_count = await postgres_db.get_unread_count(user_id)
 
@@ -2817,7 +3091,9 @@ async def list_notifications(
                     "config_name": n.get("config_name"),
                     "status": n.get("status"),
                     "read_at": n["read_at"].isoformat() if n.get("read_at") else None,
-                    "created_at": n["created_at"].isoformat() if n.get("created_at") else None,
+                    "created_at": n["created_at"].isoformat()
+                    if n.get("created_at")
+                    else None,
                 }
                 for n in notifications
             ],
@@ -2841,7 +3117,9 @@ async def mark_notification_read(
         user_id = str(user["id"])
         updated = await postgres_db.mark_notification_read(notification_id, user_id)
         if not updated:
-            raise HTTPException(status_code=404, detail="Notification not found or already read")
+            raise HTTPException(
+                status_code=404, detail="Notification not found or already read"
+            )
         return {"status": "read"}
     except HTTPException:
         raise
@@ -2904,7 +3182,9 @@ async def create_vm(request: VMCreateRequest) -> dict[str, Any]:
     Returns 503 if no VM provisioning backend is available.
     """
     if not vm_provisioner.is_available:
-        raise HTTPException(status_code=503, detail="VM provisioning not available (no NATS or K8s)")
+        raise HTTPException(
+            status_code=503, detail="VM provisioning not available (no NATS or K8s)"
+        )
 
     job = await postgres_db.get_job(request.job_id)
     if not job:
@@ -2921,7 +3201,11 @@ async def create_vm(request: VMCreateRequest) -> dict[str, Any]:
     if not success:
         raise HTTPException(status_code=500, detail="Failed to create VM")
 
-    return {"status": "provisioning", "job_id": request.job_id, "mode": vm_provisioner.mode}
+    return {
+        "status": "provisioning",
+        "job_id": request.job_id,
+        "mode": vm_provisioner.mode,
+    }
 
 
 @app.get("/api/vms")
@@ -2993,7 +3277,9 @@ async def delete_vm(job_id: str) -> dict[str, str]:
     Returns 503 if no VM provisioning backend is available.
     """
     if not vm_provisioner.is_available:
-        raise HTTPException(status_code=503, detail="VM provisioning not available (no NATS or K8s)")
+        raise HTTPException(
+            status_code=503, detail="VM provisioning not available (no NATS or K8s)"
+        )
 
     job = await postgres_db.get_job(job_id)
     if not job:
@@ -3085,17 +3371,23 @@ async def get_sudo_request(request_id: str) -> dict:
     """Get a single sudo approval request."""
     result = await sudo_gate.get_request(request_id)
     if not result:
-        raise HTTPException(status_code=404, detail=f"Sudo request '{request_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
     return result
 
 
 @app.post("/api/sudo/requests/{request_id}/approve")
-async def approve_sudo_request(request_id: str, body: SudoApproveRequest | None = None) -> dict:
+async def approve_sudo_request(
+    request_id: str, body: SudoApproveRequest | None = None
+) -> dict:
     """Approve a pending sudo request."""
     reason = body.reason if body else ""
     result = await sudo_gate.approve_request(request_id, reason=reason)
     if not result:
-        raise HTTPException(status_code=404, detail=f"Sudo request '{request_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
@@ -3106,7 +3398,9 @@ async def deny_sudo_request(request_id: str, body: SudoDenyRequest) -> dict:
     """Deny a pending sudo request."""
     result = await sudo_gate.deny_request(request_id, reason=body.reason)
     if not result:
-        raise HTTPException(status_code=404, detail=f"Sudo request '{request_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Sudo request '{request_id}' not found"
+        )
     if "error" in result:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
@@ -3122,7 +3416,9 @@ async def list_sudo_rules() -> list[dict]:
 async def create_sudo_rule(body: SudoRuleCreateRequest) -> dict:
     """Create an auto-approval rule."""
     if body.action not in ("approve", "deny", "review"):
-        raise HTTPException(status_code=400, detail="action must be 'approve', 'deny', or 'review'")
+        raise HTTPException(
+            status_code=400, detail="action must be 'approve', 'deny', or 'review'"
+        )
     result = await sudo_gate.create_rule(
         pattern=body.pattern,
         action=body.action,
@@ -3145,12 +3441,18 @@ async def delete_sudo_rule(rule_id: str) -> dict:
 class JobResumeRequest(BaseModel):
     """Request body for resuming a failed or paused job."""
 
-    feedback: str | None = Field(None, description="Optional feedback to inject before resuming")
-    agent_id: str | None = Field(None, description="Override agent ID if original is offline")
+    feedback: str | None = Field(
+        None, description="Optional feedback to inject before resuming"
+    )
+    agent_id: str | None = Field(
+        None, description="Override agent ID if original is offline"
+    )
 
 
 @app.post("/api/jobs/{job_id}/resume")
-async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> dict[str, str]:
+async def resume_job(
+    job_id: str, request: JobResumeRequest | None = None
+) -> dict[str, str]:
     """Resume a failed or paused job from its checkpoint.
 
     This endpoint:
@@ -3185,7 +3487,9 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
         # Determine which agent to use
         # Convert to string since DB returns asyncpg UUID objects
         assigned_agent_id = job.get("assigned_agent_id")
-        agent_id = request.agent_id or (str(assigned_agent_id) if assigned_agent_id else None)
+        agent_id = request.agent_id or (
+            str(assigned_agent_id) if assigned_agent_id else None
+        )
         agent = None
 
         # Try to get the specified/assigned agent
@@ -3215,7 +3519,8 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
                     async with postgres_db.acquire() as conn:
                         await conn.execute(
                             "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                            json.dumps(job_context), job_id,
+                            json.dumps(job_context),
+                            job_id,
                         )
 
                 async with postgres_db.acquire() as conn:
@@ -3276,7 +3581,9 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
 
         # Apply datasource-driven tool override (inject/strip db tool categories)
         if resolved_ds:
-            config_override = _build_datasource_tool_override(resolved_ds, config_override)
+            config_override = _build_datasource_tool_override(
+                resolved_ds, config_override
+            )
 
         # Restore S3 environment snapshot into the VM before resuming.
         # This gives true "pick up where you left off" (environment + state).
@@ -3288,18 +3595,24 @@ async def resume_job(job_id: str, request: JobResumeRequest | None = None) -> di
             ssh_port = vm_ctx.get("ssh_port")
             if ssh_host and ssh_port:
                 try:
-                    snapshot_restored = await ide_session_service.restore_snapshot_for_resume(
-                        job_id, ssh_host, int(ssh_port)
+                    snapshot_restored = (
+                        await ide_session_service.restore_snapshot_for_resume(
+                            job_id, ssh_host, int(ssh_port)
+                        )
                     )
                     if snapshot_restored:
                         logger.info(f"Snapshot restored for job {job_id} resume")
                 except Exception as e:
-                    logger.warning(f"Snapshot restore failed for job {job_id} resume (non-blocking): {e}")
+                    logger.warning(
+                        f"Snapshot restore failed for job {job_id} resume (non-blocking): {e}"
+                    )
 
         resume_payload = {
             "job_id": job_id,
             "config_name": job_config_name,
-            "config_upload_id": job_context.get("config_upload_id") if job_context else None,
+            "config_upload_id": job_context.get("config_upload_id")
+            if job_context
+            else None,
             "config_override": config_override,
             "datasources": datasources_payload,
             "previous_status": job["status"],
@@ -3358,7 +3671,9 @@ class JobApproveRequest(BaseModel):
 
 
 @app.post("/api/jobs/{job_id}/approve")
-async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> dict[str, Any]:
+async def approve_job(
+    job_id: str, request: JobApproveRequest | None = None
+) -> dict[str, Any]:
     """Approve a frozen job, marking it as completed.
 
     This endpoint mirrors the logic from agent.py:approve_frozen_job but runs
@@ -3384,7 +3699,7 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be approved (status: {job['status']}). "
-                       f"Only jobs in 'pending_review' or 'reviewing' status can be approved.",
+                f"Only jobs in 'pending_review' or 'reviewing' status can be approved.",
             )
 
         # 2. Read freeze data — DB first, Gitea fallback, local fallback
@@ -3405,14 +3720,19 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
 
         # Fallback: local workspace
         if frozen_data is None:
-            workspace_path = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+            workspace_path = (
+                workspace_service.base_path
+                / f"job_{job_id}"
+                / "output"
+                / "job_frozen.json"
+            )
             if workspace_path.exists():
                 frozen_data = json.loads(workspace_path.read_text())
             else:
                 raise HTTPException(
                     status_code=404,
                     detail=f"No freeze data found for job '{job_id}' "
-                           f"(checked DB, Gitea repo, and local workspace)",
+                    f"(checked DB, Gitea repo, and local workspace)",
                 )
 
         # 3. Determine freeze type (backward compat: missing = job_complete)
@@ -3421,7 +3741,12 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
         if freeze_type == "phase_boundary":
             # Phase boundary freeze: approve to continue execution (not complete)
             # Remove job_frozen.json from local workspace
-            local_frozen = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+            local_frozen = (
+                workspace_service.base_path
+                / f"job_{job_id}"
+                / "output"
+                / "job_frozen.json"
+            )
             if local_frozen.exists():
                 local_frozen.unlink()
 
@@ -3522,6 +3847,7 @@ async def approve_job(job_id: str, request: JobApproveRequest | None = None) -> 
 # Job Completion Handling (orchestrator-side)
 # =============================================================================
 
+
 async def _internal_resume_job(job_id: str, feedback: str) -> None:
     """Queue a job for resume via the auto-dispatcher.
 
@@ -3547,7 +3873,8 @@ async def _internal_resume_job(job_id: str, feedback: str) -> None:
             "UPDATE jobs SET context = $1::jsonb, status = 'paused', "
             "assigned_agent_id = NULL, updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2::uuid",
-            json.dumps(job_context), job_id,
+            json.dumps(job_context),
+            job_id,
         )
     logger.info(f"Queued job {job_id} for auto-dispatch with feedback")
     _trigger_dispatch()
@@ -3582,7 +3909,9 @@ async def _set_target_to_autonomy_status(target_job_id: str) -> str:
         return "completed"
     else:
         await postgres_db.update_job_status(target_job_id, status="pending_review")
-        logger.info(f"Set target job {target_job_id} to 'pending_review' (autonomy={autonomy})")
+        logger.info(
+            f"Set target job {target_job_id} to 'pending_review' (autonomy={autonomy})"
+        )
         return "pending_review"
 
 
@@ -3707,10 +4036,14 @@ async def _spawn_scholar_subjob(
             async with postgres_db.acquire() as conn:
                 await conn.execute(
                     "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3::uuid",
-                    branch_name, parent_repo_name, scholar_job_id,
+                    branch_name,
+                    parent_repo_name,
+                    scholar_job_id,
                 )
         except Exception as e:
-            logger.warning(f"Failed to create Gitea branch for scholar {scholar_job_id}: {e}")
+            logger.warning(
+                f"Failed to create Gitea branch for scholar {scholar_job_id}: {e}"
+            )
 
     _trigger_dispatch()
     logger.info(f"Scholar job {scholar_job_id} created for parent {job_id}")
@@ -3775,7 +4108,9 @@ async def _handle_scholar_completion(
         logger.warning(
             f"Scholar {job_id} {job_status} — unblocking parent {target_id} without research"
         )
-        actions.append(f"scholar {job_id} {job_status}, parent {target_id} unblocked (no research)")
+        actions.append(
+            f"scholar {job_id} {job_status}, parent {target_id} unblocked (no research)"
+        )
     else:
         parent_ctx["scholar_completed"] = True
         parent_ctx["scholar_output_dir"] = "research"
@@ -3847,19 +4182,21 @@ async def _handle_delegation_child_completion(
                 freeze = {}
         freeze = freeze or {}
 
-        child_results.append({
-            "job_id": child_id,
-            "description": child.get("description", ""),
-            "status": child_status,
-            "config_name": child.get("config_name", "default"),
-            "creation_order": child.get("creation_order"),
-            "branch_name": child.get("branch_name"),
-            "worktree_path": child.get("worktree_path"),
-            "merge_status": child.get("merge_status"),
-            "summary": freeze.get("summary", ""),
-            "confidence": freeze.get("confidence", 0.0),
-            "deliverables": freeze.get("deliverables", []),
-        })
+        child_results.append(
+            {
+                "job_id": child_id,
+                "description": child.get("description", ""),
+                "status": child_status,
+                "config_name": child.get("config_name", "default"),
+                "creation_order": child.get("creation_order"),
+                "branch_name": child.get("branch_name"),
+                "worktree_path": child.get("worktree_path"),
+                "merge_status": child.get("merge_status"),
+                "summary": freeze.get("summary", ""),
+                "confidence": freeze.get("confidence", 0.0),
+                "deliverables": freeze.get("deliverables", []),
+            }
+        )
 
     # Store results in parent context for resume injection
     parent_ctx = parent.get("context") or {}
@@ -3998,7 +4335,9 @@ async def _handle_critic_verdict_on_complete(
                 f"(round {current_round}/{max_rounds})"
             )
             await _internal_resume_job(target_job_id, feedback=feedback)
-            actions.append(f"target {target_job_id} resumed with feedback (round {current_round})")
+            actions.append(
+                f"target {target_job_id} resumed with feedback (round {current_round})"
+            )
     else:
         logger.warning(f"Unknown verdict '{verdict}' for critic job {job_id}")
 
@@ -4041,7 +4380,9 @@ async def _trigger_verification_on_complete(
     # Accept freeze_data OR status=reviewing (set by determine_job_status when
     # goal_achieved is True) OR freeze_data sent in the request body.
     if not is_job_completion_freeze(job) and job.get("status") != "reviewing":
-        logger.debug(f"Skipping verification for {job_id} — not a job completion freeze")
+        logger.debug(
+            f"Skipping verification for {job_id} — not a job completion freeze"
+        )
         return
 
     verification_config = get_verification_config(job)
@@ -4076,10 +4417,13 @@ async def _trigger_verification_on_complete(
         async with postgres_db.acquire() as conn:
             await conn.execute(
                 "UPDATE jobs SET context = $1::jsonb WHERE id = $2::uuid",
-                json.dumps(critic_context), critic_id,
+                json.dumps(critic_context),
+                critic_id,
             )
 
-        logger.info(f"Resuming existing critic {critic_id} for job {job_id} (round {new_round})")
+        logger.info(
+            f"Resuming existing critic {critic_id} for job {job_id} (round {new_round})"
+        )
         await _internal_resume_job(
             critic_id,
             feedback=(
@@ -4194,10 +4538,14 @@ async def _trigger_verification_on_complete(
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
                         "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3::uuid",
-                        branch_name, parent_repo_name, critic_job_id,
+                        branch_name,
+                        parent_repo_name,
+                        critic_job_id,
                     )
             except Exception as e:
-                logger.warning(f"Failed to create Gitea branch for critic {critic_job_id}: {e}")
+                logger.warning(
+                    f"Failed to create Gitea branch for critic {critic_job_id}: {e}"
+                )
 
         _trigger_dispatch()
         actions.append(f"critic job {critic_job_id} created")
@@ -4221,7 +4569,9 @@ async def _trigger_curation_final_pass(
     if not is_curation_enabled(target_job):
         return
 
-    curator_config_name = get_curation_config(target_job).get("curator_config", "curator")
+    curator_config_name = get_curation_config(target_job).get(
+        "curator_config", "curator"
+    )
 
     # Find a waiting curator for this target job
     async with postgres_db.acquire() as conn:
@@ -4230,7 +4580,8 @@ async def _trigger_curation_final_pass(
                WHERE parent_job_id = $1::uuid AND config_name = $2
                AND status IN ('waiting', 'paused')
                ORDER BY created_at DESC LIMIT 1""",
-            target_job_id, curator_config_name,
+            target_job_id,
+            curator_config_name,
         )
 
     if not row:
@@ -4241,7 +4592,9 @@ async def _trigger_curation_final_pass(
         return
 
     curator_id = str(row["id"])
-    logger.info(f"Triggering curation final pass via curator {curator_id} for {target_job_id}")
+    logger.info(
+        f"Triggering curation final pass via curator {curator_id} for {target_job_id}"
+    )
     await _internal_resume_job(
         curator_id,
         feedback=(
@@ -4276,7 +4629,12 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
 
-        if job["status"] not in ("processing", "reviewing", "pending_review", "completed"):
+        if job["status"] not in (
+            "processing",
+            "reviewing",
+            "pending_review",
+            "completed",
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=f"Job cannot be completed (status: {job['status']})",
@@ -4353,7 +4711,9 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 "status": "handled",
                 "job_id": job_id,
                 "new_status": "paused",
-                "actions": ["vm recovery: old VM deleted, new VM will be provisioned, job re-queued"],
+                "actions": [
+                    "vm recovery: old VM deleted, new VM will be provisioned, job re-queued"
+                ],
             }
 
         # 1. Determine and set the new job status
@@ -4390,25 +4750,34 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
         try:
             await _handle_critic_verdict_on_complete(job, actions)
         except Exception as e:
-            logger.error(f"Error handling critic verdict for {job_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error handling critic verdict for {job_id}: {e}", exc_info=True
+            )
 
         # 3b. Handle scholar completion (unblock parent job)
         try:
             await _handle_scholar_completion(job, actions)
         except Exception as e:
-            logger.error(f"Error handling scholar completion for {job_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error handling scholar completion for {job_id}: {e}", exc_info=True
+            )
 
         # 3c. Handle delegation child completion (resume parent when all siblings done)
         try:
             await _handle_delegation_child_completion(job, actions)
         except Exception as e:
-            logger.error(f"Error handling delegation child completion for {job_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error handling delegation child completion for {job_id}: {e}",
+                exc_info=True,
+            )
 
         # 4. Trigger verification (if this is a main job that completed)
         try:
             await _trigger_verification_on_complete(job, result, actions)
         except Exception as e:
-            logger.error(f"Error triggering verification for {job_id}: {e}", exc_info=True)
+            logger.error(
+                f"Error triggering verification for {job_id}: {e}", exc_info=True
+            )
 
         # 5. Curation final pass (if no verification but curation enabled, and goal achieved)
         if (
@@ -4421,14 +4790,21 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 await _trigger_curation_final_pass(job_id, job)
                 actions.append("curation final pass triggered (no verification)")
             except Exception as e:
-                logger.error(f"Error triggering curation for {job_id}: {e}", exc_info=True)
+                logger.error(
+                    f"Error triggering curation for {job_id}: {e}", exc_info=True
+                )
 
         # 6. Trigger dispatch (freed agent can pick up queued work)
         _trigger_dispatch()
 
         # 7. Capture environment snapshot to S3 (non-blocking)
-        if job.get("status") in ("completed", "failed") and snapshot_service.is_available:
-            snapshot_on_failure = job.get("status") == "completed" or True  # on_failure=true by default
+        if (
+            job.get("status") in ("completed", "failed")
+            and snapshot_service.is_available
+        ):
+            snapshot_on_failure = (
+                job.get("status") == "completed" or True
+            )  # on_failure=true by default
             if snapshot_on_failure:
                 ctx = job.get("context") or {}
                 if isinstance(ctx, str):
@@ -4437,7 +4813,11 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
                 ssh_host = vm_ctx.get("ssh_host")
                 ssh_port = vm_ctx.get("ssh_port")
 
-                if ssh_host and ssh_port and vm_ctx.get("status") not in ("deleted", "deleting"):
+                if (
+                    ssh_host
+                    and ssh_port
+                    and vm_ctx.get("status") not in ("deleted", "deleting")
+                ):
                     try:
                         config_name = job.get("config_name") or "defaults"
                         await snapshot_service.capture_vm_snapshot(
@@ -4456,7 +4836,11 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
 
         # 8. If job had a VM, request teardown
         if job.get("status") in ("completed", "failed") and vm_provisioner.is_available:
-            vm_ctx = (job.get("context") or {}).get("vm") if isinstance(job.get("context"), dict) else None
+            vm_ctx = (
+                (job.get("context") or {}).get("vm")
+                if isinstance(job.get("context"), dict)
+                else None
+            )
             if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
                 await vm_provisioner.delete_vm(job_id)
                 actions.append("vm deletion requested")
@@ -4503,7 +4887,12 @@ async def get_frozen_job_data(job_id: str) -> dict[str, Any]:
 
         # Fallback: local workspace
         if frozen_data is None:
-            workspace_path = workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+            workspace_path = (
+                workspace_service.base_path
+                / f"job_{job_id}"
+                / "output"
+                / "job_frozen.json"
+            )
             if workspace_path.exists():
                 frozen_data = json.loads(workspace_path.read_text())
 
@@ -4541,9 +4930,7 @@ async def delete_job_snapshot(job_id: str) -> dict[str, Any]:
     try:
         success = await snapshot_service.delete_snapshot(job_id)
         if not success:
-            raise HTTPException(
-                status_code=500, detail="Failed to delete snapshot"
-            )
+            raise HTTPException(status_code=500, detail="Failed to delete snapshot")
         return {"status": "deleted", "job_id": job_id}
     except HTTPException:
         raise
@@ -4587,7 +4974,9 @@ class IdeSessionRequest(BaseModel):
 
 
 @app.post("/api/jobs/{job_id}/ide")
-async def start_ide_session(job_id: str, request: IdeSessionRequest | None = None) -> dict[str, Any]:
+async def start_ide_session(
+    job_id: str, request: IdeSessionRequest | None = None
+) -> dict[str, Any]:
     """Start or get an IDE session for a job.
 
     Idempotent: if a session is already active, returns it.
@@ -4873,7 +5262,9 @@ async def get_repo_file(
         )
 
     repo_name, job_branch = await resolve_job_repo(job_id)
-    content = await gitea_client.get_file_content(repo_name, path, ref=ref or job_branch)
+    content = await gitea_client.get_file_content(
+        repo_name, path, ref=ref or job_branch
+    )
 
     if content is None:
         raise HTTPException(
@@ -4891,8 +5282,12 @@ async def get_repo_file(
 @app.get("/api/jobs/{job_id}/repo/commits")
 async def list_repo_commits(
     job_id: str,
-    sha: str = Query(default="main", description="Branch, tag, or commit SHA to list from"),
-    since_ref: str | None = Query(default=None, description="Only show commits after this ref"),
+    sha: str = Query(
+        default="main", description="Branch, tag, or commit SHA to list from"
+    ),
+    since_ref: str | None = Query(
+        default=None, description="Only show commits after this ref"
+    ),
     page: int = Query(default=1, ge=1, description="Page number"),
     limit: int = Query(default=20, ge=1, le=100, description="Max commits per page"),
 ) -> dict[str, Any]:
@@ -4920,7 +5315,9 @@ async def list_repo_commits(
             )
         return compare
     else:
-        commits = await gitea_client.get_commits(repo_name, sha=effective_sha, page=page, limit=limit)
+        commits = await gitea_client.get_commits(
+            repo_name, sha=effective_sha, page=page, limit=limit
+        )
         if commits is None:
             raise HTTPException(
                 status_code=404,
@@ -5025,7 +5422,9 @@ async def get_workspace_file(job_id: str, path: str) -> dict[str, str]:
 
 
 @app.put("/api/jobs/{job_id}/workspace/{path:path}")
-async def write_workspace_file(job_id: str, path: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+async def write_workspace_file(
+    job_id: str, path: str, body: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
     """Write content to a workspace file.
 
     Sandboxed — directory traversal is blocked, and certain paths
@@ -5079,8 +5478,7 @@ async def get_current_todos(job_id: str) -> dict[str, Any]:
     result = workspace_service.get_current_todos(job_id)
     if result is None:
         raise HTTPException(
-            status_code=404,
-            detail=f"No current todos found for job '{job_id}'"
+            status_code=404, detail=f"No current todos found for job '{job_id}'"
         )
     return result
 
@@ -5109,8 +5507,7 @@ async def get_archived_todos(job_id: str, filename: str) -> dict[str, Any]:
     result = workspace_service.get_archived_todos(job_id, filename)
     if result is None:
         raise HTTPException(
-            status_code=404,
-            detail=f"Archive '{filename}' not found for job '{job_id}'"
+            status_code=404, detail=f"Archive '{filename}' not found for job '{job_id}'"
         )
     return result
 
@@ -5285,12 +5682,24 @@ def _build_datasource_tool_override(
         "mongodb": {
             "category": "mongodb",
             "read": ["mongo_query", "mongo_aggregate", "mongo_schema"],
-            "write": ["mongo_query", "mongo_aggregate", "mongo_schema", "mongo_insert", "mongo_update"],
+            "write": [
+                "mongo_query",
+                "mongo_aggregate",
+                "mongo_schema",
+                "mongo_insert",
+                "mongo_update",
+            ],
         },
         "webdav": {
             "category": "cloud",
             "read": ["cloud_list", "cloud_read", "cloud_info"],
-            "write": ["cloud_list", "cloud_read", "cloud_info", "cloud_write", "cloud_delete"],
+            "write": [
+                "cloud_list",
+                "cloud_read",
+                "cloud_info",
+                "cloud_write",
+                "cloud_delete",
+            ],
         },
     }
 
@@ -5301,7 +5710,11 @@ def _build_datasource_tool_override(
         if ds_type in attached_types:
             # Find the datasource to check read_only
             ds = next(d for d in datasources if d["type"] == ds_type)
-            tools = tool_info["write"] if not ds.get("read_only", True) else tool_info["read"]
+            tools = (
+                tool_info["write"]
+                if not ds.get("read_only", True)
+                else tool_info["read"]
+            )
             tools_override[category] = tools
         else:
             # No datasource attached — strip the category
@@ -5311,7 +5724,9 @@ def _build_datasource_tool_override(
     return override
 
 
-def _build_datasources_payload(resolved_ds: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+def _build_datasources_payload(
+    resolved_ds: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
     """Build the datasources payload for sending to the agent.
 
     Strips internal fields (id, job_id, created_at, updated_at) that the
@@ -5331,19 +5746,22 @@ def _build_datasources_payload(resolved_ds: list[dict[str, Any]]) -> list[dict[s
         creds = ds.get("credentials") or {}
         if isinstance(creds, str):
             import json as json_module
+
             try:
                 creds = json_module.loads(creds)
             except (json.JSONDecodeError, ValueError):
                 creds = {}
 
-        payload.append({
-            "type": ds["type"],
-            "name": ds["name"],
-            "description": ds.get("description"),
-            "connection_url": ds["connection_url"],
-            "credentials": creds,
-            "read_only": ds.get("read_only", True),
-        })
+        payload.append(
+            {
+                "type": ds["type"],
+                "name": ds["name"],
+                "description": ds.get("description"),
+                "connection_url": ds["connection_url"],
+                "credentials": creds,
+                "read_only": ds.get("read_only", True),
+            }
+        )
 
     return payload or None
 
@@ -5409,13 +5827,19 @@ async def assign_job_to_agent(job_id: str, agent_id: str) -> dict[str, str]:
 
 @app.get("/api/datasources")
 async def list_datasources(
-    job_id: str | None = Query(default=None, description="Filter by job ID (use 'global' for global-only)"),
-    type: str | None = Query(default=None, description="Filter by type (postgresql, neo4j, mongodb)"),
+    job_id: str | None = Query(
+        default=None, description="Filter by job ID (use 'global' for global-only)"
+    ),
+    type: str | None = Query(
+        default=None, description="Filter by type (postgresql, neo4j, mongodb)"
+    ),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """List datasources with optional filters."""
     try:
-        return await postgres_db.list_datasources(job_id=job_id, ds_type=type, limit=limit)
+        return await postgres_db.list_datasources(
+            job_id=job_id, ds_type=type, limit=limit
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -5426,7 +5850,9 @@ async def get_datasource(datasource_id: str) -> dict[str, Any]:
     try:
         ds = await postgres_db.get_datasource(datasource_id)
         if not ds:
-            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            )
         return ds
     except HTTPException:
         raise
@@ -5469,7 +5895,9 @@ async def create_datasource(body: DatasourceCreate) -> dict[str, Any]:
 
 
 @app.put("/api/datasources/{datasource_id}")
-async def update_datasource(datasource_id: str, body: DatasourceUpdate) -> dict[str, str]:
+async def update_datasource(
+    datasource_id: str, body: DatasourceUpdate
+) -> dict[str, str]:
     """Update a datasource."""
     try:
         success = await postgres_db.update_datasource(
@@ -5481,7 +5909,9 @@ async def update_datasource(datasource_id: str, body: DatasourceUpdate) -> dict[
             read_only=body.read_only,
         )
         if not success:
-            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            )
         return {"status": "updated"}
     except HTTPException:
         raise
@@ -5495,7 +5925,9 @@ async def delete_datasource(datasource_id: str) -> dict[str, str]:
     try:
         success = await postgres_db.delete_datasource(datasource_id)
         if not success:
-            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            )
         return {"status": "deleted"}
     except HTTPException:
         raise
@@ -5526,7 +5958,9 @@ async def test_datasource(datasource_id: str) -> dict[str, Any]:
     try:
         ds = await postgres_db.get_datasource(datasource_id)
         if not ds:
-            raise HTTPException(status_code=404, detail=f"Datasource '{datasource_id}' not found")
+            raise HTTPException(
+                status_code=404, detail=f"Datasource '{datasource_id}' not found"
+            )
 
         ds_type = ds["type"]
         url = ds["connection_url"]
@@ -5546,6 +5980,7 @@ async def test_datasource(datasource_id: str) -> dict[str, Any]:
         elif ds_type == "neo4j":
             try:
                 from neo4j import GraphDatabase
+
                 username = creds.get("username", "neo4j")
                 password = creds.get("password", "")
                 driver = GraphDatabase.driver(url, auth=(username, password))
@@ -5558,6 +5993,7 @@ async def test_datasource(datasource_id: str) -> dict[str, Any]:
         elif ds_type == "mongodb":
             try:
                 from pymongo import MongoClient
+
                 client = MongoClient(url, serverSelectionTimeoutMS=5000)
                 client.server_info()
                 client.close()
@@ -5665,7 +6101,9 @@ async def list_sources(
             idx = 1
 
             if job_id:
-                conditions.append(f"s.id IN (SELECT source_id FROM job_sources WHERE job_id = ${idx}::uuid)")
+                conditions.append(
+                    f"s.id IN (SELECT source_id FROM job_sources WHERE job_id = ${idx}::uuid)"
+                )
                 params.append(job_id)
                 idx += 1
             if type:
@@ -5725,7 +6163,8 @@ async def get_source_detail(
                           LEFT(content, $2) as content, content_hash, metadata, created_at,
                           LENGTH(content) as full_content_length
                     FROM sources WHERE id = $1""",
-                    source_id, content_limit,
+                    source_id,
+                    content_limit,
                 )
             else:
                 row = await conn.fetchrow(
@@ -5737,11 +6176,14 @@ async def get_source_detail(
                 )
 
             if not row:
-                raise HTTPException(status_code=404, detail=f"Source {source_id} not found")
+                raise HTTPException(
+                    status_code=404, detail=f"Source {source_id} not found"
+                )
 
             result = dict(row)
             result["content_truncated"] = (
-                content_limit > 0 and result.get("full_content_length", 0) > content_limit
+                content_limit > 0
+                and result.get("full_content_length", 0) > content_limit
             )
 
             # Include linked job IDs
@@ -5761,7 +6203,9 @@ async def get_source_detail(
 async def list_job_citations(
     job_id: str,
     source_id: int | None = Query(default=None),
-    status: str | None = Query(default=None, description="Filter by verification_status"),
+    status: str | None = Query(
+        default=None, description="Filter by verification_status"
+    ),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
@@ -5832,7 +6276,9 @@ async def get_citation_detail(citation_id: int) -> dict[str, Any]:
             )
 
             if not row:
-                raise HTTPException(status_code=404, detail=f"Citation {citation_id} not found")
+                raise HTTPException(
+                    status_code=404, detail=f"Citation {citation_id} not found"
+                )
 
             return dict(row)
     except HTTPException:
@@ -5856,7 +6302,9 @@ async def get_source_annotations(
                     FROM source_annotations
                     WHERE source_id = $1 AND job_id = $2::uuid AND annotation_type = $3
                     ORDER BY created_at""",
-                    source_id, job_id, type,
+                    source_id,
+                    job_id,
+                    type,
                 )
             else:
                 rows = await conn.fetch(
@@ -5864,7 +6312,8 @@ async def get_source_annotations(
                     FROM source_annotations
                     WHERE source_id = $1 AND job_id = $2::uuid
                     ORDER BY created_at""",
-                    source_id, job_id,
+                    source_id,
+                    job_id,
                 )
 
             return [dict(r) for r in rows]
@@ -5879,7 +6328,8 @@ async def get_source_tags(job_id: str, source_id: int) -> list[str]:
         async with vector_db.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT tag FROM source_tags WHERE source_id = $1 AND job_id = $2::uuid ORDER BY tag",
-                source_id, job_id,
+                source_id,
+                job_id,
             )
             return [r["tag"] for r in rows]
     except Exception as e:
@@ -6035,7 +6485,13 @@ async def list_job_memories(
 ) -> dict[str, Any]:
     """List individual memories for a job with optional filters and pagination."""
     # Validate sort parameters
-    valid_sort_fields = {"created_at", "importance", "access_count", "token_count", "last_accessed"}
+    valid_sort_fields = {
+        "created_at",
+        "importance",
+        "access_count",
+        "token_count",
+        "last_accessed",
+    }
     if sort_by not in valid_sort_fields:
         sort_by = "created_at"
     if sort_order not in {"asc", "desc"}:
@@ -6105,9 +6561,13 @@ async def list_job_memories(
 async def search_job_sources(
     job_id: str,
     query: str = Query(..., description="Search query"),
-    mode: str = Query(default="keyword", description="Search mode: keyword, semantic, hybrid"),
+    mode: str = Query(
+        default="keyword", description="Search mode: keyword, semantic, hybrid"
+    ),
     source_type: str | None = Query(default=None),
-    tags: str | None = Query(default=None, description="Comma-separated tags (AND logic)"),
+    tags: str | None = Query(
+        default=None, description="Comma-separated tags (AND logic)"
+    ),
     top_k: int = Query(default=10, ge=1, le=50),
 ) -> dict[str, Any]:
     """Search a job's source library using keyword search.
@@ -6172,15 +6632,17 @@ async def search_job_sources(
                 else:
                     evidence = "LOW"
 
-                results.append({
-                    "source_id": r["id"],
-                    "source_name": r["name"],
-                    "source_type": r["type"],
-                    "identifier": r["identifier"],
-                    "evidence_label": evidence,
-                    "rank": rank,
-                    "snippet": r["snippet"],
-                })
+                results.append(
+                    {
+                        "source_id": r["id"],
+                        "source_name": r["name"],
+                        "source_type": r["type"],
+                        "identifier": r["identifier"],
+                        "evidence_label": evidence,
+                        "rank": rank,
+                        "snippet": r["snippet"],
+                    }
+                )
 
             return {
                 "job_id": job_id,
@@ -6241,7 +6703,11 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
         # If agent transitioned to ready, trigger the dispatcher
         # (will be wired up in the dispatcher task)
         prev_status = result.get("previous_status")
-        if prev_status and prev_status != heartbeat.status and heartbeat.status == "ready":
+        if (
+            prev_status
+            and prev_status != heartbeat.status
+            and heartbeat.status == "ready"
+        ):
             logger.info(f"Agent {agent_id} transitioned {prev_status} → ready")
             _trigger_dispatch()
 
@@ -6301,7 +6767,9 @@ async def get_agent_system_info(agent_id: str) -> dict[str, Any]:
 
         pod_ip = agent.get("pod_ip")
         if not pod_ip:
-            raise HTTPException(status_code=400, detail="Agent has no pod IP configured")
+            raise HTTPException(
+                status_code=400, detail="Agent has no pod IP configured"
+            )
 
         pod_port = agent.get("pod_port", 8001)
         agent_url = f"http://{pod_ip}:{pod_port}/system/info"
@@ -6353,7 +6821,9 @@ async def get_job_logs(
 
     log_path = workspace_service.base_path / "logs" / f"job_{job_id}.log"
     if not log_path.exists():
-        raise HTTPException(status_code=404, detail=f"Log file not found for job {job_id}")
+        raise HTTPException(
+            status_code=404, detail=f"Log file not found for job {job_id}"
+        )
 
     try:
         all_lines = log_path.read_text().splitlines()
@@ -6366,8 +6836,13 @@ async def get_job_logs(
     if level:
         level_upper = level.upper()
         if level_upper not in ("DEBUG", "INFO", "WARNING", "ERROR"):
-            raise HTTPException(status_code=400, detail=f"Invalid level: {level}. Must be DEBUG, INFO, WARNING, or ERROR")
-        pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{level_upper}\s+-")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid level: {level}. Must be DEBUG, INFO, WARNING, or ERROR",
+            )
+        pattern = re.compile(
+            rf"^\d{{4}}-\d{{2}}-\d{{2}}\s+\d{{2}}:\d{{2}}:\d{{2}}\s+-\s+\S+\s+-\s+{level_upper}\s+-"
+        )
         all_lines = [line for line in all_lines if pattern.match(line)]
         filtered = True
 
@@ -6435,7 +6910,7 @@ async def get_job_shell_state(job_id: str) -> dict[str, Any]:
         if job.get("status") != "processing":
             raise HTTPException(
                 status_code=400,
-                detail=f"Job is not processing (status: {job.get('status')})"
+                detail=f"Job is not processing (status: {job.get('status')})",
             )
 
         assigned_agent_id = job.get("assigned_agent_id")
@@ -6448,7 +6923,9 @@ async def get_job_shell_state(job_id: str) -> dict[str, Any]:
 
         pod_ip = agent.get("pod_ip")
         if not pod_ip:
-            raise HTTPException(status_code=400, detail="Agent has no pod IP configured")
+            raise HTTPException(
+                status_code=400, detail="Agent has no pod IP configured"
+            )
 
         pod_port = agent.get("pod_port", 8001)
         agent_url = f"http://{pod_ip}:{pod_port}/system/shell-state"
@@ -6548,12 +7025,18 @@ def _scan_experts() -> list[ExpertInfo]:
             if not description:
                 tools = data.get("tools", {})
                 tool_categories = [k for k in tools if tools[k]]
-                description = f"Agent with {', '.join(tool_categories)} tools." if tool_categories else "Custom agent configuration."
+                description = (
+                    f"Agent with {', '.join(tool_categories)} tools."
+                    if tool_categories
+                    else "Custom agent configuration."
+                )
 
             experts.append(
                 ExpertInfo(
                     id=entry.name,
-                    display_name=data.get("display_name", entry.name.replace("_", " ").title()),
+                    display_name=data.get(
+                        "display_name", entry.name.replace("_", " ").title()
+                    ),
                     description=description,
                     icon=data.get("icon", "psychology"),
                     color=data.get("color", "#cba6f7"),
@@ -6640,7 +7123,9 @@ def _load_expert_detail(expert_id: str) -> dict[str, Any]:
         instructions_content = instr_path.read_text(encoding="utf-8")
     else:
         # Fall back to template referenced in config
-        template_name = merged.get("workspace", {}).get("instructions_template", "instructions.md")
+        template_name = merged.get("workspace", {}).get(
+            "instructions_template", "instructions.md"
+        )
         template_path = config_dir / "prompts" / template_name
         if template_path.exists():
             instructions_content = template_path.read_text(encoding="utf-8")
@@ -6679,7 +7164,9 @@ async def get_expert(expert_id: str) -> dict[str, Any]:
 
     detail = _load_expert_detail(expert_id)
     if not detail:
-        raise HTTPException(status_code=404, detail=f"Expert config not found: {expert_id}")
+        raise HTTPException(
+            status_code=404, detail=f"Expert config not found: {expert_id}"
+        )
 
     return {
         **expert_info.model_dump(),
@@ -6764,9 +7251,7 @@ async def list_project_experts(project_id: str) -> list[dict[str, Any]]:
 
 
 @app.get("/api/projects/{project_id}/experts/{expert_name}")
-async def get_project_expert(
-    project_id: str, expert_name: str
-) -> dict[str, Any]:
+async def get_project_expert(project_id: str, expert_name: str) -> dict[str, Any]:
     """Get full detail for a project expert including merged config and instructions."""
     if not gitea_client.is_initialized:
         raise HTTPException(status_code=503, detail="Gitea not available")
@@ -6780,16 +7265,12 @@ async def get_project_expert(
         repo_name, f"experts/{expert_name}/config.yaml"
     )
     if not config_content:
-        raise HTTPException(
-            status_code=404, detail=f"Expert not found: {expert_name}"
-        )
+        raise HTTPException(status_code=404, detail=f"Expert not found: {expert_name}")
 
     try:
         expert_data = yaml.safe_load(config_content) or {}
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Invalid YAML: {e}"
-        ) from e
+        raise HTTPException(status_code=500, detail=f"Invalid YAML: {e}") from e
 
     # Build info
     description = expert_data.get("description", "").strip()
@@ -6852,7 +7333,9 @@ def _user_dict(user: dict) -> dict:
         "display_name": user["display_name"],
         "avatar_color": user["avatar_color"],
         "email": user.get("email"),
-        "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
+        "default_project_id": str(user["default_project_id"])
+        if user.get("default_project_id")
+        else None,
         "is_admin": user.get("is_admin", False),
         "is_approved": user.get("is_approved", False),
         "created_at": user["created_at"],
@@ -6903,9 +7386,14 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
     # Validate scope
     scope = body.scope.strip()
     if scope not in ("user", "all") and not scope.startswith("project:"):
-        raise HTTPException(status_code=400, detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid scope. Use 'user', 'all', or 'project:<uuid>'",
+        )
     if scope == "all" and not user.get("is_admin", False):
-        raise HTTPException(status_code=403, detail="Only admins can create full-access tokens")
+        raise HTTPException(
+            status_code=403, detail="Only admins can create full-access tokens"
+        )
     if scope.startswith("project:"):
         project_id = scope.split(":", 1)[1]
         members = await postgres_db.get_project_members(project_id)
@@ -6921,6 +7409,7 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
     expires_at = None
     if body.expires_in_days:
         from datetime import timedelta
+
         expires_at = datetime.now(timezone.utc) + timedelta(days=body.expires_in_days)
 
     row = await postgres_db.create_mcp_token(
@@ -6932,7 +7421,9 @@ async def create_mcp_token(request: Request, body: McpTokenCreate) -> dict[str, 
         expires_at=expires_at,
     )
 
-    result = {k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()}
+    result = {
+        k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()
+    }
     result["token"] = token  # Plaintext returned once only
     return result
 
@@ -6954,12 +7445,16 @@ async def revoke_mcp_token(request: Request, token_id: str) -> dict[str, str]:
     user = await require_approved_user(request, postgres_db)
     revoked = await postgres_db.revoke_mcp_token(token_id, str(user["id"]))
     if not revoked:
-        raise HTTPException(status_code=404, detail="Token not found or already revoked")
+        raise HTTPException(
+            status_code=404, detail="Token not found or already revoked"
+        )
     return {"status": "revoked"}
 
 
 @app.post("/api/internal/mcp-token-verify")
-async def internal_mcp_token_verify(request: Request, body: McpTokenVerifyRequest) -> dict[str, Any]:
+async def internal_mcp_token_verify(
+    request: Request, body: McpTokenVerifyRequest
+) -> dict[str, Any]:
     """Internal endpoint for MCP server to verify a token hash.
 
     Protected by X-Internal-Key header (shared secret).
@@ -6999,11 +7494,16 @@ async def list_user_api_keys(request: Request) -> list[dict[str, Any]]:
 
 
 @app.put("/api/settings/api-keys/{provider}")
-async def set_user_api_key(request: Request, provider: str, body: ApiKeySet) -> dict[str, Any]:
+async def set_user_api_key(
+    request: Request, provider: str, body: ApiKeySet
+) -> dict[str, Any]:
     """Set (create or replace) an API key for a provider."""
     user = await require_approved_user(request, postgres_db)
     if provider not in VALID_API_KEY_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}",
+        )
 
     key_prefix = body.api_key[:8]
     row = await postgres_db.upsert_user_api_key(
@@ -7022,7 +7522,9 @@ async def delete_user_api_key(request: Request, provider: str) -> dict[str, str]
     user = await require_approved_user(request, postgres_db)
     deleted = await postgres_db.delete_user_api_key(str(user["id"]), provider)
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"No API key for provider '{provider}'")
+        raise HTTPException(
+            status_code=404, detail=f"No API key for provider '{provider}'"
+        )
     return {"status": "deleted"}
 
 
@@ -7034,10 +7536,16 @@ async def get_user_preferences(request: Request) -> dict[str, Any]:
 
 
 @app.patch("/api/settings/preferences")
-async def update_user_preferences(request: Request, body: UserSettingsUpdate) -> dict[str, str]:
+async def update_user_preferences(
+    request: Request, body: UserSettingsUpdate
+) -> dict[str, str]:
     """Update the current user's preference settings (patch-merge)."""
     user = await require_approved_user(request, postgres_db)
-    settings = {k: v for k, v in body.model_dump().items() if v is not None or k in body.model_fields_set}
+    settings = {
+        k: v
+        for k, v in body.model_dump().items()
+        if v is not None or k in body.model_fields_set
+    }
     if not settings:
         raise HTTPException(status_code=400, detail="No settings provided")
     await postgres_db.update_user_settings(str(user["id"]), settings)
@@ -7050,7 +7558,9 @@ async def update_user_preferences(request: Request, body: UserSettingsUpdate) ->
 
 
 @app.get("/api/projects/{project_id}/api-keys")
-async def list_project_api_keys(request: Request, project_id: str) -> list[dict[str, Any]]:
+async def list_project_api_keys(
+    request: Request, project_id: str
+) -> list[dict[str, Any]]:
     """List a project's API keys (prefix only). Requires project membership."""
     user = await require_approved_user(request, postgres_db)
     members = await postgres_db.get_project_members(project_id)
@@ -7071,7 +7581,10 @@ async def set_project_api_key(
     """Set (create or replace) a project API key. Requires owner or editor role."""
     user = await require_approved_user(request, postgres_db)
     if provider not in VALID_API_KEY_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid provider '{provider}'. Valid: {sorted(VALID_API_KEY_PROVIDERS)}",
+        )
 
     members = await postgres_db.get_project_members(project_id)
     member = next((m for m in members if str(m["user_id"]) == str(user["id"])), None)
@@ -7102,7 +7615,9 @@ async def delete_project_api_key(
 
     deleted = await postgres_db.delete_project_api_key(project_id, provider)
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"No API key for provider '{provider}'")
+        raise HTTPException(
+            status_code=404, detail=f"No API key for provider '{provider}'"
+        )
     return {"status": "deleted"}
 
 
@@ -7173,7 +7688,9 @@ async def codex_status(request: Request) -> dict[str, Any]:
         return {"connected": False, "accounts": [], "model_count": 0}
 
     # Normalize: auth-files may return a list or a dict with a key
-    accounts = auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
+    accounts = (
+        auth_files if isinstance(auth_files, list) else auth_files.get("files", [])
+    )
     active = [a for a in accounts if not a.get("disabled") and not a.get("unavailable")]
 
     model_count = 0
@@ -7294,7 +7811,9 @@ async def create_user(body: UserCreate, request: Request) -> dict[str, Any]:
 
 
 @app.put("/api/users/{user_id}")
-async def update_user(user_id: str, body: UserUpdate, request: Request) -> dict[str, str]:
+async def update_user(
+    user_id: str, body: UserUpdate, request: Request
+) -> dict[str, str]:
     """Update a user (requires authentication)."""
     await require_approved_user(request, postgres_db)
     success = await postgres_db.update_user(
@@ -7363,7 +7882,9 @@ async def create_project(body: ProjectCreate) -> dict[str, Any]:
                                 creator["email"], repo_name
                             )
                     except Exception as e:
-                        logger.warning(f"Failed to grant Gitea access for project creator: {e}")
+                        logger.warning(
+                            f"Failed to grant Gitea access for project creator: {e}"
+                        )
 
         # Create Keycloak group and add creator
         if keycloak_groups.is_initialized:
@@ -7440,15 +7961,23 @@ async def delete_project(project_id: str) -> dict[str, str]:
     # Clean up knowledge_index in vector DB (no FK cascade across databases)
     try:
         async with vector_db.acquire() as conn:
-            await conn.execute("DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id))
+            await conn.execute(
+                "DELETE FROM knowledge_index WHERE project_id = $1", UUID(project_id)
+            )
     except Exception as e:
-        logger.warning(f"Failed to clean up knowledge_index for project {project_id}: {e}")
+        logger.warning(
+            f"Failed to clean up knowledge_index for project {project_id}: {e}"
+        )
 
     # Detach referencing rows that lack ON DELETE CASCADE/SET NULL
     uuid_val = UUID(project_id)
     async with postgres_db.acquire() as conn:
-        await conn.execute("UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val)
-        await conn.execute("UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val)
+        await conn.execute(
+            "UPDATE jobs SET project_id = NULL WHERE project_id = $1", uuid_val
+        )
+        await conn.execute(
+            "UPDATE datasources SET project_id = NULL WHERE project_id = $1", uuid_val
+        )
 
     success = await postgres_db.delete_project(project_id)
     if not success:
@@ -7564,9 +8093,7 @@ async def remove_project_member(project_id: str, user_id: str) -> dict[str, str]
                             removed_user["email"], repo["name"]
                         )
         except Exception as e:
-            logger.warning(
-                f"Failed to revoke Gitea access for member {user_id}: {e}"
-            )
+            logger.warning(f"Failed to revoke Gitea access for member {user_id}: {e}")
 
     return {"status": "removed"}
 
@@ -7599,7 +8126,9 @@ async def add_project_repository(
     if body.create_managed and gitea_client.is_initialized:
         repo_url = await gitea_client.create_repo(body.name)
         if not repo_url:
-            raise HTTPException(status_code=502, detail="Failed to create Gitea repository")
+            raise HTTPException(
+                status_code=502, detail="Failed to create Gitea repository"
+            )
         is_managed = True
 
     try:
@@ -7791,7 +8320,14 @@ async def promote_job(job_id: str, request: PromoteRequest) -> dict[str, Any]:
 
                     # Clone old jobs repo at the job branch
                     result = subprocess.run(
-                        ["git", "clone", "--branch", branch_name, old_repo_url, clone_path],
+                        [
+                            "git",
+                            "clone",
+                            "--branch",
+                            branch_name,
+                            old_repo_url,
+                            clone_path,
+                        ],
                         capture_output=True,
                         text=True,
                         timeout=120,
@@ -7809,7 +8345,9 @@ async def promote_job(job_id: str, request: PromoteRequest) -> dict[str, Any]:
                             timeout=120,
                         )
                         if result.returncode != 0:
-                            logger.error(f"Promote: clone fallback also failed: {result.stderr[:200]}")
+                            logger.error(
+                                f"Promote: clone fallback also failed: {result.stderr[:200]}"
+                            )
 
                     if os.path.isdir(clone_path):
                         # Add new repo as remote, push as main
@@ -7890,10 +8428,12 @@ def _get_knowledge_graph():
         return _knowledge_graph_db
     try:
         import sys
+
         project_root = str(Path(__file__).parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
         from src.services.knowledge_graph import KnowledgeGraphDB
+
         _knowledge_graph_db = KnowledgeGraphDB()
         if not _knowledge_graph_db.connect():
             logger.warning("Could not connect to Neo4j for knowledge base")
@@ -8023,9 +8563,9 @@ async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
     try:
         async with vector_db.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT * FROM knowledge_index "
-                "WHERE project_id = $1 AND note_id = $2",
-                project_id, note_id,
+                "SELECT * FROM knowledge_index WHERE project_id = $1 AND note_id = $2",
+                project_id,
+                note_id,
             )
         if not row:
             raise HTTPException(
@@ -8058,7 +8598,8 @@ async def get_knowledge_note(project_id: str, note_id: str) -> dict[str, Any]:
 
 @app.post("/api/projects/{project_id}/knowledge/search")
 async def search_knowledge(
-    project_id: str, body: KnowledgeSearchRequest,
+    project_id: str,
+    body: KnowledgeSearchRequest,
 ) -> dict[str, Any]:
     """Hybrid search over project knowledge base."""
     project = await postgres_db.get_project(project_id)
@@ -8071,10 +8612,12 @@ async def search_knowledge(
             embedding = None
             try:
                 import sys
+
                 project_root = str(Path(__file__).parent.parent)
                 if project_root not in sys.path:
                     sys.path.insert(0, project_root)
                 from src.services.embedding_service import get_embedding_service
+
                 svc = get_embedding_service()
                 embedding = await svc.embed(body.query)
             except Exception:
@@ -8083,7 +8626,10 @@ async def search_knowledge(
             if embedding:
                 rows = await conn.fetch(
                     "SELECT * FROM knowledge_hybrid_search($1, $2::vector, $3, $4)",
-                    body.query, str(embedding), project_id, body.limit,
+                    body.query,
+                    str(embedding),
+                    project_id,
+                    body.limit,
                 )
             else:
                 # Sparse-only fallback: tsvector keyword search
@@ -8092,7 +8638,9 @@ async def search_knowledge(
                     "WHERE project_id = $1 AND search_doc @@ websearch_to_tsquery($2) "
                     "ORDER BY ts_rank_cd(search_doc, websearch_to_tsquery($2)) DESC "
                     "LIMIT $3",
-                    project_id, body.query, body.limit,
+                    project_id,
+                    body.query,
+                    body.limit,
                 )
 
             notes = []
@@ -8109,7 +8657,9 @@ async def search_knowledge(
 
 @app.patch("/api/projects/{project_id}/knowledge/{note_id}")
 async def update_knowledge_note(
-    project_id: str, note_id: str, body: KnowledgeNoteUpdate,
+    project_id: str,
+    note_id: str,
+    body: KnowledgeNoteUpdate,
 ) -> dict[str, str]:
     """Update a knowledge note's status or tags."""
     valid_statuses = {"active", "resolved", "superseded", "archived"}
@@ -8125,7 +8675,8 @@ async def update_knowledge_note(
             row = await conn.fetchrow(
                 "SELECT note_id FROM knowledge_index "
                 "WHERE project_id = $1 AND note_id = $2",
-                project_id, note_id,
+                project_id,
+                note_id,
             )
             if not row:
                 raise HTTPException(
@@ -8192,9 +8743,9 @@ async def delete_knowledge_note(project_id: str, note_id: str) -> dict[str, str]
         # Delete from vector DB
         async with vector_db.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM knowledge_index "
-                "WHERE project_id = $1 AND note_id = $2",
-                project_id, note_id,
+                "DELETE FROM knowledge_index WHERE project_id = $1 AND note_id = $2",
+                project_id,
+                note_id,
             )
             if result == "DELETE 0":
                 raise HTTPException(
@@ -8236,6 +8787,7 @@ async def export_knowledge(project_id: str) -> dict[str, Any]:
 
     try:
         import tempfile
+
         export_dir = Path(tempfile.mkdtemp(prefix="kb_export_"))
         notes = kg.get_all_notes_for_export(project_id)
 
@@ -8328,8 +8880,14 @@ async def get_builder_session(session_id: str) -> dict[str, Any]:
 
 # Tools whose results are displayed as rich inspection panels in the frontend
 _INSPECTION_TOOLS = {
-    "list_jobs", "get_job", "get_job_progress", "get_workspace_file",
-    "get_workspace_overview", "get_frozen_job", "get_todos", "get_chat_history",
+    "list_jobs",
+    "get_job",
+    "get_job_progress",
+    "get_workspace_file",
+    "get_workspace_overview",
+    "get_frozen_job",
+    "get_todos",
+    "get_chat_history",
 }
 
 
@@ -8369,7 +8927,9 @@ def _build_workspace_proposal(tool_name: str, args: dict[str, Any]) -> dict[str,
         if current_content is None:
             return {"error": f"File '{path}' not found in workspace for job '{job_id}'"}
         if old_text not in current_content:
-            return {"error": f"old_text not found in '{path}'. The file may have changed."}
+            return {
+                "error": f"old_text not found in '{path}'. The file may have changed."
+            }
         return {
             "tool": tool_name,
             "job_id": job_id,
@@ -8462,7 +9022,11 @@ async def send_builder_message(
             builder_settings = resolve_builder_settings(raw_model)
 
             for iteration in range(MAX_ITERATIONS):
-                step_title = 'Analyzing request...' if iteration == 0 else 'Processing tool results...'
+                step_title = (
+                    "Analyzing request..."
+                    if iteration == 0
+                    else "Processing tool results..."
+                )
                 yield f"event: step\ndata: {json.dumps({'type': 'thought', 'title': step_title})}\n\n"
                 final_steps.append({"type": "thought", "title": step_title})
                 turn_text = ""
@@ -8471,12 +9035,32 @@ async def send_builder_message(
 
                 # Select streaming function based on provider and API type
                 if provider == "anthropic":
-                    stream_fn = _stream_anthropic(system_prompt, loop_messages, model_name, api_key, settings=builder_settings)
+                    stream_fn = _stream_anthropic(
+                        system_prompt,
+                        loop_messages,
+                        model_name,
+                        api_key,
+                        settings=builder_settings,
+                    )
                 elif use_responses_api:
                     input_items = _chat_messages_to_responses_input(loop_messages)
-                    stream_fn = _stream_openai_responses(system_prompt, input_items, model_name, api_key, base_url=base_url, settings=builder_settings)
+                    stream_fn = _stream_openai_responses(
+                        system_prompt,
+                        input_items,
+                        model_name,
+                        api_key,
+                        base_url=base_url,
+                        settings=builder_settings,
+                    )
                 else:
-                    stream_fn = _stream_openai(system_prompt, loop_messages, model_name, api_key, base_url=base_url, settings=builder_settings)
+                    stream_fn = _stream_openai(
+                        system_prompt,
+                        loop_messages,
+                        model_name,
+                        api_key,
+                        base_url=base_url,
+                        settings=builder_settings,
+                    )
 
                 async for evt_type, evt_data in stream_fn:
                     if evt_type == "token":
@@ -8491,17 +9075,43 @@ async def send_builder_message(
                                 step_title = f"Searching: {evt_data['args'].get('query', tool_display)}"
                             else:
                                 step_title = f"Running: {tool_display}"
-                            final_steps.append({"type": "tool_call", "title": step_title, "content": json.dumps(evt_data['args'])})
+                            final_steps.append(
+                                {
+                                    "type": "tool_call",
+                                    "title": step_title,
+                                    "content": json.dumps(evt_data["args"]),
+                                }
+                            )
                         elif evt_data["name"] in WORKSPACE_EDIT_TOOLS:
-                            proposal = _build_workspace_proposal(evt_data["name"], evt_data["args"])
+                            proposal = _build_workspace_proposal(
+                                evt_data["name"], evt_data["args"]
+                            )
                             if not proposal.get("error"):
                                 yield f"event: workspace_proposal\ndata: {json.dumps(proposal)}\n\n"
-                                ws_label = "Write" if evt_data["name"] == "write_workspace_file" else "Edit"
-                                final_steps.append({"type": "workspace_proposal", "title": f"{ws_label}: {evt_data['args'].get('path', 'file')}", "content": ""})
+                                ws_label = (
+                                    "Write"
+                                    if evt_data["name"] == "write_workspace_file"
+                                    else "Edit"
+                                )
+                                final_steps.append(
+                                    {
+                                        "type": "workspace_proposal",
+                                        "title": f"{ws_label}: {evt_data['args'].get('path', 'file')}",
+                                        "content": "",
+                                    }
+                                )
                         else:
                             yield f"event: tool_call\ndata: {json.dumps({'tool': evt_data['name'], 'args': evt_data['args']})}\n\n"
-                            final_tool_calls.append({"tool": evt_data["name"], "args": evt_data["args"]})
-                            final_steps.append({"type": "tool_call", "title": _format_tool_name(evt_data["name"]), "content": json.dumps(evt_data['args'])})
+                            final_tool_calls.append(
+                                {"tool": evt_data["name"], "args": evt_data["args"]}
+                            )
+                            final_steps.append(
+                                {
+                                    "type": "tool_call",
+                                    "title": _format_tool_name(evt_data["name"]),
+                                    "content": json.dumps(evt_data["args"]),
+                                }
+                            )
                     elif evt_type == "error":
                         yield f"event: error\ndata: {json.dumps({'message': evt_data['message']})}\n\n"
                         error_occurred = True
@@ -8522,32 +9132,52 @@ async def send_builder_message(
                     if turn_text:
                         assistant_content.append({"type": "text", "text": turn_text})
                     for tc in turn_tool_calls:
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": tc["id"],
-                            "name": tc["name"],
-                            "input": tc["args"],
-                        })
-                    loop_messages.append({"role": "assistant", "content": assistant_content})
+                        assistant_content.append(
+                            {
+                                "type": "tool_use",
+                                "id": tc["id"],
+                                "name": tc["name"],
+                                "input": tc["args"],
+                            }
+                        )
+                    loop_messages.append(
+                        {"role": "assistant", "content": assistant_content}
+                    )
 
                     # Execute server-side tools and build tool_result blocks
                     tool_results = []
                     for tc in turn_tool_calls:
                         if tc["name"] in SERVER_SIDE_TOOLS:
                             result, full_content = await _execute_server_tool(
-                                tc["name"], tc["args"],
+                                tc["name"],
+                                tc["args"],
                                 user_id=_session_user_id,
                                 active_project_id=body.active_project_id,
                             )
-                            evt_data: dict[str, Any] = {"tool": tc["name"], "summary": result[:200]}
+                            evt_data: dict[str, Any] = {
+                                "tool": tc["name"],
+                                "summary": result[:200],
+                            }
                             if full_content is not None:
                                 evt_data["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data)}\n\n"
                             formatted = _format_tool_name(tc["name"])
                             if full_content and tc["name"] in _INSPECTION_TOOLS:
-                                final_steps.append({"type": "inspection_result", "title": formatted, "content": full_content})
+                                final_steps.append(
+                                    {
+                                        "type": "inspection_result",
+                                        "title": formatted,
+                                        "content": full_content,
+                                    }
+                                )
                             else:
-                                final_steps.append({"type": "tool_result", "title": f"Result: {formatted}", "content": ""})
+                                final_steps.append(
+                                    {
+                                        "type": "tool_result",
+                                        "title": f"Result: {formatted}",
+                                        "content": "",
+                                    }
+                                )
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -8556,22 +9186,32 @@ async def send_builder_message(
                                 result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
                         else:
                             result = "OK"
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tc["id"],
-                            "content": result,
-                        })
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tc["id"],
+                                "content": result,
+                            }
+                        )
                     loop_messages.append({"role": "user", "content": tool_results})
                 else:
                     # OpenAI format: assistant message with tool_calls + tool role messages
                     openai_tool_calls = []
                     for tc in turn_tool_calls:
-                        openai_tool_calls.append({
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])},
-                        })
-                    assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": openai_tool_calls}
+                        openai_tool_calls.append(
+                            {
+                                "id": tc["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": tc["name"],
+                                    "arguments": json.dumps(tc["args"]),
+                                },
+                            }
+                        )
+                    assistant_msg: dict[str, Any] = {
+                        "role": "assistant",
+                        "tool_calls": openai_tool_calls,
+                    }
                     if turn_text:
                         assistant_msg["content"] = turn_text
                     loop_messages.append(assistant_msg)
@@ -8580,19 +9220,35 @@ async def send_builder_message(
                     for tc in turn_tool_calls:
                         if tc["name"] in SERVER_SIDE_TOOLS:
                             result, full_content = await _execute_server_tool(
-                                tc["name"], tc["args"],
+                                tc["name"],
+                                tc["args"],
                                 user_id=_session_user_id,
                                 active_project_id=body.active_project_id,
                             )
-                            evt_data_oai: dict[str, Any] = {"tool": tc["name"], "summary": result[:200]}
+                            evt_data_oai: dict[str, Any] = {
+                                "tool": tc["name"],
+                                "summary": result[:200],
+                            }
                             if full_content is not None:
                                 evt_data_oai["content"] = full_content
                             yield f"event: tool_result\ndata: {json.dumps(evt_data_oai)}\n\n"
                             formatted = _format_tool_name(tc["name"])
                             if full_content and tc["name"] in _INSPECTION_TOOLS:
-                                final_steps.append({"type": "inspection_result", "title": formatted, "content": full_content})
+                                final_steps.append(
+                                    {
+                                        "type": "inspection_result",
+                                        "title": formatted,
+                                        "content": full_content,
+                                    }
+                                )
                             else:
-                                final_steps.append({"type": "tool_result", "title": f"Result: {formatted}", "content": ""})
+                                final_steps.append(
+                                    {
+                                        "type": "tool_result",
+                                        "title": f"Result: {formatted}",
+                                        "content": "",
+                                    }
+                                )
                         elif tc["name"] in WORKSPACE_EDIT_TOOLS:
                             proposal = _build_workspace_proposal(tc["name"], tc["args"])
                             if proposal.get("error"):
@@ -8601,11 +9257,13 @@ async def send_builder_message(
                                 result = f"Proposed edit to {tc['args'].get('path', 'file')}. The user will review and approve or dismiss."
                         else:
                             result = "OK"
-                        loop_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result,
-                        })
+                        loop_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            }
+                        )
 
             # Store assistant message
             await postgres_db.create_builder_message(
@@ -8650,7 +9308,8 @@ async def _execute_server_tool(
 ) -> tuple[str, str | None]:
     """Execute a server-side builder tool via the shared dispatch module."""
     return await _dispatch_server_tool(
-        tool_name, args,
+        tool_name,
+        args,
         tavily_search_fn=tavily_search,
         user_id=user_id,
         active_project_id=active_project_id,
@@ -8693,18 +9352,22 @@ def _resolve_builder_model(raw_model: str) -> tuple[str, str | None, str | None]
     - No prefix → default OpenAI provider
     """
     if raw_model.startswith("openrouter/"):
-        model_name = raw_model[len("openrouter/"):]
+        model_name = raw_model[len("openrouter/") :]
         base_url = "https://openrouter.ai/api/v1"
         api_key = os.getenv("OPENROUTER_API_KEY")
         return model_name, base_url, api_key
     if raw_model.startswith("codex/"):
-        model_name = raw_model[len("codex/"):]
+        model_name = raw_model[len("codex/") :]
         base_url = os.getenv("CODEX_BASE_URL", "http://localhost:8317/v1")
         api_key = os.getenv("CODEX_API_KEY", "not-needed")
         return model_name, base_url, api_key
     if raw_model.startswith("openai/"):
-        model_name = raw_model[len("openai/"):]
-        base_url = os.getenv("BUILDER_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
+        model_name = raw_model[len("openai/") :]
+        base_url = (
+            os.getenv("BUILDER_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("LLM_BASE_URL")
+        )
         # Use provider-specific key only — skip generic BUILDER_API_KEY which
         # may contain a key for a different provider (e.g. Anthropic key when
         # the default builder model is Claude but user selects a local model)
@@ -8744,22 +9407,28 @@ def _chat_messages_to_responses_input(
         elif role == "assistant":
             content = msg.get("content")
             if content:
-                items.append({"type": "message", "role": "assistant", "content": content})
+                items.append(
+                    {"type": "message", "role": "assistant", "content": content}
+                )
             tool_calls = msg.get("tool_calls", [])
             for tc in tool_calls:
                 func = tc.get("function", {})
-                items.append({
-                    "type": "function_call",
-                    "call_id": tc.get("id", ""),
-                    "name": func.get("name", ""),
-                    "arguments": func.get("arguments", "{}"),
-                })
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tc.get("id", ""),
+                        "name": func.get("name", ""),
+                        "arguments": func.get("arguments", "{}"),
+                    }
+                )
         elif role == "tool":
-            items.append({
-                "type": "function_call_output",
-                "call_id": msg.get("tool_call_id", ""),
-                "output": msg.get("content", ""),
-            })
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id", ""),
+                    "output": msg.get("content", ""),
+                }
+            )
     return items
 
 
@@ -8797,12 +9466,14 @@ async def _stream_openai_responses(
     response_tools = []
     for tool in BUILDER_TOOLS:
         func = tool["function"]
-        response_tools.append({
-            "type": "function",
-            "name": func["name"],
-            "description": func["description"],
-            "parameters": func["parameters"],
-        })
+        response_tools.append(
+            {
+                "type": "function",
+                "name": func["name"],
+                "description": func["description"],
+                "parameters": func["parameters"],
+            }
+        )
 
     try:
         create_kwargs: dict[str, Any] = dict(
@@ -8857,9 +9528,14 @@ async def _stream_openai_responses(
                     tc = function_calls[call_id]
                     try:
                         args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        yield ("tool_call", {"name": tc["name"], "args": args, "id": call_id})
+                        yield (
+                            "tool_call",
+                            {"name": tc["name"], "args": args, "id": call_id},
+                        )
                     except json.JSONDecodeError:
-                        logger.warning(f"Failed to parse Responses API tool args: {tc['arguments'][:100]}")
+                        logger.warning(
+                            f"Failed to parse Responses API tool args: {tc['arguments'][:100]}"
+                        )
 
             # Output item done — emit function calls if not already emitted
             elif event_type == "response.output_item.done":
@@ -8876,7 +9552,13 @@ async def _stream_openai_responses(
             if new_key:
                 logger.info("Builder: retrying OpenAI Responses API with rotated key")
                 async for event in _stream_openai_responses(
-                    system_prompt, input_items, model, api_key=new_key, _retried=True, base_url=base_url, settings=settings
+                    system_prompt,
+                    input_items,
+                    model,
+                    api_key=new_key,
+                    _retried=True,
+                    base_url=base_url,
+                    settings=settings,
                 ):
                     yield event
                 return
@@ -8968,9 +9650,14 @@ async def _stream_openai(
         for _idx, tc_buf in sorted(tool_call_buffers.items()):
             try:
                 args = json.loads(tc_buf["arguments"])
-                yield ("tool_call", {"name": tc_buf["name"], "args": args, "id": tc_buf["id"]})
+                yield (
+                    "tool_call",
+                    {"name": tc_buf["name"], "args": args, "id": tc_buf["id"]},
+                )
             except json.JSONDecodeError:
-                logger.warning(f"Failed to parse tool call args: {tc_buf['arguments'][:100]}")
+                logger.warning(
+                    f"Failed to parse tool call args: {tc_buf['arguments'][:100]}"
+                )
 
     except Exception as e:
         if not _retried and is_auth_or_quota_error(e):
@@ -8978,7 +9665,13 @@ async def _stream_openai(
             if new_key:
                 logger.info("Builder: retrying OpenAI Chat API with rotated key")
                 async for event in _stream_openai(
-                    system_prompt, context_messages, model, api_key=new_key, _retried=True, base_url=base_url, settings=settings
+                    system_prompt,
+                    context_messages,
+                    model,
+                    api_key=new_key,
+                    _retried=True,
+                    base_url=base_url,
+                    settings=settings,
                 ):
                     yield event
                 return
@@ -9012,16 +9705,19 @@ async def _stream_anthropic(
     anthropic_tools = []
     for tool in BUILDER_TOOLS:
         func = tool["function"]
-        anthropic_tools.append({
-            "name": func["name"],
-            "description": func["description"],
-            "input_schema": func["parameters"],
-        })
+        anthropic_tools.append(
+            {
+                "name": func["name"],
+                "description": func["description"],
+                "input_schema": func["parameters"],
+            }
+        )
 
     # Separate system messages from conversation messages
     filtered_messages = [m for m in context_messages if m.get("role") != "system"]
     extra_system = "\n".join(
-        m["content"] for m in context_messages
+        m["content"]
+        for m in context_messages
         if m.get("role") == "system" and isinstance(m.get("content"), str)
     )
     full_system = system_prompt
@@ -9061,10 +9757,23 @@ async def _stream_anthropic(
                 elif event.type == "content_block_stop":
                     if current_tool_name:
                         try:
-                            args = json.loads(current_tool_args) if current_tool_args else {}
-                            yield ("tool_call", {"name": current_tool_name, "args": args, "id": current_tool_id})
+                            args = (
+                                json.loads(current_tool_args)
+                                if current_tool_args
+                                else {}
+                            )
+                            yield (
+                                "tool_call",
+                                {
+                                    "name": current_tool_name,
+                                    "args": args,
+                                    "id": current_tool_id,
+                                },
+                            )
                         except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse Anthropic tool args: {current_tool_args[:100]}")
+                            logger.warning(
+                                f"Failed to parse Anthropic tool args: {current_tool_args[:100]}"
+                            )
                         current_tool_id = ""
                         current_tool_name = ""
                         current_tool_args = ""
@@ -9075,7 +9784,12 @@ async def _stream_anthropic(
             if new_key:
                 logger.info("Builder: retrying Anthropic API with rotated key")
                 async for event in _stream_anthropic(
-                    system_prompt, context_messages, model, api_key=new_key, _retried=True, settings=settings
+                    system_prompt,
+                    context_messages,
+                    model,
+                    api_key=new_key,
+                    _retried=True,
+                    settings=settings,
                 ):
                     yield event
                 return
@@ -9111,6 +9825,7 @@ async def _summarize_builder_session(
         api_key = resolved_key or get_builder_api_key(provider)
         try:
             from anthropic import AsyncAnthropic
+
             client = AsyncAnthropic(api_key=api_key)
             response = await client.messages.create(
                 model=model_name,
@@ -9128,12 +9843,19 @@ async def _summarize_builder_session(
                         response = await client.messages.create(
                             model=model_name,
                             system=summary_prompt[0]["content"],
-                            messages=[{"role": "user", "content": summary_prompt[1]["content"]}],
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": summary_prompt[1]["content"],
+                                }
+                            ],
                             max_tokens=max_summary_tokens,
                         )
                         summary_text = response.content[0].text
                     except Exception as e2:
-                        logger.warning(f"Anthropic summarization failed after key rotation: {e2}")
+                        logger.warning(
+                            f"Anthropic summarization failed after key rotation: {e2}"
+                        )
                         return
                 else:
                     logger.warning(f"Anthropic summarization failed (no alt keys): {e}")
@@ -9145,6 +9867,7 @@ async def _summarize_builder_session(
         api_key = resolved_key or get_builder_api_key(provider)
         try:
             from openai import AsyncOpenAI
+
             client = AsyncOpenAI(
                 api_key=api_key,
                 base_url=base_url or get_builder_base_url(),
@@ -9171,7 +9894,9 @@ async def _summarize_builder_session(
                         )
                         summary_text = response.choices[0].message.content or ""
                     except Exception as e2:
-                        logger.warning(f"OpenAI summarization failed after key rotation: {e2}")
+                        logger.warning(
+                            f"OpenAI summarization failed after key rotation: {e2}"
+                        )
                         return
                 else:
                     logger.warning(f"OpenAI summarization failed (no alt keys): {e}")

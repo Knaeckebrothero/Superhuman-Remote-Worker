@@ -68,14 +68,18 @@ async def get_current_user(request: Request, db) -> dict:
             needs_update["is_admin"] = is_admin
         if needs_update:
             async with db.acquire() as conn:
-                set_clause = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(needs_update))
+                set_clause = ", ".join(
+                    f"{k} = ${i + 2}" for i, k in enumerate(needs_update)
+                )
                 await conn.execute(
                     f"UPDATE users SET {set_clause} WHERE id = $1",
                     user["id"],
                     *needs_update.values(),
                 )
             user.update(needs_update)
-            logger.info("Updated user %s from OIDC claims: %s", sub, list(needs_update.keys()))
+            logger.info(
+                "Updated user %s from OIDC claims: %s", sub, list(needs_update.keys())
+            )
         # Attach transient approval flag (not stored in DB)
         user["is_approved"] = is_approved
         return user
@@ -87,7 +91,13 @@ async def get_current_user(request: Request, db) -> dict:
         display_name=display_name,
         is_admin=is_admin,
     )
-    logger.info("JIT-provisioned user %s (sub=%s, admin=%s, approved=%s)", display_name, sub, is_admin, is_approved)
+    logger.info(
+        "JIT-provisioned user %s (sub=%s, admin=%s, approved=%s)",
+        display_name,
+        sub,
+        is_admin,
+        is_approved,
+    )
     # Attach transient approval flag (not stored in DB)
     user["is_approved"] = is_approved
     return user

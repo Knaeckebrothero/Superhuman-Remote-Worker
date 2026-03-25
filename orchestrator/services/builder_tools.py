@@ -240,16 +240,28 @@ BUILDER_TOOLS = [
                         "type": "object",
                         "description": "LLM settings to update",
                         "properties": {
-                            "model": {"type": "string", "description": "Model name (e.g. 'gpt-4o', 'claude-sonnet-4-5-20250929')"},
-                            "temperature": {"type": "number", "description": "Temperature (0.0 to 2.0)"},
-                            "reasoning_level": {"type": "string", "description": "Reasoning level (low, medium, high)"},
+                            "model": {
+                                "type": "string",
+                                "description": "Model name (e.g. 'gpt-4o', 'claude-sonnet-4-5-20250929')",
+                            },
+                            "temperature": {
+                                "type": "number",
+                                "description": "Temperature (0.0 to 2.0)",
+                            },
+                            "reasoning_level": {
+                                "type": "string",
+                                "description": "Reasoning level (low, medium, high)",
+                            },
                             "strategic": {
                                 "type": "object",
                                 "description": "Overrides for strategic (planning) phases",
                                 "properties": {
                                     "model": {"type": "string"},
                                     "temperature": {"type": "number"},
-                                    "reasoning_level": {"type": "string", "enum": ["low", "medium", "high"]},
+                                    "reasoning_level": {
+                                        "type": "string",
+                                        "enum": ["low", "medium", "high"],
+                                    },
                                 },
                             },
                             "tactical": {
@@ -258,7 +270,10 @@ BUILDER_TOOLS = [
                                 "properties": {
                                     "model": {"type": "string"},
                                     "temperature": {"type": "number"},
-                                    "reasoning_level": {"type": "string", "enum": ["low", "medium", "high"]},
+                                    "reasoning_level": {
+                                        "type": "string",
+                                        "enum": ["low", "medium", "high"],
+                                    },
                                 },
                             },
                         },
@@ -421,7 +436,15 @@ BUILDER_TOOLS = [
                 "properties": {
                     "status": {
                         "type": "string",
-                        "enum": ["created", "queued", "running", "completed", "failed", "cancelled", "pending_review"],
+                        "enum": [
+                            "created",
+                            "queued",
+                            "running",
+                            "completed",
+                            "failed",
+                            "cancelled",
+                            "pending_review",
+                        ],
                         "description": "Filter by job status",
                     },
                     "limit": {
@@ -681,7 +704,13 @@ BUILDER_TOOLS = [
                     },
                     "status": {
                         "type": "string",
-                        "enum": ["pending", "validating", "integrated", "rejected", "failed"],
+                        "enum": [
+                            "pending",
+                            "validating",
+                            "integrated",
+                            "rejected",
+                            "failed",
+                        ],
                         "description": "Filter by validation status",
                     },
                     "limit": {
@@ -895,7 +924,14 @@ BUILDER_TOOLS = [
                 "properties": {
                     "status": {
                         "type": "string",
-                        "enum": ["booting", "ready", "working", "completed", "failed", "offline"],
+                        "enum": [
+                            "booting",
+                            "ready",
+                            "working",
+                            "completed",
+                            "failed",
+                            "offline",
+                        ],
                         "description": "Filter by agent status",
                     },
                 },
@@ -1273,7 +1309,13 @@ BUILDER_TOOLS = [
                     },
                     "annotation_type": {
                         "type": "string",
-                        "enum": ["note", "highlight", "summary", "question", "critique"],
+                        "enum": [
+                            "note",
+                            "highlight",
+                            "summary",
+                            "question",
+                            "critique",
+                        ],
                         "description": "Filter by annotation type",
                     },
                 },
@@ -1952,8 +1994,7 @@ BUILDER_TOOLS = [
         "function": {
             "name": "list_project_jobs",
             "description": (
-                "List jobs belonging to a project. "
-                "Optionally filter by status."
+                "List jobs belonging to a project. Optionally filter by status."
             ),
             "parameters": {
                 "type": "object",
@@ -2050,7 +2091,7 @@ BUILDER_TOOLS = [
                     },
                     "credentials": {
                         "type": "object",
-                        "description": "Additional auth details, e.g. {\"username\": \"neo4j\", \"password\": \"...\"} (optional)",
+                        "description": 'Additional auth details, e.g. {"username": "neo4j", "password": "..."} (optional)',
                     },
                     "read_only": {
                         "type": "boolean",
@@ -2370,8 +2411,7 @@ BUILDER_TOOLS = [
         "function": {
             "name": "update_project_member",
             "description": (
-                "Change a project member's role. "
-                "Valid roles: owner, editor, viewer."
+                "Change a project member's role. Valid roles: owner, editor, viewer."
             ),
             "parameters": {
                 "type": "object",
@@ -2563,16 +2603,17 @@ def build_message_context(
 
     # Start with summary if available
     if summary:
-        context.append({
-            "role": "system",
-            "content": f"Summary of earlier conversation:\n{summary}",
-        })
+        context.append(
+            {
+                "role": "system",
+                "content": f"Summary of earlier conversation:\n{summary}",
+            }
+        )
 
     # Calculate total token cost of all messages
     total_tokens = sum(
-        estimate_token_count(m.get("content") or "") + estimate_token_count(
-            json.dumps(m.get("tool_calls") or [])
-        )
+        estimate_token_count(m.get("content") or "")
+        + estimate_token_count(json.dumps(m.get("tool_calls") or []))
         for m in messages
     )
 
@@ -2590,9 +2631,9 @@ def build_message_context(
         recent: list[dict[str, str]] = []
 
         for m in reversed(messages):
-            msg_tokens = estimate_token_count(m.get("content") or "") + estimate_token_count(
-                json.dumps(m.get("tool_calls") or [])
-            )
+            msg_tokens = estimate_token_count(
+                m.get("content") or ""
+            ) + estimate_token_count(json.dumps(m.get("tool_calls") or []))
             if running_tokens + msg_tokens > max_context_tokens:
                 break
             content = m.get("content") or ""
@@ -2617,7 +2658,11 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
     """
     conversation_text = "\n".join(
         f"[{m['role']}]: {m.get('content') or ''}"
-        + (f" [tools: {json.dumps(m.get('tool_calls') or [])}]" if m.get("tool_calls") else "")
+        + (
+            f" [tools: {json.dumps(m.get('tool_calls') or [])}]"
+            if m.get("tool_calls")
+            else ""
+        )
         for m in messages
     )
 
@@ -2630,6 +2675,7 @@ def build_summarization_prompt(messages: list[dict[str, Any]]) -> list[dict[str,
 # =============================================================================
 # LLM Provider Configuration
 # =============================================================================
+
 
 def get_builder_model() -> str:
     """Get the model name for the builder LLM."""
@@ -2684,8 +2730,16 @@ def get_builder_key_ring(provider: str | None = None):
             try:
                 import importlib.util
                 from pathlib import Path
-                _kr_path = Path(__file__).resolve().parent.parent.parent / "src" / "llm" / "key_ring.py"
-                spec = importlib.util.spec_from_file_location("_key_ring", str(_kr_path))
+
+                _kr_path = (
+                    Path(__file__).resolve().parent.parent.parent
+                    / "src"
+                    / "llm"
+                    / "key_ring.py"
+                )
+                spec = importlib.util.spec_from_file_location(
+                    "_key_ring", str(_kr_path)
+                )
                 if spec and spec.loader:
                     _mod = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(_mod)
@@ -2704,9 +2758,7 @@ def get_builder_key_ring(provider: str | None = None):
             return None
 
         cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
-        ring = KeyRing(
-            keys, cooldown_seconds=cooldown, provider=f"builder-{provider}"
-        )
+        ring = KeyRing(keys, cooldown_seconds=cooldown, provider=f"builder-{provider}")
         _builder_key_rings[provider] = ring
         return ring
 
@@ -2756,14 +2808,20 @@ def is_auth_or_quota_error(error: Exception) -> bool:
     """Check if an exception is an auth (401/403) or quota (429) error."""
     error_str = str(error)
     # Check for HTTP status codes in error messages
-    for code in ("401", "403", "429", "Incorrect API key", "invalid_api_key",
-                 "quota", "rate_limit"):
+    for code in (
+        "401",
+        "403",
+        "429",
+        "Incorrect API key",
+        "invalid_api_key",
+        "quota",
+        "rate_limit",
+    ):
         if code.lower() in error_str.lower():
             return True
     # Check for typed SDK exceptions
     type_name = type(error).__name__
-    if type_name in ("AuthenticationError", "PermissionDeniedError",
-                     "RateLimitError"):
+    if type_name in ("AuthenticationError", "PermissionDeniedError", "RateLimitError"):
         return True
     return False
 

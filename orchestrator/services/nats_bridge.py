@@ -30,6 +30,7 @@ from typing import Any, Callable, Optional
 try:
     import nats
     from nats.aio.client import Client as NatsClient
+
     NATS_AVAILABLE = True
 except ImportError:
     nats = None
@@ -115,13 +116,18 @@ class NatsBridge:
             )
 
             # Subscribe to VM lifecycle subjects (4 specific subscriptions)
-            await self._nc.subscribe("vm.lifecycle.status", cb=self._on_vm_lifecycle_status)
+            await self._nc.subscribe(
+                "vm.lifecycle.status", cb=self._on_vm_lifecycle_status
+            )
             await self._nc.subscribe("agent.vm.*.register", cb=self._on_daemon_register)
-            await self._nc.subscribe("agent.vm.*.heartbeat", cb=self._on_daemon_heartbeat)
+            await self._nc.subscribe(
+                "agent.vm.*.heartbeat", cb=self._on_daemon_heartbeat
+            )
             await self._nc.subscribe("agent.vm.*.status", cb=self._on_daemon_status)
 
             # Subscribe to sudo approval requests (from sudo-gated daemons)
             from .sudo_gate import sudo_gate
+
             sudo_gate.connect(db=db, nc=self._nc)
             await self._nc.subscribe("sudo.request.>", cb=sudo_gate.on_sudo_request)
 
@@ -194,7 +200,9 @@ class NatsBridge:
             await self._set_vm_context(job_id, {"status": "provisioning"})
             return True
         except Exception as e:
-            logger.error("Failed to publish vm.lifecycle.create for job %s: %s", job_id, e)
+            logger.error(
+                "Failed to publish vm.lifecycle.create for job %s: %s", job_id, e
+            )
             return False
 
     async def request_vm_delete(self, job_id: str) -> bool:
@@ -216,10 +224,14 @@ class NatsBridge:
             await self._set_vm_context(job_id, {"status": "deleting"})
             return True
         except Exception as e:
-            logger.error("Failed to publish vm.lifecycle.delete for job %s: %s", job_id, e)
+            logger.error(
+                "Failed to publish vm.lifecycle.delete for job %s: %s", job_id, e
+            )
             return False
 
-    async def query_vm_status(self, job_id: str, timeout: float = 5.0) -> Optional[dict]:
+    async def query_vm_status(
+        self, job_id: str, timeout: float = 5.0
+    ) -> Optional[dict]:
         """Query live VM status via NATS request/reply.
 
         Args:
@@ -336,22 +348,30 @@ class NatsBridge:
                     if pod_data.get("ssh_port"):
                         ssh_port = pod_data["ssh_port"]
                 except Exception as e:
-                    logger.warning("Failed to query SSH endpoint for job %s: %s", job_id, e)
+                    logger.warning(
+                        "Failed to query SSH endpoint for job %s: %s", job_id, e
+                    )
 
             ssh_host = ssh_host or daemon_ip
 
             logger.info(
                 "Daemon registered for job %s (ssh=%s:%d, daemon_ip=%s)",
-                job_id, ssh_host, ssh_port, daemon_ip,
+                job_id,
+                ssh_host,
+                ssh_port,
+                daemon_ip,
             )
-            await self._set_vm_context(job_id, {
-                "status": "ready",
-                "ssh_host": ssh_host,
-                "ssh_port": ssh_port,
-                "hostname": data.get("hostname"),
-                "daemon_pid": data.get("pid"),
-                "recovering": False,  # Clear recovery guard
-            })
+            await self._set_vm_context(
+                job_id,
+                {
+                    "status": "ready",
+                    "ssh_host": ssh_host,
+                    "ssh_port": ssh_port,
+                    "hostname": data.get("hostname"),
+                    "daemon_pid": data.get("pid"),
+                    "recovering": False,  # Clear recovery guard
+                },
+            )
 
             # Trigger callback (e.g. dispatch)
             if self._on_vm_ready:
@@ -374,11 +394,18 @@ class NatsBridge:
             if not job_id:
                 return
 
-            logger.debug("Heartbeat for job %s: agent_running=%s", job_id, data.get("agent_running"))
+            logger.debug(
+                "Heartbeat for job %s: agent_running=%s",
+                job_id,
+                data.get("agent_running"),
+            )
             now = datetime.now(timezone.utc).isoformat()
-            await self._set_vm_context(job_id, {
-                "last_heartbeat": now,
-            })
+            await self._set_vm_context(
+                job_id,
+                {
+                    "last_heartbeat": now,
+                },
+            )
 
             # Track code-server activity for IDE session idle detection.
             # When the daemon reports active code-server connections, update

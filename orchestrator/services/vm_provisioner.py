@@ -27,6 +27,7 @@ from .nats_bridge import nats_bridge
 
 try:
     from kubernetes import client as k8s_client, config as k8s_config
+
     K8S_AVAILABLE = True
 except ImportError:
     k8s_client = None
@@ -57,7 +58,8 @@ class VMProvisioner:
         self._template_text: str = ""
         self._vm_namespace: str = os.environ.get("VM_NAMESPACE", "agent-vms")
         self._default_vm_image: str = os.environ.get(
-            "DEFAULT_VM_IMAGE", "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest"
+            "DEFAULT_VM_IMAGE",
+            "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
         )
 
     @property
@@ -95,7 +97,9 @@ class VMProvisioner:
         elif nats_bridge.is_available:
             logger.info("VM provisioner ready: NATS mode")
         else:
-            logger.info("VM provisioner: no backend available (NATS and K8s both unavailable)")
+            logger.info(
+                "VM provisioner: no backend available (NATS and K8s both unavailable)"
+            )
 
     def _init_k8s(self) -> None:
         """Try to initialize the Kubernetes client for direct provisioning."""
@@ -109,7 +113,9 @@ class VMProvisioner:
                 try:
                     k8s_config.load_kube_config()
                 except k8s_config.ConfigException:
-                    logger.debug("Kubernetes not available (no in-cluster or kubeconfig)")
+                    logger.debug(
+                        "Kubernetes not available (no in-cluster or kubeconfig)"
+                    )
                     return
 
             self._k8s = k8s_client.CustomObjectsApi()
@@ -290,20 +296,26 @@ class VMProvisioner:
             )
 
             logger.info("VM created (direct): %s (job %s)", vm_name, job_id)
-            await self._set_vm_context(job_id, {
-                "status": "created",
-                "vm_name": vm_name,
-                "namespace": self._vm_namespace,
-                "provisioned_by": "direct",
-            })
+            await self._set_vm_context(
+                job_id,
+                {
+                    "status": "created",
+                    "vm_name": vm_name,
+                    "namespace": self._vm_namespace,
+                    "provisioned_by": "direct",
+                },
+            )
             return True
         except Exception as e:
             logger.error("Failed to create VM for job %s: %s", job_id, e)
-            await self._set_vm_context(job_id, {
-                "status": "failed",
-                "error": str(e),
-                "provisioned_by": "direct",
-            })
+            await self._set_vm_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": str(e),
+                    "provisioned_by": "direct",
+                },
+            )
             return False
 
     async def _delete_direct(self, job_id: str) -> bool:

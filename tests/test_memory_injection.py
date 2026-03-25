@@ -91,6 +91,7 @@ class TestSummarizationExclusion:
 
     def test_workspace_injection_still_catches_instruction_messages(self):
         from src.core.workspace_injection import create_instruction_tool_messages
+
         ai_msg, tool_msg = create_instruction_tool_messages("guide.md", "content")
         assert is_workspace_injection_message(ai_msg) is True
         assert is_workspace_injection_message(tool_msg) is True

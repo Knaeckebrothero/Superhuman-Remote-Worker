@@ -30,6 +30,7 @@ def _make_workspace_manager(**overrides):
 @dataclass
 class FakeInstructionEntry:
     """Minimal stand-in for InstructionFileEntry."""
+
     file: str
     trigger_type: str
     trigger_target: str
@@ -515,8 +516,10 @@ class TestSaveWebContent:
 
         ctx = ToolContext(workspace_manager=ws)
         ctx.save_web_content_to_disk(
-            "https://example.com", "Hello world",
-            title="Test Page", source_id=42,
+            "https://example.com",
+            "Hello world",
+            title="Test Page",
+            source_id=42,
         )
 
         ws.write_file.assert_called_once()

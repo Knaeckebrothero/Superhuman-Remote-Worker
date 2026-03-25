@@ -22,7 +22,9 @@ try:
     _HAS_REPLY_PARSER = True
 except ImportError:
     _HAS_REPLY_PARSER = False
-    logger.info("email-reply-parser not installed — using regex fallback for reply parsing")
+    logger.info(
+        "email-reply-parser not installed — using regex fallback for reply parsing"
+    )
 
 
 def parse_reply(body: str) -> str:

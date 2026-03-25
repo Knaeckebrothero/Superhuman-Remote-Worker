@@ -148,7 +148,9 @@ class TestTranscribe:
     """Test transcribe() method for small files (≤ 25 MB)."""
 
     @pytest.mark.asyncio
-    async def test_transcribe_success(self, audio_helper, mock_openai_client, tmp_audio):
+    async def test_transcribe_success(
+        self, audio_helper, mock_openai_client, tmp_audio
+    ):
         """Successful transcription returns text."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(
@@ -161,7 +163,9 @@ class TestTranscribe:
         mock_client.audio.transcriptions.create.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_transcribe_passes_model(self, audio_helper, mock_openai_client, tmp_audio):
+    async def test_transcribe_passes_model(
+        self, audio_helper, mock_openai_client, tmp_audio
+    ):
         """Passes configured model to API."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="text")
@@ -172,7 +176,9 @@ class TestTranscribe:
         assert call_kwargs.kwargs["model"] == "whisper-1"
 
     @pytest.mark.asyncio
-    async def test_transcribe_with_language(self, audio_helper, mock_openai_client, tmp_audio):
+    async def test_transcribe_with_language(
+        self, audio_helper, mock_openai_client, tmp_audio
+    ):
         """Passes explicit language parameter to API."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="text")
@@ -213,12 +219,16 @@ class TestTranscribe:
         assert call_kwargs.kwargs["language"] == "en"
 
     @pytest.mark.asyncio
-    async def test_transcribe_with_prompt(self, audio_helper, mock_openai_client, tmp_audio):
+    async def test_transcribe_with_prompt(
+        self, audio_helper, mock_openai_client, tmp_audio
+    ):
         """Passes prompt parameter to API for style guidance."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="text")
 
-        await audio_helper.transcribe(tmp_audio, prompt="Technical discussion about APIs")
+        await audio_helper.transcribe(
+            tmp_audio, prompt="Technical discussion about APIs"
+        )
 
         call_kwargs = mock_client.audio.transcriptions.create.call_args
         assert call_kwargs.kwargs["prompt"] == "Technical discussion about APIs"
@@ -261,7 +271,9 @@ class TestFileValidation:
         assert "[Error: unsupported audio format" in result
 
     @pytest.mark.asyncio
-    async def test_large_file_triggers_chunking(self, audio_helper, mock_openai_client, tmp_path):
+    async def test_large_file_triggers_chunking(
+        self, audio_helper, mock_openai_client, tmp_path
+    ):
         """Files over 25 MB trigger chunked transcription (not rejection)."""
         large_file = tmp_path / "huge.mp3"
         large_file.write_bytes(b"\x00" * (MAX_AUDIO_SIZE_BYTES + 1))
@@ -377,7 +389,9 @@ class TestArchiving:
         assert call_kwargs["call_type"] == "transcription"
         assert call_kwargs["auxiliary_metadata"]["trigger"] == "transcription"
         assert call_kwargs["auxiliary_metadata"]["file_name"] == "test.mp3"
-        assert call_kwargs["auxiliary_metadata"]["transcript_length"] == len("Transcribed text here")
+        assert call_kwargs["auxiliary_metadata"]["transcript_length"] == len(
+            "Transcribed text here"
+        )
 
     @pytest.mark.asyncio
     async def test_archive_stores_transcript_text(
@@ -416,9 +430,7 @@ class TestArchiving:
     ):
         """Archiver failure doesn't prevent transcription from returning."""
         mock_client, _ = mock_openai_client
-        mock_client.audio.transcriptions.create = AsyncMock(
-            return_value="Still works"
-        )
+        mock_client.audio.transcriptions.create = AsyncMock(return_value="Still works")
 
         mock_archiver = MagicMock()
         mock_archiver.archive.side_effect = Exception("MongoDB down")
@@ -500,7 +512,9 @@ class TestGetDuration:
         mock_result.returncode = 0
         mock_result.stdout = "120.5\n"
 
-        with patch("src.services.audio_helper.subprocess.run", return_value=mock_result):
+        with patch(
+            "src.services.audio_helper.subprocess.run", return_value=mock_result
+        ):
             duration = audio_helper._get_duration(tmp_audio)
 
         assert duration == 120.5
@@ -511,13 +525,16 @@ class TestGetDuration:
         mock_result.returncode = 1
         mock_result.stderr = "not a valid audio file"
 
-        with patch("src.services.audio_helper.subprocess.run", return_value=mock_result):
+        with patch(
+            "src.services.audio_helper.subprocess.run", return_value=mock_result
+        ):
             with pytest.raises(RuntimeError, match="ffprobe failed"):
                 audio_helper._get_duration(tmp_audio)
 
     def test_get_duration_timeout(self, audio_helper, tmp_audio):
         """Raises RuntimeError on ffprobe timeout."""
         import subprocess
+
         with patch(
             "src.services.audio_helper.subprocess.run",
             side_effect=subprocess.TimeoutExpired(cmd="ffprobe", timeout=30),
@@ -559,6 +576,7 @@ class TestSplitAudio:
         assert len(chunks) == 3
         # Cleanup
         import shutil
+
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     def test_split_uses_stream_copy(self, audio_helper, tmp_path):
@@ -587,6 +605,7 @@ class TestSplitAudio:
             assert "copy" in cmd
 
         import shutil
+
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -599,7 +618,9 @@ class TestChunkedTranscription:
     """Test _transcribe_chunked() for large files."""
 
     @pytest.mark.asyncio
-    async def test_small_file_no_chunking(self, audio_helper, mock_openai_client, tmp_audio):
+    async def test_small_file_no_chunking(
+        self, audio_helper, mock_openai_client, tmp_audio
+    ):
         """Files ≤ 25 MB bypass chunking entirely."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="small file")
@@ -611,7 +632,9 @@ class TestChunkedTranscription:
         assert result == "small file"
 
     @pytest.mark.asyncio
-    async def test_large_file_triggers_chunking(self, audio_helper, mock_openai_client, tmp_path):
+    async def test_large_file_triggers_chunking(
+        self, audio_helper, mock_openai_client, tmp_path
+    ):
         """Files > 25 MB trigger _split_audio and per-chunk transcription."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(
@@ -630,10 +653,13 @@ class TestChunkedTranscription:
         chunk2.write_bytes(b"\x00" * 100)
 
         with patch.object(
-            audio_helper, "_split_audio",
+            audio_helper,
+            "_split_audio",
             return_value=([chunk1, chunk2], str(chunk_dir)),
         ):
-            with patch("src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"):
+            with patch(
+                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+            ):
                 result = await audio_helper.transcribe(large_file)
 
         assert "chunk one text" in result
@@ -669,10 +695,13 @@ class TestChunkedTranscription:
         chunk2.write_bytes(b"\x00" * 100)
 
         with patch.object(
-            audio_helper, "_split_audio",
+            audio_helper,
+            "_split_audio",
             return_value=([chunk1, chunk2], str(chunk_dir)),
         ):
-            with patch("src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"):
+            with patch(
+                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+            ):
                 await audio_helper.transcribe(large_file)
 
         # First chunk: no carry-over prompt (None)
@@ -681,7 +710,9 @@ class TestChunkedTranscription:
         assert call_prompts[1] == expected_carryover
 
     @pytest.mark.asyncio
-    async def test_each_chunk_archived(self, audio_helper, mock_openai_client, tmp_path):
+    async def test_each_chunk_archived(
+        self, audio_helper, mock_openai_client, tmp_path
+    ):
         """Each chunk gets its own archive call."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(
@@ -700,11 +731,16 @@ class TestChunkedTranscription:
 
         mock_archiver = MagicMock()
         with patch.object(
-            audio_helper, "_split_audio",
+            audio_helper,
+            "_split_audio",
             return_value=([chunk1, chunk2], str(chunk_dir)),
         ):
-            with patch("src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"):
-                with patch("src.core.archiver.get_archiver", return_value=mock_archiver):
+            with patch(
+                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+            ):
+                with patch(
+                    "src.core.archiver.get_archiver", return_value=mock_archiver
+                ):
                     await audio_helper.transcribe(large_file, job_id="job-chunk")
 
         # Two chunks → two archive calls
@@ -731,7 +767,9 @@ class TestChunkedTranscription:
         assert "apt-get install ffmpeg" in result
 
     @pytest.mark.asyncio
-    async def test_temp_cleanup_on_success(self, audio_helper, mock_openai_client, tmp_path):
+    async def test_temp_cleanup_on_success(
+        self, audio_helper, mock_openai_client, tmp_path
+    ):
         """Temp directory is cleaned up after successful transcription."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(return_value="text")
@@ -745,17 +783,22 @@ class TestChunkedTranscription:
         chunk1.write_bytes(b"\x00" * 100)
 
         with patch.object(
-            audio_helper, "_split_audio",
+            audio_helper,
+            "_split_audio",
             return_value=([chunk1], str(chunk_dir)),
         ):
-            with patch("src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"):
+            with patch(
+                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+            ):
                 with patch("src.services.audio_helper.shutil.rmtree") as mock_rmtree:
                     await audio_helper.transcribe(large_file)
 
         mock_rmtree.assert_called_once_with(str(chunk_dir), ignore_errors=True)
 
     @pytest.mark.asyncio
-    async def test_temp_cleanup_on_error(self, audio_helper, mock_openai_client, tmp_path):
+    async def test_temp_cleanup_on_error(
+        self, audio_helper, mock_openai_client, tmp_path
+    ):
         """Temp directory is cleaned up even when transcription fails."""
         mock_client, _ = mock_openai_client
         mock_client.audio.transcriptions.create = AsyncMock(
@@ -771,10 +814,13 @@ class TestChunkedTranscription:
         chunk1.write_bytes(b"\x00" * 100)
 
         with patch.object(
-            audio_helper, "_split_audio",
+            audio_helper,
+            "_split_audio",
             return_value=([chunk1], str(chunk_dir)),
         ):
-            with patch("src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"):
+            with patch(
+                "src.services.audio_helper.shutil.which", return_value="/usr/bin/ffmpeg"
+            ):
                 with patch("src.services.audio_helper.shutil.rmtree") as mock_rmtree:
                     result = await audio_helper.transcribe(large_file)
 

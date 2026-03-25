@@ -44,26 +44,47 @@ COMMAND_TYPE_MAP = {
 }
 
 # Default blocked commands
-DEFAULT_BLOCKED_COMMANDS = frozenset([
-    # "sudo", "systemctl",  # allowed — agents need these for service management
-    "reboot", "shutdown", "poweroff", "halt", "init",
-])
+DEFAULT_BLOCKED_COMMANDS = frozenset(
+    [
+        # "sudo", "systemctl",  # allowed — agents need these for service management
+        "reboot",
+        "shutdown",
+        "poweroff",
+        "halt",
+        "init",
+    ]
+)
 
 # Patterns that indicate the terminal is waiting for interactive input.
 # Each entry is a tuple of (compiled_regex, description).
 INTERACTIVE_PROMPT_PATTERNS = [
     # Yes/No confirmation prompts
-    (re.compile(r"\[y/n\]|\[Y/n\]|\[y/N\]|\[N/y\]|\(yes/no\)|\(yes/no/\[fingerprint\]\)", re.IGNORECASE), "confirmation prompt"),
+    (
+        re.compile(
+            r"\[y/n\]|\[Y/n\]|\[y/N\]|\[N/y\]|\(yes/no\)|\(yes/no/\[fingerprint\]\)",
+            re.IGNORECASE,
+        ),
+        "confirmation prompt",
+    ),
     # Password / passphrase prompts
     (re.compile(r"(?:password|passphrase)\s*:", re.IGNORECASE), "password prompt"),
     # SSH host key verification
-    (re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE), "SSH host key verification"),
+    (
+        re.compile(r"Are you sure you want to continue connecting", re.IGNORECASE),
+        "SSH host key verification",
+    ),
     # PackageKit / dnf install prompts (Fedora)
-    (re.compile(r"Install package '.*?' to provide command", re.IGNORECASE), "package install prompt"),
+    (
+        re.compile(r"Install package '.*?' to provide command", re.IGNORECASE),
+        "package install prompt",
+    ),
     # sudo password
     (re.compile(r"\[sudo\] password for", re.IGNORECASE), "sudo password prompt"),
     # Press any key / press enter
-    (re.compile(r"press any key|press enter to continue|hit enter", re.IGNORECASE), "press key prompt"),
+    (
+        re.compile(r"press any key|press enter to continue|hit enter", re.IGNORECASE),
+        "press key prompt",
+    ),
     # GPG passphrase
     (re.compile(r"enter passphrase", re.IGNORECASE), "passphrase prompt"),
 ]
@@ -151,9 +172,8 @@ class ShellManager:
             self.blocked_commands = frozenset(blocked_commands)
 
         # Check if we should delegate to the backend
-        self._use_backend = (
-            backend is not None
-            and getattr(backend, "supports_shell", False)
+        self._use_backend = backend is not None and getattr(
+            backend, "supports_shell", False
         )
 
         if self._use_backend:
@@ -216,6 +236,7 @@ class ShellManager:
         if auto_start_claude_code:
             try:
                 import shutil as _shutil
+
                 if _shutil.which("claude") is not None:
                     cmd = (
                         "env -u ANTHROPIC_API_KEY -u CLAUDECODE "
@@ -244,9 +265,7 @@ class ShellManager:
         if self.is_alive():
             return
 
-        logger.warning(
-            f"Tmux session '{self._session_name}' is dead, recreating"
-        )
+        logger.warning(f"Tmux session '{self._session_name}' is dead, recreating")
         self._tabs.clear()
 
         self._session = self._server.new_session(
@@ -288,7 +307,10 @@ class ShellManager:
             # Return a stub ShellTab for compatibility
             if name not in self._tabs:
                 self._tabs[name] = ShellTab(
-                    name=name, tab_type="shell", window=None, pane=None,
+                    name=name,
+                    tab_type="shell",
+                    window=None,
+                    pane=None,
                 )
             return self._tabs[name]
         self._ensure_session_alive()
@@ -318,7 +340,9 @@ class ShellManager:
             ValueError: If name is invalid or duplicate
         """
         if self._use_backend:
-            metadata = self._backend.shell_open_tab(name, command=command, tab_type=tab_type)
+            metadata = self._backend.shell_open_tab(
+                name, command=command, tab_type=tab_type
+            )
             # Create stub ShellTab for local tracking
             self._tabs[name] = ShellTab(
                 name=name,
@@ -427,14 +451,16 @@ class ShellManager:
             KeyError: If tab doesn't exist
         """
         if self._use_backend:
-            return self._backend.shell_read(name, lines=lines, since_cursor=since_cursor)
+            return self._backend.shell_read(
+                name, lines=lines, since_cursor=since_cursor
+            )
         tab = self._get_tab(name)
         all_lines = self._capture_lines(tab)
         total_lines = len(all_lines)
 
         if since_cursor:
             # Return only lines after the read cursor
-            new_lines = all_lines[tab.read_cursor:]
+            new_lines = all_lines[tab.read_cursor :]
             tab.read_cursor = total_lines
             text = "\n".join(new_lines) if new_lines else "(no new output)"
             metadata = {
@@ -506,7 +532,9 @@ class ShellManager:
             KeyError: If tab doesn't exist
         """
         if self._use_backend:
-            return self._backend.shell_read_with_offset(name, lines=lines, offset=offset)
+            return self._backend.shell_read_with_offset(
+                name, lines=lines, offset=offset
+            )
         tab = self._get_tab(name)
         all_lines = self._capture_lines(tab)
         total_lines = len(all_lines)
@@ -625,21 +653,15 @@ class ShellManager:
             # If an interactive prompt is already visible, refuse to send the
             # command.  Sending it would type the command text into the waiting
             # prompt (e.g. a [y/N] dialog), making things worse.
-            pre_lines = tab.pane.capture_pane(
-                start="-{}".format(self.scrollback_limit)
-            )
+            pre_lines = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
             if isinstance(pre_lines, str):
                 pre_check_lines = pre_lines.splitlines()
             else:
                 pre_check_lines = list(pre_lines)
 
-            existing_prompt = self._detect_blocked_tab(
-                pre_check_lines, tab
-            )
+            existing_prompt = self._detect_blocked_tab(pre_check_lines, tab)
             if existing_prompt:
-                state_lines = [
-                    ln for ln in pre_check_lines if ln.strip()
-                ][-30:]
+                state_lines = [ln for ln in pre_check_lines if ln.strip()][-30:]
                 terminal_state = "\n".join(state_lines) or "(empty)"
                 logger.debug(
                     f"Tab '{tab_name}' is already blocked by "
@@ -658,6 +680,7 @@ class ShellManager:
             if working_dir:
                 if self.sandbox_cwd:
                     from pathlib import Path
+
                     full_dir = str(Path(self.sandbox_cwd) / working_dir)
                 else:
                     full_dir = working_dir
@@ -680,7 +703,9 @@ class ShellManager:
 
             while time.monotonic() - start_time < timeout:
                 time.sleep(0.2)
-                captured = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
+                captured = tab.pane.capture_pane(
+                    start="-{}".format(self.scrollback_limit)
+                )
                 if isinstance(captured, str):
                     all_lines = captured.splitlines()
                 else:
@@ -708,10 +733,7 @@ class ShellManager:
                     # Extract output: lines between echoed command and sentinel.
                     new_lines = all_lines[pre_count:sentinel_line_idx]
                     # Filter out lines containing the sentinel (echoed command lines)
-                    output_lines = [
-                        ol for ol in new_lines
-                        if sentinel not in ol
-                    ]
+                    output_lines = [ol for ol in new_lines if sentinel not in ol]
                     # Skip prompt/command echo lines at the start
                     while output_lines and (
                         command.split()[0] in output_lines[0]
@@ -736,9 +758,7 @@ class ShellManager:
                             f"after {elapsed:.1f}s for: {command}"
                         )
                         if working_dir and self.sandbox_cwd:
-                            tab.pane.send_keys(
-                                f"cd {self.sandbox_cwd}", enter=True
-                            )
+                            tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
                             time.sleep(0.1)
                         tab.last_activity = datetime.now(timezone.utc)
                         return (
@@ -752,10 +772,7 @@ class ShellManager:
                     if content_hash == last_content_hash:
                         if stall_start is None:
                             stall_start = time.monotonic()
-                        elif (
-                            time.monotonic() - stall_start
-                            >= STALL_DETECTION_SECONDS
-                        ):
+                        elif time.monotonic() - stall_start >= STALL_DETECTION_SECONDS:
                             terminal_state = self._capture_terminal_state(
                                 tab, sentinel, pre_count
                             )
@@ -764,9 +781,7 @@ class ShellManager:
                                 f"for: {command}"
                             )
                             if working_dir and self.sandbox_cwd:
-                                tab.pane.send_keys(
-                                    f"cd {self.sandbox_cwd}", enter=True
-                                )
+                                tab.pane.send_keys(f"cd {self.sandbox_cwd}", enter=True)
                                 time.sleep(0.1)
                             tab.last_activity = datetime.now(timezone.utc)
                             return (
@@ -788,9 +803,7 @@ class ShellManager:
             tab.last_activity = datetime.now(timezone.utc)
 
             if exit_code is None:
-                terminal_state = self._capture_terminal_state(
-                    tab, sentinel, pre_count
-                )
+                terminal_state = self._capture_terminal_state(tab, sentinel, pre_count)
                 return (
                     f"Command timed out after {timeout}s: {command}\n"
                     f"--- terminal state ---\n{terminal_state}"
@@ -836,7 +849,8 @@ class ShellManager:
             return
 
         dead = [
-            name for name, tab in self._tabs.items()
+            name
+            for name, tab in self._tabs.items()
             if tab.window.id not in live_window_ids
         ]
         for name in dead:
@@ -902,9 +916,7 @@ class ShellManager:
 
         return None
 
-    def _detect_blocked_tab(
-        self, all_lines: List[str], tab: ShellTab
-    ) -> Optional[str]:
+    def _detect_blocked_tab(self, all_lines: List[str], tab: ShellTab) -> Optional[str]:
         """Stricter check for pre-flight: is the tab stuck on a prompt RIGHT NOW?
 
         Unlike _detect_interactive_prompt (which fires during polling when we
@@ -955,9 +967,7 @@ class ShellManager:
             Cleaned terminal state string (last 30 lines, sentinel lines filtered).
         """
         try:
-            captured = tab.pane.capture_pane(
-                start="-{}".format(self.scrollback_limit)
-            )
+            captured = tab.pane.capture_pane(start="-{}".format(self.scrollback_limit))
             if isinstance(captured, str):
                 all_lines = captured.splitlines()
             else:
@@ -1001,13 +1011,19 @@ class ShellManager:
             time.sleep(1.0)
             try:
                 captured = tab.pane.capture_pane(start="-200")
-                text = "\n".join(captured) if not isinstance(captured, str) else captured
+                text = (
+                    "\n".join(captured) if not isinstance(captured, str) else captured
+                )
             except Exception:
                 continue
 
             text_lower = text.lower()
 
-            if "bypass permissions" in text_lower and "yes, i accept" in text_lower and "bypass" not in handled:
+            if (
+                "bypass permissions" in text_lower
+                and "yes, i accept" in text_lower
+                and "bypass" not in handled
+            ):
                 tab.pane.send_keys("Down", enter=False)
                 time.sleep(0.3)
                 tab.pane.send_keys("", enter=True)
@@ -1016,39 +1032,63 @@ class ShellManager:
                 time.sleep(2.0)
                 continue
 
-            if "do you want to use this api key" in text_lower and "api_key" not in handled:
+            if (
+                "do you want to use this api key" in text_lower
+                and "api_key" not in handled
+            ):
                 tab.pane.send_keys("", enter=True)
                 handled.add("api_key")
                 logger.info("Claude Code startup: dismissed API key prompt")
                 time.sleep(2.0)
                 continue
 
-            if "trust" in text_lower and "folder" in text_lower and "trust" not in handled:
+            if (
+                "trust" in text_lower
+                and "folder" in text_lower
+                and "trust" not in handled
+            ):
                 tab.pane.send_keys("y", enter=True)
                 handled.add("trust")
                 logger.info("Claude Code startup: accepted trust prompt")
                 time.sleep(2.0)
                 continue
 
-            if "\u276f" in text and "enter to confirm" in text_lower and "generic_menu" not in handled:
+            if (
+                "\u276f" in text
+                and "enter to confirm" in text_lower
+                and "generic_menu" not in handled
+            ):
                 tab.pane.send_keys("", enter=True)
                 handled.add("generic_menu")
                 logger.info("Claude Code startup: confirmed default menu selection")
                 time.sleep(2.0)
                 continue
 
-            if any(indicator in text for indicator in [
-                "Welcome to Claude Code", "/help",
-                "What can I help you with", "Type your prompt",
-            ]):
-                logger.info(f"Claude Code startup complete (handled: {handled or 'no prompts'})")
+            if any(
+                indicator in text
+                for indicator in [
+                    "Welcome to Claude Code",
+                    "/help",
+                    "What can I help you with",
+                    "Type your prompt",
+                ]
+            ):
+                logger.info(
+                    f"Claude Code startup complete (handled: {handled or 'no prompts'})"
+                )
                 return
 
-            if "(.venv) $" in text and ("bypass" in handled or time.monotonic() - start > 10):
-                logger.warning(f"Claude Code may have exited during startup (handled: {handled or 'no prompts'})")
+            if "(.venv) $" in text and (
+                "bypass" in handled or time.monotonic() - start > 10
+            ):
+                logger.warning(
+                    f"Claude Code may have exited during startup (handled: {handled or 'no prompts'})"
+                )
                 return
 
-        logger.info(f"Claude Code startup handler timed out after {timeout}s (handled: {handled or 'no prompts'})")
+        logger.info(
+            f"Claude Code startup handler timed out after {timeout}s (handled: {handled or 'no prompts'})"
+        )
 
     def _check_blocked(self, command: str) -> str | None:
         """Return error message if command's first word is blocked, else None."""

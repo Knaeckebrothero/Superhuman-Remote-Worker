@@ -137,8 +137,8 @@ def _format_stub_document_citation(
 Citation ID: {citation_id}
 Source Type: Document
 Document: {document_path}
-Page: {page or 'N/A'}
-Section: {section or 'N/A'}
+Page: {page or "N/A"}
+Section: {section or "N/A"}
 
 Quoted Text:
 "{text[:500]}{"..." if len(text) > 500 else ""}"
@@ -160,7 +160,7 @@ def _format_stub_web_citation(
 Citation ID: {citation_id}
 Source Type: Web
 URL: {url}
-Title: {title or 'Untitled'}
+Title: {title or "Untitled"}
 Accessed: {accessed_date}
 
 Content:
@@ -274,15 +274,17 @@ def create_source_tools(context: ToolContext) -> List[Any]:
             # Format result for agent
             status = result.verification_status.value
             citation_ref = f"[{result.citation_id}]"
-            similarity = f"{result.similarity_score:.2f}" if result.similarity_score else "N/A"
+            similarity = (
+                f"{result.similarity_score:.2f}" if result.similarity_score else "N/A"
+            )
 
             output = f"""Citation Created
 
 Citation ID: {citation_ref}
 Source Type: Document
 Document: {document_path}
-Page: {page or 'N/A'}
-Section: {section or 'N/A'}
+Page: {page or "N/A"}
+Section: {section or "N/A"}
 Status: {status.upper()}
 Similarity Score: {similarity}
 """
@@ -327,7 +329,7 @@ Similarity Score: {similarity}
         try:
             # Use today's date if not provided
             if not accessed_date:
-                accessed_date = datetime.utcnow().strftime('%Y-%m-%d')
+                accessed_date = datetime.utcnow().strftime("%Y-%m-%d")
 
             # Try to use CitationEngine
             try:
@@ -341,7 +343,9 @@ Similarity Score: {similarity}
 
             # Register source and create citation
             try:
-                source_id, fetch_error = context.get_or_register_web_source(url, name=title)
+                source_id, fetch_error = context.get_or_register_web_source(
+                    url, name=title
+                )
             except Exception as e:
                 logger.warning(f"Could not register web source: {e}")
                 citation_id = f"CIT-{uuid.uuid4().hex[:8].upper()}"
@@ -351,7 +355,9 @@ Similarity Score: {similarity}
 
             # Persist web content to disk (idempotent — no-op if already saved by research tools)
             if text:
-                context.save_web_content_to_disk(url, text, title=title, source_id=source_id)
+                context.save_web_content_to_disk(
+                    url, text, title=title, source_id=source_id
+                )
 
             # Build locator dict
             locator = {"accessed_at": accessed_date}
@@ -375,14 +381,16 @@ Similarity Score: {similarity}
             # Format result
             status = result.verification_status.value
             citation_ref = f"[{result.citation_id}]"
-            similarity = f"{result.similarity_score:.2f}" if result.similarity_score else "N/A"
+            similarity = (
+                f"{result.similarity_score:.2f}" if result.similarity_score else "N/A"
+            )
 
             output = f"""Web Citation Created
 
 Citation ID: {citation_ref}
 Source Type: Web
 URL: {url}
-Title: {title or 'Untitled'}
+Title: {title or "Untitled"}
 Accessed: {accessed_date}
 Status: {status.upper()}
 Similarity Score: {similarity}
@@ -462,7 +470,11 @@ Similarity Score: {similarity}
 
             source = engine.get_source(citation.source_id)
 
-            similarity = f"{citation.similarity_score:.2f}" if citation.similarity_score else "N/A"
+            similarity = (
+                f"{citation.similarity_score:.2f}"
+                if citation.similarity_score
+                else "N/A"
+            )
             source_name = source.name if source else "Unknown"
             source_type = f" ({source.type.value})" if source else ""
 
@@ -470,18 +482,28 @@ Similarity Score: {similarity}
             output += f"\nSource: [{source.id}] {source_name}{source_type}"
 
             if citation.locator:
-                loc_parts = [f"{k.capitalize()} {v}" for k, v in citation.locator.items() if v]
+                loc_parts = [
+                    f"{k.capitalize()} {v}" for k, v in citation.locator.items() if v
+                ]
                 if loc_parts:
                     output += f"\nLocation: {', '.join(loc_parts)}"
 
             output += f"\nClaim: {citation.claim}"
 
             if citation.verbatim_quote:
-                quote = citation.verbatim_quote[:500] + "..." if len(citation.verbatim_quote) > 500 else citation.verbatim_quote
+                quote = (
+                    citation.verbatim_quote[:500] + "..."
+                    if len(citation.verbatim_quote) > 500
+                    else citation.verbatim_quote
+                )
                 output += f'\n\nQuote: "{quote}"'
 
             if citation.quote_context:
-                ctx = citation.quote_context[:500] + "..." if len(citation.quote_context) > 500 else citation.quote_context
+                ctx = (
+                    citation.quote_context[:500] + "..."
+                    if len(citation.quote_context) > 500
+                    else citation.quote_context
+                )
                 output += f"\nContext: {ctx}"
 
             if citation.quote_language:
@@ -505,7 +527,9 @@ Similarity Score: {similarity}
             return f"Error getting citation: {str(e)}"
 
     @tool
-    def list_citations(source_id: Optional[int] = None, status: Optional[str] = None) -> str:
+    def list_citations(
+        source_id: Optional[int] = None, status: Optional[str] = None
+    ) -> str:
         """List citations created by this job.
 
         Shows citation IDs, claims (truncated), verification status, and source.
@@ -593,6 +617,7 @@ Similarity Score: {similarity}
             # Verify citation belongs to current job before editing
             try:
                 from citation_engine import CitationEngine  # noqa: F401
+
                 engine = context.get_citation_engine()
                 # get_citation filters by job_id from context
                 citation = engine.get_citation(citation_id)
@@ -628,10 +653,7 @@ Similarity Score: {similarity}
                 v is not None for v in [claim, verbatim_quote, quote_context]
             )
 
-            await context.db.citations.edit(
-                citation_id=citation_id,
-                **kwargs
-            )
+            await context.db.citations.edit(citation_id=citation_id, **kwargs)
 
             result = f"ok: edited citation [{citation_id}]"
             if content_changed:
@@ -682,8 +704,7 @@ Similarity Score: {similarity}
             return (
                 f"Annotation [{annotation.id}] created\n"
                 f"Type: {annotation.annotation_type.value}\n"
-                f"Source: [{source_id}]"
-                + (f"\nPage: {page}" if page else "")
+                f"Source: [{source_id}]" + (f"\nPage: {page}" if page else "")
             )
 
         except ValueError as e:
@@ -725,11 +746,18 @@ Similarity Score: {similarity}
                 filter_msg = f" of type '{type}'" if type else ""
                 return f"No annotations{filter_msg} found for source [{source_id}]."
 
-            lines = [f"Annotations for source [{source_id}] ({len(annotations)} total):", ""]
+            lines = [
+                f"Annotations for source [{source_id}] ({len(annotations)} total):",
+                "",
+            ]
             for ann in annotations:
-                preview = ann.content[:200] + "..." if len(ann.content) > 200 else ann.content
+                preview = (
+                    ann.content[:200] + "..." if len(ann.content) > 200 else ann.content
+                )
                 page_str = f" (p.{ann.page_reference})" if ann.page_reference else ""
-                lines.append(f"  [{ann.id}] {ann.annotation_type.value}{page_str}: {preview}")
+                lines.append(
+                    f"  [{ann.id}] {ann.annotation_type.value}{page_str}: {preview}"
+                )
 
             return "\n".join(lines)
 
@@ -848,7 +876,11 @@ Similarity Score: {similarity}
             for i, r in enumerate(results.results, 1):
                 source_ref = f"[{r.source_id}] {r.source_name}"
                 page_str = f", {r.page_reference}" if r.page_reference else ""
-                preview = r.chunk_text[:300] + "..." if len(r.chunk_text) > 300 else r.chunk_text
+                preview = (
+                    r.chunk_text[:300] + "..."
+                    if len(r.chunk_text) > 300
+                    else r.chunk_text
+                )
 
                 lines.append(f"  {i}. {r.evidence_label} ({r.evidence_reason})")
                 lines.append(f"     Source: {source_ref}{page_str}")
@@ -932,7 +964,9 @@ Similarity Score: {similarity}
 
             # Return text directly if no output path
             if not output_path:
-                header = f"Bibliography ({len(entries)} entries, style: {effective_style})\n"
+                header = (
+                    f"Bibliography ({len(entries)} entries, style: {effective_style})\n"
+                )
                 return header + "\n" + bibliography
 
             # Write to file in workspace

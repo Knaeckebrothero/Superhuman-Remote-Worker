@@ -71,7 +71,12 @@ from .core.loader import (
 )
 from .core.workspace import WorkspaceManager
 from .core.archiver import get_archiver
-from .core.context import ContextManager, ContextConfig, ToolRetryManager, sanitize_message_history
+from .core.context import (
+    ContextManager,
+    ContextConfig,
+    ToolRetryManager,
+    sanitize_message_history,
+)
 from .core.phase_snapshot import PhaseSnapshotManager
 from .core.phase import (
     handle_phase_transition,
@@ -133,7 +138,9 @@ def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
         current = current.__cause__ if current.__cause__ != current else None
 
     # Fallback: try to extract retry-after from error message text
-    match = re.search(r"retry.?after['\"]?\s*[:=]\s*['\"]?(\d+)", error_str, re.IGNORECASE)
+    match = re.search(
+        r"retry.?after['\"]?\s*[:=]\s*['\"]?(\d+)", error_str, re.IGNORECASE
+    )
     if match:
         return float(match.group(1)) + 5.0
 
@@ -162,7 +169,10 @@ def _extract_tool_use_failed(error: Exception) -> Optional[str]:
         body = getattr(current, "body", None)
         if isinstance(body, dict):
             inner_error = body.get("error", {})
-            if isinstance(inner_error, dict) and inner_error.get("code") == "tool_use_failed":
+            if (
+                isinstance(inner_error, dict)
+                and inner_error.get("code") == "tool_use_failed"
+            ):
                 return inner_error.get("failed_generation", "")
 
         # Move up the cause chain
@@ -200,7 +210,9 @@ def _build_tool_use_failed_feedback(failed_generation: str) -> str:
     else:
         first_100 = " ".join(words[:100])
         last_100 = " ".join(words[-100:])
-        preview = f"{first_100}\n\n[... {len(words) - 200} words truncated ...]\n\n{last_100}"
+        preview = (
+            f"{first_100}\n\n[... {len(words) - 200} words truncated ...]\n\n{last_100}"
+        )
 
     return (
         "YOUR PREVIOUS TOOL CALL FAILED: Your output exceeded the maximum completion token "
@@ -256,11 +268,13 @@ def _extract_markdown_content(content: str) -> str:
     result = content.strip()
 
     # Remove file header patterns like "**File: `filename.md`**" or "**File: filename.md**"
-    result = re.sub(r'^\*\*File:\s*`?[^`\n]+`?\*\*\s*\n*', '', result, flags=re.IGNORECASE)
+    result = re.sub(
+        r"^\*\*File:\s*`?[^`\n]+`?\*\*\s*\n*", "", result, flags=re.IGNORECASE
+    )
 
     # Check if the content is wrapped in a markdown code block
     # Pattern: ```markdown or ``` at start, ``` at end
-    code_block_pattern = r'^```(?:markdown|md)?\s*\n(.*?)\n```\s*$'
+    code_block_pattern = r"^```(?:markdown|md)?\s*\n(.*?)\n```\s*$"
     match = re.match(code_block_pattern, result, re.DOTALL | re.IGNORECASE)
     if match:
         result = match.group(1)
@@ -445,10 +459,12 @@ def create_execute_node(
     """
 
     # Extract tool schemas from bound LLMs once at creation time for archiving
-    def _extract_tool_schemas(bound_llm: BaseChatModel) -> Optional[List[Dict[str, Any]]]:
+    def _extract_tool_schemas(
+        bound_llm: BaseChatModel,
+    ) -> Optional[List[Dict[str, Any]]]:
         """Extract OpenAI-format tool schemas from a bound LLM."""
-        if hasattr(bound_llm, 'kwargs'):
-            return bound_llm.kwargs.get('tools')
+        if hasattr(bound_llm, "kwargs"):
+            return bound_llm.kwargs.get("tools")
         return None
 
     strategic_tool_schemas = _extract_tool_schemas(strategic_llm_with_tools)
@@ -458,14 +474,14 @@ def create_execute_node(
     def _extract_model_kwargs(bound_llm: BaseChatModel) -> Dict[str, Any]:
         """Extract model configuration from LLM."""
         kwargs: Dict[str, Any] = {}
-        for attr in ('temperature', 'model_name', 'max_tokens'):
+        for attr in ("temperature", "model_name", "max_tokens"):
             if hasattr(bound_llm, attr):
                 val = getattr(bound_llm, attr)
                 if val is not None:
                     kwargs[attr] = val
         # For bound LLMs, check the underlying LLM too
-        if hasattr(bound_llm, 'bound'):
-            for attr in ('temperature', 'model_name', 'max_tokens'):
+        if hasattr(bound_llm, "bound"):
+            for attr in ("temperature", "model_name", "max_tokens"):
                 if hasattr(bound_llm.bound, attr):
                     val = getattr(bound_llm.bound, attr)
                     if val is not None:
@@ -488,7 +504,9 @@ def create_execute_node(
         is_strategic = state.get("is_strategic_phase", True)
 
         # Select LLM based on current phase
-        llm_with_tools = strategic_llm_with_tools if is_strategic else tactical_llm_with_tools
+        llm_with_tools = (
+            strategic_llm_with_tools if is_strategic else tactical_llm_with_tools
+        )
 
         # Update tool context for phase-aware behavior (e.g., multimodal override)
         if tool_context is not None:
@@ -501,7 +519,9 @@ def create_execute_node(
         for msg in messages:
             msg_type = type(msg).__name__
             msg_types[msg_type] = msg_types.get(msg_type, 0) + 1
-        logger.debug(f"[{job_id}] State messages: {len(messages)} total, types: {msg_types}")
+        logger.debug(
+            f"[{job_id}] State messages: {len(messages)} total, types: {msg_types}"
+        )
 
         # Build messages for LLM
         prepared_messages = []
@@ -525,8 +545,12 @@ def create_execute_node(
 
         # Estimate transient injection overhead (system prompt + todos + memory + knowledge)
         # so compaction thresholds account for messages that will be added AFTER compaction
-        injection_overhead_tokens = context_mgr.get_token_count([prepared_messages[0]])  # system prompt
-        injection_overhead_tokens += len(todo_manager.format_for_injection()) // 4  # approximate
+        injection_overhead_tokens = context_mgr.get_token_count(
+            [prepared_messages[0]]
+        )  # system prompt
+        injection_overhead_tokens += (
+            len(todo_manager.format_for_injection()) // 4
+        )  # approximate
 
         # Add memory injection budget overhead
         recall_store = tool_context.recall_store if tool_context else None
@@ -540,7 +564,9 @@ def create_execute_node(
         # Temporarily lower compaction thresholds to account for injection overhead
         # Floor at 50% of original to avoid over-triggering
         original_compaction_threshold = context_mgr.config.compaction_threshold_tokens
-        original_summarization_threshold = context_mgr.config.summarization_threshold_tokens
+        original_summarization_threshold = (
+            context_mgr.config.summarization_threshold_tokens
+        )
         context_mgr.config.compaction_threshold_tokens = max(
             original_compaction_threshold // 2,
             original_compaction_threshold - injection_overhead_tokens,
@@ -552,7 +578,9 @@ def create_execute_node(
 
         # Ensure context is within limits before LLM call
         original_message_count = len(messages)
-        summaries_count_before = len(context_mgr._state.summaries) if hasattr(context_mgr, '_state') else 0
+        summaries_count_before = (
+            len(context_mgr._state.summaries) if hasattr(context_mgr, "_state") else 0
+        )
         try:
             messages = await context_mgr.ensure_within_limits(
                 messages,
@@ -562,8 +590,12 @@ def create_execute_node(
             )
         finally:
             # Restore original thresholds
-            context_mgr.config.compaction_threshold_tokens = original_compaction_threshold
-            context_mgr.config.summarization_threshold_tokens = original_summarization_threshold
+            context_mgr.config.compaction_threshold_tokens = (
+                original_compaction_threshold
+            )
+            context_mgr.config.summarization_threshold_tokens = (
+                original_summarization_threshold
+            )
         # Separate RemoveMessage markers from actual messages
         # RemoveMessage markers must NOT be sent to LLM - they're only for state update
         remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
@@ -577,7 +609,11 @@ def create_execute_node(
 
         # Memory Light: store compaction summary as free-source memory
         if recall_store and context_was_compacted:
-            summaries_count_after = len(context_mgr._state.summaries) if hasattr(context_mgr, '_state') else 0
+            summaries_count_after = (
+                len(context_mgr._state.summaries)
+                if hasattr(context_mgr, "_state")
+                else 0
+            )
             if summaries_count_after > summaries_count_before:
                 try:
                     await recall_store.store(
@@ -633,12 +669,15 @@ def create_execute_node(
                 context_parts = []
                 if pending_todos:
                     context_parts.append(pending_todos[0].content)
-                context_parts.append(f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}")
+                context_parts.append(
+                    f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}"
+                )
                 context_text = " ".join(context_parts)
 
                 memories = await recall_store.retrieve(context_text)
                 if memories:
                     from src.services.recall_store import RecallStore as _RS
+
                     _memory_block[0] = _RS.assemble_memory_block(memories)
                     logger.debug(
                         f"[{job_id}] Memory injection: {len(memories)} memories retrieved"
@@ -665,21 +704,33 @@ def create_execute_node(
 
         # Knowledge Base: retrieve relevant project knowledge for injection
         _knowledge_block = [""]  # mutable container for closure access
-        knowledge_store = tool_context.knowledge_store if tool_context and tool_context.has_knowledge() else None
+        knowledge_store = (
+            tool_context.knowledge_store
+            if tool_context and tool_context.has_knowledge()
+            else None
+        )
         if knowledge_store and tool_context.project_id:
             try:
                 import uuid as _uuid
-                project_uuid = _uuid.UUID(tool_context.project_id) if isinstance(tool_context.project_id, str) else tool_context.project_id
+
+                project_uuid = (
+                    _uuid.UUID(tool_context.project_id)
+                    if isinstance(tool_context.project_id, str)
+                    else tool_context.project_id
+                )
 
                 # Build retrieval context from current todo + phase info
                 pending_todos = todo_manager.list_pending()
                 kb_context_parts = []
                 if pending_todos:
                     kb_context_parts.append(pending_todos[0].content)
-                kb_context_parts.append(f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}")
+                kb_context_parts.append(
+                    f"phase {phase_number} {'strategic' if is_strategic else 'tactical'}"
+                )
                 kb_context_text = " ".join(kb_context_parts)
 
                 from src.services.knowledge_store import KnowledgeStore as _KS
+
                 kb_notes = await knowledge_store.hybrid_search(
                     project_id=project_uuid,
                     query=kb_context_text,
@@ -691,7 +742,9 @@ def create_execute_node(
                         f"[{job_id}] Knowledge injection: {len(kb_notes)} notes retrieved"
                     )
             except Exception as e:
-                logger.warning(f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}")
+                logger.warning(
+                    f"[{job_id}] Knowledge retrieval failed (non-fatal): {e}"
+                )
 
         def _inject_transient_messages(target_messages: list) -> None:
             """Append transient injection messages (todos, memories, knowledge, instruction files)."""
@@ -701,19 +754,25 @@ def create_execute_node(
             # Memory Light: inject recalled memories
             if _memory_block[0]:
                 from src.core.memory_injection import create_memory_injection_messages
+
                 mem_ai, mem_tool = create_memory_injection_messages(_memory_block[0])
                 target_messages.append(mem_ai)
                 target_messages.append(mem_tool)
 
             # Knowledge Base: inject relevant project knowledge after memories
             if _knowledge_block[0]:
-                from src.core.knowledge_injection import create_knowledge_injection_messages
-                kb_ai, kb_tool = create_knowledge_injection_messages(_knowledge_block[0])
+                from src.core.knowledge_injection import (
+                    create_knowledge_injection_messages,
+                )
+
+                kb_ai, kb_tool = create_knowledge_injection_messages(
+                    _knowledge_block[0]
+                )
                 target_messages.append(kb_ai)
                 target_messages.append(kb_tool)
 
             # Phase-triggered instruction files (active injection)
-            if tool_context and hasattr(tool_context, 'get_phase_instruction_files'):
+            if tool_context and hasattr(tool_context, "get_phase_instruction_files"):
                 _phase_name = "strategic" if is_strategic else "tactical"
                 phase_entries = tool_context.get_phase_instruction_files(_phase_name)
                 if phase_entries:
@@ -747,7 +806,10 @@ def create_execute_node(
         # LAYER 1 SAFETY CHECK: Ensure we don't exceed model context limit
         # This catches bad configs and edge cases that slip through normal compaction
         total_tokens = context_mgr.get_token_count(prepared_messages)
-        model_max = phase_llm_config.model_max_context_tokens or config.limits.model_max_context_tokens
+        model_max = (
+            phase_llm_config.model_max_context_tokens
+            or config.limits.model_max_context_tokens
+        )
 
         if total_tokens > model_max:
             logger.warning(
@@ -765,7 +827,9 @@ def create_execute_node(
             )
 
             # Separate RemoveMessage markers from actual messages
-            safety_remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
+            safety_remove_markers = [
+                m for m in messages if isinstance(m, RemoveMessage)
+            ]
             messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
             # Rebuild prepared_messages with compacted history
@@ -836,6 +900,7 @@ def create_execute_node(
         # immediately and then blocks during inference — so the read timeout
         # never triggers. asyncio.wait_for enforces a hard cap on total time.
         import asyncio
+
         llm_timeout = phase_llm_config.timeout or 600.0
 
         while True:
@@ -850,19 +915,30 @@ def create_execute_node(
                 # Reset tool_use_failed streak on successful response
                 _tool_use_failed_streak[0] = 0
 
-                tool_calls_count = len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0
+                tool_calls_count = (
+                    len(response.tool_calls)
+                    if hasattr(response, "tool_calls") and response.tool_calls
+                    else 0
+                )
                 content_str = response.content
                 if isinstance(content_str, list):
                     content_str = " ".join(
-                        b.get("text", "") if isinstance(b, dict) else str(b) for b in content_str
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in content_str
                     ).strip()
                 content_len = len(content_str) if isinstance(content_str, str) else 0
-                logger.info(f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls")
+                logger.info(
+                    f"[{job_id}] LLM response: {content_len} chars, {tool_calls_count} tool calls"
+                )
 
                 # --- Response degeneration validation ---
                 rv_config = config.limits.response_validation
                 if rv_config.enabled and isinstance(content_str, str) and content_str:
-                    tool_calls_list = response.tool_calls if hasattr(response, 'tool_calls') and response.tool_calls else None
+                    tool_calls_list = (
+                        response.tool_calls
+                        if hasattr(response, "tool_calls") and response.tool_calls
+                        else None
+                    )
                     validation = validate_response(
                         content_str,
                         tool_calls_list,
@@ -876,7 +952,9 @@ def create_execute_node(
                         _degeneration_streak[0] += 1
                         streak = _degeneration_streak[0]
                         pattern_names = [p.name for p in validation.matched_patterns]
-                        pattern_details = "; ".join(p.description for p in validation.matched_patterns)
+                        pattern_details = "; ".join(
+                            p.description for p in validation.matched_patterns
+                        )
 
                         if streak <= 3:
                             logger.warning(
@@ -884,19 +962,23 @@ def create_execute_node(
                                 f"{pattern_details}"
                             )
 
-                            ai_summary = AIMessage(content=(
-                                "My previous response was degenerate — it contained repetitive or "
-                                "malformed output that cannot be used. Detected patterns: "
-                                f"{', '.join(pattern_names)}. I need to retry with a shorter, "
-                                "more focused response."
-                            ))
-                            human_feedback = HumanMessage(content=(
-                                "Your last response was detected as degenerate and has been discarded. "
-                                f"Issues found: {pattern_details}\n\n"
-                                "Please retry your action. Keep your response concise and focused. "
-                                "If you were trying to call a tool, make the call with smaller arguments. "
-                                "Do NOT repeat the same output."
-                            ))
+                            ai_summary = AIMessage(
+                                content=(
+                                    "My previous response was degenerate — it contained repetitive or "
+                                    "malformed output that cannot be used. Detected patterns: "
+                                    f"{', '.join(pattern_names)}. I need to retry with a shorter, "
+                                    "more focused response."
+                                )
+                            )
+                            human_feedback = HumanMessage(
+                                content=(
+                                    "Your last response was detected as degenerate and has been discarded. "
+                                    f"Issues found: {pattern_details}\n\n"
+                                    "Please retry your action. Keep your response concise and focused. "
+                                    "If you were trying to call a tool, make the call with smaller arguments. "
+                                    "Do NOT repeat the same output."
+                                )
+                            )
 
                             if auditor:
                                 auditor.audit_step(
@@ -912,7 +994,9 @@ def create_execute_node(
                                             "streak": streak,
                                             "patterns": pattern_names,
                                             "content_length": content_len,
-                                            "content_preview": (validation.truncated_content or "")[:500],
+                                            "content_preview": (
+                                                validation.truncated_content or ""
+                                            )[:500],
                                         }
                                     },
                                     metadata=state.get("metadata"),
@@ -921,7 +1005,11 @@ def create_execute_node(
                                 )
 
                             if context_was_compacted:
-                                result_messages = remove_markers + messages + [ai_summary, human_feedback]
+                                result_messages = (
+                                    remove_markers
+                                    + messages
+                                    + [ai_summary, human_feedback]
+                                )
                             else:
                                 result_messages = [ai_summary, human_feedback]
 
@@ -950,7 +1038,9 @@ def create_execute_node(
                     elif validation.has_warnings:
                         logger.warning(
                             f"[{job_id}] Response validation warnings: "
-                            + "; ".join(p.description for p in validation.matched_patterns)
+                            + "; ".join(
+                                p.description for p in validation.matched_patterns
+                            )
                         )
                         if auditor:
                             auditor.audit_step(
@@ -962,8 +1052,13 @@ def create_execute_node(
                                 data={
                                     "warning": {
                                         "type": "response_validation_warning",
-                                        "patterns": [p.name for p in validation.matched_patterns],
-                                        "details": [p.description for p in validation.matched_patterns],
+                                        "patterns": [
+                                            p.name for p in validation.matched_patterns
+                                        ],
+                                        "details": [
+                                            p.description
+                                            for p in validation.matched_patterns
+                                        ],
                                     }
                                 },
                                 metadata=state.get("metadata"),
@@ -977,7 +1072,11 @@ def create_execute_node(
                 # Archive full LLM request/response to llm_requests collection
                 request_id = None
                 if auditor:
-                    current_tool_schemas = strategic_tool_schemas if is_strategic else tactical_tool_schemas
+                    current_tool_schemas = (
+                        strategic_tool_schemas
+                        if is_strategic
+                        else tactical_tool_schemas
+                    )
                     request_id = auditor.archive(
                         job_id=job_id,
                         agent_type=config.agent_id,
@@ -995,12 +1094,14 @@ def create_execute_node(
 
                     # Build tool calls preview
                     tool_calls_preview = []
-                    if hasattr(response, 'tool_calls') and response.tool_calls:
+                    if hasattr(response, "tool_calls") and response.tool_calls:
                         for tc in response.tool_calls:
-                            tool_calls_preview.append({
-                                "name": tc.get("name", "unknown"),
-                                "call_id": tc.get("id", ""),
-                            })
+                            tool_calls_preview.append(
+                                {
+                                    "name": tc.get("name", "unknown"),
+                                    "call_id": tc.get("id", ""),
+                                }
+                            )
 
                     # Update the LLM audit document with response data
                     if llm_audit_id:
@@ -1009,10 +1110,14 @@ def create_execute_node(
                         content = response.content
                         if isinstance(content, list):
                             content = " ".join(
-                                block.get("text", "") if isinstance(block, dict) else str(block)
+                                block.get("text", "")
+                                if isinstance(block, dict)
+                                else str(block)
                                 for block in content
                             ).strip()
-                        content_str = content if isinstance(content, str) else str(content or "")
+                        content_str = (
+                            content if isinstance(content, str) else str(content or "")
+                        )
 
                         auditor.update_llm_response(
                             audit_doc_id=llm_audit_id,
@@ -1027,7 +1132,7 @@ def create_execute_node(
                 # and there are pending todos, append a reminder to state so it persists
                 # in conversation history. The model will see it on the next execute loop.
                 injected_reminder = None
-                if not (hasattr(response, 'tool_calls') and response.tool_calls):
+                if not (hasattr(response, "tool_calls") and response.tool_calls):
                     remaining = todo_manager.list_pending()
                     if remaining:
                         first = remaining[0]
@@ -1035,28 +1140,33 @@ def create_execute_node(
                             f"  - {t.id}: {t.content[:80]}{'...' if len(t.content) > 80 else ''}"
                             for t in remaining
                         )
-                        injected_reminder = HumanMessage(content=(
-                            f'Action required: call `todo_complete(todo_id="{first.id}")` to mark your current task done.\n\n'
-                            "If you already finished the work for this todo, that's perfectly fine — "
-                            "just call `todo_complete` now to record it. You don't need to redo anything.\n\n"
-                            f"Pending todos ({len(remaining)}):\n"
-                            f"{todo_lines}\n\n"
-                            "Do NOT respond with text. Your next action must be a tool call."
-                        ))
+                        injected_reminder = HumanMessage(
+                            content=(
+                                f'Action required: call `todo_complete(todo_id="{first.id}")` to mark your current task done.\n\n'
+                                "If you already finished the work for this todo, that's perfectly fine — "
+                                "just call `todo_complete` now to record it. You don't need to redo anything.\n\n"
+                                f"Pending todos ({len(remaining)}):\n"
+                                f"{todo_lines}\n\n"
+                                "Do NOT respond with text. Your next action must be a tool call."
+                            )
+                        )
 
                 # Memory Light: extract + assemble memories via AuxiliaryLLM (async, non-blocking)
                 new_turn_count = state.get("turn_count", 0) + 1
                 extraction_triggered = False
                 assembly_triggered = False
                 recall_store_exec = tool_context.recall_store if tool_context else None
-                if (recall_store_exec
+                if (
+                    recall_store_exec
                     and config.auxiliary.enabled
                     and config.auxiliary.tasks.get("extract_memories", None)
-                    and config.auxiliary.tasks["extract_memories"].enabled):
+                    and config.auxiliary.tasks["extract_memories"].enabled
+                ):
                     from src.services.auxiliary import (
                         _should_extract_memories,
                         extract_and_store_memories,
                     )
+
                     last_observed = state.get("last_observed_turn", 0)
                     if _should_extract_memories(
                         new_turn_count,
@@ -1064,6 +1174,7 @@ def create_execute_node(
                         last_observed,
                     ):
                         import asyncio
+
                         extraction_triggered = True
                         asyncio.create_task(
                             extract_and_store_memories(
@@ -1078,15 +1189,18 @@ def create_execute_node(
                         )
 
                 # Memory assembler: review conversation and adjust memory TTLs
-                if (recall_store_exec
+                if (
+                    recall_store_exec
                     and config.auxiliary.enabled
                     and config.auxiliary.tasks.get("assemble_memories", None)
                     and config.auxiliary.tasks["assemble_memories"].enabled
-                    and memory_assembler_prompt):
+                    and memory_assembler_prompt
+                ):
                     from src.services.auxiliary import (
                         _should_assemble_memories,
                         assemble_memories,
                     )
+
                     last_assembled = state.get("last_assembled_turn", 0)
                     if _should_assemble_memories(
                         new_turn_count,
@@ -1094,6 +1208,7 @@ def create_execute_node(
                         last_assembled,
                     ):
                         import asyncio
+
                         assembly_triggered = True
                         asyncio.create_task(
                             assemble_memories(
@@ -1138,7 +1253,9 @@ def create_execute_node(
 
                 # Try emergency compaction once (on first attempt only)
                 if attempt == 0:
-                    logger.info(f"[{job_id}] Attempting emergency compaction after HTTP overflow")
+                    logger.info(
+                        f"[{job_id}] Attempting emergency compaction after HTTP overflow"
+                    )
 
                     # Force aggressive compaction
                     messages = await context_mgr.ensure_within_limits(
@@ -1150,11 +1267,18 @@ def create_execute_node(
                     )
 
                     # Separate RemoveMessage markers
-                    emergency_remove_markers = [m for m in messages if isinstance(m, RemoveMessage)]
+                    emergency_remove_markers = [
+                        m for m in messages if isinstance(m, RemoveMessage)
+                    ]
                     messages = [m for m in messages if not isinstance(m, RemoveMessage)]
 
                     # Rebuild prepared_messages with compacted history
-                    system_msg = prepared_messages[0] if prepared_messages and isinstance(prepared_messages[0], SystemMessage) else None
+                    system_msg = (
+                        prepared_messages[0]
+                        if prepared_messages
+                        and isinstance(prepared_messages[0], SystemMessage)
+                        else None
+                    )
                     prepared_messages = []
                     if system_msg:
                         prepared_messages.append(system_msg)
@@ -1231,19 +1355,27 @@ def create_execute_node(
                         )
 
                         # Build feedback for the model
-                        feedback_text = _build_tool_use_failed_feedback(failed_generation)
+                        feedback_text = _build_tool_use_failed_feedback(
+                            failed_generation
+                        )
 
                         # Create AIMessage (model's failed turn summary) + HumanMessage (guidance)
-                        ai_summary = AIMessage(content=(
-                            "My previous attempt to call a tool failed because the output "
-                            "exceeded the maximum completion token limit. The tool call was "
-                            "truncated and never executed. I need to retry with smaller chunks."
-                        ))
+                        ai_summary = AIMessage(
+                            content=(
+                                "My previous attempt to call a tool failed because the output "
+                                "exceeded the maximum completion token limit. The tool call was "
+                                "truncated and never executed. I need to retry with smaller chunks."
+                            )
+                        )
                         human_feedback = HumanMessage(content=feedback_text)
 
                         # Audit as warning
                         if auditor:
-                            preview = failed_generation[:500] if failed_generation else "(empty)"
+                            preview = (
+                                failed_generation[:500]
+                                if failed_generation
+                                else "(empty)"
+                            )
                             auditor.audit_step(
                                 job_id=job_id,
                                 agent_type=config.agent_id,
@@ -1256,7 +1388,9 @@ def create_execute_node(
                                         "message": "Groq output exceeded max completion tokens",
                                         "streak": streak,
                                         "failed_generation_preview": preview,
-                                        "failed_generation_length": len(failed_generation),
+                                        "failed_generation_length": len(
+                                            failed_generation
+                                        ),
                                     }
                                 },
                                 metadata=state.get("metadata"),
@@ -1267,7 +1401,9 @@ def create_execute_node(
                         # Return feedback messages — graph continues normally
                         # Route: execute → check_todos (no tool_calls) → pending todos → execute
                         if context_was_compacted:
-                            result_messages = remove_markers + messages + [ai_summary, human_feedback]
+                            result_messages = (
+                                remove_markers + messages + [ai_summary, human_feedback]
+                            )
                         else:
                             result_messages = [ai_summary, human_feedback]
 
@@ -1374,10 +1510,14 @@ def create_check_todos_node(
             phase_number = state.get("phase_number", 0)
             if phase_number == 0:
                 # Initial strategic phase
-                strategic_todos = get_initial_strategic_todos(config, tool_names=tool_names)
+                strategic_todos = get_initial_strategic_todos(
+                    config, tool_names=tool_names
+                )
             else:
                 # Transition strategic phase (between tactical phases)
-                strategic_todos = get_transition_strategic_todos(config, tool_names=tool_names)
+                strategic_todos = get_transition_strategic_todos(
+                    config, tool_names=tool_names
+                )
 
             if strategic_todos:
                 todo_list = [todo.to_dict() for todo in strategic_todos]
@@ -1387,7 +1527,9 @@ def create_check_todos_node(
                 )
                 return {"phase_complete": False}  # Continue with reloaded todos
 
-            logger.warning(f"[{job_id}] No todos loaded and no predefined todos available")
+            logger.warning(
+                f"[{job_id}] No todos loaded and no predefined todos available"
+            )
             return {"phase_complete": False}
 
         # Check todos
@@ -1452,11 +1594,14 @@ def create_archive_phase_node(
         import asyncio
 
         # Memory Light: extract memories at phase boundary via AuxiliaryLLM (async, non-blocking)
-        if (recall_store
+        if (
+            recall_store
             and config.auxiliary.enabled
             and config.auxiliary.tasks.get("extract_memories", None)
-            and config.auxiliary.tasks["extract_memories"].enabled):
+            and config.auxiliary.tasks["extract_memories"].enabled
+        ):
             from src.services.auxiliary import extract_and_store_memories
+
             asyncio.create_task(
                 extract_and_store_memories(
                     auxiliary_llm=auxiliary_llm,
@@ -1473,7 +1618,9 @@ def create_archive_phase_node(
             try:
                 # Get todo stats for snapshot metadata
                 todos = todo_manager.list_all()
-                todos_completed = sum(1 for t in todos if t.status == TodoStatus.COMPLETED)
+                todos_completed = sum(
+                    1 for t in todos if t.status == TodoStatus.COMPLETED
+                )
                 todos_total = len(todos)
 
                 snapshot_manager.create_snapshot(
@@ -1490,8 +1637,11 @@ def create_archive_phase_node(
         # Collect completed todo summaries BEFORE archiving (archive clears them)
         phase_str = "strategic" if is_strategic else "tactical"
         curation_todo_summaries = []
-        if (tool_context and tool_context.has_knowledge()
-                and config.extra.get("curator", {}).get("enabled", False)):
+        if (
+            tool_context
+            and tool_context.has_knowledge()
+            and config.extra.get("curator", {}).get("enabled", False)
+        ):
             for todo in todo_manager.list_all():
                 if todo.status == TodoStatus.COMPLETED and todo.notes:
                     curation_todo_summaries.append(
@@ -1526,17 +1676,29 @@ def create_archive_phase_node(
             )
 
         # Inline curation via AuxiliaryLLM (async, non-blocking)
-        if (tool_context and tool_context.has_knowledge()
-                and config.extra.get("curator", {}).get("enabled", False)
-                and config.auxiliary.enabled):
+        if (
+            tool_context
+            and tool_context.has_knowledge()
+            and config.extra.get("curator", {}).get("enabled", False)
+            and config.auxiliary.enabled
+        ):
             try:
                 from src.services.auxiliary import curate_and_store_knowledge
+
                 try:
-                    ws_md = workspace_manager.read_file("workspace.md") if workspace_manager else ""
+                    ws_md = (
+                        workspace_manager.read_file("workspace.md")
+                        if workspace_manager
+                        else ""
+                    )
                 except (FileNotFoundError, ValueError):
                     ws_md = ""
                 try:
-                    plan_md_content = workspace_manager.read_file("plan.md") if workspace_manager else ""
+                    plan_md_content = (
+                        workspace_manager.read_file("plan.md")
+                        if workspace_manager
+                        else ""
+                    )
                 except (FileNotFoundError, ValueError):
                     plan_md_content = ""
                 phase_context_parts = [f"Phase {phase_number} ({phase_str}) archived."]
@@ -1544,14 +1706,16 @@ def create_archive_phase_node(
                     phase_context_parts.append(f"Archive: {archive_path}")
                 phase_context_parts.extend(curation_todo_summaries)
                 curation_phase_data = "\n".join(phase_context_parts)
-                asyncio.create_task(curate_and_store_knowledge(
-                    auxiliary_llm=auxiliary_llm,
-                    tool_context=tool_context,
-                    phase_data=curation_phase_data,
-                    workspace_md=ws_md or "",
-                    plan_md=plan_md_content or "",
-                    curation_prompt=curation_prompt,
-                ))
+                asyncio.create_task(
+                    curate_and_store_knowledge(
+                        auxiliary_llm=auxiliary_llm,
+                        tool_context=tool_context,
+                        phase_data=curation_phase_data,
+                        workspace_md=ws_md or "",
+                        plan_md=plan_md_content or "",
+                        curation_prompt=curation_prompt,
+                    )
+                )
             except Exception as e:
                 logger.warning(f"[{job_id}] Inline curation failed (non-fatal): {e}")
 
@@ -1578,11 +1742,19 @@ def create_archive_phase_node(
 
             # Check for RemoveMessage markers to detect if compaction occurred
             # (RemoveMessage count makes len() unreliable)
-            remove_markers = [m for m in compacted_messages if isinstance(m, RemoveMessage)]
+            remove_markers = [
+                m for m in compacted_messages if isinstance(m, RemoveMessage)
+            ]
             if remove_markers:
                 # Compaction occurred - separate markers from actual messages
-                actual_messages = [m for m in compacted_messages if not isinstance(m, RemoveMessage)]
-                reason = "strategic→tactical transition" if force_summarize else "threshold exceeded"
+                actual_messages = [
+                    m for m in compacted_messages if not isinstance(m, RemoveMessage)
+                ]
+                reason = (
+                    "strategic→tactical transition"
+                    if force_summarize
+                    else "threshold exceeded"
+                )
                 logger.info(
                     f"[{job_id}] Compacted context ({reason}): "
                     f"{len(messages)} -> {len(actual_messages)} messages "
@@ -1603,7 +1775,9 @@ def create_archive_phase_node(
                 "messages": compacted_messages + [message],
             }
 
-        logger.debug(f"[{job_id}] archive_phase returning 1 new message (no compaction)")
+        logger.debug(
+            f"[{job_id}] archive_phase returning 1 new message (no compaction)"
+        )
         return {
             "messages": [message],
         }
@@ -1628,7 +1802,8 @@ async def _process_queued_replies(
 
     # Read queued_replies from job context
     row = await postgres_db.fetchrow(
-        "SELECT context FROM jobs WHERE id = $1::uuid", job_id,
+        "SELECT context FROM jobs WHERE id = $1::uuid",
+        job_id,
     )
     if not row:
         return 0
@@ -1649,7 +1824,9 @@ async def _process_queued_replies(
     for reply in queued:
         thread_id = reply.get("thread_id", "unknown")
         message = reply.get("message", "")
-        timestamp = reply.get("timestamp", datetime.now(tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        timestamp = reply.get(
+            "timestamp", datetime.now(tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
 
         msg_dir = f"messages/{thread_id}"
         try:
@@ -1673,11 +1850,11 @@ async def _process_queued_replies(
         workspace.write_file(f"{msg_dir}/{seq:03d}_received.md", msg_content)
 
     if queued and workspace.git_manager and workspace.git_manager.is_active:
-        workspace.git_manager.commit(
-            f"Received {len(queued)} queued reply(ies)"
-        )
+        workspace.git_manager.commit(f"Received {len(queued)} queued reply(ies)")
 
-    logger.info(f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary")
+    logger.info(
+        f"[{job_id}] Processed {len(queued)} queued async replies at phase boundary"
+    )
     return len(queued)
 
 
@@ -1771,7 +1948,9 @@ def create_handle_transition_node(
                 f"phase_number={result.state_updates.get('phase_number')}"
             )
             # Update phase state on TodoManager for tool access
-            new_is_strategic = result.state_updates.get("is_strategic_phase", is_strategic)
+            new_is_strategic = result.state_updates.get(
+                "is_strategic_phase", is_strategic
+            )
             todo_manager.is_strategic_phase = new_is_strategic
             new_phase_number = result.state_updates.get("phase_number", phase_number)
             todo_manager.phase_number = new_phase_number
@@ -1862,7 +2041,9 @@ def create_check_goal_node(
         # early exit when todos have been staged but plan appears complete
         pending_todos = todo_manager.list_pending()
         if pending_todos:
-            logger.info(f"[{job_id}] Goal not achieved - {len(pending_todos)} pending todos")
+            logger.info(
+                f"[{job_id}] Goal not achieved - {len(pending_todos)} pending todos"
+            )
             return {"goal_achieved": False}
 
         # Legacy: Check if plan is complete
@@ -1900,7 +2081,9 @@ def create_check_goal_node(
         # Check if there's a next phase (legacy)
         next_phase = plan_manager.get_current_phase()
         if not next_phase:
-            logger.info(f"[{job_id}] No more phases and no pending todos - goal achieved")
+            logger.info(
+                f"[{job_id}] No more phases and no pending todos - goal achieved"
+            )
 
             # Audit goal achieved (no more phases)
             auditor = get_archiver()
@@ -1991,7 +2174,9 @@ def route_after_check_todos(
     return "execute"
 
 
-def route_entry(state: UniversalAgentState) -> Literal["init_workspace", "restore_todo_state", "restore_from_feedback"]:
+def route_entry(
+    state: UniversalAgentState,
+) -> Literal["init_workspace", "restore_todo_state", "restore_from_feedback"]:
     """Route at entry based on initialization state.
 
     If resuming with feedback, route to feedback processing node.
@@ -2031,16 +2216,20 @@ def create_restore_todo_state_node(
 
         # Check if we have todo state in the checkpoint
         if todos is not None or staged_todos is not None:
-            todo_manager.restore_state({
-                "todos": todos,
-                "staged_todos": staged_todos,
-                "next_id": todo_next_id,
-            })
+            todo_manager.restore_state(
+                {
+                    "todos": todos,
+                    "staged_todos": staged_todos,
+                    "next_id": todo_next_id,
+                }
+            )
             logger.info(f"[{job_id}] Restored TodoManager from checkpoint state")
         else:
             # No todo state in checkpoint - this is expected for old checkpoints
             # The existing recovery logic in check_todos will handle this
-            logger.warning(f"[{job_id}] No todo state in checkpoint, using legacy recovery")
+            logger.warning(
+                f"[{job_id}] No todo state in checkpoint, using legacy recovery"
+            )
 
         # Also restore phase state on TodoManager for tool access
         is_strategic = state.get("is_strategic_phase", True)
@@ -2113,7 +2302,9 @@ def create_restore_from_feedback_node(
         feedback = state.get("resume_feedback", "")
         messages = state.get("messages", [])
 
-        logger.info(f"[{job_id}] Restoring from feedback resume ({len(feedback)} chars)")
+        logger.info(
+            f"[{job_id}] Restoring from feedback resume ({len(feedback)} chars)"
+        )
 
         # Step 1: Force-compact old conversation context
         # This gives the agent a "fresh start" with just a summary of prior work
@@ -2127,7 +2318,9 @@ def create_restore_from_feedback_node(
 
         # Separate RemoveMessage markers from actual messages
         remove_markers = [m for m in compacted_messages if isinstance(m, RemoveMessage)]
-        actual_messages = [m for m in compacted_messages if not isinstance(m, RemoveMessage)]
+        actual_messages = [
+            m for m in compacted_messages if not isinstance(m, RemoveMessage)
+        ]
 
         if remove_markers:
             logger.info(
@@ -2164,6 +2357,7 @@ def create_restore_from_feedback_node(
             except Exception:
                 seq = 2  # First message was sent, reply is #2
             from datetime import datetime, timezone as tz
+
             msg_content = (
                 f"---\n"
                 f"from: user\n"
@@ -2177,7 +2371,9 @@ def create_restore_from_feedback_node(
                 f"{feedback}\n"
             )
             workspace.write_file(f"{msg_dir}/{seq:03d}_received.md", msg_content)
-            logger.info(f"[{job_id}] Wrote received message to {msg_dir}/{seq:03d}_received.md")
+            logger.info(
+                f"[{job_id}] Wrote received message to {msg_dir}/{seq:03d}_received.md"
+            )
 
         # Step 3: Create HumanMessage with formatted feedback
         feedback_message = HumanMessage(
@@ -2201,9 +2397,7 @@ def create_restore_from_feedback_node(
         # Export todo state for checkpointing
         todo_state = todo_manager.export_state()
 
-        logger.info(
-            f"[{job_id}] Loaded {len(resume_todos)} resume strategic todos"
-        )
+        logger.info(f"[{job_id}] Loaded {len(resume_todos)} resume strategic todos")
 
         # Audit the feedback resume
         auditor = get_archiver()
@@ -2324,6 +2518,7 @@ def create_audited_tool_node(
     # Loop detection state: track recent tool calls as (name, args_hash) tuples
     import hashlib
     from collections import deque
+
     _tool_call_history: deque = deque(maxlen=30)
     _LOOP_WARNING_THRESHOLD = 10  # warn after 10 identical calls in last 30
 
@@ -2343,24 +2538,38 @@ def create_audited_tool_node(
 
     # Tools that indicate forward progress (reset stuck counter)
     PROGRESS_TOOLS = {
-        "todo_complete", "write_file", "next_phase_todos",
-        "job_complete", "mark_complete", "kb_write", "kb_update",
+        "todo_complete",
+        "write_file",
+        "next_phase_todos",
+        "job_complete",
+        "mark_complete",
+        "kb_write",
+        "kb_update",
     }
 
     TOOL_NOT_FOUND_PATTERN = "is not a valid tool"
 
     def _get_tool_category(tool_name: str) -> Optional[str]:
         from .tools.registry import TOOL_REGISTRY
+
         return TOOL_REGISTRY.get(tool_name, {}).get("category")
 
     def _get_category_tool_names(category: str) -> List[str]:
         from .tools.registry import TOOL_REGISTRY
-        return [name for name, meta in TOOL_REGISTRY.items()
-                if meta.get("category") == category]
+
+        return [
+            name
+            for name, meta in TOOL_REGISTRY.items()
+            if meta.get("category") == category
+        ]
 
     # Build phase-allowed tool sets for defense-in-depth validation.
     # Primary enforcement is LLM schema binding; this catches hallucinated calls.
-    from .tools.registry import filter_tools_by_phase as _filter_phase, TOOL_REGISTRY as _TOOL_REG
+    from .tools.registry import (
+        filter_tools_by_phase as _filter_phase,
+        TOOL_REGISTRY as _TOOL_REG,
+    )
+
     _all_tool_names = [t.name for t in tools]
     _phase_allowed: Dict[str, set] = {
         "strategic": set(_filter_phase(_all_tool_names, "strategic")),
@@ -2385,11 +2594,13 @@ def create_audited_tool_node(
             last_msg = messages[-1]
             if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
                 for tc in last_msg.tool_calls:
-                    tool_calls_info.append({
-                        "name": tc.get("name", "unknown"),
-                        "call_id": tc.get("id", ""),
-                        "args": tc.get("args", {}),
-                    })
+                    tool_calls_info.append(
+                        {
+                            "name": tc.get("name", "unknown"),
+                            "call_id": tc.get("id", ""),
+                            "args": tc.get("args", {}),
+                        }
+                    )
 
         # Defense-in-depth: reject tool calls not declared for the current phase.
         # LLM schema binding is the primary gate; this catches hallucinated calls.
@@ -2397,7 +2608,8 @@ def create_audited_tool_node(
         # phase gate we reject the entire batch with explicit error messages.
         allowed = _phase_allowed.get(phase_str, set())
         phase_violations = [
-            tc for tc in tool_calls_info
+            tc
+            for tc in tool_calls_info
             if tc["name"] in _phase_gated_names and tc["name"] not in allowed
         ]
         if phase_violations:
@@ -2406,18 +2618,20 @@ def create_audited_tool_node(
                 f"[{job_id}] Phase gate: {violated_names} not available "
                 f"in {phase_str} phase — rejecting entire batch"
             )
-            return {"messages": [
-                ToolMessage(
-                    content=(
-                        f"Error: '{tc['name']}' is not available in the "
-                        f"{phase_str} phase. Use tools appropriate for "
-                        f"this phase."
-                    ),
-                    tool_call_id=tc["call_id"],
-                    name=tc["name"],
-                )
-                for tc in tool_calls_info  # respond to ALL calls so LangGraph is happy
-            ]}
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=(
+                            f"Error: '{tc['name']}' is not available in the "
+                            f"{phase_str} phase. Use tools appropriate for "
+                            f"this phase."
+                        ),
+                        tool_call_id=tc["call_id"],
+                        name=tc["name"],
+                    )
+                    for tc in tool_calls_info  # respond to ALL calls so LangGraph is happy
+                ]
+            }
 
         # Phase change: reset all detection state
         if phase_number != _last_phase_number[0]:
@@ -2464,7 +2678,8 @@ def create_audited_tool_node(
                         ),
                         tool_call_id=tc["call_id"],
                         name=tc["name"],
-                    ) for tc in tool_calls_info
+                    )
+                    for tc in tool_calls_info
                 ]
                 return {"should_stop": True, "messages": freeze_msgs}
             else:
@@ -2474,21 +2689,15 @@ def create_audited_tool_node(
                     f"{_phase_tool_call_count[0]} calls "
                     f"(phase {phase_number}). Triggering rewind."
                 )
-                rewind_note = (
-                    f"Budget of {_HARD_CAP} tool calls reached in this phase"
-                )
+                rewind_note = f"Budget of {_HARD_CAP} tool calls reached in this phase"
                 # Archive current todos and clear the list
                 if tool_context and tool_context.todo_manager:
                     try:
-                        tool_context.todo_manager.archive_with_failure_note(
-                            rewind_note
-                        )
+                        tool_context.todo_manager.archive_with_failure_note(rewind_note)
                         if tool_context.todo_manager.has_staged_todos():
                             tool_context.todo_manager.clear_staged_todos()
                     except Exception as e:
-                        logger.error(
-                            f"[{job_id}] Failed to rewind todos: {e}"
-                        )
+                        logger.error(f"[{job_id}] Failed to rewind todos: {e}")
                 # Capture count before reset for the message
                 calls_used = _phase_tool_call_count[0]
                 # Reset counters so the next phase starts fresh
@@ -2498,18 +2707,20 @@ def create_audited_tool_node(
                 _warned_signatures.clear()
                 _reflection_injected[0] = False
 
-                rewind_msg = SystemMessage(content=(
-                    f"PHASE BUDGET REACHED: "
-                    f"{calls_used}/{_HARD_CAP} tool calls "
-                    "consumed without completing this phase's objectives. "
-                    "Current todos have been archived.\n\n"
-                    "Before creating new todos:\n"
-                    "1. Review what worked and what didn't in this phase\n"
-                    "2. Update plan.md if the approach needs to change\n"
-                    "3. Create smaller, more focused todos with "
-                    "next_phase_todos()\n\n"
-                    "Do not repeat the same sequence of actions."
-                ))
+                rewind_msg = SystemMessage(
+                    content=(
+                        f"PHASE BUDGET REACHED: "
+                        f"{calls_used}/{_HARD_CAP} tool calls "
+                        "consumed without completing this phase's objectives. "
+                        "Current todos have been archived.\n\n"
+                        "Before creating new todos:\n"
+                        "1. Review what worked and what didn't in this phase\n"
+                        "2. Update plan.md if the approach needs to change\n"
+                        "3. Create smaller, more focused todos with "
+                        "next_phase_todos()\n\n"
+                        "Do not repeat the same sequence of actions."
+                    )
+                )
                 # Return ToolMessages (to satisfy pending tool calls) + the rewind message.
                 # Don't execute the tools — skip straight to the rewind.
                 tool_msgs = [
@@ -2520,7 +2731,8 @@ def create_audited_tool_node(
                         ),
                         tool_call_id=tc["call_id"],
                         name=tc["name"],
-                    ) for tc in tool_calls_info
+                    )
+                    for tc in tool_calls_info
                 ]
                 return {"messages": tool_msgs + [rewind_msg]}
 
@@ -2569,11 +2781,13 @@ def create_audited_tool_node(
         # Append loop warnings to tool results for flagged calls
         if _loop_warned_call_ids and "messages" in result:
             for msg in result["messages"]:
-                if (isinstance(msg, ToolMessage)
-                        and msg.tool_call_id in _loop_warned_call_ids):
+                if (
+                    isinstance(msg, ToolMessage)
+                    and msg.tool_call_id in _loop_warned_call_ids
+                ):
                     msg.content = (
-                        (msg.content or "") +
-                        "\n\n[LOOP WARNING] You have called this tool with the "
+                        (msg.content or "")
+                        + "\n\n[LOOP WARNING] You have called this tool with the "
                         "same arguments multiple times. You may be stuck in a "
                         "loop. Consider a different approach: try different "
                         "arguments, use a different tool, or mark the current "
@@ -2588,6 +2802,7 @@ def create_audited_tool_node(
                 if isinstance(msg, ToolMessage) and msg.content:
                     if "WorkspaceUnavailableError" in msg.content:
                         from .core.workspace_backend import WorkspaceUnavailableError
+
                         raise WorkspaceUnavailableError(
                             f"VM workspace connection lost during tool execution: "
                             f"{msg.content[:300]}"
@@ -2596,9 +2811,11 @@ def create_audited_tool_node(
         # Enrich tool-not-found errors with actionable guidance
         if "messages" in result:
             for msg in result["messages"]:
-                if (isinstance(msg, ToolMessage)
-                        and msg.content
-                        and TOOL_NOT_FOUND_PATTERN in msg.content):
+                if (
+                    isinstance(msg, ToolMessage)
+                    and msg.content
+                    and TOOL_NOT_FOUND_PATTERN in msg.content
+                ):
                     msg.content += (
                         "\n\nIf your current todo requires this tool, mark it "
                         "as blocked using todo_complete with a note explaining "
@@ -2617,7 +2834,9 @@ def create_audited_tool_node(
                     if tool_name:
                         category = _get_tool_category(tool_name)
                         if category:
-                            _category_failures.setdefault(category, set()).add(tool_name)
+                            _category_failures.setdefault(category, set()).add(
+                                tool_name
+                            )
                             if len(_category_failures[category]) >= 3:
                                 logger.warning(
                                     f"[{job_id}] Multiple failures in category "
@@ -2629,10 +2848,14 @@ def create_audited_tool_node(
         executed_names = {tc["name"] for tc in tool_calls_info}
         if executed_names & PROGRESS_TOOLS:
             for msg in result.get("messages", []):
-                if isinstance(msg, ToolMessage) and not _is_tool_error(msg.content or ""):
+                if isinstance(msg, ToolMessage) and not _is_tool_error(
+                    msg.content or ""
+                ):
                     for tc in tool_calls_info:
-                        if (tc["call_id"] == getattr(msg, "tool_call_id", "")
-                                and tc["name"] in PROGRESS_TOOLS):
+                        if (
+                            tc["call_id"] == getattr(msg, "tool_call_id", "")
+                            and tc["name"] in PROGRESS_TOOLS
+                        ):
                             progress_made = True
                             break
                 if progress_made:
@@ -2647,18 +2870,20 @@ def create_audited_tool_node(
         # todo_rewind is a deliberate re-plan: reset loop detection state
         if "todo_rewind" in {tc["name"] for tc in tool_calls_info}:
             for msg in result.get("messages", []):
-                if (isinstance(msg, ToolMessage)
-                        and not _is_tool_error(msg.content or "")
-                        and any(tc["name"] == "todo_rewind"
-                                and tc["call_id"] == msg.tool_call_id
-                                for tc in tool_calls_info)):
+                if (
+                    isinstance(msg, ToolMessage)
+                    and not _is_tool_error(msg.content or "")
+                    and any(
+                        tc["name"] == "todo_rewind"
+                        and tc["call_id"] == msg.tool_call_id
+                        for tc in tool_calls_info
+                    )
+                ):
                     _tool_call_history.clear()
                     _warned_signatures.clear()
                     _calls_since_progress[0] = 0
                     _reflection_injected[0] = False
-                    logger.info(
-                        f"[{job_id}] Loop detection reset after todo_rewind"
-                    )
+                    logger.info(f"[{job_id}] Loop detection reset after todo_rewind")
                     break
 
         # Progress nudge: periodic reminders to write findings down.
@@ -2669,15 +2894,17 @@ def create_audited_tool_node(
             # Inject a nudge every _PROGRESS_THRESHOLD calls without progress
             if calls == _PROGRESS_THRESHOLD or calls % _PROGRESS_THRESHOLD == 0:
                 remaining = _HARD_CAP - _phase_tool_call_count[0]
-                diagnostic = SystemMessage(content=(
-                    f"OBSERVATION: {calls} tool calls since the last file "
-                    f"write or todo completion. Phase budget: "
-                    f"{remaining}/{_HARD_CAP} calls remaining.\n\n"
-                    "If you have gathered useful information, write it to "
-                    "a file now — findings not written to files are lost "
-                    "during context compaction. If you still need specific "
-                    "information, identify the gap and target it directly."
-                ))
+                diagnostic = SystemMessage(
+                    content=(
+                        f"OBSERVATION: {calls} tool calls since the last file "
+                        f"write or todo completion. Phase budget: "
+                        f"{remaining}/{_HARD_CAP} calls remaining.\n\n"
+                        "If you have gathered useful information, write it to "
+                        "a file now — findings not written to files are lost "
+                        "during context compaction. If you still need specific "
+                        "information, identify the gap and target it directly."
+                    )
+                )
                 result.setdefault("messages", []).append(diagnostic)
                 logger.info(
                     f"[{job_id}] Progress nudge #{nudge_count}: "
@@ -2699,7 +2926,8 @@ def create_audited_tool_node(
                             audit_doc_id=audit_doc_id,
                             result=content,
                             success=not is_error,
-                            latency_ms=execution_time_ms // max(len(tool_calls_info), 1),
+                            latency_ms=execution_time_ms
+                            // max(len(tool_calls_info), 1),
                             error=content[:500] if is_error else None,
                         )
 
@@ -2792,6 +3020,7 @@ def build_phase_alternation_graph(
     # Backwards compatibility: if old param used, map to new params
     if llm_with_tools is not None and strategic_llm_with_tools is None:
         import warnings
+
         warnings.warn(
             "llm_with_tools is deprecated, use strategic_llm_with_tools and "
             "tactical_llm_with_tools instead",
@@ -2825,7 +3054,9 @@ def build_phase_alternation_graph(
         model=config.llm.model,
         strategic_model=strategic_config.model,
         tactical_model=tactical_config.model,
-        summarization_timeout=summarization_config.timeout or config.llm.timeout or 600.0,
+        summarization_timeout=summarization_config.timeout
+        or config.llm.timeout
+        or 600.0,
     )
 
     # Create retry manager for LLM call retries
@@ -2833,12 +3064,18 @@ def build_phase_alternation_graph(
 
     # Load summarization prompt (use summarization model for matrix resolution)
     summarization_config = config.llm.get_phase_config("summarization")
-    summarization_prompt = load_summarization_prompt(config, model=summarization_config.model)
+    summarization_prompt = load_summarization_prompt(
+        config, model=summarization_config.model
+    )
 
     # Load auxiliary task prompts (use auxiliary model for matrix resolution)
     aux_model = config.auxiliary.model or summarization_config.model or config.llm.model
-    memory_extraction_prompt = load_auxiliary_prompt(config, "memory_extraction", model=aux_model)
-    memory_assembler_prompt = load_auxiliary_prompt(config, "memory_assembler", model=aux_model)
+    memory_extraction_prompt = load_auxiliary_prompt(
+        config, "memory_extraction", model=aux_model
+    )
+    memory_assembler_prompt = load_auxiliary_prompt(
+        config, "memory_assembler", model=aux_model
+    )
     curation_prompt = load_auxiliary_prompt(config, "curation", model=aux_model)
 
     # workspace_template is no longer used — workspace.md replaced by
@@ -2847,6 +3084,7 @@ def build_phase_alternation_graph(
     # Backwards compatibility: wrap a raw LLM in AuxiliaryLLM if needed
     if auxiliary_llm is None:
         from src.services.auxiliary import AuxiliaryLLM
+
         raw_llm = summarization_llm or strategic_llm_with_tools
         auxiliary_llm = AuxiliaryLLM(llm=raw_llm)
 
@@ -2860,12 +3098,20 @@ def build_phase_alternation_graph(
     _tool_names = [t.name for t in tools] if tools else None
 
     # Create nodes
-    init_workspace = create_init_workspace_node(memory_manager, workspace_template, config)
-    init_strategic_todos = create_init_strategic_todos_node(workspace, todo_manager, config, tool_names=_tool_names)
+    init_workspace = create_init_workspace_node(
+        memory_manager, workspace_template, config
+    )
+    init_strategic_todos = create_init_strategic_todos_node(
+        workspace, todo_manager, config, tool_names=_tool_names
+    )
     restore_todo_state = create_restore_todo_state_node(todo_manager)
     restore_from_feedback = create_restore_from_feedback_node(
-        workspace, todo_manager, config,
-        context_mgr, auxiliary_llm, summarization_prompt,
+        workspace,
+        todo_manager,
+        config,
+        context_mgr,
+        auxiliary_llm,
+        summarization_prompt,
         tool_names=_tool_names,
     )
 
@@ -2887,8 +3133,12 @@ def build_phase_alternation_graph(
     )
     check_todos = create_check_todos_node(todo_manager, config, tool_names=_tool_names)
     archive_phase = create_archive_phase_node(
-        todo_manager, plan_manager, config,
-        context_mgr, auxiliary_llm, summarization_prompt,
+        todo_manager,
+        plan_manager,
+        config,
+        context_mgr,
+        auxiliary_llm,
+        summarization_prompt,
         snapshot_manager=snapshot_manager,
         recall_store=recall_store,
         tool_context=tool_context,
@@ -2898,7 +3148,9 @@ def build_phase_alternation_graph(
     )
 
     handle_transition = create_handle_transition_node(
-        workspace, todo_manager, config,
+        workspace,
+        todo_manager,
+        config,
         min_todos=config.phase_settings.min_todos,
         max_todos=config.phase_settings.max_todos,
         postgres_db=postgres_db,
@@ -2907,7 +3159,8 @@ def build_phase_alternation_graph(
 
     check_goal = create_check_goal_node(plan_manager, workspace, config, todo_manager)
     tool_node = create_audited_tool_node(
-        tools, config,
+        tools,
+        config,
         recall_store=recall_store,
         tool_context=tool_context,
     )
@@ -2983,7 +3236,9 @@ def build_phase_alternation_graph(
     # Wire goal check
     workflow.add_conditional_edges(
         "check_goal",
-        lambda s: "end" if s.get("goal_achieved") or s.get("should_stop") else "execute",
+        lambda s: "end"
+        if s.get("goal_achieved") or s.get("should_stop")
+        else "execute",
         {
             "execute": "execute",
             "end": END,
@@ -3028,6 +3283,7 @@ def build_nested_loop_graph(
         Compiled StateGraph
     """
     import warnings
+
     warnings.warn(
         "build_nested_loop_graph is deprecated, use build_phase_alternation_graph instead",
         DeprecationWarning,

@@ -6,7 +6,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-
 class TestJobStartEndpoint:
     """Tests for POST /job/start endpoint."""
 

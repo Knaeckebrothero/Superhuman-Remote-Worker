@@ -44,33 +44,37 @@ def _make_structured_llm(return_value):
     mock_llm = MagicMock()
     raw_response = AIMessage(content="structured output")
     structured_mock = AsyncMock()
-    structured_mock.ainvoke = AsyncMock(return_value={
-        "raw": raw_response,
-        "parsed": return_value,
-        "parsing_error": None,
-    })
+    structured_mock.ainvoke = AsyncMock(
+        return_value={
+            "raw": raw_response,
+            "parsed": return_value,
+            "parsing_error": None,
+        }
+    )
     mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
     return mock_llm
 
 
 def _sample_extracted_memories():
     """Return a sample ExtractedMemories result."""
-    return ExtractedMemories(memories=[
-        ExtractedMemory(
-            content="The users table uses soft deletes via deleted_at.",
-            summary="Users table has soft deletes",
-            keywords=["users", "soft_delete", "deleted_at"],
-            importance=0.8,
-            type="factual",
-        ),
-        ExtractedMemory(
-            content="API rate limiting is set to 100 req/min per user.",
-            summary="Rate limit: 100 req/min",
-            keywords=["api", "rate_limit"],
-            importance=0.6,
-            type="factual",
-        ),
-    ])
+    return ExtractedMemories(
+        memories=[
+            ExtractedMemory(
+                content="The users table uses soft deletes via deleted_at.",
+                summary="Users table has soft deletes",
+                keywords=["users", "soft_delete", "deleted_at"],
+                importance=0.8,
+                type="factual",
+            ),
+            ExtractedMemory(
+                content="API rate limiting is set to 100 req/min per user.",
+                summary="Rate limit: 100 req/min",
+                keywords=["api", "rate_limit"],
+                importance=0.6,
+                type="factual",
+            ),
+        ]
+    )
 
 
 def _sample_curation_result():
@@ -103,36 +107,43 @@ class TestAuxiliaryConfigParsing:
         assert config.tasks["extract_memories"].enabled is True
 
     def test_custom_model(self):
-        config = _parse_auxiliary_config({
-            "model": "gpt-oss-120b",
-            "base_url": "http://uni-server:8080/v1",
-            "temperature": 0.1,
-        })
+        config = _parse_auxiliary_config(
+            {
+                "model": "gpt-oss-120b",
+                "base_url": "http://uni-server:8080/v1",
+                "temperature": 0.1,
+            }
+        )
         assert config.model == "gpt-oss-120b"
         assert config.base_url == "http://uni-server:8080/v1"
         assert config.temperature == 0.1
 
     def test_disabled_task(self):
-        config = _parse_auxiliary_config({
-            "tasks": {
-                "extract_memories": {"enabled": False},
-                "curate_knowledge": {"enabled": True},
+        config = _parse_auxiliary_config(
+            {
+                "tasks": {
+                    "extract_memories": {"enabled": False},
+                    "curate_knowledge": {"enabled": True},
+                }
             }
-        })
+        )
         assert config.tasks["extract_memories"].enabled is False
         assert config.tasks["curate_knowledge"].enabled is True
 
     def test_custom_iterations_and_timeout(self):
-        config = _parse_auxiliary_config({
-            "max_iterations": 10,
-            "timeout": 60.0,
-        })
+        config = _parse_auxiliary_config(
+            {
+                "max_iterations": 10,
+                "timeout": 60.0,
+            }
+        )
         assert config.max_iterations == 10
         assert config.timeout == 60.0
 
     def test_full_config_from_yaml(self):
         """Test that defaults.yaml auxiliary section parses correctly."""
         from src.core.loader import load_agent_config
+
         config = load_agent_config("config/defaults.yaml")
         assert config.auxiliary.enabled is True
         assert config.auxiliary.model == "openai/gpt-oss-120b"
@@ -164,7 +175,9 @@ class TestExtractMemoriesTask:
             HumanMessage(content="What's the database schema?"),
             AIMessage(content="The users table has columns: id, name, email."),
         ]
-        task = ExtractMemoriesTask(messages=messages, prompt=_TEST_MEMORY_PROMPT, phase=1)
+        task = ExtractMemoriesTask(
+            messages=messages, prompt=_TEST_MEMORY_PROMPT, phase=1
+        )
         context = task.build_context()
         assert "database schema" in context
         assert "users table" in context
@@ -174,13 +187,17 @@ class TestExtractMemoriesTask:
         context = task.build_context()
         assert context == ""
 
-    @patch("src.core.workspace_injection.is_workspace_injection_message", return_value=True)
+    @patch(
+        "src.core.workspace_injection.is_workspace_injection_message", return_value=True
+    )
     def test_build_context_skips_injections(self, mock_is_injection):
         messages = [
             HumanMessage(content="This is an injection"),
             HumanMessage(content="This is real"),
         ]
-        task = ExtractMemoriesTask(messages=messages, prompt=_TEST_MEMORY_PROMPT, phase=0)
+        task = ExtractMemoriesTask(
+            messages=messages, prompt=_TEST_MEMORY_PROMPT, phase=0
+        )
         # All messages will be skipped because mock returns True for all
         context = task.build_context()
         assert context == ""
@@ -210,8 +227,11 @@ class TestCurateKnowledgeTask:
 
     def test_output_schema(self):
         task = CurateKnowledgeTask(
-            phase_data="", workspace_md="", plan_md="",
-            existing_notes=[], kb_tools=[],
+            phase_data="",
+            workspace_md="",
+            plan_md="",
+            existing_notes=[],
+            kb_tools=[],
             prompt=_TEST_CURATION_PROMPT,
         )
         assert task.output_schema is CurationResult
@@ -246,8 +266,11 @@ class TestCurateKnowledgeTask:
     def test_get_tools_returns_provided_tools(self):
         mock_tools = [MagicMock(), MagicMock()]
         task = CurateKnowledgeTask(
-            phase_data="", workspace_md="", plan_md="",
-            existing_notes=[], kb_tools=mock_tools,
+            phase_data="",
+            workspace_md="",
+            plan_md="",
+            existing_notes=[],
+            kb_tools=mock_tools,
             prompt=_TEST_CURATION_PROMPT,
         )
         assert task.get_tools() is mock_tools
@@ -277,8 +300,13 @@ class TestAuxiliaryLLMChain:
 
         assert result is expected
         assert len(result.memories) == 2
-        assert result.memories[0].content == "The users table uses soft deletes via deleted_at."
-        mock_llm.with_structured_output.assert_called_once_with(ExtractedMemories, include_raw=True)
+        assert (
+            result.memories[0].content
+            == "The users table uses soft deletes via deleted_at."
+        )
+        mock_llm.with_structured_output.assert_called_once_with(
+            ExtractedMemories, include_raw=True
+        )
 
     @pytest.mark.asyncio
     async def test_chain_passes_correct_messages(self):
@@ -299,7 +327,7 @@ class TestAuxiliaryLLMChain:
         call_args = structured_mock.ainvoke.call_args[0][0]
         assert len(call_args) == 2
         assert call_args[0].content == task.system_prompt  # SystemMessage
-        assert "Hello world" in call_args[1].content       # HumanMessage with context
+        assert "Hello world" in call_args[1].content  # HumanMessage with context
 
     @pytest.mark.asyncio
     async def test_chain_timeout(self):
@@ -345,9 +373,13 @@ class TestAuxiliaryLLMAgent:
         # Final structured output call (include_raw=True format)
         raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value={
-            "raw": raw_response, "parsed": expected, "parsing_error": None,
-        })
+        structured_mock.ainvoke = AsyncMock(
+            return_value={
+                "raw": raw_response,
+                "parsed": expected,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         aux = AuxiliaryLLM(llm=mock_llm, max_iterations=5, timeout=30.0)
@@ -384,21 +416,29 @@ class TestAuxiliaryLLMAgent:
         done_response.content = "Done curating."
 
         tool_loop_mock = AsyncMock()
-        tool_loop_mock.ainvoke = AsyncMock(side_effect=[tool_call_response, done_response])
+        tool_loop_mock.ainvoke = AsyncMock(
+            side_effect=[tool_call_response, done_response]
+        )
         mock_llm.bind_tools = MagicMock(return_value=tool_loop_mock)
 
         # Final structured output (include_raw=True format)
         raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value={
-            "raw": raw_response, "parsed": expected, "parsing_error": None,
-        })
+        structured_mock.ainvoke = AsyncMock(
+            return_value={
+                "raw": raw_response,
+                "parsed": expected,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         # Create a mock tool
         mock_kb_search = AsyncMock()
         mock_kb_search.name = "kb_search"
-        mock_kb_search.ainvoke = AsyncMock(return_value="Found 2 notes about API design.")
+        mock_kb_search.ainvoke = AsyncMock(
+            return_value="Found 2 notes about API design."
+        )
 
         task = CurateKnowledgeTask(
             phase_data="Phase 1 done.",
@@ -435,9 +475,13 @@ class TestAuxiliaryLLMAgent:
         # Final structured output (include_raw=True format)
         raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value={
-            "raw": raw_response, "parsed": expected, "parsing_error": None,
-        })
+        structured_mock.ainvoke = AsyncMock(
+            return_value={
+                "raw": raw_response,
+                "parsed": expected,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         mock_tool = AsyncMock()
@@ -445,8 +489,11 @@ class TestAuxiliaryLLMAgent:
         mock_tool.ainvoke = AsyncMock(return_value="result")
 
         task = CurateKnowledgeTask(
-            phase_data="", workspace_md="", plan_md="",
-            existing_notes=[], kb_tools=[mock_tool],
+            phase_data="",
+            workspace_md="",
+            plan_md="",
+            existing_notes=[],
+            kb_tools=[mock_tool],
             prompt=_TEST_CURATION_PROMPT,
         )
 
@@ -476,25 +523,36 @@ class TestAuxiliaryLLMAgent:
         done_response.content = "Done."
 
         tool_loop_mock = AsyncMock()
-        tool_loop_mock.ainvoke = AsyncMock(side_effect=[tool_call_response, done_response])
+        tool_loop_mock.ainvoke = AsyncMock(
+            side_effect=[tool_call_response, done_response]
+        )
         mock_llm.bind_tools = MagicMock(return_value=tool_loop_mock)
 
         # Final structured output (include_raw=True format)
         raw_response = AIMessage(content="structured output")
         structured_mock = AsyncMock()
-        structured_mock.ainvoke = AsyncMock(return_value={
-            "raw": raw_response, "parsed": expected, "parsing_error": None,
-        })
+        structured_mock.ainvoke = AsyncMock(
+            return_value={
+                "raw": raw_response,
+                "parsed": expected,
+                "parsing_error": None,
+            }
+        )
         mock_llm.with_structured_output = MagicMock(return_value=structured_mock)
 
         # Tool that raises an error
         mock_tool = AsyncMock()
         mock_tool.name = "kb_write"
-        mock_tool.ainvoke = AsyncMock(side_effect=RuntimeError("Neo4j connection failed"))
+        mock_tool.ainvoke = AsyncMock(
+            side_effect=RuntimeError("Neo4j connection failed")
+        )
 
         task = CurateKnowledgeTask(
-            phase_data="", workspace_md="", plan_md="",
-            existing_notes=[], kb_tools=[mock_tool],
+            phase_data="",
+            workspace_md="",
+            plan_md="",
+            existing_notes=[],
+            kb_tools=[mock_tool],
             prompt=_TEST_CURATION_PROMPT,
         )
 
@@ -520,7 +578,9 @@ class TestMessageFormatting:
         assert _get_message_role(AIMessage(content="hello")) == "Agent"
 
     def test_get_message_role_ai_with_tools(self):
-        msg = AIMessage(content="", tool_calls=[{"name": "read_file", "args": {}, "id": "1"}])
+        msg = AIMessage(
+            content="", tool_calls=[{"name": "read_file", "args": {}, "id": "1"}]
+        )
         role = _get_message_role(msg)
         assert "Agent" in role
         assert "read_file" in role
@@ -532,7 +592,9 @@ class TestMessageFormatting:
     def test_format_basic_conversation(self):
         messages = [
             HumanMessage(content="What tables exist?"),
-            AIMessage(content="There are 5 tables: users, posts, comments, tags, settings."),
+            AIMessage(
+                content="There are 5 tables: users, posts, comments, tags, settings."
+            ),
         ]
         result = _format_messages_for_extraction(messages)
         assert "[User]" in result

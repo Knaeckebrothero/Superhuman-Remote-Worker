@@ -86,8 +86,12 @@ class PostgresDB:
                 "Set DATABASE_URL environment variable or pass connection_string."
             )
 
-        self._min_connections = min_connections or int(os.getenv("POSTGRES_MIN_CONNECTIONS", "2"))
-        self._max_connections = max_connections or int(os.getenv("POSTGRES_MAX_CONNECTIONS", "10"))
+        self._min_connections = min_connections or int(
+            os.getenv("POSTGRES_MIN_CONNECTIONS", "2")
+        )
+        self._max_connections = max_connections or int(
+            os.getenv("POSTGRES_MAX_CONNECTIONS", "10")
+        )
         self._command_timeout = command_timeout or 60.0
 
         self._pool: Optional[asyncpg.Pool] = None
@@ -108,10 +112,12 @@ class PostgresDB:
         This method is idempotent - safe to call multiple times.
         """
         if self._pool is None:
+
             async def _init_connection(conn):
                 """Register pgvector type codec on new connections."""
                 try:
                     from pgvector.asyncpg import register_vector
+
                     await register_vector(conn)
                 except (ImportError, ValueError):
                     pass  # pgvector not installed or extension not on this DB
@@ -288,6 +294,7 @@ class PostgresDB:
         connection pools to persist between sync wrapper calls.
         """
         import asyncio
+
         if cls._sync_loop is None or cls._sync_loop.is_closed():
             cls._sync_loop = asyncio.new_event_loop()
         return cls._sync_loop
@@ -306,6 +313,7 @@ class PostgresDB:
             Result of the coroutine
         """
         import asyncio
+
         try:
             # Check if we're already in an async context
             loop = asyncio.get_running_loop()
@@ -398,7 +406,7 @@ class JobsNamespace:
         self,
         description: str,
         document_path: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
     ) -> uuid.UUID:
         """Create a new job.
 
@@ -418,7 +426,7 @@ class JobsNamespace:
             """,
             description,
             document_path,
-            json.dumps(context or {})
+            json.dumps(context or {}),
         )
         logger.info(f"Created job {job_id}")
         return job_id
@@ -432,10 +440,7 @@ class JobsNamespace:
         Returns:
             Job details as dictionary or None if not found
         """
-        row = await self.db.fetchrow(
-            "SELECT * FROM jobs WHERE id = $1",
-            job_id
-        )
+        row = await self.db.fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
         return self.db._row_to_dict(row)
 
     async def update_status(
@@ -444,7 +449,7 @@ class JobsNamespace:
         status: Optional[str] = None,
         creator_status: Optional[str] = None,
         validator_status: Optional[str] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
     ) -> None:
         """Update job status fields.
 
@@ -487,7 +492,7 @@ class JobsNamespace:
 
         query = f"""
             UPDATE jobs
-            SET {', '.join(updates)}
+            SET {", ".join(updates)}
             WHERE id = ${idx}
         """
 
@@ -510,15 +515,12 @@ class JobsNamespace:
             ORDER BY created_at ASC
             LIMIT $1
             """,
-            limit
+            limit,
         )
         return [self.db._row_to_dict(row) for row in rows]
 
     async def list(
-        self,
-        status: Optional[str] = None,
-        limit: int = 100,
-        offset: int = 0
+        self, status: Optional[str] = None, limit: int = 100, offset: int = 0
     ) -> List[Dict[str, Any]]:
         """List jobs with optional filtering.
 
@@ -538,7 +540,9 @@ class JobsNamespace:
                 ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
                 """,
-                status, limit, offset
+                status,
+                limit,
+                offset,
             )
         else:
             rows = await self.db.fetch(
@@ -547,7 +551,8 @@ class JobsNamespace:
                 ORDER BY created_at DESC
                 LIMIT $1 OFFSET $2
                 """,
-                limit, offset
+                limit,
+                offset,
             )
         return [self.db._row_to_dict(row) for row in rows]
 
@@ -603,12 +608,10 @@ class JobsNamespace:
         self,
         description: str,
         document_path: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
     ) -> uuid.UUID:
         """Synchronous wrapper for create()."""
-        return PostgresDB._run_async(
-            self.create(description, document_path, context)
-        )
+        return PostgresDB._run_async(self.create(description, document_path, context))
 
     def get_sync(self, job_id: uuid.UUID) -> Optional[Dict[str, Any]]:
         """Synchronous wrapper for get()."""
@@ -620,11 +623,13 @@ class JobsNamespace:
         status: Optional[str] = None,
         creator_status: Optional[str] = None,
         validator_status: Optional[str] = None,
-        error_message: Optional[str] = None
+        error_message: Optional[str] = None,
     ) -> None:
         """Synchronous wrapper for update_status()."""
         return PostgresDB._run_async(
-            self.update_status(job_id, status, creator_status, validator_status, error_message)
+            self.update_status(
+                job_id, status, creator_status, validator_status, error_message
+            )
         )
 
     def get_pending_sync(self, limit: int = 100) -> List[Dict[str, Any]]:
@@ -632,10 +637,7 @@ class JobsNamespace:
         return PostgresDB._run_async(self.get_pending(limit))
 
     def list_sync(
-        self,
-        status: Optional[str] = None,
-        limit: int = 100,
-        offset: int = 0
+        self, status: Optional[str] = None, limit: int = 100, offset: int = 0
     ) -> List[Dict[str, Any]]:
         """Synchronous wrapper for list()."""
         return PostgresDB._run_async(self.list(status, limit, offset))
@@ -720,7 +722,9 @@ class RequirementsNamespace:
             research_notes,
             json.dumps(tags or []),
         )
-        logger.debug(f"Created requirement {requirement_id or req_uuid} (uuid={req_uuid})")
+        logger.debug(
+            f"Created requirement {requirement_id or req_uuid} (uuid={req_uuid})"
+        )
         return req_uuid
 
     async def get(self, requirement_uuid: uuid.UUID) -> Optional[Dict[str, Any]]:
@@ -733,15 +737,12 @@ class RequirementsNamespace:
             Requirement details as dictionary or None if not found
         """
         row = await self.db.fetchrow(
-            "SELECT * FROM requirements WHERE id = $1",
-            requirement_uuid
+            "SELECT * FROM requirements WHERE id = $1", requirement_uuid
         )
         return self.db._row_to_dict(row)
 
     async def get_by_requirement_id(
-        self,
-        job_id: uuid.UUID,
-        requirement_id: str
+        self, job_id: uuid.UUID, requirement_id: str
     ) -> Optional[Dict[str, Any]]:
         """Get requirement by external requirement ID within a job.
 
@@ -757,14 +758,13 @@ class RequirementsNamespace:
             SELECT * FROM requirements
             WHERE job_id = $1 AND requirement_id = $2
             """,
-            job_id, requirement_id
+            job_id,
+            requirement_id,
         )
         return self.db._row_to_dict(row)
 
     async def list_by_job(
-        self,
-        job_id: uuid.UUID,
-        status: Optional[str] = None
+        self, job_id: uuid.UUID, status: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """List requirements for a job.
 
@@ -782,7 +782,8 @@ class RequirementsNamespace:
                 WHERE job_id = $1 AND status = $2
                 ORDER BY created_at ASC
                 """,
-                job_id, status
+                job_id,
+                status,
             )
         else:
             rows = await self.db.fetch(
@@ -791,13 +792,12 @@ class RequirementsNamespace:
                 WHERE job_id = $1
                 ORDER BY created_at ASC
                 """,
-                job_id
+                job_id,
             )
         return [self.db._row_to_dict(row) for row in rows]
 
     async def get_pending_for_validation(
-        self,
-        limit: int = 100
+        self, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """Get requirements pending Neo4j integration.
 
@@ -818,7 +818,7 @@ class RequirementsNamespace:
             ORDER BY created_at ASC
             LIMIT $1
             """,
-            limit
+            limit,
         )
         return [self.db._row_to_dict(row) for row in rows]
 
@@ -890,7 +890,7 @@ class RequirementsNamespace:
 
         query = f"""
             UPDATE requirements
-            SET {', '.join(updates)}
+            SET {", ".join(updates)}
             WHERE id = ${idx}
         """
 
@@ -898,10 +898,7 @@ class RequirementsNamespace:
         logger.debug(f"Updated requirement {requirement_uuid}")
 
     async def update_neo4j_id(
-        self,
-        requirement_uuid: uuid.UUID,
-        neo4j_id: str,
-        status: str = "integrated"
+        self, requirement_uuid: uuid.UUID, neo4j_id: str, status: str = "integrated"
     ) -> None:
         """Update requirement with Neo4j element ID.
 
@@ -917,7 +914,7 @@ class RequirementsNamespace:
             requirement_uuid=requirement_uuid,
             neo4j_id=neo4j_id,
             status=status,
-            validated_at=True
+            validated_at=True,
         )
         logger.debug(f"Updated requirement {requirement_uuid} with neo4j_id={neo4j_id}")
 
@@ -962,8 +959,7 @@ class RequirementsNamespace:
         """
         # Guard: check current status
         row = await self.db.fetchrow(
-            "SELECT status FROM requirements WHERE id = $1",
-            requirement_uuid
+            "SELECT status FROM requirements WHERE id = $1", requirement_uuid
         )
         if not row:
             raise ValueError(f"Requirement {requirement_uuid} not found")
@@ -1007,18 +1003,14 @@ class RequirementsNamespace:
 
         query = f"""
             UPDATE requirements
-            SET {', '.join(updates)}
+            SET {", ".join(updates)}
             WHERE id = ${idx}
         """
 
         await self.db.execute(query, *values)
         logger.debug(f"Edited content of requirement {requirement_uuid}")
 
-    def edit_content_sync(
-        self,
-        requirement_uuid: uuid.UUID,
-        **kwargs
-    ) -> None:
+    def edit_content_sync(self, requirement_uuid: uuid.UUID, **kwargs) -> None:
         """Synchronous wrapper for edit_content()."""
         return PostgresDB._run_async(self.edit_content(requirement_uuid, **kwargs))
 
@@ -1043,9 +1035,20 @@ class RequirementsNamespace:
         """Synchronous wrapper for create()."""
         return PostgresDB._run_async(
             self.create(
-                job_id, text, name, requirement_id, req_type, priority,
-                source_document, source_location, gobd_relevant, gdpr_relevant,
-                citations, reasoning, research_notes, tags
+                job_id,
+                text,
+                name,
+                requirement_id,
+                req_type,
+                priority,
+                source_document,
+                source_location,
+                gobd_relevant,
+                gdpr_relevant,
+                citations,
+                reasoning,
+                research_notes,
+                tags,
             )
         )
 
@@ -1054,34 +1057,21 @@ class RequirementsNamespace:
         return PostgresDB._run_async(self.get(requirement_uuid))
 
     def list_by_job_sync(
-        self,
-        job_id: uuid.UUID,
-        status: Optional[str] = None,
-        limit: int = 1000
+        self, job_id: uuid.UUID, status: Optional[str] = None, limit: int = 1000
     ) -> List[Dict[str, Any]]:
         """Synchronous wrapper for list_by_job()."""
         return PostgresDB._run_async(self.list_by_job(job_id, status, limit))
 
-    def get_pending_for_validation_sync(
-        self,
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
+    def get_pending_for_validation_sync(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Synchronous wrapper for get_pending_for_validation()."""
         return PostgresDB._run_async(self.get_pending_for_validation(limit))
 
-    def update_sync(
-        self,
-        requirement_uuid: uuid.UUID,
-        **kwargs
-    ) -> None:
+    def update_sync(self, requirement_uuid: uuid.UUID, **kwargs) -> None:
         """Synchronous wrapper for update()."""
         return PostgresDB._run_async(self.update(requirement_uuid, **kwargs))
 
     def update_neo4j_id_sync(
-        self,
-        requirement_uuid: uuid.UUID,
-        neo4j_id: str,
-        status: str = "integrated"
+        self, requirement_uuid: uuid.UUID, neo4j_id: str, status: str = "integrated"
     ) -> None:
         """Synchronous wrapper for update_neo4j_id()."""
         return PostgresDB._run_async(
@@ -1130,14 +1120,15 @@ class CitationsNamespace:
         """
         # Guard: check citation exists
         row = await self.db.fetchrow(
-            "SELECT id FROM citations WHERE id = $1",
-            citation_id
+            "SELECT id FROM citations WHERE id = $1", citation_id
         )
         if not row:
             raise ValueError(f"Citation {citation_id} not found")
 
         # Determine if content fields are changing
-        content_fields_changed = any(v is not None for v in [claim, verbatim_quote, quote_context])
+        content_fields_changed = any(
+            v is not None for v in [claim, verbatim_quote, quote_context]
+        )
 
         # Build dynamic UPDATE clause
         updates = []
@@ -1174,7 +1165,7 @@ class CitationsNamespace:
 
         query = f"""
             UPDATE citations
-            SET {', '.join(updates)}
+            SET {", ".join(updates)}
             WHERE id = ${idx}
         """
 
@@ -1186,4 +1177,4 @@ class CitationsNamespace:
         return PostgresDB._run_async(self.edit(citation_id, **kwargs))
 
 
-__all__ = ['PostgresDB']
+__all__ = ["PostgresDB"]

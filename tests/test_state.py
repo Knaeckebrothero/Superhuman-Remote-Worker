@@ -3,7 +3,6 @@
 Verifies all default values, metadata handling, and type correctness.
 """
 
-
 from src.core.state import create_initial_state
 
 

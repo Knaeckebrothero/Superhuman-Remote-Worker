@@ -154,12 +154,14 @@ class WorkspaceService:
                 except (ValueError, IndexError):
                     pass
 
-            archives.append({
-                "filename": f.name,
-                "phase_name": phase_name or name.replace("todos_", ""),
-                "timestamp": timestamp,
-                "path": str(f.relative_to(job_path)),
-            })
+            archives.append(
+                {
+                    "filename": f.name,
+                    "phase_name": phase_name or name.replace("todos_", ""),
+                    "timestamp": timestamp,
+                    "path": str(f.relative_to(job_path)),
+                }
+            )
 
         # Sort by timestamp (newest first)
         archives.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
@@ -222,7 +224,9 @@ class WorkspaceService:
 
             # Parse header for phase name
             if line_stripped.startswith("# Archived Todos:"):
-                result["phase_name"] = line_stripped.replace("# Archived Todos:", "").strip()
+                result["phase_name"] = line_stripped.replace(
+                    "# Archived Todos:", ""
+                ).strip()
             elif line_stripped.startswith("Archived:"):
                 result["archived_at"] = line_stripped.replace("Archived:", "").strip()
 
@@ -244,14 +248,21 @@ class WorkspaceService:
                 current_section = "failure_note"
 
             # Parse todos
-            elif current_section in ("completed", "not_completed") and line_stripped.startswith("- ["):
+            elif current_section in (
+                "completed",
+                "not_completed",
+            ) and line_stripped.startswith("- ["):
                 # Parse todo line: - [x] Content or - [ ] Content or - [~] Content
                 match = re.match(r"- \[([x ~])\] (.+)", line_stripped)
                 if match:
                     status_char = match.group(1)
                     content = match.group(2)
 
-                    status = "completed" if status_char == "x" else ("in_progress" if status_char == "~" else "pending")
+                    status = (
+                        "completed"
+                        if status_char == "x"
+                        else ("in_progress" if status_char == "~" else "pending")
+                    )
 
                     current_todo = {
                         "content": content,
@@ -261,7 +272,11 @@ class WorkspaceService:
                     result["todos"].append(current_todo)
 
             # Parse todo notes (indented under todo)
-            elif current_todo and line.startswith("  - ") and current_section in ("completed", "not_completed"):
+            elif (
+                current_todo
+                and line.startswith("  - ")
+                and current_section in ("completed", "not_completed")
+            ):
                 note = line.strip()[2:]  # Remove "- " prefix
                 current_todo["notes"].append(note)
 
@@ -274,7 +289,11 @@ class WorkspaceService:
                     result["summary"][key] = value
 
             # Parse failure note
-            elif current_section == "failure_note" and line_stripped and not line_stripped.startswith("#"):
+            elif (
+                current_section == "failure_note"
+                and line_stripped
+                and not line_stripped.startswith("#")
+            ):
                 if result["failure_note"]:
                     result["failure_note"] += "\n" + line_stripped
                 else:
@@ -357,11 +376,13 @@ class WorkspaceService:
             file_path = job_path / filename
             if file_path.exists():
                 stat = file_path.stat()
-                files.append({
-                    "name": filename,
-                    "size": stat.st_size,
-                    "modified": stat.st_mtime,
-                })
+                files.append(
+                    {
+                        "name": filename,
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime,
+                    }
+                )
 
         return files
 

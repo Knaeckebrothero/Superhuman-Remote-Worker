@@ -24,6 +24,7 @@ except ImportError:
         from services import formatters as fmt  # type: ignore[no-redef]
     except ImportError:
         import importlib
+
         fmt = importlib.import_module("orchestrator.services.formatters")  # type: ignore[assignment]
 
 # Conditional auth: HTTP transport uses token verification, stdio skips it
@@ -97,7 +98,10 @@ async def health_check(request):
 
 @mcp.tool
 async def list_jobs(
-    status: Literal["created", "processing", "completed", "failed", "cancelled", "pending_review"] | None = None,
+    status: Literal[
+        "created", "processing", "completed", "failed", "cancelled", "pending_review"
+    ]
+    | None = None,
     limit: int = 20,
 ) -> str:
     """List agent jobs with optional status filter.
@@ -1230,8 +1234,12 @@ async def search_job_sources(
     client = _get_client()
     try:
         data = await client.search_job_sources(
-            job_id, query=query, mode=mode,
-            source_type=source_type, tags=tags, top_k=top_k,
+            job_id,
+            query=query,
+            mode=mode,
+            source_type=source_type,
+            tags=tags,
+            top_k=top_k,
         )
         return fmt.format_source_search(data)
     except Exception as e:
@@ -1257,9 +1265,13 @@ async def get_source_annotations(
     client = _get_client()
     try:
         annotations = await client.get_source_annotations(
-            job_id, source_id, annotation_type=annotation_type,
+            job_id,
+            source_id,
+            annotation_type=annotation_type,
         )
-        return fmt.format_annotations(job_id, source_id, annotations, type_filter=annotation_type)
+        return fmt.format_annotations(
+            job_id, source_id, annotations, type_filter=annotation_type
+        )
     except Exception as e:
         return fmt.format_citation_error(
             f"get annotations for source {source_id}", e, job_id=job_id
@@ -1473,9 +1485,7 @@ async def list_llm_requests(
 
     client = _get_client()
     try:
-        data = await client.list_llm_requests(
-            job_id=job_id, limit=limit, offset=offset
-        )
+        data = await client.list_llm_requests(job_id=job_id, limit=limit, offset=offset)
         return fmt.format_llm_requests(job_id, data)
     except Exception as e:
         return fmt.format_workspace_error("list LLM requests", job_id, e)
@@ -2288,6 +2298,7 @@ async def _search_audit(
 ) -> str:
     """Search audit entries for a pattern."""
     import json as _json
+
     query_lower = query.lower()
     matches: list[dict] = []
 
@@ -2380,7 +2391,9 @@ async def list_sudo_requests(
         limit = 100
 
     client = _get_client()
-    requests = await client.list_sudo_requests(job_id=job_id, status=status, limit=limit)
+    requests = await client.list_sudo_requests(
+        job_id=job_id, status=status, limit=limit
+    )
 
     if not requests:
         return "No sudo approval requests found."
@@ -2398,13 +2411,20 @@ async def list_sudo_requests(
         vm = req.get("vm_name", "?")
         ts = req.get("requested_at", "?")
 
-        status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌", "expired": "⏰"}.get(st, "•")
+        status_icon = {
+            "pending": "⏳",
+            "approved": "✅",
+            "denied": "❌",
+            "expired": "⏰",
+        }.get(st, "•")
         lines.append(f"{status_icon} [{rid}] {st.upper()}")
         lines.append(f"  Command: {cmd_str}")
         lines.append(f"  User: {user} → {target} | VM: {vm} | Job: {jid}")
         lines.append(f"  Requested: {ts}")
         if req.get("decided_by"):
-            lines.append(f"  Decided by: {req['decided_by']} — {req.get('decision_reason', '')}")
+            lines.append(
+                f"  Decided by: {req['decided_by']} — {req.get('decision_reason', '')}"
+            )
         lines.append("")
 
     return "\n".join(lines)
@@ -2508,7 +2528,10 @@ async def send_message_to_job(
     client = _get_client()
     try:
         result = await client.reply_to_message(
-            job_id, thread_id, message, urgent=urgent,
+            job_id,
+            thread_id,
+            message,
+            urgent=urgent,
         )
         strategy = result.get("delivery_strategy", "unknown")
         seq = result.get("sequence", "?")

@@ -107,8 +107,14 @@ def create_webdav_tools(context: ToolContext) -> List[Any]:
                             sub_is_dir = sub.get("isdir", False)
                             sub_size = sub.get("size", "")
                             sub_icon = "[DIR]" if sub_is_dir else "[FILE]"
-                            sub_size_str = f"  {_human_size(int(sub_size))}" if sub_size and not sub_is_dir else ""
-                            lines.append(f"    {sub_icon} {name}/{sub_name}{sub_size_str}")
+                            sub_size_str = (
+                                f"  {_human_size(int(sub_size))}"
+                                if sub_size and not sub_is_dir
+                                else ""
+                            )
+                            lines.append(
+                                f"    {sub_icon} {name}/{sub_name}{sub_size_str}"
+                            )
                     except Exception:
                         lines.append(f"    (could not list {name}/)")
 

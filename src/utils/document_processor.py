@@ -20,6 +20,7 @@ from .document_models import (
 # Optional imports for document processing
 try:
     import pdfplumber
+
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
@@ -27,6 +28,7 @@ except ImportError:
 
 try:
     from docx import Document as DocxDocument
+
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
@@ -34,6 +36,7 @@ except ImportError:
 
 try:
     from bs4 import BeautifulSoup
+
     HTML_AVAILABLE = True
 except ImportError:
     HTML_AVAILABLE = False
@@ -41,6 +44,7 @@ except ImportError:
 
 try:
     from pptx import Presentation
+
     PPTX_AVAILABLE = True
 except ImportError:
     PPTX_AVAILABLE = False
@@ -48,6 +52,7 @@ except ImportError:
 
 try:
     from openpyxl import load_workbook
+
     XLSX_AVAILABLE = True
 except ImportError:
     XLSX_AVAILABLE = False
@@ -107,12 +112,44 @@ CHUNKING_PRESETS = {
 # Simple language detection based on common words
 LANGUAGE_INDICATORS = {
     "de": [
-        "und", "der", "die", "das", "ist", "sind", "werden", "muss", "soll",
-        "gemäß", "sowie", "durch", "für", "bei", "zur", "vom", "nach", "über",
+        "und",
+        "der",
+        "die",
+        "das",
+        "ist",
+        "sind",
+        "werden",
+        "muss",
+        "soll",
+        "gemäß",
+        "sowie",
+        "durch",
+        "für",
+        "bei",
+        "zur",
+        "vom",
+        "nach",
+        "über",
     ],
     "en": [
-        "the", "and", "is", "are", "must", "shall", "should", "will", "may",
-        "for", "with", "from", "this", "that", "which", "have", "has", "been",
+        "the",
+        "and",
+        "is",
+        "are",
+        "must",
+        "shall",
+        "should",
+        "will",
+        "may",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "which",
+        "have",
+        "has",
+        "been",
     ],
 }
 
@@ -176,6 +213,7 @@ def detect_document_type(text: str) -> DocumentCategory:
 # Text Extraction
 # =============================================================================
 
+
 class DocumentExtractor:
     """Extracts text content from various document formats."""
 
@@ -186,26 +224,60 @@ class DocumentExtractor:
     # Text-based formats that can be read directly as plain text
     TEXT_FORMATS = {
         # Plain text
-        ".txt", ".text",
+        ".txt",
+        ".text",
         # Data formats
-        ".csv", ".tsv",
-        ".json", ".jsonl", ".ndjson",
+        ".csv",
+        ".tsv",
+        ".json",
+        ".jsonl",
+        ".ndjson",
         ".xml",
-        ".yaml", ".yml",
+        ".yaml",
+        ".yml",
         ".toml",
-        ".ini", ".cfg", ".conf",
+        ".ini",
+        ".cfg",
+        ".conf",
         # Markup/documentation
-        ".md", ".markdown", ".rst", ".asciidoc", ".adoc",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".asciidoc",
+        ".adoc",
         # Code files (common ones)
-        ".py", ".js", ".ts", ".jsx", ".tsx",
-        ".java", ".kt", ".scala",
-        ".c", ".cpp", ".h", ".hpp",
-        ".cs", ".go", ".rs", ".rb",
-        ".php", ".swift", ".r",
-        ".sql", ".sh", ".bash", ".zsh", ".ps1",
-        ".css", ".scss", ".sass", ".less",
+        ".py",
+        ".js",
+        ".ts",
+        ".jsx",
+        ".tsx",
+        ".java",
+        ".kt",
+        ".scala",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".go",
+        ".rs",
+        ".rb",
+        ".php",
+        ".swift",
+        ".r",
+        ".sql",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".ps1",
+        ".css",
+        ".scss",
+        ".sass",
+        ".less",
         # Config files
-        ".env", ".properties", ".gradle",
+        ".env",
+        ".properties",
+        ".gradle",
         ".dockerfile",
         # Log files
         ".log",
@@ -357,8 +429,10 @@ class DocumentExtractor:
 
             # Check ratio of non-printable characters
             non_printable = sum(
-                1 for b in sample
-                if b < 32 and b not in (9, 10, 13)  # Allow tab, newline, carriage return
+                1
+                for b in sample
+                if b < 32
+                and b not in (9, 10, 13)  # Allow tab, newline, carriage return
             )
             if len(sample) > 0 and non_printable / len(sample) > 0.1:
                 raise ValueError(
@@ -502,6 +576,7 @@ class DocumentExtractor:
 # Document Chunker
 # =============================================================================
 
+
 class DocumentChunker:
     """
     Intelligent document chunking with support for legal document structure.
@@ -549,7 +624,9 @@ class DocumentChunker:
     def from_preset(cls, preset: str) -> "DocumentChunker":
         """Create a chunker from a preset configuration."""
         if preset not in CHUNKING_PRESETS:
-            raise ValueError(f"Unknown preset: {preset}. Available: {list(CHUNKING_PRESETS.keys())}")
+            raise ValueError(
+                f"Unknown preset: {preset}. Available: {list(CHUNKING_PRESETS.keys())}"
+            )
 
         config = CHUNKING_PRESETS[preset]
         return cls(**config)
@@ -582,7 +659,11 @@ class DocumentChunker:
         # Build DocumentChunk objects
         doc_chunks = []
         for i, chunk_info in enumerate(chunks):
-            chunk_id = f"{document_id}_chunk_{i:04d}" if document_id else f"chunk_{uuid.uuid4().hex[:8]}"
+            chunk_id = (
+                f"{document_id}_chunk_{i:04d}"
+                if document_id
+                else f"chunk_{uuid.uuid4().hex[:8]}"
+            )
 
             # Calculate overlap with previous
             overlap = 0
@@ -616,18 +697,22 @@ class DocumentChunker:
         # Find page markers
         page_pattern = re.compile(r"\[PAGE (\d+)\]")
         for match in page_pattern.finditer(text):
-            structure["pages"].append({
-                "page": int(match.group(1)),
-                "position": match.start(),
-            })
+            structure["pages"].append(
+                {
+                    "page": int(match.group(1)),
+                    "position": match.start(),
+                }
+            )
 
         # Find section headers using boundary patterns
         for pattern in self._compiled_patterns:
             for match in pattern.finditer(text):
-                structure["sections"].append({
-                    "header": match.group().strip(),
-                    "position": match.start(),
-                })
+                structure["sections"].append(
+                    {
+                        "header": match.group().strip(),
+                        "position": match.start(),
+                    }
+                )
 
         # Sort sections by position
         structure["sections"].sort(key=lambda x: x["position"])
@@ -650,13 +735,15 @@ class DocumentChunker:
         if not pages:
             # No page markers found - treat entire text as one chunk
             if text.strip():
-                chunks.append({
-                    "text": text.strip(),
-                    "start": 0,
-                    "end": len(text),
-                    "hierarchy": [],
-                    "page": 1,
-                })
+                chunks.append(
+                    {
+                        "text": text.strip(),
+                        "start": 0,
+                        "end": len(text),
+                        "hierarchy": [],
+                        "page": 1,
+                    }
+                )
             return chunks
 
         # Add end marker for easier iteration
@@ -671,17 +758,21 @@ class DocumentChunker:
             page_text = text[page_start:page_end]
 
             if page_text.strip():
-                chunks.append({
-                    "text": page_text.strip(),
-                    "start": page_start,
-                    "end": page_end,
-                    "hierarchy": [],
-                    "page": page_info["page"],
-                })
+                chunks.append(
+                    {
+                        "text": page_text.strip(),
+                        "start": page_start,
+                        "end": page_end,
+                        "hierarchy": [],
+                        "page": page_info["page"],
+                    }
+                )
 
         return chunks
 
-    def _chunk_with_boundaries(self, text: str, structure: Dict[str, Any]) -> List[Dict]:
+    def _chunk_with_boundaries(
+        self, text: str, structure: Dict[str, Any]
+    ) -> List[Dict]:
         """Chunk text respecting structural boundaries."""
         chunks = []
         sections = structure.get("sections", [])
@@ -700,18 +791,22 @@ class DocumentChunker:
 
             # Update hierarchy
             if self.preserve_hierarchy and section_header:
-                current_hierarchy = self._update_hierarchy(current_hierarchy, section_header)
+                current_hierarchy = self._update_hierarchy(
+                    current_hierarchy, section_header
+                )
 
             # If section is small enough, add as single chunk
             if self.max_chunk_size is None or len(section_text) <= self.max_chunk_size:
                 if section_text.strip():
-                    chunks.append({
-                        "text": section_text.strip(),
-                        "start": section_start,
-                        "end": section_end,
-                        "hierarchy": current_hierarchy.copy(),
-                        "page": self._find_page(section_start, pages),
-                    })
+                    chunks.append(
+                        {
+                            "text": section_text.strip(),
+                            "start": section_start,
+                            "end": section_end,
+                            "hierarchy": current_hierarchy.copy(),
+                            "page": self._find_page(section_start, pages),
+                        }
+                    )
             else:
                 # Split section into smaller chunks
                 sub_chunks = self._split_section(
@@ -721,7 +816,7 @@ class DocumentChunker:
 
         # Handle text before first section
         if sections and sections[0]["position"] > 0:
-            pre_text = text[:sections[0]["position"]]
+            pre_text = text[: sections[0]["position"]]
             if pre_text.strip():
                 pre_chunks = self._split_section(pre_text, 0, [], pages)
                 chunks = pre_chunks + chunks
@@ -749,13 +844,15 @@ class DocumentChunker:
             # If adding this sentence exceeds max, save current chunk
             if current_len + sentence_len > self.max_chunk_size and current_chunk:
                 chunk_text = " ".join(current_chunk)
-                chunks.append({
-                    "text": chunk_text.strip(),
-                    "start": chunk_start,
-                    "end": chunk_start + len(chunk_text),
-                    "hierarchy": hierarchy.copy(),
-                    "page": self._find_page(chunk_start, pages),
-                })
+                chunks.append(
+                    {
+                        "text": chunk_text.strip(),
+                        "start": chunk_start,
+                        "end": chunk_start + len(chunk_text),
+                        "hierarchy": hierarchy.copy(),
+                        "page": self._find_page(chunk_start, pages),
+                    }
+                )
 
                 # Start new chunk with overlap
                 overlap_sentences = []
@@ -777,13 +874,15 @@ class DocumentChunker:
         # Add final chunk
         if current_chunk:
             chunk_text = " ".join(current_chunk)
-            chunks.append({
-                "text": chunk_text.strip(),
-                "start": chunk_start,
-                "end": chunk_start + len(chunk_text),
-                "hierarchy": hierarchy.copy(),
-                "page": self._find_page(chunk_start, pages),
-            })
+            chunks.append(
+                {
+                    "text": chunk_text.strip(),
+                    "start": chunk_start,
+                    "end": chunk_start + len(chunk_text),
+                    "hierarchy": hierarchy.copy(),
+                    "page": self._find_page(chunk_start, pages),
+                }
+            )
 
         return chunks
 
@@ -807,13 +906,15 @@ class DocumentChunker:
 
             chunk_text = text[start:end].strip()
             if chunk_text:
-                chunks.append({
-                    "text": chunk_text,
-                    "start": start,
-                    "end": end,
-                    "hierarchy": [],
-                    "page": None,
-                })
+                chunks.append(
+                    {
+                        "text": chunk_text,
+                        "start": start,
+                        "end": end,
+                        "hierarchy": [],
+                        "page": None,
+                    }
+                )
 
             # Move to next chunk with overlap
             start = end - self.overlap_size
@@ -859,6 +960,7 @@ class DocumentChunker:
 # =============================================================================
 # Main Document Processor
 # =============================================================================
+
 
 class DocumentProcessor:
     """
@@ -924,11 +1026,17 @@ class DocumentProcessor:
         text_lower = text.lower()
 
         # German jurisdiction indicators
-        if any(ind in text_lower for ind in ["bundesrepublik deutschland", "bgb", "hgb", "gobd"]):
+        if any(
+            ind in text_lower
+            for ind in ["bundesrepublik deutschland", "bgb", "hgb", "gobd"]
+        ):
             return "DE"
 
         # EU indicators
-        if any(ind in text_lower for ind in ["european union", "eu regulation", "dsgvo", "gdpr"]):
+        if any(
+            ind in text_lower
+            for ind in ["european union", "eu regulation", "dsgvo", "gdpr"]
+        ):
             return "EU"
 
         # Default based on language
@@ -947,6 +1055,7 @@ class DocumentProcessor:
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
 
 def estimate_processing_time(file_path: str) -> float:
     """Estimate processing time in seconds based on file size."""

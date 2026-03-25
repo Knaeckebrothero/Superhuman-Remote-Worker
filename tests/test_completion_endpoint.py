@@ -103,9 +103,11 @@ class TestGetVerificationConfig:
         assert get_verification_config(job) == {}
 
     def test_string_resolved_config(self):
-        rc = json.dumps({
-            "agent": {"verification": {"enabled": True, "critic_config": "critic"}},
-        })
+        rc = json.dumps(
+            {
+                "agent": {"verification": {"enabled": True, "critic_config": "critic"}},
+            }
+        )
         job = {"id": "x", "resolved_config": rc}
         vc = get_verification_config(job)
         assert vc["enabled"] is True
@@ -253,7 +255,11 @@ class TestDetermineJobStatus:
         """Critic jobs with approved verdict get status from freeze_data."""
         job = make_job(
             parent_job_id="parent-1",
-            freeze_data={"status": "completed", "freeze_type": "verdict", "verdict": "approved"},
+            freeze_data={
+                "status": "completed",
+                "freeze_type": "verdict",
+                "verdict": "approved",
+            },
         )
         result = {"should_stop": True, "goal_achieved": True}
         status, err = determine_job_status(job, result)
@@ -264,7 +270,11 @@ class TestDetermineJobStatus:
         """Critic jobs with returned verdict get 'waiting' status from freeze_data."""
         job = make_job(
             parent_job_id="parent-1",
-            freeze_data={"status": "waiting", "freeze_type": "verdict", "verdict": "returned"},
+            freeze_data={
+                "status": "waiting",
+                "freeze_type": "verdict",
+                "verdict": "returned",
+            },
         )
         result = {"should_stop": True, "goal_achieved": False}
         status, err = determine_job_status(job, result)
@@ -423,9 +433,11 @@ class TestGetScholarConfig:
         assert sc["scholar_config"] == "custom_scholar"
 
     def test_string_resolved_config(self):
-        rc = json.dumps({
-            "agent": {"scholar": {"enabled": True, "scholar_config": "scholar"}},
-        })
+        rc = json.dumps(
+            {
+                "agent": {"scholar": {"enabled": True, "scholar_config": "scholar"}},
+            }
+        )
         job = {"id": "x", "resolved_config": rc}
         sc = get_scholar_config(job)
         assert sc["enabled"] is True

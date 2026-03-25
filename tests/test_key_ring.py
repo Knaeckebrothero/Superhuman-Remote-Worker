@@ -5,7 +5,13 @@ import time
 
 import pytest
 
-from src.llm.key_ring import KeyRing, clear_registry, get_or_create_key_ring, parse_key_string, _mask_key
+from src.llm.key_ring import (
+    KeyRing,
+    clear_registry,
+    get_or_create_key_ring,
+    parse_key_string,
+    _mask_key,
+)
 
 
 # =============================================================================
@@ -195,7 +201,7 @@ class TestCooldownExpiry:
 
         # Exhaust all 5 uni keys
         for i in range(5):
-            ring.rotate(f"quota exhausted on uni key {i+1}")
+            ring.rotate(f"quota exhausted on uni key {i + 1}")
 
         # Now on personal key
         assert ring.current_key == "sk-personal"

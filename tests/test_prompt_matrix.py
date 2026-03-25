@@ -71,9 +71,14 @@ class TestDetectModelFamily:
         assert detect_model_family("meta-llama-3.1-8b") == "llama"
 
     def test_openrouter_prefix_stripped(self):
-        assert detect_model_family("openrouter/anthropic/claude-opus-4") == "claude-opus"
+        assert (
+            detect_model_family("openrouter/anthropic/claude-opus-4") == "claude-opus"
+        )
         assert detect_model_family("openrouter/deepseek/deepseek-r1") == "deepseek"
-        assert detect_model_family("openrouter/meta-llama/llama-3.3-70b-instruct") == "llama"
+        assert (
+            detect_model_family("openrouter/meta-llama/llama-3.3-70b-instruct")
+            == "llama"
+        )
 
     def test_groq_prefix_stripped(self):
         assert detect_model_family("groq/llama-3.3-70b") == "llama"
@@ -130,7 +135,10 @@ class TestDetectReasoningMethod:
 
     def test_explicit_override(self):
         assert detect_reasoning_method("gpt-oss-120b", explicit_method="none") == "none"
-        assert detect_reasoning_method("claude-opus-4-6", explicit_method="prompt") == "prompt"
+        assert (
+            detect_reasoning_method("claude-opus-4-6", explicit_method="prompt")
+            == "prompt"
+        )
         assert detect_reasoning_method("gpt-4o", explicit_method="api") == "api"
 
 
@@ -159,19 +167,25 @@ class TestPromptMatrixResolver:
         # Create base matrix
         base_matrix = tmp_path / "config" / "prompt_matrix.yaml"
         base_matrix.parent.mkdir(parents=True)
-        base_matrix.write_text(textwrap.dedent("""\
+        base_matrix.write_text(
+            textwrap.dedent("""\
             default:
               systemprompt: custom_systemprompt.txt
               strategic: custom_strategic.txt
-        """))
+        """)
+        )
 
-        with patch.object(PromptMatrixResolver, "__init__", lambda self, *a, **kw: None):
+        with patch.object(
+            PromptMatrixResolver, "__init__", lambda self, *a, **kw: None
+        ):
             resolver = PromptMatrixResolver.__new__(PromptMatrixResolver)
             resolver.deployment_dir = None
             resolver.model_family = "default"
             resolver._prompt_resolver = PromptResolver(None)
             resolver._expert_matrix = {}
-            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(base_matrix)
+            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(
+                base_matrix
+            )
 
         assert resolver.resolve_filename("systemprompt") == "custom_systemprompt.txt"
         assert resolver.resolve_filename("strategic") == "custom_strategic.txt"
@@ -182,26 +196,36 @@ class TestPromptMatrixResolver:
         """Expert matrix entries override base matrix entries."""
         # Create base matrix
         base_matrix_path = tmp_path / "base_matrix.yaml"
-        base_matrix_path.write_text(textwrap.dedent("""\
+        base_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               systemprompt: base_system.txt
               strategic: base_strategic.txt
-        """))
+        """)
+        )
 
         # Create expert matrix
         expert_matrix_path = tmp_path / "expert_matrix.yaml"
-        expert_matrix_path.write_text(textwrap.dedent("""\
+        expert_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               strategic: expert_strategic.txt
-        """))
+        """)
+        )
 
-        with patch.object(PromptMatrixResolver, "__init__", lambda self, *a, **kw: None):
+        with patch.object(
+            PromptMatrixResolver, "__init__", lambda self, *a, **kw: None
+        ):
             resolver = PromptMatrixResolver.__new__(PromptMatrixResolver)
             resolver.deployment_dir = tmp_path
             resolver.model_family = "default"
             resolver._prompt_resolver = PromptResolver(str(tmp_path))
-            resolver._expert_matrix = PromptMatrixResolver._load_matrix_from_path(expert_matrix_path)
-            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(base_matrix_path)
+            resolver._expert_matrix = PromptMatrixResolver._load_matrix_from_path(
+                expert_matrix_path
+            )
+            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(
+                base_matrix_path
+            )
 
         # Expert overrides strategic
         assert resolver.resolve_filename("strategic") == "expert_strategic.txt"
@@ -211,31 +235,40 @@ class TestPromptMatrixResolver:
     def test_model_specific_entry(self, tmp_path):
         """Model-specific entries take priority over default entries."""
         base_matrix_path = tmp_path / "base_matrix.yaml"
-        base_matrix_path.write_text(textwrap.dedent("""\
+        base_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               systemprompt: systemprompt.txt
               strategic: strategic.txt
             claude-opus:
               systemprompt: systemprompt_claude_opus.txt
-        """))
+        """)
+        )
 
-        with patch.object(PromptMatrixResolver, "__init__", lambda self, *a, **kw: None):
+        with patch.object(
+            PromptMatrixResolver, "__init__", lambda self, *a, **kw: None
+        ):
             resolver = PromptMatrixResolver.__new__(PromptMatrixResolver)
             resolver.deployment_dir = None
             resolver.model_family = "claude-opus"
             resolver._prompt_resolver = PromptResolver(None)
             resolver._expert_matrix = {}
-            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(base_matrix_path)
+            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(
+                base_matrix_path
+            )
 
         # Model-specific entry wins for systemprompt
-        assert resolver.resolve_filename("systemprompt") == "systemprompt_claude_opus.txt"
+        assert (
+            resolver.resolve_filename("systemprompt") == "systemprompt_claude_opus.txt"
+        )
         # Falls back to default for strategic (no model-specific entry)
         assert resolver.resolve_filename("strategic") == "strategic.txt"
 
     def test_full_chain_4_levels(self, tmp_path):
         """Exercise the full 4-level fallback chain."""
         base_matrix_path = tmp_path / "base_matrix.yaml"
-        base_matrix_path.write_text(textwrap.dedent("""\
+        base_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               systemprompt: base_default_system.txt
               strategic: base_default_strategic.txt
@@ -243,23 +276,32 @@ class TestPromptMatrixResolver:
               summarization: base_default_summarization.txt
             claude-opus:
               tactical: base_claude_tactical.txt
-        """))
+        """)
+        )
 
         expert_matrix_path = tmp_path / "expert_matrix.yaml"
-        expert_matrix_path.write_text(textwrap.dedent("""\
+        expert_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               strategic: expert_default_strategic.txt
             claude-opus:
               systemprompt: expert_claude_system.txt
-        """))
+        """)
+        )
 
-        with patch.object(PromptMatrixResolver, "__init__", lambda self, *a, **kw: None):
+        with patch.object(
+            PromptMatrixResolver, "__init__", lambda self, *a, **kw: None
+        ):
             resolver = PromptMatrixResolver.__new__(PromptMatrixResolver)
             resolver.deployment_dir = tmp_path
             resolver.model_family = "claude-opus"
             resolver._prompt_resolver = PromptResolver(str(tmp_path))
-            resolver._expert_matrix = PromptMatrixResolver._load_matrix_from_path(expert_matrix_path)
-            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(base_matrix_path)
+            resolver._expert_matrix = PromptMatrixResolver._load_matrix_from_path(
+                expert_matrix_path
+            )
+            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(
+                base_matrix_path
+            )
 
         # Level 1: Expert model-specific
         assert resolver.resolve_filename("systemprompt") == "expert_claude_system.txt"
@@ -268,7 +310,10 @@ class TestPromptMatrixResolver:
         # Level 3: Base model-specific
         assert resolver.resolve_filename("tactical") == "base_claude_tactical.txt"
         # Level 4: Base default
-        assert resolver.resolve_filename("summarization") == "base_default_summarization.txt"
+        assert (
+            resolver.resolve_filename("summarization")
+            == "base_default_summarization.txt"
+        )
 
     def test_load_matrix_invalid_yaml(self, tmp_path):
         """Invalid YAML in matrix file returns empty dict gracefully."""
@@ -303,20 +348,26 @@ class TestPromptMatrixResolver:
     def test_default_model_family_skips_model_levels(self, tmp_path):
         """When model_family is 'default', levels 1 and 3 are skipped."""
         base_matrix_path = tmp_path / "base_matrix.yaml"
-        base_matrix_path.write_text(textwrap.dedent("""\
+        base_matrix_path.write_text(
+            textwrap.dedent("""\
             default:
               systemprompt: default_system.txt
             claude-opus:
               systemprompt: claude_system.txt
-        """))
+        """)
+        )
 
-        with patch.object(PromptMatrixResolver, "__init__", lambda self, *a, **kw: None):
+        with patch.object(
+            PromptMatrixResolver, "__init__", lambda self, *a, **kw: None
+        ):
             resolver = PromptMatrixResolver.__new__(PromptMatrixResolver)
             resolver.deployment_dir = None
             resolver.model_family = "default"
             resolver._prompt_resolver = PromptResolver(None)
             resolver._expert_matrix = {}
-            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(base_matrix_path)
+            resolver._base_matrix = PromptMatrixResolver._load_matrix_from_path(
+                base_matrix_path
+            )
 
         # Should use default, not claude-opus
         assert resolver.resolve_filename("systemprompt") == "default_system.txt"
@@ -335,7 +386,9 @@ class TestDefaultResolution:
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
-            (config_prompts / "systemprompt.txt").write_text("base template {prompt_content}")
+            (config_prompts / "systemprompt.txt").write_text(
+                "base template {prompt_content}"
+            )
 
             resolver = PromptMatrixResolver(model_family="default")
             result = load_base_system_prompt(resolver)
@@ -346,7 +399,9 @@ class TestDefaultResolution:
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             config_prompts = tmp_path / "config" / "prompts"
             config_prompts.mkdir(parents=True)
-            (config_prompts / "strategic.txt").write_text("strategic phase {phase_number}")
+            (config_prompts / "strategic.txt").write_text(
+                "strategic phase {phase_number}"
+            )
 
             resolver = PromptMatrixResolver(model_family="default")
             result = load_phase_component(is_strategic=True, matrix_resolver=resolver)
@@ -416,10 +471,12 @@ class TestPromptMatrixResolverLoad:
         expert_dir = tmp_path / "expert"
         expert_dir.mkdir()
         (expert_dir / "strategic.txt").write_text("expert strategic content")
-        (expert_dir / "prompt_matrix.yaml").write_text(textwrap.dedent("""\
+        (expert_dir / "prompt_matrix.yaml").write_text(
+            textwrap.dedent("""\
             default:
               strategic: strategic.txt
-        """))
+        """)
+        )
 
         with patch("src.core.loader.get_project_root", return_value=tmp_path):
             # Also create base files
@@ -492,7 +549,9 @@ class TestPhaseConfigContextTokens:
         config = LLMConfig(
             model="gpt-4o",
             model_max_context_tokens=128000,
-            tactical=PhaseLLMOverride(model="gpt-4o-mini", model_max_context_tokens=32000),
+            tactical=PhaseLLMOverride(
+                model="gpt-4o-mini", model_max_context_tokens=32000
+            ),
         )
         phase = config.get_phase_config("tactical")
         assert phase.model_max_context_tokens == 32000
@@ -548,7 +607,9 @@ class TestLLMReuseEquality:
 
     def test_same_model_same_settings_are_equal(self):
         """Identical configs should be equal (enabling reuse)."""
-        config = LLMConfig(model="gpt-4o", temperature=0.3, model_max_context_tokens=128000)
+        config = LLMConfig(
+            model="gpt-4o", temperature=0.3, model_max_context_tokens=128000
+        )
         strategic = config.get_phase_config("strategic")
         tactical = config.get_phase_config("tactical")
         assert strategic == tactical

@@ -12,8 +12,7 @@ import pytest
 
 # Skip entire module if tmux is not available
 pytestmark = pytest.mark.skipif(
-    shutil.which("tmux") is None,
-    reason="tmux not installed"
+    shutil.which("tmux") is None, reason="tmux not installed"
 )
 
 from src.tools.coding.shell_manager import ShellManager, TAB_NAME_PATTERN  # noqa: E402
@@ -235,7 +234,9 @@ class TestRunSync:
     def test_rejects_non_shell_tab(self, manager):
         """run_sync raises ValueError on non-shell tabs (repl, ssh, etc.)."""
         manager.open_tab("my-repl", command="echo running", tab_type="repl")
-        with pytest.raises(ValueError, match="Synchronous execution only works on shell-type tabs"):
+        with pytest.raises(
+            ValueError, match="Synchronous execution only works on shell-type tabs"
+        ):
             manager.run_sync("echo test", tab_name="my-repl")
 
     def test_rejects_nonexistent_tab(self, manager):
@@ -359,7 +360,10 @@ class TestInteractiveDetection:
         )
         assert "--- terminal state ---" in output
         assert "[y/N]" in output
-        assert "interactive prompt" in output.lower() or "waiting for input" in output.lower()
+        assert (
+            "interactive prompt" in output.lower()
+            or "waiting for input" in output.lower()
+        )
 
     def test_password_prompt_detected(self, manager):
         """Commands that produce a password prompt should return early."""
@@ -377,7 +381,10 @@ class TestInteractiveDetection:
         output = manager.run_sync("read answer", timeout=15)
         elapsed = time.monotonic() - start
         assert "--- terminal state ---" in output
-        assert "waiting for input" in output.lower() or "no output change" in output.lower()
+        assert (
+            "waiting for input" in output.lower()
+            or "no output change" in output.lower()
+        )
         # Should detect stall within ~7s (1s grace + 5s threshold + margin)
         assert elapsed < 10
 
@@ -469,6 +476,7 @@ class TestBlockedCommandSend:
     def test_all_default_blocked_commands_in_send(self, manager):
         """All default blocked commands are caught by send()."""
         from src.tools.coding.shell_manager import DEFAULT_BLOCKED_COMMANDS
+
         for cmd in DEFAULT_BLOCKED_COMMANDS:
             result = manager.send("default", f"{cmd} something", enter=True)
             assert "blocked" in result.lower(), f"{cmd} was not blocked by send()"
@@ -479,6 +487,7 @@ class TestApplyTailTerminalState:
 
     def test_terminal_state_preserved_when_short(self):
         from src.tools.coding.shell_tools import _apply_tail
+
         output = (
             "Command timed out after 120s: ssh admin@host\n"
             "--- terminal state ---\n"
@@ -489,11 +498,11 @@ class TestApplyTailTerminalState:
 
     def test_terminal_state_truncated_when_long(self):
         from src.tools.coding.shell_tools import _apply_tail
+
         body_lines = [f"line {i}" for i in range(50)]
         output = (
             "Command timed out after 120s: ssh admin@host\n"
-            "--- terminal state ---\n"
-            + "\n".join(body_lines)
+            "--- terminal state ---\n" + "\n".join(body_lines)
         )
         result = _apply_tail(output, tail=10)
         assert "--- terminal state ---" in result
@@ -503,12 +512,9 @@ class TestApplyTailTerminalState:
 
     def test_stdout_format_still_works(self):
         from src.tools.coding.shell_tools import _apply_tail
+
         body_lines = [f"line {i}" for i in range(50)]
-        output = (
-            "Exit code: 0\n"
-            "--- stdout ---\n"
-            + "\n".join(body_lines)
-        )
+        output = "Exit code: 0\n--- stdout ---\n" + "\n".join(body_lines)
         result = _apply_tail(output, tail=10)
         assert "Exit code: 0" in result
         assert "--- stdout ---" in result

@@ -36,6 +36,7 @@ def _load_config(name: str):
 # curate_and_store_knowledge helper
 # =========================================================================
 
+
 class TestCurateAndStoreKnowledge:
     """Tests for the curate_and_store_knowledge helper function."""
 
@@ -96,8 +97,13 @@ class TestCurateAndStoreKnowledge:
         mock_llm = MagicMock()
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
 
-        with patch.object(aux, "agent", new_callable=AsyncMock, return_value=curation_result):
-            with patch("src.tools.knowledge.knowledge_tools.create_kb_tools", return_value=[MagicMock()]):
+        with patch.object(
+            aux, "agent", new_callable=AsyncMock, return_value=curation_result
+        ):
+            with patch(
+                "src.tools.knowledge.knowledge_tools.create_kb_tools",
+                return_value=[MagicMock()],
+            ):
                 result = await curate_and_store_knowledge(
                     auxiliary_llm=aux,
                     tool_context=ctx,
@@ -123,8 +129,13 @@ class TestCurateAndStoreKnowledge:
         mock_llm = MagicMock()
         aux = AuxiliaryLLM(llm=mock_llm, timeout=30.0)
 
-        with patch.object(aux, "agent", new_callable=AsyncMock, side_effect=RuntimeError("LLM down")):
-            with patch("src.tools.knowledge.knowledge_tools.create_kb_tools", return_value=[MagicMock()]):
+        with patch.object(
+            aux, "agent", new_callable=AsyncMock, side_effect=RuntimeError("LLM down")
+        ):
+            with patch(
+                "src.tools.knowledge.knowledge_tools.create_kb_tools",
+                return_value=[MagicMock()],
+            ):
                 result = await curate_and_store_knowledge(
                     auxiliary_llm=aux,
                     tool_context=ctx,
@@ -140,6 +151,7 @@ class TestCurateAndStoreKnowledge:
 # =========================================================================
 # CurateKnowledgeTask
 # =========================================================================
+
 
 class TestCurateKnowledgeTask:
     """Tests for the CurateKnowledgeTask class."""
@@ -198,6 +210,7 @@ class TestCurateKnowledgeTask:
 # Curation config
 # =========================================================================
 
+
 class TestCurationConfig:
     """Tests for curation config in defaults.yaml and curator expert config."""
 
@@ -219,6 +232,7 @@ class TestCurationConfig:
 # Inline curation wiring in archive_phase
 # =========================================================================
 
+
 class TestInlineCurationWiring:
     """Tests that inline curation is wired into archive_phase."""
 
@@ -230,6 +244,7 @@ class TestInlineCurationWiring:
     @pytest.fixture
     def workspace_manager(self, temp_workspace):
         from src.core.workspace import WorkspaceManager
+
         ws = WorkspaceManager(job_id="test-job-123", base_path=temp_workspace)
         ws.initialize()
         return ws
@@ -378,7 +393,9 @@ class TestInlineCurationWiring:
             "messages": [],
         }
 
-        with patch("src.services.auxiliary.curate_and_store_knowledge", new_callable=AsyncMock) as mock_curate:
+        with patch(
+            "src.services.auxiliary.curate_and_store_knowledge", new_callable=AsyncMock
+        ) as mock_curate:
             await archive_fn(state)
             # Allow async task to run
             await asyncio.sleep(0.1)
@@ -394,6 +411,7 @@ class TestInlineCurationWiring:
 # =========================================================================
 # Agent no longer has curation_callback
 # =========================================================================
+
 
 class TestAgentNoCurationCallback:
     """Tests that the agent no longer has the curation_callback attribute."""

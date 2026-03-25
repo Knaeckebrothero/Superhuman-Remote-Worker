@@ -36,7 +36,9 @@ class OIDCValidator:
     def jwks_client(self) -> jwt.PyJWKClient:
         if self._jwks_client is None:
             # Fetch JWKS via internal URL (backchannel, fast)
-            jwks_uri = f"{self.keycloak_url}/realms/{self.realm}/protocol/openid-connect/certs"
+            jwks_uri = (
+                f"{self.keycloak_url}/realms/{self.realm}/protocol/openid-connect/certs"
+            )
             self._jwks_client = jwt.PyJWKClient(jwks_uri, cache_keys=True)
         return self._jwks_client
 

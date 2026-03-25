@@ -16,6 +16,7 @@ _citation_engine_available = False
 
 try:
     from citation_engine import CitationEngine, Citation, Source
+
     _citation_engine_available = True
 except ImportError:
     CitationEngine = None
@@ -48,7 +49,9 @@ def get_citation_engine_config() -> Dict[str, Any]:
         llm_url = os.getenv("LLM_BASE_URL")
 
     return {
-        "db_url": os.getenv("CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))),
+        "db_url": os.getenv(
+            "CITATION_DB_URL", os.getenv("VECTOR_DB_URL", os.getenv("DATABASE_URL"))
+        ),
         "llm_url": llm_url,
         "llm_model": llm_model,
         "reasoning_required": os.getenv("CITATION_REASONING_REQUIRED", "low"),
@@ -56,7 +59,7 @@ def get_citation_engine_config() -> Dict[str, Any]:
 
 
 async def create_citation_engine(
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Create and initialize a Citation Engine instance.
 
@@ -134,7 +137,7 @@ class CitationHelper:
         page: Optional[int] = None,
         section: Optional[str] = None,
         article: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Create a citation from a document source.
 
@@ -183,7 +186,7 @@ class CitationHelper:
         quote: str,
         claim: str,
         accessed_at: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Create a citation from a web source.
 
@@ -228,7 +231,7 @@ class CitationHelper:
         result_summary: str,
         claim: str,
         database: str = "neo4j",
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Create a citation from a database query.
 
@@ -319,9 +322,7 @@ class CitationHelper:
             return None
 
     async def list_citations(
-        self,
-        job_id: Optional[str] = None,
-        limit: int = 100
+        self, job_id: Optional[str] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """List citations, optionally filtered by job.
 
@@ -367,12 +368,13 @@ def create_citation_tools(helper: CitationHelper) -> List[Dict[str, Any]]:
     Returns:
         List of tool definitions
     """
+
     async def cite_document(
         document_path: str,
         quote: str,
         claim: str,
         page: int = None,
-        section: str = None
+        section: str = None,
     ) -> str:
         """Create a citation from a document source."""
         citation_id = await helper.cite_document(

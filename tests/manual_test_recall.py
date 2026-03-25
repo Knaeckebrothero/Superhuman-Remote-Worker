@@ -25,8 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FAKE_MEMORIES = [
     {
         "content": "The config system uses YAML files with $extends inheritance. "
-                   "Child configs deep-merge with parent (defaults.yaml). "
-                   "Arrays replace entirely, dicts merge recursively, null clears a key.",
+        "Child configs deep-merge with parent (defaults.yaml). "
+        "Arrays replace entirely, dicts merge recursively, null clears a key.",
         "summary": "Config uses YAML inheritance with deep merge",
         "keywords": ["config", "yaml", "extends", "inheritance", "deep_merge"],
         "importance": 0.9,
@@ -36,8 +36,8 @@ FAKE_MEMORIES = [
     },
     {
         "content": "PostgreSQL uses asyncpg with connection pooling. "
-                   "Pool size is configured via POSTGRES_MIN_CONNECTIONS and POSTGRES_MAX_CONNECTIONS. "
-                   "pgvector extension is registered on each connection via init callback.",
+        "Pool size is configured via POSTGRES_MIN_CONNECTIONS and POSTGRES_MAX_CONNECTIONS. "
+        "pgvector extension is registered on each connection via init callback.",
         "summary": "PostgreSQL uses asyncpg with pgvector",
         "keywords": ["postgres", "asyncpg", "pool", "pgvector", "connection"],
         "importance": 0.8,
@@ -47,8 +47,8 @@ FAKE_MEMORIES = [
     },
     {
         "content": "When writing Neo4j Cypher queries, always use MERGE with ON CREATE SET "
-                   "instead of separate MATCH + CREATE. This is ~40% faster for this schema "
-                   "and avoids duplicate node creation.",
+        "instead of separate MATCH + CREATE. This is ~40% faster for this schema "
+        "and avoids duplicate node creation.",
         "summary": "Use MERGE instead of MATCH+CREATE in Cypher",
         "keywords": ["neo4j", "cypher", "merge", "performance", "query"],
         "importance": 0.85,
@@ -58,8 +58,8 @@ FAKE_MEMORIES = [
     },
     {
         "content": "Attempted to use ts_rank with 'simple' dictionary for German text. "
-                   "Failed: German compound words not tokenized properly. "
-                   "Solution: Use 'german' dictionary or split compounds before indexing.",
+        "Failed: German compound words not tokenized properly. "
+        "Solution: Use 'german' dictionary or split compounds before indexing.",
         "summary": "German FTS needs 'german' dictionary, not 'simple'",
         "keywords": ["fts", "tsvector", "german", "tokenization", "dictionary"],
         "importance": 0.75,
@@ -69,8 +69,8 @@ FAKE_MEMORIES = [
     },
     {
         "content": "The workspace.md file is injected as a transient fake tool result "
-                   "before every LLM call. It survives context compaction because it's "
-                   "never stored in state — it's re-injected fresh each time.",
+        "before every LLM call. It survives context compaction because it's "
+        "never stored in state — it's re-injected fresh each time.",
         "summary": "workspace.md is transient injection, survives compaction",
         "keywords": ["workspace", "injection", "transient", "compaction", "context"],
         "importance": 0.8,
@@ -80,8 +80,8 @@ FAKE_MEMORIES = [
     },
     {
         "content": "The agent uses a phase alternation model: strategic phases for planning "
-                   "and tactical phases for execution. Phase transitions happen when all "
-                   "todos in the current phase are completed.",
+        "and tactical phases for execution. Phase transitions happen when all "
+        "todos in the current phase are completed.",
         "summary": "Strategic/tactical phase alternation model",
         "keywords": ["phase", "strategic", "tactical", "alternation", "transition"],
         "importance": 0.9,
@@ -91,9 +91,9 @@ FAKE_MEMORIES = [
     },
     {
         "content": "GoBD stands for 'Grundsätze zur ordnungsmäßigen Führung und "
-                   "Aufbewahrung von Büchern, Aufzeichnungen und Unterlagen in "
-                   "elektronischer Form sowie zum Datenzugriff'. It's a German regulation "
-                   "for electronic bookkeeping.",
+        "Aufbewahrung von Büchern, Aufzeichnungen und Unterlagen in "
+        "elektronischer Form sowie zum Datenzugriff'. It's a German regulation "
+        "for electronic bookkeeping.",
         "summary": "GoBD = German electronic bookkeeping regulation",
         "keywords": ["gobd", "german", "regulation", "bookkeeping", "compliance"],
         "importance": 0.7,
@@ -103,11 +103,17 @@ FAKE_MEMORIES = [
     },
     {
         "content": "Citations in this system link claims to source evidence. "
-                   "Each citation has a source_id (FK to sources table), a locator "
-                   "(JSONB with page/section), and verification_status. "
-                   "CitationEngine handles the full lifecycle.",
+        "Each citation has a source_id (FK to sources table), a locator "
+        "(JSONB with page/section), and verification_status. "
+        "CitationEngine handles the full lifecycle.",
         "summary": "Citations link claims to sources via CitationEngine",
-        "keywords": ["citation", "source", "locator", "verification", "citation_engine"],
+        "keywords": [
+            "citation",
+            "source",
+            "locator",
+            "verification",
+            "citation_engine",
+        ],
         "importance": 0.75,
         "memory_type": "relational",
         "source": "phase_archive",
@@ -115,10 +121,16 @@ FAKE_MEMORIES = [
     },
     {
         "content": "The todo_guide.md instruction file uses passive enforcement: "
-                   "the next_phase_todos tool rejects calls until the agent reads "
-                   "the guide file. This is controlled by enforce: true in the config.",
+        "the next_phase_todos tool rejects calls until the agent reads "
+        "the guide file. This is controlled by enforce: true in the config.",
         "summary": "todo_guide uses passive enforcement (tool rejection)",
-        "keywords": ["instruction_files", "enforce", "todo_guide", "passive", "tool_rejection"],
+        "keywords": [
+            "instruction_files",
+            "enforce",
+            "todo_guide",
+            "passive",
+            "tool_rejection",
+        ],
         "importance": 0.65,
         "memory_type": "procedural",
         "source": "observer",
@@ -126,9 +138,9 @@ FAKE_MEMORIES = [
     },
     {
         "content": "The KeyRing in src/llm/key_ring.py provides API key rotation. "
-                   "Comma-separated keys in env vars are rotated on auth/quota failures. "
-                   "Thread-safe with masked key logging. Cooldown prevents hammering "
-                   "a failing key.",
+        "Comma-separated keys in env vars are rotated on auth/quota failures. "
+        "Thread-safe with masked key logging. Cooldown prevents hammering "
+        "a failing key.",
         "summary": "KeyRing rotates API keys on failure with cooldown",
         "keywords": ["keyring", "api_key", "rotation", "cooldown", "failover"],
         "importance": 0.7,
@@ -182,9 +194,14 @@ async def main():
     # Ensure schema exists
     try:
         from pathlib import Path
+
         schema_path = (
             Path(__file__).parent.parent
-            / "src" / "database" / "queries" / "postgres" / "schema.sql"
+            / "src"
+            / "database"
+            / "queries"
+            / "postgres"
+            / "schema.sql"
         )
         async with db.acquire() as conn:
             await conn.execute(schema_path.read_text())
@@ -217,21 +234,25 @@ async def main():
     print(f"\nInserting {len(FAKE_MEMORIES)} test memories...")
     for i, mem in enumerate(FAKE_MEMORIES):
         mem_id = await store.store(**mem)
-        print(f"  [{i+1}] {mem['summary']} -> {mem_id}")
+        print(f"  [{i + 1}] {mem['summary']} -> {mem_id}")
 
     # Get stats
     stats = await store.get_stats()
     print(f"\nStats: {stats['total']} memories, {stats['total_tokens']} tokens")
-    print(f"  By type: factual={stats.get('factual', 0)}, "
-          f"procedural={stats.get('procedural', 0)}, "
-          f"error_solution={stats.get('error_solution', 0)}, "
-          f"vocabulary={stats.get('vocabulary', 0)}, "
-          f"relational={stats.get('relational', 0)}")
-    print(f"  By source: observer={stats.get('from_observer', 0)}, "
-          f"todo={stats.get('from_todo', 0)}, "
-          f"compaction={stats.get('from_compaction', 0)}, "
-          f"phase_archive={stats.get('from_phase_archive', 0)}, "
-          f"tool_error={stats.get('from_tool_error', 0)}")
+    print(
+        f"  By type: factual={stats.get('factual', 0)}, "
+        f"procedural={stats.get('procedural', 0)}, "
+        f"error_solution={stats.get('error_solution', 0)}, "
+        f"vocabulary={stats.get('vocabulary', 0)}, "
+        f"relational={stats.get('relational', 0)}"
+    )
+    print(
+        f"  By source: observer={stats.get('from_observer', 0)}, "
+        f"todo={stats.get('from_todo', 0)}, "
+        f"compaction={stats.get('from_compaction', 0)}, "
+        f"phase_archive={stats.get('from_phase_archive', 0)}, "
+        f"tool_error={stats.get('from_tool_error', 0)}"
+    )
 
     # Run test queries
     print(f"\n{'=' * 70}")
@@ -249,10 +270,12 @@ async def main():
         print(f"    Retrieved {len(memories)} memories:")
 
         for j, mem in enumerate(memories, 1):
-            print(f"    [{j}] (imp={mem.importance:.1f}, "
-                  f"type={mem.memory_type}, "
-                  f"tokens={mem.token_count}) "
-                  f"{mem.summary or mem.content[:80]}")
+            print(
+                f"    [{j}] (imp={mem.importance:.1f}, "
+                f"type={mem.memory_type}, "
+                f"tokens={mem.token_count}) "
+                f"{mem.summary or mem.content[:80]}"
+            )
 
         # Check if expected topics are covered
         all_content = " ".join(m.content.lower() for m in memories)

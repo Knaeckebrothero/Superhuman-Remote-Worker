@@ -18,9 +18,11 @@ from src.services.recall_store import MemoryRecord, RecallStore
 # Fixtures
 # =============================================================================
 
+
 @dataclass
 class MockMemoryConfig:
     """Minimal config matching MemoryConfig fields."""
+
     enabled: bool = True
     budget_tokens: int = 5000
     max_memories_per_injection: int = 10
@@ -73,6 +75,7 @@ def store(mock_db, mock_embedding_service, job_id, config):
 # MemoryRecord Tests
 # =============================================================================
 
+
 class TestMemoryRecord:
     """Test MemoryRecord dataclass."""
 
@@ -117,6 +120,7 @@ class TestMemoryRecord:
 # =============================================================================
 # Storage Tests
 # =============================================================================
+
 
 class TestStore:
     """Test RecallStore.store()."""
@@ -216,6 +220,7 @@ class TestStore:
 # Retrieval Tests
 # =============================================================================
 
+
 class TestRetrieval:
     """Test RecallStore retrieval methods."""
 
@@ -283,7 +288,9 @@ class TestRetrieval:
         assert len(results) == 1
 
     @pytest.mark.asyncio
-    async def test_retrieve_respects_budget(self, store, mock_db, mock_embedding_service):
+    async def test_retrieve_respects_budget(
+        self, store, mock_db, mock_embedding_service
+    ):
         """retrieve() stops adding memories when budget is exhausted."""
         # Return 3 candidates with 2000 tokens each
         mock_db.fetch.return_value = [
@@ -311,6 +318,7 @@ class TestRetrieval:
 # =============================================================================
 # Assembly Tests
 # =============================================================================
+
 
 class TestAssembly:
     """Test memory block assembly."""
@@ -360,7 +368,10 @@ class TestAssembly:
 
         block = RecallStore.assemble_memory_block(memories)
         assert "--- Retrieved Memories (relevance-ranked) ---" in block
-        assert "--- End Memories (2 items: 0 pinned + 2 retrieved, ~150 tokens) ---" in block
+        assert (
+            "--- End Memories (2 items: 0 pinned + 2 retrieved, ~150 tokens) ---"
+            in block
+        )
         assert "[1]" in block
         assert "[2]" in block
         assert "Memory one" in block
@@ -385,8 +396,15 @@ class TestAssembly:
     def test_assemble_memory_block_mixed(self):
         """assemble_memory_block() separates pinned from retrieved."""
         memories = [
-            MemoryRecord(content="Pinned one", importance=0.9, token_count=50, remaining_turns=5),
-            MemoryRecord(content="Retrieved one", importance=0.7, token_count=50, remaining_turns=0),
+            MemoryRecord(
+                content="Pinned one", importance=0.9, token_count=50, remaining_turns=5
+            ),
+            MemoryRecord(
+                content="Retrieved one",
+                importance=0.7,
+                token_count=50,
+                remaining_turns=0,
+            ),
             MemoryRecord(content="Retrieved two", importance=0.5, token_count=50),
         ]
 
@@ -417,6 +435,7 @@ class TestAssembly:
 # =============================================================================
 # Stats Tests
 # =============================================================================
+
 
 class TestStats:
     """Test get_stats()."""
@@ -479,7 +498,11 @@ class TestIntegration:
         async with db.acquire() as conn:
             schema_path = (
                 __import__("pathlib").Path(__file__).parent.parent
-                / "src" / "database" / "queries" / "postgres" / "schema.sql"
+                / "src"
+                / "database"
+                / "queries"
+                / "postgres"
+                / "schema.sql"
             )
             await conn.execute(schema_path.read_text())
 

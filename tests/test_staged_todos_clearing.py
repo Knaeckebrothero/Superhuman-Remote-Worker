@@ -59,6 +59,7 @@ class TestJobCompleteClears:
     def _get_job_complete(self, context: ToolContext):
         """Create and return the job_complete tool function."""
         from src.tools.core.job import create_job_tools
+
         tools = create_job_tools(context)
         return next(t for t in tools if t.name == "job_complete")
 
@@ -72,11 +73,13 @@ class TestJobCompleteClears:
         ctx = make_context(todo_mgr)
         job_complete = self._get_job_complete(ctx)
 
-        result = await job_complete.ainvoke({
-            "summary": "Job is done.",
-            "deliverables": ["output/result.md"],
-            "confidence": 0.9,
-        })
+        result = await job_complete.ainvoke(
+            {
+                "summary": "Job is done.",
+                "deliverables": ["output/result.md"],
+                "confidence": 0.9,
+            }
+        )
 
         # Should NOT contain the old rejection error
         assert "ERROR" not in result
@@ -94,11 +97,13 @@ class TestJobCompleteClears:
         ctx = make_context(todo_mgr)
         job_complete = self._get_job_complete(ctx)
 
-        result = await job_complete.ainvoke({
-            "summary": "Job is done.",
-            "deliverables": ["output/result.md"],
-            "confidence": 0.9,
-        })
+        result = await job_complete.ainvoke(
+            {
+                "summary": "Job is done.",
+                "deliverables": ["output/result.md"],
+                "confidence": 0.9,
+            }
+        )
 
         assert "ERROR" not in result
         assert not todo_mgr.has_staged_todos()
@@ -115,6 +120,7 @@ class TestTodoRewindClears:
     def _get_todo_rewind(self, context: ToolContext):
         """Create and return the todo_rewind tool function."""
         from src.tools.core.todo import create_todo_tools
+
         tools = create_todo_tools(context)
         return next(t for t in tools if t.name == "todo_rewind")
 
@@ -136,7 +142,9 @@ class TestTodoRewindClears:
         ctx = make_context(todo_mgr)
         todo_rewind = self._get_todo_rewind(ctx)
 
-        result = todo_rewind.invoke({"issue": "Current approach is fundamentally broken"})
+        result = todo_rewind.invoke(
+            {"issue": "Current approach is fundamentally broken"}
+        )
 
         # Staged todos should be cleared
         assert not todo_mgr.has_staged_todos()

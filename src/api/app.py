@@ -48,7 +48,9 @@ _current_job_task: Optional[asyncio.Task] = None
 # Used by both pause and cancel — _stop_reason discriminates the action.
 _stop_requested: asyncio.Event = asyncio.Event()  # Signals streaming loop to break
 _stop_reason: Optional[str] = None  # "pause" or "cancel"
-_stop_completed: asyncio.Event = asyncio.Event()  # Signals waiting endpoint that stop finished
+_stop_completed: asyncio.Event = (
+    asyncio.Event()
+)  # Signals waiting endpoint that stop finished
 
 
 def _request_stop(reason: str) -> None:
@@ -185,8 +187,7 @@ def _get_agent_metrics() -> Optional[Dict[str, Any]]:
 
         process = psutil.Process()
         listening = [
-            c for c in psutil.net_connections(kind="inet")
-            if c.status == "LISTEN"
+            c for c in psutil.net_connections(kind="inet") if c.status == "LISTEN"
         ]
         return {
             "memory_mb": process.memory_info().rss / (1024 * 1024),
@@ -223,8 +224,8 @@ def _collect_system_info() -> Dict[str, Any]:
     # Disk
     disk = psutil.disk_usage("/")
     disk_info = {
-        "total_gb": round(disk.total / (1024 ** 3), 1),
-        "used_gb": round(disk.used / (1024 ** 3), 1),
+        "total_gb": round(disk.total / (1024**3), 1),
+        "used_gb": round(disk.used / (1024**3), 1),
         "percent": disk.percent,
     }
 
@@ -233,11 +234,13 @@ def _collect_system_info() -> Dict[str, Any]:
     try:
         for c in psutil.net_connections(kind="inet"):
             if c.status == "LISTEN":
-                listening_ports.append({
-                    "port": c.laddr.port,
-                    "address": c.laddr.ip,
-                    "pid": c.pid,
-                })
+                listening_ports.append(
+                    {
+                        "port": c.laddr.port,
+                        "address": c.laddr.ip,
+                        "pid": c.pid,
+                    }
+                )
     except (psutil.AccessDenied, PermissionError):
         pass
 
@@ -245,20 +248,26 @@ def _collect_system_info() -> Dict[str, Any]:
     processes = []
     try:
         for proc in sorted(
-            psutil.process_iter(["pid", "name", "cmdline", "memory_info", "cpu_percent"]),
+            psutil.process_iter(
+                ["pid", "name", "cmdline", "memory_info", "cpu_percent"]
+            ),
             key=lambda p: (p.info.get("memory_info") or type("", (), {"rss": 0})).rss,
             reverse=True,
         )[:20]:
             info = proc.info
             mem_info = info.get("memory_info")
             cmdline = info.get("cmdline") or []
-            processes.append({
-                "pid": info["pid"],
-                "name": info.get("name", ""),
-                "cmd": " ".join(cmdline[:5]) if cmdline else "",
-                "memory_mb": round(mem_info.rss / (1024 * 1024), 1) if mem_info else 0,
-                "cpu_percent": info.get("cpu_percent", 0),
-            })
+            processes.append(
+                {
+                    "pid": info["pid"],
+                    "name": info.get("name", ""),
+                    "cmd": " ".join(cmdline[:5]) if cmdline else "",
+                    "memory_mb": round(mem_info.rss / (1024 * 1024), 1)
+                    if mem_info
+                    else 0,
+                    "cpu_percent": info.get("cpu_percent", 0),
+                }
+            )
     except (psutil.AccessDenied, PermissionError):
         pass
 
@@ -267,11 +276,13 @@ def _collect_system_info() -> Dict[str, Any]:
     try:
         for c in psutil.net_connections(kind="inet"):
             if c.status == "ESTABLISHED" and len(network_connections) < 50:
-                network_connections.append({
-                    "local": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "",
-                    "remote": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else "",
-                    "pid": c.pid,
-                })
+                network_connections.append(
+                    {
+                        "local": f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "",
+                        "remote": f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else "",
+                        "pid": c.pid,
+                    }
+                )
     except (psutil.AccessDenied, PermissionError):
         pass
 
@@ -320,12 +331,14 @@ def _setup_job_file_logging(job_id: str) -> Path:
     level = getattr(logging, level_name, logging.INFO)
 
     # Create flushing file handler for crash safety
-    file_handler = _FlushingFileHandler(log_file, mode='a')
+    file_handler = _FlushingFileHandler(log_file, mode="a")
     file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
 
     # Add to root logger
     root_logger = logging.getLogger()
@@ -348,7 +361,6 @@ def _cleanup_job_file_handler(job_id: str) -> None:
             if f"job_{job_id}.log" in str(handler.baseFilename):
                 handler.close()
                 root.removeHandler(handler)
-
 
 
 # NOTE: Verification config, status determination, critic verdict handling,
@@ -437,11 +449,15 @@ async def _process_orchestrator_job(
                 if iteration is not None:
                     last_iteration = iteration
                 has_error = state.get("error") is not None
-                logger.info(f"[Iteration {last_iteration}] job={job_id} error={has_error}")
+                logger.info(
+                    f"[Iteration {last_iteration}] job={job_id} error={has_error}"
+                )
 
             # Cooperative stop check: exit after the current node completes
             if _stop_requested.is_set():
-                logger.info(f"Stop requested ({_stop_reason}) for job {job_id} — stopping after current node")
+                logger.info(
+                    f"Stop requested ({_stop_reason}) for job {job_id} — stopping after current node"
+                )
                 break
 
         # Handle cooperative stop (pause or cancel) vs normal completion.
@@ -463,7 +479,8 @@ async def _process_orchestrator_job(
         _current_job_id = None
         if _orchestrator_client and _orchestrator_client.agent_id:
             await _orchestrator_client.heartbeat(
-                status="ready", job_id=None,
+                status="ready",
+                job_id=None,
                 metrics=_get_agent_metrics(),
             )
 
@@ -484,9 +501,7 @@ async def _process_orchestrator_job(
         error_result = {"error": {"message": str(e)}}
         if _orchestrator_client:
             try:
-                await _orchestrator_client.report_completion(
-                    job_id, error_result
-                )
+                await _orchestrator_client.report_completion(job_id, error_result)
             except Exception:
                 logger.error(f"Failed to report error for job {job_id}")
     finally:
@@ -563,10 +578,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         status = _agent.get_status()
 
         # Ready if initialized and has required connections
-        ready = (
-            status["initialized"]
-            and status["connections"]["postgres"]
-        )
+        ready = status["initialized"] and status["connections"]["postgres"]
 
         return ReadyResponse(
             ready=ready,
@@ -664,19 +676,29 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 name = tab_meta.get("name", "unknown")
                 try:
                     read_result = shell_manager.read_with_offset(name, lines=30)
-                    recent_output = read_result.get("output", "") if isinstance(read_result, dict) else str(read_result)
-                    total_lines = read_result.get("total_lines", 0) if isinstance(read_result, dict) else 0
+                    recent_output = (
+                        read_result.get("output", "")
+                        if isinstance(read_result, dict)
+                        else str(read_result)
+                    )
+                    total_lines = (
+                        read_result.get("total_lines", 0)
+                        if isinstance(read_result, dict)
+                        else 0
+                    )
                 except Exception:
                     recent_output = ""
                     total_lines = 0
 
-                tabs.append({
-                    "name": name,
-                    "type": tab_meta.get("type", "unknown"),
-                    "created_at": tab_meta.get("created_at", ""),
-                    "total_lines": total_lines,
-                    "recent_output": recent_output,
-                })
+                tabs.append(
+                    {
+                        "name": name,
+                        "type": tab_meta.get("type", "unknown"),
+                        "created_at": tab_meta.get("created_at", ""),
+                        "total_lines": total_lines,
+                        "recent_output": recent_output,
+                    }
+                )
 
             return {"tabs": tabs}
         except Exception as e:
@@ -758,7 +780,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         tags=["Orchestrator"],
         responses={
             404: {"model": ErrorResponse, "description": "No job running"},
-            408: {"model": ErrorResponse, "description": "Cancel timed out (hard-killed)"},
+            408: {
+                "model": ErrorResponse,
+                "description": "Cancel timed out (hard-killed)",
+            },
         },
     )
     async def cancel_current_job(
@@ -855,7 +880,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         except asyncio.TimeoutError:
             # The flag persists, so the job will still pause after the current node
             # finishes — but we can't wait any longer
-            logger.warning(f"Pause timed out for job {job_id} — flag still set, will pause after current node")
+            logger.warning(
+                f"Pause timed out for job {job_id} — flag still set, will pause after current node"
+            )
             raise HTTPException(
                 status_code=408,
                 detail=f"Pause timed out after 120s. Job {job_id} will pause after current node completes.",
@@ -945,11 +972,15 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                         iteration = state.get("iteration")
                         if iteration is not None:
                             last_iteration = iteration
-                        logger.info(f"[Resume iteration {last_iteration}] job={request.job_id}")
+                        logger.info(
+                            f"[Resume iteration {last_iteration}] job={request.job_id}"
+                        )
 
                     # Cooperative stop check
                     if _stop_requested.is_set():
-                        logger.info(f"Stop requested ({_stop_reason}) for resumed job {request.job_id}")
+                        logger.info(
+                            f"Stop requested ({_stop_reason}) for resumed job {request.job_id}"
+                        )
                         break
 
                 # Handle cooperative stop vs normal completion.
@@ -958,20 +989,25 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 if _stop_requested.is_set():
                     reason = _stop_reason
                     _clear_stop()
-                    logger.info(f"Resumed job {request.job_id} stopped gracefully (reason={reason})")
+                    logger.info(
+                        f"Resumed job {request.job_id} stopped gracefully (reason={reason})"
+                    )
                     _current_job_id = None
                     _stop_completed.set()
                     _cleanup_job_file_handler(request.job_id)
                     return
 
                 result = final_state or {}
-                logger.info(f"Resumed job {request.job_id} completed: {result.get('should_stop')}")
+                logger.info(
+                    f"Resumed job {request.job_id} completed: {result.get('should_stop')}"
+                )
 
                 # Mark agent as available BEFORE reporting completion
                 _current_job_id = None
                 if _orchestrator_client and _orchestrator_client.agent_id:
                     await _orchestrator_client.heartbeat(
-                        status="ready", job_id=None,
+                        status="ready",
+                        job_id=None,
                         metrics=_get_agent_metrics(),
                     )
 
@@ -982,7 +1018,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                             request.job_id, result
                         )
                     except Exception as e:
-                        logger.error(f"Failed to report completion for resumed job {request.job_id}: {e}")
+                        logger.error(
+                            f"Failed to report completion for resumed job {request.job_id}: {e}"
+                        )
 
             except asyncio.CancelledError:
                 logger.info(f"Resumed job {request.job_id} was cancelled")
@@ -996,7 +1034,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                             request.job_id, error_result
                         )
                     except Exception:
-                        logger.error(f"Failed to report error for resumed job {request.job_id}")
+                        logger.error(
+                            f"Failed to report error for resumed job {request.job_id}"
+                        )
             finally:
                 # Only clear if this job still owns the slot — a new job may
                 # have been dispatched while post-completion handlers were running.

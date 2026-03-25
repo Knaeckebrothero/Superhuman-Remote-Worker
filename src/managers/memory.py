@@ -168,7 +168,11 @@ class MemoryManager:
             return f"{header}{new_content}\n\n"
 
         new_memory, count = re.subn(
-            pattern, replace_section, content, count=1, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE
+            pattern,
+            replace_section,
+            content,
+            count=1,
+            flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
         )
 
         if count > 0:

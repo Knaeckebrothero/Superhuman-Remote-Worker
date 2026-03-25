@@ -55,9 +55,17 @@ class ImapPoller:
         self._port = int(os.getenv("IMAP_PORT", "993"))
         self._user = os.getenv("IMAP_USER", "")
         self._password = os.getenv("IMAP_PASSWORD", "")
-        self._use_ssl = os.getenv("IMAP_USE_SSL", "true").lower() in ("true", "1", "yes")
-        self._trust_self_signed = os.getenv("IMAP_TRUST_SELF_SIGNED", "false").lower() in (
-            "true", "1", "yes",
+        self._use_ssl = os.getenv("IMAP_USE_SSL", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        self._trust_self_signed = os.getenv(
+            "IMAP_TRUST_SELF_SIGNED", "false"
+        ).lower() in (
+            "true",
+            "1",
+            "yes",
         )
         self._poll_interval = int(os.getenv("IMAP_POLL_INTERVAL", "30"))
         self._agent_email = os.getenv("AGENT_EMAIL", "")
@@ -102,7 +110,9 @@ class ImapPoller:
         self._available = True
         logger.info(
             "IMAP poller configured: %s:%d (poll every %ds)",
-            self._host, self._port, self._poll_interval,
+            self._host,
+            self._port,
+            self._poll_interval,
         )
 
     async def poll_once(self) -> int:
@@ -151,14 +161,19 @@ class ImapPoller:
         skipped = len(mark_unseen)
         logger.debug(
             "Poll: %d checked, %d routed, %d duplicate, %d skipped",
-            len(raw_emails), processed, duplicates, skipped,
+            len(raw_emails),
+            processed,
+            duplicates,
+            skipped,
         )
 
         # Update flags in a thread (blocking I/O)
         if mark_seen or mark_unseen:
             try:
                 await asyncio.to_thread(
-                    self._update_flags, mark_seen, mark_unseen,
+                    self._update_flags,
+                    mark_seen,
+                    mark_unseen,
                 )
             except Exception as e:
                 logger.warning(f"Failed to update IMAP flags: {e}")
@@ -327,7 +342,11 @@ class ImapPoller:
 
         # Route via the reply handler
         strategy = await self._reply_handler(
-            job_id, thread_id, cleaned_body, sender, email_msg_id,
+            job_id,
+            thread_id,
+            cleaned_body,
+            sender,
+            email_msg_id,
         )
         logger.info(
             f"IMAP reply routed: job={job_id[:8]}, thread={thread_id}, "
@@ -448,17 +467,23 @@ class ImapPoller:
         # Remove blockquote content (quoted original message)
         text = re.sub(
             r"<blockquote[^>]*>.*?</blockquote>",
-            "", text := html, flags=re.DOTALL | re.IGNORECASE,
+            "",
+            text := html,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         # Remove protonmail_quote div (Proton Mail quoted text)
         text = re.sub(
             r'<div[^>]*class="protonmail_quote"[^>]*>.*?</div>\s*$',
-            "", text, flags=re.DOTALL | re.IGNORECASE,
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         # Remove signature blocks
         text = re.sub(
             r'<div[^>]*class="[^"]*signature[^"]*"[^>]*>.*?</div>',
-            "", text, flags=re.DOTALL | re.IGNORECASE,
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         # Replace <br> and </div><div> with newlines
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)

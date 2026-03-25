@@ -101,7 +101,9 @@ class JobStatusResponse(BaseModel):
     updated_at: Optional[datetime] = Field(None, description="Last update timestamp")
     iteration: int = Field(default=0, description="Current iteration count")
     error: Optional[Dict[str, Any]] = Field(None, description="Error details if failed")
-    result: Optional[Dict[str, Any]] = Field(None, description="Result data if complete")
+    result: Optional[Dict[str, Any]] = Field(
+        None, description="Result data if complete"
+    )
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -242,7 +244,9 @@ class JobStartRequest(BaseModel):
     """Request from orchestrator to start a job."""
 
     job_id: str = Field(..., description="Job UUID assigned by orchestrator")
-    description: str = Field(..., description="Job description - what the agent should accomplish")
+    description: str = Field(
+        ..., description="Job description - what the agent should accomplish"
+    )
     upload_id: Optional[str] = Field(
         default=None,
         description="Upload ID for document files (from /api/uploads)",
@@ -358,5 +362,5 @@ class JobResumeRequest(BaseModel):
     previous_status: Optional[str] = Field(
         default=None,
         description="Job status before resume. Graceful stops (cancelled, paused, pending_review) "
-                    "skip snapshot recovery; crashes (processing, failed) use snapshot recovery.",
+        "skip snapshot recovery; crashes (processing, failed) use snapshot recovery.",
     )

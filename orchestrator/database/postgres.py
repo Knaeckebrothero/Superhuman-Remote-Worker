@@ -34,13 +34,48 @@ QUERIES_DIR = Path(__file__).parent / "queries" / "postgres"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 
 # Tables exposed to the cockpit
-ALLOWED_TABLES = frozenset({"jobs", "agents", "requirements", "datasources", "users", "projects", "project_members", "project_repositories"})
+ALLOWED_TABLES = frozenset(
+    {
+        "jobs",
+        "agents",
+        "requirements",
+        "datasources",
+        "users",
+        "projects",
+        "project_members",
+        "project_repositories",
+    }
+)
 
 # Required tables that must exist for the orchestrator to function
-REQUIRED_TABLES = ["users", "sessions", "projects", "project_members", "project_repositories", "jobs", "agents", "requirements", "datasources", "builder_sessions", "builder_messages", "user_api_keys", "project_api_keys"]
+REQUIRED_TABLES = [
+    "users",
+    "sessions",
+    "projects",
+    "project_members",
+    "project_repositories",
+    "jobs",
+    "agents",
+    "requirements",
+    "datasources",
+    "builder_sessions",
+    "builder_messages",
+    "user_api_keys",
+    "project_api_keys",
+]
 
 # Tables in the vector DB (verified separately when VECTOR_DB_URL is set)
-VECTOR_REQUIRED_TABLES = ["memories", "knowledge_index", "sources", "citations", "job_sources", "source_annotations", "source_tags", "source_embeddings", "schema_migrations"]
+VECTOR_REQUIRED_TABLES = [
+    "memories",
+    "knowledge_index",
+    "sources",
+    "citations",
+    "job_sources",
+    "source_annotations",
+    "source_tags",
+    "source_embeddings",
+    "schema_migrations",
+]
 
 # Column type mapping from PostgreSQL types to frontend-friendly types
 PG_TYPE_MAP = {
@@ -132,8 +167,12 @@ class PostgresDB:
             "postgresql://srw:srw_password@localhost:5432/srw",
         )
 
-        self._min_connections = min_connections or int(os.getenv("POSTGRES_MIN_CONNECTIONS", "2"))
-        self._max_connections = max_connections or int(os.getenv("POSTGRES_MAX_CONNECTIONS", "10"))
+        self._min_connections = min_connections or int(
+            os.getenv("POSTGRES_MIN_CONNECTIONS", "2")
+        )
+        self._max_connections = max_connections or int(
+            os.getenv("POSTGRES_MAX_CONNECTIONS", "10")
+        )
         self._command_timeout = command_timeout or 60.0
 
         self._pool: Optional[asyncpg.Pool] = None
@@ -149,10 +188,12 @@ class PostgresDB:
         This method is idempotent - safe to call multiple times.
         """
         if self._pool is None:
+
             async def _init_connection(conn):
                 """Register pgvector type codec on new connections."""
                 try:
                     from pgvector.asyncpg import register_vector
+
                     await register_vector(conn)
                 except (ImportError, ValueError):
                     pass  # pgvector not installed or extension not on this DB
@@ -926,7 +967,9 @@ class PostgresDB:
         except ValueError:
             return False
 
-        query = "UPDATE jobs SET context = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+        query = (
+            "UPDATE jobs SET context = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2"
+        )
         async with self.acquire() as conn:
             result = await conn.execute(query, json_module.dumps(context), uuid_val)
 
@@ -998,7 +1041,9 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def merge_snapshot_context(self, job_id: str, snapshot_updates: Dict[str, Any]) -> bool:
+    async def merge_snapshot_context(
+        self, job_id: str, snapshot_updates: Dict[str, Any]
+    ) -> bool:
         """Atomically merge updates into context.snapshot without touching other keys.
 
         Uses jsonb_set + || to merge into the nested 'snapshot' key in a single
@@ -1029,11 +1074,15 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(snapshot_updates), uuid_val)
+            result = await conn.execute(
+                query, json_module.dumps(snapshot_updates), uuid_val
+            )
 
         return result == "UPDATE 1"
 
-    async def merge_ide_session_context(self, job_id: str, session_updates: Dict[str, Any]) -> bool:
+    async def merge_ide_session_context(
+        self, job_id: str, session_updates: Dict[str, Any]
+    ) -> bool:
         """Atomically merge updates into context.ide_session without touching other keys.
 
         Uses jsonb_set + || to merge into the nested 'ide_session' key in a single
@@ -1064,7 +1113,9 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(session_updates), uuid_val)
+            result = await conn.execute(
+                query, json_module.dumps(session_updates), uuid_val
+            )
 
         return result == "UPDATE 1"
 
@@ -1155,7 +1206,14 @@ class PostgresDB:
         try:
             uuid_val = UUID(job_id)
         except ValueError:
-            return {"pending": 0, "validating": 0, "integrated": 0, "rejected": 0, "failed": 0, "total": 0}
+            return {
+                "pending": 0,
+                "validating": 0,
+                "integrated": 0,
+                "rejected": 0,
+                "failed": 0,
+                "total": 0,
+            }
 
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -1175,7 +1233,14 @@ class PostgresDB:
 
         if row:
             return dict(row)
-        return {"pending": 0, "validating": 0, "integrated": 0, "rejected": 0, "failed": 0, "total": 0}
+        return {
+            "pending": 0,
+            "validating": 0,
+            "integrated": 0,
+            "rejected": 0,
+            "failed": 0,
+            "total": 0,
+        }
 
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get detailed progress information for a job including ETA.
@@ -1249,7 +1314,9 @@ class PostgresDB:
             "eta_seconds": eta_seconds,
             "created_at": job["created_at"].isoformat() if job["created_at"] else None,
             "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
-            "completed_at": job["completed_at"].isoformat() if job["completed_at"] else None,
+            "completed_at": job["completed_at"].isoformat()
+            if job["completed_at"]
+            else None,
         }
 
     async def get_daily_statistics(self, days: int = 7) -> List[Dict[str, Any]]:
@@ -1302,7 +1369,9 @@ class PostgresDB:
 
         return dict(row) if row else {}
 
-    async def detect_stuck_jobs(self, threshold_minutes: int = 60) -> List[Dict[str, Any]]:
+    async def detect_stuck_jobs(
+        self, threshold_minutes: int = 60
+    ) -> List[Dict[str, Any]]:
         """Detect jobs that appear to be stuck.
 
         A job is considered stuck if it's in 'processing' status but hasn't
@@ -1337,11 +1406,18 @@ class PostgresDB:
         for row in rows:
             job = dict(row)
             # Determine stuck reason
-            if job["creator_status"] == "processing" and job["integrated_requirements"] == 0:
+            if (
+                job["creator_status"] == "processing"
+                and job["integrated_requirements"] == 0
+            ):
                 job["stuck_reason"] = "Creator not producing requirements"
                 job["stuck_component"] = "creator"
-            elif job["creator_status"] == "completed" and job["pending_requirements"] > 0:
-                job["stuck_reason"] = f"Validator not processing {job['pending_requirements']} pending requirements"
+            elif (
+                job["creator_status"] == "completed" and job["pending_requirements"] > 0
+            ):
+                job["stuck_reason"] = (
+                    f"Validator not processing {job['pending_requirements']} pending requirements"
+                )
                 job["stuck_component"] = "validator"
             else:
                 job["stuck_reason"] = "No recent activity"
@@ -1470,9 +1546,9 @@ class PostgresDB:
 
             # Set last_completed_at when transitioning from working → ready/completed
             # This enables the dispatch cooldown (30s before next job assignment)
-            set_completed = (
-                prev_status == "working"
-                and status in ("ready", "completed")
+            set_completed = prev_status == "working" and status in (
+                "ready",
+                "completed",
             )
 
             if metrics:
@@ -2135,9 +2211,7 @@ class PostgresDB:
     async def delete_expired_sessions(self) -> None:
         """Delete all expired sessions."""
         async with self.acquire() as conn:
-            result = await conn.execute(
-                "DELETE FROM sessions WHERE expires_at < NOW()"
-            )
+            result = await conn.execute("DELETE FROM sessions WHERE expires_at < NOW()")
             if result != "DELETE 0":
                 logger.debug(f"Cleaned up expired sessions: {result}")
 
@@ -2182,7 +2256,9 @@ class PostgresDB:
                 expires_at,
             )
 
-    async def get_auth_token(self, token: str, token_type: str) -> Dict[str, Any] | None:
+    async def get_auth_token(
+        self, token: str, token_type: str
+    ) -> Dict[str, Any] | None:
         """Get a valid (non-expired, unused) auth token."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -2364,7 +2440,12 @@ class PostgresDB:
                 RETURNING id, user_id, name, token_prefix, scope,
                           expires_at, revoked_at, last_used_at, created_at
                 """,
-                user_id, name, token_hash, token_prefix, scope, expires_at,
+                user_id,
+                name,
+                token_hash,
+                token_prefix,
+                scope,
+                expires_at,
             )
             return dict(row)
 
@@ -2409,7 +2490,8 @@ class PostgresDB:
                 UPDATE mcp_tokens SET revoked_at = CURRENT_TIMESTAMP
                 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
                 """,
-                token_id, user_id,
+                token_id,
+                user_id,
             )
             return result == "UPDATE 1"
 
@@ -2617,7 +2699,9 @@ class PostgresDB:
                 return {}
             return json.loads(val) if isinstance(val, str) else val
 
-    async def update_user_settings(self, user_id: str, settings: Dict[str, Any]) -> bool:
+    async def update_user_settings(
+        self, user_id: str, settings: Dict[str, Any]
+    ) -> bool:
         """Merge settings into user's settings JSONB (patch semantics).
 
         Keys set to null are removed from the settings object.
@@ -3138,7 +3222,9 @@ class PostgresDB:
                 goal,
                 is_default,
                 default_config_name,
-                json.dumps(default_config_override) if default_config_override else None,
+                json.dumps(default_config_override)
+                if default_config_override
+                else None,
             )
 
         return dict(row)
@@ -3228,8 +3314,12 @@ class PostgresDB:
             return False
 
         allowed_fields = {
-            "name", "description", "goal", "status",
-            "default_config_name", "default_config_override",
+            "name",
+            "description",
+            "goal",
+            "status",
+            "default_config_name",
+            "default_config_override",
         }
 
         updates = []
@@ -3327,9 +3417,7 @@ class PostgresDB:
 
         return result
 
-    async def get_project_members(
-        self, project_id: str
-    ) -> List[Dict[str, Any]]:
+    async def get_project_members(self, project_id: str) -> List[Dict[str, Any]]:
         """Get all members of a project with user info.
 
         Args:
@@ -3412,9 +3500,7 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def remove_project_member(
-        self, project_id: str, user_id: str
-    ) -> bool:
+    async def remove_project_member(self, project_id: str, user_id: str) -> bool:
         """Remove a member from a project.
 
         Args:
@@ -3544,9 +3630,7 @@ class PostgresDB:
 
         return [dict(row) for row in rows]
 
-    async def get_project_repository(
-        self, repo_id: str
-    ) -> Dict[str, Any] | None:
+    async def get_project_repository(self, repo_id: str) -> Dict[str, Any] | None:
         """Get a single project repository by ID.
 
         Args:
@@ -3615,9 +3699,7 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def remove_project_repository(
-        self, repo_id: str
-    ) -> Dict[str, Any] | None:
+    async def remove_project_repository(self, repo_id: str) -> Dict[str, Any] | None:
         """Remove a project repository. Returns the deleted row for cleanup.
 
         Args:
@@ -3697,9 +3779,7 @@ class PostgresDB:
 
         return dict(project_row)
 
-    async def get_user_default_project(
-        self, user_id: str
-    ) -> Dict[str, Any] | None:
+    async def get_user_default_project(self, user_id: str) -> Dict[str, Any] | None:
         """Get a user's default project.
 
         Args:
@@ -3812,7 +3892,9 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def update_builder_session_summary(self, session_id: str, summary: str) -> bool:
+    async def update_builder_session_summary(
+        self, session_id: str, summary: str
+    ) -> bool:
         """Update the auto-summary for a builder session.
 
         Args:
@@ -3931,12 +4013,12 @@ class PostgresDB:
         """
         # Extract database name from connection string
         # Format: postgresql://user:pass@host:port/dbname
-        db_name = self._connection_string.rsplit('/', 1)[-1].split('?')[0]
+        db_name = self._connection_string.rsplit("/", 1)[-1].split("?")[0]
         if not db_name:
             raise RuntimeError("Could not extract database name from connection string")
 
         # Connect to postgres database to create the target database
-        base_conn_str = self._connection_string.rsplit('/', 1)[0] + '/postgres'
+        base_conn_str = self._connection_string.rsplit("/", 1)[0] + "/postgres"
 
         conn = await asyncpg.connect(base_conn_str)
         try:
@@ -4133,7 +4215,8 @@ class PostgresDB:
                       AND email_message_id IS NOT NULL
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                job_uuid, thread_id,
+                job_uuid,
+                thread_id,
             )
 
     async def get_job_by_short_id(self, short_id: str) -> Dict[str, Any] | None:
@@ -4311,14 +4394,18 @@ class PostgresDB:
 
         messages = []
         for row in rows:
-            messages.append({
-                "id": str(row["id"]),
-                "direction": row["direction"],
-                "subject": row["subject"],
-                "message": row["message"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                "read_at": row["read_at"].isoformat() if row["read_at"] else None,
-            })
+            messages.append(
+                {
+                    "id": str(row["id"]),
+                    "direction": row["direction"],
+                    "subject": row["subject"],
+                    "message": row["message"],
+                    "created_at": row["created_at"].isoformat()
+                    if row["created_at"]
+                    else None,
+                    "read_at": row["read_at"].isoformat() if row["read_at"] else None,
+                }
+            )
 
         # Thread metadata from first outbound message
         first_outbound = next(
@@ -4339,17 +4426,26 @@ class PostgresDB:
             Dict with sudo, messages, reviews counts and most_urgent info.
         """
         async with self.acquire() as conn:
-            sudo_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM sudo_approval_requests WHERE status = 'pending'"
-            ) or 0
+            sudo_count = (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM sudo_approval_requests WHERE status = 'pending'"
+                )
+                or 0
+            )
 
-            message_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
-            ) or 0
+            message_count = (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jobs WHERE status = 'waiting_for_reply'"
+                )
+                or 0
+            )
 
-            review_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
-            ) or 0
+            review_count = (
+                await conn.fetchval(
+                    "SELECT COUNT(*) FROM jobs WHERE status = 'pending_review'"
+                )
+                or 0
+            )
 
             # Find most urgent sudo request (lowest TTL)
             most_urgent_sudo = await conn.fetchrow(
@@ -4475,7 +4571,9 @@ class PostgresDB:
         return result == "DELETE 1"
 
     async def resolve_external_contact(
-        self, project_id: str, name_or_email: str,
+        self,
+        project_id: str,
+        name_or_email: str,
     ) -> Dict[str, Any] | None:
         """Resolve an external contact by display name or email (case-insensitive).
 
@@ -4566,7 +4664,8 @@ class PostgresDB:
         return int(result.split()[-1]) if result else 0
 
     async def get_users_exiting_quiet_hours(
-        self, check_window_minutes: int = 5,
+        self,
+        check_window_minutes: int = 5,
     ) -> List[Dict[str, Any]]:
         """Find users whose quiet hours ended within the check window
         and who have pending notifications.
@@ -4656,6 +4755,7 @@ class PostgresDB:
         connection pools to persist between sync wrapper calls.
         """
         import asyncio
+
         if cls._sync_loop is None or cls._sync_loop.is_closed():
             cls._sync_loop = asyncio.new_event_loop()
         return cls._sync_loop
@@ -4674,6 +4774,7 @@ class PostgresDB:
             Result of the coroutine
         """
         import asyncio
+
         try:
             # Check if we're already in an async context
             loop = asyncio.get_running_loop()
@@ -4753,4 +4854,10 @@ class PostgresDB:
         return self._run_async(self.fetchval(query, *args))
 
 
-__all__ = ['PostgresDB', 'ALLOWED_TABLES', 'PG_TYPE_MAP', 'SCHEMA_FILE', 'REQUIRED_TABLES']
+__all__ = [
+    "PostgresDB",
+    "ALLOWED_TABLES",
+    "PG_TYPE_MAP",
+    "SCHEMA_FILE",
+    "REQUIRED_TABLES",
+]

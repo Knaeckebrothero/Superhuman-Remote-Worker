@@ -32,16 +32,12 @@ class TestProxyConfig:
         assert config.url is None
 
     def test_configured_socks5(self):
-        config = ProxyConfig(
-            type=ProxyType.SOCKS5, host="localhost", port=1080
-        )
+        config = ProxyConfig(type=ProxyType.SOCKS5, host="localhost", port=1080)
         assert config.is_configured is True
         assert config.url == "socks5://localhost:1080"
 
     def test_configured_http(self):
-        config = ProxyConfig(
-            type=ProxyType.HTTP, host="proxy.uni.edu", port=8080
-        )
+        config = ProxyConfig(type=ProxyType.HTTP, host="proxy.uni.edu", port=8080)
         assert config.url == "http://proxy.uni.edu:8080"
 
     def test_url_with_auth(self):
@@ -162,9 +158,7 @@ class TestProxyConfigToPlaywright:
         assert config.to_playwright_proxy() is None
 
     def test_returns_proxy_dict(self):
-        config = ProxyConfig(
-            type=ProxyType.SOCKS5, host="localhost", port=1080
-        )
+        config = ProxyConfig(type=ProxyType.SOCKS5, host="localhost", port=1080)
         result = config.to_playwright_proxy()
         assert result == {"server": "socks5://localhost:1080"}
 
@@ -189,10 +183,10 @@ class TestProxyConfigToBrowserUse:
         assert config.to_browser_use_proxy() is None
 
     def test_returns_none_when_browser_use_not_installed(self):
-        config = ProxyConfig(
-            type=ProxyType.SOCKS5, host="localhost", port=1080
-        )
-        with patch.dict("sys.modules", {"browser_use": None, "browser_use.browser.profile": None}):
+        config = ProxyConfig(type=ProxyType.SOCKS5, host="localhost", port=1080)
+        with patch.dict(
+            "sys.modules", {"browser_use": None, "browser_use.browser.profile": None}
+        ):
             # Force ImportError by patching the import
             with patch(
                 "builtins.__import__",
@@ -506,7 +500,9 @@ class TestResearchTopic:
     """Tests for research_topic tool."""
 
     @pytest.mark.asyncio
-    async def test_research_topic_combines_sources(self, mock_tool_context, sample_paper, sample_paper_s2):
+    async def test_research_topic_combines_sources(
+        self, mock_tool_context, sample_paper, sample_paper_s2
+    ):
         from src.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
@@ -518,14 +514,17 @@ class TestResearchTopic:
         sample_paper_s2.doi = "10.1/s2"
         sample_paper_s2.arxiv_id = "2222.22222"
 
-        with patch(
-            "src.tools.research.workflow._search_arxiv_raw",
-            new_callable=AsyncMock,
-            return_value=[sample_paper],
-        ), patch(
-            "src.tools.research.workflow._search_semantic_scholar_raw",
-            new_callable=AsyncMock,
-            return_value=[sample_paper_s2],
+        with (
+            patch(
+                "src.tools.research.workflow._search_arxiv_raw",
+                new_callable=AsyncMock,
+                return_value=[sample_paper],
+            ),
+            patch(
+                "src.tools.research.workflow._search_semantic_scholar_raw",
+                new_callable=AsyncMock,
+                return_value=[sample_paper_s2],
+            ),
         ):
             result = await research_topic.ainvoke(
                 {"topic": "transformers", "download_available": False}
@@ -536,20 +535,25 @@ class TestResearchTopic:
         assert "Unique papers after deduplication: 2" in result
 
     @pytest.mark.asyncio
-    async def test_research_topic_handles_search_failure(self, mock_tool_context, sample_paper):
+    async def test_research_topic_handles_search_failure(
+        self, mock_tool_context, sample_paper
+    ):
         from src.tools.research.workflow import create_workflow_tools
 
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
-        with patch(
-            "src.tools.research.workflow._search_arxiv_raw",
-            new_callable=AsyncMock,
-            return_value=[sample_paper],
-        ), patch(
-            "src.tools.research.workflow._search_semantic_scholar_raw",
-            new_callable=AsyncMock,
-            side_effect=Exception("API error"),
+        with (
+            patch(
+                "src.tools.research.workflow._search_arxiv_raw",
+                new_callable=AsyncMock,
+                return_value=[sample_paper],
+            ),
+            patch(
+                "src.tools.research.workflow._search_semantic_scholar_raw",
+                new_callable=AsyncMock,
+                side_effect=Exception("API error"),
+            ),
         ):
             result = await research_topic.ainvoke(
                 {"topic": "test", "download_available": False}
@@ -565,14 +569,17 @@ class TestResearchTopic:
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
-        with patch(
-            "src.tools.research.workflow._search_arxiv_raw",
-            new_callable=AsyncMock,
-            return_value=[],
-        ), patch(
-            "src.tools.research.workflow._search_semantic_scholar_raw",
-            new_callable=AsyncMock,
-            return_value=[],
+        with (
+            patch(
+                "src.tools.research.workflow._search_arxiv_raw",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "src.tools.research.workflow._search_semantic_scholar_raw",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
         ):
             result = await research_topic.ainvoke({"topic": "xyznonexistent"})
 
@@ -585,14 +592,17 @@ class TestResearchTopic:
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
-        with patch(
-            "src.tools.research.workflow._search_arxiv_raw",
-            new_callable=AsyncMock,
-            side_effect=Exception("arXiv down"),
-        ), patch(
-            "src.tools.research.workflow._search_semantic_scholar_raw",
-            new_callable=AsyncMock,
-            side_effect=Exception("S2 down"),
+        with (
+            patch(
+                "src.tools.research.workflow._search_arxiv_raw",
+                new_callable=AsyncMock,
+                side_effect=Exception("arXiv down"),
+            ),
+            patch(
+                "src.tools.research.workflow._search_semantic_scholar_raw",
+                new_callable=AsyncMock,
+                side_effect=Exception("S2 down"),
+            ),
         ):
             result = await research_topic.ainvoke({"topic": "test"})
 
@@ -605,18 +615,19 @@ class TestResearchTopic:
         tools = create_workflow_tools(mock_tool_context)
         research_topic = tools[0]
 
-        with patch(
-            "src.tools.research.workflow._search_arxiv_raw",
-            new_callable=AsyncMock,
-            return_value=[],
-        ), patch(
-            "src.tools.research.workflow._search_semantic_scholar_raw",
-            new_callable=AsyncMock,
-            return_value=[],
+        with (
+            patch(
+                "src.tools.research.workflow._search_arxiv_raw",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch(
+                "src.tools.research.workflow._search_semantic_scholar_raw",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
         ):
-            result = await research_topic.ainvoke(
-                {"topic": "test", "num_papers": 100}
-            )
+            result = await research_topic.ainvoke({"topic": "test", "num_papers": 100})
 
         # Should cap to 30 (max) - no error even with large value
         assert isinstance(result, str)

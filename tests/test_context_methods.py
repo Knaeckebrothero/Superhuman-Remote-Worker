@@ -50,7 +50,9 @@ class TestSanitizeMessageHistory:
     def test_no_orphans(self):
         """Messages with matching AIMessage tool_calls should be kept."""
         messages = [
-            AIMessage(content="", tool_calls=[{"name": "read_file", "id": "tc1", "args": {}}]),
+            AIMessage(
+                content="", tool_calls=[{"name": "read_file", "id": "tc1", "args": {}}]
+            ),
             ToolMessage(content="file content", tool_call_id="tc1"),
         ]
         result = sanitize_message_history(messages)
@@ -79,7 +81,9 @@ class TestSanitizeMessageHistory:
     def test_mixed_orphaned_and_valid(self):
         """Should only remove orphaned, keep valid."""
         messages = [
-            AIMessage(content="", tool_calls=[{"name": "read", "id": "valid", "args": {}}]),
+            AIMessage(
+                content="", tool_calls=[{"name": "read", "id": "valid", "args": {}}]
+            ),
             ToolMessage(content="ok", tool_call_id="valid"),
             ToolMessage(content="orphaned", tool_call_id="missing_parent"),
         ]
@@ -177,7 +181,12 @@ class TestClearOldToolResults:
     def test_clears_old_keeps_recent(self, mgr):
         """Should replace old tool results, keep recent ones."""
         messages = [
-            AIMessage(content="", tool_calls=[{"name": "r", "id": f"tc{i}", "args": {}} for i in range(4)]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "r", "id": f"tc{i}", "args": {}} for i in range(4)
+                ],
+            ),
             ToolMessage(content="old result 1", tool_call_id="tc0"),
             ToolMessage(content="old result 2", tool_call_id="tc1"),
             ToolMessage(content="recent 1", tool_call_id="tc2"),
@@ -195,7 +204,12 @@ class TestClearOldToolResults:
     def test_tracks_cleared_count(self, mgr):
         """Should update state tracking."""
         messages = [
-            AIMessage(content="", tool_calls=[{"name": "r", "id": f"tc{i}", "args": {}} for i in range(3)]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "r", "id": f"tc{i}", "args": {}} for i in range(3)
+                ],
+            ),
             ToolMessage(content="a", tool_call_id="tc0"),
             ToolMessage(content="b", tool_call_id="tc1"),
             ToolMessage(content="c", tool_call_id="tc2"),
@@ -225,11 +239,14 @@ class TestTruncateLongToolResults:
     def test_long_old_results_truncated(self, mgr):
         """Long old tool results should be truncated."""
         messages = [
-            AIMessage(content="", tool_calls=[
-                {"name": "r", "id": "tc1", "args": {}},
-                {"name": "r", "id": "tc2", "args": {}},
-                {"name": "r", "id": "tc3", "args": {}},
-            ]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "r", "id": "tc1", "args": {}},
+                    {"name": "r", "id": "tc2", "args": {}},
+                    {"name": "r", "id": "tc3", "args": {}},
+                ],
+            ),
             ToolMessage(content="x" * 500, tool_call_id="tc1"),  # Old, long
             ToolMessage(content="y" * 500, tool_call_id="tc2"),  # Recent (kept)
             ToolMessage(content="z" * 500, tool_call_id="tc3"),  # Recent (kept)
@@ -279,11 +296,14 @@ class TestPrepareMessagesForLlm:
     def test_aggressive_flag_clears_old(self, mgr):
         """aggressive=True should clear old tool results even below threshold."""
         messages = [
-            AIMessage(content="", tool_calls=[
-                {"name": "r", "id": "tc1", "args": {}},
-                {"name": "r", "id": "tc2", "args": {}},
-                {"name": "r", "id": "tc3", "args": {}},
-            ]),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "r", "id": "tc1", "args": {}},
+                    {"name": "r", "id": "tc2", "args": {}},
+                    {"name": "r", "id": "tc3", "args": {}},
+                ],
+            ),
             ToolMessage(content="old", tool_call_id="tc1"),
             ToolMessage(content="recent1", tool_call_id="tc2"),
             ToolMessage(content="recent2", tool_call_id="tc3"),
@@ -346,9 +366,6 @@ class TestTrimMessages:
 
     def test_tracks_trimmed_count(self, mgr):
         """Should update state tracking."""
-        messages = [
-            HumanMessage(content=f"msg {i}")
-            for i in range(10)
-        ]
+        messages = [HumanMessage(content=f"msg {i}") for i in range(10)]
         mgr.trim_messages(messages, keep_recent=3)
         assert mgr.state.total_messages_trimmed > 0

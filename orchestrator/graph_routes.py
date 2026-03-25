@@ -27,6 +27,7 @@ def get_mongodb() -> MongoDB | None:
     """Get the MongoDB instance."""
     return _mongodb
 
+
 router = APIRouter(prefix="/api/graph", tags=["graph"])
 
 # Snapshot configuration
@@ -61,7 +62,8 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
 
         # Filter to graph operations (execute_cypher_query)
         graph_calls = [
-            entry for entry in all_entries
+            entry
+            for entry in all_entries
             if entry.get("tool", {}).get("name") == "execute_cypher_query"
         ]
 
@@ -89,18 +91,22 @@ async def get_graph_changes(job_id: str) -> dict[str, Any]:
             query = entry.get("tool", {}).get("arguments", {}).get("query", "")
             parsed = parse_cypher_query(query)
 
-            deltas.append({
-                "timestamp": entry["timestamp"],
-                "toolCallIndex": i,
-                "cypherQuery": query,
-                "toolCallId": entry["_id"],
-                "stepNumber": entry.get("step_number"),
-                "changes": parsed,
-            })
+            deltas.append(
+                {
+                    "timestamp": entry["timestamp"],
+                    "toolCallIndex": i,
+                    "cypherQuery": query,
+                    "toolCallId": entry["_id"],
+                    "stepNumber": entry.get("step_number"),
+                    "changes": parsed,
+                }
+            )
 
         # Build snapshots using sqrt(N) interval
         n = len(deltas)
-        interval = max(MIN_SNAPSHOT_INTERVAL, min(MAX_SNAPSHOT_INTERVAL, int(math.sqrt(n))))
+        interval = max(
+            MIN_SNAPSHOT_INTERVAL, min(MAX_SNAPSHOT_INTERVAL, int(math.sqrt(n)))
+        )
         snapshots = _build_snapshots(deltas, interval=interval)
 
         # Compute summary
@@ -148,7 +154,11 @@ async def _get_all_tool_calls(job_id: str) -> list[dict[str, Any]]:
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
         if "timestamp" in doc:
-            doc["timestamp"] = doc["timestamp"].isoformat() if hasattr(doc["timestamp"], "isoformat") else doc["timestamp"]
+            doc["timestamp"] = (
+                doc["timestamp"].isoformat()
+                if hasattr(doc["timestamp"], "isoformat")
+                else doc["timestamp"]
+            )
         entries.append(doc)
 
     return entries
@@ -182,143 +192,165 @@ def parse_cypher_query(query: str) -> dict[str, list[Any]]:
     # Extract MATCH variable bindings: MATCH (var:Label {props})
     # This regex finds all node patterns anywhere in the query (not just after MATCH)
     for match in re.finditer(
-        r'\((\w+):(\w+)\s*(?:\{([^}]*)\})?\)',
+        r"\((\w+):(\w+)\s*(?:\{([^}]*)\})?\)",
         query,
         re.IGNORECASE,
     ):
         # Only add if it looks like a MATCH pattern (has properties that identify it)
         props = _parse_properties(match.group(3))
         if props:  # Only add if there are identifying properties
-            changes["matchedVariables"].append({
-                "variable": match.group(1),
-                "label": match.group(2),
-                "properties": props,
-            })
+            changes["matchedVariables"].append(
+                {
+                    "variable": match.group(1),
+                    "label": match.group(2),
+                    "properties": props,
+                }
+            )
 
     # CREATE node: CREATE (var:Label {props}) or CREATE (var:Label)
     for match in re.finditer(
-        r'CREATE\s+\((\w+):(\w+)\s*(?:\{([^}]*)\})?\)',
+        r"CREATE\s+\((\w+):(\w+)\s*(?:\{([^}]*)\})?\)",
         query,
         re.IGNORECASE,
     ):
-        changes["nodesCreated"].append({
-            "variable": match.group(1),
-            "label": match.group(2),
-            "properties": _parse_properties(match.group(3)),
-        })
+        changes["nodesCreated"].append(
+            {
+                "variable": match.group(1),
+                "label": match.group(2),
+                "properties": _parse_properties(match.group(3)),
+            }
+        )
 
     # MERGE node: MERGE (var:Label {props}) or MERGE (var:Label)
     for match in re.finditer(
-        r'MERGE\s+\((\w+):(\w+)\s*(?:\{([^}]*)\})?\)',
+        r"MERGE\s+\((\w+):(\w+)\s*(?:\{([^}]*)\})?\)",
         query,
         re.IGNORECASE,
     ):
-        changes["nodesCreated"].append({
-            "variable": match.group(1),
-            "label": match.group(2),
-            "properties": _parse_properties(match.group(3)),
-            "merge": True,
-        })
+        changes["nodesCreated"].append(
+            {
+                "variable": match.group(1),
+                "label": match.group(2),
+                "properties": _parse_properties(match.group(3)),
+                "merge": True,
+            }
+        )
 
     # DELETE: DELETE var or DETACH DELETE var
     for match in re.finditer(
-        r'(DETACH\s+)?DELETE\s+(\w+)',
+        r"(DETACH\s+)?DELETE\s+(\w+)",
         query,
         re.IGNORECASE,
     ):
-        changes["nodesDeleted"].append({
-            "variable": match.group(2),
-            "detach": bool(match.group(1)),
-        })
+        changes["nodesDeleted"].append(
+            {
+                "variable": match.group(2),
+                "detach": bool(match.group(1)),
+            }
+        )
 
     # CREATE relationship: CREATE (a)-[:TYPE {props}]->(b) or CREATE (a)-[var:TYPE]->(b)
     for match in re.finditer(
-        r'CREATE\s+\((\w+)\)-\[(?:\w+)?:(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)',
+        r"CREATE\s+\((\w+)\)-\[(?:\w+)?:(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)",
         query,
         re.IGNORECASE,
     ):
-        changes["relationshipsCreated"].append({
-            "sourceVar": match.group(1),
-            "type": match.group(2),
-            "properties": _parse_properties(match.group(3)),
-            "targetVar": match.group(4),
-        })
+        changes["relationshipsCreated"].append(
+            {
+                "sourceVar": match.group(1),
+                "type": match.group(2),
+                "properties": _parse_properties(match.group(3)),
+                "targetVar": match.group(4),
+            }
+        )
 
     # MERGE relationship: MERGE (a)-[:TYPE]->(b) or MERGE (a)-[var:TYPE]->(b)
     for match in re.finditer(
-        r'MERGE\s+\((\w+)\)-\[(?:\w+)?:(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)',
+        r"MERGE\s+\((\w+)\)-\[(?:\w+)?:(\w+)\s*(?:\{([^}]*)\})?\]->\((\w+)\)",
         query,
         re.IGNORECASE,
     ):
-        changes["relationshipsCreated"].append({
-            "sourceVar": match.group(1),
-            "type": match.group(2),
-            "properties": _parse_properties(match.group(3)),
-            "targetVar": match.group(4),
-            "merge": True,
-        })
+        changes["relationshipsCreated"].append(
+            {
+                "sourceVar": match.group(1),
+                "type": match.group(2),
+                "properties": _parse_properties(match.group(3)),
+                "targetVar": match.group(4),
+                "merge": True,
+            }
+        )
 
     # SET: SET var.prop = value
     for match in re.finditer(
-        r'SET\s+(\w+)\.(\w+)\s*=\s*([^\s,;]+)',
+        r"SET\s+(\w+)\.(\w+)\s*=\s*([^\s,;]+)",
         query,
         re.IGNORECASE,
     ):
-        changes["nodesModified"].append({
-            "variable": match.group(1),
-            "property": match.group(2),
-            "value": match.group(3).strip("'\""),
-        })
+        changes["nodesModified"].append(
+            {
+                "variable": match.group(1),
+                "property": match.group(2),
+                "value": match.group(3).strip("'\""),
+            }
+        )
 
     # SET with multiple properties: SET var = {props} or SET var += {props}
     for match in re.finditer(
-        r'SET\s+(\w+)\s*\+?=\s*\{([^}]+)\}',
+        r"SET\s+(\w+)\s*\+?=\s*\{([^}]+)\}",
         query,
         re.IGNORECASE,
     ):
         props = _parse_properties(match.group(2))
         for prop_name, prop_value in props.items():
-            changes["nodesModified"].append({
-                "variable": match.group(1),
-                "property": prop_name,
-                "value": prop_value,
-            })
+            changes["nodesModified"].append(
+                {
+                    "variable": match.group(1),
+                    "property": prop_name,
+                    "value": prop_value,
+                }
+            )
 
     # REMOVE property: REMOVE var.prop
     for match in re.finditer(
-        r'REMOVE\s+(\w+)\.(\w+)',
+        r"REMOVE\s+(\w+)\.(\w+)",
         query,
         re.IGNORECASE,
     ):
-        changes["nodesModified"].append({
-            "variable": match.group(1),
-            "property": match.group(2),
-            "removed": True,
-        })
+        changes["nodesModified"].append(
+            {
+                "variable": match.group(1),
+                "property": match.group(2),
+                "removed": True,
+            }
+        )
 
     # REMOVE label: REMOVE var:Label
     for match in re.finditer(
-        r'REMOVE\s+(\w+):(\w+)',
+        r"REMOVE\s+(\w+):(\w+)",
         query,
         re.IGNORECASE,
     ):
-        changes["nodesModified"].append({
-            "variable": match.group(1),
-            "labelRemoved": match.group(2),
-        })
+        changes["nodesModified"].append(
+            {
+                "variable": match.group(1),
+                "labelRemoved": match.group(2),
+            }
+        )
 
     # DELETE relationship in MATCH: MATCH ()-[r]->() DELETE r
     for match in re.finditer(
-        r'DELETE\s+(\w+)\s*(?:,|\s|$)(?!.*DETACH)',
+        r"DELETE\s+(\w+)\s*(?:,|\s|$)(?!.*DETACH)",
         query,
         re.IGNORECASE,
     ):
         # Check if this variable was defined as a relationship
         var = match.group(1)
-        if re.search(rf'\[{var}(?::\w+)?\]', query, re.IGNORECASE):
-            changes["relationshipsDeleted"].append({
-                "variable": var,
-            })
+        if re.search(rf"\[{var}(?::\w+)?\]", query, re.IGNORECASE):
+            changes["relationshipsDeleted"].append(
+                {
+                    "variable": var,
+                }
+            )
 
     return changes
 
@@ -350,13 +382,13 @@ def _parse_properties(props_str: str | None) -> dict[str, Any]:
             # Try to parse as number
             if value.isdigit():
                 props[key] = int(value)
-            elif re.match(r'^-?\d+\.?\d*$', value):
+            elif re.match(r"^-?\d+\.?\d*$", value):
                 props[key] = float(value)
-            elif value.lower() == 'true':
+            elif value.lower() == "true":
                 props[key] = True
-            elif value.lower() == 'false':
+            elif value.lower() == "false":
                 props[key] = False
-            elif value.lower() == 'null':
+            elif value.lower() == "null":
                 props[key] = None
             else:
                 props[key] = value
@@ -364,7 +396,9 @@ def _parse_properties(props_str: str | None) -> dict[str, Any]:
     return props
 
 
-def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[str, Any]]:
+def _build_snapshots(
+    deltas: list[dict[str, Any]], interval: int
+) -> list[dict[str, Any]]:
     """Build graph snapshots at regular intervals.
 
     Creates complete graph state snapshots at every `interval` operations,
@@ -429,7 +463,10 @@ def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[s
 
                 # Cascade: mark relationships referencing this node as invisible
                 for rel_id, rel_data in relationships.items():
-                    if rel_data["sourceId"] == node_id or rel_data["targetId"] == node_id:
+                    if (
+                        rel_data["sourceId"] == node_id
+                        or rel_data["targetId"] == node_id
+                    ):
                         rel_data["visible"] = False
                         rel_data["deletedAt"] = delta["toolCallIndex"]
 
@@ -475,21 +512,24 @@ def _build_snapshots(deltas: list[dict[str, Any]], interval: int) -> list[dict[s
 
         # Create snapshot at intervals or after large operations
         should_snapshot = (
-            i == 0 or  # First operation
-            (i + 1) % interval == 0 or  # Regular interval
-            i - (snapshots[-1]["toolCallIndex"] if snapshots else 0) >= MAX_DELTA_CHAIN or  # Chain limit
-            len(changes.get("nodesCreated", [])) > 50 or  # Large create
-            len(changes.get("nodesDeleted", [])) > 50  # Large delete
+            i == 0  # First operation
+            or (i + 1) % interval == 0  # Regular interval
+            or i - (snapshots[-1]["toolCallIndex"] if snapshots else 0)
+            >= MAX_DELTA_CHAIN  # Chain limit
+            or len(changes.get("nodesCreated", [])) > 50  # Large create
+            or len(changes.get("nodesDeleted", [])) > 50  # Large delete
         )
 
         if should_snapshot:
             # Deep copy current state for snapshot
-            snapshots.append({
-                "timestamp": delta["timestamp"],
-                "toolCallIndex": i,
-                "nodes": {k: dict(v) for k, v in nodes.items()},
-                "relationships": {k: dict(v) for k, v in relationships.items()},
-            })
+            snapshots.append(
+                {
+                    "timestamp": delta["timestamp"],
+                    "toolCallIndex": i,
+                    "nodes": {k: dict(v) for k, v in nodes.items()},
+                    "relationships": {k: dict(v) for k, v in relationships.items()},
+                }
+            )
 
     return snapshots
 
@@ -549,7 +589,18 @@ def _get_node_id(node: dict[str, Any]) -> str:
     props = node.get("properties", {})
 
     # Try common ID properties (domain-specific IDs first, then generic)
-    for id_prop in ["rid", "boid", "mid", "sid", "id", "uuid", "ID", "name", "title", "key"]:
+    for id_prop in [
+        "rid",
+        "boid",
+        "mid",
+        "sid",
+        "id",
+        "uuid",
+        "ID",
+        "name",
+        "title",
+        "key",
+    ]:
         if id_prop in props and props[id_prop]:
             return str(props[id_prop])
 
@@ -557,7 +608,9 @@ def _get_node_id(node: dict[str, Any]) -> str:
     return f"{node['label']}_{node['variable']}"
 
 
-def _compute_summary(deltas: list[dict[str, Any]], total_tool_calls: int) -> dict[str, int]:
+def _compute_summary(
+    deltas: list[dict[str, Any]], total_tool_calls: int
+) -> dict[str, int]:
     """Compute summary statistics from deltas.
 
     Args:

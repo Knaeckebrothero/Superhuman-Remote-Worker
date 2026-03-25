@@ -207,7 +207,9 @@ class TestTodoManagerCompletion:
         """Test completing with notes."""
         todo_manager.add("Task with notes")
 
-        result = todo_manager.complete("todo_1", notes=["Done successfully", "No issues"])
+        result = todo_manager.complete(
+            "todo_1", notes=["Done successfully", "No issues"]
+        )
 
         assert result.notes == ["Done successfully", "No issues"]
 
@@ -489,6 +491,7 @@ class TestTodoManagerLogging:
     def test_log_state(self, todo_manager, caplog):
         """Test that log_state logs todo statistics."""
         import logging
+
         caplog.set_level(logging.INFO)
 
         todo_manager.add("Task 1")
@@ -536,9 +539,7 @@ class TestTodoManagerStatePersistence:
     def test_export_state_with_staged_todos(self, todo_manager):
         """Test export_state captures staged todos."""
         # Stage some todos
-        todos = [
-            f"Task {i}: do something meaningful here" for i in range(1, 6)
-        ]
+        todos = [f"Task {i}: do something meaningful here" for i in range(1, 6)]
         todo_manager.stage_tactical_todos(todos, "Test Phase")
 
         state = todo_manager.export_state()
@@ -550,8 +551,20 @@ class TestTodoManagerStatePersistence:
         """Test restore_state restores todos correctly."""
         state = {
             "todos": [
-                {"id": "todo_1", "content": "Task 1", "status": "pending", "priority": "high", "notes": []},
-                {"id": "todo_2", "content": "Task 2", "status": "completed", "priority": "medium", "notes": ["Done"]},
+                {
+                    "id": "todo_1",
+                    "content": "Task 1",
+                    "status": "pending",
+                    "priority": "high",
+                    "notes": [],
+                },
+                {
+                    "id": "todo_2",
+                    "content": "Task 2",
+                    "status": "completed",
+                    "priority": "medium",
+                    "notes": ["Done"],
+                },
             ],
             "staged_todos": [],
             "next_id": 3,
@@ -574,7 +587,13 @@ class TestTodoManagerStatePersistence:
         state = {
             "todos": [],
             "staged_todos": [
-                {"id": "todo_1", "content": "Staged Task 1", "status": "pending", "priority": "medium", "notes": []},
+                {
+                    "id": "todo_1",
+                    "content": "Staged Task 1",
+                    "status": "pending",
+                    "priority": "medium",
+                    "notes": [],
+                },
             ],
             "next_id": 5,
             "staged_phase_name": "Restored Phase",
@@ -630,6 +649,7 @@ class TestTodoManagerStatePersistence:
 
         # Create a new manager and restore
         from src.managers.todo import TodoManager
+
         new_manager = TodoManager(todo_manager._workspace)
         new_manager.restore_state(state)
 
@@ -841,6 +861,7 @@ class TestTodoManagerPhaseStatePersistence:
 
         # Create new manager and restore
         from src.managers.todo import TodoManager
+
         new_manager = TodoManager(todo_manager._workspace)
         new_manager.restore_state(state)
 
@@ -870,7 +891,7 @@ class TestTodoManagerAutoCommit:
         todo_manager.add("Task 1")
 
         # Mock the _commit_todo_completion method
-        with patch.object(todo_manager, '_commit_todo_completion') as mock_commit:
+        with patch.object(todo_manager, "_commit_todo_completion") as mock_commit:
             mock_commit.return_value = True
             todo_manager.complete("todo_1")
 
@@ -887,7 +908,7 @@ class TestTodoManagerAutoCommit:
         todo_manager.add("Task 1")
 
         # Mock commit to fail
-        with patch.object(todo_manager, '_commit_todo_completion', return_value=False):
+        with patch.object(todo_manager, "_commit_todo_completion", return_value=False):
             result = todo_manager.complete("todo_1")
 
             # Todo should still be marked complete
