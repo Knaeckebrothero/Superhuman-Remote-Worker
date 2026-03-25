@@ -271,7 +271,18 @@
       ]
     }
   ],
-  "smtpServer": {},
+  "smtpServer": {
+    "host": "${env.SMTP_HOST}",
+    "port": "1025",
+    "from": "noreply@superhuman-remote-worker.com",
+    "fromDisplayName": "Superhuman Remote Worker",
+    "ssl": "false",
+    "starttls": "true",
+    "envelopeFrom": "noreply@superhuman-remote-worker.com",
+    "auth": "true",
+    "user": "${env.SMTP_USER}",
+    "password": "${env.SMTP_PASSWORD}"
+  },
   "internationalizationEnabled": false,
   "loginTheme": "keycloak",
   "accountTheme": "keycloak.v3"
