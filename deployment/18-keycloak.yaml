@@ -375,7 +375,7 @@ data:
         }
       ],
       "smtpServer": {
-        "host": "srw-protonmail-bridge",
+        "host": "protonmail-bridge.protonmail-bridge.svc",
         "port": "1025",
         "from": "noreply@superhuman-remote-worker.com",
         "fromDisplayName": "Superhuman Remote Worker",
@@ -425,7 +425,7 @@ spec:
               echo "Waiting for ProtonMail Bridge SMTP..."
               for i in $(seq 1 30); do
                 if echo | openssl s_client -starttls smtp \
-                    -connect srw-protonmail-bridge:1025 \
+                    -connect protonmail-bridge.protonmail-bridge.svc:1025 \
                     2>/dev/null | openssl x509 -outform PEM \
                     > /certs/bridge-cert.pem 2>/dev/null \
                   && [ -s /certs/bridge-cert.pem ]; then
@@ -474,7 +474,7 @@ spec:
               value: "/opt/keycloak/certs/bridge-cert.pem"
             # Bridge cert has CN=127.0.0.1 — skip hostname check for SMTP
             - name: JAVA_OPTS_APPEND
-              value: "-Dmail.smtp.ssl.trust=srw-protonmail-bridge"
+              value: "-Dmail.smtp.ssl.trust=protonmail-bridge.protonmail-bridge.svc"
             # Admin credentials (Keycloak server admin)
             - name: KEYCLOAK_ADMIN
               valueFrom:
