@@ -50,7 +50,7 @@ from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
-from fastapi import Body, FastAPI, HTTPException, Query, Request, Response  # noqa: E402
+from fastapi import Body, FastAPI, HTTPException, Query, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 

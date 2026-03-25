@@ -800,7 +800,6 @@ class IdeSessionService:
     @staticmethod
     async def _detect_container_runtime() -> str:
         """Detect available container runtime (podman or docker)."""
-        import asyncio
         import shutil
 
         for runtime in ("podman", "docker"):
