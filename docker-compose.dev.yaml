@@ -201,6 +201,10 @@ services:
       # Admin console credentials
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
+      # SMTP — Proton Bridge on host machine (set in .env)
+      SMTP_HOST: "${SMTP_HOST:-host.containers.internal}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
     volumes:
       # Copy realm-export.json.example to realm-export.json and edit credentials.
       # See keycloak/realm-export.json.example for the template.

@@ -375,7 +375,7 @@ data:
         }
       ],
       "smtpServer": {
-        "host": "127.0.0.1",
+        "host": "${env.SMTP_HOST}",
         "port": "1025",
         "from": "noreply@superhuman-remote-worker.com",
         "fromDisplayName": "Superhuman Remote Worker",
@@ -383,7 +383,7 @@ data:
         "starttls": "true",
         "envelopeFrom": "noreply@superhuman-remote-worker.com",
         "auth": "true",
-        "user": "project@redacted.invalid",
+        "user": "${env.SMTP_USER}",
         "password": "${env.SMTP_PASSWORD}"
       },
       "internationalizationEnabled": false,
@@ -524,6 +524,13 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: PGADMIN_OIDC_CLIENT_SECRET
+            - name: SMTP_HOST
+              value: "127.0.0.1"
+            - name: SMTP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: SMTP_USER
             - name: SMTP_PASSWORD
               valueFrom:
                 secretKeyRef:
