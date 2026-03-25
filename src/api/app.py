@@ -127,11 +127,41 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
+    # Shutdown — graceful drain with cooperative stop
     logger.info("Shutting down Universal Agent application...")
     _shutdown_requested = True
 
-    # Stop orchestrator heartbeat and deregister
+    # Phase 1: Send immediate "draining" heartbeat so the orchestrator
+    # stops assigning new jobs (don't wait for the next heartbeat tick)
+    if _orchestrator_client and _orchestrator_client.agent_id:
+        try:
+            await _orchestrator_client.heartbeat(
+                status="draining",
+                job_id=_current_job_id,
+                metrics=_get_agent_metrics(),
+            )
+        except Exception:
+            pass  # Best-effort; stale detector will catch us if this fails
+
+    # Phase 2: If a job is running, use cooperative stop (same as pause).
+    # The job stays resumable from its checkpoint; the orchestrator's
+    # stale detector + recover_orphaned_jobs() will reassign it.
+    if _current_job_task and not _current_job_task.done():
+        logger.info("Requesting cooperative stop for graceful shutdown...")
+        _request_stop("pause")
+
+        try:
+            await asyncio.wait_for(_stop_completed.wait(), timeout=120.0)
+            logger.info("Job stopped cooperatively during shutdown")
+        except asyncio.TimeoutError:
+            logger.warning("Cooperative stop timed out after 120s — hard cancelling")
+            _current_job_task.cancel()
+            try:
+                await _current_job_task
+            except asyncio.CancelledError:
+                pass
+
+    # Phase 3: Stop heartbeat loop and deregister
     if _orchestrator_client:
         logger.info("Stopping orchestrator heartbeat and deregistering...")
         _orchestrator_client.stop_heartbeat()
@@ -146,14 +176,6 @@ async def lifespan(app: FastAPI):
         await _orchestrator_client.deregister()
         await _orchestrator_client.close()
 
-    # Cancel any running job task
-    if _current_job_task and not _current_job_task.done():
-        _current_job_task.cancel()
-        try:
-            await _current_job_task
-        except asyncio.CancelledError:
-            pass
-
     if _agent:
         await _agent.shutdown()
 
@@ -162,6 +184,9 @@ async def lifespan(app: FastAPI):
 
 def _get_agent_status_for_heartbeat() -> str:
     """Get current agent status for heartbeat reporting."""
+    if _shutdown_requested:
+        return "draining"
+
     if _agent is None:
         return "booting"
 
@@ -568,6 +593,13 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     @app.get("/ready", response_model=ReadyResponse, tags=["Health"])
     async def readiness_check() -> ReadyResponse:
         """Readiness probe - check if the service can accept requests."""
+        if _shutdown_requested:
+            return ReadyResponse(
+                ready=False,
+                message="Agent is draining (shutting down)",
+                connections={},
+            )
+
         if _agent is None:
             return ReadyResponse(
                 ready=False,
@@ -733,6 +765,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        if _shutdown_requested:
+            raise HTTPException(status_code=503, detail="Agent is shutting down")
 
         # Check if already processing a job
         if _current_job_id is not None:
@@ -916,6 +951,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
 
         if _agent is None:
             raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        if _shutdown_requested:
+            raise HTTPException(status_code=503, detail="Agent is shutting down")
 
         # Log config mismatch as warning (don't reject - checkpoint discovery handles it)
         if request.config_name and request.config_name != _agent.config.agent_id:
