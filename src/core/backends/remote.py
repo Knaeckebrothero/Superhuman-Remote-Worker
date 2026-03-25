@@ -195,8 +195,7 @@ class RemoteBackend(WorkspaceBackend):
                         f"after {self._max_retries} attempts: {e}"
                     ) from e
                 logger.warning(
-                    "SSH connect attempt %d/%d to %s:%d failed (%s), "
-                    "retrying in %.0fs",
+                    "SSH connect attempt %d/%d to %s:%d failed (%s), retrying in %.0fs",
                     attempt,
                     self._max_retries,
                     self._host,
