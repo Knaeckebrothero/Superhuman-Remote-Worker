@@ -334,8 +334,10 @@ class TestOpenRouterLLMCreation:
         _create_openrouter_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
-        assert "reasoning" not in call_kwargs  # not in top-level llm_kwargs
-        assert call_kwargs["model_kwargs"]["reasoning"] == {"effort": "high"}
+        # reasoning is a first-class kwarg (not nested in model_kwargs)
+        # to avoid LangChain warning about unknown model_kwargs
+        assert call_kwargs["reasoning"] == {"effort": "high"}
+        assert "reasoning" not in call_kwargs.get("model_kwargs", {})
 
     def test_missing_api_key_raises(self):
         """Should raise ValueError when OPENROUTER_API_KEY is not set."""
