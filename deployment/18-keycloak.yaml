@@ -148,7 +148,7 @@ data:
               "protocol": "openid-connect",
               "protocolMapper": "oidc-usermodel-attribute-mapper",
               "config": {
-                "user.attribute": "gitea_username",
+                "user.attribute": "username",
                 "claim.name": "preferred_username",
                 "id.token.claim": "true",
                 "access.token.claim": "true",
@@ -543,6 +543,49 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: SMTP_PASSWORD
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    # Sync OIDC client config from env vars into Keycloak DB.
+                    # Realm import resolves ${env.VAR} only on first boot; if the
+                    # realm already exists the placeholders are stored literally
+                    # and protocol mapper configs can be empty. This hook runs on
+                    # every start and ensures secrets + mappers are correct.
+                    KC="/opt/keycloak/bin/kcadm.sh"
+                    until curl -sf http://localhost:9000/health/ready >/dev/null 2>&1; do sleep 3; done
+                    $KC config credentials --server http://localhost:8080 \
+                      --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
+                    # --- Sync client secrets ---
+                    for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
+                                "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
+                                "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET"; do
+                      CID="${pair%%:*}"; SEC="${pair#*:}"
+                      [ -z "$SEC" ] && continue
+                      ID=$($KC get clients -r srw -q "clientId=$CID" --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      [ -z "$ID" ] && continue
+                      $KC update "clients/$ID" -r srw -s "secret=$SEC" 2>/dev/null
+                    done
+                    # --- Ensure Gitea protocol mappers have config ---
+                    # (realm import sometimes stores empty config objects)
+                    GID=$($KC get clients -r srw -q clientId=gitea --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                    if [ -n "$GID" ]; then
+                      ensure_mapper() {
+                        NAME="$1"; ATTR="$2"; CLAIM="$3"; JTYPE="$4"
+                        MID=$($KC get "clients/$GID/protocol-mappers/models" -r srw 2>/dev/null \
+                          | grep -B1 "\"name\" : \"$NAME\"" | grep '"id"' | sed 's/.*: "//;s/".*//')
+                        [ -n "$MID" ] && $KC delete "clients/$GID/protocol-mappers/models/$MID" -r srw 2>/dev/null
+                        $KC create "clients/$GID/protocol-mappers/models" -r srw -f - 2>/dev/null <<MAPPER
+                    {"name":"$NAME","protocol":"openid-connect","protocolMapper":"oidc-usermodel-attribute-mapper","config":{"user.attribute":"$ATTR","claim.name":"$CLAIM","id.token.claim":"true","access.token.claim":"true","userinfo.token.claim":"true","jsonType.label":"$JTYPE"}}
+                    MAPPER
+                      }
+                      ensure_mapper "gitea-username" "username" "preferred_username" "String"
+                      ensure_mapper "given-name" "firstName" "given_name" "String"
+                      ensure_mapper "family-name" "lastName" "family_name" "String"
+                    fi
           volumeMounts:
             - name: realm-import
               mountPath: /opt/keycloak/data/import
