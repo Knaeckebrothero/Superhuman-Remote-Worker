@@ -1707,6 +1707,38 @@ class PostgresDB:
             return int(result.split()[1])
         return 0
 
+    async def recover_orphaned_jobs(self) -> int:
+        """Pause jobs still assigned to offline or deleted agents.
+
+        Finds jobs in 'processing' status whose assigned agent is offline
+        (or NULL, e.g. after agent row deletion via ON DELETE SET NULL).
+        Sets them to 'paused' with cleared assigned_agent_id so the
+        dispatcher can reassign them.
+
+        Returns:
+            Number of jobs recovered
+        """
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'paused',
+                    assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'processing'
+                  AND (
+                      assigned_agent_id IS NULL
+                      OR assigned_agent_id IN (
+                          SELECT id FROM agents WHERE status = 'offline'
+                      )
+                  )
+                """
+            )
+
+        if result.startswith("UPDATE "):
+            return int(result.split()[1])
+        return 0
+
     async def get_ready_agents(self) -> List[Dict[str, Any]]:
         """Get all agents with 'ready' status.
 

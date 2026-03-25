@@ -443,8 +443,16 @@ CREATE TABLE IF NOT EXISTS agents (
     -- Extensible metadata
     metadata JSONB DEFAULT '{}',
 
-    CONSTRAINT valid_agent_status CHECK (status IN ('booting', 'ready', 'working', 'completed', 'failed', 'offline'))
+    CONSTRAINT valid_agent_status CHECK (status IN ('booting', 'ready', 'working', 'draining', 'completed', 'failed', 'offline'))
 );
+
+-- Migration: Add 'draining' to valid_agent_status constraint (graceful shutdown)
+DO $$ BEGIN
+    ALTER TABLE agents DROP CONSTRAINT valid_agent_status;
+    ALTER TABLE agents ADD CONSTRAINT valid_agent_status
+        CHECK (status IN ('booting', 'ready', 'working', 'draining', 'completed', 'failed', 'offline'));
+EXCEPTION WHEN undefined_object THEN null;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
 CREATE INDEX IF NOT EXISTS idx_agents_last_heartbeat ON agents(last_heartbeat);
