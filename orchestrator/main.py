@@ -315,7 +315,9 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
     """Background task that marks agents as offline if no heartbeat received.
 
     Runs every 60 seconds and marks agents as offline if they haven't sent
-    a heartbeat in the last 3 minutes.
+    a heartbeat in the last 3 minutes.  After marking agents offline, recovers
+    any orphaned jobs (still in 'processing' but assigned to offline/deleted
+    agents) by pausing them so the dispatcher can reassign.
     """
     logger.info("Stale agent detector started")
     while not shutdown_event.is_set():
@@ -325,6 +327,13 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 logger.info(
                     f"Marked {count} agent(s) as offline due to missed heartbeats"
                 )
+            # Recover orphaned jobs from offline or deleted agents
+            recovered = await postgres_db.recover_orphaned_jobs()
+            if recovered > 0:
+                logger.info(
+                    f"Recovered {recovered} orphaned job(s) from offline agents"
+                )
+                _trigger_dispatch()
         except Exception as e:
             logger.error(f"Error in stale agent detector: {e}")
 
@@ -1190,7 +1199,7 @@ class AgentHeartbeat(BaseModel):
     status: str = Field(
         ...,
         description="Agent status",
-        pattern="^(booting|ready|working|completed|failed)$",
+        pattern="^(booting|ready|working|draining|completed|failed)$",
     )
     current_job_id: str | None = Field(None, description="Current job UUID if working")
     metrics: dict[str, Any] | None = Field(

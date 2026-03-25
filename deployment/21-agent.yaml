@@ -5,6 +5,11 @@ metadata:
   namespace: superhuman-remote-worker
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: srw-agent
@@ -13,6 +18,7 @@ spec:
       labels:
         app: srw-agent
     spec:
+      terminationGracePeriodSeconds: 180
       initContainers:
         - name: wait-for-orchestrator
           image: busybox:1.36
@@ -263,7 +269,7 @@ spec:
             periodSeconds: 30
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 8001
             initialDelaySeconds: 30
             periodSeconds: 10
