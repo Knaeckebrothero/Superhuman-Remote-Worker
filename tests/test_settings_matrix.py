@@ -747,7 +747,7 @@ class TestRealMatrixFamilies:
             ("o3-mini", 130000, 170000),
             ("deepseek-r1", 40000, 55000),
             ("gemini-2.0-flash", 150000, 200000),
-            ("gpt-oss-120b", 60000, 85000),
+            ("gpt-oss-120b", 85000, 110000),
             ("some-unknown-model", 80000, 100000),  # default entry
         ],
     )
