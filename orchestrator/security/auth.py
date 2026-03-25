@@ -47,8 +47,8 @@ async def get_current_user(request: Request, db) -> dict:
     sub = claims["sub"]
     email = claims.get("email", "")
     display_name = (
-        claims.get("name")
-        or claims.get("preferred_username")
+        claims.get("preferred_username")
+        or claims.get("name")
         or email.split("@")[0]
         or "User"
     )
