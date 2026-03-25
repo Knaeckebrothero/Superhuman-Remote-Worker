@@ -3397,7 +3397,7 @@ class PostgresDB:
                 """
                 INSERT INTO project_members (project_id, user_id, role)
                 VALUES ($1, $2, $3)
-                RETURNING project_id, user_id, role, added_at
+                RETURNING project_id, user_id, role, added_at AS joined_at
                 """,
                 project_uuid,
                 user_uuid,
@@ -3434,7 +3434,8 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT pm.project_id, pm.user_id, pm.role, pm.added_at,
+                SELECT pm.project_id, pm.user_id, pm.role,
+                       pm.added_at AS joined_at,
                        u.display_name, u.avatar_color, u.email
                 FROM project_members pm
                 JOIN users u ON pm.user_id = u.id
