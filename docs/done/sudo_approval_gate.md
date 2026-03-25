@@ -202,7 +202,7 @@ The C plugin can only be tested on a Linux system with sudo 1.9.0+ (Ubuntu 24.04
 
 Compiled binaries (the Go daemon and C plugin `.so`) should **not** be checked into the repository. Instead:
 
-1. `sudo-gated/Makefile` and `sudo-gate-plugin/Makefile` produce the binaries
+1. `vm/sudo-daemon/Makefile` and `vm/sudo-plugin/Makefile` produce the binaries
 2. The Packer build for the VM base image compiles both from source during provisioning (or downloads pre-built artifacts from a CI release)
 3. For iterative development, `scp` the binaries to a running VM for testing
 
@@ -215,11 +215,11 @@ The existing CI pipeline (GitHub Actions) can be extended with build steps for G
 **Goal**: Build and test the daemon in isolation before touching the C plugin or orchestrator.
 
 **Deliverables**:
-- `sudo-gated/` — Go module with Unix socket server, NATS client, rate limiter
-- `sudo-gated/cmd/sudo-gated/main.go` — Entry point with systemd integration (`sd_notify`)
-- `sudo-gated/internal/gate/` — Socket server, request handling, NATS forwarding
-- `sudo-gated/test/mock_plugin.py` — Python script that connects to the Unix socket and sends JSON payloads mimicking the C plugin
-- `sudo-gated/test/mock_orchestrator.py` — Python NATS subscriber that auto-approves/denies for testing
+- `vm/sudo-daemon/` — Go module with Unix socket server, NATS client, rate limiter
+- `vm/sudo-daemon/cmd/sudo-gated/main.go` — Entry point with systemd integration (`sd_notify`)
+- `vm/sudo-daemon/internal/gate/` — Socket server, request handling, NATS forwarding
+- `vm/sudo-daemon/test/mock_plugin.py` — Python script that connects to the Unix socket and sends JSON payloads mimicking the C plugin
+- `vm/sudo-daemon/test/mock_orchestrator.py` — Python NATS subscriber that auto-approves/denies for testing
 
 **Test criteria**:
 - Mock plugin sends request → daemon forwards via NATS → mock orchestrator replies → daemon writes response to socket → mock plugin reads approval
@@ -247,11 +247,11 @@ The existing CI pipeline (GitHub Actions) can be extended with build steps for G
 - JSON handling: a purpose-built `json_util.c`/`json_util.h` provides safe serialization and parsing (no external dependency like cJSON needed — the plugin only needs to build/parse two simple JSON shapes)
 
 **Deliverables**:
-- `sudo-gate-plugin/sudo_gate.c` — Approval plugin implementation (built incrementally, see below)
-- `sudo-gate-plugin/include/sudo_plugin.h` — Vendored from sudo source (avoids build-time dependency on `apt-get source`)
-- `sudo-gate-plugin/json_util.c`, `sudo-gate-plugin/json_util.h` — Purpose-built JSON serialization/parsing (safe `find_key()` parser that skips string values to prevent injection)
-- `sudo-gate-plugin/Makefile` — Build with GCC 14, `-fPIC -shared -Wall -Wextra -O2 -I./include`
-- `sudo-gate-plugin/sudo.conf.d/sudo_gate.conf` — Plugin registration for `/etc/sudo.conf`
+- `vm/sudo-plugin/sudo_gate.c` — Approval plugin implementation (built incrementally, see below)
+- `vm/sudo-plugin/include/sudo_plugin.h` — Vendored from sudo source (avoids build-time dependency on `apt-get source`)
+- `vm/sudo-plugin/json_util.c`, `vm/sudo-plugin/json_util.h` — Purpose-built JSON serialization/parsing (safe `find_key()` parser that skips string values to prevent injection)
+- `vm/sudo-plugin/Makefile` — Build with GCC 14, `-fPIC -shared -Wall -Wextra -O2 -I./include`
+- `vm/sudo-plugin/sudo.conf.d/sudo_gate.conf` — Plugin registration for `/etc/sudo.conf`
 
 **Incremental build sequence**:
 1. **Stub** — `check()` logs to `syslog(LOG_AUTH)` and returns 1 (always approve). Validates struct layout, symbol export, and plugin loading.
@@ -570,7 +570,7 @@ sudo systemctl enable sudo-gated.socket
 ## File Layout
 
 ```
-sudo-gated/                          # Go daemon (new directory at repo root)
+vm/sudo-daemon/                      # Go daemon (under vm/ directory)
 ├── cmd/sudo-gated/main.go
 ├── internal/
 │   ├── gate/server.go               # Unix socket server
@@ -585,7 +585,7 @@ sudo-gated/                          # Go daemon (new directory at repo root)
     ├── mock_plugin.py               # Simulates the C plugin over Unix socket
     └── mock_orchestrator.py          # Simulates orchestrator via NATS subscription
 
-sudo-gate-plugin/                    # C plugin (new directory at repo root)
+vm/sudo-plugin/                      # C plugin (under vm/ directory)
 ├── sudo_gate.c                      # Approval plugin implementation
 ├── json_util.c                      # Purpose-built JSON serialization/parsing
 ├── json_util.h                      # (no external dependencies — avoids cJSON bloat)

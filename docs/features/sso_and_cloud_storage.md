@@ -218,7 +218,7 @@ keycloak:
     KEYCLOAK_ADMIN: admin
     KEYCLOAK_ADMIN_PASSWORD: admin
   volumes:
-    - ./keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro
+    - ./docker/keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro
   ports:
     - "${KEYCLOAK_PORT:-8180}:8080"
   depends_on:
@@ -228,9 +228,9 @@ keycloak:
 
 **Port note:** Default host port is `8180` (not `8080`) to avoid conflict with the VPN cluster service. Override via `KEYCLOAK_PORT` in `.env`.
 
-**Hostname resolution:** `KC_HOSTNAME` sets browser-facing URLs to `localhost:8180` so OIDC redirects work from the user's browser. `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` allows container-to-container traffic (e.g., Gitea token exchange at `keycloak:8080`) to work without hostname conflicts. Services that need split URLs (browser vs. server-to-server) use custom endpoint overrides — see `keycloak/setup-gitea-oidc.sh`.
+**Hostname resolution:** `KC_HOSTNAME` sets browser-facing URLs to `localhost:8180` so OIDC redirects work from the user's browser. `KC_HOSTNAME_BACKCHANNEL_DYNAMIC` allows container-to-container traffic (e.g., Gitea token exchange at `keycloak:8080`) to work without hostname conflicts. Services that need split URLs (browser vs. server-to-server) use custom endpoint overrides — see `docker/keycloak/setup-gitea-oidc.sh`.
 
-A `keycloak/realm-export.json` file contains the full `srw` realm definition (clients, roles, scopes, default users) for reproducible one-command setup. This file is committed to the repository and updated via Keycloak admin UI export when the realm configuration changes.
+A `docker/keycloak/realm-export.json` file contains the full `srw` realm definition (clients, roles, scopes, default users) for reproducible one-command setup. This file is committed to the repository and updated via Keycloak admin UI export when the realm configuration changes.
 
 **Database prerequisites:** Both Keycloak and Nextcloud need their own PostgreSQL databases on the shared `postgres` container. These are created during `init.py` setup (alongside the existing `orchestrator` and `vector` databases):
 
@@ -650,7 +650,7 @@ All connectors implement the same abstract tool interface (`cloud_list`, `cloud_
 1. Add Keycloak to `docker-compose.dev.yaml`
 2. Update `init.py` to create `keycloak` database on the shared PostgreSQL container
 3. Create `srw` realm with default clients, roles, and dev users
-4. Export realm config to `keycloak/realm-export.json` for reproducible setup
+4. Export realm config to `docker/keycloak/realm-export.json` for reproducible setup
 5. Configure Gitea as OIDC client → **solves the immediate workspace viewer pain point**
 
 ### Phase 2: Cockpit + Orchestrator OIDC Migration

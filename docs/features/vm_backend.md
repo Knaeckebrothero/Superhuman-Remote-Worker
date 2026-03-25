@@ -691,7 +691,7 @@ Alternatively, the orchestrator can pull snapshots via SFTP periodically, indepe
    - `nats-leaf-values.yaml` — single node, no JetStream, dials out to hub
    - `setup-streams.sh` — creates `VM_EVENTS`, `AGENT_HEARTBEATS`, `JOB_ASSIGNMENTS` streams
 
-2. **VM Controller service** in `vm-controller/`
+2. **VM Controller service** in `vm/controller/`
    - `controller.py` (~270 lines) — async Python service using `nats-py` + `kubernetes` client
    - Subscribes to `vm.lifecycle.create`, `vm.lifecycle.delete`, `vm.lifecycle.get`
    - On create: renders `vm-template.yaml` via string substitution → applies VirtualMachine via K8s API

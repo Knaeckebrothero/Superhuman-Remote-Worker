@@ -73,7 +73,7 @@ Both auto-create on first connection (`OBJECTSTORE_S3_AUTOCREATE` / orchestrator
 | `21-agent.yaml` | Added: WORKSTATION_BASE_URL, GITEA_URL |
 | `23-mcp.yaml` | Added: MCP_INTERNAL_KEY env var |
 | `30-ingress.yaml` | All hostnames updated to `*.superhuman-remote-worker.com`. Added: Keycloak, Nextcloud, Dozzle ingress rules. Removed: X-CSRF-Token from CORS middleware |
-| `keycloak/realm-export.json` | Added production redirect URIs for all clients (cockpit, gitea, nextcloud, pgadmin) alongside localhost dev URIs |
+| `docker/keycloak/realm-export.json` | Added production redirect URIs for all clients (cockpit, gitea, nextcloud, pgadmin) alongside localhost dev URIs |
 
 #### Bug fix during deployment
 
@@ -113,7 +113,7 @@ Keycloak 26.2 in dev mode serves health endpoints on port 9000, not 8080, and re
 | `12-gitea.yaml` | Added wait-for-keycloak initContainer, postStart lifecycle hook (admin user + OIDC bootstrap), bootstrap env vars |
 | `19-nextcloud.yaml` | Added wait-for-keycloak initContainer, OIDC env vars, oidc-hook volume mount |
 | `20-orchestrator.yaml` | Added `GITEA_OIDC_CLIENT_SECRET` env var |
-| `keycloak/realm-export.json` | Enabled `verifyEmail`, added SMTP config for Proton Bridge |
+| `docker/keycloak/realm-export.json` | Enabled `verifyEmail`, added SMTP config for Proton Bridge |
 | `orchestrator/security/auth.py` | Added `is_approved` flag, `require_approved_user()` |
 | `orchestrator/main.py` | Switched to `require_approved_user()`, added OIDC setup call |
 | `orchestrator/services/gitea.py` | Added `ensure_oidc_configured()`, fixed unauthenticated version check |
@@ -167,8 +167,8 @@ Keycloak 26.2 in dev mode serves health endpoints on port 9000, not 8080, and re
 
 - [x] **Change Keycloak admin password** — changed from default, stored in `srw-secrets`
 - [x] **User registration with admin approval** — email verification enabled, new users lack `user` role until admin grants it in Keycloak. Cockpit shows "pending approval" screen for unapproved users, API returns 403 via `require_approved_user()`.
-- [x] **Gitea OIDC setup** — automated via postStart lifecycle hook on Gitea container. Creates admin user + registers Keycloak OAuth2 source on every pod start. Persisted in SQLite on PVC. Legacy script `keycloak/setup-gitea-oidc.sh` deprecated.
-- [x] **Nextcloud OIDC setup** — automated via `before-starting` hook (ConfigMap `srw-nextcloud-hooks`). Installs `user_oidc` app + registers Keycloak provider on every container start. Legacy script `keycloak/setup-nextcloud-oidc.sh` deprecated.
+- [x] **Gitea OIDC setup** — automated via postStart lifecycle hook on Gitea container. Creates admin user + registers Keycloak OAuth2 source on every pod start. Persisted in SQLite on PVC. Legacy script `docker/keycloak/setup-gitea-oidc.sh` deprecated.
+- [x] **Nextcloud OIDC setup** — automated via `before-starting` hook (ConfigMap `srw-nextcloud-hooks`). Installs `user_oidc` app + registers Keycloak provider on every container start. Legacy script `docker/keycloak/setup-nextcloud-oidc.sh` deprecated.
 - [x] **Debug sidebar links fixed** — cockpit env.js ConfigMap updated with correct `*.superhuman-remote-worker.com` URLs for all admin UIs
 - [x] **IPv6 DNS bypass fixed** — MikroTik static DNS AAAA record blocks Cloudflare IPv6 wildcard, forcing local clients to resolve via IPv4 to Traefik
 

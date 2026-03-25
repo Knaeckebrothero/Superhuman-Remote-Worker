@@ -207,8 +207,8 @@ services:
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
     volumes:
       # Copy realm-export.json.example to realm-export.json and edit credentials.
-      # See keycloak/realm-export.json.example for the template.
-      - ./keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
+      # See docker/keycloak/realm-export.json.example for the template.
+      - ./docker/keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
     ports:
       - "${KEYCLOAK_PORT:-8180}:8080"
     depends_on:

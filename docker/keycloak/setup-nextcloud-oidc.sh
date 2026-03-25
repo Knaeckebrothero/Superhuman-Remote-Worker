@@ -12,7 +12,7 @@
 # Requires: podman (or docker) with the srw-nextcloud container running.
 #
 # Usage:
-#   ./keycloak/setup-nextcloud-oidc.sh
+#   ./docker/keycloak/setup-nextcloud-oidc.sh
 #
 # What it does:
 #   1. Installs and enables the user_oidc app in Nextcloud
@@ -30,7 +30,7 @@ CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
 NEXTCLOUD_CONTAINER="${NEXTCLOUD_CONTAINER:-srw-nextcloud}"
 KEYCLOAK_PORT="${KEYCLOAK_PORT:-8180}"
 
-# Client credentials — must match keycloak/realm-export.json
+# Client credentials — must match docker/keycloak/realm-export.json
 CLIENT_ID="nextcloud"
 CLIENT_SECRET="nextcloud-client-secret"
 
