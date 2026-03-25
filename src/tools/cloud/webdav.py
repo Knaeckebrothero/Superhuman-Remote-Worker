@@ -26,30 +26,35 @@ CLOUD_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "function": "cloud_list",
         "category": "cloud",
         "phases": ["strategic", "tactical"],
+        "description": "List files and folders in WebDAV",
     },
     "cloud_read": {
         "module": "cloud.webdav",
         "function": "cloud_read",
         "category": "cloud",
         "phases": ["strategic", "tactical"],
+        "description": "Download a file from WebDAV into the workspace",
     },
     "cloud_info": {
         "module": "cloud.webdav",
         "function": "cloud_info",
         "category": "cloud",
         "phases": ["strategic", "tactical"],
+        "description": "Get metadata about a file or folder in WebDAV",
     },
     "cloud_write": {
         "module": "cloud.webdav",
         "function": "cloud_write",
         "category": "cloud",
         "phases": ["tactical"],
+        "description": "Upload a file from the workspace to WebDAV",
     },
     "cloud_delete": {
         "module": "cloud.webdav",
         "function": "cloud_delete",
         "category": "cloud",
         "phases": ["tactical"],
+        "description": "Delete a file or folder from WebDAV",
     },
 }
 
