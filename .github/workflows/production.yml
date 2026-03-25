@@ -1,4 +1,4 @@
-name: CI/CD
+name: Production
 
 on:
   push:
@@ -89,7 +89,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install -r requirements.txt -r orchestrator/requirements.txt pytest
+        run: pip install -r requirements.txt -r orchestrator/requirements.txt pytest pytest-asyncio
       - name: Run tests
         run: pytest tests/ -x -q --tb=short
 
