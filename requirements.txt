@@ -46,6 +46,7 @@ langdetect>=1.0.9
 fastapi>=0.109.0
 uvicorn>=0.27.0
 httpx>=0.26.0
+requests>=2.33.0  # CVE-2026-25645: predictable temp path in extract_zipped_paths
 python-multipart>=0.0.6
 # Optional: MongoDB for LLM request archiving
 pymongo>=4.6.0
