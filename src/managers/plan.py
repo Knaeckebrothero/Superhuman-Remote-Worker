@@ -239,7 +239,11 @@ class PlanManager:
             return f"{header.rstrip()} (COMPLETE)"
 
         new_content, count = re.subn(
-            pattern, add_complete_marker, content, count=1, flags=re.IGNORECASE | re.MULTILINE
+            pattern,
+            add_complete_marker,
+            content,
+            count=1,
+            flags=re.IGNORECASE | re.MULTILINE,
         )
 
         if count > 0:

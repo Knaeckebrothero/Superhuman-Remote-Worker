@@ -3,6 +3,7 @@ Configuration utilities for loading config files and prompts.
 
 Environment variables take precedence over config file values.
 """
+
 import json
 import os
 from pathlib import Path
@@ -25,7 +26,7 @@ def load_config(name: str) -> dict:
         Config dictionary
     """
     config_path = get_project_root() / "config" / name
-    with open(config_path, 'r') as f:
+    with open(config_path, "r") as f:
         return json.load(f)
 
 
@@ -40,7 +41,7 @@ def load_prompt(name: str) -> str:
         Prompt text content
     """
     prompt_path = get_project_root() / "config" / "prompts" / name
-    with open(prompt_path, 'r') as f:
+    with open(prompt_path, "r") as f:
         return f.read()
 
 
@@ -175,12 +176,11 @@ def get_env_str(env_var: str, config_path: list[str], default: str) -> str:
 # Polling & Retry
 # =============================================================================
 
+
 def get_creator_polling_interval() -> int:
     """Get Creator agent polling interval in seconds (default: 30)."""
     return get_env_int(
-        "CREATOR_POLLING_INTERVAL",
-        ["creator_agent", "polling_interval_seconds"],
-        30
+        "CREATOR_POLLING_INTERVAL", ["creator_agent", "polling_interval_seconds"], 30
     )
 
 
@@ -189,29 +189,24 @@ def get_validator_polling_interval() -> int:
     return get_env_int(
         "VALIDATOR_POLLING_INTERVAL",
         ["validator_agent", "polling_interval_seconds"],
-        10
+        10,
     )
 
 
 def get_agent_retry_delay() -> int:
     """Get delay in seconds before retrying after an error (default: 10)."""
-    return get_env_int(
-        "AGENT_RETRY_DELAY",
-        ["agent", "retry_delay_seconds"],
-        10
-    )
+    return get_env_int("AGENT_RETRY_DELAY", ["agent", "retry_delay_seconds"], 10)
 
 
 # =============================================================================
 # Thresholds
 # =============================================================================
 
+
 def get_min_confidence_threshold() -> float:
     """Get minimum confidence threshold for candidate extraction (default: 0.6)."""
     return get_env_float(
-        "MIN_CONFIDENCE_THRESHOLD",
-        ["creator_agent", "min_confidence_threshold"],
-        0.6
+        "MIN_CONFIDENCE_THRESHOLD", ["creator_agent", "min_confidence_threshold"], 0.6
     )
 
 
@@ -220,7 +215,7 @@ def get_duplicate_similarity_threshold() -> float:
     return get_env_float(
         "DUPLICATE_SIMILARITY_THRESHOLD",
         ["validator_agent", "duplicate_threshold"],
-        0.95
+        0.95,
     )
 
 
@@ -229,7 +224,7 @@ def get_fulfillment_confidence_threshold() -> float:
     return get_env_float(
         "FULFILLMENT_CONFIDENCE_THRESHOLD",
         ["validator_agent", "fulfillment_confidence_threshold"],
-        0.7
+        0.7,
     )
 
 
@@ -237,21 +232,20 @@ def get_fulfillment_confidence_threshold() -> float:
 # Context Management
 # =============================================================================
 
+
 def get_context_compaction_threshold() -> int:
     """Get token threshold for context compaction (default: 100000)."""
     return get_env_int(
         "CONTEXT_COMPACTION_THRESHOLD",
         ["context_management", "compaction_threshold_tokens"],
-        100000
+        100000,
     )
 
 
 def get_context_max_output_tokens() -> int:
     """Get max output tokens for context (default: 80000)."""
     return get_env_int(
-        "CONTEXT_MAX_OUTPUT_TOKENS",
-        ["context_management", "max_output_tokens"],
-        80000
+        "CONTEXT_MAX_OUTPUT_TOKENS", ["context_management", "max_output_tokens"], 80000
     )
 
 
@@ -259,27 +253,23 @@ def get_context_max_output_tokens() -> int:
 # Orchestrator
 # =============================================================================
 
+
 def get_job_timeout_hours() -> int:
     """Get job timeout in hours (default: 168 = 7 days)."""
-    return get_env_int(
-        "JOB_TIMEOUT_HOURS",
-        ["orchestrator", "job_timeout_hours"],
-        168
-    )
+    return get_env_int("JOB_TIMEOUT_HOURS", ["orchestrator", "job_timeout_hours"], 168)
 
 
 def get_max_requirement_retries() -> int:
     """Get max retries for failed requirements (default: 5)."""
     return get_env_int(
-        "MAX_REQUIREMENT_RETRIES",
-        ["orchestrator", "max_requirement_retries"],
-        5
+        "MAX_REQUIREMENT_RETRIES", ["orchestrator", "max_requirement_retries"], 5
     )
 
 
 # =============================================================================
 # Workspace Configuration
 # =============================================================================
+
 
 def get_workspace_base_path() -> str:
     """Get base path for agent workspaces.
@@ -292,7 +282,7 @@ def get_workspace_base_path() -> str:
     return get_env_str(
         "WORKSPACE_PATH",
         ["workspace", "base_path"],
-        ""  # Empty means auto-detect in WorkspaceManager
+        "",  # Empty means auto-detect in WorkspaceManager
     )
 
 
@@ -300,13 +290,16 @@ def get_workspace_structure() -> list[str]:
     """Get default workspace directory structure."""
     config = _get_llm_config()
     workspace_config = config.get("workspace", {})
-    return workspace_config.get("structure", [
-        "plans",
-        "archive",
-        "documents",
-        "notes",
-        "chunks",
-        "candidates",
-        "requirements",
-        "output",
-    ])
+    return workspace_config.get(
+        "structure",
+        [
+            "plans",
+            "archive",
+            "documents",
+            "notes",
+            "chunks",
+            "candidates",
+            "requirements",
+            "output",
+        ],
+    )

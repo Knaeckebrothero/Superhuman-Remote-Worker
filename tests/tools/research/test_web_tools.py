@@ -100,7 +100,12 @@ class TestCreateWebTools:
     def test_tool_names(self, mock_tool_context):
         tools = create_web_tools(mock_tool_context)
         names = {t.name for t in tools}
-        assert names == {"web_search", "extract_webpage", "crawl_website", "map_website"}
+        assert names == {
+            "web_search",
+            "extract_webpage",
+            "crawl_website",
+            "map_website",
+        }
 
 
 # ── web_search ─────────────────────────────────────────────────────
@@ -154,7 +159,9 @@ class TestWebSearch:
         result = ws.invoke({"query": "obscure"})
         assert "No web results found" in result
 
-    def test_search_depth_advanced(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_search_depth_advanced(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = self._make_search_response()
@@ -193,7 +200,9 @@ class TestWebSearch:
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["time_range"] == "week"
 
-    def test_include_domains(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_include_domains(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = self._make_search_response()
@@ -206,7 +215,9 @@ class TestWebSearch:
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["include_domains"] == ["example.com", "other.com"]
 
-    def test_exclude_domains(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_exclude_domains(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = self._make_search_response()
@@ -219,7 +230,9 @@ class TestWebSearch:
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["exclude_domains"] == ["spam.com"]
 
-    def test_raw_content_creates_new_instance(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_raw_content_creates_new_instance(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = self._make_search_response(include_raw=True)
@@ -232,12 +245,21 @@ class TestWebSearch:
         constructor_kwargs = mock_langchain_tavily.TavilySearch.call_args[1]
         assert constructor_kwargs.get("include_raw_content") is True
 
-    def test_raw_content_not_truncated_300(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_raw_content_not_truncated_300(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         long_content = "A" * 500
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = {
-            "results": [{"url": "https://ex.com", "title": "T", "content": "short", "raw_content": long_content}]
+            "results": [
+                {
+                    "url": "https://ex.com",
+                    "title": "T",
+                    "content": "short",
+                    "raw_content": long_content,
+                }
+            ]
         }
         mock_langchain_tavily.TavilySearch.return_value = mock_instance
 
@@ -247,12 +269,21 @@ class TestWebSearch:
 
         assert long_content in result
 
-    def test_raw_content_word_limit(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_raw_content_word_limit(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         huge_content = "word " * 6000
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = {
-            "results": [{"url": "https://ex.com", "title": "T", "content": "short", "raw_content": huge_content}]
+            "results": [
+                {
+                    "url": "https://ex.com",
+                    "title": "T",
+                    "content": "short",
+                    "raw_content": huge_content,
+                }
+            ]
         }
         mock_langchain_tavily.TavilySearch.return_value = mock_instance
 
@@ -262,7 +293,9 @@ class TestWebSearch:
 
         assert "truncated from 6000 words" in result
 
-    def test_citation_registration(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_citation_registration(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = self._make_search_response()
@@ -276,12 +309,17 @@ class TestWebSearch:
         assert mock_tool_context.get_or_register_web_source.called
         assert "archived" in result
 
-    def test_inaccessible_sources_warning(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_inaccessible_sources_warning(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = MagicMock()
         mock_instance.invoke.return_value = self._make_search_response()
         mock_langchain_tavily.TavilySearch.return_value = mock_instance
-        mock_tool_context.get_or_register_web_source.return_value = ("src-1", "HTTP 403")
+        mock_tool_context.get_or_register_web_source.return_value = (
+            "src-1",
+            "HTTP 403",
+        )
 
         tools = create_web_tools(mock_tool_context)
         ws = next(t for t in tools if t.name == "web_search")
@@ -302,7 +340,10 @@ class TestExtractWebpage:
         if response is None:
             response = {
                 "results": [
-                    {"url": "https://example.com/page1", "raw_content": "Full page content here"},
+                    {
+                        "url": "https://example.com/page1",
+                        "raw_content": "Full page content here",
+                    },
                 ],
                 "failed_results": [],
             }
@@ -324,13 +365,16 @@ class TestExtractWebpage:
 
     def test_multiple_urls(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
-        mock_instance = self._setup_extract(mock_langchain_tavily, {
-            "results": [
-                {"url": "https://a.com", "raw_content": "Content A"},
-                {"url": "https://b.com", "raw_content": "Content B"},
-            ],
-            "failed_results": [],
-        })
+        mock_instance = self._setup_extract(
+            mock_langchain_tavily,
+            {
+                "results": [
+                    {"url": "https://a.com", "raw_content": "Content A"},
+                    {"url": "https://b.com", "raw_content": "Content B"},
+                ],
+                "failed_results": [],
+            },
+        )
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "extract_webpage")
@@ -352,7 +396,9 @@ class TestExtractWebpage:
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["query"] == "important info"
 
-    def test_advanced_depth(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_advanced_depth(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         self._setup_extract(mock_langchain_tavily)
 
@@ -360,9 +406,14 @@ class TestExtractWebpage:
         t = next(t for t in tools if t.name == "extract_webpage")
         t.invoke({"urls": "https://example.com", "extract_depth": "advanced"})
 
-        assert mock_langchain_tavily.TavilyExtract.call_args[1]["extract_depth"] == "advanced"
+        assert (
+            mock_langchain_tavily.TavilyExtract.call_args[1]["extract_depth"]
+            == "advanced"
+        )
 
-    def test_citation_registration(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_citation_registration(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         self._setup_extract(mock_langchain_tavily)
         mock_tool_context.get_or_register_web_source.return_value = ("src-1", None)
@@ -381,13 +432,18 @@ class TestExtractWebpage:
         result = t.invoke({"urls": "https://example.com"})
         assert "TAVILY_API_KEY not configured" in result
 
-    def test_content_word_limit(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_content_word_limit(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         huge = "word " * 6000
-        self._setup_extract(mock_langchain_tavily, {
-            "results": [{"url": "https://ex.com", "raw_content": huge}],
-            "failed_results": [],
-        })
+        self._setup_extract(
+            mock_langchain_tavily,
+            {
+                "results": [{"url": "https://ex.com", "raw_content": huge}],
+                "failed_results": [],
+            },
+        )
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "extract_webpage")
@@ -395,12 +451,17 @@ class TestExtractWebpage:
 
         assert "truncated from 6000 words" in result
 
-    def test_failed_urls_reported(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_failed_urls_reported(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
-        self._setup_extract(mock_langchain_tavily, {
-            "results": [{"url": "https://a.com", "raw_content": "OK"}],
-            "failed_results": ["https://bad.com"],
-        })
+        self._setup_extract(
+            mock_langchain_tavily,
+            {
+                "results": [{"url": "https://a.com", "raw_content": "OK"}],
+                "failed_results": ["https://bad.com"],
+            },
+        )
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "extract_webpage")
@@ -436,8 +497,14 @@ class TestCrawlWebsite:
         if response is None:
             response = {
                 "results": [
-                    {"url": "https://docs.example.com/", "raw_content": "Homepage content"},
-                    {"url": "https://docs.example.com/page2", "raw_content": "Page 2 content"},
+                    {
+                        "url": "https://docs.example.com/",
+                        "raw_content": "Homepage content",
+                    },
+                    {
+                        "url": "https://docs.example.com/page2",
+                        "raw_content": "Page 2 content",
+                    },
                 ],
             }
         mock_instance.invoke.return_value = response
@@ -457,7 +524,9 @@ class TestCrawlWebsite:
         assert "Pages crawled: 2" in result
         assert "Homepage content" in result
 
-    def test_with_instructions(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_with_instructions(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = self._setup_crawl(mock_langchain_tavily)
 
@@ -474,17 +543,21 @@ class TestCrawlWebsite:
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "crawl_website")
-        t.invoke({
-            "url": "https://docs.example.com/",
-            "select_paths": "/api/.*, /docs/.*",
-            "exclude_paths": "/blog/.*",
-        })
+        t.invoke(
+            {
+                "url": "https://docs.example.com/",
+                "select_paths": "/api/.*, /docs/.*",
+                "exclude_paths": "/blog/.*",
+            }
+        )
 
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["select_paths"] == ["/api/.*", "/docs/.*"]
         assert call_kwargs["exclude_paths"] == ["/blog/.*"]
 
-    def test_depth_clamping_high(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_depth_clamping_high(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = self._setup_crawl(mock_langchain_tavily)
 
@@ -495,7 +568,9 @@ class TestCrawlWebsite:
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["max_depth"] == 5
 
-    def test_depth_clamping_low(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_depth_clamping_low(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = self._setup_crawl(mock_langchain_tavily)
 
@@ -506,7 +581,9 @@ class TestCrawlWebsite:
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["max_depth"] == 1
 
-    def test_citation_registration(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_citation_registration(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         self._setup_crawl(mock_langchain_tavily)
         mock_tool_context.get_or_register_web_source.return_value = ("src-1", None)
@@ -525,12 +602,17 @@ class TestCrawlWebsite:
         result = t.invoke({"url": "https://example.com"})
         assert "TAVILY_API_KEY not configured" in result
 
-    def test_content_word_limit(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_content_word_limit(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         huge = "word " * 6000
-        self._setup_crawl(mock_langchain_tavily, {
-            "results": [{"url": "https://ex.com", "raw_content": huge}],
-        })
+        self._setup_crawl(
+            mock_langchain_tavily,
+            {
+                "results": [{"url": "https://ex.com", "raw_content": huge}],
+            },
+        )
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "crawl_website")
@@ -581,7 +663,9 @@ class TestMapWebsite:
         assert "URLs discovered: 3" in result
         assert "https://example.com/about" in result
 
-    def test_with_instructions(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_with_instructions(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = self._setup_map(mock_langchain_tavily)
 
@@ -598,17 +682,21 @@ class TestMapWebsite:
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "map_website")
-        t.invoke({
-            "url": "https://example.com",
-            "select_paths": "/docs/.*",
-            "exclude_paths": "/blog/.*",
-        })
+        t.invoke(
+            {
+                "url": "https://example.com",
+                "select_paths": "/docs/.*",
+                "exclude_paths": "/blog/.*",
+            }
+        )
 
         call_kwargs = mock_instance.invoke.call_args[0][0]
         assert call_kwargs["select_paths"] == ["/docs/.*"]
         assert call_kwargs["exclude_paths"] == ["/blog/.*"]
 
-    def test_no_citation_registration(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_no_citation_registration(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         self._setup_map(mock_langchain_tavily)
 
@@ -625,7 +713,9 @@ class TestMapWebsite:
         result = t.invoke({"url": "https://example.com"})
         assert "TAVILY_API_KEY not configured" in result
 
-    def test_guidance_message(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_guidance_message(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         self._setup_map(mock_langchain_tavily)
 
@@ -639,12 +729,15 @@ class TestMapWebsite:
     def test_dict_results(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
         """Test handling when results are dicts instead of strings."""
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
-        self._setup_map(mock_langchain_tavily, {
-            "results": [
-                {"url": "https://example.com/page1"},
-                {"url": "https://example.com/page2"},
-            ],
-        })
+        self._setup_map(
+            mock_langchain_tavily,
+            {
+                "results": [
+                    {"url": "https://example.com/page1"},
+                    {"url": "https://example.com/page2"},
+                ],
+            },
+        )
 
         tools = create_web_tools(mock_tool_context)
         t = next(t for t in tools if t.name == "map_website")
@@ -663,7 +756,9 @@ class TestMapWebsite:
 
         assert "No URLs discovered" in result
 
-    def test_depth_clamping(self, mock_tool_context, mock_langchain_tavily, monkeypatch):
+    def test_depth_clamping(
+        self, mock_tool_context, mock_langchain_tavily, monkeypatch
+    ):
         monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
         mock_instance = self._setup_map(mock_langchain_tavily)
 

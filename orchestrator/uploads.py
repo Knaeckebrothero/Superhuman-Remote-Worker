@@ -33,8 +33,10 @@ class UploadType(str, Enum):
     CONFIG = "config"
     INSTRUCTIONS = "instructions"
 
+
 router = APIRouter(prefix="/api/uploads", tags=["Uploads"])
 logger = logging.getLogger(__name__)
+
 
 def _get_uploads_dir() -> Path:
     """Resolve uploads directory, respecting WORKSPACE_PATH env var."""
@@ -325,7 +327,9 @@ async def get_upload_info(upload_id: str) -> UploadInfo:
 
     return UploadInfo(
         upload_id=metadata["upload_id"],
-        upload_type=metadata.get("upload_type", "documents"),  # Default for legacy uploads
+        upload_type=metadata.get(
+            "upload_type", "documents"
+        ),  # Default for legacy uploads
         files=[UploadedFile(**f) for f in metadata["files"]],
         created_at=metadata["created_at"],
     )

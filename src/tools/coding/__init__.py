@@ -37,6 +37,7 @@ def create_coding_tools(context: ToolContext) -> List[Any]:
     # Include shell tools when ShellManager is available
     if context.shell_manager is not None:
         from .shell_tools import create_shell_tools as _create_shell_tools
+
         tools.extend(_create_shell_tools(context))
 
     return tools

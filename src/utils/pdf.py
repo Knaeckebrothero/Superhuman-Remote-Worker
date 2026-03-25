@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import pdfplumber
+
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
@@ -275,11 +276,10 @@ def format_read_info(info: Dict[str, Any], file_path: str) -> str:
     if info["next_page"]:
         # Suggest reading the next batch
         suggested_end = min(
-            info["next_page"] + len(info["pages_read"]) - 1,
-            info["total_pages"]
+            info["next_page"] + len(info["pages_read"]) - 1, info["total_pages"]
         )
         lines.append(
-            f"To continue: read_file(\"{file_path}\", "
+            f'To continue: read_file("{file_path}", '
             f"page_start={info['next_page']}, page_end={suggested_end})"
         )
 

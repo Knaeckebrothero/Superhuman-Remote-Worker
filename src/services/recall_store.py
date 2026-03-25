@@ -42,17 +42,94 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # English stopwords — small hardcoded set for keyword extraction
-_STOPWORDS = frozenset({
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "is", "was", "are", "were", "be", "been",
-    "being", "have", "has", "had", "do", "does", "did", "will", "would",
-    "could", "should", "may", "might", "shall", "can", "this", "that",
-    "these", "those", "it", "its", "i", "me", "my", "we", "our", "you",
-    "your", "he", "she", "his", "her", "they", "them", "their", "not",
-    "no", "if", "then", "else", "when", "up", "out", "so", "as", "all",
-    "each", "every", "both", "few", "more", "most", "other", "some", "such",
-    "into", "over", "after", "before", "between", "under", "about", "than",
-})
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "with",
+        "by",
+        "from",
+        "is",
+        "was",
+        "are",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "shall",
+        "can",
+        "this",
+        "that",
+        "these",
+        "those",
+        "it",
+        "its",
+        "i",
+        "me",
+        "my",
+        "we",
+        "our",
+        "you",
+        "your",
+        "he",
+        "she",
+        "his",
+        "her",
+        "they",
+        "them",
+        "their",
+        "not",
+        "no",
+        "if",
+        "then",
+        "else",
+        "when",
+        "up",
+        "out",
+        "so",
+        "as",
+        "all",
+        "each",
+        "every",
+        "both",
+        "few",
+        "more",
+        "most",
+        "other",
+        "some",
+        "such",
+        "into",
+        "over",
+        "after",
+        "before",
+        "between",
+        "under",
+        "about",
+        "than",
+    }
+)
 
 
 def extract_keywords(text: str, max_keywords: int = 8) -> List[str]:
@@ -69,7 +146,8 @@ def extract_keywords(text: str, max_keywords: int = 8) -> List[str]:
         List of keyword strings
     """
     import re
-    tokens = re.split(r'[\s\W]+', text.lower())
+
+    tokens = re.split(r"[\s\W]+", text.lower())
     seen: set = set()
     result: List[str] = []
     for token in tokens:
@@ -170,7 +248,9 @@ class RecallStore:
         self.agent_id = agent_id
         self.project_id = project_id
         self._archiver = archiver
-        self.project_scoped = getattr(config, "project_scoped", False) if config else False
+        self.project_scoped = (
+            getattr(config, "project_scoped", False) if config else False
+        )
 
         # Config defaults (matches MemoryConfig dataclass)
         self.dedup_threshold = 0.85
@@ -259,8 +339,7 @@ class RecallStore:
         existing = await self.find_similar(embedding, self.dedup_threshold)
         if existing:
             logger.debug(
-                f"Dedup: updating existing memory {existing.id} "
-                f"instead of creating new"
+                f"Dedup: updating existing memory {existing.id} instead of creating new"
             )
             ttl = remaining_turns if remaining_turns is not None else self.default_ttl
             await self.db.execute(
@@ -286,7 +365,9 @@ class RecallStore:
                     data={
                         "existing_id": str(existing.id),
                         "source": source,
-                        "similarity": round(existing.similarity, 3) if hasattr(existing, "similarity") else None,
+                        "similarity": round(existing.similarity, 3)
+                        if hasattr(existing, "similarity")
+                        else None,
                     },
                 )
             return existing.id
@@ -339,14 +420,14 @@ class RecallStore:
         # Store retrieval messages (trigger phrases) if provided
         if retrieval_messages and mem_id:
             try:
-                rm_count = await self.store_retrieval_messages(mem_id, retrieval_messages)
+                rm_count = await self.store_retrieval_messages(
+                    mem_id, retrieval_messages
+                )
                 logger.debug(
                     f"Stored {rm_count} retrieval messages for memory {mem_id}"
                 )
             except Exception as e:
-                logger.warning(
-                    f"Failed to store retrieval messages for {mem_id}: {e}"
-                )
+                logger.warning(f"Failed to store retrieval messages for {mem_id}: {e}")
 
         logger.debug(
             f"Stored memory {mem_id} (type={memory_type}, source={source}, "
@@ -687,7 +768,11 @@ class RecallStore:
             List of MemoryRecord objects ranked by RRF score
         """
         match_count = match_count or self.max_memories_per_injection
-        importance_floor = importance_floor if importance_floor is not None else self.retrieval_importance_floor
+        importance_floor = (
+            importance_floor
+            if importance_floor is not None
+            else self.retrieval_importance_floor
+        )
 
         if self.project_scoped and self.project_id:
             func_name = "memory_project_hybrid_search"
@@ -862,7 +947,9 @@ class RecallStore:
             return ""
 
         pinned = [m for m in memories if m.remaining_turns and m.remaining_turns > 0]
-        retrieved = [m for m in memories if not (m.remaining_turns and m.remaining_turns > 0)]
+        retrieved = [
+            m for m in memories if not (m.remaining_turns and m.remaining_turns > 0)
+        ]
         tokens_used = sum(m.token_count for m in memories)
 
         lines = []

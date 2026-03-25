@@ -56,30 +56,49 @@ class ToolContext:
     """
 
     workspace_manager: Optional[WorkspaceManager] = None
-    todo_manager: Optional[Any] = None  # TodoManager, imported later to avoid circular deps
+    todo_manager: Optional[Any] = (
+        None  # TodoManager, imported later to avoid circular deps
+    )
     postgres_db: Optional["PostgresDB"] = None
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
-    _source_registry: Dict[str, int] = field(default_factory=dict)  # path/url -> source_id
-    _inaccessible_sources: Dict[str, str] = field(default_factory=dict)  # url -> error message
-    _recent_reads: Deque[str] = field(default_factory=lambda: deque(maxlen=10))  # Recently read file paths
+    _source_registry: Dict[str, int] = field(
+        default_factory=dict
+    )  # path/url -> source_id
+    _inaccessible_sources: Dict[str, str] = field(
+        default_factory=dict
+    )  # url -> error message
+    _recent_reads: Deque[str] = field(
+        default_factory=lambda: deque(maxlen=10)
+    )  # Recently read file paths
     _current_phase: Optional[str] = None
     _llm_config: Optional[Any] = None  # LLMConfig for phase-aware multimodal
-    _instruction_files: List[Any] = field(default_factory=list)  # List[InstructionFileEntry]
+    _instruction_files: List[Any] = field(
+        default_factory=list
+    )  # List[InstructionFileEntry]
     recall_store: Optional[Any] = None  # RecallStore instance (Memory Light)
     shell_manager: Optional[Any] = None  # ShellManager (persistent terminal sessions)
-    knowledge_graph: Optional[Any] = None  # KnowledgeGraphDB (system Neo4j for knowledge base)
+    knowledge_graph: Optional[Any] = (
+        None  # KnowledgeGraphDB (system Neo4j for knowledge base)
+    )
     knowledge_store: Optional[Any] = None  # KnowledgeStore (pgvector search index)
     _project_id: Optional[str] = None  # Project UUID for knowledge scoping
-    _pending_memories: List[Dict[str, Any]] = field(default_factory=list)  # Sync-safe memory queue
-    _freeze_request: Optional[Dict[str, Any]] = None  # Tool-requested job freeze (blocking send_message)
+    _pending_memories: List[Dict[str, Any]] = field(
+        default_factory=list
+    )  # Sync-safe memory queue
+    _freeze_request: Optional[Dict[str, Any]] = (
+        None  # Tool-requested job freeze (blocking send_message)
+    )
 
     def __post_init__(self):
         """Validate context after initialization."""
         # Workspace manager is required for workspace tools
-        if self.workspace_manager is not None and not self.workspace_manager.is_initialized:
+        if (
+            self.workspace_manager is not None
+            and not self.workspace_manager.is_initialized
+        ):
             raise ValueError(
                 "WorkspaceManager must be initialized before creating ToolContext. "
                 "Call workspace_manager.initialize() first."
@@ -213,7 +232,9 @@ class ToolContext:
 
         return self.citation_engine
 
-    def get_or_register_doc_source(self, file_path: str, name: Optional[str] = None) -> int:
+    def get_or_register_doc_source(
+        self, file_path: str, name: Optional[str] = None
+    ) -> int:
         """Get cached source_id or register new document source.
 
         Checks the source registry first to avoid re-registering the same document.
@@ -363,14 +384,16 @@ class ToolContext:
             source_phase: Phase number when memory was created
             memory_type: factual, procedural, error_solution, vocabulary, relational
         """
-        self._pending_memories.append({
-            "content": content,
-            "keywords": keywords,
-            "importance": importance,
-            "source": source,
-            "source_phase": source_phase,
-            "memory_type": memory_type,
-        })
+        self._pending_memories.append(
+            {
+                "content": content,
+                "keywords": keywords,
+                "importance": importance,
+                "source": source,
+                "source_phase": source_phase,
+                "memory_type": memory_type,
+            }
+        )
 
     def drain_pending_memories(self) -> List[Dict[str, Any]]:
         """Return and clear all pending memories.
@@ -470,7 +493,11 @@ class ToolContext:
         """
         required = []
         for entry in self._instruction_files:
-            if entry.enforce and entry.trigger_type == "before_tool" and entry.trigger_target == tool_name:
+            if (
+                entry.enforce
+                and entry.trigger_type == "before_tool"
+                and entry.trigger_target == tool_name
+            ):
                 required.append(entry.file)
         return required
 
@@ -508,7 +535,8 @@ class ToolContext:
             List of InstructionFileEntry objects for this phase
         """
         return [
-            entry for entry in self._instruction_files
+            entry
+            for entry in self._instruction_files
             if entry.trigger_type == "phase" and entry.trigger_target == phase
         ]
 
@@ -534,4 +562,3 @@ class ToolContext:
             phase_config = self._llm_config.get_phase_config(self._current_phase)
             return phase_config.multimodal
         return self.get_config("multimodal", False)
-

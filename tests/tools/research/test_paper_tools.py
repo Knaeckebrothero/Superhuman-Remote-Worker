@@ -139,7 +139,9 @@ class TestDownloadPaper:
     """Tests for download_paper tool."""
 
     @pytest.mark.asyncio
-    async def test_download_arxiv_success(self, mock_tool_context, sample_paper, temp_docs_dir):
+    async def test_download_arxiv_success(
+        self, mock_tool_context, sample_paper, temp_docs_dir
+    ):
         tools = create_paper_tools(mock_tool_context)
         download_paper = next(t for t in tools if t.name == "download_paper")
 
@@ -183,14 +185,17 @@ class TestDownloadPaper:
             paper=paper,
         )
 
-        with patch(
-            "src.tools.research.papers._try_arxiv_download",
-            new_callable=AsyncMock,
-            return_value=DownloadResult(success=False, error="Not on arXiv"),
-        ), patch(
-            "src.tools.research.papers._try_unpaywall_download",
-            new_callable=AsyncMock,
-            return_value=mock_result,
+        with (
+            patch(
+                "src.tools.research.papers._try_arxiv_download",
+                new_callable=AsyncMock,
+                return_value=DownloadResult(success=False, error="Not on arXiv"),
+            ),
+            patch(
+                "src.tools.research.papers._try_unpaywall_download",
+                new_callable=AsyncMock,
+                return_value=mock_result,
+            ),
         ):
             result = await download_paper.ainvoke(
                 {"identifier": "10.1038/test", "identifier_type": "doi"}
@@ -204,18 +209,22 @@ class TestDownloadPaper:
         tools = create_paper_tools(mock_tool_context)
         download_paper = next(t for t in tools if t.name == "download_paper")
 
-        with patch(
-            "src.tools.research.papers._try_arxiv_download",
-            new_callable=AsyncMock,
-            return_value=DownloadResult(success=False, error="Not found"),
-        ), patch(
-            "src.tools.research.papers._try_unpaywall_download",
-            new_callable=AsyncMock,
-            return_value=DownloadResult(success=False, error="Not found"),
-        ), patch(
-            "src.tools.research.papers._try_browser_download",
-            new_callable=AsyncMock,
-            return_value=None,
+        with (
+            patch(
+                "src.tools.research.papers._try_arxiv_download",
+                new_callable=AsyncMock,
+                return_value=DownloadResult(success=False, error="Not found"),
+            ),
+            patch(
+                "src.tools.research.papers._try_unpaywall_download",
+                new_callable=AsyncMock,
+                return_value=DownloadResult(success=False, error="Not found"),
+            ),
+            patch(
+                "src.tools.research.papers._try_browser_download",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
             result = await download_paper.ainvoke(
                 {"identifier": "10.1038/test", "identifier_type": "doi"}
@@ -237,18 +246,21 @@ class TestDownloadPaper:
             access_status=AccessStatus.PAYWALLED,
         )
 
-        with patch(
-            "src.tools.research.papers._try_unpaywall_download",
-            new_callable=AsyncMock,
-            return_value=DownloadResult(
-                success=False,
-                error="No OA PDF",
-                paper=paywalled_paper,
+        with (
+            patch(
+                "src.tools.research.papers._try_unpaywall_download",
+                new_callable=AsyncMock,
+                return_value=DownloadResult(
+                    success=False,
+                    error="No OA PDF",
+                    paper=paywalled_paper,
+                ),
             ),
-        ), patch(
-            "src.tools.research.papers._try_browser_download",
-            new_callable=AsyncMock,
-            return_value=None,
+            patch(
+                "src.tools.research.papers._try_browser_download",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
         ):
             result = await download_paper.ainvoke(
                 {"identifier": "10.1016/test", "identifier_type": "doi"}
@@ -258,7 +270,9 @@ class TestDownloadPaper:
         assert "Paywalled Paper" in result
 
     @pytest.mark.asyncio
-    async def test_download_auto_detects_arxiv(self, mock_tool_context, sample_paper, temp_docs_dir):
+    async def test_download_auto_detects_arxiv(
+        self, mock_tool_context, sample_paper, temp_docs_dir
+    ):
         tools = create_paper_tools(mock_tool_context)
         download_paper = next(t for t in tools if t.name == "download_paper")
 
@@ -285,14 +299,17 @@ class TestDownloadPaper:
         tools = create_paper_tools(mock_tool_context)
         download_paper = next(t for t in tools if t.name == "download_paper")
 
-        with patch(
-            "src.tools.research.papers._try_unpaywall_download",
-            new_callable=AsyncMock,
-            return_value=DownloadResult(success=False, error="No OA"),
-        ), patch(
-            "src.tools.research.papers._try_browser_download",
-            new_callable=AsyncMock,
-            return_value="Downloaded via browser: test.pdf\nPath: /tmp/test.pdf\nSize: 1,234 bytes",
+        with (
+            patch(
+                "src.tools.research.papers._try_unpaywall_download",
+                new_callable=AsyncMock,
+                return_value=DownloadResult(success=False, error="No OA"),
+            ),
+            patch(
+                "src.tools.research.papers._try_browser_download",
+                new_callable=AsyncMock,
+                return_value="Downloaded via browser: test.pdf\nPath: /tmp/test.pdf\nSize: 1,234 bytes",
+            ),
         ):
             result = await download_paper.ainvoke(
                 {
@@ -309,14 +326,17 @@ class TestDownloadPaper:
         tools = create_paper_tools(mock_tool_context)
         download_paper = next(t for t in tools if t.name == "download_paper")
 
-        with patch(
-            "src.tools.research.papers._try_unpaywall_download",
-            new_callable=AsyncMock,
-            return_value=DownloadResult(success=False, error="No OA"),
-        ), patch(
-            "src.tools.research.papers._try_browser_download",
-            new_callable=AsyncMock,
-        ) as mock_browser:
+        with (
+            patch(
+                "src.tools.research.papers._try_unpaywall_download",
+                new_callable=AsyncMock,
+                return_value=DownloadResult(success=False, error="No OA"),
+            ),
+            patch(
+                "src.tools.research.papers._try_browser_download",
+                new_callable=AsyncMock,
+            ) as mock_browser,
+        ):
             result = await download_paper.ainvoke(
                 {
                     "identifier": "10.1038/test",
@@ -342,9 +362,7 @@ class TestGetPaperInfo:
             new_callable=AsyncMock,
             return_value="Paper: Test Paper\nAuthors: Alice\nCitations: 100",
         ):
-            result = await get_paper_info.ainvoke(
-                {"identifier": "10.1038/nature12373"}
-            )
+            result = await get_paper_info.ainvoke({"identifier": "10.1038/nature12373"})
 
         assert "Test Paper" in result
 
@@ -353,14 +371,17 @@ class TestGetPaperInfo:
         tools = create_paper_tools(mock_tool_context)
         get_paper_info = next(t for t in tools if t.name == "get_paper_info")
 
-        with patch(
-            "src.tools.research.papers._get_semantic_scholar_info",
-            new_callable=AsyncMock,
-            return_value=None,
-        ), patch(
-            "src.tools.research.papers._get_arxiv_info",
-            new_callable=AsyncMock,
-            return_value="Paper: Arxiv Paper\narXiv: 1706.03762",
+        with (
+            patch(
+                "src.tools.research.papers._get_semantic_scholar_info",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "src.tools.research.papers._get_arxiv_info",
+                new_callable=AsyncMock,
+                return_value="Paper: Arxiv Paper\narXiv: 1706.03762",
+            ),
         ):
             result = await get_paper_info.ainvoke({"identifier": "1706.03762"})
 
@@ -376,9 +397,7 @@ class TestGetPaperInfo:
             new_callable=AsyncMock,
             return_value=None,
         ):
-            result = await get_paper_info.ainvoke(
-                {"identifier": "10.9999/nonexistent"}
-            )
+            result = await get_paper_info.ainvoke({"identifier": "10.9999/nonexistent"})
 
         assert "Could not find" in result
 

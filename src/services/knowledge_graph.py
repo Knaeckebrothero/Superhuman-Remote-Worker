@@ -43,19 +43,36 @@ from ..database.neo4j_db import Neo4jDB
 logger = logging.getLogger(__name__)
 
 # Valid note types and statuses
-NOTE_TYPES = frozenset({
-    "goal", "plan", "decision", "learning", "code",
-    "source", "question", "state", "retrospective",
-})
+NOTE_TYPES = frozenset(
+    {
+        "goal",
+        "plan",
+        "decision",
+        "learning",
+        "code",
+        "source",
+        "question",
+        "state",
+        "retrospective",
+    }
+)
 
 NOTE_STATUSES = frozenset({"active", "resolved", "superseded", "archived"})
 
 CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
 
-RELATIONSHIP_TYPES = frozenset({
-    "REFERENCES", "DERIVED_FROM", "SUPPORTS", "CONTRADICTS",
-    "ANSWERS", "DEPENDS_ON", "SUPERSEDES", "IMPLEMENTS",
-})
+RELATIONSHIP_TYPES = frozenset(
+    {
+        "REFERENCES",
+        "DERIVED_FROM",
+        "SUPPORTS",
+        "CONTRADICTS",
+        "ANSWERS",
+        "DEPENDS_ON",
+        "SUPERSEDES",
+        "IMPLEMENTS",
+    }
+)
 
 
 def slugify(title: str, max_length: int = 80) -> str:
@@ -69,10 +86,10 @@ def slugify(title: str, max_length: int = 80) -> str:
         Lowercase hyphenated slug (e.g., "chose-jwt-over-oauth")
     """
     slug = title.lower().strip()
-    slug = re.sub(r'[^a-z0-9\s-]', '', slug)
-    slug = re.sub(r'[\s_]+', '-', slug)
-    slug = re.sub(r'-+', '-', slug)
-    slug = slug.strip('-')
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"[\s_]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug)
+    slug = slug.strip("-")
     return slug[:max_length]
 
 
@@ -146,9 +163,13 @@ class KnowledgeGraphDB:
             ValueError: If note_type or confidence is invalid
         """
         if note_type not in NOTE_TYPES:
-            raise ValueError(f"Invalid note_type: {note_type}. Must be one of {NOTE_TYPES}")
+            raise ValueError(
+                f"Invalid note_type: {note_type}. Must be one of {NOTE_TYPES}"
+            )
         if confidence and confidence not in CONFIDENCE_LEVELS:
-            raise ValueError(f"Invalid confidence: {confidence}. Must be one of {CONFIDENCE_LEVELS}")
+            raise ValueError(
+                f"Invalid confidence: {confidence}. Must be one of {CONFIDENCE_LEVELS}"
+            )
 
         slug = slugify(title)
         if not slug:
@@ -197,7 +218,7 @@ class KnowledgeGraphDB:
         )
 
         # Create Tag nodes and relationships
-        for tag in (tags or []):
+        for tag in tags or []:
             self._db.execute_write(
                 """
                 MATCH (n:Note {project_id: $pid, id: $nid})
@@ -208,7 +229,7 @@ class KnowledgeGraphDB:
             )
 
         # Create Keyword nodes and relationships
-        for kw in (keywords or []):
+        for kw in keywords or []:
             self._db.execute_write(
                 """
                 MATCH (n:Note {project_id: $pid, id: $nid})
@@ -219,7 +240,7 @@ class KnowledgeGraphDB:
             )
 
         # Create relationships to other notes
-        for link in (links or []):
+        for link in links or []:
             rel_type = link.get("type", "REFERENCES")
             target = link.get("target")
             if not target:
@@ -237,7 +258,9 @@ class KnowledgeGraphDB:
                 {"pid": project_id, "src": slug, "tgt": target},
             )
 
-        logger.debug(f"Created knowledge note: {slug} (type={note_type}, project={project_id})")
+        logger.debug(
+            f"Created knowledge note: {slug} (type={note_type}, project={project_id})"
+        )
         return slug
 
     # =========================================================================
@@ -273,7 +296,7 @@ class KnowledgeGraphDB:
         node = record["n"]
 
         # Get node properties (handle both dict and Node types)
-        if hasattr(node, 'items'):
+        if hasattr(node, "items"):
             props = dict(node.items())
         elif isinstance(node, dict):
             props = dict(node)
@@ -292,7 +315,11 @@ class KnowledgeGraphDB:
             {"pid": project_id, "nid": note_id},
         )
         props["relationships"] = [
-            {"type": r["rel_type"], "target": r["target_id"], "target_title": r.get("target_title")}
+            {
+                "type": r["rel_type"],
+                "target": r["target_id"],
+                "target_title": r.get("target_title"),
+            }
             for r in rels
         ]
 
@@ -305,7 +332,11 @@ class KnowledgeGraphDB:
             {"pid": project_id, "nid": note_id},
         )
         props["incoming_relationships"] = [
-            {"type": r["rel_type"], "source": r["source_id"], "source_title": r.get("source_title")}
+            {
+                "type": r["rel_type"],
+                "source": r["source_id"],
+                "source_title": r.get("source_title"),
+            }
             for r in incoming
         ]
 
@@ -438,13 +469,13 @@ class KnowledgeGraphDB:
         self._db.execute_write(
             f"""
             MATCH (n:Note {{project_id: $pid, id: $nid}})
-            SET {', '.join(set_clauses)}
+            SET {", ".join(set_clauses)}
             """,
             params,
         )
 
         # Add new tags
-        for tag in (add_tags or []):
+        for tag in add_tags or []:
             self._db.execute_write(
                 """
                 MATCH (n:Note {project_id: $pid, id: $nid})
@@ -455,7 +486,7 @@ class KnowledgeGraphDB:
             )
 
         # Add new relationships
-        for link in (add_links or []):
+        for link in add_links or []:
             rel_type = link.get("type", "REFERENCES")
             target = link.get("target")
             if not target or rel_type not in RELATIONSHIP_TYPES:
@@ -611,7 +642,7 @@ class KnowledgeGraphDB:
         result = []
         for record in notes:
             node = record["n"]
-            if hasattr(node, 'items'):
+            if hasattr(node, "items"):
                 props = dict(node.items())
             elif isinstance(node, dict):
                 props = dict(node)
@@ -631,8 +662,7 @@ class KnowledgeGraphDB:
                 {"pid": project_id, "nid": note_id},
             )
             props["relationships"] = [
-                {"type": r["rel_type"], "target": r["target_id"]}
-                for r in rels
+                {"type": r["rel_type"], "target": r["target_id"]} for r in rels
             ]
 
             result.append(props)

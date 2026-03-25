@@ -115,7 +115,9 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             # Enforcement of todo_guide.md read is now config-driven via
             # instruction_files triggers (apply_instruction_enforcement wrapper).
             # Fallback check for backward compat when no instruction_files configured:
-            if not context._instruction_files and not context.was_recently_read("todo_guide.md"):
+            if not context._instruction_files and not context.was_recently_read(
+                "todo_guide.md"
+            ):
                 return (
                     "Error: You must read_file('todo_guide.md') before creating todos. "
                     "The guide contains critical instructions on how to craft effective, "
@@ -125,6 +127,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
             # Convert to list if it's a string (JSON)
             if isinstance(todos, str):
                 import json
+
                 todos = json.loads(todos)
 
             if not isinstance(todos, list):
@@ -201,7 +204,7 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                     return (
                         "Error: Complete one todo at a time. Each todo_complete call should "
                         "reflect verified work for that specific task.\n"
-                        f"Call todo_complete(todo_id=\"{ids[0]}\") for the first task, "
+                        f'Call todo_complete(todo_id="{ids[0]}") for the first task, '
                         "then call again for each subsequent task."
                     )
 
@@ -214,14 +217,17 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                         if available:
                             todo_list_str = ", ".join(t.id for t in available)
                             return f"Error: Todo '{ids[0]}' not found. Available todos: {todo_list_str}"
-                        return f"Error: Todo '{ids[0]}' not found. No todos in the list."
+                        return (
+                            f"Error: Todo '{ids[0]}' not found. No todos in the list."
+                        )
 
                     # Queue memory for completed todo with notes (Memory Light)
                     # Only store if notes contain substantive content (>50 chars)
                     if context.recall_store and todo.notes:
-                        combined_notes = '; '.join(todo.notes)
+                        combined_notes = "; ".join(todo.notes)
                         if len(combined_notes) > 50:
                             from src.services.recall_store import extract_keywords
+
                             context.queue_memory(
                                 content=f"Completed: {todo.content}\nOutcome: {combined_notes}",
                                 keywords=extract_keywords(todo.content),
@@ -297,7 +303,9 @@ def create_todo_tools(context: ToolContext) -> List[Any]:
                 status_mark = "x" if todo.status.value == "completed" else " "
                 status_text = f"({todo.status.value})"
                 priority_mark = " [!]" if todo.priority == "high" else ""
-                lines.append(f"- [{status_mark}] {todo.id}: {todo.content}{priority_mark} {status_text}")
+                lines.append(
+                    f"- [{status_mark}] {todo.id}: {todo.content}{priority_mark} {status_text}"
+                )
 
             return "\n".join(lines)
 

@@ -26,7 +26,9 @@ def create_workspace_tools(context: ToolContext) -> List[Any]:
         ValueError: If context doesn't have a workspace_manager
     """
     if not context.has_workspace():
-        raise ValueError("ToolContext must have a workspace_manager for workspace tools")
+        raise ValueError(
+            "ToolContext must have a workspace_manager for workspace tools"
+        )
 
     from .files import create_file_tools
     from .filesystem import create_filesystem_tools
@@ -51,4 +53,5 @@ def _get_combined_metadata() -> Dict[str, Dict[str, Any]]:
     """Internal: get combined metadata (called at module level for registry)."""
     from .files import FILE_TOOLS_METADATA
     from .filesystem import FILESYSTEM_TOOLS_METADATA
+
     return {**FILE_TOOLS_METADATA, **FILESYSTEM_TOOLS_METADATA}

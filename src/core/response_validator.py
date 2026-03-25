@@ -47,7 +47,9 @@ class DegenerationPattern:
 # ---------------------------------------------------------------------------
 
 
-def _detect_tag_repetition(content: str, max_tag_repetitions: int = 50, **_) -> Optional[str]:
+def _detect_tag_repetition(
+    content: str, max_tag_repetitions: int = 50, **_
+) -> Optional[str]:
     """Detect closing XML/HTML tags repeated excessively (e.g. </invoke> spam)."""
     # Find all closing tags
     closing_tags = re.findall(r"</\w[\w:.-]*>", content)
@@ -61,11 +63,15 @@ def _detect_tag_repetition(content: str, max_tag_repetitions: int = 50, **_) -> 
 
     for tag, count in tag_counts.items():
         if count > max_tag_repetitions:
-            return f"Tag {tag} repeated {count} times (threshold: {max_tag_repetitions})"
+            return (
+                f"Tag {tag} repeated {count} times (threshold: {max_tag_repetitions})"
+            )
     return None
 
 
-def _detect_token_repetition(content: str, max_token_repetitions: int = 20, **_) -> Optional[str]:
+def _detect_token_repetition(
+    content: str, max_token_repetitions: int = 20, **_
+) -> Optional[str]:
     """Detect a single token/word repeating consecutively."""
     words = content.split()
     if len(words) < max_token_repetitions:
@@ -93,7 +99,9 @@ def _detect_token_repetition(content: str, max_token_repetitions: int = 20, **_)
     return None
 
 
-def _detect_line_repetition(content: str, max_line_repetitions: int = 10, **_) -> Optional[str]:
+def _detect_line_repetition(
+    content: str, max_line_repetitions: int = 10, **_
+) -> Optional[str]:
     """Detect the same line repeating many times."""
     lines = content.splitlines()
     if len(lines) < max_line_repetitions:
@@ -283,7 +291,9 @@ def validate_response(
     if result.is_degenerate:
         # Show first 500 chars + last 200 chars for context
         if len(content) > 800:
-            result.truncated_content = content[:500] + "\n...[truncated]...\n" + content[-200:]
+            result.truncated_content = (
+                content[:500] + "\n...[truncated]...\n" + content[-200:]
+            )
         else:
             result.truncated_content = content
 

@@ -254,7 +254,9 @@ class LLMArchiver:
                         sort=[("step_number", -1)],
                         projection={"step_number": 1},
                     )
-                    self._step_counters[job_id] = max_doc["step_number"] if max_doc else 0
+                    self._step_counters[job_id] = (
+                        max_doc["step_number"] if max_doc else 0
+                    )
                 except Exception:
                     self._step_counters[job_id] = 0
             else:
@@ -348,17 +350,20 @@ class LLMArchiver:
 
             # Count tokens approximately
             total_input_chars = sum(
-                len(_normalize_content(m.content))
-                for m in messages
+                len(_normalize_content(m.content)) for m in messages
             )
             response_chars = len(_normalize_content(response.content))
 
             doc["metrics"] = {
                 "input_chars": total_input_chars,
                 "output_chars": response_chars,
-                "tool_calls": len(response.tool_calls) if hasattr(response, "tool_calls") and response.tool_calls else 0,
+                "tool_calls": len(response.tool_calls)
+                if hasattr(response, "tool_calls") and response.tool_calls
+                else 0,
                 # Token usage from response metadata (includes reasoning_tokens for supported models)
-                "token_usage": getattr(response, "response_metadata", {}).get("token_usage", {}),
+                "token_usage": getattr(response, "response_metadata", {}).get(
+                    "token_usage", {}
+                ),
             }
 
             # Insert
@@ -570,7 +575,9 @@ class LLMArchiver:
             response_data: Dict[str, Any] = {
                 "content": resp_content,
                 "content_preview": self._truncate_string(resp_content, 500),
-                "has_tool_calls": bool(response.tool_calls) if hasattr(response, "tool_calls") else False,
+                "has_tool_calls": bool(response.tool_calls)
+                if hasattr(response, "tool_calls")
+                else False,
             }
 
             # Add tool calls if present
@@ -579,7 +586,9 @@ class LLMArchiver:
                     {
                         "id": tc.get("id", ""),
                         "name": tc.get("name", ""),
-                        "args_preview": self._truncate_string(str(tc.get("args", {})), 200),
+                        "args_preview": self._truncate_string(
+                            str(tc.get("args", {})), 200
+                        ),
                     }
                     for tc in response.tool_calls
                 ]
@@ -591,7 +600,9 @@ class LLMArchiver:
                 if reasoning_content:
                     reasoning = {
                         "content": reasoning_content,
-                        "content_preview": self._truncate_string(reasoning_content, 500),
+                        "content_preview": self._truncate_string(
+                            reasoning_content, 500
+                        ),
                     }
 
             # Build document
@@ -829,15 +840,16 @@ class LLMArchiver:
                 update_data["tool.error"] = self._truncate_string(error, 500)
 
             result_obj = self._audit_collection.update_one(
-                {"_id": ObjectId(audit_doc_id)},
-                {"$set": update_data}
+                {"_id": ObjectId(audit_doc_id)}, {"$set": update_data}
             )
 
             if result_obj.modified_count > 0:
                 logger.debug(f"[AUDIT] Updated tool result: {audit_doc_id[-8:]}")
                 return True
             else:
-                logger.warning(f"[AUDIT] No document updated for tool result: {audit_doc_id}")
+                logger.warning(
+                    f"[AUDIT] No document updated for tool result: {audit_doc_id}"
+                )
                 return False
 
         except Exception as e:
@@ -941,15 +953,16 @@ class LLMArchiver:
             }
 
             result = self._audit_collection.update_one(
-                {"_id": ObjectId(audit_doc_id)},
-                {"$set": update_data}
+                {"_id": ObjectId(audit_doc_id)}, {"$set": update_data}
             )
 
             if result.modified_count > 0:
                 logger.debug(f"[AUDIT] Updated LLM response: {audit_doc_id[-8:]}")
                 return True
             else:
-                logger.warning(f"[AUDIT] No document updated for LLM response: {audit_doc_id}")
+                logger.warning(
+                    f"[AUDIT] No document updated for LLM response: {audit_doc_id}"
+                )
                 return False
 
         except Exception as e:
@@ -981,9 +994,7 @@ class LLMArchiver:
                 query["step_type"] = step_type
 
             cursor = (
-                self._audit_collection.find(query)
-                .sort("step_number", 1)
-                .limit(limit)
+                self._audit_collection.find(query).sort("step_number", 1).limit(limit)
             )
             return list(cursor)
 

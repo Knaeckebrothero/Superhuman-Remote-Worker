@@ -73,9 +73,15 @@ Example:
 """
 
 # Valid memory types for validation
-_VALID_TYPES = frozenset({
-    "factual", "procedural", "error_solution", "vocabulary", "relational",
-})
+_VALID_TYPES = frozenset(
+    {
+        "factual",
+        "procedural",
+        "error_solution",
+        "vocabulary",
+        "relational",
+    }
+)
 
 # Max messages to include in a single observation window
 _MAX_OBSERVATION_WINDOW = 40
@@ -152,7 +158,9 @@ class MemoryObserver:
             # Get recent messages (within window)
             segment = self._get_message_segment(messages, window_start, current_turn)
             if not segment:
-                logger.debug(f"Observer: no messages in window [{window_start}:{current_turn}]")
+                logger.debug(
+                    f"Observer: no messages in window [{window_start}:{current_turn}]"
+                )
                 return []
 
             # Extract memories via LLM
@@ -210,7 +218,11 @@ class MemoryObserver:
         """
         try:
             # Use the last N messages as the segment
-            segment = messages[-_MAX_OBSERVATION_WINDOW:] if len(messages) > _MAX_OBSERVATION_WINDOW else messages
+            segment = (
+                messages[-_MAX_OBSERVATION_WINDOW:]
+                if len(messages) > _MAX_OBSERVATION_WINDOW
+                else messages
+            )
             if not segment:
                 return []
 
@@ -233,7 +245,9 @@ class MemoryObserver:
                     if mem_id:
                         stored_count += 1
                 except Exception as e:
-                    logger.warning(f"Observer (phase boundary): failed to store memory: {e}")
+                    logger.warning(
+                        f"Observer (phase boundary): failed to store memory: {e}"
+                    )
 
             logger.info(
                 f"Observer (phase boundary): extracted {len(extracted)}, "
@@ -266,13 +280,17 @@ class MemoryObserver:
         # Call LLM with extraction prompt
         try:
             llm_messages = [
-                HumanMessage(content=f"{EXTRACTION_PROMPT}\n\n--- Conversation Segment ---\n{conversation_text}\n--- End Segment ---")
+                HumanMessage(
+                    content=f"{EXTRACTION_PROMPT}\n\n--- Conversation Segment ---\n{conversation_text}\n--- End Segment ---"
+                )
             ]
             response = await asyncio.wait_for(
                 self.llm.ainvoke(llm_messages),
                 timeout=self._timeout,
             )
-            raw_content = response.content if hasattr(response, "content") else str(response)
+            raw_content = (
+                response.content if hasattr(response, "content") else str(response)
+            )
         except Exception as e:
             logger.warning(f"Observer: LLM extraction call failed: {e}")
             return []
@@ -367,7 +385,7 @@ class MemoryObserver:
         if text.startswith("```"):
             # Remove opening fence (with optional language tag)
             first_newline = text.index("\n") if "\n" in text else len(text)
-            text = text[first_newline + 1:]
+            text = text[first_newline + 1 :]
             # Remove closing fence
             if text.rstrip().endswith("```"):
                 text = text.rstrip()[:-3].rstrip()
@@ -381,9 +399,11 @@ class MemoryObserver:
             end = text.rfind("]")
             if start != -1 and end != -1 and end > start:
                 try:
-                    data = json.loads(text[start:end + 1])
+                    data = json.loads(text[start : end + 1])
                 except json.JSONDecodeError:
-                    logger.warning("Observer: failed to parse extraction response as JSON")
+                    logger.warning(
+                        "Observer: failed to parse extraction response as JSON"
+                    )
                     return []
             else:
                 logger.warning("Observer: no JSON array found in extraction response")
@@ -420,13 +440,17 @@ class MemoryObserver:
                 keywords = []
             keywords = [str(k).lower() for k in keywords if k][:8]
 
-            validated.append({
-                "content": str(item["content"]).strip(),
-                "summary": str(item.get("summary", ""))[:100] if item.get("summary") else None,
-                "keywords": keywords,
-                "importance": importance,
-                "type": mem_type,
-            })
+            validated.append(
+                {
+                    "content": str(item["content"]).strip(),
+                    "summary": str(item.get("summary", ""))[:100]
+                    if item.get("summary")
+                    else None,
+                    "keywords": keywords,
+                    "importance": importance,
+                    "type": mem_type,
+                }
+            )
 
         return validated
 

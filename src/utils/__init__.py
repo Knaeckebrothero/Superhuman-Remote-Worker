@@ -26,34 +26,37 @@ try:
         get_citation_engine_config,
         create_citation_tools,
     )
+
     _citation_available = True
 except ImportError:
     _citation_available = False
 
 __all__ = [
     # Document Processing
-    'DocumentProcessor',
-    'DocumentExtractor',
-    'DocumentChunker',
+    "DocumentProcessor",
+    "DocumentExtractor",
+    "DocumentChunker",
     # Document Models
-    'DocumentChunk',
-    'DocumentMetadata',
-    'RequirementCandidate',
-    'ValidatedRequirement',
-    'ProcessingOptions',
-    'PipelineReport',
+    "DocumentChunk",
+    "DocumentMetadata",
+    "RequirementCandidate",
+    "ValidatedRequirement",
+    "ProcessingOptions",
+    "PipelineReport",
     # Configuration
-    'load_config',
-    'load_prompt',
-    'get_project_root',
+    "load_config",
+    "load_prompt",
+    "get_project_root",
 ]
 
 # Add citation exports if available
 if _citation_available:
-    __all__.extend([
-        'CitationHelper',
-        'create_citation_engine',
-        'is_citation_engine_available',
-        'get_citation_engine_config',
-        'create_citation_tools',
-    ])
+    __all__.extend(
+        [
+            "CitationHelper",
+            "create_citation_engine",
+            "is_citation_engine_available",
+            "get_citation_engine_config",
+            "create_citation_tools",
+        ]
+    )

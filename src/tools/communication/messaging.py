@@ -261,14 +261,16 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
 
         # If blocking mode, request job freeze
         if mode == "blocking" and resp.status_code == 200:
-            context.request_freeze({
-                "status": "waiting_for_reply",
-                "freeze_type": "blocking_message",
-                "thread_id": thread_id,
-                "subject": subject,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "job_id": job_id,
-            })
+            context.request_freeze(
+                {
+                    "status": "waiting_for_reply",
+                    "freeze_type": "blocking_message",
+                    "thread_id": thread_id,
+                    "subject": subject,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "job_id": job_id,
+                }
+            )
 
             return (
                 f"Message sent to {masked_recipient} (thread: {thread_id}).\n"

@@ -195,7 +195,9 @@ class TestEmbeddingProviders:
         assert service.provider == "local"
         assert service.api_key == "test-key-123"
 
-    def test_unknown_provider_falls_back_to_local(self, mock_env, monkeypatch, mock_openai_client):
+    def test_unknown_provider_falls_back_to_local(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
         """Unknown provider name falls back to local behavior."""
         monkeypatch.setenv("EMBEDDING_PROVIDER", "nonexistent")
 

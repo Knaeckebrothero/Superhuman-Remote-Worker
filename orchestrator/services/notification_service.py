@@ -45,7 +45,9 @@ class NotificationService:
         self._notification_feed: Any = None
         self._available = False
 
-        self._cockpit_url = os.getenv("COCKPIT_EXTERNAL_URL", "http://localhost:4200").rstrip("/")
+        self._cockpit_url = os.getenv(
+            "COCKPIT_EXTERNAL_URL", "http://localhost:4200"
+        ).rstrip("/")
 
         # Initialize transports (each checks its own env vars)
         self._transports = {
@@ -138,7 +140,8 @@ class NotificationService:
             results["queued"] = True
             logger.info(
                 "Notification queued (quiet hours): job=%s, subject=%s",
-                job_id[:8], subject,
+                job_id[:8],
+                subject,
             )
 
             # Still broadcast to cockpit SSE (in-app is not affected by quiet hours)
@@ -216,7 +219,9 @@ class NotificationService:
             return {}
 
         # Build digest body
-        lines = [f"You have {len(notifications)} notification(s) from while you were away:\n"]
+        lines = [
+            f"You have {len(notifications)} notification(s) from while you were away:\n"
+        ]
         for n in notifications:
             lines.append(f"**{n['subject']}**")
             lines.append(f"{n['message'][:200]}")

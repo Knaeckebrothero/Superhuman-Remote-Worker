@@ -101,6 +101,7 @@ class DocumentRenderer:
         """Check if pdf2image and poppler are available."""
         try:
             import pdf2image  # noqa: F401
+
             # Quick test to see if poppler is installed
             # This will fail fast if poppler is missing
             return True
@@ -310,8 +311,7 @@ class DocumentRenderer:
             return self.render_docx_page(file_path, page_num, dpi)
         else:
             raise ValueError(
-                f"Unsupported document type: {suffix}. "
-                f"Supported: .pdf, .pptx, .docx"
+                f"Unsupported document type: {suffix}. Supported: .pdf, .pptx, .docx"
             )
 
     def get_page_count(self, file_path: Path) -> int:
@@ -336,8 +336,7 @@ class DocumentRenderer:
             return self._get_docx_page_count(file_path)
         else:
             raise ValueError(
-                f"Unsupported document type: {suffix}. "
-                f"Supported: .pdf, .pptx, .docx"
+                f"Unsupported document type: {suffix}. Supported: .pdf, .pptx, .docx"
             )
 
     def _get_pdf_page_count(self, file_path: Path) -> int:
@@ -372,9 +371,7 @@ class DocumentRenderer:
         """
         if not self.libreoffice_path:
             # Fallback: estimate based on content
-            logger.warning(
-                "LibreOffice not available - estimating DOCX page count"
-            )
+            logger.warning("LibreOffice not available - estimating DOCX page count")
             return self._estimate_docx_pages(file_path)
 
         # Convert to PDF and count pages
@@ -398,10 +395,7 @@ class DocumentRenderer:
             doc = Document(file_path)
 
             # Rough estimate: ~500 words per page
-            word_count = sum(
-                len(para.text.split())
-                for para in doc.paragraphs
-            )
+            word_count = sum(len(para.text.split()) for para in doc.paragraphs)
             estimated_pages = max(1, word_count // 500)
 
             logger.debug(
@@ -439,8 +433,10 @@ class DocumentRenderer:
                 [
                     self.libreoffice_path,
                     "--headless",
-                    "--convert-to", "pdf",
-                    "--outdir", str(temp_dir),
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    str(temp_dir),
                     str(file_path),
                 ],
                 capture_output=True,
@@ -450,9 +446,7 @@ class DocumentRenderer:
 
             if result.returncode != 0:
                 logger.error(f"LibreOffice conversion failed: {result.stderr}")
-                raise RuntimeError(
-                    f"LibreOffice conversion failed: {result.stderr}"
-                )
+                raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
 
             # Find the output PDF
             pdf_name = file_path.stem + ".pdf"
@@ -473,9 +467,7 @@ class DocumentRenderer:
             return pdf_path
 
         except subprocess.TimeoutExpired:
-            raise RuntimeError(
-                f"LibreOffice conversion timed out for {file_path}"
-            )
+            raise RuntimeError(f"LibreOffice conversion timed out for {file_path}")
         except Exception:
             # Clean up temp dir on error
             shutil.rmtree(temp_dir, ignore_errors=True)

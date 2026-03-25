@@ -118,7 +118,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },
-"get_document_info": {
+    "get_document_info": {
         "module": "workspace.filesystem",
         "function": "get_document_info",
         "description": "Get document metadata (page count, size) for planning access",
@@ -157,7 +157,9 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         ValueError: If context doesn't have a workspace_manager
     """
     if not context.has_workspace():
-        raise ValueError("ToolContext must have a workspace_manager for filesystem tools")
+        raise ValueError(
+            "ToolContext must have a workspace_manager for filesystem tools"
+        )
 
     workspace = context.workspace_manager
 
@@ -218,7 +220,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 return item_path
             prefix = base_path.rstrip("/") + "/"
             if item_path.startswith(prefix):
-                return item_path[len(prefix):]
+                return item_path[len(prefix) :]
             return item_path
 
         def list_recursive(dir_path: str, current_depth: int, indent: str) -> list[str]:
@@ -241,7 +243,9 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 lines.append(f"{indent}{_strip_prefix(d, dir_path)}")
                 if current_depth < depth:
                     # d is already workspace-relative, use directly
-                    sub_lines = list_recursive(d.rstrip("/"), current_depth + 1, indent + "  ")
+                    sub_lines = list_recursive(
+                        d.rstrip("/"), current_depth + 1, indent + "  "
+                    )
                     lines.extend(sub_lines)
 
             return lines
@@ -316,11 +320,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             return f"Error deleting: {str(e)}"
 
     @tool
-    def search_files(
-        query: str,
-        path: str = "",
-        case_sensitive: bool = False
-    ) -> str:
+    def search_files(query: str, path: str = "", case_sensitive: bool = False) -> str:
         """Search for text content in workspace files.
 
         Searches through all text files and returns matching lines
@@ -336,9 +336,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         """
         try:
             results = workspace.search_files(
-                query,
-                path=path,
-                case_sensitive=case_sensitive
+                query, path=path, case_sensitive=case_sensitive
             )
 
             if not results:
@@ -456,8 +454,13 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         try:
             # Extract directory from original path and combine with new name
             from pathlib import Path as PurePath
+
             original = PurePath(path)
-            new_path = str(original.parent / new_name) if original.parent != PurePath(".") else new_name
+            new_path = (
+                str(original.parent / new_name)
+                if original.parent != PurePath(".")
+                else new_name
+            )
 
             workspace.move_file(path, new_path)
             return f"Renamed: {path} -> {new_path}"
@@ -519,7 +522,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 return f"Error: '{path}' is a directory, not a file."
 
             # For PDF files, get detailed info
-            if full_path.suffix.lower() == '.pdf':
+            if full_path.suffix.lower() == ".pdf":
                 if not pdf_reader.is_available():
                     return "Error: PDF info requires pdfplumber. Install with: pip install pdfplumber"
 
@@ -542,14 +545,26 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                     else:
                         # Estimate how many pages fit in one read
                         chars_per_page = info.get("estimated_chars_per_page", 3000)
-                        words_per_page = chars_per_page // 5  # Approximate words per page
-                        pages_per_read = max(1, max_read_words // words_per_page) if words_per_page > 0 else 1
+                        words_per_page = (
+                            chars_per_page // 5
+                        )  # Approximate words per page
+                        pages_per_read = (
+                            max(1, max_read_words // words_per_page)
+                            if words_per_page > 0
+                            else 1
+                        )
 
-                        lines.append(f"Suggested approach (document exceeds single-read limit of ~{max_read_words:,} words):")
+                        lines.append(
+                            f"Suggested approach (document exceeds single-read limit of ~{max_read_words:,} words):"
+                        )
                         lines.append(f"- Read ~{pages_per_read} pages at a time")
-                        lines.append(f'- Start with: read_file("{path}", page_start=1, page_end={min(pages_per_read, page_count)})')
+                        lines.append(
+                            f'- Start with: read_file("{path}", page_start=1, page_end={min(pages_per_read, page_count)})'
+                        )
                         if page_count > pages_per_read:
-                            lines.append(f'- Continue with: read_file("{path}", page_start={pages_per_read + 1}, page_end={min(pages_per_read * 2, page_count)})')
+                            lines.append(
+                                f'- Continue with: read_file("{path}", page_start={pages_per_read + 1}, page_end={min(pages_per_read * 2, page_count)})'
+                            )
 
                     return "\n".join(lines)
 
@@ -572,7 +587,9 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 lines.append("\nThis file fits in a single read.")
                 lines.append(f'Use: read_file("{path}")')
             else:
-                lines.append(f"\nFile exceeds single-read limit (~{max_read_words:,} words).")
+                lines.append(
+                    f"\nFile exceeds single-read limit (~{max_read_words:,} words)."
+                )
                 lines.append("Consider using search_files() or chunking.")
 
             return "\n".join(lines)

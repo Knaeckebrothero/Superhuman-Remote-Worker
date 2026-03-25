@@ -58,6 +58,7 @@ RESEARCH_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 def _get_tavily_api_key() -> Optional[str]:
     """Get Tavily API key from environment."""
     import os
+
     return os.getenv("TAVILY_API_KEY")
 
 
@@ -73,7 +74,9 @@ def _truncate_content(content: str, max_words: int = MAX_RAW_CONTENT_WORDS) -> s
     """Truncate content to max_words, appending a note if truncated."""
     words = content.split()
     if len(words) > max_words:
-        return ' '.join(words[:max_words]) + f"\n... (truncated from {len(words)} words)"
+        return (
+            " ".join(words[:max_words]) + f"\n... (truncated from {len(words)} words)"
+        )
     return content
 
 
@@ -117,9 +120,14 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             Search results with snippets (or full content), URLs, and source IDs
         """
         return _direct_web_search(
-            query, max_results, context,
-            search_depth=search_depth, topic=topic, time_range=time_range,
-            include_domains=include_domains, exclude_domains=exclude_domains,
+            query,
+            max_results,
+            context,
+            search_depth=search_depth,
+            topic=topic,
+            time_range=time_range,
+            include_domains=include_domains,
+            exclude_domains=exclude_domains,
             include_raw_content=include_raw_content,
         )
 
@@ -175,9 +183,14 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             Crawled content from each page with source IDs for citation
         """
         return _crawl_website(
-            url, context, instructions=instructions,
-            max_depth=max_depth, max_breadth=max_breadth, limit=limit,
-            select_paths=select_paths, exclude_paths=exclude_paths,
+            url,
+            context,
+            instructions=instructions,
+            max_depth=max_depth,
+            max_breadth=max_breadth,
+            limit=limit,
+            select_paths=select_paths,
+            exclude_paths=exclude_paths,
         )
 
     @tool
@@ -207,9 +220,12 @@ def create_web_tools(context: ToolContext) -> List[Any]:
             List of discovered URLs
         """
         return _map_website(
-            url, instructions=instructions,
-            max_depth=max_depth, limit=limit,
-            select_paths=select_paths, exclude_paths=exclude_paths,
+            url,
+            instructions=instructions,
+            max_depth=max_depth,
+            limit=limit,
+            select_paths=select_paths,
+            exclude_paths=exclude_paths,
         )
 
     return [web_search, extract_webpage, crawl_website, map_website]
@@ -282,11 +298,13 @@ def _direct_web_search(
         inaccessible_sources = []
         if context is not None:
             for r in results:
-                url = r.get('url', '')
-                title = r.get('title', 'Untitled')
+                url = r.get("url", "")
+                title = r.get("title", "Untitled")
                 if url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(url, name=title)
+                        source_id, fetch_error = context.get_or_register_web_source(
+                            url, name=title
+                        )
                         registered_sources.append((url, source_id))
                         if fetch_error:
                             inaccessible_sources.append((url, source_id))
@@ -296,13 +314,17 @@ def _direct_web_search(
         # Save web content to disk for persistence
         if context is not None:
             for r in results:
-                url = r.get('url', '')
+                url = r.get("url", "")
                 if url:
-                    content = r.get('raw_content', r.get('content', ''))
+                    content = r.get("raw_content", r.get("content", ""))
                     if content and len(content) > 50:
-                        title = r.get('title', 'Untitled')
-                        source_id = next((sid for u, sid in registered_sources if u == url), None)
-                        context.save_web_content_to_disk(url, content, title=title, source_id=source_id)
+                        title = r.get("title", "Untitled")
+                        source_id = next(
+                            (sid for u, sid in registered_sources if u == url), None
+                        )
+                        context.save_web_content_to_disk(
+                            url, content, title=title, source_id=source_id
+                        )
 
         # Format output
         result = f"Web Search Results for: {query}\n"
@@ -312,18 +334,20 @@ def _direct_web_search(
             result += f"Results: {len(results)}\n\n"
 
         for i, r in enumerate(results, 1):
-            url = r.get('url', 'N/A')
+            url = r.get("url", "N/A")
             source_id = next((sid for u, sid in registered_sources if u == url), None)
             is_inaccessible = any(u == url for u, _ in inaccessible_sources)
             result += f"{i}. {r.get('title', 'Untitled')}\n"
             result += f"   URL: {url}\n"
             if source_id and is_inaccessible:
-                result += f"   Source ID: {source_id} (INACCESSIBLE - content not fetched)\n"
+                result += (
+                    f"   Source ID: {source_id} (INACCESSIBLE - content not fetched)\n"
+                )
             elif source_id:
                 result += f"   Source ID: {source_id} (archived)\n"
 
             if include_raw_content:
-                content = r.get('raw_content', r.get('content', ''))
+                content = r.get("raw_content", r.get("content", ""))
                 result += f"   {_truncate_content(content)}\n\n"
             else:
                 result += f"   {r.get('content', '')[:300]}...\n\n"
@@ -442,7 +466,9 @@ def _extract_webpage(
                 output += f"  - {u}\n"
 
         if registered:
-            output += "\nTo cite: use cite_web(text, url) - sources are already archived."
+            output += (
+                "\nTo cite: use cite_web(text, url) - sources are already archived."
+            )
 
         return output
 
@@ -519,7 +545,9 @@ def _crawl_website(
                 page_url = r.get("url", "")
                 if page_url:
                     try:
-                        source_id, fetch_error = context.get_or_register_web_source(page_url)
+                        source_id, fetch_error = context.get_or_register_web_source(
+                            page_url
+                        )
                         registered.append((page_url, source_id))
                     except Exception as e:
                         logger.warning(f"Could not register source {page_url}: {e}")
@@ -530,7 +558,9 @@ def _crawl_website(
                 page_url = r.get("url", "")
                 raw = r.get("raw_content", "")
                 if page_url and raw:
-                    source_id = next((sid for u, sid in registered if u == page_url), None)
+                    source_id = next(
+                        (sid for u, sid in registered if u == page_url), None
+                    )
                     context.save_web_content_to_disk(page_url, raw, source_id=source_id)
 
         # Format output

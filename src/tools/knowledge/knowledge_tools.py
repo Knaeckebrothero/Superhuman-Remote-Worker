@@ -150,7 +150,9 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
         return asyncio.run(coro)
 
     if not kg or not ks:
-        raise ValueError("Knowledge tools require knowledge_graph and knowledge_store in ToolContext")
+        raise ValueError(
+            "Knowledge tools require knowledge_graph and knowledge_store in ToolContext"
+        )
 
     # =========================================================================
     # Write Tools
@@ -210,21 +212,23 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             # Write-through to pgvector
             now = datetime.now(timezone.utc)
             try:
-                _run_async(ks.upsert_note(
-                    note_id=slug,
-                    project_id=uuid.UUID(project_id),
-                    title=title,
-                    note_type=type,
-                    content=content,
-                    tags=tags,
-                    keywords=keywords,
-                    confidence=confidence,
-                    job_id=uuid.UUID(context.job_id) if context.job_id else None,
-                    phase=context.config.get("current_phase"),
-                    retrieval_messages=retrieval_messages,
-                    created_at=now,
-                    modified_at=now,
-                ))
+                _run_async(
+                    ks.upsert_note(
+                        note_id=slug,
+                        project_id=uuid.UUID(project_id),
+                        title=title,
+                        note_type=type,
+                        content=content,
+                        tags=tags,
+                        keywords=keywords,
+                        confidence=confidence,
+                        job_id=uuid.UUID(context.job_id) if context.job_id else None,
+                        phase=context.config.get("current_phase"),
+                        retrieval_messages=retrieval_messages,
+                        created_at=now,
+                        modified_at=now,
+                    )
+                )
             except Exception as e:
                 logger.warning(f"pgvector write-through failed for {slug}: {e}")
                 # Note exists in Neo4j — pgvector can be rebuilt
@@ -290,21 +294,25 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             try:
                 full_note = kg.read_note(project_id, note)
                 if full_note:
-                    _run_async(ks.upsert_note(
-                        note_id=note,
-                        project_id=uuid.UUID(project_id),
-                        title=full_note.get("title", ""),
-                        note_type=full_note.get("type", "learning"),
-                        content=full_note.get("content", ""),
-                        status=full_note.get("status", "active"),
-                        confidence=full_note.get("confidence"),
-                        tags=full_note.get("tags", []),
-                        keywords=full_note.get("keywords", []),
-                        job_id=uuid.UUID(full_note["job_id"]) if full_note.get("job_id") else None,
-                        phase=full_note.get("phase"),
-                        retrieval_messages=full_note.get("retrieval_messages", []),
-                        modified_at=datetime.now(timezone.utc),
-                    ))
+                    _run_async(
+                        ks.upsert_note(
+                            note_id=note,
+                            project_id=uuid.UUID(project_id),
+                            title=full_note.get("title", ""),
+                            note_type=full_note.get("type", "learning"),
+                            content=full_note.get("content", ""),
+                            status=full_note.get("status", "active"),
+                            confidence=full_note.get("confidence"),
+                            tags=full_note.get("tags", []),
+                            keywords=full_note.get("keywords", []),
+                            job_id=uuid.UUID(full_note["job_id"])
+                            if full_note.get("job_id")
+                            else None,
+                            phase=full_note.get("phase"),
+                            retrieval_messages=full_note.get("retrieval_messages", []),
+                            modified_at=datetime.now(timezone.utc),
+                        )
+                    )
             except Exception as e:
                 logger.warning(f"pgvector write-through failed for {note}: {e}")
 
@@ -384,13 +392,17 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             if rels:
                 lines.extend(["", "## Outgoing Relationships"])
                 for r in rels:
-                    lines.append(f"- **{r['type']}** → [[{r['target']}]] ({r.get('target_title', '')})")
+                    lines.append(
+                        f"- **{r['type']}** → [[{r['target']}]] ({r.get('target_title', '')})"
+                    )
 
             incoming = data.get("incoming_relationships", [])
             if incoming:
                 lines.extend(["", "## Incoming Relationships"])
                 for r in incoming:
-                    lines.append(f"- [[{r['source']}]] ({r.get('source_title', '')}) **{r['type']}** → this")
+                    lines.append(
+                        f"- [[{r['source']}]] ({r.get('source_title', '')}) **{r['type']}** → this"
+                    )
 
             return "\n".join(lines)
 
@@ -475,11 +487,13 @@ def create_kb_tools(context: ToolContext) -> List[Any]:
             return "Error: No project_id available."
 
         try:
-            results = _run_async(ks.hybrid_search(
-                project_id=uuid.UUID(project_id),
-                query=query,
-                match_count=max_results,
-            ))
+            results = _run_async(
+                ks.hybrid_search(
+                    project_id=uuid.UUID(project_id),
+                    query=query,
+                    match_count=max_results,
+                )
+            )
 
             if not results:
                 return f"No knowledge notes match '{query}'."

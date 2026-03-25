@@ -220,9 +220,7 @@ class CockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_archived_todos(
-        self, job_id: str, filename: str
-    ) -> dict[str, Any] | None:
+    def get_archived_todos(self, job_id: str, filename: str) -> dict[str, Any] | None:
         """Get parsed content of an archived todo file.
 
         Args:
@@ -286,9 +284,7 @@ class CockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    def resume_job(
-        self, job_id: str, feedback: str | None = None
-    ) -> dict[str, Any]:
+    def resume_job(self, job_id: str, feedback: str | None = None) -> dict[str, Any]:
         """Resume a job from its checkpoint with optional feedback."""
         body: dict[str, Any] = {}
         if feedback:
@@ -904,9 +900,7 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {"sha": sha, "page": page, "limit": limit}
         if since_ref:
             params["since_ref"] = since_ref
-        resp = await self._client.get(
-            f"/api/jobs/{job_id}/repo/commits", params=params
-        )
+        resp = await self._client.get(f"/api/jobs/{job_id}/repo/commits", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -954,9 +948,7 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {"path": path}
         if ref:
             params["ref"] = ref
-        resp = await self._client.get(
-            f"/api/jobs/{job_id}/repo/file", params=params
-        )
+        resp = await self._client.get(f"/api/jobs/{job_id}/repo/file", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1083,9 +1075,7 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if status:
             params["status"] = status
-        resp = await self._client.get(
-            f"/api/jobs/{job_id}/requirements", params=params
-        )
+        resp = await self._client.get(f"/api/jobs/{job_id}/requirements", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1166,9 +1156,7 @@ class AsyncCockpitClient:
             List of daily stats with date, jobs_created, jobs_completed,
             jobs_failed, jobs_cancelled
         """
-        resp = await self._client.get(
-            "/api/stats/daily", params={"days": days}
-        )
+        resp = await self._client.get("/api/stats/daily", params={"days": days})
         resp.raise_for_status()
         return resp.json()
 
@@ -1323,9 +1311,7 @@ class AsyncCockpitClient:
             params["source_id"] = source_id
         if verification_status:
             params["status"] = verification_status
-        resp = await self._client.get(
-            f"/api/jobs/{job_id}/citations", params=params
-        )
+        resp = await self._client.get(f"/api/jobs/{job_id}/citations", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1414,9 +1400,7 @@ class AsyncCockpitClient:
         Returns:
             List of tag strings
         """
-        resp = await self._client.get(
-            f"/api/jobs/{job_id}/sources/{source_id}/tags"
-        )
+        resp = await self._client.get(f"/api/jobs/{job_id}/sources/{source_id}/tags")
         resp.raise_for_status()
         return resp.json()
 
@@ -1476,9 +1460,7 @@ class AsyncCockpitClient:
             params["grep"] = grep
         if level:
             params["level"] = level
-        resp = await self._client.get(
-            f"/api/jobs/{job_id}/logs", params=params
-        )
+        resp = await self._client.get(f"/api/jobs/{job_id}/logs", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1558,9 +1540,7 @@ class AsyncCockpitClient:
         Returns:
             Dict with total, by_type, by_status, and recent notes
         """
-        resp = await self._client.get(
-            f"/api/projects/{project_id}/knowledge/summary"
-        )
+        resp = await self._client.get(f"/api/projects/{project_id}/knowledge/summary")
         resp.raise_for_status()
         return resp.json()
 
@@ -1605,9 +1585,7 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
-    async def get_knowledge_note(
-        self, project_id: str, note_id: str
-    ) -> dict[str, Any]:
+    async def get_knowledge_note(self, project_id: str, note_id: str) -> dict[str, Any]:
         """Get a single knowledge note with full content and relationships.
 
         Args:
@@ -1617,9 +1595,7 @@ class AsyncCockpitClient:
         Returns:
             Full note record with content, metadata, and Neo4j relationships
         """
-        resp = await self._client.get(
-            f"/api/projects/{project_id}/knowledge/{note_id}"
-        )
+        resp = await self._client.get(f"/api/projects/{project_id}/knowledge/{note_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -1654,9 +1630,7 @@ class AsyncCockpitClient:
     # =========================================================================
 
     @_create_retry_decorator()
-    async def list_projects(
-        self, user_id: str | None = None
-    ) -> list[dict[str, Any]]:
+    async def list_projects(self, user_id: str | None = None) -> list[dict[str, Any]]:
         """List projects, optionally filtered by user membership.
 
         Args:
@@ -1741,9 +1715,7 @@ class AsyncCockpitClient:
         params: dict[str, Any] = {"limit": limit}
         if status:
             params["status"] = status
-        resp = await self._client.get(
-            f"/api/projects/{project_id}/jobs", params=params
-        )
+        resp = await self._client.get(f"/api/projects/{project_id}/jobs", params=params)
         resp.raise_for_status()
         return resp.json()
 
@@ -1783,9 +1755,7 @@ class AsyncCockpitClient:
             body["config_override"] = config_override
         if context:
             body["context"] = context
-        resp = await self._client.post(
-            f"/api/projects/{project_id}/jobs", json=body
-        )
+        resp = await self._client.post(f"/api/projects/{project_id}/jobs", json=body)
         resp.raise_for_status()
         return resp.json()
 
@@ -1830,9 +1800,7 @@ class AsyncCockpitClient:
             body["default_config_name"] = default_config_name
         if default_config_override is not None:
             body["default_config_override"] = default_config_override
-        resp = await self._client.patch(
-            f"/api/projects/{project_id}", json=body
-        )
+        resp = await self._client.patch(f"/api/projects/{project_id}", json=body)
         resp.raise_for_status()
         return resp.json()
 
@@ -1852,9 +1820,7 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
-    async def list_project_members(
-        self, project_id: str
-    ) -> list[dict[str, Any]]:
+    async def list_project_members(self, project_id: str) -> list[dict[str, Any]]:
         """List members of a project with their roles.
 
         Args:
@@ -1863,9 +1829,7 @@ class AsyncCockpitClient:
         Returns:
             List of member dicts with user_id, role, display_name, etc.
         """
-        resp = await self._client.get(
-            f"/api/projects/{project_id}/members"
-        )
+        resp = await self._client.get(f"/api/projects/{project_id}/members")
         resp.raise_for_status()
         return resp.json()
 
@@ -1886,9 +1850,7 @@ class AsyncCockpitClient:
             Created member record
         """
         body = {"user_id": user_id, "role": role}
-        resp = await self._client.post(
-            f"/api/projects/{project_id}/members", json=body
-        )
+        resp = await self._client.post(f"/api/projects/{project_id}/members", json=body)
         resp.raise_for_status()
         return resp.json()
 
@@ -1938,9 +1900,7 @@ class AsyncCockpitClient:
         return resp.json()
 
     @_create_retry_decorator()
-    async def list_project_experts(
-        self, project_id: str
-    ) -> list[dict[str, Any]]:
+    async def list_project_experts(self, project_id: str) -> list[dict[str, Any]]:
         """List project-specific expert configurations.
 
         Args:
@@ -1949,9 +1909,7 @@ class AsyncCockpitClient:
         Returns:
             List of ExpertInfo dicts
         """
-        resp = await self._client.get(
-            f"/api/projects/{project_id}/experts"
-        )
+        resp = await self._client.get(f"/api/projects/{project_id}/experts")
         resp.raise_for_status()
         return resp.json()
 
@@ -2051,9 +2009,7 @@ class AsyncCockpitClient:
             body["credentials"] = credentials
         if read_only is not None:
             body["read_only"] = read_only
-        resp = await self._client.put(
-            f"/api/datasources/{datasource_id}", json=body
-        )
+        resp = await self._client.put(f"/api/datasources/{datasource_id}", json=body)
         resp.raise_for_status()
         return resp.json()
 
@@ -2134,9 +2090,7 @@ class AsyncCockpitClient:
         Returns:
             Dict with status, path, note_count, project_name
         """
-        resp = await self._client.post(
-            f"/api/projects/{project_id}/knowledge/export"
-        )
+        resp = await self._client.post(f"/api/projects/{project_id}/knowledge/export")
         resp.raise_for_status()
         return resp.json()
 
@@ -2172,9 +2126,7 @@ class AsyncCockpitClient:
             body["description"] = description
         if goal:
             body["goal"] = goal
-        resp = await self._client.post(
-            f"/api/jobs/{job_id}/promote", json=body
-        )
+        resp = await self._client.post(f"/api/jobs/{job_id}/promote", json=body)
         resp.raise_for_status()
         return resp.json()
 

@@ -22,6 +22,7 @@ except ImportError:
         from mcp.client import AsyncCockpitClient  # type: ignore[no-redef]
     except ImportError:
         import importlib
+
         _mod = importlib.import_module("orchestrator.mcp.client")
         AsyncCockpitClient = _mod.AsyncCockpitClient  # type: ignore[misc]
 
@@ -138,7 +139,9 @@ async def _list_job_commits(args: dict) -> tuple[str, str | None]:
         page=args.get("page", 1),
         limit=args.get("limit", 20),
     )
-    formatted = fmt.format_commits(args["job_id"], result, ref=ref, since_ref=args.get("since_ref"))
+    formatted = fmt.format_commits(
+        args["job_id"], result, ref=ref, since_ref=args.get("since_ref")
+    )
     return formatted, formatted
 
 
@@ -153,8 +156,11 @@ async def _get_job_diff(args: dict) -> tuple[str, str | None]:
     if args.get("file_path") and diff_text:
         diff_text = fmt.filter_diff_by_file(diff_text, args["file_path"])
     formatted = fmt.format_diff(
-        args["job_id"], args["base"], args.get("head", "HEAD"),
-        diff_text, max_chars=args.get("max_chars", 50000),
+        args["job_id"],
+        args["base"],
+        args.get("head", "HEAD"),
+        diff_text,
+        max_chars=args.get("max_chars", 50000),
     )
     return formatted, formatted
 
@@ -169,7 +175,9 @@ async def _get_job_file(args: dict) -> tuple[str, str | None]:
     content = result.get("content", "")
     ref_label = args.get("ref") or "HEAD"
     size = result.get("size", len(content))
-    formatted = f"File: {args['file_path']} (ref: {ref_label}, {size} bytes)\n---\n{content}"
+    formatted = (
+        f"File: {args['file_path']} (ref: {ref_label}, {size} bytes)\n---\n{content}"
+    )
     return formatted, formatted
 
 
@@ -181,7 +189,10 @@ async def _list_job_files(args: dict) -> tuple[str, str | None]:
         ref=args.get("ref"),
     )
     formatted = fmt.format_file_listing(
-        args["job_id"], args.get("path", ""), entries, ref=args.get("ref"),
+        args["job_id"],
+        args.get("path", ""),
+        entries,
+        ref=args.get("ref"),
     )
     return formatted, formatted
 
@@ -379,7 +390,9 @@ async def _list_job_sources(args: dict) -> tuple[str, str | None]:
         limit=args.get("limit", 50),
         offset=args.get("offset", 0),
     )
-    formatted = fmt.format_sources(data, job_id=args.get("job_id"), type_filter=args.get("source_type"))
+    formatted = fmt.format_sources(
+        data, job_id=args.get("job_id"), type_filter=args.get("source_type")
+    )
     return formatted, formatted
 
 
@@ -403,7 +416,9 @@ async def _list_job_citations(args: dict) -> tuple[str, str | None]:
         offset=args.get("offset", 0),
     )
     formatted = fmt.format_citations(
-        args["job_id"], data, status_filter=args.get("verification_status"),
+        args["job_id"],
+        data,
+        status_filter=args.get("verification_status"),
     )
     return formatted, formatted
 
@@ -437,7 +452,9 @@ async def _get_source_annotations(args: dict) -> tuple[str, str | None]:
         annotation_type=args.get("annotation_type"),
     )
     formatted = fmt.format_annotations(
-        args["job_id"], args["source_id"], annotations,
+        args["job_id"],
+        args["source_id"],
+        annotations,
         type_filter=args.get("annotation_type"),
     )
     return formatted, formatted
@@ -477,7 +494,10 @@ async def _resume_job_with_feedback(args: dict) -> tuple[str, str | None]:
     client = _get_client()
     result = await client.resume_job(args["job_id"], feedback=args.get("feedback"))
     return fmt.format_action_result(
-        "resume", args["job_id"], result, feedback=args.get("feedback"),
+        "resume",
+        args["job_id"],
+        result,
+        feedback=args.get("feedback"),
     ), None
 
 
@@ -497,12 +517,18 @@ async def _assign_job(args: dict) -> tuple[str, str | None]:
     client = _get_client()
     result = await client.assign_job(args["job_id"], args["agent_id"])
     return fmt.format_action_result(
-        "assign", args["job_id"], result, agent_id=args["agent_id"],
+        "assign",
+        args["job_id"],
+        result,
+        agent_id=args["agent_id"],
     ), None
 
 
 async def _create_job(
-    args: dict, *, user_id: str | None = None, project_id: str | None = None,
+    args: dict,
+    *,
+    user_id: str | None = None,
+    project_id: str | None = None,
 ) -> tuple[str, str | None]:
     client = _get_client()
     result = await client.create_job(
@@ -561,6 +587,7 @@ async def _get_chat_bulk(args: dict) -> tuple[str, str | None]:
 
 async def _get_job_summary(args: dict) -> tuple[str, str | None]:
     import asyncio
+
     client = _get_client()
     job_id = args["job_id"]
 
@@ -645,10 +672,15 @@ async def _get_audit_timerange(args: dict) -> tuple[str, str | None]:
     client = _get_client()
     data = await client.get_audit_time_range(args["job_id"])
     if data is None:
-        return f"No audit time range available for job {args['job_id']} (MongoDB may be unavailable).", None
+        return (
+            f"No audit time range available for job {args['job_id']} (MongoDB may be unavailable).",
+            None,
+        )
     start = data.get("start", "unknown")
     end = data.get("end", "unknown")
-    formatted = f"Audit time range for job {args['job_id']}:\n  Start: {start}\n  End:   {end}"
+    formatted = (
+        f"Audit time range for job {args['job_id']}:\n  Start: {start}\n  End:   {end}"
+    )
     return formatted, formatted
 
 
@@ -953,9 +985,7 @@ async def _list_project_experts(args: dict) -> tuple[str, str | None]:
 
 async def _get_project_expert(args: dict) -> tuple[str, str | None]:
     client = _get_client()
-    data = await client.get_project_expert(
-        args["project_id"], args["expert_name"]
-    )
+    data = await client.get_project_expert(args["project_id"], args["expert_name"])
     formatted = fmt.format_project_expert_detail(args["project_id"], data)
     return formatted, formatted
 
@@ -1092,7 +1122,10 @@ async def execute_server_tool(
     # Special case: web_search uses the tavily search function
     if tool_name == "web_search":
         if tavily_search_fn is None:
-            return "Error: web_search not available (no search function configured)", None
+            return (
+                "Error: web_search not available (no search function configured)",
+                None,
+            )
         result = await tavily_search_fn(
             query=args.get("query", ""),
             max_results=args.get("max_results", 5),
@@ -1107,12 +1140,16 @@ async def execute_server_tool(
         # Pass user/project context to job-creation handlers
         if tool_name in ("create_job", "create_follow_up_job"):
             return await handler(
-                args, user_id=user_id, project_id=active_project_id,
+                args,
+                user_id=user_id,
+                project_id=active_project_id,
             )
         return await handler(args)
     except Exception as e:
         error_msg = str(e)[:300]
         if hasattr(e, "response") and hasattr(e.response, "status_code"):
-            error_detail = e.response.text[:200] if hasattr(e.response, "text") else error_msg
+            error_detail = (
+                e.response.text[:200] if hasattr(e.response, "text") else error_msg
+            )
             return f"Error ({e.response.status_code}): {error_detail}", None
         return f"Error: {error_msg}", None

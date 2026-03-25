@@ -103,7 +103,9 @@ class TestReadTracking:
 class TestReadFileTracking:
     """Tests for read_file recording reads."""
 
-    def test_read_file_records_path(self, workspace_tools, workspace_manager, tool_context):
+    def test_read_file_records_path(
+        self, workspace_tools, workspace_manager, tool_context
+    ):
         """Test that read_file records the path in context."""
         # Create a test file
         workspace_manager.write_file("test.md", "Hello, world!")
@@ -135,11 +137,9 @@ class TestEditFileReadRequirement:
 
         # Try to edit without reading first
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke({
-            "path": "test.md",
-            "old_string": "Hello",
-            "new_string": "Goodbye"
-        })
+        result = edit_file.invoke(
+            {"path": "test.md", "old_string": "Hello", "new_string": "Goodbye"}
+        )
 
         assert "Error" in result
         assert "read_file" in result.lower()
@@ -155,11 +155,9 @@ class TestEditFileReadRequirement:
 
         # Now edit should work
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke({
-            "path": "test.md",
-            "old_string": "Hello",
-            "new_string": "Goodbye"
-        })
+        result = edit_file.invoke(
+            {"path": "test.md", "old_string": "Hello", "new_string": "Goodbye"}
+        )
 
         assert "Edited" in result
 
@@ -182,11 +180,9 @@ class TestEditFilePositionModes:
 
         # Append using position="end"
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke({
-            "path": "test.md",
-            "new_string": "\nLine 2",
-            "position": "end"
-        })
+        result = edit_file.invoke(
+            {"path": "test.md", "new_string": "\nLine 2", "position": "end"}
+        )
 
         assert "Appended" in result
 
@@ -194,7 +190,9 @@ class TestEditFilePositionModes:
         content = workspace_manager.read_file("test.md")
         assert content == "Line 1\nLine 2"
 
-    def test_edit_file_position_start_prepends(self, workspace_tools, workspace_manager):
+    def test_edit_file_position_start_prepends(
+        self, workspace_tools, workspace_manager
+    ):
         """Test that position='start' prepends to file."""
         # Create a test file
         workspace_manager.write_file("test.md", "Line 2")
@@ -205,11 +203,9 @@ class TestEditFilePositionModes:
 
         # Prepend using position="start"
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke({
-            "path": "test.md",
-            "new_string": "Line 1\n",
-            "position": "start"
-        })
+        result = edit_file.invoke(
+            {"path": "test.md", "new_string": "Line 1\n", "position": "start"}
+        )
 
         assert "Prepended" in result
 
@@ -228,16 +224,20 @@ class TestEditFilePositionModes:
 
         # Try invalid position
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke({
-            "path": "test.md",
-            "new_string": "New",
-            "position": "middle"  # Invalid
-        })
+        result = edit_file.invoke(
+            {
+                "path": "test.md",
+                "new_string": "New",
+                "position": "middle",  # Invalid
+            }
+        )
 
         assert "Error" in result
         assert "Invalid position" in result
 
-    def test_edit_file_replace_requires_old_string(self, workspace_tools, workspace_manager):
+    def test_edit_file_replace_requires_old_string(
+        self, workspace_tools, workspace_manager
+    ):
         """Test that replace mode (no position) requires old_string."""
         # Create a test file
         workspace_manager.write_file("test.md", "Content")
@@ -248,11 +248,13 @@ class TestEditFilePositionModes:
 
         # Try replace without old_string
         edit_file = workspace_tools["edit_file"]
-        result = edit_file.invoke({
-            "path": "test.md",
-            "new_string": "New"
-            # No old_string, no position
-        })
+        result = edit_file.invoke(
+            {
+                "path": "test.md",
+                "new_string": "New",
+                # No old_string, no position
+            }
+        )
 
         assert "Error" in result
         assert "old_string is required" in result
@@ -261,17 +263,16 @@ class TestEditFilePositionModes:
 class TestWriteFileReadRequirement:
     """Tests for write_file requiring recent read for existing files."""
 
-    def test_write_file_existing_requires_read(self, workspace_tools, workspace_manager):
+    def test_write_file_existing_requires_read(
+        self, workspace_tools, workspace_manager
+    ):
         """Test that overwriting existing file fails without recent read."""
         # Create a test file
         workspace_manager.write_file("test.md", "Original content")
 
         # Try to overwrite without reading first
         write_file = workspace_tools["write_file"]
-        result = write_file.invoke({
-            "path": "test.md",
-            "content": "New content"
-        })
+        result = write_file.invoke({"path": "test.md", "content": "New content"})
 
         assert "Error" in result
         assert "read_file" in result.lower()
@@ -284,10 +285,9 @@ class TestWriteFileReadRequirement:
         """Test that creating a new file doesn't require read."""
         # Write a new file without reading
         write_file = workspace_tools["write_file"]
-        result = write_file.invoke({
-            "path": "new_file.md",
-            "content": "Brand new content"
-        })
+        result = write_file.invoke(
+            {"path": "new_file.md", "content": "Brand new content"}
+        )
 
         assert "Written" in result
 
@@ -306,10 +306,7 @@ class TestWriteFileReadRequirement:
 
         # Now overwrite should work
         write_file = workspace_tools["write_file"]
-        result = write_file.invoke({
-            "path": "test.md",
-            "content": "New content"
-        })
+        result = write_file.invoke({"path": "test.md", "content": "New content"})
 
         assert "Written" in result
 

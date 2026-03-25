@@ -61,7 +61,7 @@ class MongoDB:
                 "Install with: pip install pymongo"
             )
 
-        self._url = url or os.getenv('MONGODB_URL')
+        self._url = url or os.getenv("MONGODB_URL")
         self._client: Optional[MongoClient] = None
         self._db = None
         self._connected = False
@@ -89,13 +89,13 @@ class MongoDB:
         try:
             self._client = MongoClient(
                 self._url,
-                serverSelectionTimeoutMS=5000  # 5 second timeout
+                serverSelectionTimeoutMS=5000,  # 5 second timeout
             )
             # Test connection with ping
-            self._client.admin.command('ping')
+            self._client.admin.command("ping")
 
             # Extract database name from URL
-            db_name = self._url.split('/')[-1].split('?')[0] or 'srw_logs'
+            db_name = self._url.split("/")[-1].split("?")[0] or "srw_logs"
             self._db = self._client[db_name]
 
             self._connected = True
@@ -130,7 +130,7 @@ class MongoDB:
         messages: List[Dict],
         response: Dict,
         model: str,
-        **metadata
+        **metadata,
     ) -> Optional[str]:
         """Archive LLM request/response for debugging and compliance.
 
@@ -156,7 +156,7 @@ class MongoDB:
                 "response": response,
                 "model": model,
                 "timestamp": datetime.utcnow(),
-                **metadata
+                **metadata,
             }
             result = self._db.llm_requests.insert_one(doc)
             logger.debug(f"Archived LLM request: {result.inserted_id}")
@@ -173,7 +173,7 @@ class MongoDB:
         inputs: Dict,
         output: Optional[Any] = None,
         error: Optional[str] = None,
-        **metadata
+        **metadata,
     ) -> Optional[str]:
         """Audit a tool invocation.
 
@@ -202,7 +202,7 @@ class MongoDB:
                 "output": output,
                 "error": error,
                 "timestamp": datetime.utcnow(),
-                **metadata
+                **metadata,
             }
             result = self._db.agent_audit.insert_one(doc)
             logger.debug(f"Audited tool call: {tool_name}")
@@ -212,12 +212,7 @@ class MongoDB:
             return None
 
     def audit_phase_transition(
-        self,
-        job_id: str,
-        agent_type: str,
-        from_phase: str,
-        to_phase: str,
-        **metadata
+        self, job_id: str, agent_type: str, from_phase: str, to_phase: str, **metadata
     ) -> Optional[str]:
         """Audit a phase transition in nested loop architecture.
 
@@ -242,7 +237,7 @@ class MongoDB:
                 "from_phase": from_phase,
                 "to_phase": to_phase,
                 "timestamp": datetime.utcnow(),
-                **metadata
+                **metadata,
             }
             result = self._db.agent_audit.insert_one(doc)
             logger.debug(f"Audited phase transition: {from_phase} -> {to_phase}")
@@ -252,9 +247,7 @@ class MongoDB:
             return None
 
     def get_job_audit_trail(
-        self,
-        job_id: str,
-        event_type: Optional[str] = None
+        self, job_id: str, event_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Get complete audit trail for a job.
 
@@ -280,9 +273,7 @@ class MongoDB:
             return []
 
     def get_llm_conversation(
-        self,
-        job_id: str,
-        limit: int = 100
+        self, job_id: str, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """Get LLM conversation history for a job.
 
@@ -297,9 +288,11 @@ class MongoDB:
             return []
 
         try:
-            cursor = self._db.llm_requests.find(
-                {"job_id": job_id}
-            ).sort("timestamp", 1).limit(limit)
+            cursor = (
+                self._db.llm_requests.find({"job_id": job_id})
+                .sort("timestamp", 1)
+                .limit(limit)
+            )
             return list(cursor)
         except Exception as e:
             logger.error(f"Failed to get LLM conversation: {e}")
@@ -316,14 +309,14 @@ class MongoDB:
 
         try:
             stats = {
-                'llm_requests_count': self._db.llm_requests.count_documents({}),
-                'agent_audit_count': self._db.agent_audit.count_documents({}),
-                'connected': True
+                "llm_requests_count": self._db.llm_requests.count_documents({}),
+                "agent_audit_count": self._db.agent_audit.count_documents({}),
+                "connected": True,
             }
             return stats
         except Exception as e:
             logger.error(f"Failed to get statistics: {e}")
-            return {'connected': False}
+            return {"connected": False}
 
     @property
     def db(self):
@@ -342,4 +335,4 @@ class MongoDB:
         return self._connected
 
 
-__all__ = ['MongoDB']
+__all__ = ["MongoDB"]

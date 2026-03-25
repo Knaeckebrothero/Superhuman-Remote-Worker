@@ -26,6 +26,7 @@ Usage:
     python -m orchestrator.init --backup /path/to/backup
     python -m orchestrator.init --restore /path/to/backup
 """
+
 import argparse
 import asyncio
 import hashlib
@@ -48,6 +49,7 @@ if str(ORCHESTRATOR_DIR) not in sys.path:
     sys.path.insert(0, str(ORCHESTRATOR_DIR))
 
 from dotenv import load_dotenv  # noqa: E402
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,7 @@ def setup_logging(verbose: bool = False) -> None:
 # PostgreSQL Initialization
 # =============================================================================
 
+
 def get_postgres_connection_string() -> str:
     """Get PostgreSQL connection string from environment."""
     connection_string = os.getenv("DATABASE_URL")
@@ -97,7 +100,7 @@ def _parse_connection_string(connection_string: str) -> dict:
         "port": str(parsed.port or 5432),
         "user": parsed.username or "srw",
         "password": parsed.password or "",
-        "database": parsed.path.lstrip('/').split('?')[0] or "srw",
+        "database": parsed.path.lstrip("/").split("?")[0] or "srw",
     }
 
 
@@ -163,7 +166,9 @@ async def ensure_sso_databases() -> bool:
         return True
     except Exception as e:
         logger.warning(f"    Could not create SSO databases: {e}")
-        logger.warning("    (This is expected if Keycloak/Nextcloud are not being used)")
+        logger.warning(
+            "    (This is expected if Keycloak/Nextcloud are not being used)"
+        )
         return False
 
 
@@ -232,7 +237,7 @@ async def init_postgres(force_reset: bool = False) -> bool:
         return False
 
     connection_string = get_postgres_connection_string()
-    db_name = connection_string.split('/')[-1].split('?')[0]
+    db_name = connection_string.split("/")[-1].split("?")[0]
     logger.info(f"  Database: {db_name}")
 
     db = PostgresDB(connection_string)
@@ -299,6 +304,7 @@ async def init_postgres(force_reset: bool = False) -> bool:
 # Vector DB Initialization
 # =============================================================================
 
+
 def get_vector_connection_string() -> Optional[str]:
     """Get Vector DB connection string from environment.
 
@@ -329,7 +335,7 @@ async def init_vector_db(force_reset: bool = False) -> bool:
         logger.error(f"  Could not import PostgresDB: {e}")
         return False
 
-    db_name = vector_url.split('/')[-1].split('?')[0]
+    db_name = vector_url.split("/")[-1].split("?")[0]
     logger.info(f"  Database: {db_name}")
 
     db = PostgresDB(vector_url)
@@ -355,12 +361,20 @@ async def init_vector_db(force_reset: bool = False) -> bool:
                 await conn.execute("DROP TABLE IF EXISTS job_sources CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS sources CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
-                await conn.execute("DROP TABLE IF EXISTS memory_retrieval_messages CASCADE")
+                await conn.execute(
+                    "DROP TABLE IF EXISTS memory_retrieval_messages CASCADE"
+                )
                 await conn.execute("DROP TABLE IF EXISTS memories CASCADE")
                 await conn.execute("DROP TABLE IF EXISTS knowledge_index CASCADE")
-                await conn.execute("DROP FUNCTION IF EXISTS memory_hybrid_search CASCADE")
-                await conn.execute("DROP FUNCTION IF EXISTS memory_project_hybrid_search CASCADE")
-                await conn.execute("DROP FUNCTION IF EXISTS knowledge_hybrid_search CASCADE")
+                await conn.execute(
+                    "DROP FUNCTION IF EXISTS memory_hybrid_search CASCADE"
+                )
+                await conn.execute(
+                    "DROP FUNCTION IF EXISTS memory_project_hybrid_search CASCADE"
+                )
+                await conn.execute(
+                    "DROP FUNCTION IF EXISTS knowledge_hybrid_search CASCADE"
+                )
                 await conn.execute("DROP TYPE IF EXISTS source_type CASCADE")
                 await conn.execute("DROP TYPE IF EXISTS confidence_level CASCADE")
                 await conn.execute("DROP TYPE IF EXISTS extraction_method CASCADE")
@@ -383,7 +397,8 @@ async def init_vector_db(force_reset: bool = False) -> bool:
             for table in VECTOR_REQUIRED_TABLES:
                 exists = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                    "WHERE table_name = $1)", table,
+                    "WHERE table_name = $1)",
+                    table,
                 )
                 status = "ok" if exists else "MISSING"
                 logger.info(f"    {table}: {status}")
@@ -413,7 +428,11 @@ async def verify_vector_db() -> dict:
     try:
         from orchestrator.database.postgres import PostgresDB, VECTOR_REQUIRED_TABLES
     except ImportError:
-        return {"configured": True, "connected": False, "error": "asyncpg not installed"}
+        return {
+            "configured": True,
+            "connected": False,
+            "error": "asyncpg not installed",
+        }
 
     db = PostgresDB(vector_url)
 
@@ -424,7 +443,8 @@ async def verify_vector_db() -> dict:
             for table in VECTOR_REQUIRED_TABLES:
                 exists = await conn.fetchval(
                     "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
-                    "WHERE table_name = $1)", table,
+                    "WHERE table_name = $1)",
+                    table,
                 )
                 tables[table] = exists
         return {
@@ -458,12 +478,18 @@ def backup_vector_db(backup_file: Path) -> bool:
 
     cmd = [
         "pg_dump",
-        "-h", params["host"],
-        "-p", params["port"],
-        "-U", params["user"],
-        "-d", params["database"],
-        "-F", "c",  # Custom format (compressed)
-        "-f", str(backup_file),
+        "-h",
+        params["host"],
+        "-p",
+        params["port"],
+        "-U",
+        params["user"],
+        "-d",
+        params["database"],
+        "-F",
+        "c",  # Custom format (compressed)
+        "-f",
+        str(backup_file),
     ]
 
     env = os.environ.copy()
@@ -508,10 +534,14 @@ def restore_vector_db(backup_file: Path) -> bool:
 
     cmd = [
         "pg_restore",
-        "-h", params["host"],
-        "-p", params["port"],
-        "-U", params["user"],
-        "-d", params["database"],
+        "-h",
+        params["host"],
+        "-p",
+        params["port"],
+        "-U",
+        params["user"],
+        "-d",
+        params["database"],
         "--clean",
         "--if-exists",
         str(backup_file),
@@ -573,12 +603,18 @@ def backup_postgres(backup_file: Path) -> bool:
 
     cmd = [
         "pg_dump",
-        "-h", params["host"],
-        "-p", params["port"],
-        "-U", params["user"],
-        "-d", params["database"],
-        "-F", "c",  # Custom format (compressed)
-        "-f", str(backup_file),
+        "-h",
+        params["host"],
+        "-p",
+        params["port"],
+        "-U",
+        params["user"],
+        "-d",
+        params["database"],
+        "-F",
+        "c",  # Custom format (compressed)
+        "-f",
+        str(backup_file),
     ]
 
     env = os.environ.copy()
@@ -626,10 +662,14 @@ def restore_postgres(backup_file: Path) -> bool:
 
     cmd = [
         "pg_restore",
-        "-h", params["host"],
-        "-p", params["port"],
-        "-U", params["user"],
-        "-d", params["database"],
+        "-h",
+        params["host"],
+        "-p",
+        params["port"],
+        "-U",
+        params["user"],
+        "-d",
+        params["database"],
         "--clean",
         "--if-exists",
         str(backup_file),
@@ -651,6 +691,7 @@ def restore_postgres(backup_file: Path) -> bool:
 async def _reset_postgres_schema():
     """Helper to reset PostgreSQL schema."""
     from orchestrator.database.postgres import PostgresDB
+
     connection_string = get_postgres_connection_string()
     db = PostgresDB(connection_string)
     try:
@@ -663,6 +704,7 @@ async def _reset_postgres_schema():
 # =============================================================================
 # Default Datasource Seeding
 # =============================================================================
+
 
 async def _seed_default_datasources(db) -> None:
     """Seed global datasources from DEFAULT_DS_* environment variables.
@@ -681,9 +723,14 @@ async def _seed_default_datasources(db) -> None:
     pg_url = os.getenv("DEFAULT_DS_POSTGRESQL_URL")
     if pg_url:
         name = os.getenv("DEFAULT_DS_POSTGRESQL_NAME", "Default PostgreSQL")
-        read_only = os.getenv("DEFAULT_DS_POSTGRESQL_READ_ONLY", "true").lower() == "true"
+        read_only = (
+            os.getenv("DEFAULT_DS_POSTGRESQL_READ_ONLY", "true").lower() == "true"
+        )
         await db.upsert_default_datasource(
-            name=name, ds_type="postgresql", connection_url=pg_url, read_only=read_only,
+            name=name,
+            ds_type="postgresql",
+            connection_url=pg_url,
+            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: postgresql ({name})")
         seeded += 1
@@ -701,8 +748,11 @@ async def _seed_default_datasources(db) -> None:
         if password:
             credentials["password"] = password
         await db.upsert_default_datasource(
-            name=name, ds_type="neo4j", connection_url=neo4j_url,
-            credentials=credentials if credentials else None, read_only=read_only,
+            name=name,
+            ds_type="neo4j",
+            connection_url=neo4j_url,
+            credentials=credentials if credentials else None,
+            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: neo4j ({name})")
         seeded += 1
@@ -713,7 +763,10 @@ async def _seed_default_datasources(db) -> None:
         name = os.getenv("DEFAULT_DS_MONGODB_NAME", "Default MongoDB")
         read_only = os.getenv("DEFAULT_DS_MONGODB_READ_ONLY", "true").lower() == "true"
         await db.upsert_default_datasource(
-            name=name, ds_type="mongodb", connection_url=mongo_url, read_only=read_only,
+            name=name,
+            ds_type="mongodb",
+            connection_url=mongo_url,
+            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: mongodb ({name})")
         seeded += 1
@@ -731,8 +784,11 @@ async def _seed_default_datasources(db) -> None:
         if password:
             credentials["password"] = password
         await db.upsert_default_datasource(
-            name=name, ds_type="webdav", connection_url=webdav_url,
-            credentials=credentials if credentials else None, read_only=read_only,
+            name=name,
+            ds_type="webdav",
+            connection_url=webdav_url,
+            credentials=credentials if credentials else None,
+            read_only=read_only,
         )
         logger.info(f"    Seeded default datasource: webdav ({name})")
         seeded += 1
@@ -740,12 +796,15 @@ async def _seed_default_datasources(db) -> None:
     if seeded > 0:
         logger.info(f"  Seeded {seeded} default datasource(s)")
     else:
-        logger.info("  No default datasources configured (DEFAULT_DS_* env vars not set)")
+        logger.info(
+            "  No default datasources configured (DEFAULT_DS_* env vars not set)"
+        )
 
 
 # =============================================================================
 # Default Project Seeding
 # =============================================================================
+
 
 async def _seed_default_projects(db) -> None:
     """Create default projects for users that don't have one.
@@ -1030,7 +1089,11 @@ def verify_neo4j() -> dict:
     try:
         from src.database.neo4j_db import Neo4jDB
     except ImportError:
-        return {"connected": False, "configured": True, "error": "neo4j driver not installed"}
+        return {
+            "connected": False,
+            "configured": True,
+            "error": "neo4j driver not installed",
+        }
 
     db = Neo4jDB(**config)
     if not db.connect():
@@ -1054,6 +1117,7 @@ def verify_neo4j() -> dict:
 # MongoDB Initialization
 # =============================================================================
 
+
 def get_mongodb_url() -> Optional[str]:
     """Get MongoDB URL from environment."""
     return os.getenv("MONGODB_URL")
@@ -1065,7 +1129,7 @@ def _parse_mongodb_url(url: str) -> dict:
     return {
         "host": parsed.hostname or "localhost",
         "port": str(parsed.port or 27017),
-        "database": parsed.path.lstrip('/').split('?')[0] or "srw_logs",
+        "database": parsed.path.lstrip("/").split("?")[0] or "srw_logs",
         "username": parsed.username,
         "password": parsed.password,
     }
@@ -1105,7 +1169,7 @@ async def init_mongodb(force_reset: bool = False) -> bool:
 
     try:
         # Parse database name from URL
-        db_name = mongo_url.split('/')[-1].split('?')[0]
+        db_name = mongo_url.split("/")[-1].split("?")[0]
         if not db_name:
             db_name = "srw_logs"
 
@@ -1120,7 +1184,9 @@ async def init_mongodb(force_reset: bool = False) -> bool:
             logger.info("  Clearing database...")
             for collection_name in db.list_collection_names():
                 result = db[collection_name].delete_many({})
-                logger.info(f"    Deleted {result.deleted_count} documents from {collection_name}")
+                logger.info(
+                    f"    Deleted {result.deleted_count} documents from {collection_name}"
+                )
 
         # Create collections and indexes
         logger.info("  Configuring collections and indexes...")
@@ -1149,7 +1215,10 @@ def _create_mongodb_indexes(db) -> None:
         ("agent_type", {"name": "idx_agent_type"}),
         ("timestamp", {"name": "idx_timestamp"}),
         ("model", {"name": "idx_model"}),
-        ([("job_id", 1), ("agent_type", 1), ("timestamp", -1)], {"name": "idx_job_agent_time"}),
+        (
+            [("job_id", 1), ("agent_type", 1), ("timestamp", -1)],
+            {"name": "idx_job_agent_time"},
+        ),
     ]
 
     logger.info("  Configuring llm_requests collection...")
@@ -1174,8 +1243,14 @@ def _create_mongodb_indexes(db) -> None:
         ("node_name", {"name": "idx_audit_node_name"}),
         ("timestamp", {"name": "idx_audit_timestamp"}),
         ([("job_id", 1), ("step_number", 1)], {"name": "idx_audit_job_step"}),
-        ([("job_id", 1), ("iteration", 1), ("step_number", 1)], {"name": "idx_audit_job_iter_step"}),
-        ([("job_id", 1), ("agent_type", 1), ("step_type", 1)], {"name": "idx_audit_job_agent_type"}),
+        (
+            [("job_id", 1), ("iteration", 1), ("step_number", 1)],
+            {"name": "idx_audit_job_iter_step"},
+        ),
+        (
+            [("job_id", 1), ("agent_type", 1), ("step_type", 1)],
+            {"name": "idx_audit_job_agent_type"},
+        ),
     ]
 
     logger.info("  Configuring agent_audit collection...")
@@ -1233,7 +1308,7 @@ async def verify_mongodb() -> dict:
         client = MongoClient(mongo_url, serverSelectionTimeoutMS=2000)
         client.server_info()
 
-        db_name = mongo_url.split('/')[-1].split('?')[0] or "srw_logs"
+        db_name = mongo_url.split("/")[-1].split("?")[0] or "srw_logs"
         db = client[db_name]
         collections = db.list_collection_names()
 
@@ -1265,10 +1340,14 @@ def backup_mongodb(backup_dir: Path) -> bool:
 
     cmd = [
         "mongodump",
-        "--host", params["host"],
-        "--port", params["port"],
-        "--db", params["database"],
-        "--out", str(backup_dir),
+        "--host",
+        params["host"],
+        "--port",
+        params["port"],
+        "--db",
+        params["database"],
+        "--out",
+        str(backup_dir),
     ]
 
     if params["username"] and params["password"]:
@@ -1320,6 +1399,7 @@ def restore_mongodb(backup_dir: Path) -> bool:
     logger.info(f"  Clearing database: {params['database']}")
     try:
         from pymongo import MongoClient
+
         client = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)
         db = client[params["database"]]
         for collection_name in db.list_collection_names():
@@ -1330,9 +1410,12 @@ def restore_mongodb(backup_dir: Path) -> bool:
 
     cmd = [
         "mongorestore",
-        "--host", params["host"],
-        "--port", params["port"],
-        "--db", params["database"],
+        "--host",
+        params["host"],
+        "--port",
+        params["port"],
+        "--db",
+        params["database"],
         "--drop",
         str(db_backup_dir),
     ]
@@ -1358,6 +1441,7 @@ def restore_mongodb(backup_dir: Path) -> bool:
 # =============================================================================
 # Uploads Directory Management
 # =============================================================================
+
 
 def _resolve_uploads_dir() -> Path:
     """Resolve uploads directory, respecting WORKSPACE_PATH env var."""
@@ -1478,6 +1562,7 @@ def restore_uploads(backup_dir: Path) -> bool:
 # Combined Operations
 # =============================================================================
 
+
 async def init_databases(
     force_reset: bool = False,
     skip_postgres: bool = False,
@@ -1514,7 +1599,9 @@ async def init_databases(
         logger.info("")
         logger.info("Initializing Vector DB...")
         if not await init_vector_db(force_reset):
-            logger.warning("Vector DB initialization had issues (non-fatal in single-DB mode)")
+            logger.warning(
+                "Vector DB initialization had issues (non-fatal in single-DB mode)"
+            )
 
     # Neo4j (system knowledge base) — non-fatal if not configured
     logger.info("")
@@ -1621,6 +1708,7 @@ def restore_databases(backup_dir: Path) -> dict:
 # CLI
 # =============================================================================
 
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -1667,7 +1755,8 @@ Examples:
         help="Restore from backup directory",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose output",
     )
@@ -1693,16 +1782,22 @@ async def main_async(args: argparse.Namespace) -> int:
                 if not pg.get("all_tables_exist"):
                     logger.warning("  Some tables missing - run init to create them")
             else:
-                logger.warning(f"PostgreSQL: not connected ({pg.get('error', 'unknown error')})")
+                logger.warning(
+                    f"PostgreSQL: not connected ({pg.get('error', 'unknown error')})"
+                )
 
         if "mongodb" in result:
             mg = result["mongodb"]
             if not mg.get("configured"):
                 logger.info("MongoDB: not configured (optional)")
             elif mg.get("connected"):
-                logger.info(f"MongoDB: connected (collections: {mg.get('collections', [])})")
+                logger.info(
+                    f"MongoDB: connected (collections: {mg.get('collections', [])})"
+                )
             else:
-                logger.warning(f"MongoDB: not connected ({mg.get('error', 'unknown error')})")
+                logger.warning(
+                    f"MongoDB: not connected ({mg.get('error', 'unknown error')})"
+                )
 
         return 0
 

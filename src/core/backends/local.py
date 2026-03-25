@@ -145,11 +145,13 @@ class LocalBackend(WorkspaceBackend):
                     search_line = line if case_sensitive else line.lower()
                     if query in search_line:
                         rel_path = str(file_path.relative_to(workspace_resolved))
-                        results.append({
-                            "path": rel_path,
-                            "line_number": i,
-                            "line": line.strip(),
-                        })
+                        results.append(
+                            {
+                                "path": rel_path,
+                                "line_number": i,
+                                "line": line.strip(),
+                            }
+                        )
             except (UnicodeDecodeError, IOError):
                 continue
 

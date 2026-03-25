@@ -90,16 +90,24 @@ class TestRegistryMetadata:
     def test_expected_categories_present(self):
         """All expected tool categories must be registered."""
         categories = get_categories()
-        expected = {"workspace", "core", "document", "research", "citation",
-                    "graph", "sql", "mongodb", "git", "coding"}
+        expected = {
+            "workspace",
+            "core",
+            "document",
+            "research",
+            "citation",
+            "graph",
+            "sql",
+            "mongodb",
+            "git",
+            "coding",
+        }
         for cat in expected:
             assert cat in categories, f"Missing category: {cat}"
 
     def test_registry_has_minimum_tool_count(self):
         """Registry should have a reasonable number of tools."""
-        assert len(TOOL_REGISTRY) >= 40, (
-            f"Expected 40+ tools, got {len(TOOL_REGISTRY)}"
-        )
+        assert len(TOOL_REGISTRY) >= 40, f"Expected 40+ tools, got {len(TOOL_REGISTRY)}"
 
 
 # =============================================================================
@@ -416,16 +424,19 @@ class TestRegisterTool:
 
     def test_register_overwrites_existing(self):
         """Registering same name should overwrite."""
-        register_tool(name="__test_custom_tool__", module="m1", function="f1",
-                      description="d1")
-        register_tool(name="__test_custom_tool__", module="m2", function="f2",
-                      description="d2")
+        register_tool(
+            name="__test_custom_tool__", module="m1", function="f1", description="d1"
+        )
+        register_tool(
+            name="__test_custom_tool__", module="m2", function="f2", description="d2"
+        )
         assert TOOL_REGISTRY["__test_custom_tool__"]["module"] == "m2"
 
     def test_unregister_removes_tool(self):
         """unregister_tool should remove tool from registry."""
-        register_tool(name="__test_custom_tool__", module="m", function="f",
-                      description="d")
+        register_tool(
+            name="__test_custom_tool__", module="m", function="f", description="d"
+        )
         result = unregister_tool("__test_custom_tool__")
         assert result is True
         assert "__test_custom_tool__" not in TOOL_REGISTRY
@@ -437,8 +448,9 @@ class TestRegisterTool:
 
     def test_unregistered_tool_not_in_available(self):
         """After unregistering, tool should not appear in get_available_tools."""
-        register_tool(name="__test_custom_tool__", module="m", function="f",
-                      description="d")
+        register_tool(
+            name="__test_custom_tool__", module="m", function="f", description="d"
+        )
         unregister_tool("__test_custom_tool__")
         assert "__test_custom_tool__" not in get_available_tools()
 
@@ -451,6 +463,7 @@ class TestRegisterTool:
 @dataclass
 class FakeInstructionEntry:
     """Fake InstructionFileEntry for testing."""
+
     file: str
     trigger_type: str
     trigger_target: str
@@ -480,8 +493,10 @@ class TestApplyInstructionEnforcement:
         # Phase trigger, not before_tool
         ctx._instruction_files = [
             FakeInstructionEntry(
-                file="guide.md", trigger_type="phase",
-                trigger_target="strategic", enforce=False,
+                file="guide.md",
+                trigger_type="phase",
+                trigger_target="strategic",
+                enforce=False,
             )
         ]
         tools = [self._make_tool("read_file")]
@@ -494,8 +509,10 @@ class TestApplyInstructionEnforcement:
         ctx = ToolContext()
         ctx._instruction_files = [
             FakeInstructionEntry(
-                file="todo_guide.md", trigger_type="before_tool",
-                trigger_target="next_phase_todos", enforce=True,
+                file="todo_guide.md",
+                trigger_type="before_tool",
+                trigger_target="next_phase_todos",
+                enforce=True,
             )
         ]
         tool = self._make_tool("next_phase_todos")
@@ -512,8 +529,10 @@ class TestApplyInstructionEnforcement:
         ctx = ToolContext()
         ctx._instruction_files = [
             FakeInstructionEntry(
-                file="todo_guide.md", trigger_type="before_tool",
-                trigger_target="next_phase_todos", enforce=True,
+                file="todo_guide.md",
+                trigger_type="before_tool",
+                trigger_target="next_phase_todos",
+                enforce=True,
             )
         ]
         tool = self._make_tool("next_phase_todos")
@@ -532,8 +551,10 @@ class TestApplyInstructionEnforcement:
         ctx = ToolContext()
         ctx._instruction_files = [
             FakeInstructionEntry(
-                file="todo_guide.md", trigger_type="before_tool",
-                trigger_target="next_phase_todos", enforce=True,
+                file="todo_guide.md",
+                trigger_type="before_tool",
+                trigger_target="next_phase_todos",
+                enforce=True,
             )
         ]
         read_tool = self._make_tool("read_file")
@@ -549,12 +570,16 @@ class TestApplyInstructionEnforcement:
         ctx = ToolContext()
         ctx._instruction_files = [
             FakeInstructionEntry(
-                file="guide_a.md", trigger_type="before_tool",
-                trigger_target="my_tool", enforce=True,
+                file="guide_a.md",
+                trigger_type="before_tool",
+                trigger_target="my_tool",
+                enforce=True,
             ),
             FakeInstructionEntry(
-                file="guide_b.md", trigger_type="before_tool",
-                trigger_target="my_tool", enforce=True,
+                file="guide_b.md",
+                trigger_type="before_tool",
+                trigger_target="my_tool",
+                enforce=True,
             ),
         ]
         tool = self._make_tool("my_tool")

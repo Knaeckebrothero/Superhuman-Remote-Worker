@@ -36,6 +36,7 @@ WARNING_THRESHOLD_RATIO = 0.9
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken
+
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
@@ -169,7 +170,11 @@ def _extract_responses_api_reasoning(message) -> None:
             cleaned.append(block["text"])
         # Skip non-text blocks (function_call items are already in tool_calls)
 
-    message.content = " ".join(cleaned).strip() if all(isinstance(c, str) for c in cleaned) else cleaned or ""
+    message.content = (
+        " ".join(cleaned).strip()
+        if all(isinstance(c, str) for c in cleaned)
+        else cleaned or ""
+    )
 
 
 def _extract_reasoning_from_response(data: dict) -> Optional[str]:
@@ -254,7 +259,9 @@ class ReasoningCapturingClient(httpx.Client):
     def send(self, request, **kwargs):
         url_str = str(request.url)
         is_chat = "/chat/completions" in url_str
-        is_responses = url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+        is_responses = (
+            url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+        )
         is_llm_request = is_chat or is_responses
 
         # Inject current key from KeyRing into the request header
@@ -264,7 +271,9 @@ class ReasoningCapturingClient(httpx.Client):
                 request.headers["authorization"] = f"Bearer {current}"
             except RuntimeError:
                 # All keys exhausted — let the request go with whatever header it has
-                logger.error("KeyRing: all keys exhausted, sending with original header")
+                logger.error(
+                    "KeyRing: all keys exhausted, sending with original header"
+                )
 
         # Token validation for LLM requests (Layer 0 safety check)
         if is_llm_request:
@@ -331,7 +340,9 @@ class ReasoningCapturingClient(httpx.Client):
         status = response.status_code
 
         if status == 401 or status == 403:
-            return self._rotate_and_retry(request, f"HTTP {status} auth error", **kwargs)
+            return self._rotate_and_retry(
+                request, f"HTTP {status} auth error", **kwargs
+            )
 
         if status == 429 and self._is_quota_error(response):
             return self._rotate_and_retry(request, "quota exceeded (429)", **kwargs)
@@ -384,7 +395,9 @@ class ReasoningCapturingClient(httpx.Client):
         """
         new_key = self._key_ring.rotate(reason)
         if new_key is None:
-            logger.error(f"Key rotation failed: no alternative keys available ({reason})")
+            logger.error(
+                f"Key rotation failed: no alternative keys available ({reason})"
+            )
             return None
 
         # Override header with new key and retry
@@ -434,7 +447,9 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
     async def send(self, request, **kwargs):
         url_str = str(request.url)
         is_chat = "/chat/completions" in url_str
-        is_responses = url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+        is_responses = (
+            url_str.rstrip("/").endswith("/responses") or "/responses/" in url_str
+        )
         is_llm_request = is_chat or is_responses
 
         # Inject current key from KeyRing into the request header
@@ -443,7 +458,9 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
                 current = self._key_ring.current_key
                 request.headers["authorization"] = f"Bearer {current}"
             except RuntimeError:
-                logger.error("KeyRing: all keys exhausted, sending with original header")
+                logger.error(
+                    "KeyRing: all keys exhausted, sending with original header"
+                )
 
         # Token validation for LLM requests (Layer 0 safety check)
         if is_llm_request:
@@ -481,7 +498,9 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
 
         # Key rotation: retry once on auth/quota errors
         if is_llm_request and self._key_ring and self._key_ring.has_alternatives:
-            rotated_response = await self._handle_key_rotation(request, response, **kwargs)
+            rotated_response = await self._handle_key_rotation(
+                request, response, **kwargs
+            )
             if rotated_response is not None:
                 response = rotated_response
 
@@ -502,10 +521,14 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         status = response.status_code
 
         if status == 401 or status == 403:
-            return await self._rotate_and_retry(request, f"HTTP {status} auth error", **kwargs)
+            return await self._rotate_and_retry(
+                request, f"HTTP {status} auth error", **kwargs
+            )
 
         if status == 429 and self._is_quota_error(response):
-            return await self._rotate_and_retry(request, "quota exceeded (429)", **kwargs)
+            return await self._rotate_and_retry(
+                request, "quota exceeded (429)", **kwargs
+            )
 
         return None
 
@@ -542,7 +565,9 @@ class AsyncReasoningCapturingClient(httpx.AsyncClient):
         """Rotate to next key and retry the request once."""
         new_key = self._key_ring.rotate(reason)
         if new_key is None:
-            logger.error(f"Key rotation failed: no alternative keys available ({reason})")
+            logger.error(
+                f"Key rotation failed: no alternative keys available ({reason})"
+            )
             return None
 
         request.headers["authorization"] = f"Bearer {new_key}"
@@ -577,7 +602,12 @@ class ReasoningChatOpenAI(ChatOpenAI):
     _reasoning_client: ReasoningCapturingClient = PrivateAttr(default=None)
     _async_reasoning_client: AsyncReasoningCapturingClient = PrivateAttr(default=None)
 
-    def __init__(self, max_context_tokens: Optional[int] = None, key_ring: Optional["KeyRing"] = None, **kwargs):
+    def __init__(
+        self,
+        max_context_tokens: Optional[int] = None,
+        key_ring: Optional["KeyRing"] = None,
+        **kwargs,
+    ):
         # Extract config for our custom client
         timeout = kwargs.get("timeout")
         model = kwargs.get("model", "gpt-4")
@@ -614,14 +644,19 @@ class ReasoningChatOpenAI(ChatOpenAI):
         if self._reasoning_client and self._reasoning_client._last_reasoning_content:
             reasoning_content = self._reasoning_client._last_reasoning_content
             self._reasoning_client._last_reasoning_content = None
-        elif self._async_reasoning_client and self._async_reasoning_client._last_reasoning_content:
+        elif (
+            self._async_reasoning_client
+            and self._async_reasoning_client._last_reasoning_content
+        ):
             reasoning_content = self._async_reasoning_client._last_reasoning_content
             self._async_reasoning_client._last_reasoning_content = None
 
         if reasoning_content:
             for gen in result.generations:
                 if hasattr(gen, "message"):
-                    gen.message.additional_kwargs["reasoning_content"] = reasoning_content
+                    gen.message.additional_kwargs["reasoning_content"] = (
+                        reasoning_content
+                    )
                     logger.debug(
                         f"Captured reasoning_content: {len(reasoning_content)} chars"
                     )
@@ -645,18 +680,28 @@ class ReasoningChatOpenAI(ChatOpenAI):
                 # Build debug output
                 parts = []
                 if reasoning:
-                    r_tail = reasoning[-tail_chars:] if len(reasoning) > tail_chars else reasoning
-                    parts.append(f"\033[33m[reasoning {len(reasoning)} chars]\033[0m ...{r_tail}")
-                if content:
-                    c_tail = content[-tail_chars:] if len(content) > tail_chars else content
-                    parts.append(f"\033[36m[content {len(content)} chars]\033[0m ...{c_tail}")
-                if tool_calls:
-                    tc_summary = ", ".join(
-                        tc.get("name", "?") for tc in tool_calls
+                    r_tail = (
+                        reasoning[-tail_chars:]
+                        if len(reasoning) > tail_chars
+                        else reasoning
                     )
+                    parts.append(
+                        f"\033[33m[reasoning {len(reasoning)} chars]\033[0m ...{r_tail}"
+                    )
+                if content:
+                    c_tail = (
+                        content[-tail_chars:] if len(content) > tail_chars else content
+                    )
+                    parts.append(
+                        f"\033[36m[content {len(content)} chars]\033[0m ...{c_tail}"
+                    )
+                if tool_calls:
+                    tc_summary = ", ".join(tc.get("name", "?") for tc in tool_calls)
                     parts.append(f"\033[32m[tools: {tc_summary}]\033[0m")
                 if not content and not tool_calls:
-                    parts.append("\033[31m[empty response — no content, no tools]\033[0m")
+                    parts.append(
+                        "\033[31m[empty response — no content, no tools]\033[0m"
+                    )
 
                 for part in parts:
                     sys.stderr.write(f"\n{part}\n")

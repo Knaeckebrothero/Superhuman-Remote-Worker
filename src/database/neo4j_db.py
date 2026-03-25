@@ -81,8 +81,7 @@ class Neo4jDB:
 
         try:
             self.driver = GraphDatabase.driver(
-                self._uri,
-                auth=(self._username, self._password)
+                self._uri, auth=(self._username, self._password)
             )
             # Verify connectivity
             self.driver.verify_connectivity()
@@ -109,9 +108,7 @@ class Neo4jDB:
             logger.info("Neo4j connection closed")
 
     def execute_query(
-        self,
-        query: str,
-        parameters: Optional[Dict[str, Any]] = None
+        self, query: str, parameters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Execute a Cypher query and return results.
 
@@ -141,9 +138,7 @@ class Neo4jDB:
             raise
 
     def execute_write(
-        self,
-        query: str,
-        parameters: Optional[Dict[str, Any]] = None
+        self, query: str, parameters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """Execute a write transaction.
 
@@ -228,24 +223,22 @@ class Neo4jDB:
         Returns:
             Dictionary containing node labels, relationship types, and property keys
         """
-        schema = {
-            'node_labels': [],
-            'relationship_types': [],
-            'property_keys': []
-        }
+        schema = {"node_labels": [], "relationship_types": [], "property_keys": []}
 
         try:
             # Get node labels
             result = self.execute_query("CALL db.labels()")
-            schema['node_labels'] = [record['label'] for record in result]
+            schema["node_labels"] = [record["label"] for record in result]
 
             # Get relationship types
             result = self.execute_query("CALL db.relationshipTypes()")
-            schema['relationship_types'] = [record['relationshipType'] for record in result]
+            schema["relationship_types"] = [
+                record["relationshipType"] for record in result
+            ]
 
             # Get property keys
             result = self.execute_query("CALL db.propertyKeys()")
-            schema['property_keys'] = [record['propertyKey'] for record in result]
+            schema["property_keys"] = [record["propertyKey"] for record in result]
 
         except Exception as e:
             logger.error(f"Error retrieving schema: {e}")
@@ -258,4 +251,4 @@ class Neo4jDB:
         return self.driver is not None
 
 
-__all__ = ['Neo4jDB']
+__all__ = ["Neo4jDB"]

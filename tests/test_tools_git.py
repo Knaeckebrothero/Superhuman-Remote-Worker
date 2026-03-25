@@ -25,8 +25,7 @@ def git_available():
 
 # Skip all tests if git is not available
 pytestmark = pytest.mark.skipif(
-    not git_available(),
-    reason="Git not available on system"
+    not git_available(), reason="Git not available on system"
 )
 
 
@@ -367,7 +366,9 @@ class TestGitToolsInactive:
 
         for tool in tools:
             result = tool.invoke({})
-            assert "not available" in result.lower(), f"{tool.name} didn't handle inactive"
+            assert "not available" in result.lower(), (
+                f"{tool.name} didn't handle inactive"
+            )
 
 
 class TestGitToolsIntegration:
@@ -398,5 +399,7 @@ class TestGitToolsIntegration:
         assert "test-job-phase-1-tactical-complete" in tags_result
 
         git_show = get_tool_by_name(tools, "git_show")
-        show_result = git_show.invoke({"commit_ref": "test-job-phase-1-tactical-complete"})
+        show_result = git_show.invoke(
+            {"commit_ref": "test-job-phase-1-tactical-complete"}
+        )
         assert "todo_2" in show_result  # Last commit before tag

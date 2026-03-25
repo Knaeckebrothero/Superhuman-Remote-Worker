@@ -42,16 +42,37 @@ class ConversationSummary(BaseModel):
     A model_validator coerces any remaining list/dict values to strings
     as a catch-all safety net.
     """
-    summary: str | List[str] = Field(description="General overview of the conversation and what happened")
-    tasks_completed: str | List[str] = Field(description="Bullet-point list of completed tasks")
-    tasks_in_progress: str | List[str] = Field(default="", description="Tasks started but not finished")
+
+    summary: str | List[str] = Field(
+        description="General overview of the conversation and what happened"
+    )
+    tasks_completed: str | List[str] = Field(
+        description="Bullet-point list of completed tasks"
+    )
+    tasks_in_progress: str | List[str] = Field(
+        default="", description="Tasks started but not finished"
+    )
     key_decisions: str | List[str] = Field(description="Important decisions made")
-    current_state: str | List[str] = Field(description="Current progress and immediate next steps")
-    blockers: str | List[str] = Field(default="", description="Errors or blockers encountered, empty if none")
-    critical_facts: str | List[str] = Field(default="", description="Exact identifiers, file paths, error messages, URLs, version numbers, and configuration values that must survive compression verbatim")
-    state_changes: str | List[str] = Field(default="", description="Files created, modified, or deleted during this period")
-    pinned_instructions: str | List[str] = Field(default="", description="Rules from instructions/config that must persist")
-    identity_anchor: dict | str | List[str] = Field(default="", description="Agent role, current task, and active constraints for identity persistence")
+    current_state: str | List[str] = Field(
+        description="Current progress and immediate next steps"
+    )
+    blockers: str | List[str] = Field(
+        default="", description="Errors or blockers encountered, empty if none"
+    )
+    critical_facts: str | List[str] = Field(
+        default="",
+        description="Exact identifiers, file paths, error messages, URLs, version numbers, and configuration values that must survive compression verbatim",
+    )
+    state_changes: str | List[str] = Field(
+        default="", description="Files created, modified, or deleted during this period"
+    )
+    pinned_instructions: str | List[str] = Field(
+        default="", description="Rules from instructions/config that must persist"
+    )
+    identity_anchor: dict | str | List[str] = Field(
+        default="",
+        description="Agent role, current task, and active constraints for identity persistence",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -108,16 +129,16 @@ def find_safe_slice_start(messages: List[BaseMessage], target_start: int) -> int
         if isinstance(msg, ToolMessage):
             # This ToolMessage needs its parent AIMessage
             # Look backwards for the AIMessage with matching tool_call
-            tool_call_id = getattr(msg, 'tool_call_id', None)
+            tool_call_id = getattr(msg, "tool_call_id", None)
 
             if tool_call_id:
                 for i in range(adjusted_start - 1, -1, -1):
                     prev_msg = messages[i]
                     if isinstance(prev_msg, AIMessage):
-                        if hasattr(prev_msg, 'tool_calls') and prev_msg.tool_calls:
+                        if hasattr(prev_msg, "tool_calls") and prev_msg.tool_calls:
                             # Check if this AIMessage has the matching tool_call
                             for tc in prev_msg.tool_calls:
-                                if tc.get('id') == tool_call_id:
+                                if tc.get("id") == tool_call_id:
                                     # Found the parent - start from here
                                     adjusted_start = i
                                     break
@@ -171,9 +192,9 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
     # Build a set of valid tool_call_ids from AIMessages
     valid_tool_call_ids = set()
     for msg in messages:
-        if isinstance(msg, AIMessage) and hasattr(msg, 'tool_calls') and msg.tool_calls:
+        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
-                tc_id = tc.get('id')
+                tc_id = tc.get("id")
                 if tc_id:
                     valid_tool_call_ids.add(tc_id)
 
@@ -182,7 +203,7 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
     orphaned_count = 0
     for msg in messages:
         if isinstance(msg, ToolMessage):
-            tool_call_id = getattr(msg, 'tool_call_id', None)
+            tool_call_id = getattr(msg, "tool_call_id", None)
             if tool_call_id and tool_call_id not in valid_tool_call_ids:
                 # This ToolMessage is orphaned - skip it
                 orphaned_count += 1
@@ -222,6 +243,7 @@ def sanitize_message_history(messages: List[BaseMessage]) -> List[BaseMessage]:
 # Try to import tiktoken for accurate token counting
 try:
     import tiktoken
+
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
@@ -234,6 +256,7 @@ class ContextManagementState:
 
     Stored in agent metadata to track context management operations.
     """
+
     total_tool_results_cleared: int = 0
     total_messages_trimmed: int = 0
     total_summarizations: int = 0
@@ -261,6 +284,7 @@ class ContextConfig:
         summarization_safe_limit: Max input tokens for summarization LLM
         summarization_chunk_size: Chunk size for recursive summarization
     """
+
     compaction_threshold_tokens: int = 80_000
     summarization_threshold_tokens: int = 100_000
     message_count_threshold: int = 200
@@ -317,7 +341,9 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
             # Count tool calls if present
             tool_call_tokens = 0
             if hasattr(msg, "tool_calls") and msg.tool_calls:
-                tool_call_tokens = len(enc.encode(str(msg.tool_calls), disallowed_special=()))
+                tool_call_tokens = len(
+                    enc.encode(str(msg.tool_calls), disallowed_special=())
+                )
                 msg_tokens += tool_call_tokens
 
             # Add overhead for message structure (role, etc.)
@@ -327,10 +353,19 @@ def count_tokens_tiktoken(messages: List[BaseMessage], model: str = "gpt-4") -> 
             # Log large messages
             if msg_tokens > 1000:
                 msg_type = type(msg).__name__
-                debug_details.append(f"[{i}] {msg_type}: {content_tokens}t content, {tool_call_tokens}t tools, {len(content)} chars")
+                debug_details.append(
+                    f"[{i}] {msg_type}: {content_tokens}t content, {tool_call_tokens}t tools, {len(content)} chars"
+                )
 
-        if debug_details and total > 50000 and os.getenv("DEBUG_TOKEN_BREAKDOWN", "").strip() in ("1", "true"):
-            logger.debug(f"Token count breakdown ({len(messages)} msgs, {total} total tokens):\n  " + "\n  ".join(debug_details))
+        if (
+            debug_details
+            and total > 50000
+            and os.getenv("DEBUG_TOKEN_BREAKDOWN", "").strip() in ("1", "true")
+        ):
+            logger.debug(
+                f"Token count breakdown ({len(messages)} msgs, {total} total tokens):\n  "
+                + "\n  ".join(debug_details)
+            )
 
         return total
 
@@ -493,8 +528,10 @@ class ContextManager:
             return True
 
         # New: message count threshold with minimum token requirement
-        if (message_count > self.config.message_count_threshold and
-                token_count > self.config.message_count_min_tokens):
+        if (
+            message_count > self.config.message_count_threshold
+            and token_count > self.config.message_count_min_tokens
+        ):
             return True
 
         return False
@@ -519,10 +556,7 @@ class ContextManager:
         keep_recent = keep_recent or self.config.keep_recent_tool_results
 
         # Count tool messages from the end
-        tool_indices = [
-            i for i, m in enumerate(messages)
-            if isinstance(m, ToolMessage)
-        ]
+        tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
 
         if not tool_indices:
             return messages
@@ -575,10 +609,7 @@ class ContextManager:
         keep_recent = keep_recent or self.config.keep_recent_tool_results
 
         # Count tool messages from the end
-        tool_indices = [
-            i for i, m in enumerate(messages)
-            if isinstance(m, ToolMessage)
-        ]
+        tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
 
         if not tool_indices:
             return messages
@@ -591,8 +622,8 @@ class ContextManager:
             if isinstance(msg, ToolMessage) and i not in recent_indices:
                 if len(msg.content) > max_length:
                     truncated = (
-                        msg.content[:max_length] +
-                        f"\n\n[TRUNCATED - {len(msg.content) - max_length} chars omitted, see workspace]"
+                        msg.content[:max_length]
+                        + f"\n\n[TRUNCATED - {len(msg.content) - max_length} chars omitted, see workspace]"
                     )
                     result.append(
                         ToolMessage(
@@ -630,7 +661,9 @@ class ContextManager:
             return messages
 
         token_count = self.get_token_count(messages)
-        should_be_aggressive = aggressive or token_count > self.config.compaction_threshold_tokens
+        should_be_aggressive = (
+            aggressive or token_count > self.config.compaction_threshold_tokens
+        )
 
         # Step 1: Clear old tool results
         if should_be_aggressive:
@@ -685,12 +718,14 @@ class ContextManager:
 
         # Keep first human message (original task) and recent messages
         first_human_idx = next(
-            (i for i, m in enumerate(conversation) if isinstance(m, HumanMessage)),
-            None
+            (i for i, m in enumerate(conversation) if isinstance(m, HumanMessage)), None
         )
 
         trimmed_conversation = []
-        if first_human_idx is not None and first_human_idx < len(conversation) - keep_recent:
+        if (
+            first_human_idx is not None
+            and first_human_idx < len(conversation) - keep_recent
+        ):
             trimmed_conversation = [conversation[first_human_idx]]
 
         # Add recent messages, ensuring we don't orphan ToolMessages
@@ -746,11 +781,13 @@ class ContextManager:
                 keep_recent = self.config.keep_recent_messages
                 # Count conversation messages (non-system, non-RemoveMessage)
                 prev_conv_count = sum(
-                    1 for m in messages
+                    1
+                    for m in messages
                     if not isinstance(m, (SystemMessage, RemoveMessage))
                 )
                 conv_count = sum(
-                    1 for m in result
+                    1
+                    for m in result
                     if not isinstance(m, (SystemMessage, RemoveMessage))
                 )
                 # If first compaction didn't reduce, skip progressive loop
@@ -786,7 +823,8 @@ class ContextManager:
                             keep_recent_override=next_keep,
                         )
                         conv_count = sum(
-                            1 for m in result
+                            1
+                            for m in result
                             if not isinstance(m, (SystemMessage, RemoveMessage))
                         )
                         keep_recent = next_keep
@@ -845,7 +883,8 @@ class ContextManager:
             for idx, orig_len in tool_sizes:
                 msg = result[idx]
                 result[idx] = ToolMessage(
-                    content=msg.content[:limit] + f"\n\n[EMERGENCY TRUNCATED - {orig_len - limit} chars removed]",
+                    content=msg.content[:limit]
+                    + f"\n\n[EMERGENCY TRUNCATED - {orig_len - limit} chars removed]",
                     tool_call_id=msg.tool_call_id,
                 )
                 truncated_count += 1
@@ -884,7 +923,11 @@ class ContextManager:
         tool_msg_indices = []
         tool_call_parent = {}  # tool_call_id → parent AIMessage index
         for i, msg in enumerate(messages):
-            if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
+            if (
+                isinstance(msg, AIMessage)
+                and hasattr(msg, "tool_calls")
+                and msg.tool_calls
+            ):
                 for tc in msg.tool_calls:
                     tc_id = tc.get("id")
                     if tc_id:
@@ -928,7 +971,11 @@ class ContextManager:
                 continue
 
             # Insert recency marker before the first message in the recent window
-            if recency_boundary is not None and i >= recency_boundary and not marker_inserted:
+            if (
+                recency_boundary is not None
+                and i >= recency_boundary
+                and not marker_inserted
+            ):
                 if formatted_parts:  # Only if there are older messages to separate from
                     formatted_parts.append(
                         "\n════════════════════════════════════════\n"
@@ -946,7 +993,9 @@ class ContextManager:
             elif isinstance(msg, HumanMessage):
                 formatted_parts.append(f"User: {msg.content[:500]}")
             elif isinstance(msg, AIMessage):
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                content = (
+                    msg.content if isinstance(msg.content, str) else str(msg.content)
+                )
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     tool_names = [tc.get("name", "unknown") for tc in msg.tool_calls]
                     if content:
@@ -956,20 +1005,28 @@ class ContextManager:
                             f"Assistant: {content[:800]}... [Called tools: {', '.join(tool_names)}]"
                         )
                     else:
-                        formatted_parts.append(f"Assistant: [Called tools: {', '.join(tool_names)}]")
+                        formatted_parts.append(
+                            f"Assistant: [Called tools: {', '.join(tool_names)}]"
+                        )
                 elif content:
                     formatted_parts.append(f"Assistant: {content[:800]}...")
             elif isinstance(msg, ToolMessage):
                 tool_name = getattr(msg, "name", None) or "unknown"
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                content = (
+                    msg.content if isinstance(msg.content, str) else str(msg.content)
+                )
                 if i in recent_tool_indices:
                     # Recent: include truncated content for summarization
                     truncated = content[:300]
                     suffix = "..." if len(content) > 300 else ""
-                    formatted_parts.append(f"[Tool '{tool_name}' result: {truncated}{suffix}]")
+                    formatted_parts.append(
+                        f"[Tool '{tool_name}' result: {truncated}{suffix}]"
+                    )
                 else:
                     # Old: observation masking — placeholder only
-                    formatted_parts.append(f"[Tool '{tool_name}' result omitted ({len(content)} chars)]")
+                    formatted_parts.append(
+                        f"[Tool '{tool_name}' result omitted ({len(content)} chars)]"
+                    )
 
         return formatted_parts
 
@@ -1045,7 +1102,9 @@ class ContextManager:
             if result.tasks_completed.strip():
                 parts.append(f"**Tasks Completed:**\n{result.tasks_completed.strip()}")
             if result.tasks_in_progress and result.tasks_in_progress.strip():
-                parts.append(f"**Tasks In Progress:**\n{result.tasks_in_progress.strip()}")
+                parts.append(
+                    f"**Tasks In Progress:**\n{result.tasks_in_progress.strip()}"
+                )
             if result.key_decisions.strip():
                 parts.append(f"**Key Decisions:**\n{result.key_decisions.strip()}")
             if result.current_state.strip():
@@ -1057,22 +1116,35 @@ class ContextManager:
             if result.state_changes and result.state_changes.strip():
                 parts.append(f"**State Changes:**\n{result.state_changes.strip()}")
             if result.pinned_instructions and result.pinned_instructions.strip():
-                parts.append(f"**Pinned Instructions:**\n{result.pinned_instructions.strip()}")
+                parts.append(
+                    f"**Pinned Instructions:**\n{result.pinned_instructions.strip()}"
+                )
             if result.identity_anchor:
                 if isinstance(result.identity_anchor, dict):
                     anchor_parts = []
                     if result.identity_anchor.get("agent_role"):
-                        anchor_parts.append(f"Role: {result.identity_anchor['agent_role']}")
+                        anchor_parts.append(
+                            f"Role: {result.identity_anchor['agent_role']}"
+                        )
                     if result.identity_anchor.get("current_task"):
-                        anchor_parts.append(f"Task: {result.identity_anchor['current_task']}")
+                        anchor_parts.append(
+                            f"Task: {result.identity_anchor['current_task']}"
+                        )
                     if result.identity_anchor.get("active_constraints"):
                         constraints = result.identity_anchor["active_constraints"]
                         if isinstance(constraints, list):
-                            anchor_parts.append("Constraints: " + "; ".join(constraints))
+                            anchor_parts.append(
+                                "Constraints: " + "; ".join(constraints)
+                            )
                     if anchor_parts:
                         parts.append("**Identity Anchor:**\n" + "\n".join(anchor_parts))
-                elif isinstance(result.identity_anchor, str) and result.identity_anchor.strip():
-                    parts.append(f"**Identity Anchor:**\n{result.identity_anchor.strip()}")
+                elif (
+                    isinstance(result.identity_anchor, str)
+                    and result.identity_anchor.strip()
+                ):
+                    parts.append(
+                        f"**Identity Anchor:**\n{result.identity_anchor.strip()}"
+                    )
             summary = "\n\n".join(parts)
 
             return summary
@@ -1092,9 +1164,13 @@ class ContextManager:
                     auxiliary.llm.ainvoke([HumanMessage(content=fallback_prompt)]),
                     timeout=self._summarization_timeout,
                 )
-                fallback_summary = response.content if hasattr(response, 'content') else str(response)
+                fallback_summary = (
+                    response.content if hasattr(response, "content") else str(response)
+                )
                 if fallback_summary and len(fallback_summary.strip()) > 50:
-                    logger.info(f"Unstructured fallback succeeded ({len(fallback_summary)} chars)")
+                    logger.info(
+                        f"Unstructured fallback succeeded ({len(fallback_summary)} chars)"
+                    )
                     return fallback_summary.strip()
             except Exception as fallback_err:
                 logger.error(f"Unstructured fallback also failed: {fallback_err}")
@@ -1135,7 +1211,9 @@ class ContextManager:
             )
             # Truncate and return what we have
             combined = "\n".join(formatted_parts)
-            return combined[:max_summary_length * 4]  # Approximate chars for token limit
+            return combined[
+                : max_summary_length * 4
+            ]  # Approximate chars for token limit
 
         chunk_size = self.config.summarization_chunk_size
 
@@ -1150,7 +1228,9 @@ class ContextManager:
         chunk_summaries = []
         for i, chunk in enumerate(chunks):
             chunk_text = "\n".join(chunk)
-            logger.debug(f"Summarizing chunk {i+1}/{len(chunks)} ({len(chunk_text)} chars)")
+            logger.debug(
+                f"Summarizing chunk {i + 1}/{len(chunks)} ({len(chunk_text)} chars)"
+            )
 
             # Allocate proportional max length to each chunk
             chunk_max_length = max(1000, max_summary_length // max(len(chunks), 1))
@@ -1296,11 +1376,14 @@ class ContextManager:
         # 2. Old summary messages (incorporate into new summary, then discard)
         # Old summaries are identified by the "[Summary of prior work]" prefix
         system_msgs = [
-            m for m in messages
-            if isinstance(m, SystemMessage) and "[Summary of prior work]" not in m.content
+            m
+            for m in messages
+            if isinstance(m, SystemMessage)
+            and "[Summary of prior work]" not in m.content
         ]
         old_summaries = [
-            m for m in messages
+            m
+            for m in messages
             if isinstance(m, SystemMessage) and "[Summary of prior work]" in m.content
         ]
         conversation = [m for m in messages if not isinstance(m, SystemMessage)]
@@ -1339,9 +1422,7 @@ class ContextManager:
 
         # Create summary as SystemMessage (best practice per OpenAI/LangChain)
         # SystemMessage signals "background context" rather than user dialogue
-        summary_msg = SystemMessage(
-            content=f"[Summary of prior work]\n{summary}"
-        )
+        summary_msg = SystemMessage(content=f"[Summary of prior work]\n{summary}")
 
         # Generate removal markers for:
         # 1. ALL conversation messages (summarized + recent) - recent are re-added as fresh copies
@@ -1351,43 +1432,51 @@ class ContextManager:
 
         # Remove old summaries (they've been merged into the new summary)
         for msg in old_summaries:
-            if hasattr(msg, 'id') and msg.id:
+            if hasattr(msg, "id") and msg.id:
                 removal_markers.append(RemoveMessage(id=msg.id))
             else:
                 messages_without_ids += 1
 
         # Remove conversation messages (recent ones will be re-added as fresh copies)
         for msg in conversation:
-            if hasattr(msg, 'id') and msg.id:
+            if hasattr(msg, "id") and msg.id:
                 removal_markers.append(RemoveMessage(id=msg.id))
             else:
                 messages_without_ids += 1
 
         if messages_without_ids > 0:
-            logger.warning(f"{messages_without_ids} messages without IDs cannot be removed")
+            logger.warning(
+                f"{messages_without_ids} messages without IDs cannot be removed"
+            )
 
         # Create fresh copies of recent messages without IDs so they get appended
         # after the summary instead of staying in their original positions
         fresh_recent = []
         for msg in recent_messages:
             if isinstance(msg, AIMessage):
-                fresh_recent.append(AIMessage(
-                    content=msg.content,
-                    tool_calls=getattr(msg, 'tool_calls', None) or [],
-                    additional_kwargs=msg.additional_kwargs,
-                ))
+                fresh_recent.append(
+                    AIMessage(
+                        content=msg.content,
+                        tool_calls=getattr(msg, "tool_calls", None) or [],
+                        additional_kwargs=msg.additional_kwargs,
+                    )
+                )
             elif isinstance(msg, ToolMessage):
-                fresh_recent.append(ToolMessage(
-                    content=msg.content,
-                    tool_call_id=msg.tool_call_id,
-                ))
+                fresh_recent.append(
+                    ToolMessage(
+                        content=msg.content,
+                        tool_call_id=msg.tool_call_id,
+                    )
+                )
             elif isinstance(msg, HumanMessage):
                 fresh_recent.append(HumanMessage(content=msg.content))
             else:
                 # For any other message type, try to preserve it
                 fresh_recent.append(msg)
 
-        merged_summaries_info = f", merged {len(old_summaries)} prior summaries" if old_summaries else ""
+        merged_summaries_info = (
+            f", merged {len(old_summaries)} prior summaries" if old_summaries else ""
+        )
         logger.info(
             f"Compacted {len(messages)} messages to {len(system_msgs) + 1 + len(fresh_recent)} "
             f"(summarized {len(messages_to_summarize)} messages{merged_summaries_info}, "
@@ -1407,6 +1496,7 @@ class ContextManager:
         Returns:
             Callable compatible with LangGraph pre_model_hook
         """
+
         def pre_model_hook(state: Dict[str, Any]) -> Dict[str, Any]:
             messages = state.get("messages", [])
 
@@ -1463,7 +1553,7 @@ class ToolRetryManager:
         """
         import random
 
-        delay = self.base_delay * (2 ** attempt)
+        delay = self.base_delay * (2**attempt)
         delay = min(delay, self.max_delay)
         # Add 10% jitter
         jitter = delay * 0.1 * random.random()
@@ -1532,17 +1622,17 @@ async def write_error_to_workspace(
     error_content = f"""# Error Report
 
 **Timestamp:** {datetime.now(UTC).isoformat()}
-**Error Type:** {error.get('type', 'unknown')}
-**Recoverable:** {error.get('recoverable', False)}
+**Error Type:** {error.get("type", "unknown")}
+**Recoverable:** {error.get("recoverable", False)}
 
 ## Error Message
 
-{error.get('message', 'No message provided')}
+{error.get("message", "No message provided")}
 
 ## Stack Trace
 
 ```
-{error.get('traceback', 'No traceback available')}
+{error.get("traceback", "No traceback available")}
 ```
 
 ## Context

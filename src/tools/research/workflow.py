@@ -158,20 +158,24 @@ async def _search_semantic_scholar_raw(query: str, max_results: int, *, proxy=No
     for r in results:
         ext_ids = r.get("externalIds") or {}
         oa_pdf = r.get("openAccessPdf") or {}
-        papers.append(Paper(
-            title=r.get("title", "Unknown"),
-            authors=[a.get("name", "") for a in r.get("authors", [])],
-            abstract=r.get("abstract"),
-            doi=ext_ids.get("DOI"),
-            arxiv_id=ext_ids.get("ArXiv"),
-            url=f"https://api.semanticscholar.org/graph/v1/paper/{r.get('paperId', '')}",
-            pdf_url=oa_pdf.get("url"),
-            source=PaperSource.SEMANTIC_SCHOLAR,
-            access_status=AccessStatus.OPEN_ACCESS if oa_pdf else AccessStatus.UNKNOWN,
-            citation_count=r.get("citationCount"),
-            year=r.get("year"),
-            venue=r.get("venue"),
-        ))
+        papers.append(
+            Paper(
+                title=r.get("title", "Unknown"),
+                authors=[a.get("name", "") for a in r.get("authors", [])],
+                abstract=r.get("abstract"),
+                doi=ext_ids.get("DOI"),
+                arxiv_id=ext_ids.get("ArXiv"),
+                url=f"https://api.semanticscholar.org/graph/v1/paper/{r.get('paperId', '')}",
+                pdf_url=oa_pdf.get("url"),
+                source=PaperSource.SEMANTIC_SCHOLAR,
+                access_status=AccessStatus.OPEN_ACCESS
+                if oa_pdf
+                else AccessStatus.UNKNOWN,
+                citation_count=r.get("citationCount"),
+                year=r.get("year"),
+                venue=r.get("venue"),
+            )
+        )
     return papers
 
 
@@ -246,7 +250,8 @@ async def _download_available_papers(
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     downloadable = [
-        p for p in papers
+        p
+        for p in papers
         if p.access_status == AccessStatus.OPEN_ACCESS
         or p.arxiv_id is not None
         or p.pdf_url is not None
@@ -260,16 +265,16 @@ async def _download_available_papers(
             if paper.arxiv_id:
                 result = await _download_single_arxiv(paper.arxiv_id, dest_dir)
             elif paper.pdf_url:
-                result = await _download_single_url(paper.pdf_url, paper.title, dest_dir, proxy=proxy)
+                result = await _download_single_url(
+                    paper.pdf_url, paper.title, dest_dir, proxy=proxy
+                )
             else:
                 continue
 
             if result:
                 # Register as citation source
                 try:
-                    context.get_or_register_doc_source(
-                        str(result), name=paper.title
-                    )
+                    context.get_or_register_doc_source(str(result), name=paper.title)
                 except Exception:
                     pass
                 results.append(f"  Downloaded: {paper.title} -> {result.name}")
@@ -305,8 +310,7 @@ async def _download_single_url(
 
             # Generate filename from title
             safe_title = "".join(
-                c if c.isalnum() or c in " -_" else "_"
-                for c in title[:80]
+                c if c.isalnum() or c in " -_" else "_" for c in title[:80]
             ).strip()
             filename = f"{safe_title}.pdf"
             path = dest_dir / filename
@@ -341,8 +345,7 @@ def _format_research_report(
 
     # Stats
     oa_count = sum(
-        1 for p in papers
-        if p.access_status == AccessStatus.OPEN_ACCESS or p.arxiv_id
+        1 for p in papers if p.access_status == AccessStatus.OPEN_ACCESS or p.arxiv_id
     )
     lines.append(f"Open access available: {oa_count}/{len(papers)}")
     lines.append("")

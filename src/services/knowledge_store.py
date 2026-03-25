@@ -197,9 +197,18 @@ class KnowledgeStore:
                 WHERE project_id = $1 AND note_id = $2
                 RETURNING id
                 """,
-                project_id, note_id, title, note_type, status, confidence,
-                tags_list, keywords_list, job_id, phase,
-                retrieval_list, modified_at,
+                project_id,
+                note_id,
+                title,
+                note_type,
+                status,
+                confidence,
+                tags_list,
+                keywords_list,
+                job_id,
+                phase,
+                retrieval_list,
+                modified_at,
             )
             logger.debug(f"Updated knowledge index (metadata only): {note_id}")
             return row_id
@@ -214,13 +223,15 @@ class KnowledgeStore:
         embedding_vec = self._prepare_embedding(embedding_raw)
 
         # Build tsvector text from all searchable fields
-        search_text = " ".join([
-            title,
-            content,
-            " ".join(tags_list),
-            " ".join(keywords_list),
-            " ".join(retrieval_list),
-        ])
+        search_text = " ".join(
+            [
+                title,
+                content,
+                " ".join(tags_list),
+                " ".join(keywords_list),
+                " ".join(retrieval_list),
+            ]
+        )
 
         row_id = await self.db.fetchval(
             """
@@ -253,9 +264,22 @@ class KnowledgeStore:
                 content_hash = EXCLUDED.content_hash
             RETURNING id
             """,
-            note_id, project_id, title, note_type, status, confidence,
-            tags_list, keywords_list, job_id, phase, content, retrieval_list,
-            embedding_vec, search_text, created_at, modified_at,
+            note_id,
+            project_id,
+            title,
+            note_type,
+            status,
+            confidence,
+            tags_list,
+            keywords_list,
+            job_id,
+            phase,
+            content,
+            retrieval_list,
+            embedding_vec,
+            search_text,
+            created_at,
+            modified_at,
             new_hash,
         )
 
@@ -404,9 +428,9 @@ class KnowledgeStore:
                 # Convert Neo4j DateTime to Python datetime if needed
                 created = note.get("created")
                 modified = note.get("modified")
-                if hasattr(created, 'to_native'):
+                if hasattr(created, "to_native"):
                     created = created.to_native()
-                if hasattr(modified, 'to_native'):
+                if hasattr(modified, "to_native"):
                     modified = modified.to_native()
 
                 await self.upsert_note(

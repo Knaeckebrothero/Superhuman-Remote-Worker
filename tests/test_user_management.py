@@ -27,6 +27,7 @@ if _orchestrator_dir not in sys.path:
 # Helpers
 # ============================================================================
 
+
 def _make_user(
     user_id=None,
     display_name="Test User",
@@ -85,50 +86,59 @@ def _make_mcp_token(user_id=None, scope="user", name="Test Token", revoked=False
 # Password Module Tests
 # ============================================================================
 
+
 class TestPasswordModule:
     """Tests for orchestrator/security/password.py."""
 
     def test_hash_password_returns_string(self):
         from security.password import hash_password
+
         result = hash_password("test_password_123")
         assert isinstance(result, str)
         assert result.startswith("$argon2")
 
     def test_verify_password_correct(self):
         from security.password import hash_password, verify_password
+
         pw = "correct_horse_battery_staple1"
         hashed = hash_password(pw)
         assert verify_password(pw, hashed) is True
 
     def test_verify_password_incorrect(self):
         from security.password import hash_password, verify_password
+
         hashed = hash_password("right_password1")
         assert verify_password("wrong_password1", hashed) is False
 
     def test_verify_password_invalid_hash(self):
         from security.password import verify_password
+
         assert verify_password("anything", "not-a-valid-hash") is False
 
     def test_validate_password_strength_too_short(self):
         from security.password import validate_password_strength
+
         ok, msg = validate_password_strength("Ab1")
         assert not ok
         assert "8 characters" in msg
 
     def test_validate_password_strength_no_letter(self):
         from security.password import validate_password_strength
+
         ok, msg = validate_password_strength("12345678")
         assert not ok
         assert "letter" in msg
 
     def test_validate_password_strength_no_digit(self):
         from security.password import validate_password_strength
+
         ok, msg = validate_password_strength("abcdefgh")
         assert not ok
         assert "digit" in msg
 
     def test_validate_password_strength_valid(self):
         from security.password import validate_password_strength
+
         ok, msg = validate_password_strength("secure_pw1")
         assert ok
         assert msg == ""
@@ -137,6 +147,7 @@ class TestPasswordModule:
 # ============================================================================
 # Auth Module Tests
 # ============================================================================
+
 
 class TestGetCurrentUser:
     """Tests for security.auth.get_current_user."""
@@ -214,6 +225,7 @@ class TestValidateSession:
     @pytest.mark.asyncio
     async def test_none_session_key_returns_none(self):
         from security.auth import validate_session
+
         db = MagicMock()
         result = await validate_session(db, None)
         assert result is None
@@ -221,6 +233,7 @@ class TestValidateSession:
     @pytest.mark.asyncio
     async def test_empty_session_key_returns_none(self):
         from security.auth import validate_session
+
         db = MagicMock()
         result = await validate_session(db, "")
         assert result is None
@@ -248,6 +261,7 @@ class TestValidateSession:
     @pytest.mark.asyncio
     async def test_expired_session_returns_none(self):
         from security.auth import validate_session
+
         db = MagicMock()
         db.get_session = AsyncMock(return_value=None)  # DB filters expired
 
@@ -259,6 +273,7 @@ class TestValidateSession:
 # PostgresDB User Method Tests (mocked connection)
 # ============================================================================
 
+
 class TestPostgresDBUserOps:
     """Tests for PostgresDB user-related methods using mocked connections."""
 
@@ -266,11 +281,14 @@ class TestPostgresDBUserOps:
         """Create a PostgresDB instance with a mocked pool."""
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from database import PostgresDB
+
             db = PostgresDB()
         db._pool = MagicMock()
         return db
 
-    def _mock_conn(self, db, fetchrow_return=None, fetch_return=None, execute_return="UPDATE 1"):
+    def _mock_conn(
+        self, db, fetchrow_return=None, fetch_return=None, execute_return="UPDATE 1"
+    ):
         """Set up a mock connection context manager on the db."""
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(return_value=fetchrow_return)
@@ -360,14 +378,22 @@ class TestPostgresDBUserOps:
         db = self._make_db()
         rows = [
             {
-                "id": uuid4(), "display_name": "Admin", "avatar_color": "#f38ba8",
-                "email": "admin@test.com", "default_project_id": uuid4(),
-                "is_admin": True, "created_at": datetime.now(timezone.utc),
+                "id": uuid4(),
+                "display_name": "Admin",
+                "avatar_color": "#f38ba8",
+                "email": "admin@test.com",
+                "default_project_id": uuid4(),
+                "is_admin": True,
+                "created_at": datetime.now(timezone.utc),
             },
             {
-                "id": uuid4(), "display_name": "User", "avatar_color": "#89b4fa",
-                "email": "user@test.com", "default_project_id": uuid4(),
-                "is_admin": False, "created_at": datetime.now(timezone.utc),
+                "id": uuid4(),
+                "display_name": "User",
+                "avatar_color": "#89b4fa",
+                "email": "user@test.com",
+                "default_project_id": uuid4(),
+                "is_admin": False,
+                "created_at": datetime.now(timezone.utc),
             },
         ]
         self._mock_conn(db, fetch_return=rows)
@@ -381,7 +407,9 @@ class TestPostgresDBUserOps:
     async def test_get_admin_user_found(self):
         db = self._make_db()
         row = {
-            "id": uuid4(), "display_name": "Admin", "is_admin": True,
+            "id": uuid4(),
+            "display_name": "Admin",
+            "is_admin": True,
             "email": "admin@test.com",
         }
         self._mock_conn(db, fetchrow_return=row)
@@ -405,6 +433,7 @@ class TestUpsertDefaultUser:
     def _make_db(self):
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from database import PostgresDB
+
             db = PostgresDB()
         db._pool = MagicMock()
         return db
@@ -423,8 +452,11 @@ class TestUpsertDefaultUser:
         conn = self._mock_conn(db)
 
         new_row = {
-            "id": uuid4(), "display_name": "Admin", "avatar_color": "#f38ba8",
-            "email": "admin@test.com", "is_admin": True,
+            "id": uuid4(),
+            "display_name": "Admin",
+            "avatar_color": "#f38ba8",
+            "email": "admin@test.com",
+            "is_admin": True,
             "created_at": datetime.now(timezone.utc),
         }
         # First fetchrow (check existing) returns None, second (INSERT) returns new_row
@@ -448,8 +480,11 @@ class TestUpsertDefaultUser:
         conn = self._mock_conn(db)
 
         new_row = {
-            "id": uuid4(), "display_name": "Admin", "avatar_color": "#f38ba8",
-            "email": "admin@test.com", "is_admin": True,
+            "id": uuid4(),
+            "display_name": "Admin",
+            "avatar_color": "#f38ba8",
+            "email": "admin@test.com",
+            "is_admin": True,
             "created_at": datetime.now(timezone.utc),
         }
         conn.fetchrow = AsyncMock(side_effect=[None, new_row])
@@ -475,8 +510,11 @@ class TestUpsertDefaultUser:
         conn = self._mock_conn(db)
 
         existing = {
-            "id": uuid4(), "display_name": "Admin", "avatar_color": "#f38ba8",
-            "email": "admin@test.com", "is_admin": False,
+            "id": uuid4(),
+            "display_name": "Admin",
+            "avatar_color": "#f38ba8",
+            "email": "admin@test.com",
+            "is_admin": False,
             "created_at": datetime.now(timezone.utc),
         }
         conn.fetchrow = AsyncMock(return_value=existing)
@@ -499,8 +537,11 @@ class TestUpsertDefaultUser:
         conn = self._mock_conn(db)
 
         existing = {
-            "id": uuid4(), "display_name": "Default", "avatar_color": "#89b4fa",
-            "email": "default@cockpit.local", "is_admin": False,
+            "id": uuid4(),
+            "display_name": "Default",
+            "avatar_color": "#89b4fa",
+            "email": "default@cockpit.local",
+            "is_admin": False,
             "created_at": datetime.now(timezone.utc),
         }
         conn.fetchrow = AsyncMock(return_value=existing)
@@ -521,8 +562,11 @@ class TestUpsertDefaultUser:
         conn = self._mock_conn(db)
 
         existing = {
-            "id": uuid4(), "display_name": "Default", "avatar_color": "#89b4fa",
-            "email": None, "is_admin": False,
+            "id": uuid4(),
+            "display_name": "Default",
+            "avatar_color": "#89b4fa",
+            "email": None,
+            "is_admin": False,
             "created_at": datetime.now(timezone.utc),
         }
         conn.fetchrow = AsyncMock(return_value=existing)
@@ -543,17 +587,21 @@ class TestUpsertDefaultUser:
 # PostgresDB MCP Token Tests
 # ============================================================================
 
+
 class TestPostgresDBMcpTokens:
     """Tests for PostgresDB MCP token operations."""
 
     def _make_db(self):
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             from database import PostgresDB
+
             db = PostgresDB()
         db._pool = MagicMock()
         return db
 
-    def _mock_conn(self, db, fetchrow_return=None, fetch_return=None, execute_return="UPDATE 1"):
+    def _mock_conn(
+        self, db, fetchrow_return=None, fetch_return=None, execute_return="UPDATE 1"
+    ):
         conn = AsyncMock()
         conn.fetchrow = AsyncMock(return_value=fetchrow_return)
         conn.fetch = AsyncMock(return_value=fetch_return or [])
@@ -652,6 +700,7 @@ class TestPostgresDBMcpTokens:
 # Init Seeding Tests
 # ============================================================================
 
+
 class TestSeedDefaultUsers:
     """Tests for _seed_default_users in orchestrator/init.py."""
 
@@ -690,10 +739,13 @@ class TestSeedDefaultUsers:
         db = MagicMock()
         db.upsert_default_user = AsyncMock(return_value=_make_user())
 
-        with patch.dict("os.environ", {
-            "ADMIN_EMAIL": "boss@company.com",
-            "ADMIN_DISPLAY_NAME": "Boss",
-        }):
+        with patch.dict(
+            "os.environ",
+            {
+                "ADMIN_EMAIL": "boss@company.com",
+                "ADMIN_DISPLAY_NAME": "Boss",
+            },
+        ):
             await _seed_default_users(db)
 
         admin_call = db.upsert_default_user.call_args_list[0]
@@ -707,9 +759,12 @@ class TestSeedDefaultUsers:
         db = MagicMock()
         db.upsert_default_user = AsyncMock(return_value=_make_user())
 
-        with patch.dict("os.environ", {
-            "ADMIN_PASSWORD": "secure_password_1",
-        }):
+        with patch.dict(
+            "os.environ",
+            {
+                "ADMIN_PASSWORD": "secure_password_1",
+            },
+        ):
             await _seed_default_users(db)
 
         admin_call = db.upsert_default_user.call_args_list[0]
@@ -787,6 +842,7 @@ class TestSeedAdminMcpToken:
 # Orchestrator API Endpoint Tests
 # ============================================================================
 
+
 class TestMcpTokenEndpoints:
     """Tests for MCP token API endpoints in orchestrator/main.py."""
 
@@ -845,8 +901,9 @@ class TestMcpTokenEndpoints:
         user = await get_current_user(request, mock_db)
 
         scope = "all"
-        assert scope == "all" and not user.get("is_admin", False), \
+        assert scope == "all" and not user.get("is_admin", False), (
             "Non-admin should be blocked from creating full-access tokens"
+        )
 
     @pytest.mark.asyncio
     async def test_non_admin_can_create_user_scope_token(self, mock_db):
@@ -861,7 +918,7 @@ class TestMcpTokenEndpoints:
 
         scope = "user"
         # Should not be blocked
-        blocked = (scope == "all" and not user.get("is_admin", False))
+        blocked = scope == "all" and not user.get("is_admin", False)
         assert not blocked, "User-scope tokens should be allowed for everyone"
 
 
@@ -879,7 +936,9 @@ class TestUserDictHelper:
             "display_name": user["display_name"],
             "avatar_color": user["avatar_color"],
             "email": user.get("email"),
-            "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
+            "default_project_id": str(user["default_project_id"])
+            if user.get("default_project_id")
+            else None,
             "is_admin": user.get("is_admin", False),
             "created_at": user["created_at"],
         }
@@ -894,7 +953,9 @@ class TestUserDictHelper:
             "display_name": user["display_name"],
             "avatar_color": user["avatar_color"],
             "email": user.get("email"),
-            "default_project_id": str(user["default_project_id"]) if user.get("default_project_id") else None,
+            "default_project_id": str(user["default_project_id"])
+            if user.get("default_project_id")
+            else None,
             "is_admin": user.get("is_admin", False),
             "created_at": user["created_at"],
         }
@@ -912,6 +973,7 @@ class TestUserDictHelper:
 # ============================================================================
 # Integration-style Tests (Full Flow)
 # ============================================================================
+
 
 class TestAdminBootstrapFlow:
     """Integration-style tests for the admin bootstrap flow."""
@@ -1047,6 +1109,7 @@ class TestAdminBootstrapFlow:
 # Schema Tests
 # ============================================================================
 
+
 class TestSchemaContainsIsAdmin:
     """Verify schema.sql has the is_admin migration."""
 
@@ -1084,6 +1147,7 @@ class TestSchemaContainsIsAdmin:
 # ============================================================================
 # Config File Tests
 # ============================================================================
+
 
 class TestConfigFiles:
     """Verify config files include admin env vars."""

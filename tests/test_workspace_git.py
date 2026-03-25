@@ -27,8 +27,7 @@ def git_available():
 
 # Skip all tests if git is not available
 pytestmark = pytest.mark.skipif(
-    not git_available(),
-    reason="Git not available on system"
+    not git_available(), reason="Git not available on system"
 )
 
 
@@ -146,6 +145,7 @@ class TestWorkspaceGitInitialization:
         # Git history should be preserved
         log = ws.git_manager.log()
         assert "Add test file" in log
+
 
 class TestWorkspaceGitConfig:
     """Tests for workspace git configuration."""
@@ -277,7 +277,9 @@ class TestWorkspaceGitGracefulDegradation:
     def test_workspace_works_without_git(self, temp_base, monkeypatch):
         """Test that workspace works even if git initialization fails."""
         # Simulate git not being available
-        monkeypatch.setattr(shutil, "which", lambda x: None if x == "git" else shutil.which(x))
+        monkeypatch.setattr(
+            shutil, "which", lambda x: None if x == "git" else shutil.which(x)
+        )
 
         ws = WorkspaceManager(
             job_id="test-job",

@@ -120,7 +120,9 @@ class TestParseExtractionResponse:
         obs = _make_observer()
         result = obs._parse_extraction_response(json.dumps(_sample_memories()))
         assert len(result) == 2
-        assert result[0]["content"] == "The users table uses soft deletes via deleted_at."
+        assert (
+            result[0]["content"] == "The users table uses soft deletes via deleted_at."
+        )
 
     def test_markdown_code_fence(self):
         obs = _make_observer()
@@ -164,10 +166,12 @@ class TestParseExtractionResponse:
 
     def test_importance_clamped_to_range(self):
         obs = _make_observer()
-        raw = json.dumps([
-            {"content": "test", "importance": 1.5},
-            {"content": "test2", "importance": -0.3},
-        ])
+        raw = json.dumps(
+            [
+                {"content": "test", "importance": 1.5},
+                {"content": "test2", "importance": -0.3},
+            ]
+        )
         result = obs._parse_extraction_response(raw)
         assert result[0]["importance"] == 1.0
         assert result[1]["importance"] == 0.0
@@ -186,17 +190,27 @@ class TestParseExtractionResponse:
 
     def test_valid_types_preserved(self):
         obs = _make_observer()
-        for valid_type in ["factual", "procedural", "error_solution", "vocabulary", "relational"]:
+        for valid_type in [
+            "factual",
+            "procedural",
+            "error_solution",
+            "vocabulary",
+            "relational",
+        ]:
             raw = json.dumps([{"content": "test", "type": valid_type}])
             result = obs._parse_extraction_response(raw)
             assert result[0]["type"] == valid_type
 
     def test_keywords_lowercased_and_capped(self):
         obs = _make_observer()
-        raw = json.dumps([{
-            "content": "test",
-            "keywords": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
-        }])
+        raw = json.dumps(
+            [
+                {
+                    "content": "test",
+                    "keywords": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
+                }
+            ]
+        )
         result = obs._parse_extraction_response(raw)
         assert all(k == k.lower() for k in result[0]["keywords"])
         assert len(result[0]["keywords"]) <= 8
@@ -254,7 +268,10 @@ class TestFormatMessages:
 
     def test_skips_instruction_injection_messages(self):
         from src.core.workspace_injection import create_instruction_tool_messages
-        ai_msg, tool_msg = create_instruction_tool_messages("guide.md", "instruction content")
+
+        ai_msg, tool_msg = create_instruction_tool_messages(
+            "guide.md", "instruction content"
+        )
         messages = [
             HumanMessage(content="real message"),
             ai_msg,
@@ -266,6 +283,7 @@ class TestFormatMessages:
 
     def test_skips_memory_injection_messages(self):
         from src.core.memory_injection import create_memory_injection_messages
+
         ai_msg, tool_msg = create_memory_injection_messages("memory content")
         messages = [
             HumanMessage(content="real message"),
@@ -300,7 +318,9 @@ class TestObserve:
 
         messages = [
             HumanMessage(content="How does the users table work?"),
-            AIMessage(content="The users table uses soft deletes via deleted_at column."),
+            AIMessage(
+                content="The users table uses soft deletes via deleted_at column."
+            ),
         ]
 
         result = await obs.observe(messages, current_turn=5, phase=2)
@@ -349,10 +369,12 @@ class TestObserve:
         obs = _make_observer(interval=5)
         obs.llm.ainvoke = AsyncMock(return_value=_make_llm_response(_sample_memories()))
         # First store succeeds, second fails
-        obs.recall_store.store = AsyncMock(side_effect=[
-            "mem-id-1",
-            Exception("DB error"),
-        ])
+        obs.recall_store.store = AsyncMock(
+            side_effect=[
+                "mem-id-1",
+                Exception("DB error"),
+            ]
+        )
 
         messages = [HumanMessage(content="test")]
         result = await obs.observe(messages, current_turn=5)
@@ -399,7 +421,8 @@ class TestObservePhaseBoundary:
         obs.llm.ainvoke = AsyncMock(side_effect=Exception("fail"))
 
         result = await obs.observe_phase_boundary(
-            [HumanMessage(content="test")], phase=1,
+            [HumanMessage(content="test")],
+            phase=1,
         )
         assert result == []
 
@@ -446,7 +469,13 @@ class TestExtractionPrompt:
         assert "JSON" in EXTRACTION_PROMPT
 
     def test_prompt_mentions_all_types(self):
-        for mem_type in ["factual", "procedural", "error_solution", "vocabulary", "relational"]:
+        for mem_type in [
+            "factual",
+            "procedural",
+            "error_solution",
+            "vocabulary",
+            "relational",
+        ]:
             assert mem_type in EXTRACTION_PROMPT
 
     def test_prompt_mentions_importance(self):

@@ -45,12 +45,18 @@ logger = logging.getLogger(__name__)
 
 _TYPE_RULES: List[tuple] = [
     ("decision", re.compile(r"\b(decision|chose|picked|selected)\b", re.IGNORECASE)),
-    ("learning", re.compile(r"\b(learned|discovered|found|issue|error|fix)\b", re.IGNORECASE)),
+    (
+        "learning",
+        re.compile(r"\b(learned|discovered|found|issue|error|fix)\b", re.IGNORECASE),
+    ),
     ("goal", re.compile(r"\b(goal|objective|milestone)\b", re.IGNORECASE)),
     ("plan", re.compile(r"\b(plan|roadmap|phase)\b", re.IGNORECASE)),
     ("question", re.compile(r"\b(question|investigate|TODO|open)\b", re.IGNORECASE)),
     ("state", re.compile(r"\b(status|progress|current)\b", re.IGNORECASE)),
-    ("code", re.compile(r"\b(code|implementation|module|class|function)\b", re.IGNORECASE)),
+    (
+        "code",
+        re.compile(r"\b(code|implementation|module|class|function)\b", re.IGNORECASE),
+    ),
 ]
 
 _DEFAULT_TYPE = "learning"
@@ -60,16 +66,82 @@ _DEFAULT_TYPE = "learning"
 # ---------------------------------------------------------------------------
 
 # Common stop-words to exclude from tag extraction
-_STOP_WORDS = frozenset({
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
-    "should", "may", "might", "can", "could", "to", "of", "in", "for",
-    "on", "with", "at", "by", "from", "as", "into", "about", "between",
-    "through", "during", "before", "after", "above", "below", "and", "but",
-    "or", "nor", "not", "so", "if", "then", "than", "that", "this",
-    "these", "those", "it", "its", "we", "our", "they", "their", "them",
-    "you", "your", "he", "she", "his", "her", "i", "me", "my",
-})
+_STOP_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "shall",
+        "should",
+        "may",
+        "might",
+        "can",
+        "could",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "about",
+        "between",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "and",
+        "but",
+        "or",
+        "nor",
+        "not",
+        "so",
+        "if",
+        "then",
+        "than",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "we",
+        "our",
+        "they",
+        "their",
+        "them",
+        "you",
+        "your",
+        "he",
+        "she",
+        "his",
+        "her",
+        "i",
+        "me",
+        "my",
+    }
+)
 
 
 def _slugify(title: str, max_length: int = 80) -> str:
@@ -221,10 +293,12 @@ def _infer_links(
             # Check if the target's title appears in the source's body
             tgt_title_lower = tgt["title"].lower()
             if len(tgt_title_lower) >= 4 and tgt_title_lower in src_body_lower:
-                links.setdefault(src_slug, []).append({
-                    "target": tgt["slug"],
-                    "type": "REFERENCES",
-                })
+                links.setdefault(src_slug, []).append(
+                    {
+                        "target": tgt["slug"],
+                        "type": "REFERENCES",
+                    }
+                )
 
     return links
 
@@ -288,15 +362,17 @@ def convert_workspace(
         if job_id:
             tags.append("migrated-from-workspace")
 
-        sections.append({
-            "title": title,
-            "note_type": note_type,
-            "content": body,
-            "tags": tags,
-            "slug": slug,
-            "body": body,  # kept for link inference
-            "links": [],
-        })
+        sections.append(
+            {
+                "title": title,
+                "note_type": note_type,
+                "content": body,
+                "tags": tags,
+                "slug": slug,
+                "body": body,  # kept for link inference
+                "links": [],
+            }
+        )
 
     # 3. Infer cross-references
     link_map = _infer_links(sections)

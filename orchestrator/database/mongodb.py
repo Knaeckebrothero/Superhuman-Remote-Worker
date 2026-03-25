@@ -35,10 +35,12 @@ def _to_iso_utc(timestamp: Any) -> str:
         return timestamp.isoformat()
     return str(timestamp)
 
+
 try:
     from bson import ObjectId
     from bson.errors import InvalidId
     from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+
     MOTOR_AVAILABLE = True
 except ImportError:
     ObjectId = None
@@ -100,7 +102,7 @@ class MongoDB:
                 "Install with: pip install motor"
             )
 
-        self._url = url or os.getenv('MONGODB_URL')
+        self._url = url or os.getenv("MONGODB_URL")
         self._client: Optional[AsyncIOMotorClient] = None
         self._db: Optional[AsyncIOMotorDatabase] = None
         self._available: bool = False
@@ -222,7 +224,9 @@ class MongoDB:
         has_more = (skip + page_size) < total
 
         # Fetch paginated entries, sorted by step_number
-        cursor = collection.find(query).sort("step_number", 1).skip(skip).limit(page_size)
+        cursor = (
+            collection.find(query).sort("step_number", 1).skip(skip).limit(page_size)
+        )
 
         entries = []
         async for doc in cursor:
@@ -625,13 +629,15 @@ class MongoDB:
             timestamp = doc.get("timestamp")
             timestamp = _to_iso_utc(timestamp) if timestamp else None
 
-            deltas.append({
-                "toolCallIndex": index,
-                "timestamp": timestamp,
-                "cypherQuery": query_text,
-                "toolCallId": str(doc["_id"]),
-                "stepNumber": doc.get("step_number"),
-            })
+            deltas.append(
+                {
+                    "toolCallIndex": index,
+                    "timestamp": timestamp,
+                    "cypherQuery": query_text,
+                    "toolCallId": str(doc["_id"]),
+                    "stepNumber": doc.get("step_number"),
+                }
+            )
             index += 1
 
         return {
@@ -668,11 +674,13 @@ class MongoDB:
         chat_count = await chat_collection.count_documents({"job_id": job_id})
 
         # Count graph deltas (execute_cypher_query tool calls)
-        graph_count = await audit_collection.count_documents({
-            "job_id": job_id,
-            "step_type": "tool",
-            "tool.name": "execute_cypher_query",
-        })
+        graph_count = await audit_collection.count_documents(
+            {
+                "job_id": job_id,
+                "step_type": "tool",
+                "tool.name": "execute_cypher_query",
+            }
+        )
 
         # Get last audit entry timestamp
         last_entry = await audit_collection.find_one(
@@ -767,7 +775,9 @@ class MongoDB:
             if isinstance(response, dict):
                 tool_calls_raw = response.get("tool_calls", [])
                 doc["tool_calls"] = [
-                    {"name": tc.get("name", "?")} if isinstance(tc, dict) else {"name": str(tc)}
+                    {"name": tc.get("name", "?")}
+                    if isinstance(tc, dict)
+                    else {"name": str(tc)}
                     for tc in (tool_calls_raw or [])
                 ]
             else:
@@ -788,9 +798,7 @@ class MongoDB:
     # =========================================================================
 
     async def get_job_audit_trail(
-        self,
-        job_id: str,
-        event_type: Optional[str] = None
+        self, job_id: str, event_type: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Get complete audit trail for a job (legacy method).
 
@@ -820,9 +828,7 @@ class MongoDB:
             return []
 
     async def get_llm_conversation(
-        self,
-        job_id: str,
-        limit: int = 100
+        self, job_id: str, limit: int = 100
     ) -> List[Dict[str, Any]]:
         """Get LLM conversation history for a job (legacy method).
 
@@ -837,9 +843,11 @@ class MongoDB:
             return []
 
         try:
-            cursor = self._db.llm_requests.find(
-                {"job_id": job_id}
-            ).sort("timestamp", 1).limit(limit)
+            cursor = (
+                self._db.llm_requests.find({"job_id": job_id})
+                .sort("timestamp", 1)
+                .limit(limit)
+            )
             results = []
             async for doc in cursor:
                 doc["_id"] = str(doc["_id"])
@@ -860,14 +868,14 @@ class MongoDB:
 
         try:
             stats = {
-                'llm_requests_count': await self._db.llm_requests.count_documents({}),
-                'agent_audit_count': await self._db.agent_audit.count_documents({}),
-                'connected': True
+                "llm_requests_count": await self._db.llm_requests.count_documents({}),
+                "agent_audit_count": await self._db.agent_audit.count_documents({}),
+                "connected": True,
             }
             return stats
         except Exception as e:
             logger.error(f"Failed to get statistics: {e}")
-            return {'connected': False}
+            return {"connected": False}
 
     @property
     def db(self):
@@ -879,4 +887,4 @@ class MongoDB:
         return self._db
 
 
-__all__ = ['MongoDB', 'FILTER_MAPPINGS', 'FilterCategory']
+__all__ = ["MongoDB", "FILTER_MAPPINGS", "FilterCategory"]

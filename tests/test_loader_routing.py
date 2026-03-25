@@ -185,7 +185,10 @@ class TestReasoningSummaryRouting:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["reasoning"] == {"effort": "high", "summary": "auto"}
         # Should NOT have reasoning_effort in model_kwargs
-        assert "model_kwargs" not in call_kwargs or "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        assert (
+            "model_kwargs" not in call_kwargs
+            or "reasoning_effort" not in call_kwargs.get("model_kwargs", {})
+        )
 
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_o3_gets_reasoning_dict(self, mock_chat):
@@ -248,7 +251,10 @@ class TestDetectProviderOpenRouter:
     def test_openrouter_various_models(self):
         assert _detect_provider("openrouter/deepseek/deepseek-r1") == "openrouter"
         assert _detect_provider("openrouter/openai/gpt-4o-mini") == "openrouter"
-        assert _detect_provider("openrouter/meta-llama/llama-3.3-70b-instruct") == "openrouter"
+        assert (
+            _detect_provider("openrouter/meta-llama/llama-3.3-70b-instruct")
+            == "openrouter"
+        )
 
     def test_explicit_provider_overrides_prefix(self):
         """Explicit provider should always win over prefix detection."""
@@ -293,11 +299,15 @@ class TestOpenRouterLLMCreation:
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "https://custom-proxy.example.com/v1"
 
-    @patch.dict(os.environ, {
-        "OPENROUTER_API_KEY": "sk-or-test-key",
-        "OPENROUTER_REFERER": "https://my-app.com",
-        "OPENROUTER_TITLE": "My Agent",
-    }, clear=False)
+    @patch.dict(
+        os.environ,
+        {
+            "OPENROUTER_API_KEY": "sk-or-test-key",
+            "OPENROUTER_REFERER": "https://my-app.com",
+            "OPENROUTER_TITLE": "My Agent",
+        },
+        clear=False,
+    )
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_custom_headers(self, mock_chat):
         """Should pass HTTP-Referer and X-Title headers when env vars are set."""
@@ -317,7 +327,9 @@ class TestOpenRouterLLMCreation:
     def test_reasoning_in_model_kwargs(self, mock_chat):
         """Reasoning should use nested reasoning object for OpenRouter."""
         mock_chat.return_value = MagicMock()
-        config = _make_config(model="openrouter/deepseek/deepseek-r1", reasoning_level="high")
+        config = _make_config(
+            model="openrouter/deepseek/deepseek-r1", reasoning_level="high"
+        )
 
         _create_openrouter_llm(config, limits=None)
 
@@ -335,7 +347,9 @@ class TestOpenRouterLLMCreation:
             with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
                 _create_openrouter_llm(config, limits=None)
 
-    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-key1,sk-or-key2"}, clear=False)
+    @patch.dict(
+        os.environ, {"OPENROUTER_API_KEY": "sk-or-key1,sk-or-key2"}, clear=False
+    )
     @patch("src.core.loader.ReasoningChatOpenAI")
     def test_multiple_keys(self, mock_chat):
         """Should support comma-separated keys for rotation."""
@@ -404,7 +418,9 @@ class TestOpenRouterReasoningFormat:
     def test_xhigh_not_clamped(self, mock_chat):
         """OpenRouter should pass xhigh through without clamping."""
         mock_chat.return_value = MagicMock()
-        config = _make_config(model="openrouter/deepseek/deepseek-r1", reasoning_level="xhigh")
+        config = _make_config(
+            model="openrouter/deepseek/deepseek-r1", reasoning_level="xhigh"
+        )
 
         _create_openrouter_llm(config, limits=None)
 
@@ -416,7 +432,9 @@ class TestOpenRouterReasoningFormat:
     def test_minimal_not_clamped(self, mock_chat):
         """OpenRouter should pass minimal through without clamping."""
         mock_chat.return_value = MagicMock()
-        config = _make_config(model="openrouter/minimax/minimax-m2.7", reasoning_level="minimal")
+        config = _make_config(
+            model="openrouter/minimax/minimax-m2.7", reasoning_level="minimal"
+        )
 
         _create_openrouter_llm(config, limits=None)
 

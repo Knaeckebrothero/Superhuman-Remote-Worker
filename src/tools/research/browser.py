@@ -69,7 +69,9 @@ def _get_browser_llm():
     return ChatOpenAI(**kwargs)
 
 
-def _get_browser_config(context: ToolContext, downloads_path: Optional[Path] = None) -> Dict[str, Any]:
+def _get_browser_config(
+    context: ToolContext, downloads_path: Optional[Path] = None
+) -> Dict[str, Any]:
     """Build browser configuration kwargs.
 
     Reads settings from agent config (extra.browser section) and env vars.
@@ -119,7 +121,9 @@ def _get_browser_config(context: ToolContext, downloads_path: Optional[Path] = N
         browser_use_proxy = proxy.to_browser_use_proxy()
         if browser_use_proxy:
             kwargs["proxy"] = browser_use_proxy
-            logger.info(f"Browser using proxy: {proxy.type.value}://{proxy.host}:{proxy.port}")
+            logger.info(
+                f"Browser using proxy: {proxy.type.value}://{proxy.host}:{proxy.port}"
+            )
 
     return kwargs
 
@@ -249,8 +253,7 @@ def create_browser_tools(context: ToolContext) -> List[Any]:
 
             # Build download task
             full_task = (
-                f"Go to {url} and {download_task}. "
-                f"Wait for the download to complete."
+                f"Go to {url} and {download_task}. Wait for the download to complete."
             )
 
             # Create and run browser agent
@@ -373,6 +376,8 @@ def _register_downloaded_file(context: ToolContext, file_path: Path) -> None:
         source_id = context.get_or_register_doc_source(
             str(file_path), name=file_path.name
         )
-        logger.info(f"Registered downloaded file as citation source {source_id}: {file_path.name}")
+        logger.info(
+            f"Registered downloaded file as citation source {source_id}: {file_path.name}"
+        )
     except Exception as e:
         logger.debug(f"Could not register downloaded file as citation source: {e}")

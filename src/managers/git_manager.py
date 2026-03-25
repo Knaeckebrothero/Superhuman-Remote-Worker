@@ -173,7 +173,10 @@ class GitManager:
 
             # Check for "nothing to commit" which is OK if allow_empty=False
             if result.returncode != 0:
-                if "nothing to commit" in result.stdout or "nothing to commit" in result.stderr:
+                if (
+                    "nothing to commit" in result.stdout
+                    or "nothing to commit" in result.stderr
+                ):
                     if allow_empty:
                         logger.debug("No changes to commit (allow_empty=True)")
                         return True
@@ -324,7 +327,11 @@ class GitManager:
 
             # Get branch name
             branch_result = self._run_git(["branch", "--show-current"])
-            branch = branch_result.stdout.strip() if branch_result.returncode == 0 else "unknown"
+            branch = (
+                branch_result.stdout.strip()
+                if branch_result.returncode == 0
+                else "unknown"
+            )
 
             lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
 
@@ -476,10 +483,14 @@ class GitManager:
                 result = self._run_git(["branch", "--list", branch_name])
                 if not result.stdout.strip():
                     # Check if it exists on remote
-                    result = self._run_git(["branch", "-r", "--list", f"origin/{branch_name}"])
+                    result = self._run_git(
+                        ["branch", "-r", "--list", f"origin/{branch_name}"]
+                    )
                     if result.stdout.strip():
                         # Track remote branch
-                        result = self._run_git(["checkout", "-b", branch_name, f"origin/{branch_name}"])
+                        result = self._run_git(
+                            ["checkout", "-b", branch_name, f"origin/{branch_name}"]
+                        )
                         return result.returncode == 0
                     else:
                         # Create new local branch
@@ -567,7 +578,9 @@ class GitManager:
             logger.error(f"Failed to configure remote '{name}': {e}")
             return False
 
-    def push(self, remote: str = "origin", branch: Optional[str] = None, tags: bool = True) -> bool:
+    def push(
+        self, remote: str = "origin", branch: Optional[str] = None, tags: bool = True
+    ) -> bool:
         """Push commits and optionally tags to remote.
 
         Gracefully returns False if no remote is configured.
@@ -698,6 +711,7 @@ class GitManager:
     def _mask_url_static(url: str) -> str:
         """Mask credentials in a URL for safe logging."""
         import re
+
         return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", url)
 
     def _mask_url(self, url: str) -> str:
@@ -730,7 +744,10 @@ class GitManager:
             logger.error(f"Git command timed out after {timeout}s: {' '.join(cmd)}")
             # Return a fake CompletedProcess with error
             return subprocess.CompletedProcess(
-                cmd, returncode=1, stdout="", stderr=f"Command timed out after {timeout}s"
+                cmd,
+                returncode=1,
+                stdout="",
+                stderr=f"Command timed out after {timeout}s",
             )
         except Exception as e:
             logger.error(f"Git command failed: {e}")

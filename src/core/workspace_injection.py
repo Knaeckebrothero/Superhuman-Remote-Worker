@@ -38,7 +38,9 @@ def create_todos_human_message(todos_content: str) -> HumanMessage:
     Returns:
         HumanMessage with content prefixed by TODOS_INJECTION_CONTENT_PREFIX
     """
-    return HumanMessage(content=f"{TODOS_INJECTION_CONTENT_PREFIX}{todos_content}\n</active_tasks>")
+    return HumanMessage(
+        content=f"{TODOS_INJECTION_CONTENT_PREFIX}{todos_content}\n</active_tasks>"
+    )
 
 
 def create_instruction_tool_messages(
@@ -101,7 +103,12 @@ def is_workspace_injection_message(message: BaseMessage) -> bool:
 
     from src.core.memory_injection import MEMORY_TOOL_CALL_ID_PREFIX
     from src.core.knowledge_injection import KNOWLEDGE_TOOL_CALL_ID_PREFIX
-    prefixes = (INSTRUCTION_TOOL_CALL_ID_PREFIX, MEMORY_TOOL_CALL_ID_PREFIX, KNOWLEDGE_TOOL_CALL_ID_PREFIX)
+
+    prefixes = (
+        INSTRUCTION_TOOL_CALL_ID_PREFIX,
+        MEMORY_TOOL_CALL_ID_PREFIX,
+        KNOWLEDGE_TOOL_CALL_ID_PREFIX,
+    )
 
     if isinstance(message, ToolMessage):
         tool_call_id = getattr(message, "tool_call_id", "")

@@ -124,6 +124,7 @@ class TestRouteAfterExecute:
 
         # Make isinstance check work
         from langchain_core.messages import AIMessage
+
         mock_message.__class__ = AIMessage
 
         state = {"messages": [mock_message]}
@@ -136,6 +137,7 @@ class TestRouteAfterExecute:
         mock_message.tool_calls = []
 
         from langchain_core.messages import AIMessage
+
         mock_message.__class__ = AIMessage
 
         state = {"messages": [mock_message]}
@@ -145,6 +147,7 @@ class TestRouteAfterExecute:
     def test_route_after_execute_human_message(self):
         """Test routing with HumanMessage goes to check_todos."""
         from langchain_core.messages import HumanMessage
+
         state = {"messages": [HumanMessage(content="test")]}
         result = route_after_execute(state)
         assert result == "check_todos"
@@ -271,8 +274,20 @@ class TestRestoreTodoStateNode:
             "job_id": "test-123",
             "is_strategic_phase": False,
             "todos": [
-                {"id": "todo_1", "content": "Task 1", "status": "completed", "priority": "high", "notes": ["Done"]},
-                {"id": "todo_2", "content": "Task 2", "status": "pending", "priority": "medium", "notes": []},
+                {
+                    "id": "todo_1",
+                    "content": "Task 1",
+                    "status": "completed",
+                    "priority": "high",
+                    "notes": ["Done"],
+                },
+                {
+                    "id": "todo_2",
+                    "content": "Task 2",
+                    "status": "pending",
+                    "priority": "medium",
+                    "notes": [],
+                },
             ],
             "staged_todos": [],
             "todo_next_id": 3,
@@ -330,7 +345,13 @@ class TestRestoreTodoStateNode:
             "is_strategic_phase": True,
             "todos": [],
             "staged_todos": [
-                {"id": "todo_1", "content": "Staged Task 1", "status": "pending", "priority": "medium", "notes": []},
+                {
+                    "id": "todo_1",
+                    "content": "Staged Task 1",
+                    "status": "pending",
+                    "priority": "medium",
+                    "notes": [],
+                },
             ],
             "todo_next_id": 5,
         }
@@ -360,10 +381,22 @@ class TestRestoreTodoStateNode:
             "job_id": "test-123",
             "is_strategic_phase": True,
             "todos": [
-                {"id": "todo_1", "content": "Active Task", "status": "pending", "priority": "medium", "notes": []},
+                {
+                    "id": "todo_1",
+                    "content": "Active Task",
+                    "status": "pending",
+                    "priority": "medium",
+                    "notes": [],
+                },
             ],
             "staged_todos": [
-                {"id": "todo_2", "content": "Staged Task", "status": "pending", "priority": "medium", "notes": []},
+                {
+                    "id": "todo_2",
+                    "content": "Staged Task",
+                    "status": "pending",
+                    "priority": "medium",
+                    "notes": [],
+                },
             ],
             "todo_next_id": 5,
         }
@@ -393,6 +426,7 @@ class TestArchivePhaseNode:
         mock_context_mgr = MagicMock()
         # ensure_within_limits is async, so we need AsyncMock
         from unittest.mock import AsyncMock
+
         mock_context_mgr.ensure_within_limits = AsyncMock(return_value=[])
 
         # Mock config to enable compact_on_archive
@@ -407,8 +441,12 @@ class TestArchivePhaseNode:
         mock_summarization_prompt = "Summarize this conversation."
 
         node = create_archive_phase_node(
-            managers["todo"], managers["plan"], mock_config,
-            mock_context_mgr, mock_llm, mock_summarization_prompt
+            managers["todo"],
+            managers["plan"],
+            mock_config,
+            mock_context_mgr,
+            mock_llm,
+            mock_summarization_prompt,
         )
 
         state = {"job_id": "test-123", "messages": []}
@@ -420,7 +458,9 @@ class TestArchivePhaseNode:
         assert len(managers["todo"].list_all()) == 0
 
     @pytest.mark.asyncio
-    async def test_force_summarize_on_strategic_to_tactical_transition(self, managers, mock_config):
+    async def test_force_summarize_on_strategic_to_tactical_transition(
+        self, managers, mock_config
+    ):
         """Test that summarization is forced when transitioning from strategic to tactical.
 
         This ensures tactical phases get a 'fresh conversation' with just the plan summary,
@@ -446,8 +486,12 @@ class TestArchivePhaseNode:
         mock_summarization_prompt = "Summarize this conversation."
 
         node = create_archive_phase_node(
-            managers["todo"], managers["plan"], mock_config,
-            mock_context_mgr, mock_llm, mock_summarization_prompt
+            managers["todo"],
+            managers["plan"],
+            mock_config,
+            mock_context_mgr,
+            mock_llm,
+            mock_summarization_prompt,
         )
 
         # Test strategic phase (is_strategic=True) - should force summarization
@@ -461,7 +505,9 @@ class TestArchivePhaseNode:
         )
 
     @pytest.mark.asyncio
-    async def test_no_force_summarize_on_tactical_to_strategic_transition(self, managers, mock_config):
+    async def test_no_force_summarize_on_tactical_to_strategic_transition(
+        self, managers, mock_config
+    ):
         """Test that summarization is NOT forced when transitioning from tactical to strategic.
 
         Tactical→strategic transitions should preserve execution context for strategic reflection,
@@ -487,8 +533,12 @@ class TestArchivePhaseNode:
         mock_summarization_prompt = "Summarize this conversation."
 
         node = create_archive_phase_node(
-            managers["todo"], managers["plan"], mock_config,
-            mock_context_mgr, mock_llm, mock_summarization_prompt
+            managers["todo"],
+            managers["plan"],
+            mock_config,
+            mock_context_mgr,
+            mock_llm,
+            mock_summarization_prompt,
         )
 
         # Test tactical phase (is_strategic=False) - should NOT force summarization
@@ -509,7 +559,9 @@ class TestCheckGoalNode:
         """Test when plan is not complete."""
         managers["plan"].write("## Phase 1\n\n- [ ] Task 1")
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
+        node = create_check_goal_node(
+            managers["plan"], managers["workspace"], mock_config, managers["todo"]
+        )
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -520,7 +572,9 @@ class TestCheckGoalNode:
         """Test when plan is marked complete."""
         managers["plan"].write("# Plan\n\n# Complete\n\nAll done.")
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
+        node = create_check_goal_node(
+            managers["plan"], managers["workspace"], mock_config, managers["todo"]
+        )
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -537,7 +591,9 @@ class TestCheckGoalNode:
 - [x] Done
 """)
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
+        node = create_check_goal_node(
+            managers["plan"], managers["workspace"], mock_config, managers["todo"]
+        )
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -545,7 +601,9 @@ class TestCheckGoalNode:
         # Should check is_complete which looks for completed markers
         # If plan has "(complete)" it might trigger completion
         # Otherwise no more phases means goal achieved
-        assert result.get("goal_achieved") is True or result.get("goal_achieved") is False
+        assert (
+            result.get("goal_achieved") is True or result.get("goal_achieved") is False
+        )
         # At minimum, should return something about goal state
         assert "goal_achieved" in result
 
@@ -553,17 +611,19 @@ class TestCheckGoalNode:
         """Test that job_complete (writing job_completion.json) triggers goal achieved."""
         # Simulate job_complete tool having written the completion file
         import json
+
         completion_data = {
             "status": "job_completed",
             "summary": "All tasks complete",
             "deliverables": ["output/results.json"],
         }
         managers["workspace"].write_file(
-            "output/job_completion.json",
-            json.dumps(completion_data)
+            "output/job_completion.json", json.dumps(completion_data)
         )
 
-        node = create_check_goal_node(managers["plan"], managers["workspace"], mock_config, managers["todo"])
+        node = create_check_goal_node(
+            managers["plan"], managers["workspace"], mock_config, managers["todo"]
+        )
 
         state = {"job_id": "test-123"}
         result = node(state)
@@ -584,6 +644,7 @@ class TestRouteAfterTransition:
         """Test routing when transition succeeded (phase boundary marker present)."""
         route_after_transition = create_route_after_transition(workspace_manager)
         from langchain_core.messages import HumanMessage
+
         marker = HumanMessage(content="[PHASE_TRANSITION] Tactical phase complete.")
         state = {"messages": [marker]}
         result = route_after_transition(state)
@@ -593,6 +654,7 @@ class TestRouteAfterTransition:
         """Test routing when transition was rejected."""
         route_after_transition = create_route_after_transition(workspace_manager)
         from langchain_core.messages import ToolMessage
+
         error_msg = ToolMessage(
             content="[TRANSITION_REJECTED] todos.yaml validation failed",
             tool_call_id="phase_transition",
@@ -605,6 +667,7 @@ class TestRouteAfterTransition:
         """Test routing with other types of messages."""
         route_after_transition = create_route_after_transition(workspace_manager)
         from langchain_core.messages import HumanMessage
+
         state = {"messages": [HumanMessage(content="Some message")]}
         result = route_after_transition(state)
         # Other messages go to check_goal
@@ -620,6 +683,7 @@ class TestRouteAfterTransition:
 
         # Even with rejection message, should route to check_goal when should_stop=True
         from langchain_core.messages import ToolMessage
+
         error_msg = ToolMessage(
             content="[TRANSITION_REJECTED] No todos staged",
             tool_call_id="phase_transition",
@@ -635,7 +699,9 @@ class TestInitStrategicTodosNode:
     def test_loads_predefined_strategic_todos(self, managers, mock_config):
         """Test that init loads predefined strategic todos."""
         # Write instructions for the node to read
-        managers["workspace"].write_file("instructions.md", "# Test Task\n\nDo something.")
+        managers["workspace"].write_file(
+            "instructions.md", "# Test Task\n\nDo something."
+        )
 
         node = create_init_strategic_todos_node(
             managers["workspace"], managers["todo"], mock_config
@@ -701,7 +767,9 @@ class TestPredefinedTodos:
         assert any("review" in c.lower() for c in contents)
         assert any("knowledge" in c.lower() or "kb_" in c.lower() for c in contents)
         assert any("plan.md" in c.lower() for c in contents)
-        assert any("todos.yaml" in c.lower() or "job_complete" in c.lower() for c in contents)
+        assert any(
+            "todos.yaml" in c.lower() or "job_complete" in c.lower() for c in contents
+        )
 
 
 class TestTodosYamlValidation:
@@ -751,7 +819,9 @@ todos:
 
     def test_too_many_todos(self):
         """Test validation fails when too many todos."""
-        todos_list = "\n".join([f"  - id: {i}\n    content: 'Todo number {i}'" for i in range(1, 25)])
+        todos_list = "\n".join(
+            [f"  - id: {i}\n    content: 'Todo number {i}'" for i in range(1, 25)]
+        )
         content = f"todos:\n{todos_list}"
         with pytest.raises(TodosYamlValidationError) as exc_info:
             validate_todos_yaml(content, max_todos=20)
@@ -802,8 +872,11 @@ class TestHandleTransitionNode:
         mock_config.phase_settings = phase_settings
 
         node = create_handle_transition_node(
-            managers["workspace"], managers["todo"], mock_config,
-            min_todos=5, max_todos=20
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
         )
 
         state = {
@@ -836,8 +909,11 @@ class TestHandleTransitionNode:
         mock_config.phase_settings = phase_settings
 
         node = create_handle_transition_node(
-            managers["workspace"], managers["todo"], mock_config,
-            min_todos=5, max_todos=20
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
         )
 
         state = {
@@ -867,8 +943,11 @@ class TestHandleTransitionNode:
         mock_config.phase_settings = phase_settings
 
         node = create_handle_transition_node(
-            managers["workspace"], managers["todo"], mock_config,
-            min_todos=5, max_todos=20
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
         )
 
         state = {
@@ -910,7 +989,9 @@ class TestPhaseAlternationCycle:
         mock_config.phase_settings = phase_settings
 
         # Step 1: Initialize with strategic todos
-        managers["workspace"].write_file("instructions.md", "# Test Task\n\nExtract data.")
+        managers["workspace"].write_file(
+            "instructions.md", "# Test Task\n\nExtract data."
+        )
         init_node = create_init_strategic_todos_node(
             managers["workspace"], managers["todo"], mock_config
         )
@@ -941,8 +1022,11 @@ class TestPhaseAlternationCycle:
 
         # Step 3: Transition strategic → tactical
         transition_node = create_handle_transition_node(
-            managers["workspace"], managers["todo"], mock_config,
-            min_todos=5, max_todos=20
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
         )
 
         state["iteration"] = 10
@@ -952,7 +1036,10 @@ class TestPhaseAlternationCycle:
         # Verify transition to tactical
         assert state.get("is_strategic_phase") is False
         assert state.get("phase_number") == 1
-        assert any("[PHASE_TRANSITION]" in getattr(m, "content", "") for m in state.get("messages", []))
+        assert any(
+            "[PHASE_TRANSITION]" in getattr(m, "content", "")
+            for m in state.get("messages", [])
+        )
         assert len(managers["todo"].list_all()) == 5  # Loaded from todos.yaml
 
         # Step 4: Complete tactical todos
@@ -967,7 +1054,10 @@ class TestPhaseAlternationCycle:
         # Verify transition back to strategic
         assert state.get("is_strategic_phase") is True
         assert state.get("phase_number") == 2
-        assert any("[PHASE_TRANSITION]" in getattr(m, "content", "") for m in state.get("messages", []))
+        assert any(
+            "[PHASE_TRANSITION]" in getattr(m, "content", "")
+            for m in state.get("messages", [])
+        )
         # Should have transition strategic todos (4 items)
         assert len(managers["todo"].list_all()) == 4
 
@@ -1002,8 +1092,11 @@ class TestPhaseAlternationCycle:
         mock_config.phase_settings = phase_settings
 
         transition_node = create_handle_transition_node(
-            managers["workspace"], managers["todo"], mock_config,
-            min_todos=5, max_todos=20
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
         )
 
         # Create the routing function with workspace access
@@ -1021,7 +1114,10 @@ class TestPhaseAlternationCycle:
         # Should be rejected
         assert "[TRANSITION_REJECTED]" in result["messages"][0].content
         # State should NOT change
-        assert "is_strategic_phase" not in result or result.get("is_strategic_phase") is None
+        assert (
+            "is_strategic_phase" not in result
+            or result.get("is_strategic_phase") is None
+        )
 
         # After rejection, route_after_transition sends back to execute
         assert route_after_transition({"messages": result["messages"]}) == "execute"
@@ -1060,7 +1156,9 @@ class TestPhaseAlternationCycle:
         mock_config.phase_settings = phase_settings
 
         # Write initial memory
-        managers["memory"].write("# Project Memory\n\n## Findings\n\n- Important fact 1")
+        managers["memory"].write(
+            "# Project Memory\n\n## Findings\n\n- Important fact 1"
+        )
 
         # Initialize strategic phase
         init_node = create_init_strategic_todos_node(
@@ -1088,8 +1186,11 @@ class TestPhaseAlternationCycle:
 
         # Transition to tactical
         transition_node = create_handle_transition_node(
-            managers["workspace"], managers["todo"], mock_config,
-            min_todos=5, max_todos=20
+            managers["workspace"],
+            managers["todo"],
+            mock_config,
+            min_todos=5,
+            max_todos=20,
         )
         state["is_strategic_phase"] = True
         state["phase_number"] = 0
@@ -1101,7 +1202,9 @@ class TestPhaseAlternationCycle:
         assert "Important fact 1" in memory_content
 
         # Update memory during tactical phase
-        managers["memory"].update_section("Findings", "- Important fact 1\n- Important fact 2")
+        managers["memory"].update_section(
+            "Findings", "- Important fact 1\n- Important fact 2"
+        )
 
         # Complete tactical and transition back to strategic
         for todo in managers["todo"].list_all():
@@ -1146,11 +1249,15 @@ class TestEditFileTool:
         """Get the read_file tool from workspace tools."""
         return workspace_tools_dict["read_file"]
 
-    def test_edit_file_single_replacement(self, workspace_manager, edit_tool, read_tool):
+    def test_edit_file_single_replacement(
+        self, workspace_manager, edit_tool, read_tool
+    ):
         """Test successful single replacement."""
         workspace_manager.write_file("test.md", "Hello world\nGoodbye world\n")
         read_tool.invoke({"path": "test.md"})  # Must read first
-        result = edit_tool.invoke({"path": "test.md", "old_string": "Hello world", "new_string": "Hi world"})
+        result = edit_tool.invoke(
+            {"path": "test.md", "old_string": "Hello world", "new_string": "Hi world"}
+        )
         assert "Edited" in result
         content = workspace_manager.read_file("test.md")
         assert content == "Hi world\nGoodbye world\n"
@@ -1158,15 +1265,21 @@ class TestEditFileTool:
     def test_edit_file_not_found(self, edit_tool):
         """Test error when file doesn't exist."""
         # File doesn't exist - should fail before read check
-        result = edit_tool.invoke({"path": "missing.md", "old_string": "x", "new_string": "y"})
+        result = edit_tool.invoke(
+            {"path": "missing.md", "old_string": "x", "new_string": "y"}
+        )
         assert "Error" in result
         assert "not found" in result
 
-    def test_edit_file_old_string_missing(self, workspace_manager, edit_tool, read_tool):
+    def test_edit_file_old_string_missing(
+        self, workspace_manager, edit_tool, read_tool
+    ):
         """Test error when old_string not in file content."""
         workspace_manager.write_file("test.md", "Hello world\n")
         read_tool.invoke({"path": "test.md"})  # Must read first
-        result = edit_tool.invoke({"path": "test.md", "old_string": "does not exist", "new_string": "y"})
+        result = edit_tool.invoke(
+            {"path": "test.md", "old_string": "does not exist", "new_string": "y"}
+        )
         assert "Error" in result
         assert "old_string not found" in result
 
@@ -1174,7 +1287,9 @@ class TestEditFileTool:
         """Test error when old_string appears multiple times."""
         workspace_manager.write_file("test.md", "foo bar\nfoo baz\n")
         read_tool.invoke({"path": "test.md"})  # Must read first
-        result = edit_tool.invoke({"path": "test.md", "old_string": "foo", "new_string": "qux"})
+        result = edit_tool.invoke(
+            {"path": "test.md", "old_string": "foo", "new_string": "qux"}
+        )
         assert "Error" in result
         assert "2 times" in result
         assert "more surrounding context" in result
@@ -1185,7 +1300,9 @@ class TestEditFileTool:
         """Test deletion by replacing with empty string."""
         workspace_manager.write_file("test.md", "keep this\ndelete this\nkeep too\n")
         read_tool.invoke({"path": "test.md"})  # Must read first
-        result = edit_tool.invoke({"path": "test.md", "old_string": "delete this\n", "new_string": ""})
+        result = edit_tool.invoke(
+            {"path": "test.md", "old_string": "delete this\n", "new_string": ""}
+        )
         assert "Edited" in result
         content = workspace_manager.read_file("test.md")
         assert content == "keep this\nkeep too\n"
@@ -1194,7 +1311,9 @@ class TestEditFileTool:
         """Test error when path is a directory."""
         workspace_manager.get_path("subdir").mkdir(parents=True, exist_ok=True)
         # Can't read a directory, so this should fail at the directory check
-        result = edit_tool.invoke({"path": "subdir", "old_string": "x", "new_string": "y"})
+        result = edit_tool.invoke(
+            {"path": "subdir", "old_string": "x", "new_string": "y"}
+        )
         assert "Error" in result
         assert "directory" in result
 
@@ -1202,7 +1321,9 @@ class TestEditFileTool:
         """Test that edit_file fails without recent read."""
         workspace_manager.write_file("test.md", "Hello world\n")
         # Don't read first - should fail
-        result = edit_tool.invoke({"path": "test.md", "old_string": "Hello", "new_string": "Hi"})
+        result = edit_tool.invoke(
+            {"path": "test.md", "old_string": "Hello", "new_string": "Hi"}
+        )
         assert "Error" in result
         assert "read_file" in result.lower()
 
@@ -1244,10 +1365,12 @@ class TestEditCitationTool:
         """Test successful edit of claim field."""
         mock_db.citations.edit = AsyncMock(return_value=None)
 
-        result = await edit_tool.ainvoke({
-            "citation_id": 1,
-            "claim": "Updated claim text",
-        })
+        result = await edit_tool.ainvoke(
+            {
+                "citation_id": 1,
+                "claim": "Updated claim text",
+            }
+        )
 
         assert "ok: edited citation [1]" in result
         assert "verification_status reset" in result
@@ -1261,10 +1384,12 @@ class TestEditCitationTool:
             side_effect=ValueError("Citation 999 not found")
         )
 
-        result = await edit_tool.ainvoke({
-            "citation_id": 999,
-            "claim": "New claim",
-        })
+        result = await edit_tool.ainvoke(
+            {
+                "citation_id": 999,
+                "claim": "New claim",
+            }
+        )
 
         assert "error:" in result
         assert "not found" in result
@@ -1274,10 +1399,12 @@ class TestEditCitationTool:
         """Test that editing content fields triggers verification reset message."""
         mock_db.citations.edit = AsyncMock(return_value=None)
 
-        result = await edit_tool.ainvoke({
-            "citation_id": 1,
-            "verbatim_quote": "New quote text",
-        })
+        result = await edit_tool.ainvoke(
+            {
+                "citation_id": 1,
+                "verbatim_quote": "New quote text",
+            }
+        )
 
         assert "verification_status reset to 'pending'" in result
 
@@ -1286,10 +1413,12 @@ class TestEditCitationTool:
         """Test that editing non-content fields does not mention verification reset."""
         mock_db.citations.edit = AsyncMock(return_value=None)
 
-        result = await edit_tool.ainvoke({
-            "citation_id": 1,
-            "confidence": "medium",
-        })
+        result = await edit_tool.ainvoke(
+            {
+                "citation_id": 1,
+                "confidence": "medium",
+            }
+        )
 
         assert "ok: edited citation [1]" in result
         assert "verification_status reset" not in result
@@ -1297,9 +1426,11 @@ class TestEditCitationTool:
     @pytest.mark.asyncio
     async def test_edit_no_fields(self, edit_tool, mock_db):
         """Test error when no fields are provided."""
-        result = await edit_tool.ainvoke({
-            "citation_id": 1,
-        })
+        result = await edit_tool.ainvoke(
+            {
+                "citation_id": 1,
+            }
+        )
 
         assert "error:" in result
         assert "no fields" in result
@@ -1307,10 +1438,12 @@ class TestEditCitationTool:
     @pytest.mark.asyncio
     async def test_edit_invalid_locator_json(self, edit_tool, mock_db):
         """Test error when locator is not valid JSON."""
-        result = await edit_tool.ainvoke({
-            "citation_id": 1,
-            "locator": "not valid json{",
-        })
+        result = await edit_tool.ainvoke(
+            {
+                "citation_id": 1,
+                "locator": "not valid json{",
+            }
+        )
 
         assert "error:" in result
         assert "valid JSON" in result
@@ -1328,6 +1461,7 @@ class TestEnsureWithinLimits:
     def context_mgr(self):
         """Create a ContextManager with low thresholds for testing."""
         from src.core.context import ContextManager, ContextConfig
+
         config = ContextConfig(
             compaction_threshold_tokens=1000,
             summarization_threshold_tokens=1000,
@@ -1342,6 +1476,7 @@ class TestEnsureWithinLimits:
         """Create a mock AuxiliaryLLM that returns a summary."""
         from src.services.auxiliary import AuxiliaryLLM
         from langchain_core.messages import AIMessage
+
         llm = MagicMock()
         # with_structured_output(include_raw=True) returns dict with raw/parsed/parsing_error
         parsed = MagicMock(
@@ -1352,11 +1487,13 @@ class TestEnsureWithinLimits:
             blockers="",
         )
         structured_llm = MagicMock()
-        structured_llm.ainvoke = AsyncMock(return_value={
-            "raw": AIMessage(content="structured output"),
-            "parsed": parsed,
-            "parsing_error": None,
-        })
+        structured_llm.ainvoke = AsyncMock(
+            return_value={
+                "raw": AIMessage(content="structured output"),
+                "parsed": parsed,
+                "parsing_error": None,
+            }
+        )
         llm.with_structured_output = MagicMock(return_value=structured_llm)
         return AuxiliaryLLM(llm=llm)
 
@@ -1365,6 +1502,7 @@ class TestEnsureWithinLimits:
         """Test that messages are returned unchanged when under threshold."""
         from langchain_core.messages import HumanMessage
         from src.services.auxiliary import AuxiliaryLLM
+
         messages = [HumanMessage(content="Hello")]
 
         mock_llm = MagicMock()
@@ -1377,7 +1515,9 @@ class TestEnsureWithinLimits:
         mock_llm.with_structured_output.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_compaction_when_over_message_threshold(self, context_mgr, mock_auxiliary):
+    async def test_compaction_when_over_message_threshold(
+        self, context_mgr, mock_auxiliary
+    ):
         """Test that compaction happens when message count exceeds threshold."""
         from langchain_core.messages import HumanMessage, AIMessage
 
@@ -1410,20 +1550,26 @@ class TestEnsureWithinLimits:
             AIMessage(content="I am doing great, thanks! " * 50),
         ]
 
-        result = await context_mgr.ensure_within_limits(messages, mock_auxiliary, force=True)
+        result = await context_mgr.ensure_within_limits(
+            messages, mock_auxiliary, force=True
+        )
 
         # With force=True, compaction should happen (summary is smaller than original)
         assert len(result) < len(messages)
 
     @pytest.mark.asyncio
-    async def test_returns_original_when_not_enough_messages(self, context_mgr, mock_auxiliary):
+    async def test_returns_original_when_not_enough_messages(
+        self, context_mgr, mock_auxiliary
+    ):
         """Test that messages are returned unchanged when too few to compact."""
         from langchain_core.messages import HumanMessage
 
         # Only 1 message - can't really compact
         messages = [HumanMessage(content="Hello")]
 
-        result = await context_mgr.ensure_within_limits(messages, mock_auxiliary, force=True)
+        result = await context_mgr.ensure_within_limits(
+            messages, mock_auxiliary, force=True
+        )
 
         # Should return same messages since there's nothing to summarize
         assert result == messages

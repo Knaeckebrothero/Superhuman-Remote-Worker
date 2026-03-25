@@ -19,8 +19,10 @@ class TestExtraSerializationRoundTrip:
 
     def _mock_serialize(self, config: AgentConfig) -> dict:
         """Serialize config with mocked prompt/instruction resolvers."""
-        with patch("src.core.loader.PromptMatrixResolver") as mock_prompt, \
-             patch("src.core.loader.InstructionMatrixResolver") as mock_instr:
+        with (
+            patch("src.core.loader.PromptMatrixResolver") as mock_prompt,
+            patch("src.core.loader.InstructionMatrixResolver") as mock_instr,
+        ):
             mock_prompt.return_value.load.return_value = "dummy prompt"
             mock_instr.return_value.load.return_value = "dummy instruction"
             return serialize_resolved_config(config, model="gpt-4o")
@@ -42,7 +44,10 @@ class TestExtraSerializationRoundTrip:
         restored = load_config_from_resolved(resolved)
 
         # All extra fields should be directly accessible
-        assert restored.extra.get("verification") == {"enabled": True, "agent_config": "critic"}
+        assert restored.extra.get("verification") == {
+            "enabled": True,
+            "agent_config": "critic",
+        }
         assert restored.extra.get("shell") == {"max_tabs": 5}
         assert restored.extra.get("claude_code") == {"model": "claude-opus-4-6"}
         assert restored.extra.get("browser") == {"headless": True}

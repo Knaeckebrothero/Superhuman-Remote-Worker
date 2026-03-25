@@ -301,7 +301,11 @@ async def migrate_memories(
         return stats
 
     if not rows:
-        logger.info("No memories found for project %s (min_importance=%.2f)", project_id, min_importance)
+        logger.info(
+            "No memories found for project %s (min_importance=%.2f)",
+            project_id,
+            min_importance,
+        )
         return stats
 
     logger.info(
@@ -385,7 +389,9 @@ async def migrate_memories(
 
                 await knowledge_store.upsert_note(
                     note_id=created_slug,
-                    project_id=uuid.UUID(project_id) if isinstance(project_id, str) else project_id,
+                    project_id=uuid.UUID(project_id)
+                    if isinstance(project_id, str)
+                    else project_id,
                     title=title,
                     note_type=note_type,
                     content=content,

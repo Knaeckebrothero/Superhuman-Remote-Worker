@@ -12,9 +12,7 @@ from .paper_types import AccessStatus, DownloadResult, Paper, PaperSource
 logger = logging.getLogger(__name__)
 
 # Pattern to extract arXiv ID from various formats
-ARXIV_ID_PATTERN = re.compile(
-    r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)"
-)
+ARXIV_ID_PATTERN = re.compile(r"(?:arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5}(?:v\d+)?)")
 
 
 def extract_arxiv_id(identifier: str) -> Optional[str]:
