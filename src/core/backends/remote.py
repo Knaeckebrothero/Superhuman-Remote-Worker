@@ -115,7 +115,7 @@ class RemoteBackend(WorkspaceBackend):
         blocked_commands: Optional[List[str]] = None,
         sandbox_cwd: Optional[str] = None,
         connect_timeout: int = 30,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ):
         if paramiko is None:
             raise ImportError(
@@ -166,10 +166,12 @@ class RemoteBackend(WorkspaceBackend):
     # =========================================================================
 
     def connect(self) -> None:
-        """Establish SSH connection and SFTP channel."""
-        self._ssh = paramiko.SSHClient()
-        self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        """Establish SSH connection and SFTP channel.
 
+        Retries up to ``_max_retries`` times with exponential backoff to
+        tolerate the window between daemon registration (NATS) and SSHD
+        readiness inside the VM.
+        """
         connect_kwargs = {
             "hostname": self._host,
             "port": self._port,
@@ -179,12 +181,31 @@ class RemoteBackend(WorkspaceBackend):
         if self._key_path:
             connect_kwargs["key_filename"] = self._key_path
 
-        try:
-            self._ssh.connect(**connect_kwargs)
-        except (paramiko.SSHException, socket.error, OSError) as e:
-            raise WorkspaceUnavailableError(
-                f"Failed to connect to VM {self._host}:{self._port}: {e}"
-            ) from e
+        backoff = 2.0
+        for attempt in range(1, self._max_retries + 1):
+            self._ssh = paramiko.SSHClient()
+            self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                self._ssh.connect(**connect_kwargs)
+                break
+            except (paramiko.SSHException, socket.error, OSError) as e:
+                if attempt == self._max_retries:
+                    raise WorkspaceUnavailableError(
+                        f"Failed to connect to VM {self._host}:{self._port} "
+                        f"after {self._max_retries} attempts: {e}"
+                    ) from e
+                logger.warning(
+                    "SSH connect attempt %d/%d to %s:%d failed (%s), "
+                    "retrying in %.0fs",
+                    attempt,
+                    self._max_retries,
+                    self._host,
+                    self._port,
+                    e,
+                    backoff,
+                )
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 15.0)
 
         self._sftp = self._ssh.open_sftp()
         logger.info(f"Connected to VM {self._host}:{self._port}")
