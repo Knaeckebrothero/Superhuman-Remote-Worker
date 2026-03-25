@@ -1354,6 +1354,11 @@ class TestEditCitationTool:
             postgres_db=mock_db,
             _job_id="test-job-123",
         )
+        # Pre-set a mock citation engine so get_citation_engine() doesn't
+        # try to connect to a real database via CITATION_DB_URL.
+        mock_engine = MagicMock()
+        mock_engine.get_citation.return_value = {"id": 1}
+        ctx.citation_engine = mock_engine
         tools = create_citation_tools(ctx)
         for t in tools:
             if t.name == "edit_citation":
