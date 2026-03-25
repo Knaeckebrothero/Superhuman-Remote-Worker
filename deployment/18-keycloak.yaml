@@ -465,6 +465,8 @@ spec:
               value: "https://auth.superhuman-remote-worker.com"
             - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
               value: "true"
+            - name: KC_PROXY_HEADERS
+              value: "xforwarded"
             - name: KC_HTTP_ENABLED
               value: "true"
             # Trust ProtonMail Bridge self-signed cert for SMTP STARTTLS
