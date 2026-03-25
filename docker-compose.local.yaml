@@ -15,17 +15,23 @@
 #
 # Prerequisites:
 #   - Copy .env.example to .env and configure API keys + VPN credentials
+#   - Copy docker/keycloak/realm-export.json.example to docker/keycloak/realm-export.json
 #
 # Exposed ports:
 #   - 8085: Orchestrator API
 #   - 8055: MCP Server (Claude Code)
 #   - 4000: Cockpit Frontend
+#   - 8180: Keycloak SSO
+#   - 3000: Gitea
 #
 # =============================================================================
 
 name: superhuman-remote-worker
 
 services:
+  # ---------------------------------------------------------------------------
+  # Databases
+  # ---------------------------------------------------------------------------
   postgres:
     image: docker.io/library/postgres:15
     container_name: srw-postgres
@@ -35,6 +41,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-srw}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./orchestrator/database/init_sso_dbs.sh:/docker-entrypoint-initdb.d/000_init_sso_dbs.sh:Z
       - ./orchestrator/database/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:Z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-srw}"]
@@ -74,41 +81,63 @@ services:
       retries: 5
     restart: unless-stopped
 
-  pgadmin:
-    image: docker.io/dpage/pgadmin4:latest
-    container_name: srw-pgadmin
+  neo4j:
+    image: docker.io/library/neo4j:5
+    container_name: srw-neo4j
     environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@srw.dev}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
-      PGADMIN_CONFIG_SERVER_MODE: "False"
-    ports:
-      - "${PGADMIN_PORT:-5050}:80"
-    depends_on:
-      postgres:
-        condition: service_healthy
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-neo4j_password}
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/misc/ping"]
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USERNAME:-neo4j}", "-p", "${NEO4J_PASSWORD:-neo4j_password}", "RETURN 1"]
       interval: 10s
       timeout: 5s
       retries: 5
     restart: unless-stopped
 
-  mongo-express:
-    image: docker.io/library/mongo-express:latest
-    container_name: srw-mongo-express
+  # ---------------------------------------------------------------------------
+  # Identity & Storage
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2
+    container_name: srw-keycloak
+    command: start-dev --import-realm
     environment:
-      ME_CONFIG_MONGODB_SERVER: mongodb
-      ME_CONFIG_BASICAUTH: "false"
+      # Database
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      # Hostname — front-channel URLs use localhost so the browser can reach them.
+      # KC_HOSTNAME_BACKCHANNEL_DYNAMIC allows container-to-container backchannel
+      # requests (e.g. Gitea token exchange) to use the internal hostname.
+      KC_HOSTNAME: "http://localhost:${KEYCLOAK_PORT:-8180}"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HTTP_ENABLED: "true"
+      # Admin console credentials
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # SMTP — realm JSON resolves ${env.SMTP_*} from these at import time.
+      # Default: Proton Bridge on host machine (Podman: host.containers.internal)
+      SMTP_HOST: "${SMTP_HOST:-host.containers.internal}"
+      SMTP_USER: "${SMTP_USER:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+    volumes:
+      # Copy realm-export.json.example to realm-export.json and edit credentials.
+      # See docker/keycloak/realm-export.json.example for the template.
+      - ./docker/keycloak/realm-export.json:/opt/keycloak/data/import/srw-realm.json:ro,Z
     ports:
-      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+      - "${KEYCLOAK_PORT:-8180}:8080"
     depends_on:
-      mongodb:
+      postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/"]
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 15
+      start_period: 30s
     restart: unless-stopped
 
   gitea:
@@ -117,13 +146,19 @@ services:
     environment:
       GITEA__database__DB_TYPE: sqlite3
       GITEA__database__PATH: /var/lib/gitea/data/gitea.db
-      GITEA__server__ROOT_URL: http://gitea:3000
+      GITEA__server__ROOT_URL: "http://localhost:${GITEA_PORT:-3000}"
       GITEA__server__HTTP_PORT: "3000"
       GITEA__security__INSTALL_LOCK: "true"
       GITEA__server__DISABLE_SSH: "true"
       GITEA__service__DISABLE_REGISTRATION: "false"
+      GITEA__service__ALLOW_ONLY_EXTERNAL_REGISTRATION: "true"
+      GITEA__service__SHOW_REGISTRATION_BUTTON: "false"
       GITEA__service__REQUIRE_SIGNIN_VIEW: "false"
       GITEA__service__ENABLE_CAPTCHA: "false"
+      GITEA__service__AUTO_WATCH_NEW_REPOS: "false"
+      GITEA__oauth2_client__ENABLE_AUTO_REGISTRATION: "true"
+      GITEA__oauth2_client__USERNAME: preferred_username
+      GITEA__oauth2_client__UPDATE_EXISTING: "true"
       GITEA__repository__DEFAULT_PRIVATE: private
       GITEA__repository__ENABLE_PUSH_CREATE_USER: "true"
     volumes:
@@ -137,6 +172,34 @@ services:
       retries: 5
     restart: unless-stopped
 
+  nextcloud:
+    image: docker.io/library/nextcloud:31-apache
+    container_name: srw-nextcloud
+    environment:
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:-admin}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-admin}
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: nextcloud
+    volumes:
+      - nextcloud_data:/var/www/html
+    ports:
+      - "${NEXTCLOUD_PORT:-8800}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/status.php"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # VPN Sidecars
+  # ---------------------------------------------------------------------------
   vpn-cluster:
     build:
       context: docker/vpn/
@@ -228,6 +291,9 @@ services:
       retries: 3
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # Application
+  # ---------------------------------------------------------------------------
   orchestrator:
     build:
       context: .
@@ -236,29 +302,91 @@ services:
     container_name: srw-orchestrator
     environment:
       PORT: 8085
+      # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
       MONGODB_URL: mongodb://mongodb:27017/srw_logs
       WORKSPACE_PATH: /workspace
+      # Gitea
       GITEA_URL: http://gitea:3000
+      GITEA_INTERNAL_URL: http://gitea:3000
       GITEA_ADMIN_USER: ${GITEA_ADMIN_USER:-srw}
       GITEA_ADMIN_PASSWORD: ${GITEA_ADMIN_PASSWORD:-srw_gitea}
-      # Authentication
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cockpit.local}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
-      SMTP_TRUST_SELF_SIGNED: ${SMTP_TRUST_SELF_SIGNED:-false}
-      SMTP_FROM: ${SMTP_FROM:-noreply@h4ll.app}
+      GITEA_OIDC_CLIENT_SECRET: ${GITEA_OIDC_CLIENT_SECRET:-}
+      # Keycloak SSO
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_ISSUER_URL: "http://localhost:${KEYCLOAK_PORT:-8180}"
+      KEYCLOAK_REALM: srw
+      KEYCLOAK_ADMIN_USER: ${KEYCLOAK_ADMIN_USER:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # CORS
+      CORS_ORIGINS: "http://localhost:${COCKPIT_PORT:-4000}"
+      COCKPIT_EXTERNAL_URL: "http://localhost:${COCKPIT_PORT:-4000}"
       # Admin user
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@cockpit.local}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@srw.dev}
       ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-Admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       # MCP token verification
       MCP_INTERNAL_KEY: ${MCP_INTERNAL_KEY:-dev-internal-key}
+      # Instruction Builder
+      BUILDER_API_KEY: ${BUILDER_API_KEY:-${OPENAI_API_KEY:-}}
+      BUILDER_MODEL: ${BUILDER_MODEL:-gpt-4o}
+      BUILDER_LLM_PROVIDER: ${BUILDER_LLM_PROVIDER:-openai}
+      # Notification — SMTP
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      SMTP_TRUST_SELF_SIGNED: ${SMTP_TRUST_SELF_SIGNED:-true}
+      SMTP_FROM: ${SMTP_FROM:-noreply@superhuman-remote-worker.com}
+      # Notification — IMAP (inbound email replies)
+      IMAP_HOST: ${IMAP_HOST:-}
+      IMAP_PORT: ${IMAP_PORT:-1143}
+      IMAP_USER: ${IMAP_USER:-}
+      IMAP_PASSWORD: ${IMAP_PASSWORD:-}
+      IMAP_USE_SSL: ${IMAP_USE_SSL:-false}
+      IMAP_TRUST_SELF_SIGNED: ${IMAP_TRUST_SELF_SIGNED:-true}
+      IMAP_POLL_INTERVAL: ${IMAP_POLL_INTERVAL:-30}
+      AGENT_EMAIL: ${AGENT_EMAIL:-agent@superhuman-remote-worker.com}
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-superhuman-remote-worker.com}
+      # Notification — Webhooks
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      NTFY_URL: ${NTFY_URL:-}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      # Default datasources — Neo4j
+      DEFAULT_DS_NEO4J_URL: bolt://neo4j:7687
+      DEFAULT_DS_NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      DEFAULT_DS_NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_password}
+      DEFAULT_DS_NEO4J_NAME: "Default Neo4j"
+      DEFAULT_DS_NEO4J_READ_ONLY: "false"
+      # Default datasources — WebDAV (Nextcloud)
+      DEFAULT_DS_WEBDAV_URL: "http://nextcloud/remote.php/dav/files/admin/"
+      DEFAULT_DS_WEBDAV_USERNAME: ${NEXTCLOUD_ADMIN_USER:-admin}
+      DEFAULT_DS_WEBDAV_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:-admin}
+      DEFAULT_DS_WEBDAV_NAME: "Nextcloud"
+      DEFAULT_DS_WEBDAV_READ_ONLY: "false"
+      # S3 / MinIO
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-srw}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-srw_password}
+      S3_BUCKET: ${S3_BUCKET:-srw-snapshots}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      SNAPSHOT_MAX_SIZE_GB: ${SNAPSHOT_MAX_SIZE_GB:-10}
+      SNAPSHOT_RETENTION_DAYS: ${SNAPSHOT_RETENTION_DAYS:-90}
+      # IDE sessions
+      IDE_SESSION_IDLE_TIMEOUT: ${IDE_SESSION_IDLE_TIMEOUT:-30}
+      IDE_SESSION_MAX_LIFETIME: ${IDE_SESSION_MAX_LIFETIME:-240}
+      IDE_MAX_CONCURRENT_PER_USER: ${IDE_MAX_CONCURRENT_PER_USER:-2}
+      CODE_SERVER_IMAGE: ${CODE_SERVER_IMAGE:-codercom/code-server:latest}
+      # VM lifecycle (optional)
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      # Orchestrator settings
+      AUTO_ASSIGN_ENABLED: ${AUTO_ASSIGN_ENABLED:-true}
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - workspace_data:/workspace:z
     ports:
@@ -289,38 +417,62 @@ services:
     environment:
       AGENT_CONFIG: ${AGENT_CONFIG:-defaults}
       AGENT_PORT: 8001
+      # Core databases
       DATABASE_URL: postgresql://${POSTGRES_USER:-srw}:${POSTGRES_PASSWORD:-srw_password}@postgres:5432/${POSTGRES_DB:-srw}
       VECTOR_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
       MONGODB_URL: mongodb://mongodb:27017/srw_logs
       ORCHESTRATOR_URL: http://orchestrator:8085
       WORKSPACE_PATH: /workspace
+      # LLM routing (via VPN sidecar)
+      LLM_BASE_URL: http://vpn-cluster:8080/v1
+      KEY_COOLDOWN_SECONDS: ${KEY_COOLDOWN_SECONDS:-3600}
       # LLM provider keys — set in .env
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
-      # VPN routing — agent containers reach VPN sidecars over Docker network
-      LLM_BASE_URL: http://vpn-cluster:8080/v1
-      BROWSER_LLM_BASE_URL: http://vpn-cluster:8080/v1
-      CITATION_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
-      CITATION_LLM_URL: http://vpn-cluster:8080/v1
-      # Embedding routing — workstation VPN hosts qwen3-embedding-8b
-      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
-      EMBEDDING_BASE_URL: http://vpn-workstation:8080/v1
-      EMBEDDING_MODEL: qwen3-embedding-8b
-      CITATION_EMBEDDING_KEY: ${CITATION_EMBEDDING_KEY:-}
-      CITATION_EMBEDDING_URL: http://vpn-workstation:8080/v1
-      CITATION_EMBEDDING_MODEL: qwen3-embedding-8b
-      RESEARCH_PROXY_TYPE: socks5
-      RESEARCH_PROXY_HOST: vpn-research
-      RESEARCH_PROXY_PORT: 1080
+      SEMANTIC_SCHOLAR_API_KEY: ${SEMANTIC_SCHOLAR_API_KEY:-}
       # Vision model (for text-only agents)
       VISION_API_KEY: ${VISION_API_KEY:-}
       VISION_BASE_URL: ${VISION_BASE_URL:-}
-      VISION_MODEL: ${VISION_MODEL:-}
+      VISION_MODEL: ${VISION_MODEL:-gpt-4o-mini}
+      # Audio transcription (Whisper)
+      WHISPER_API_KEY: ${WHISPER_API_KEY:-}
+      # Browser automation (via VPN sidecar)
+      BROWSER_LLM_MODEL: ${BROWSER_LLM_MODEL:-gpt-4o-mini}
+      BROWSER_LLM_BASE_URL: http://vpn-cluster:8080/v1
+      # Research proxy (via VPN sidecar SOCKS5)
+      RESEARCH_PROXY_TYPE: socks5
+      RESEARCH_PROXY_HOST: vpn-research
+      RESEARCH_PROXY_PORT: 1080
+      # Citation Engine (via VPN sidecar)
+      CITATION_DB_URL: postgresql://${VECTOR_POSTGRES_USER:-srw}:${VECTOR_POSTGRES_PASSWORD:-srw_password}@postgres-vector:5432/${VECTOR_POSTGRES_DB:-srw_vector}
+      CITATION_LLM_URL: http://vpn-cluster:8080/v1
+      CITATION_LLM_MODEL: ${CITATION_LLM_MODEL:-gpt-4o}
+      CITATION_REASONING_LEVEL: ${CITATION_REASONING_LEVEL:-high}
+      CITATION_EMBEDDING_MODEL: ${CITATION_EMBEDDING_MODEL:-qwen3-embedding-8b}
+      CITATION_EMBEDDING_URL: http://vpn-workstation:8080/v1
+      CITATION_EMBEDDING_KEY: ${CITATION_EMBEDDING_KEY:-}
+      # Embedding routing — workstation VPN hosts embedding models
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: http://vpn-workstation:8080/v1
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-qwen3-embedding-8b}
+      # Research
+      UNPAYWALL_EMAIL: ${UNPAYWALL_EMAIL:-}
+      # Neo4j (local instance)
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-neo4j_password}
+      # Workstation API (embeddings, vision, whisper, TTS)
+      WORKSTATION_BASE_URL: http://vpn-workstation:8080/v1
+      # Gitea
+      GITEA_URL: http://gitea:3000
       # Claude Code CLI auth (for coder-cc expert, uses Max/Pro plan)
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - workspace_data:/workspace:z
     deploy:
@@ -386,9 +538,83 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Container log viewer (Dozzle)
+  # Messaging (optional — required for VM lifecycle)
   # ---------------------------------------------------------------------------
-  # Socket path varies by runtime:
+  nats:
+    image: docker.io/nats:2.10-alpine
+    container_name: srw-nats
+    command: ["--jetstream", "--store_dir", "/data"]
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Object Storage (optional — for VM snapshots + IDE sessions)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: srw-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-srw}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-srw_password}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Admin UIs & Utilities
+  # ---------------------------------------------------------------------------
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:latest
+    container_name: srw-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@srw.dev}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/misc/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  mongo-express:
+    image: docker.io/library/mongo-express:latest
+    container_name: srw-mongo-express
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_BASICAUTH: "false"
+    ports:
+      - "${MONGO_EXPRESS_PORT:-8081}:8081"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   # ---------------------------------------------------------------------------
   # Codex OAuth Proxy (optional — for codex/* models via ChatGPT subscription)
   # ---------------------------------------------------------------------------
@@ -442,8 +668,16 @@ volumes:
     name: srw_postgres_vector_data
   mongodb_data:
     name: srw_mongodb_data
+  neo4j_data:
+    name: srw_neo4j_data
+  nats_data:
+    name: srw_nats_data
   gitea_data:
     name: srw_gitea_data
+  nextcloud_data:
+    name: srw_nextcloud_data
+  minio_data:
+    name: srw_minio_data
   workspace_data:
     name: srw_workspace_data
   codex_proxy_auths:

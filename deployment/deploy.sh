@@ -151,7 +151,7 @@ read -rp "Commit and push? [Y/n] " confirm
 confirm="${confirm:-Y}"
 
 if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    git add deployments/superhuman-remote-worker/ deployments/srw-vm-controller/
+    git add deployment/ deployment-vms/
     git commit -m "deploy: update SRW image tags to $TAG"
     git push
     echo ""

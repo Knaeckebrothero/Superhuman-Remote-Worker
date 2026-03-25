@@ -114,6 +114,7 @@ Deploy the complete system using containers.
 git clone <repo-url>
 cd Superhuman-Remote-Worker
 cp .env.example .env
+cp docker/keycloak/realm-export.json.example docker/keycloak/realm-export.json
 ```
 
 ### 2. Edit Environment Variables
@@ -128,8 +129,11 @@ Edit `.env` with your configuration:
 - `ANTHROPIC_API_KEY` — For Claude models
 - `GOOGLE_API_KEY` — For Gemini models
 - `TAVILY_API_KEY` — For web search
-- `MONGODB_URL` — LLM request logging and audit trail
+- `KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` — SSO admin (default: admin/admin)
+- `SMTP_HOST` / `SMTP_USER` / `SMTP_PASSWORD` — Email via ProtonMail Bridge or other SMTP
 - `LOG_LEVEL` — DEBUG, INFO, WARNING, ERROR (default: INFO)
+
+Edit `docker/keycloak/realm-export.json` for OIDC client secrets if needed (see the example file for details).
 
 ### 3. Start All Services
 
@@ -138,20 +142,34 @@ podman-compose up -d
 ```
 
 This starts:
-- **PostgreSQL** — Job tracking and data storage
-- **MongoDB** — LLM request logging and audit trail (optional)
-- **Gitea** — Git server for agent workspace repositories
+- **PostgreSQL** — Job tracking and data storage (+ SSO databases for Keycloak/Nextcloud)
+- **PostgreSQL (Vector)** — Citations, embeddings, knowledge index (pgvector)
+- **MongoDB** — LLM request logging and audit trail
+- **Neo4j** — Graph database for agent datasources
+- **Keycloak** — SSO identity provider (OIDC for all services)
+- **Gitea** — Git server for agent workspace repositories (Keycloak OIDC login)
+- **Nextcloud** — Cloud storage / WebDAV datasource
+- **VPN Sidecars** — Route LLM and research traffic through university network
 - **Orchestrator** — Backend API for job management and agent coordination
 - **Agent** — Worker instances (defaults to 2 replicas via `AGENT_REPLICAS`)
+- **MCP Server** — Claude Code integration (port 8055)
 - **Cockpit** — Web UI for job management and monitoring
+- **NATS** — Messaging for VM lifecycle (optional)
+- **MinIO** — S3-compatible object storage for snapshots and IDE sessions (optional)
 
 ### 4. Access Services
 
 | Service | URL |
 |---------|-----|
 | Cockpit (Web UI) | http://localhost:4000 |
+| Keycloak SSO | http://localhost:8180 |
 | Orchestrator API | http://localhost:8085 |
 | Gitea | http://localhost:3000 |
+| Nextcloud | http://localhost:8800 |
+| MCP Server | http://localhost:8055 |
+| pgAdmin | http://localhost:5050 |
+| MinIO Console | http://localhost:9001 |
+| Dozzle (logs) | http://localhost:9999 |
 
 ### 5. Common Operations
 
@@ -169,6 +187,8 @@ podman-compose down
 # Stop and remove all data
 podman-compose down -v
 ```
+
+For local builds (no GHCR access), use `docker-compose.local.yaml` instead — it builds all custom images from source.
 
 ## Development Setup
 

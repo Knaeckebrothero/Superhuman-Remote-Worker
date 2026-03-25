@@ -37,14 +37,19 @@ Transform this project from a domain-specific requirement extraction system (cre
 - Dockerfile.agent exists (multi-stage build, non-root user)
 - Self-hosted OSS model on A100 (~100 tokens/sec)
 
-### What Doesn't Work for Deployment
-- **Config rigidity**: Creator/Validator configs are domain-specific (requirement extraction, Neo4j validation)
-- **Tool organization**: Flat list of tools, hard to enable/disable capabilities
-- **Polling model**: Each agent type polls a specific table with specific status fields
-- **Workspace paths**: Local paths break when containerized (volume mounts, permissions)
-- **Job submission**: No proper UI for creating jobs, tied to document processing
-- **No compose for full stack**: Dev compose only runs databases, agents run locally
-- **Cockpit incomplete**: Missing login/auth, no job submission page
+### What Has Been Resolved
+- ~~Config rigidity~~ → Universal agent with YAML config inheritance (`$extends: defaults`)
+- ~~Tool organization~~ → Tool categories in config, phase-specific filtering via `TOOL_REGISTRY`
+- ~~Polling model~~ → Orchestrator assigns jobs to agents, agents poll orchestrator API
+- ~~Workspace paths~~ → Shared PVC (`/workspace`) with Longhorn RWX in K8s, named volume in compose
+- ~~Job submission~~ → Cockpit has full job creation UI + instruction builder chat
+- ~~No compose for full stack~~ → Production compose with 20 services (databases, SSO, VPN, app, admin UIs)
+- ~~Cockpit incomplete~~ → Keycloak SSO auth, job submission, agent management, conversation viewer
+
+### Remaining Deployment Gaps
+- **Cost tracking** — Token usage logged in MongoDB but no per-job cost estimation UI
+- **Budget controls** — No automatic fallback when spending limits are exceeded
+- **SELECT FOR UPDATE SKIP LOCKED** — Manual job assignment for now (auto-assign via orchestrator)
 
 ## Goals
 
@@ -311,43 +316,93 @@ Checkpoints: `/app/workspace/checkpoints/job_<uuid>.db`
 
 ## Docker Compose
 
-The production compose file is [`docker-compose.yaml`](../docker-compose.yaml) (uses pre-built GHCR images). For development, use [`docker-compose.dev.yaml`](../docker-compose.dev.yaml) (databases only, with exposed ports for local development).
+Three compose files cover different deployment scenarios:
 
-Services in the production stack:
-- **postgres** - PostgreSQL 15 (jobs, agents, requirements)
-- **mongodb** - MongoDB 7 (LLM request logging, audit trail)
-- **gitea** - Gitea 1.22 (Git server for agent workspaces)
-- **orchestrator** - FastAPI backend (job management, agent coordination)
-- **vpn-sidecar** - OpenFortiVPN + SOCKS proxy for institutional research access
-- **agent** - Universal agent workers (defaults to 2 replicas via `AGENT_REPLICAS`)
-- **cockpit** - Angular frontend (job management UI)
+| File | Purpose | Custom images |
+|------|---------|---------------|
+| [`docker-compose.yaml`](../docker-compose.yaml) | **Production** — full stack, pre-built GHCR images | Pulled from `ghcr.io/knaeckebrothero/superhuman-remote-worker-*` |
+| [`docker-compose.local.yaml`](../docker-compose.local.yaml) | **Local build** — same stack, builds from source | Built locally via `podman-compose build` |
+| [`docker-compose.dev.yaml`](../docker-compose.dev.yaml) | **Development** — infrastructure only, apps run locally | Only MCP + VPN built locally |
 
-Exposed ports (production): orchestrator (8085), cockpit (4000), gitea (3000). Database ports are internal-only.
+### Services in the production/local-build stack (20 services):
+
+**Databases:**
+- **postgres** — PostgreSQL 15 (jobs, agents + Keycloak/Nextcloud DBs via `init_sso_dbs.sh`)
+- **postgres-vector** — pgvector/pg15 (citations, embeddings, knowledge index)
+- **mongodb** — MongoDB 7 (LLM request logging, audit trail)
+- **neo4j** — Neo4j 5 with APOC (graph datasource for agents)
+
+**Identity & Storage:**
+- **keycloak** — Keycloak 26.2 SSO (OIDC for cockpit, Gitea, Nextcloud, pgAdmin)
+- **gitea** — Gitea 1.22 (Git server, Keycloak OIDC login, admin auto-bootstrap in K8s)
+- **nextcloud** — Nextcloud 31 (WebDAV cloud storage, Keycloak OIDC)
+
+**VPN Sidecars:**
+- **vpn-cluster** — OpenFortiVPN + port forward to GPU cluster for LLM inference
+- **vpn-research** — OpenFortiVPN + SOCKS5 proxy for institutional research access
+- **vpn-workstation** — OpenFortiVPN + port forward to AI workstation (embeddings, vision)
+
+**Application:**
+- **orchestrator** — FastAPI backend (job management, agent coordination, SSO, notifications)
+- **agent** — Universal agent workers (defaults to 2 replicas via `AGENT_REPLICAS`)
+- **mcp** — MCP server for Claude Code integration (port 8055)
+- **cockpit** — Angular SSR frontend (job management UI)
+
+**Optional Infrastructure:**
+- **nats** — NATS JetStream messaging (required for VM lifecycle)
+- **minio** — S3-compatible object storage (VM snapshots, IDE sessions)
+
+**Admin UIs & Utilities:**
+- **pgadmin** — PostgreSQL admin UI
+- **mongo-express** — MongoDB admin UI
+- **codex-proxy** — CLIProxyAPI OAuth proxy (codex/* models via ChatGPT subscription)
+- **dozzle** — Container log viewer
+
+### Exposed ports (production/local-build):
+
+| Service | Port |
+|---------|------|
+| Orchestrator API | 8085 |
+| Cockpit (Web UI) | 4000 |
+| Keycloak SSO | 8180 |
+| Gitea | 3000 |
+| MCP Server | 8055 |
+| Nextcloud | 8800 |
+| pgAdmin | 5050 |
+| Mongo Express | 8081 |
+| MinIO API / Console | 9000 / 9001 |
+| Codex OAuth Proxy | 8317 |
+| Dozzle | 9999 |
+
+Database ports (postgres, vector, mongodb, neo4j) are internal-only in production. The dev compose exposes them for local debugging.
+
+### Prerequisites
+
+```bash
+cp .env.example .env                                          # Configure API keys, VPN, SSO
+cp docker/keycloak/realm-export.json.example docker/keycloak/realm-export.json  # Keycloak realm config
+```
 
 ## Image Documentation
 
-| Image | Purpose | Required | Key Env Vars |
-|-------|---------|----------|--------------|
-| `graphrag-agent` | Universal agent worker pool | Yes | `DATABASE_URL`, `MONGODB_URL`, `TOOLKITS`, `LLM_BASE_URL` |
-| `cockpit-api` | REST API for job management, auth, monitoring | Yes | `DATABASE_URL`, `MONGODB_URL`, `JWT_SECRET` |
-| `cockpit-frontend` | Angular UI: login, job submission, monitoring | Yes | `API_URL` |
-| `postgres:15-alpine` | Job queue, user accounts | Yes | Standard Postgres vars |
-| `mongo:7` | LLM conversation logging, audit trail | Yes | Standard Mongo vars |
-| `neo4j:5.15-community` | Graph database (neo4j toolkit only) | No | `NEO4J_AUTH` |
+| Image | Source | Purpose |
+|-------|--------|---------|
+| `superhuman-remote-worker-agent` | `docker/Dockerfile.agent` | Universal agent worker pool |
+| `superhuman-remote-worker-orchestrator` | `docker/Dockerfile.orchestrator` | FastAPI backend API |
+| `superhuman-remote-worker-cockpit` | `docker/Dockerfile.cockpit` | Angular SSR frontend |
+| `superhuman-remote-worker-mcp` | `docker/Dockerfile.mcp` | MCP server (Claude Code) |
+| `superhuman-remote-worker-vpn` | `docker/vpn/Dockerfile` | OpenFortiVPN + microsocks sidecar |
+| `keycloak:26.2` | Official (Quay) | SSO identity provider |
+| `postgres:15` | Official | App database |
+| `pgvector/pgvector:pg15` | Official | Vector database (citations, embeddings) |
+| `mongo:7` | Official | LLM audit trail |
+| `neo4j:5` | Official | Graph database |
+| `gitea:1.22-rootless` | Official | Git server |
+| `nextcloud:31-apache` | Official | Cloud storage / WebDAV |
+| `nats:2.10-alpine` | Official | JetStream messaging |
+| `minio:latest` | Official (Quay) | S3 object storage |
 
-### Agent Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string |
-| `MONGODB_URL` | Yes | MongoDB connection string |
-| `TOOLKITS` | No | Comma-separated list of toolkits to enable (default: workspace,todo) |
-| `LLM_BASE_URL` | No | Base URL for OpenAI-compatible API (self-hosted) |
-| `OPENAI_API_KEY` | Conditional | Required if using OpenAI or self-hosted |
-| `ANTHROPIC_API_KEY` | No | Required if using Anthropic backend |
-| `GOOGLE_API_KEY` | No | Required if using Google/Gemini backend |
-| `NEO4J_URI` | No | Required if neo4j toolkit enabled |
-| `AGENT_CONFIG` | No | Config directory name (default: generic) |
+See `.env.example` for the full list of environment variables per service.
 
 ## Refactoring Tasks
 

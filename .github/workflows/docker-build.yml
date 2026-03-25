@@ -72,10 +72,10 @@ jobs:
             vm-base:
               - 'docker/agent-vm-base/**'
             vm-controller:
-              - 'vm-controller/**'
+              - 'vm/controller/**'
             sudo-gate:
-              - 'sudo-gated/**'
-              - 'sudo-gate-plugin/**'
+              - 'vm/sudo-daemon/**'
+              - 'vm/sudo-plugin/**'
 
   build-agent:
     needs: changes
@@ -351,7 +351,7 @@ jobs:
           go-version: '1.22'
 
       - name: Build sudo-gated (Go daemon)
-        working-directory: sudo-gated
+        working-directory: vm/sudo-daemon
         run: |
           go mod tidy
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
@@ -361,7 +361,7 @@ jobs:
           ls -lh sudo-gated
 
       - name: Build sudo_gate.so (C plugin)
-        working-directory: sudo-gate-plugin
+        working-directory: vm/sudo-plugin
         run: |
           gcc -fPIC -shared -Wall -Wextra -Werror -O2 -I./include \
             -o sudo_gate.so sudo_gate.c json_util.c
@@ -373,8 +373,8 @@ jobs:
         with:
           name: sudo-gate-binaries
           path: |
-            sudo-gated/sudo-gated
-            sudo-gate-plugin/sudo_gate.so
+            vm/sudo-daemon/sudo-gated
+            vm/sudo-plugin/sudo_gate.so
           retention-days: 7
 
   build-agent-vm-base:
@@ -419,15 +419,15 @@ jobs:
           # If artifacts weren't downloaded (build-sudo-gate was skipped),
           # create empty placeholders so Packer's file provisioner doesn't fail.
           # provision.sh uses -s (non-empty check) to skip installation.
-          if [ -f files/sudo-gated/sudo-gated ]; then
-            mv files/sudo-gated/sudo-gated files/sudo-gated-bin
+          if [ -f files/vm/sudo-daemon/sudo-gated ]; then
+            mv files/vm/sudo-daemon/sudo-gated files/sudo-gated-bin
             echo "sudo-gated binary ready ($(wc -c < files/sudo-gated-bin) bytes)"
           else
             touch files/sudo-gated-bin
             echo "sudo-gated binary not available — creating empty placeholder"
           fi
-          if [ -f files/sudo-gate-plugin/sudo_gate.so ]; then
-            mv files/sudo-gate-plugin/sudo_gate.so files/sudo_gate.so
+          if [ -f files/vm/sudo-plugin/sudo_gate.so ]; then
+            mv files/vm/sudo-plugin/sudo_gate.so files/sudo_gate.so
             echo "sudo_gate.so ready ($(wc -c < files/sudo_gate.so) bytes)"
           else
             touch files/sudo_gate.so
@@ -529,8 +529,8 @@ jobs:
       - name: Build and push VM Controller image
         uses: docker/build-push-action@v5
         with:
-          context: ./vm-controller
-          file: ./vm-controller/Dockerfile
+          context: ./vm/controller
+          file: ./vm/controller/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

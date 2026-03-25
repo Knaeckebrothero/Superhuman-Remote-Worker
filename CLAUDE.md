@@ -377,7 +377,7 @@ The orchestrator can provision KubeVirt VMs for agent jobs, with two auto-select
 
 NATS takes priority when both are available. All VM features are fully optional — the system degrades gracefully when unconfigured, following the same pattern as MongoDB (`orchestrator/database/mongodb.py`).
 
-**Implementation:** `orchestrator/services/vm_provisioner.py` (unified provisioner, auto-selects backend), `orchestrator/services/nats_bridge.py` (NATS subscriptions + publishers), `vm-controller/controller.py` (agent cluster side). REST endpoints: `POST/GET /api/vms`, `GET/DELETE /api/vms/{job_id}`.
+**Implementation:** `orchestrator/services/vm_provisioner.py` (unified provisioner, auto-selects backend), `orchestrator/services/nats_bridge.py` (NATS subscriptions + publishers), `vm/controller/controller.py` (agent cluster side). REST endpoints: `POST/GET /api/vms`, `GET/DELETE /api/vms/{job_id}`.
 
 **NATS subjects:**
 
@@ -399,7 +399,7 @@ Control commands (freeze/resume/terminate) require NATS since they target the ma
 
 Human-in-the-loop privilege escalation for agents in VMs. When an agent runs `sudo`, the command is intercepted by a C plugin, forwarded via a Go daemon over NATS to the orchestrator, and held for human approval via the cockpit UI, REST API, or MCP tools. Auto-approval rules provide instant approval for safe patterns (e.g., `ls *`, `apt-get install *-dev`).
 
-**Components:** C plugin (`sudo-gate-plugin/`), Go daemon (`sudo-gated/`), orchestrator service (`orchestrator/services/sudo_gate.py`), cockpit UI (`/sudo` route), MCP tools (`list_sudo_requests`, `approve_sudo_request`, `deny_sudo_request`).
+**Components:** C plugin (`vm/sudo-plugin/`), Go daemon (`vm/sudo-daemon/`), orchestrator service (`orchestrator/services/sudo_gate.py`), cockpit UI (`/sudo` route), MCP tools (`list_sudo_requests`, `approve_sudo_request`, `deny_sudo_request`).
 
 **REST endpoints:** `/api/sudo/events` (SSE), `/api/sudo/requests` (CRUD), `/api/sudo/rules` (auto-approval management).
 
@@ -424,7 +424,7 @@ See `docs/features/vm_backend.md` for the full workspace backend design and `doc
 - `orchestrator/services/builder_tools.py` - Instruction builder tool schemas (cockpit chat assistant)
 - `orchestrator/mcp/` - MCP server for Claude Code integration
 
-**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/core/backends/` (LocalBackend, RemoteBackend for VM workspaces), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `orchestrator/services/` (nats_bridge, vm_provisioner, sudo_gate, gitea, builder, completion), `cockpit/` (Angular frontend), `vm-controller/` (KubeVirt VM lifecycle on agent cluster), `sudo-gated/` (Go daemon for sudo approval gate), `sudo-gate-plugin/` (C sudo approval plugin), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
+**Directory layout:** `src/core/` (state, workspace, context, phase transitions, shell injection), `src/core/backends/` (LocalBackend, RemoteBackend for VM workspaces), `src/managers/` (Todo, Memory, Plan, Git), `src/services/` (vision, document rendering, embeddings, recall), `src/llm/` (LLM wrappers, key rotation), `src/tools/` (tool implementations by category), `src/database/` (PostgreSQL/Neo4j/MongoDB managers, SQL in `queries/postgres/*.sql`), `src/api/` (agent FastAPI app), `config/` (YAML configs, prompts, templates), `orchestrator/` (backend API + MCP + builder), `orchestrator/services/` (nats_bridge, vm_provisioner, sudo_gate, gitea, builder, completion), `cockpit/` (Angular frontend), `vm/` (VM lifecycle: `controller/` KubeVirt controller, `sudo-daemon/` Go approval daemon, `sudo-plugin/` C sudo plugin), [`CitationEngine`](https://github.com/Knaeckebrothero/CitationEngine) (separate repo, pip-installed).
 
 **Design documents:** `docs/` contains concept/design documents for features — `docs/persistent_shell.md`, `docs/datasources.md`, `docs/features/` (memory_light, projects, repo_datasource, prompting, summary_tool, etc.). These are architectural specs, not user-facing docs.
 
@@ -525,6 +525,7 @@ Required in `.env`:
 | Service | Port |
 |---------|------|
 | Agent API | 8001 |
+| Keycloak SSO | 8180 (compose) / 8080 (K8s internal) |
 | NATS (client connections) | 4222 |
 | NATS (monitoring) | 8222 |
 | MCP Server (Claude Code) | 8055 |
@@ -532,6 +533,9 @@ Required in `.env`:
 | Cockpit Frontend (docker) | 4000 |
 | Cockpit Frontend (npm start) | 4200 |
 | Gitea | 3000 |
+| Nextcloud | 8800 |
+| Neo4j HTTP | 7474 |
+| Neo4j Bolt | 7687 |
 | pgAdmin | 5050 |
 | PostgreSQL (App DB) | 5432 |
 | PostgreSQL (Vector DB) | 5433 |

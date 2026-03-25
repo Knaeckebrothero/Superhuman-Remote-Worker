@@ -12,7 +12,7 @@
 # Requires: podman (or docker) with the srw-gitea container running.
 #
 # Usage:
-#   ./keycloak/setup-gitea-oidc.sh
+#   ./docker/keycloak/setup-gitea-oidc.sh
 #
 # What it does:
 #   Registers Keycloak's srw realm as an OpenID Connect auth source in Gitea.
@@ -30,7 +30,7 @@ CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-podman}"
 GITEA_CONTAINER="${GITEA_CONTAINER:-srw-gitea}"
 KEYCLOAK_PORT="${KEYCLOAK_PORT:-8180}"
 
-# Client credentials — must match keycloak/realm-export.json
+# Client credentials — must match docker/keycloak/realm-export.json
 CLIENT_ID="gitea"
 CLIENT_SECRET="gitea-client-secret"
 
