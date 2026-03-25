@@ -444,7 +444,7 @@ spec:
             - sh
             - -c
             - |
-              cp /etc/pki/java/cacerts /certs/cacerts
+              cp /etc/pki/java/cacerts /certs/cacerts && chmod 644 /certs/cacerts
               if [ -s /certs/bridge-cert.pem ]; then
                 keytool -importcert -noprompt -alias protonmail-bridge \
                   -file /certs/bridge-cert.pem -keystore /certs/cacerts \
