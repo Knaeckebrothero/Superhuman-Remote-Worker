@@ -7,7 +7,6 @@ Tests cover:
 3. OrchestratorClient.approve_job: success/failure paths
 """
 
-import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -246,7 +245,6 @@ class TestVerificationTriggerGuards:
 
     def test_guard_error_skips(self):
         """Guard 1: Jobs with errors should not trigger verification."""
-        job = make_job(verification_enabled=True)
         result = {"error": {"message": "failed"}, "should_stop": True}
         # Error guard: result.get("error") → return
         assert result.get("error") is not None

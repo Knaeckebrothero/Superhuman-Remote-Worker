@@ -9,7 +9,6 @@ files with YAML frontmatter, making them visible via git_diff during
 strategic review phases.
 """
 
-import json
 import logging
 import os
 import uuid

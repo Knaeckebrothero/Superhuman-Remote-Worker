@@ -18,7 +18,6 @@ import re
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from typing import Any, Optional
-from uuid import UUID
 
 logger = logging.getLogger(__name__)
 

@@ -1,7 +1,10 @@
-name: Build and Push Docker Images
+name: CI/CD
 
 on:
   push:
+    branches:
+      - main
+  pull_request:
     branches:
       - main
   workflow_dispatch:
@@ -14,7 +17,6 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,9 +25,93 @@ jobs:
       - name: Install ruff
         run: pip install ruff
       - name: Ruff lint
-        run: ruff check --fix src/ orchestrator/ tests/
-      - name: Ruff format
-        run: ruff format src/ orchestrator/ tests/
+        run: ruff check src/ orchestrator/ tests/
+      - name: Ruff format check
+        run: ruff format --check src/ orchestrator/ tests/
+
+  # ---------------------------------------------------------------------------
+  # CodeQL — static analysis for security vulnerabilities
+  # Results appear in the GitHub Security tab
+  # ---------------------------------------------------------------------------
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit — check for known CVEs in Python and JS dependencies
+  # ---------------------------------------------------------------------------
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Audit Python dependencies
+        run: pip-audit --desc
+      - name: Audit npm dependencies
+        working-directory: cockpit
+        run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # Python tests
+  # ---------------------------------------------------------------------------
+  test-python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+      - name: Run tests
+        run: pytest tests/ -x -q --tb=short
+
+  # ---------------------------------------------------------------------------
+  # Cockpit (Angular) tests
+  # ---------------------------------------------------------------------------
+  test-cockpit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+      - name: Install dependencies
+        working-directory: cockpit
+        run: npm ci
+      - name: Run tests
+        working-directory: cockpit
+        run: npm test
 
   # ---------------------------------------------------------------------------
   # Detect which components changed — build jobs only run when needed
@@ -79,7 +165,7 @@ jobs:
 
   build-agent:
     needs: changes
-    if: needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.agent == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -137,7 +223,7 @@ jobs:
 
   build-orchestrator:
     needs: changes
-    if: needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.orchestrator == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -187,7 +273,7 @@ jobs:
 
   build-cockpit:
     needs: changes
-    if: needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.cockpit == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -237,7 +323,7 @@ jobs:
 
   build-mcp:
     needs: changes
-    if: needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.mcp == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -287,7 +373,7 @@ jobs:
 
   build-vpn:
     needs: changes
-    if: needs.changes.outputs.vpn == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.vpn == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -337,7 +423,7 @@ jobs:
 
   build-sudo-gate:
     needs: changes
-    if: needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.sudo-gate == 'true' || needs.changes.outputs.vm-base == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -381,7 +467,7 @@ jobs:
     needs: [changes, build-sudo-gate]
     # Rebuild when vm-base OR sudo-gate changes (sudo gate binaries are baked into the image)
     if: >-
-      always() && (
+      always() && github.event_name != 'pull_request' && (
         needs.changes.outputs.vm-base == 'true' ||
         needs.changes.outputs.sudo-gate == 'true' ||
         github.event_name == 'workflow_dispatch'
@@ -496,7 +582,7 @@ jobs:
 
   build-vm-controller:
     needs: changes
-    if: needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' && (needs.changes.outputs.vm-controller == 'true' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -549,8 +635,14 @@ jobs:
   # Fleet detects the git change and rolls out updated pods automatically
   # ---------------------------------------------------------------------------
   deploy:
-    needs: [build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-vm-controller, build-agent-vm-base]
-    if: always() && !cancelled()
+    needs: [lint, codeql, dependency-audit, test-python, test-cockpit, build-agent, build-orchestrator, build-cockpit, build-mcp, build-vpn, build-vm-controller, build-agent-vm-base]
+    if: >-
+      always() && !cancelled() && github.event_name != 'pull_request' &&
+      needs.lint.result == 'success' &&
+      needs.test-python.result == 'success' &&
+      needs.test-cockpit.result == 'success' &&
+      needs.dependency-audit.result == 'success' &&
+      !contains(needs.codeql.result, 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -13,9 +13,8 @@ Validates:
 - Sync wrapper bridging async to sync
 """
 
-import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,7 +22,6 @@ from src.services.audio_helper import (
     AudioHelper,
     AUDIO_EXTENSIONS,
     MAX_AUDIO_SIZE_BYTES,
-    get_audio_helper,
     split_transcript_into_lines,
 )
 
