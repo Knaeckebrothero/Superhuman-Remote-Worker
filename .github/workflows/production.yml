@@ -62,16 +62,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
           cache-dependency-path: cockpit/package-lock.json
       - name: Install pip-audit
-        run: pip install pip-audit
+        run: uv pip install --system pip-audit
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: uv pip install --system -r requirements.txt
       - name: Audit Python dependencies
         run: pip-audit --desc --ignore-vuln CVE-2026-4539  # pygments ≤2.19.2 local-only ReDoS in AdlLexer, no fix released
       - name: Audit npm dependencies
@@ -89,12 +91,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            orchestrator/requirements.txt
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Install dependencies
-        run: pip install -r requirements.txt -r orchestrator/requirements.txt pytest pytest-asyncio
+        run: uv pip install --system -r requirements.txt -r orchestrator/requirements.txt pytest pytest-asyncio
       - name: Run tests
         run: pytest tests/ -x -q --tb=short
 
