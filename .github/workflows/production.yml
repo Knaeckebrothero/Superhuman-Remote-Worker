@@ -75,7 +75,13 @@ jobs:
       - name: Install Python dependencies
         run: uv pip install --system -r requirements.txt
       - name: Audit Python dependencies
-        run: pip-audit --desc --ignore-vuln CVE-2026-4539  # pygments ≤2.19.2 local-only ReDoS in AdlLexer, no fix released
+        # CVE-2026-4539: pygments ReDoS in AdlLexer — local-only, no fix released
+        # CVE-2026-25645: requests extract_zipped_paths() temp path — we don't call it;
+        #   arxiv pins requests<2.33.0 so we can't upgrade until arxiv releases a fix
+        run: >-
+          pip-audit --desc
+          --ignore-vuln CVE-2026-4539
+          --ignore-vuln CVE-2026-25645
       - name: Audit npm dependencies
         working-directory: cockpit
         run: npm audit --audit-level=high
