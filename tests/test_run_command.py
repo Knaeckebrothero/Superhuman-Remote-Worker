@@ -192,6 +192,8 @@ class TestToolNameAliasing:
         config.tools.git = []
         config.tools.coding = ["shell_execute", "shell_read"]
         config.tools.evaluation = []
+        config.tools.knowledge = []
+        config.tools.delegation = []
         config.extra = {"shell": {"mode": "stateless"}}
 
         names = get_all_tool_names(config)
@@ -214,6 +216,8 @@ class TestToolNameAliasing:
         config.tools.git = []
         config.tools.coding = ["run_command", "shell_read"]
         config.tools.evaluation = []
+        config.tools.knowledge = []
+        config.tools.delegation = []
         config.extra = {"shell": {"mode": "persistent"}}
 
         names = get_all_tool_names(config)
@@ -236,6 +240,8 @@ class TestToolNameAliasing:
         config.tools.git = []
         config.tools.coding = ["shell_execute"]
         config.tools.evaluation = []
+        config.tools.knowledge = []
+        config.tools.delegation = []
         config.extra = {}  # No shell config at all
 
         names = get_all_tool_names(config)
