@@ -1,5 +1,6 @@
 """Tests for the per-job repo model (resolve_job_repo, _squash_merge_subjob, etc.)."""
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,9 @@ from fastapi import HTTPException
 _orch_dir = str(Path(__file__).parent.parent / "orchestrator")
 if _orch_dir not in sys.path:
     sys.path.insert(0, _orch_dir)
+
+# main.py requires VECTOR_DB_URL at module level
+os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
 import main as orch_main  # noqa: E402
 
