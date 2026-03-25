@@ -463,6 +463,7 @@ spec:
             - start-dev
             - --import-realm
             - --health-enabled=true
+            - --tls-hostname-verifier=ANY
           ports:
             - containerPort: 8080
           env:
@@ -487,9 +488,12 @@ spec:
               value: "xforwarded"
             - name: KC_HTTP_ENABLED
               value: "true"
-            # Trust ProtonMail Bridge self-signed cert for SMTP STARTTLS
+            # Trust ProtonMail Bridge self-signed cert for SMTP STARTTLS.
             # KC_TRUSTSTORE_PATHS only applies to Quarkus HTTP clients, not Jakarta Mail.
             # We override the JVM truststore with a copy that includes the bridge cert.
+            # --tls-hostname-verifier=ANY makes DefaultEmailSenderProvider set
+            # mail.smtp.ssl.checkserveridentity=false (fix from keycloak#28095),
+            # so the cert CN=127.0.0.1 vs service hostname mismatch is ignored.
             - name: JAVA_OPTS_APPEND
               value: "-Djavax.net.ssl.trustStore=/opt/keycloak/certs/cacerts -Djavax.net.ssl.trustStorePassword=changeit"
             # Admin credentials (Keycloak server admin)
@@ -525,7 +529,10 @@ spec:
                   name: srw-secrets
                   key: PGADMIN_OIDC_CLIENT_SECRET
             - name: SMTP_HOST
-              value: "127.0.0.1"
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: SMTP_HOST
             - name: SMTP_USER
               valueFrom:
                 secretKeyRef:
@@ -568,20 +575,6 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "1000m"
-        # Sidecar: TCP proxy so Keycloak connects to 127.0.0.1:1025.
-        # The bridge cert has CN=127.0.0.1 — this makes hostname verification pass.
-        - name: smtp-proxy
-          image: alpine/socat:1.8.0.3
-          args:
-            - TCP-LISTEN:1025,bind=127.0.0.1,reuseaddr,fork
-            - TCP:protonmail-bridge.protonmail-bridge.svc:1025
-          resources:
-            requests:
-              memory: "16Mi"
-              cpu: "10m"
-            limits:
-              memory: "32Mi"
-              cpu: "50m"
       volumes:
         - name: realm-import
           configMap:
