@@ -1,3 +1,44 @@
+# ServiceAccount for agent pods (Tailscale sidecar needs Secret RBAC)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: srw-agent
+  namespace: superhuman-remote-worker
+  labels:
+    app: srw-agent
+
+---
+# Role: Tailscale sidecar needs to read/write its state Secret
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: srw-agent-tailscale
+  namespace: superhuman-remote-worker
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["tailscale-state"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: srw-agent-tailscale
+  namespace: superhuman-remote-worker
+subjects:
+  - kind: ServiceAccount
+    name: srw-agent
+    namespace: superhuman-remote-worker
+roleRef:
+  kind: Role
+  name: srw-agent-tailscale
+  apiGroup: rbac.authorization.k8s.io
+
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -20,6 +61,7 @@ spec:
       labels:
         app: srw-agent
     spec:
+      serviceAccountName: srw-agent
       terminationGracePeriodSeconds: 180
       initContainers:
         - name: wait-for-orchestrator
@@ -305,6 +347,37 @@ spec:
             limits:
               memory: "2Gi"
               cpu: "1000m"
+        # Tailscale sidecar — mesh VPN for SSH access to KubeVirt VMs
+        # Kernel mode: creates tailscale0 tun in shared pod network namespace
+        # so the agent container can route directly to 100.64.x.y addresses.
+        - name: tailscale
+          image: ghcr.io/tailscale/tailscale:v1.82.5
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          env:
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: TAILSCALE_AUTH_KEY
+            - name: TS_EXTRA_ARGS
+              value: "--login-server=https://headscale.superhuman-remote-worker.com"
+            - name: TS_KUBE_SECRET
+              value: "tailscale-state"
+            - name: TS_ACCEPT_DNS
+              value: "false"
+            - name: TS_HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
       volumes:
         - name: workspace
           persistentVolumeClaim:

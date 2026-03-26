@@ -10,6 +10,12 @@ Subjects:
   vm.lifecycle.delete   Orchestrator requests VM teardown
   vm.lifecycle.status   Controller publishes creation/deletion results
 
+SSH connectivity uses a Headscale mesh VPN (self-hosted Tailscale). The
+controller generates short-lived auth keys via the Headscale API and injects
+them into cloud-init so VMs join the tailnet on boot. Agent pods run a
+Tailscale sidecar and route directly to VMs via 100.64.x.y addresses.
+
+See docs/features/headscale_mesh.md for the mesh VPN design.
 See docs/features/vm_backend.md (Phase 3) and docs/features/nats.md.
 """
 
@@ -21,6 +27,8 @@ import signal
 import sys
 
 import yaml
+
+from headscale_client import HeadscaleClient
 
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
@@ -59,6 +67,7 @@ class VMController:
         self.nc = None  # NATS client
         self.k8s_client = None  # kubernetes CustomObjectsApi
         self.template_text: str = ""  # Raw YAML template (for string substitution)
+        self.headscale = HeadscaleClient()
         self._shutdown = asyncio.Event()
 
     def load_template(self):
@@ -73,7 +82,7 @@ class VMController:
 
         log.info("Loaded VM template from %s", path)
 
-    def render_template(self, job_config: dict) -> dict:
+    def render_template(self, job_config: dict, tailscale_auth_key: str = "") -> dict:
         """Render the VM template with job-specific values.
 
         Performs string substitution on the raw YAML text, then parses
@@ -83,10 +92,14 @@ class VMController:
         Args:
             job_config: Dict with keys: job_id, agent_config, vm_image,
                         cpu_cores, memory, nats_url, description.
+            tailscale_auth_key: Headscale pre-auth key for the VM to join
+                                the tailnet. Empty string if Headscale unavailable.
 
         Returns:
             Parsed YAML dict ready for the Kubernetes API.
         """
+        headscale_url = os.environ.get("HEADSCALE_URL", "")
+
         replacements = {
             "${JOB_ID}": job_config["job_id"],
             "${AGENT_CONFIG}": job_config.get("agent_config", "defaults"),
@@ -97,6 +110,9 @@ class VMController:
             # not the orchestrator's cluster where the job's nats_url points.
             "${NATS_URL}": NATS_URL,
             "${DESCRIPTION}": job_config.get("description", ""),
+            # Headscale mesh VPN — VM joins tailnet on boot
+            "${TAILSCALE_AUTH_KEY}": tailscale_auth_key,
+            "${HEADSCALE_URL}": headscale_url,
         }
 
         rendered = self.template_text
@@ -111,7 +127,6 @@ class VMController:
 
         config.load_incluster_config()
         self.k8s_client = client.CustomObjectsApi()
-        self.core_v1 = client.CoreV1Api()
         log.info("Kubernetes client initialized (in-cluster)")
 
     async def connect_nats(self):
@@ -158,7 +173,18 @@ class VMController:
             job_id = job_config.get("job_id", "unknown")
             log.info("Creating VM for job %s", job_id)
 
-            manifest = self.render_template(job_config)
+            # Generate a Headscale pre-auth key so the VM joins the tailnet
+            tailscale_auth_key = ""
+            if self.headscale.is_available:
+                tailscale_auth_key = await self.headscale.create_auth_key(job_id) or ""
+                if not tailscale_auth_key:
+                    log.warning(
+                        "Failed to get Headscale auth key for job %s — "
+                        "VM will boot without mesh VPN",
+                        job_id,
+                    )
+
+            manifest = self.render_template(job_config, tailscale_auth_key)
             vm_name = manifest["metadata"]["name"]
 
             # Retry loop: if the old VM is still being deleted (409 Conflict),
@@ -191,15 +217,11 @@ class VMController:
 
             log.info("VM created: %s (job %s)", vm_name, job_id)
 
-            # Create a NodePort Service to expose SSH (port 22) for cross-cluster access
-            ssh_nodeport = self._create_ssh_service(vm_name, job_id)
-
             await self._publish_status(job_id, {
                 "job_id": job_id,
                 "status": "created",
                 "vm_name": vm_name,
                 "namespace": VM_NAMESPACE,
-                "ssh_nodeport": ssh_nodeport,
             })
 
         except Exception as e:
@@ -246,8 +268,10 @@ class VMController:
                 else:
                     raise
 
-            # Clean up the SSH NodePort Service
-            self._delete_ssh_service(vm_name, job_id)
+            # Remove the VM's node from Headscale (ephemeral nodes auto-expire,
+            # but explicit cleanup is faster and avoids stale entries)
+            if self.headscale.is_available:
+                await self.headscale.delete_node(job_id)
 
             log.info("VM deleted: %s (job %s)", vm_name, job_id)
 
@@ -333,142 +357,6 @@ class VMController:
             else:
                 await self._publish_status(job_id, error_response)
 
-    async def handle_pod_ip_query(self, msg):
-        """Handle vm.query.pod-ip — look up the SSH endpoint for a VM.
-
-        Returns the node IP + NodePort of the SSH service, which is
-        routable from any cluster on the same LAN (cross-cluster access).
-        Falls back to pod IP for same-cluster access.
-
-        Expected payload: {"job_id": "uuid"}
-        Response: {"job_id": "...", "ssh_host": "10.0.50.x", "ssh_port": 3xxxx}
-                  or {"job_id": "...", "pod_ip": "10.42.x.x"} (fallback)
-        """
-        try:
-            data = json.loads(msg.data.decode())
-            job_id = data["job_id"]
-            vm_name = f"agent-vm-{job_id}"
-            svc_name = f"ssh-{vm_name}"
-
-            # Try NodePort service first (cross-cluster)
-            ssh_host = None
-            ssh_port = None
-            try:
-                svc = self.core_v1.read_namespaced_service(svc_name, VM_NAMESPACE)
-                nodeport = svc.spec.ports[0].node_port if svc.spec.ports else None
-                if nodeport:
-                    # Get a node IP (any node will work for NodePort)
-                    nodes = self.core_v1.list_node()
-                    for node in nodes.items:
-                        for addr in (node.status.addresses or []):
-                            if addr.type == "InternalIP":
-                                ssh_host = addr.address
-                                ssh_port = nodeport
-                                break
-                        if ssh_host:
-                            break
-            except Exception:
-                log.debug("No SSH service found for %s, falling back to pod IP", vm_name)
-
-            # Fallback: pod IP (same-cluster only)
-            pod_ip = None
-            if not ssh_host:
-                pods = self.core_v1.list_namespaced_pod(
-                    VM_NAMESPACE,
-                    label_selector=f"vm.kubevirt.io/name={vm_name}",
-                )
-                for pod in pods.items:
-                    if pod.status and pod.status.pod_ip:
-                        pod_ip = pod.status.pod_ip
-                        break
-
-            response = {"job_id": job_id}
-            if ssh_host and ssh_port:
-                response["ssh_host"] = ssh_host
-                response["ssh_port"] = ssh_port
-                log.info("SSH endpoint for %s: %s:%d", vm_name, ssh_host, ssh_port)
-            else:
-                response["pod_ip"] = pod_ip
-                log.info("Pod IP fallback for %s: %s", vm_name, pod_ip)
-
-            if msg.reply:
-                await self.nc.publish(msg.reply, json.dumps(response).encode())
-
-        except Exception as e:
-            job_id = "unknown"
-            try:
-                job_id = json.loads(msg.data.decode()).get("job_id", "unknown")
-            except Exception:
-                pass
-            log.exception("Failed pod-ip query for job %s", job_id)
-            if msg.reply:
-                await self.nc.publish(
-                    msg.reply,
-                    json.dumps({"job_id": job_id, "error": str(e)}).encode(),
-                )
-
-    def _create_ssh_service(self, vm_name: str, job_id: str) -> int | None:
-        """Create a NodePort Service to expose VM SSH port for cross-cluster access.
-
-        Returns the assigned NodePort, or None on failure.
-        """
-        from kubernetes import client
-
-        svc_name = f"ssh-{vm_name}"
-        svc = client.V1Service(
-            metadata=client.V1ObjectMeta(
-                name=svc_name,
-                namespace=VM_NAMESPACE,
-                labels={
-                    "app": "agent-vm-ssh",
-                    "job-id": job_id,
-                    "vm-name": vm_name,
-                },
-            ),
-            spec=client.V1ServiceSpec(
-                type="NodePort",
-                selector={"vm.kubevirt.io/name": vm_name},
-                ports=[
-                    client.V1ServicePort(
-                        name="ssh",
-                        port=22,
-                        target_port=22,
-                        protocol="TCP",
-                    ),
-                ],
-            ),
-        )
-        try:
-            created = self.core_v1.create_namespaced_service(VM_NAMESPACE, svc)
-            nodeport = created.spec.ports[0].node_port
-            log.info("SSH service created: %s (NodePort %d)", svc_name, nodeport)
-            return nodeport
-        except client.exceptions.ApiException as e:
-            if e.status == 409:
-                # Service already exists — read the existing one
-                try:
-                    existing = self.core_v1.read_namespaced_service(svc_name, VM_NAMESPACE)
-                    nodeport = existing.spec.ports[0].node_port
-                    log.info("SSH service already exists: %s (NodePort %d)", svc_name, nodeport)
-                    return nodeport
-                except Exception:
-                    log.exception("Failed to read existing SSH service for %s", vm_name)
-                    return None
-            log.exception("Failed to create SSH service for %s", vm_name)
-            return None
-        except Exception:
-            log.exception("Failed to create SSH service for %s", vm_name)
-            return None
-
-    def _delete_ssh_service(self, vm_name: str, job_id: str) -> None:
-        """Delete the SSH NodePort Service for a VM."""
-        svc_name = f"ssh-{vm_name}"
-        try:
-            self.core_v1.delete_namespaced_service(svc_name, VM_NAMESPACE)
-            log.info("SSH service deleted: %s", svc_name)
-        except Exception:
-            log.warning("Failed to delete SSH service %s (may not exist)", svc_name)
-
     async def _publish_status(self, job_id: str, payload: dict):
         """Publish a status message on vm.lifecycle.status."""
         try:
@@ -485,15 +373,15 @@ class VMController:
 
         self.load_template()
         self.init_k8s()
+        await self.headscale.init()
         await self.connect_nats()
 
         # Subscribe to lifecycle subjects
         await self.nc.subscribe("vm.lifecycle.create", cb=self.handle_create)
         await self.nc.subscribe("vm.lifecycle.delete", cb=self.handle_delete)
         await self.nc.subscribe("vm.lifecycle.get", cb=self.handle_status_query)
-        await self.nc.subscribe("vm.query.pod-ip", cb=self.handle_pod_ip_query)
         log.info(
-            "Subscribed to vm.lifecycle.{create,delete,get}, vm.query.pod-ip — waiting for requests"
+            "Subscribed to vm.lifecycle.{create,delete,get} — waiting for requests"
         )
 
         # Wait for shutdown signal
@@ -503,6 +391,7 @@ class VMController:
         log.info("Shutting down...")
         if self.nc and self.nc.is_connected:
             await self.nc.drain()
+        await self.headscale.close()
 
         log.info("VM Controller stopped")
 
