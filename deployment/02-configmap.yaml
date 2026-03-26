@@ -130,5 +130,8 @@ data:
   # NATS (hub on main cluster, used by orchestrator for VM lifecycle)
   NATS_URL: "nats://nats.nats.svc.cluster.local:4222"
 
+  # Headscale (mesh VPN coordination server)
+  HEADSCALE_URL: "https://headscale.superhuman-remote-worker.com"
+
   # Logging
   LOG_LEVEL: "DEBUG"
