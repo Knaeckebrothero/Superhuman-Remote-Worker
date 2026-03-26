@@ -43,10 +43,12 @@ COMMAND_TYPE_MAP = {
     "redis-cli": "repl",
 }
 
-# Default blocked commands
+# Sentinel returned by _check_blocked when sudo is intercepted (freeze mode)
+SUDO_FREEZE_SENTINEL = "SUDO_FREEZE_REQUESTED"
+
+# Default blocked commands (sudo handled separately via sudo_action)
 DEFAULT_BLOCKED_COMMANDS = frozenset(
     [
-        # "sudo", "systemctl",  # allowed — agents need these for service management
         "reboot",
         "shutdown",
         "poweroff",
@@ -141,6 +143,7 @@ class ShellManager:
         auto_start_claude_code: bool = False,
         claude_code_model: str = "claude-opus-4-6",
         backend: Optional[Any] = None,
+        sudo_action: str = "freeze",
     ):
         """Initialize ShellManager with a new tmux session.
 
@@ -157,6 +160,9 @@ class ShellManager:
                      and backend.supports_shell is True, all shell operations delegate
                      to the backend (for remote execution). When None, local libtmux
                      is used.
+            sudo_action: How to handle sudo commands. "freeze" returns a sentinel
+                         for the tool layer to trigger a job freeze (VM upgrade prompt).
+                         "block" hard-rejects. "allow" passes through (VM-backed agents).
         """
         self.job_id = job_id
         self.max_tabs = max_tabs
@@ -165,6 +171,7 @@ class ShellManager:
         self.sandbox_cwd = sandbox_cwd
         self._claude_code_model = claude_code_model
         self._backend = backend
+        self.sudo_action = sudo_action
 
         if blocked_commands is None:
             self.blocked_commands = DEFAULT_BLOCKED_COMMANDS
@@ -1091,11 +1098,30 @@ class ShellManager:
         )
 
     def _check_blocked(self, command: str) -> str | None:
-        """Return error message if command's first word is blocked, else None."""
-        if not self.blocked_commands:
-            return None
+        """Return error message if command's first word is blocked, else None.
+
+        Returns SUDO_FREEZE_SENTINEL when sudo_action is "freeze" and the
+        command starts with sudo. The tool layer detects this sentinel and
+        triggers a job freeze (VM upgrade prompt).
+        """
         first_word = command.strip().split()[0] if command.strip() else ""
-        if first_word in self.blocked_commands:
+        if not first_word:
+            return None
+
+        # Sudo intercept (separate from blocked_commands)
+        if first_word == "sudo":
+            if self.sudo_action == "allow":
+                return None  # VM-backed agents: pass through
+            elif self.sudo_action == "freeze":
+                return SUDO_FREEZE_SENTINEL
+            else:  # "block"
+                return (
+                    "Command blocked: 'sudo' is not available in this container. "
+                    "System package installation requires a VM runtime."
+                )
+
+        # Standard blocked commands
+        if self.blocked_commands and first_word in self.blocked_commands:
             return (
                 f"Command blocked: '{first_word}' is not allowed. "
                 f"Blocked commands: {', '.join(sorted(self.blocked_commands))}"

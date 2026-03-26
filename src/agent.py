@@ -27,16 +27,6 @@ import aiosqlite
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from .core.workspace import (
-    WorkspaceManager,
-    WorkspaceManagerConfig,
-    get_checkpoints_path,
-)
-from .core.phase_snapshot import PhaseSnapshotManager
-from .core.loader import get_project_root
-from .managers import TodoManager
-from .tools import ToolContext, load_tools, apply_instruction_enforcement
-from .core.state import UniversalAgentState, create_initial_state
 from .core.loader import (
     AgentConfig,
     LLMConfig,
@@ -47,11 +37,21 @@ from .core.loader import (
     resolve_config_path,
     resolve_model_settings,
 )
+from .core.loader import get_project_root
+from .core.phase_snapshot import PhaseSnapshotManager
+from .core.state import UniversalAgentState, create_initial_state
+from .core.workspace import (
+    WorkspaceManager,
+    WorkspaceManagerConfig,
+    get_checkpoints_path,
+)
+from .graph import build_phase_alternation_graph, run_graph_with_streaming
+from .managers import TodoManager
+from .tools import ToolContext, load_tools, apply_instruction_enforcement
 from .tools.description_manager import (
     generate_workspace_tool_docs,
     apply_description_overrides,
 )
-from .graph import build_phase_alternation_graph, run_graph_with_streaming
 
 
 class _AiosqliteConnectionWrapper:
@@ -1494,6 +1494,12 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
 
                 shell_config = self.config.extra.get("shell", {})
                 cc_config = self.config.extra.get("claude_code", {})
+                # VM-backed agents get sudo_action=allow (sudo goes through
+                # the VM's approval gate, not the container intercept)
+                sudo_action = shell_config.get("sudo_action", "freeze")
+                if use_remote_shell:
+                    sudo_action = "allow"
+
                 shell_manager = ShellManager(
                     job_id=self._current_job_id,
                     max_tabs=shell_config.get("max_tabs", 15),
@@ -1510,6 +1516,7 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     else False,
                     claude_code_model=cc_config.get("model", "claude-opus-4-6"),
                     backend=ws_backend if use_remote_shell else None,
+                    sudo_action=sudo_action,
                 )
                 context.shell_manager = shell_manager
                 self._shell_manager = shell_manager

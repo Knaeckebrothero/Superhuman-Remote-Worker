@@ -588,8 +588,14 @@
           "items": {
             "type": "string"
           },
-          "description": "Commands blocked from execution for safety",
-          "default": ["sudo", "reboot", "shutdown", "poweroff", "halt", "init", "systemctl"]
+          "description": "Commands blocked from execution for safety (sudo has its own intercept via sudo_action)",
+          "default": ["reboot", "shutdown", "poweroff", "halt", "init"]
+        },
+        "sudo_action": {
+          "type": "string",
+          "enum": ["freeze", "block", "allow"],
+          "default": "freeze",
+          "description": "How to handle sudo commands: 'freeze' (intercept and offer VM upgrade), 'block' (hard reject), 'allow' (pass through, for VM-backed agents)"
         },
         "sandbox": {
           "type": "boolean",
