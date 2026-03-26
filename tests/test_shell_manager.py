@@ -463,10 +463,27 @@ class TestBlockedCommandSend:
         result = manager.send("default", "echo hello", enter=True)
         assert result == "Sent to 'default'"
 
-    def test_send_allows_sudo(self, manager):
-        """send() allows sudo (not blocked by default)."""
+    def test_send_freezes_sudo_by_default(self, manager):
+        """send() returns freeze sentinel for sudo (default sudo_action=freeze)."""
+        from src.tools.coding.shell_manager import SUDO_FREEZE_SENTINEL
+
+        result = manager.send("default", "sudo ls", enter=True)
+        assert result == SUDO_FREEZE_SENTINEL
+
+    def test_send_allows_sudo_when_action_allow(self, manager):
+        """send() allows sudo when sudo_action='allow' (VM-backed agents)."""
+        manager.sudo_action = "allow"
         result = manager.send("default", "sudo ls", enter=True)
         assert result == "Sent to 'default'"
+        manager.sudo_action = "freeze"  # restore
+
+    def test_send_blocks_sudo_when_action_block(self, manager):
+        """send() hard-blocks sudo when sudo_action='block'."""
+        manager.sudo_action = "block"
+        result = manager.send("default", "sudo ls", enter=True)
+        assert "blocked" in result.lower()
+        assert "vm runtime" in result.lower()
+        manager.sudo_action = "freeze"  # restore
 
     def test_send_skips_check_without_enter(self, manager):
         """send() with enter=False skips blocking (control keys, etc.)."""

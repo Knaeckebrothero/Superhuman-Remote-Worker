@@ -53,20 +53,22 @@ spec:
         - name: reloader
           image: stakater/reloader:v1.3.0
           args:
-            - --namespaces-to-watch=superhuman-remote-worker
             - --reload-strategy=annotations
+          env:
+            - name: KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - containerPort: 9090
               name: metrics
           livenessProbe:
-            httpGet:
-              path: /live
+            tcpSocket:
               port: 9090
             initialDelaySeconds: 10
             periodSeconds: 10
           readinessProbe:
-            httpGet:
-              path: /ready
+            tcpSocket:
               port: 9090
             initialDelaySeconds: 5
             periodSeconds: 5

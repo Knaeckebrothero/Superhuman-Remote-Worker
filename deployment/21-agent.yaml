@@ -29,6 +29,17 @@ spec:
         - name: agent
           image: ghcr.io/knaeckebrothero/superhuman-remote-worker-agent:sha-e7c03d8
           imagePullPolicy: Always
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
           ports:
             - containerPort: 8001
           env:
@@ -263,6 +274,12 @@ spec:
               mountPath: /run/secrets/vm-ssh-key
               subPath: ssh-privatekey
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: run
+              mountPath: /run
+            - name: home-srw
+              mountPath: /home/srw
           livenessProbe:
             httpGet:
               path: /health
@@ -296,3 +313,14 @@ spec:
           secret:
             secretName: vm-ssh-key
             defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: home-srw
+          emptyDir:
+            sizeLimit: 512Mi

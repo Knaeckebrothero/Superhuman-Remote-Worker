@@ -556,7 +556,7 @@ spec:
                     # and protocol mapper configs can be empty. This hook runs on
                     # every start and ensures secrets + mappers are correct.
                     KC="/opt/keycloak/bin/kcadm.sh"
-                    until curl -sf http://localhost:9000/health/ready >/dev/null 2>&1; do sleep 3; done
+                    until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
                     $KC config credentials --server http://localhost:8080 \
                       --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
                     # --- Sync client secrets ---
