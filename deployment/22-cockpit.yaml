@@ -75,12 +75,9 @@ spec:
           imagePullPolicy: Always
           ports:
             - containerPort: 4000
-          env:
-            - name: PORT
-              value: "4000"
           volumeMounts:
             - name: env-js
-              mountPath: /app/dist/cockpit/browser/assets/env.js
+              mountPath: /usr/share/nginx/html/assets/env.js
               subPath: env.js
           livenessProbe:
             httpGet:

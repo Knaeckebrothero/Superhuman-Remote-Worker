@@ -53,7 +53,6 @@ spec:
         - name: reloader
           image: stakater/reloader:v1.3.0
           args:
-            - --namespaces-to-watch=superhuman-remote-worker
             - --reload-strategy=annotations
           ports:
             - containerPort: 9090
