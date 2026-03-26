@@ -15,12 +15,14 @@ Available in both strategic and tactical phases.
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
-from ..context import ToolContext
 from .coding_tools import _truncate_output
+from .shell_manager import SUDO_FREEZE_SENTINEL
+from ..context import ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,25 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
+def _check_sudo_freeze(output: str, command: str, context: ToolContext) -> Optional[str]:
+    """If output is the sudo freeze sentinel, trigger a job freeze and return
+    a message for the agent. Returns None if not a sudo freeze."""
+    if output != SUDO_FREEZE_SENTINEL:
+        return None
+    context.request_freeze({
+        "freeze_type": "vm_upgrade_required",
+        "reason": "Agent attempted a sudo command that requires VM-level access.",
+        "command": command,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return (
+        "This command requires elevated privileges (sudo). "
+        "The job has been paused while the operator decides whether to "
+        "upgrade this job to a VM environment. You do not need to take "
+        "any action — the job will resume automatically if approved."
+    )
+
+
 def _apply_tail(output: str, tail: int) -> str:
     """Apply tail truncation to run_sync output, preserving the header.
 
@@ -219,11 +240,11 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
           - apt/dnf: use -y flag
           - git: configure credential helper
 
-        SUDO NOTE: Commands prefixed with `sudo` require human approval and
-        may block for up to 5 minutes while awaiting operator consent. Always
-        use timeout=600 for sudo commands. If denied, exit code 1 with
-        "sudo request denied by operator" in stderr. On denial, try an
-        alternative approach or note the need in workspace.md.
+        SUDO NOTE: Commands prefixed with `sudo` may pause the job while
+        the operator decides whether to upgrade to a VM environment. If the
+        job is upgraded, it will resume automatically with sudo access. If
+        not upgraded, try an alternative approach (pip install as user,
+        compile from source in userspace, etc.).
 
         For long output, only the last `tail` lines are returned. Use
         shell_read() to page through the full scrollback if needed.
@@ -249,6 +270,11 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             sm.ensure_tab("default")
 
             output = sm.run_sync(command, tab_name="default", timeout=min(timeout, 600))
+
+            # Sudo intercept: trigger freeze for VM upgrade
+            freeze_msg = _check_sudo_freeze(output, command, context)
+            if freeze_msg:
+                return freeze_msg
 
             # Interactive prompt → error (model should use non-interactive alternatives)
             if (
@@ -344,7 +370,11 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
                 is_special = command in TMUX_SPECIAL_KEYS or command.startswith(
                     ("C-", "M-")
                 )
-                sm.send(name, command, enter=not is_special)
+                result = sm.send(name, command, enter=not is_special)
+                # Sudo intercept: trigger freeze for VM upgrade
+                freeze_msg = _check_sudo_freeze(result, command, context)
+                if freeze_msg:
+                    return freeze_msg
                 time.sleep(0.5)
                 text, metadata = sm.read_with_offset(name, lines=tail)
                 text = _truncate_output(text, max_output_chars, "shell output")
@@ -353,7 +383,11 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             elif is_async:
                 # Async mode: send command, wait briefly, return what appeared
                 sm.read(name, lines=1, since_cursor=False)  # snapshot cursor
-                sm.send(name, command, enter=True)
+                result = sm.send(name, command, enter=True)
+                # Sudo intercept: trigger freeze for VM upgrade
+                freeze_msg = _check_sudo_freeze(result, command, context)
+                if freeze_msg:
+                    return freeze_msg
                 time.sleep(0.5)
                 text, metadata = sm.read(name, since_cursor=True)
                 text = _truncate_output(text, max_output_chars, "shell output")
@@ -362,6 +396,10 @@ def create_shell_tools(context: ToolContext) -> List[Any]:
             else:
                 # Sync mode: sentinel-based wait for completion
                 output = sm.run_sync(command, tab_name=name)
+                # Sudo intercept: trigger freeze for VM upgrade
+                freeze_msg = _check_sudo_freeze(output, command, context)
+                if freeze_msg:
+                    return freeze_msg
                 output = _apply_tail(output, tail)
                 output = _truncate_output(output, max_output_chars, "output")
                 # Scan for application-level errors in output

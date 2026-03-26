@@ -460,10 +460,22 @@ services:
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+      - /run:rw,noexec,nosuid,size=16m
     volumes:
       - workspace_data:/workspace:z
+      - agent_home:/home/srw
     deploy:
       replicas: ${AGENT_REPLICAS:-2}
+      resources:
+        limits:
+          pids: 256
     depends_on:
       postgres:
         condition: service_healthy
@@ -665,5 +677,7 @@ volumes:
     name: srw_minio_data
   workspace_data:
     name: srw_workspace_data
+  agent_home:
+    name: srw_agent_home
   codex_proxy_auths:
     name: srw_codex_proxy_auths

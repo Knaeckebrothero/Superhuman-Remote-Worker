@@ -282,7 +282,8 @@ shell:
   max_read_lines: 200          # Maximum lines shell_read can return
   scrollback_limit: 5000       # Tmux history-limit per pane
   default_timeout: 120         # Default timeout for sync mode (seconds)
-  blocked_commands: [reboot, shutdown, poweroff, halt, init]  # sudo/systemctl allowed for remote server management
+  blocked_commands: [reboot, shutdown, poweroff, halt, init]
+  sudo_action: freeze          # "freeze" (intercept sudo, offer VM upgrade) or "block" (hard reject)
   sandbox: true                # Restrict working directory to workspace
   auto_start_claude_code: false # Auto-open a Claude Code tab on job start (requires claude CLI)
 
