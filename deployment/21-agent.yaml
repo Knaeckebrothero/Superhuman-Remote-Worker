@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: srw-agent
   namespace: superhuman-remote-worker
+  annotations:
+    reloader.stakater.com/auto: "true"
 spec:
   replicas: 2
   strategy:

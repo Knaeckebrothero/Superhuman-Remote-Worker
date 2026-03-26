@@ -333,14 +333,16 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
             </button>
           </div>
 
-          <!-- Connection Instructions -->
-          <div class="instructions">
-            <h3 class="form-title">Connection</h3>
-            <p class="section-desc">
-              Add this to your <code>.mcp.json</code> file:
-            </p>
-            <pre class="code-block">{{mcpJsonSnippet()}}</pre>
-          </div>
+          <!-- Connection Instructions (shown after token creation) -->
+          @if (newToken()) {
+            <div class="instructions">
+              <h3 class="form-title">Connection</h3>
+              <p class="section-desc">
+                Add this to your <code>.mcp.json</code> file:
+              </p>
+              <pre class="code-block">{{mcpJsonSnippet()}}</pre>
+            </div>
+          }
         </section>
 
         <!-- Codex Proxy Section (Admin Only) -->
@@ -918,20 +920,24 @@ export class SettingsComponent implements OnInit {
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   }
 
-  mcpJsonSnippet = () =>
-    JSON.stringify(
+  mcpJsonSnippet = () => {
+    const token = this.newToken()?.token ?? 'srw_YOUR_TOKEN_HERE';
+    return JSON.stringify(
       {
         mcpServers: {
           orchestrator: {
             type: 'http',
             url: `${window.location.origin.replace(/:\d+$/, ':8055')}/mcp`,
-            auth: 'srw_YOUR_TOKEN_HERE',
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
           },
         },
       },
       null,
       2,
     );
+  };
 
   // ── API Keys ──────────────────────────────────────────────────────
 
