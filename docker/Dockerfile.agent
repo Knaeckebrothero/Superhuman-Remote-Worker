@@ -35,6 +35,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# Install CPU-only PyTorch first (separate layer — rarely changes, ~200MB vs ~2GB with CUDA)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
 # Optional: path to local CitationEngine source (for local builds)
 ARG CITATION_ENGINE_PATH=""
 
