@@ -73,15 +73,35 @@ def load_config() -> dict:
 def detect_ip() -> str:
     """Detect the VM's routable IPv4 address.
 
-    Tries UDP connect trick first (works without actual network traffic),
-    falls back to iterating interfaces.
+    Prefers Tailscale IP (100.64.x.y) when the VM is connected to a
+    Headscale tailnet — this address is directly reachable from agent pods
+    on any cluster. Falls back to LAN IP detection if Tailscale is not
+    available (graceful degradation).
     """
-    # UDP connect trick: connect to a non-routable address to find local IP
+    # Prefer Tailscale IP — reachable from agent pods via mesh VPN
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            ip = result.stdout.strip()
+            if ip:
+                log.info("Using Tailscale IP: %s", ip)
+                return ip
+    except FileNotFoundError:
+        pass  # Tailscale not installed
+    except Exception as e:
+        log.debug("Tailscale IP detection failed: %s", e)
+
+    # Fallback: UDP connect trick (works without actual network traffic)
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("10.255.255.255", 1))
             ip = s.getsockname()[0]
             if ip and not ip.startswith("127."):
+                log.info("Using LAN IP (no Tailscale): %s", ip)
                 return ip
     except Exception:
         pass

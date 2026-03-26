@@ -318,11 +318,9 @@ class NatsBridge:
 
         Payload: {job_id, hostname, ip, pid}
 
-        For SSH access, we prefer the pod_ip (reported earlier by the VM
-        controller) over the daemon's self-reported IP.  The daemon runs
-        inside the VM and sees its masquerade address (10.0.2.x), which
-        is not reachable from cluster pods.  The pod IP (from the VMI
-        status) is the address that agents can actually SSH to.
+        The daemon reports its Tailscale IP (100.64.x.y), which is directly
+        reachable from agent pods via the Headscale mesh VPN. No NodePort
+        lookup or pod-ip query needed.
         """
         try:
             data = json.loads(msg.data.decode())
@@ -330,36 +328,15 @@ class NatsBridge:
             if not job_id:
                 return
 
-            # Query the VM controller for the SSH endpoint.
-            # Prefers NodePort service (cross-cluster), falls back to pod IP.
-            daemon_ip = data.get("ip") or data.get("hostname")
-            ssh_host = None
+            # Daemon reports its Tailscale IP — directly reachable from agent pods
+            ssh_host = data.get("ip") or data.get("hostname")
             ssh_port = 22
-            nc_connected = self._nc and self._nc.is_connected
-            if nc_connected:
-                try:
-                    reply = await self._nc.request(
-                        "vm.query.pod-ip",
-                        json.dumps({"job_id": job_id}).encode(),
-                        timeout=5.0,
-                    )
-                    pod_data = json.loads(reply.data.decode())
-                    ssh_host = pod_data.get("ssh_host") or pod_data.get("pod_ip")
-                    if pod_data.get("ssh_port"):
-                        ssh_port = pod_data["ssh_port"]
-                except Exception as e:
-                    logger.warning(
-                        "Failed to query SSH endpoint for job %s: %s", job_id, e
-                    )
-
-            ssh_host = ssh_host or daemon_ip
 
             logger.info(
-                "Daemon registered for job %s (ssh=%s:%d, daemon_ip=%s)",
+                "Daemon registered for job %s (ssh=%s:%d)",
                 job_id,
                 ssh_host,
                 ssh_port,
-                daemon_ip,
             )
             await self._set_vm_context(
                 job_id,
