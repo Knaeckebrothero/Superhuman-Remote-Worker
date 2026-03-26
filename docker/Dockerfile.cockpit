@@ -2,15 +2,13 @@
 # Cockpit Frontend Dockerfile
 # =============================================================================
 #
-# Angular SSR application for the Cockpit UI.
+# Static Angular application served via nginx.
 #
 # Build:
 #   docker build -t srw-cockpit -f docker/Dockerfile.cockpit .
 #
 # Run:
-#   docker run -p 4000:4000 \
-#     -e PORT=4000 \
-#     srw-cockpit
+#   docker run -p 4000:4000 srw-cockpit
 # =============================================================================
 
 FROM node:22-alpine AS builder
@@ -28,33 +26,29 @@ COPY cockpit/tsconfig.json cockpit/tsconfig.app.json cockpit/angular.json ./
 COPY cockpit/src/ ./src/
 COPY cockpit/public/ ./public/
 
-# Build the Angular SSR application
+# Build the Angular application (static output)
 RUN npm run build
 
 # Production image
-FROM node:22-alpine
+FROM nginx:alpine
 
 LABEL maintainer="SRW Team"
-LABEL description="Cockpit Angular SSR Frontend"
+LABEL description="Cockpit Angular Frontend"
 
-ENV NODE_ENV=production \
-    PORT=4000
+# Copy built static assets from builder
+COPY --from=builder /app/dist/cockpit/browser /usr/share/nginx/html
 
-WORKDIR /app
-
-# Copy built application from builder
-COPY --from=builder /app/dist/cockpit ./dist/cockpit
-
-# Create non-root user
-RUN addgroup -g 1001 -S srw && \
-    adduser -u 1001 -S srw -G srw && \
-    chown -R srw:srw /app
-
-USER srw
+# Nginx config: SPA fallback + port 4000
+RUN printf 'server {\n\
+    listen 4000;\n\
+    root /usr/share/nginx/html;\n\
+    index index.html;\n\
+    location / {\n\
+        try_files $uri $uri/ /index.html;\n\
+    }\n\
+}\n' > /etc/nginx/conf.d/default.conf
 
 EXPOSE 4000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD wget -q --spider http://localhost:${PORT}/ || exit 1
-
-CMD ["node", "dist/cockpit/server/server.mjs"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget -q --spider http://localhost:4000/ || exit 1
