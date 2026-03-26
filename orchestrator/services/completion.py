@@ -24,7 +24,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Repo root for template resolution
 # ---------------------------------------------------------------------------
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+def _find_repo_root() -> Path:
+    """Walk up from this file to find the directory containing ``config/``."""
+    anchor = Path(__file__).resolve().parent
+    for _ in range(5):
+        if (anchor / "config" / "defaults.yaml").is_file():
+            return anchor
+        anchor = anchor.parent
+    # Last resort: assume working directory (WORKDIR /app in Docker)
+    return Path.cwd()
+
+
+_REPO_ROOT = _find_repo_root()
 
 
 # ---------------------------------------------------------------------------
