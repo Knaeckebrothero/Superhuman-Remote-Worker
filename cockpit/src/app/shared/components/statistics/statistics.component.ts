@@ -340,16 +340,6 @@ import {
         font-weight: 600;
       }
 
-      .component-creator {
-        background: rgba(148, 226, 213, 0.2);
-        color: #94e2d5;
-      }
-
-      .component-validator {
-        background: rgba(249, 226, 175, 0.2);
-        color: #f9e2af;
-      }
-
       .component-unknown {
         background: rgba(108, 112, 134, 0.2);
         color: #6c7086;

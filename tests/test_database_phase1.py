@@ -38,7 +38,6 @@ class TestPostgresDB:
         with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
             db = PostgresDB()
             assert hasattr(db, "jobs")
-            assert hasattr(db, "requirements")
             assert hasattr(db, "citations")
 
     def test_row_to_dict_with_none(self):

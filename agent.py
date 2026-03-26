@@ -12,44 +12,35 @@ Logging is controlled via environment variables:
 
 Examples:
     # Process a single document
-    python agent.py --config creator \
+    python agent.py --config developer \
         --document-path ./data/doc.pdf \
-        --description "Extract GoBD requirements"
+        --description "Analyze and summarize this document"
 
     # Process all documents in a directory (with debug logging)
-    LOG_LEVEL=DEBUG python agent.py --config creator \
+    LOG_LEVEL=DEBUG python agent.py --config scholar \
         --document-dir ./data/example_data/ \
-        --description "Extract requirements based on the provided documents"
+        --description "Research based on the provided documents"
 
-    # Combine single document with directory
-    python agent.py --config creator \
-        --document-path ./data/main.pdf \
-        --document-dir ./data/context/ \
-        --description "Extract requirements"
-
-    # Run as API server (Creator agent on port 8001)
-    python agent.py --config creator --port 8001
-
-    # Run as Validator on port 8002
-    python agent.py --config validator --port 8002
+    # Run as API server on port 8001
+    python agent.py --config developer --port 8001
 
     # Process an existing job by ID
-    python agent.py --config creator --job-id <uuid>
+    python agent.py --config developer --job-id <uuid>
 
     # Resume an existing job
-    python agent.py --config creator --job-id abc123 --resume
+    python agent.py --config developer --job-id abc123 --resume
 
     # Resume a frozen job with feedback
-    python agent.py --config validator --job-id abc123 --resume --feedback "Please also check X"
+    python agent.py --config critic --job-id abc123 --resume --feedback "Please also check X"
 
     # Approve a frozen job (marks as completed)
-    python agent.py --config validator --job-id abc123 --approve
+    python agent.py --config critic --job-id abc123 --approve
 
     # List available phase snapshots for recovery
-    python agent.py --config validator --job-id abc123 --list-phases
+    python agent.py --job-id abc123 --list-phases
 
     # Recover to a specific phase and resume
-    python agent.py --config validator --job-id abc123 --recover-phase 2 --resume
+    python agent.py --job-id abc123 --recover-phase 2 --resume
 """
 import argparse
 import asyncio
@@ -155,104 +146,6 @@ def setup_job_file_logging(job_id: str) -> Path:
     return log_file
 
 
-def _extract_field_from_markdown(content: str, *field_names: str) -> Optional[str]:
-    """Extract a field value from markdown content.
-
-    Looks for patterns like "RID: R-0042" or "**RID:** R-0042" or "Created requirement R-0042".
-
-    Args:
-        content: Markdown content to search
-        *field_names: Field names to look for
-
-    Returns:
-        Extracted value or None
-    """
-    import re
-    for field in field_names:
-        patterns = [
-            rf"{field}:\s*[`]?([R]-\d+)[`]?",
-            rf"\*\*{field}:\*\*\s*[`]?([R]-\d+)[`]?",
-            rf"{field}\s+([R]-\d+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, content, re.IGNORECASE)
-            if match:
-                return match.group(1)
-    return None
-
-
-async def _update_requirement_after_validation(
-    requirement_uuid: uuid.UUID,
-    workspace_path: Path,
-) -> bool:
-    """Update PostgreSQL requirement after Validator completes.
-
-    Reads the integration result from the workspace and updates
-    the requirement record with neo4j_id, status, etc.
-
-    Args:
-        requirement_uuid: The PostgreSQL UUID of the requirement
-        workspace_path: Path to the job workspace
-
-    Returns:
-        True if update succeeded, False otherwise
-    """
-    logger = logging.getLogger(__name__)
-
-    # Look for integration result file (prefer JSON, fall back to markdown)
-    result_file = workspace_path / "output" / "integration_result.json"
-    if not result_file.exists():
-        result_file = workspace_path / "output" / "integration_result.md"
-        if not result_file.exists():
-            logger.warning(f"No integration result file found in {workspace_path}/output/")
-            return False
-
-    try:
-        content = result_file.read_text()
-
-        # Parse the result based on file type
-        if result_file.suffix == ".json":
-            result = json.loads(content)
-            neo4j_id = result.get("neo4j_id") or result.get("rid")
-            status = result.get("status", "integrated")
-            rejection_reason = result.get("rejection_reason")
-            validation_result = result
-        else:
-            # Parse markdown - look for key fields
-            neo4j_id = _extract_field_from_markdown(content, "RID", "neo4j_id", "Created requirement")
-            status = "integrated" if neo4j_id else "rejected"
-            if "rejected" in content.lower() or "rejection" in content.lower():
-                status = "rejected"
-            rejection_reason = None
-            validation_result = {"raw_output": content}
-
-        # If we think it's integrated but have no ID, mark as failed
-        if not neo4j_id and status == "integrated":
-            logger.warning("No neo4j_id found in integration result, marking as failed")
-            status = "failed"
-
-        # Update PostgreSQL
-        db = PostgresDB()
-        await db.connect()
-        try:
-            await db.requirements.update(
-                requirement_uuid=requirement_uuid,
-                neo4j_id=neo4j_id,
-                status=status,
-                validation_result=validation_result,
-                rejection_reason=rejection_reason,
-                validated_at=True,
-            )
-            logger.info(f"Updated requirement {requirement_uuid}: neo4j_id={neo4j_id}, status={status}")
-            return True
-        finally:
-            await db.close()
-
-    except Exception as e:
-        logger.error(f"Failed to update requirement after validation: {e}")
-        return False
-
-
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
@@ -307,10 +200,6 @@ def parse_args():
         help="Job description - what the agent should accomplish",
     )
     parser.add_argument(
-        "--requirement-id", "-r",
-        help="Requirement UUID to validate (fetches from PostgreSQL, writes to workspace)",
-    )
-    parser.add_argument(
         "--context",
         help="Additional context as JSON string (e.g., '{\"domain\": \"car_rental\"}')",
     )
@@ -362,7 +251,6 @@ async def run_single_job(
     document_paths: Optional[List[str]] = None,
     description: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
-    requirement_data: Optional[Dict[str, Any]] = None,
     resume: bool = False,
     feedback: Optional[str] = None,
 ):
@@ -378,7 +266,6 @@ async def run_single_job(
         document_paths: List of document paths to include
         description: Job description - what the agent should accomplish
         context: Additional context dictionary
-        requirement_data: Requirement data fetched from PostgreSQL (for validator)
         resume: Resume existing job
         feedback: Feedback message to inject when resuming a frozen job
     """
@@ -424,9 +311,6 @@ async def run_single_job(
         metadata["description"] = description
     if context:
         metadata.update(context)
-    if requirement_data:
-        metadata["requirement_data"] = requirement_data
-
     # Query job status before resume (so process_job knows if this was a graceful stop)
     previous_status = None
     if resume and job_id:
@@ -486,18 +370,6 @@ async def run_single_job(
             print(f"Should stop:  {result.get('should_stop', False)}")
             print("=" * 60)
 
-            # Update PostgreSQL requirement if this was a validation job
-            if requirement_data:
-                workspace_path = Path(get_workspace_base_path()) / f"job_{job_id}"
-                updated = await _update_requirement_after_validation(
-                    requirement_uuid=requirement_data["id"],
-                    workspace_path=workspace_path,
-                )
-                if updated:
-                    print(f"PostgreSQL:   Requirement updated")
-                else:
-                    print(f"PostgreSQL:   Update skipped (no integration result found)")
-
     finally:
         await agent.shutdown()
 
@@ -556,7 +428,6 @@ async def recover_and_resume(
     document_paths: Optional[List[str]] = None,
     description: Optional[str] = None,
     context: Optional[Dict[str, Any]] = None,
-    requirement_data: Optional[Dict[str, Any]] = None,
 ):
     """Recover to a specific phase and resume execution.
 
@@ -567,7 +438,6 @@ async def recover_and_resume(
         document_paths: List of document paths (for metadata)
         description: Job description (for metadata)
         context: Additional context dictionary
-        requirement_data: Requirement data (for validator)
     """
     logger = logging.getLogger(__name__)
 
@@ -609,7 +479,6 @@ async def recover_and_resume(
         document_paths=document_paths,
         description=description,
         context=context,
-        requirement_data=requirement_data,
         resume=True,  # Always resume after recovery
         feedback=None,
     )
@@ -685,32 +554,6 @@ def main():
             logger.error("--git-url requires --description")
             sys.exit(1)
 
-    # Validate and fetch requirement if --requirement-id provided
-    requirement_data = None
-    if args.requirement_id:
-        try:
-            req_uuid = uuid.UUID(args.requirement_id)
-        except ValueError:
-            logger.error(f"Invalid requirement ID (not a valid UUID): {args.requirement_id}")
-            sys.exit(1)
-
-        # Fetch requirement from database (run in async context)
-        async def fetch_requirement():
-            db = PostgresDB()
-            await db.connect()
-            try:
-                return await db.requirements.get(req_uuid)
-            finally:
-                await db.close()
-
-        requirement_data = asyncio.run(fetch_requirement())
-
-        if not requirement_data:
-            logger.error(f"Requirement not found: {args.requirement_id}")
-            sys.exit(1)
-
-        logger.info(f"Fetched requirement: {requirement_data.get('name', 'unnamed')}")
-
     # Approve frozen job mode
     if args.approve:
         if not args.job_id:
@@ -742,19 +585,17 @@ def main():
             document_paths=document_paths if document_paths else None,
             description=args.description,
             context=context,
-            requirement_data=requirement_data,
         ))
         return
 
-    # Single job mode (either by job_id or by description or by requirement_id)
-    if args.job_id or args.description or args.requirement_id:
+    # Single job mode
+    if args.job_id or args.description:
         asyncio.run(run_single_job(
             config_path=config_path,
             job_id=args.job_id,
             document_paths=document_paths if document_paths else None,
             description=args.description,
             context=context,
-            requirement_data=requirement_data,
             resume=args.resume,
             feedback=args.feedback,
         ))

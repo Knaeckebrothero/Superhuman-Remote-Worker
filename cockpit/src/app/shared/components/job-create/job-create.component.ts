@@ -1729,15 +1729,20 @@ export class JobCreateComponent implements OnInit {
   readonly enableScholar = signal(true);
   readonly enableCritic = signal(true);
   readonly criticMaxRounds = signal<number>(5);
+  /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
+  private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectHasSharedMemory = computed(() => {
     const pid = this.selectedProjectId();
     if (!pid) return false;
     const proj = this.projects().find((p) => p.id === pid);
     if (!proj) return false;
-    // Project-scoped memory is on by default (defaults.yaml), so treat absent as true
     const override = proj.default_config_override as Record<string, any> | null;
     const val = override?.['memory']?.['project_scoped'];
-    return val !== false;
+    if (typeof val === 'boolean') return val;
+    // Fall back to framework default from defaults.yaml
+    const defaults = this.frameworkDefaults();
+    const defaultVal = (defaults?.['memory'] as any)?.['project_scoped'];
+    return typeof defaultVal === 'boolean' ? defaultVal : true;
   });
 
   readonly autonomyLevels = [
@@ -1805,6 +1810,10 @@ export class JobCreateComponent implements OnInit {
     this.loadExperts();
     this.loadDatasources();
     this.loadProjects();
+    // Load framework defaults so toggles reflect the actual base config
+    this.api.getExpertDetail('defaults').subscribe((d) => {
+      if (d?.config) this.frameworkDefaults.set(d.config);
+    });
   }
 
   private loadExperts(): void {

@@ -745,7 +745,6 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
         await postgres_db.update_job_status(
             job_id=job_id,
             status="processing",
-            creator_status="pending",
             assigned_agent_id=agent_id,
         )
 
@@ -5068,25 +5067,6 @@ async def ensure_workspace_access(request: Request, job_id: str) -> dict[str, An
         raise
     except Exception as e:
         logger.exception(f"Failed to ensure workspace access for job {job_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-@app.get("/api/jobs/{job_id}/requirements")
-async def get_job_requirements(
-    job_id: str,
-    status: str | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-) -> dict[str, Any]:
-    """Get requirements for a job with optional filtering."""
-    try:
-        return await postgres_db.get_requirements(
-            job_id=job_id,
-            status=status,
-            limit=limit,
-            offset=offset,
-        )
-    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

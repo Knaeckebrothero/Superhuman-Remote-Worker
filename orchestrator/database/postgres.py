@@ -38,7 +38,6 @@ ALLOWED_TABLES = frozenset(
     {
         "jobs",
         "agents",
-        "requirements",
         "datasources",
         "users",
         "projects",
@@ -56,7 +55,6 @@ REQUIRED_TABLES = [
     "project_repositories",
     "jobs",
     "agents",
-    "requirements",
     "datasources",
     "builder_sessions",
     "builder_messages",
@@ -436,7 +434,7 @@ class PostgresDB:
             columns = await self.get_table_schema(table_name)
 
             # Get data with ordering by created_at/registered_at if available, else by id
-            if table_name in ("jobs", "requirements", "citations", "datasources"):
+            if table_name in ("jobs", "citations", "datasources"):
                 order_col = "created_at"
             elif table_name == "agents":
                 order_col = "registered_at"
@@ -485,7 +483,7 @@ class PostgresDB:
             limit: Maximum number of jobs to return
 
         Returns:
-            List of job dicts with id, description, status, creator_status, validator_status, created_at, user_id
+            List of job dicts with id, description, status, config_name, created_at, user_id
         """
         conditions = []
         values = []
@@ -508,7 +506,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT id, description, status, creator_status, validator_status,
+                SELECT id, description, status,
                        config_name, assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
                        repo_name, branch_name, merge_status, created_at,
@@ -540,7 +538,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, status, creator_status, validator_status,
+                SELECT id, status,
                        config_name, config_override, resolved_config,
                        assigned_agent_id, user_id,
                        project_id, parent_job_id, priority,
@@ -603,9 +601,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, creator_status, validator_status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-                RETURNING id, status, creator_status, validator_status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path
+                INSERT INTO jobs (description, document_path, config_name, config_override, context, status, user_id, project_id, branch_name, parent_job_id, priority, repo_name, creation_order, worktree_path, delegation_context)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                RETURNING id, status, config_name, assigned_agent_id, user_id, project_id, parent_job_id, priority, branch_name, repo_name, created_at, updated_at, description, creation_order, worktree_path
                 """,
                 description,
                 document_path or document_dir,
@@ -613,8 +611,6 @@ class PostgresDB:
                 json.dumps(config_override) if config_override else None,
                 json.dumps(context) if context else None,
                 "created",
-                "pending",
-                "pending",
                 user_uuid,
                 project_uuid,
                 branch_name,
@@ -715,8 +711,6 @@ class PostgresDB:
         self,
         job_id: str,
         status: str | None = None,
-        creator_status: str | None = None,
-        validator_status: str | None = None,
         assigned_agent_id: str | None = None,
         error_message: str | None = None,
         freeze_data: Dict[str, Any] | None = None,
@@ -726,8 +720,6 @@ class PostgresDB:
         Args:
             job_id: Job UUID as string
             status: New job status
-            creator_status: New creator status
-            validator_status: New validator status
             assigned_agent_id: Agent ID if being assigned
             error_message: Error message if failed
             freeze_data: Freeze metadata dict (for waiting_for_reply, pending_review)
@@ -749,16 +741,6 @@ class PostgresDB:
             param_count += 1
             updates.append(f"status = ${param_count}")
             values.append(status)
-
-        if creator_status is not None:
-            param_count += 1
-            updates.append(f"creator_status = ${param_count}")
-            values.append(creator_status)
-
-        if validator_status is not None:
-            param_count += 1
-            updates.append(f"validator_status = ${param_count}")
-            values.append(validator_status)
 
         if error_message is not None:
             param_count += 1
@@ -1119,129 +1101,6 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
-    async def get_requirements(
-        self,
-        job_id: str,
-        status: str | None = None,
-        limit: int = 1000,
-        offset: int = 0,
-    ) -> Dict[str, Any]:
-        """Get requirements for a job with optional filtering.
-
-        Args:
-            job_id: Job UUID as string
-            status: Optional status filter
-            limit: Maximum requirements to return
-            offset: Number to skip
-
-        Returns:
-            Dict with requirements list and total count
-        """
-        try:
-            uuid_val = UUID(job_id)
-        except ValueError:
-            return {"requirements": [], "total": 0}
-
-        async with self.acquire() as conn:
-            # Get total count
-            if status:
-                count_row = await conn.fetchrow(
-                    "SELECT COUNT(*) as total FROM requirements WHERE job_id = $1 AND status = $2",
-                    uuid_val,
-                    status,
-                )
-                rows = await conn.fetch(
-                    """
-                    SELECT id, requirement_id, name, text, type, priority, status,
-                           source_document, gobd_relevant, gdpr_relevant,
-                           quality_score, fulfillment_status, neo4j_id,
-                           created_at, updated_at
-                    FROM requirements
-                    WHERE job_id = $1 AND status = $2
-                    ORDER BY created_at
-                    LIMIT $3 OFFSET $4
-                    """,
-                    uuid_val,
-                    status,
-                    limit,
-                    offset,
-                )
-            else:
-                count_row = await conn.fetchrow(
-                    "SELECT COUNT(*) as total FROM requirements WHERE job_id = $1",
-                    uuid_val,
-                )
-                rows = await conn.fetch(
-                    """
-                    SELECT id, requirement_id, name, text, type, priority, status,
-                           source_document, gobd_relevant, gdpr_relevant,
-                           quality_score, fulfillment_status, neo4j_id,
-                           created_at, updated_at
-                    FROM requirements
-                    WHERE job_id = $1
-                    ORDER BY created_at
-                    LIMIT $2 OFFSET $3
-                    """,
-                    uuid_val,
-                    limit,
-                    offset,
-                )
-
-        return {
-            "requirements": [dict(row) for row in rows],
-            "total": count_row["total"] if count_row else 0,
-            "limit": limit,
-            "offset": offset,
-        }
-
-    async def get_requirement_summary(self, job_id: str) -> Dict[str, int]:
-        """Get requirement counts by status for a job.
-
-        Args:
-            job_id: Job UUID as string
-
-        Returns:
-            Dict with counts by status
-        """
-        try:
-            uuid_val = UUID(job_id)
-        except ValueError:
-            return {
-                "pending": 0,
-                "validating": 0,
-                "integrated": 0,
-                "rejected": 0,
-                "failed": 0,
-                "total": 0,
-            }
-
-        async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                    COUNT(*) FILTER (WHERE status = 'validating') as validating,
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed,
-                    COUNT(*) as total
-                FROM requirements
-                WHERE job_id = $1
-                """,
-                uuid_val,
-            )
-
-        if row:
-            return dict(row)
-        return {
-            "pending": 0,
-            "validating": 0,
-            "integrated": 0,
-            "rejected": 0,
-            "failed": 0,
-            "total": 0,
-        }
-
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get detailed progress information for a job including ETA.
 
@@ -1257,10 +1116,9 @@ class PostgresDB:
             return None
 
         async with self.acquire() as conn:
-            # Get job info
             job = await conn.fetchrow(
                 """
-                SELECT id, description, status, creator_status, validator_status,
+                SELECT id, description, status,
                        config_name, assigned_agent_id, created_at, updated_at, completed_at
                 FROM jobs WHERE id = $1
                 """,
@@ -1269,27 +1127,7 @@ class PostgresDB:
             if not job:
                 return None
 
-            # Get requirement counts
-            req_counts = await conn.fetchrow(
-                """
-                SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE status = 'pending') as pending,
-                    COUNT(*) FILTER (WHERE status = 'validating') as validating,
-                    COUNT(*) FILTER (WHERE status = 'integrated') as integrated,
-                    COUNT(*) FILTER (WHERE status = 'rejected') as rejected,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failed
-                FROM requirements WHERE job_id = $1
-                """,
-                uuid_val,
-            )
-
-        # Calculate progress
-        total = req_counts["total"]
-        processed = req_counts["integrated"] + req_counts["rejected"]
-        progress_percent = (processed / total * 100) if total > 0 else 0
-
-        # Calculate ETA
+        # Calculate elapsed time
         created_at = job["created_at"]
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
@@ -1297,21 +1135,12 @@ class PostgresDB:
         elapsed = now - created_at
         elapsed_seconds = elapsed.total_seconds()
 
-        eta_seconds = None
-        if processed > 0 and total > processed:
-            avg_time_per_req = elapsed_seconds / processed
-            remaining = (total - processed) * avg_time_per_req
-            eta_seconds = remaining
-
         return {
             "job_id": str(job["id"]),
             "status": job["status"],
-            "creator_status": job["creator_status"],
-            "validator_status": job["validator_status"],
-            "requirements": dict(req_counts),
-            "progress_percent": round(progress_percent, 1),
+            "progress_percent": 0,
             "elapsed_seconds": elapsed_seconds,
-            "eta_seconds": eta_seconds,
+            "eta_seconds": None,
             "created_at": job["created_at"].isoformat() if job["created_at"] else None,
             "updated_at": job["updated_at"].isoformat() if job["updated_at"] else None,
             "completed_at": job["completed_at"].isoformat()
@@ -1388,15 +1217,11 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT j.id, j.description, j.status, j.creator_status, j.validator_status,
-                       j.config_name, j.assigned_agent_id, j.created_at, j.updated_at,
-                       COUNT(r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,
-                       COUNT(r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements
+                SELECT j.id, j.description, j.status,
+                       j.config_name, j.assigned_agent_id, j.created_at, j.updated_at
                 FROM jobs j
-                LEFT JOIN requirements r ON j.id = r.job_id
                 WHERE j.status = 'processing'
                 AND j.updated_at < $1
-                GROUP BY j.id
                 ORDER BY j.updated_at ASC
                 """,
                 threshold,
@@ -1405,23 +1230,8 @@ class PostgresDB:
         stuck_jobs = []
         for row in rows:
             job = dict(row)
-            # Determine stuck reason
-            if (
-                job["creator_status"] == "processing"
-                and job["integrated_requirements"] == 0
-            ):
-                job["stuck_reason"] = "Creator not producing requirements"
-                job["stuck_component"] = "creator"
-            elif (
-                job["creator_status"] == "completed" and job["pending_requirements"] > 0
-            ):
-                job["stuck_reason"] = (
-                    f"Validator not processing {job['pending_requirements']} pending requirements"
-                )
-                job["stuck_component"] = "validator"
-            else:
-                job["stuck_reason"] = "No recent activity"
-                job["stuck_component"] = "unknown"
+            job["stuck_reason"] = "No recent activity"
+            job["stuck_component"] = "unknown"
             stuck_jobs.append(job)
 
         return stuck_jobs

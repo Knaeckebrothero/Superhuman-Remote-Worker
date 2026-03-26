@@ -1414,9 +1414,16 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
   readonly settingsName = signal('');
   readonly settingsConfigName = signal('');
   readonly isSavingSettings = signal(false);
+  /** Framework defaults from GET /api/experts/defaults — used as fallback for toggles. */
+  private readonly frameworkDefaults = signal<Record<string, unknown> | null>(null);
   readonly projectMemoryShared = computed(() => {
     const p = this.project();
-    return !!(p?.default_config_override as any)?.memory?.project_scoped;
+    const val = (p?.default_config_override as any)?.memory?.project_scoped;
+    if (typeof val === 'boolean') return val;
+    // Fall back to framework default from defaults.yaml
+    const defaults = this.frameworkDefaults();
+    const defaultVal = (defaults?.['memory'] as any)?.['project_scoped'];
+    return typeof defaultVal === 'boolean' ? defaultVal : true;
   });
 
   // Knowledge tab
@@ -1448,6 +1455,10 @@ export class ProjectDetailPageComponent implements OnInit, OnDestroy {
       if (this.projectId) this.loadAll();
     });
     this.api.getUsers().subscribe((users) => this.allUsers.set(users));
+    // Load framework defaults so toggles reflect the actual base config
+    this.api.getExpertDetail('defaults').subscribe((d) => {
+      if (d?.config) this.frameworkDefaults.set(d.config);
+    });
 
     this.refreshInterval = setInterval(() => {
       if (this.activeTab() === 'jobs' && this.projectId) {
