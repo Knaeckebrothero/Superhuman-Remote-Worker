@@ -13,7 +13,6 @@
 --   project_repositories - Repositories linked to projects (jobs, source, reference)
 --   jobs              - Job tracking and orchestration
 --   agents            - Registered agent pods for orchestration
---   requirements      - Primary storage for extracted requirements
 --   datasources       - External database connections for agent jobs
 --   builder_sessions  - Instruction builder chat sessions
 --   builder_messages  - Messages within builder sessions
@@ -280,8 +279,6 @@ CREATE TABLE IF NOT EXISTS jobs (
 
     -- Status tracking
     status VARCHAR(50) NOT NULL DEFAULT 'created',
-    creator_status VARCHAR(50) DEFAULT 'pending',
-    validator_status VARCHAR(50) DEFAULT 'pending',
 
     -- Metadata
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -305,13 +302,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     -- Scheduling
     priority INTEGER NOT NULL DEFAULT 5,
 
-    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply')),
-    CONSTRAINT valid_creator_status CHECK (creator_status IN ('pending', 'processing', 'completed', 'failed')),
-    CONSTRAINT valid_validator_status CHECK (validator_status IN ('pending', 'processing', 'completed', 'failed'))
+    CONSTRAINT valid_status CHECK (status IN ('created', 'processing', 'completed', 'failed', 'cancelled', 'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-CREATE INDEX IF NOT EXISTS idx_jobs_creator_status ON jobs(creator_status);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_jobs_config_name ON jobs(config_name);
 CREATE INDEX IF NOT EXISTS idx_jobs_assigned_agent ON jobs(assigned_agent_id);
@@ -473,108 +467,7 @@ EXCEPTION WHEN duplicate_column THEN null;
 END $$;
 
 -- ============================================================================
--- 3. REQUIREMENTS TABLE
--- Primary storage for extracted requirements.
---
--- Workflow:
---   1. Creator Agent extracts requirements from documents and stores them here
---   2. Validator Agent queries for requirements with neo4j_id IS NULL (unprocessed)
---   3. After validation, Validator updates neo4j_id to link to the Neo4j node
---
--- Human-queryable: This table serves as the authoritative source for all
--- extracted requirements and their validation status.
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS requirements (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-
-    -- ========================================================================
-    -- CREATOR FIELDS (filled by Creator Agent)
-    -- ========================================================================
-
-    -- Requirement identification
-    requirement_id VARCHAR(100),  -- Globally unique ID assigned by Creator
-
-    -- Requirement content
-    name VARCHAR(500),            -- Short, content-appropriate designation
-    text TEXT NOT NULL,           -- Full requirement description (atomic, verifiable)
-    type VARCHAR(100),            -- functional, compliance, constraint, etc.
-    priority VARCHAR(50),         -- high, medium, low
-
-    -- Source tracking
-    source_document TEXT,         -- Document path/name
-    source_location JSONB,        -- {page, section, paragraph, line, marginal_number}
-
-    -- Compliance relevance
-    gobd_relevant BOOLEAN DEFAULT FALSE,
-    gdpr_relevant BOOLEAN DEFAULT FALSE,
-
-    -- Creator research data
-    citations JSONB DEFAULT '[]',      -- Citation IDs linking to citations table
-    reasoning TEXT,                    -- Creator's extraction reasoning
-    research_notes TEXT,               -- Additional notes from Creator
-
-    -- ========================================================================
-    -- VALIDATOR FIELDS (filled by Validator Agent)
-    -- ========================================================================
-
-    -- Quality assessment
-    quality_score FLOAT,                        -- Numeric quality score (0.0-1.0)
-    quality_class VARCHAR(50),                  -- Quality classification (A/B/C or similar)
-
-    -- ISO/IEC/IEEE 29148:2018 evaluation (9 criteria)
-    -- Each criterion: necessary, appropriate, unambiguous, complete, singular,
-    --                 feasible, verifiable, correct, conforming
-    iso_29148_evaluation JSONB,                 -- {criterion: {score, notes}, ...}
-
-    -- Fulfillment assessment against domain model
-    fulfillment_status VARCHAR(50),             -- FULFILLED, PARTIALLY_FULFILLED, NOT_FULFILLED, UNCLEAR
-    fulfillment_justification TEXT,             -- Explanation for the status
-
-    -- Domain model mapping
-    found_model_elements JSONB,                 -- BusinessObjects, attributes, services found
-    attribute_quality_assessment JSONB,         -- Attribute quality checks per found element
-
-    -- Graph integration
-    neo4j_id VARCHAR(100),                      -- Neo4j node ID after integration
-    graph_query TEXT,                           -- Cypher query used for validation/integration
-
-    -- Recommendations
-    recommendations TEXT,                       -- Improvement suggestions from Validator
-
-    -- Legacy/compatibility (may be removed in future)
-    validation_result JSONB,                    -- Deprecated: use structured fields above
-    rejection_reason TEXT,                      -- Deprecated: use fulfillment_justification
-
-    -- ========================================================================
-    -- PROCESSING METADATA
-    -- ========================================================================
-
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
-    retry_count INTEGER DEFAULT 0,
-    last_error TEXT,
-
-    -- Timestamps
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    validated_at TIMESTAMP WITH TIME ZONE,
-
-    tags JSONB DEFAULT '[]',
-
-    CONSTRAINT valid_req_status CHECK (status IN ('pending', 'validating', 'integrated', 'rejected', 'failed')),
-    CONSTRAINT valid_fulfillment_status CHECK (fulfillment_status IS NULL OR fulfillment_status IN ('FULFILLED', 'PARTIALLY_FULFILLED', 'NOT_FULFILLED', 'UNCLEAR'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_requirements_job_id ON requirements(job_id);
-CREATE INDEX IF NOT EXISTS idx_requirements_status ON requirements(status);
-CREATE INDEX IF NOT EXISTS idx_requirements_neo4j_id ON requirements(neo4j_id);
-CREATE INDEX IF NOT EXISTS idx_requirements_created_at ON requirements(created_at);
--- Partial index for efficient polling of unprocessed requirements
-CREATE INDEX IF NOT EXISTS idx_requirements_unprocessed ON requirements(job_id, created_at) WHERE neo4j_id IS NULL;
-
--- ============================================================================
--- 4. DATASOURCES TABLE
+-- 3. DATASOURCES TABLE
 -- External database connections that agents can use during job execution.
 -- See docs/datasources.md for the full connector system design.
 -- ============================================================================
@@ -868,8 +761,6 @@ CREATE OR REPLACE VIEW job_summary AS
 SELECT
     j.id,
     j.status,
-    j.creator_status,
-    j.validator_status,
     j.config_name,
     j.assigned_agent_id,
     j.user_id,
@@ -882,13 +773,6 @@ SELECT
     j.freeze_data,
     j.created_at,
     j.completed_at,
-    COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'pending') as pending_requirements,
-    COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'validating') as validating_requirements,
-    COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'integrated') as integrated_requirements,
-    COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'rejected') as rejected_requirements,
-    COUNT(DISTINCT r.id) FILTER (WHERE r.status = 'failed') as failed_requirements,
     j.total_tokens_used,
     j.total_requests
-FROM jobs j
-LEFT JOIN requirements r ON j.id = r.job_id
-GROUP BY j.id;
+FROM jobs j;

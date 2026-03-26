@@ -101,8 +101,6 @@ export interface JobSummary {
   description: string;
   status: string;
   config_name?: string;
-  creator_status?: string;
-  validator_status?: string;
   user_id?: string | null;
   project_id?: string | null;
   parent_job_id?: string | null;

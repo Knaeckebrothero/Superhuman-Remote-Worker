@@ -1043,28 +1043,6 @@ def format_job_progress(job_id: str, data: dict[str, Any]) -> str:
 
     lines.append(f"Status: {data.get('status', 'unknown')}")
 
-    if data.get("creator_status"):
-        lines.append(f"Creator: {data['creator_status']}")
-    if data.get("validator_status"):
-        lines.append(f"Validator: {data['validator_status']}")
-
-    # Requirements progress
-    reqs = data.get("requirements", {})
-    if reqs:
-        total = reqs.get("total", 0)
-        integrated = reqs.get("integrated", 0)
-        rejected = reqs.get("rejected", 0)
-        pending = reqs.get("pending", 0)
-        failed = reqs.get("failed", 0)
-        lines.append(f"\nRequirements: {total} total")
-        lines.append(f"  Integrated: {integrated}")
-        if rejected:
-            lines.append(f"  Rejected: {rejected}")
-        if pending:
-            lines.append(f"  Pending: {pending}")
-        if failed:
-            lines.append(f"  Failed: {failed}")
-
     progress_pct = data.get("progress_percent")
     if progress_pct is not None:
         lines.append(f"\nProgress: {progress_pct:.1f}%")
@@ -1080,42 +1058,6 @@ def format_job_progress(job_id: str, data: dict[str, Any]) -> str:
         eta_mins = int(eta) // 60
         eta_secs = int(eta) % 60
         lines.append(f"ETA: ~{eta_mins}m {eta_secs}s remaining")
-
-    return "\n".join(lines)
-
-
-def format_requirements(job_id: str, data: dict[str, Any]) -> str:
-    """Format requirements list."""
-    reqs = data.get("requirements", [])
-    total = data.get("total", len(reqs))
-
-    if not reqs:
-        return f"No requirements found for job {job_id}."
-
-    lines = [f"Requirements for job {job_id} ({len(reqs)} of {total}):\n"]
-
-    for r in reqs:
-        name = r.get("name", r.get("requirement_id", "unknown"))
-        status = r.get("status", "unknown")
-        priority = r.get("priority", "")
-        text = r.get("text", "")
-        if len(text) > 150:
-            text = text[:150] + "..."
-
-        status_icon = {
-            "integrated": "+",
-            "pending": "?",
-            "validating": "~",
-            "rejected": "x",
-            "failed": "!",
-        }.get(status, " ")
-
-        line = f"  [{status_icon}] {name}"
-        if priority:
-            line += f" (priority: {priority})"
-        lines.append(line)
-        if text:
-            lines.append(f"      {text}")
 
     return "\n".join(lines)
 

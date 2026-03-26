@@ -114,18 +114,6 @@ async def _get_chat_history(args: dict) -> tuple[str, str | None]:
     return formatted, formatted
 
 
-async def _get_job_requirements(args: dict) -> tuple[str, str | None]:
-    client = _get_client()
-    data = await client.get_job_requirements(
-        job_id=args["job_id"],
-        status=args.get("status"),
-        limit=args.get("limit", 100),
-        offset=args.get("offset", 0),
-    )
-    formatted = fmt.format_requirements(args["job_id"], data)
-    return formatted, formatted
-
-
 # ---- Git History ----
 
 
@@ -1004,7 +992,6 @@ _DISPATCH: dict[str, Any] = {
     "get_frozen_job": _get_frozen_job,
     "get_todos": _get_todos,
     "get_chat_history": _get_chat_history,
-    "get_job_requirements": _get_job_requirements,
     # Git history
     "list_job_commits": _list_job_commits,
     "get_job_diff": _get_job_diff,

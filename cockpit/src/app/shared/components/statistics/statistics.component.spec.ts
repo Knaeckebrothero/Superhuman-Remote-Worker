@@ -83,8 +83,9 @@ function createMockStuckJob(overrides: Partial<StuckJob> = {}): StuckJob {
     id: `job_${Math.random().toString(36).slice(2)}`,
     description: 'Test stuck job',
     status: 'processing',
-    stuck_component: 'creator',
-    stuck_reason: 'No heartbeat for 60 minutes',
+    stuck_component: 'unknown',
+    stuck_reason: 'No recent activity',
+    created_at: new Date(Date.now() - 7200000).toISOString(), // 2 hours ago
     updated_at: new Date(Date.now() - 3600000).toISOString(), // 1 hour ago
     ...overrides,
   };
@@ -232,16 +233,14 @@ describe('StatisticsComponent utilities', () => {
       const stuckJob = createMockStuckJob();
 
       expect(stuckJob.status).toBe('processing');
-      expect(stuckJob.stuck_component).toBe('creator');
-      expect(stuckJob.stuck_reason).toBe('No heartbeat for 60 minutes');
+      expect(stuckJob.stuck_component).toBe('unknown');
+      expect(stuckJob.stuck_reason).toBe('No recent activity');
     });
 
     it('should allow different stuck components', () => {
-      const creatorStuck = createMockStuckJob({ stuck_component: 'creator' });
-      const validatorStuck = createMockStuckJob({ stuck_component: 'validator' });
+      const unknownStuck = createMockStuckJob({ stuck_component: 'unknown' });
 
-      expect(creatorStuck.stuck_component).toBe('creator');
-      expect(validatorStuck.stuck_component).toBe('validator');
+      expect(unknownStuck.stuck_component).toBe('unknown');
     });
 
     it('should have ID and description', () => {

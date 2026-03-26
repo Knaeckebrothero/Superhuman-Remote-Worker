@@ -48,8 +48,6 @@ function createMockJob(overrides: Partial<Job> = {}): Job {
     description: 'Test job description',
     config_name: 'default',
     status: 'created' as JobStatus,
-    creator_status: 'pending',
-    validator_status: 'pending',
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
     ...overrides,

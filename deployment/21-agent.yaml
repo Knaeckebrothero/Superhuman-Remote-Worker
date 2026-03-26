@@ -295,4 +295,4 @@ spec:
         - name: vm-ssh-key
           secret:
             secretName: vm-ssh-key
-            defaultMode: 0400
+            defaultMode: 0440

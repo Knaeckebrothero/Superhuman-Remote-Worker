@@ -78,9 +78,8 @@ interface JobRow {
           <table class="job-table">
             <thead>
               <tr>
+                <th class="col-prompt">Job</th>
                 <th class="col-status">Status</th>
-                <th class="col-prompt">Prompt</th>
-                <th class="col-progress">Progress</th>
                 <th class="col-created">Created</th>
                 <th class="col-actions">Actions</th>
               </tr>
@@ -92,8 +91,8 @@ interface JobRow {
                   [class.child-row]="row.isChild"
                   (click)="selectJob(row.job.id)"
                 >
-                  <td>
-                    <div class="status-cell-inner" [style.padding-left.px]="row.isChild ? 16 : 0">
+                  <td class="prompt-cell">
+                    <div class="prompt-inner" [style.padding-left.px]="row.isChild ? 16 : 0">
                       @if (row.hasChildren) {
                         <button
                           class="expand-btn"
@@ -106,19 +105,6 @@ interface JobRow {
                       @if (row.isChild) {
                         <span class="child-connector">\u2514</span>
                       }
-                      <span class="status-badge" [class]="'status-' + row.job.status">
-                        {{ formatStatus(row.job.status) }}
-                      </span>
-                      @if (row.job.snapshot_status === 'available') {
-                        <span class="snapshot-badge" title="Environment snapshot available">S</span>
-                      }
-                      @if (row.isChild && row.job.config_name) {
-                        <span class="config-badge">{{ row.job.config_name }}</span>
-                      }
-                    </div>
-                  </td>
-                  <td class="prompt-cell">
-                    <span class="prompt-text" [title]="row.job.description">
                       @if (getUserColor(row.job.user_id)) {
                         <span
                           class="user-dot"
@@ -126,14 +112,25 @@ interface JobRow {
                           [title]="getUserName(row.job.user_id)"
                         ></span>
                       }
-                      {{ truncatePrompt(row.job.description) }}
-                    </span>
-                    <span class="job-id">{{ row.job.id.slice(0, 8) }}...</span>
+                      <span class="prompt-text" [title]="row.job.description">
+                        {{ row.job.description }}
+                      </span>
+                    </div>
+                    <div class="job-id" [style.padding-left.px]="row.isChild ? 16 : 0">
+                      {{ row.job.id }}
+                      @if (row.isChild && row.job.config_name) {
+                        <span class="config-badge">{{ row.job.config_name }}</span>
+                      }
+                    </div>
                   </td>
-                  <td class="progress-cell">
-                    <div class="progress-info">
-                      <span class="creator-status">C: {{ row.job.creator_status }}</span>
-                      <span class="validator-status">V: {{ row.job.validator_status }}</span>
+                  <td>
+                    <div class="status-cell-inner">
+                      <span class="status-badge" [class]="'status-' + row.job.status">
+                        {{ formatStatus(row.job.status) }}
+                      </span>
+                      @if (row.job.snapshot_status === 'available') {
+                        <span class="snapshot-badge" title="Environment snapshot available">S</span>
+                      }
                     </div>
                   </td>
                   <td class="created-cell">
@@ -451,7 +448,8 @@ interface JobRow {
       /* Table */
       .table-container {
         flex: 1;
-        overflow: auto;
+        overflow-y: auto;
+        overflow-x: hidden;
       }
 
       .job-table {
@@ -475,11 +473,10 @@ interface JobRow {
         z-index: 1;
       }
 
-      .col-status { width: 100px; }
-      .col-prompt { width: auto; }
-      .col-progress { width: 140px; }
-      .col-created { width: 120px; }
-      .col-actions { width: 200px; }
+      .col-prompt { width: 100%; }
+      .col-status { white-space: nowrap; }
+      .col-created { white-space: nowrap; }
+      .col-actions { white-space: nowrap; }
 
       .job-table td {
         padding: 10px 12px;
@@ -509,6 +506,7 @@ interface JobRow {
         font-size: 11px;
         font-weight: 500;
         text-transform: capitalize;
+        white-space: nowrap;
       }
 
       .status-badge.status-created {
@@ -636,40 +634,31 @@ interface JobRow {
         flex-shrink: 0;
       }
 
-      /* Prompt Cell */
+      /* Prompt/Job Cell */
       .prompt-cell {
-        max-width: 300px;
+        max-width: 0;
+        overflow: hidden;
+      }
+
+      .prompt-inner {
+        display: flex;
+        align-items: center;
+        gap: 4px;
       }
 
       .prompt-text {
-        display: block;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        margin-bottom: 2px;
       }
 
       .job-id {
         font-family: 'JetBrains Mono', monospace;
         font-size: 10px;
         color: var(--text-muted, #6c7086);
-      }
-
-      /* Progress Cell */
-      .progress-info {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        font-size: 11px;
-        font-family: 'JetBrains Mono', monospace;
-      }
-
-      .creator-status {
-        color: #94e2d5;
-      }
-
-      .validator-status {
-        color: #f9e2af;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
 
       /* Created Cell */
@@ -682,11 +671,12 @@ interface JobRow {
       /* Actions */
       .actions-cell {
         white-space: nowrap;
+        overflow: hidden;
       }
 
       .action-btn {
-        padding: 4px 8px;
-        margin-right: 4px;
+        padding: 3px 6px;
+        margin-right: 3px;
         border: 1px solid var(--border-color, #45475a);
         border-radius: 4px;
         background: transparent;
@@ -849,7 +839,6 @@ interface JobRow {
       }
 
       @media (max-width: 768px) {
-        .col-progress,
         .col-created {
           display: none;
         }
