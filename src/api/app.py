@@ -14,9 +14,6 @@ from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 
-from ..agent import UniversalAgent
-from ..core.loader import resolve_config_path
-from ..core.workspace import get_logs_path
 from .models import (
     HealthResponse,
     HealthStatus,
@@ -30,6 +27,9 @@ from .models import (
     JobResumeRequest,
 )
 from .orchestrator_client import OrchestratorClient, create_orchestrator_client_from_env
+from ..agent import UniversalAgent
+from ..core.loader import resolve_config_path
+from ..core.workspace import get_logs_path
 
 logger = logging.getLogger(__name__)
 
@@ -423,10 +423,10 @@ async def _process_orchestrator_job(
         logger.error("Cannot process job - agent not initialized")
         return
 
-    # Set up per-job file logging for crash safety
-    _setup_job_file_logging(job_id)
-
     try:
+        # Set up per-job file logging for crash safety
+        _setup_job_file_logging(job_id)
+
         logger.info(f"Starting orchestrator job {job_id}")
 
         # Build metadata
