@@ -125,17 +125,21 @@ SHELL_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _check_sudo_freeze(output: str, command: str, context: ToolContext) -> Optional[str]:
+def _check_sudo_freeze(
+    output: str, command: str, context: ToolContext
+) -> Optional[str]:
     """If output is the sudo freeze sentinel, trigger a job freeze and return
     a message for the agent. Returns None if not a sudo freeze."""
     if output != SUDO_FREEZE_SENTINEL:
         return None
-    context.request_freeze({
-        "freeze_type": "vm_upgrade_required",
-        "reason": "Agent attempted a sudo command that requires VM-level access.",
-        "command": command,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    context.request_freeze(
+        {
+            "freeze_type": "vm_upgrade_required",
+            "reason": "Agent attempted a sudo command that requires VM-level access.",
+            "command": command,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
     return (
         "This command requires elevated privileges (sudo). "
         "The job has been paused while the operator decides whether to "
