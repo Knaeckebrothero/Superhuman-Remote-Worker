@@ -13,7 +13,6 @@ import {
   Job,
   JobCreateRequest,
   JobProgress,
-  RequirementsResponse,
   JobStatistics,
   DailyStatistics,
   AgentStatistics,
@@ -980,30 +979,6 @@ export class ApiService {
         catchError((error) => {
           console.error(`Failed to assign job ${jobId} to agent ${agentId}:`, error);
           return of(null);
-        }),
-      );
-  }
-
-  /**
-   * Get requirements for a job.
-   */
-  getJobRequirements(
-    jobId: string,
-    status?: string,
-    limit: number = 100,
-    offset: number = 0,
-  ): Observable<RequirementsResponse> {
-    let params = new HttpParams().set('limit', limit.toString()).set('offset', offset.toString());
-    if (status) {
-      params = params.set('status', status);
-    }
-
-    return this.http
-      .get<RequirementsResponse>(`${this.baseUrl}/jobs/${jobId}/requirements`, { params })
-      .pipe(
-        catchError((error) => {
-          console.error(`Failed to fetch requirements for job ${jobId}:`, error);
-          return of({ requirements: [], total: 0, limit, offset });
         }),
       );
   }

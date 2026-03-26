@@ -848,41 +848,6 @@ async def get_job_progress(job_id: str) -> str:
         return fmt.format_workspace_error("get job progress", job_id, e)
 
 
-@mcp.tool
-async def get_job_requirements(
-    job_id: str,
-    status: str | None = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> str:
-    """Get extracted requirements for a job.
-
-    Lists requirements with their validation status, priority, and metadata.
-
-    Args:
-        job_id: Job UUID
-        status: Filter by status (pending, validating, integrated, rejected, failed)
-        limit: Max results (default: 100)
-        offset: Pagination offset (default: 0)
-
-    Returns:
-        List of requirements with status and metadata
-    """
-    if limit < 1:
-        limit = 1
-    elif limit > 1000:
-        limit = 1000
-
-    client = _get_client()
-    try:
-        data = await client.get_job_requirements(
-            job_id, status=status, limit=limit, offset=offset
-        )
-        return fmt.format_requirements(job_id, data)
-    except Exception as e:
-        return fmt.format_workspace_error("get requirements", job_id, e)
-
-
 # =============================================================================
 # System Monitoring Tools (Category D)
 # =============================================================================

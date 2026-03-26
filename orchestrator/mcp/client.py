@@ -1053,32 +1053,6 @@ class AsyncCockpitClient:
         resp.raise_for_status()
         return resp.json()
 
-    @_create_retry_decorator()
-    async def get_job_requirements(
-        self,
-        job_id: str,
-        status: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
-    ) -> dict[str, Any]:
-        """Get extracted requirements for a job.
-
-        Args:
-            job_id: Job UUID
-            status: Filter by validation status
-            limit: Max results
-            offset: Pagination offset
-
-        Returns:
-            Dict with requirements list and total count
-        """
-        params: dict[str, Any] = {"limit": limit, "offset": offset}
-        if status:
-            params["status"] = status
-        resp = await self._client.get(f"/api/jobs/{job_id}/requirements", params=params)
-        resp.raise_for_status()
-        return resp.json()
-
     # =========================================================================
     # System Monitoring
     # =========================================================================

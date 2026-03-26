@@ -615,8 +615,6 @@ export interface Job {
   merge_status?: string | null;
   priority?: number;
   status: JobStatus;
-  creator_status: string;
-  validator_status: string;
   created_at: string;
   updated_at?: string;
   completed_at?: string;
@@ -648,63 +646,17 @@ export interface JobCreateRequest {
 }
 
 /**
- * Requirement counts by status.
- */
-export interface RequirementSummary {
-  pending: number;
-  validating: number;
-  integrated: number;
-  rejected: number;
-  failed: number;
-  total: number;
-}
-
-/**
  * Job progress with ETA calculation.
  */
 export interface JobProgress {
   job_id: string;
   status: JobStatus;
-  creator_status: string;
-  validator_status: string;
-  requirements: RequirementSummary;
   progress_percent: number;
   elapsed_seconds: number;
   eta_seconds?: number;
   created_at?: string;
   updated_at?: string;
   completed_at?: string;
-}
-
-/**
- * Requirement from a job.
- */
-export interface Requirement {
-  id: string;
-  requirement_id?: string;
-  name?: string;
-  text: string;
-  type?: string;
-  priority?: string;
-  status: string;
-  source_document?: string;
-  gobd_relevant?: boolean;
-  gdpr_relevant?: boolean;
-  quality_score?: number;
-  fulfillment_status?: string;
-  neo4j_id?: string;
-  created_at: string;
-  updated_at?: string;
-}
-
-/**
- * Response for requirements list endpoint.
- */
-export interface RequirementsResponse {
-  requirements: Requirement[];
-  total: number;
-  limit: number;
-  offset: number;
 }
 
 // =============================================================================
@@ -754,12 +706,8 @@ export interface StuckJob {
   id: string;
   description: string;
   status: string;
-  creator_status: string;
-  validator_status: string;
   created_at: string;
   updated_at: string;
-  pending_requirements: number;
-  integrated_requirements: number;
   stuck_reason: string;
   stuck_component: string;
 }

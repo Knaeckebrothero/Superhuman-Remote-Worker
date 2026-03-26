@@ -420,7 +420,7 @@ export class DbTableComponent implements OnInit {
   readonly state = inject(StateService);
 
   // Hardcoded table names - always show these tabs
-  readonly availableTables = ['jobs', 'requirements', 'sources', 'citations'];
+  readonly availableTables = ['jobs', 'sources', 'citations'];
 
   ngOnInit(): void {
     this.state.loadTables();

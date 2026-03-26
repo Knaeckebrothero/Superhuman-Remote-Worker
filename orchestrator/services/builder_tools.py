@@ -37,7 +37,6 @@ SERVER_SIDE_TOOLS = {
     "get_frozen_job",
     "get_todos",
     "get_chat_history",
-    "get_job_requirements",
     # Git history
     "list_job_commits",
     "get_job_diff",
@@ -681,45 +680,6 @@ BUILDER_TOOLS = [
                     },
                 },
                 "required": ["description"],
-            },
-        },
-    },
-    # -----------------------------------------------------------------
-    # Job Requirements
-    # -----------------------------------------------------------------
-    {
-        "type": "function",
-        "function": {
-            "name": "get_job_requirements",
-            "description": (
-                "Get extracted requirements for a job with their validation status, "
-                "priority, and metadata."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "The job UUID",
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": [
-                            "pending",
-                            "validating",
-                            "integrated",
-                            "rejected",
-                            "failed",
-                        ],
-                        "description": "Filter by validation status",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (default 100)",
-                        "default": 100,
-                    },
-                },
-                "required": ["job_id"],
             },
         },
     },
