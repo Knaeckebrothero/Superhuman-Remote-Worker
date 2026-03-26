@@ -31,8 +31,8 @@ spec:
           imagePullPolicy: Always
           securityContext:
             runAsNonRoot: true
-            runAsUser: 1000
-            runAsGroup: 1000
+            runAsUser: 999
+            runAsGroup: 999
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             seccompProfile:
@@ -312,7 +312,7 @@ spec:
         - name: vm-ssh-key
           secret:
             secretName: vm-ssh-key
-            defaultMode: 0440
+            defaultMode: 0444
         - name: tmp
           emptyDir:
             medium: Memory
