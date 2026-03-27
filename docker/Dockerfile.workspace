@@ -3,7 +3,6 @@
 # =============================================================================
 #
 # Provides: SSH server, tmux, git, code-server, dev tools.
-# Initial build: 2026-03-27
 # The agent connects via RemoteBackend (SSH/SFTP) — identical to VM workspaces.
 #
 # Does NOT include: Python agent code, LLM libraries, playwright, PyTorch.
@@ -90,7 +89,8 @@ RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_S
 # ---------------------------------------------------------------------------
 # 4. User setup (mirrors provision.sh lines 111-131)
 # ---------------------------------------------------------------------------
-RUN useradd -m -s /bin/bash -u 1000 agent-host \
+RUN userdel -r $(getent passwd 1000 | cut -d: -f1) 2>/dev/null || true \
+    && useradd -m -s /bin/bash -u 1000 agent-host \
     && echo "agent-host ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent-host \
     && chmod 0440 /etc/sudoers.d/agent-host \
     && mkdir -p /home/agent-host/workspace \
