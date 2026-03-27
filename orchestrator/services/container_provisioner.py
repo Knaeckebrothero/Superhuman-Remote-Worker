@@ -320,8 +320,7 @@ class ContainerProvisioner:
                             },
                             {
                                 "name": "ssh-pubkey",
-                                "mountPath": "/home/agent-host/.ssh/authorized_keys",
-                                "subPath": "ssh-publickey",
+                                "mountPath": "/tmp/ssh-pubkey",
                                 "readOnly": True,
                             },
                         ],
