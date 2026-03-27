@@ -1101,6 +1101,45 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def merge_workspace_container_context(
+        self, job_id: str, container_updates: Dict[str, Any]
+    ) -> bool:
+        """Atomically merge updates into context.workspace_container.
+
+        Uses jsonb_set + || to merge into the nested 'workspace_container' key
+        in a single atomic SQL statement, same pattern as merge_vm_context().
+
+        Args:
+            job_id: Job UUID as string
+            container_updates: Dictionary of keys to merge into context.workspace_container
+
+        Returns:
+            True if updated, False if not found
+        """
+        import json as json_module
+
+        try:
+            uuid_val = UUID(job_id)
+        except ValueError:
+            return False
+
+        query = (
+            "UPDATE jobs "
+            "SET context = jsonb_set("
+            "    COALESCE(context, '{}'::jsonb), "
+            "    '{workspace_container}', "
+            "    COALESCE(context->'workspace_container', '{}'::jsonb) || $1::jsonb"
+            "), "
+            "    updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json_module.dumps(container_updates), uuid_val
+            )
+
+        return result == "UPDATE 1"
+
     async def get_job_progress(self, job_id: str) -> Dict[str, Any] | None:
         """Get detailed progress information for a job including ETA.
 

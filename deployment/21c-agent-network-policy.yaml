@@ -115,3 +115,15 @@ spec:
     - ports:
         - protocol: UDP
           port: 41641
+    # SSH to workspace containers
+    - to:
+        - podSelector:
+            matchLabels:
+              app: srw-workspace
+      ports:
+        - protocol: TCP
+          port: 22
+    # External HTTPS (LLM APIs: OpenRouter, Anthropic, OpenAI, Google, Groq, etc.)
+    - ports:
+        - protocol: TCP
+          port: 443
