@@ -5,6 +5,7 @@
 #
 # Installs everything an agent needs to work inside the VM:
 #   - System packages (dev tools, build essentials, networking)
+#   - Tailscale (mesh VPN client for Headscale connectivity)
 #   - Python 3 + pip (Ubuntu 24.04 ships 3.12 natively)
 #   - Node.js 22 + npm + Angular CLI + TypeScript
 #   - Management daemon (NATS bridge to orchestrator)
@@ -67,7 +68,15 @@ sudo apt-get install -y \
     python3-pip
 
 # -----------------------------------------------------------------------------
-# 2. Python setup (Ubuntu 24.04 ships Python 3.12)
+# 2. Tailscale (mesh VPN — joins Headscale tailnet at VM boot via cloud-init)
+# -----------------------------------------------------------------------------
+
+echo "--- Installing Tailscale ---"
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo systemctl enable tailscaled
+
+# -----------------------------------------------------------------------------
+# 3. Python setup (Ubuntu 24.04 ships Python 3.12)
 # -----------------------------------------------------------------------------
 
 echo "--- Configuring Python ---"
@@ -79,7 +88,7 @@ sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || 
 sudo python3 -m pip install --break-system-packages nats-py psutil
 
 # -----------------------------------------------------------------------------
-# 3. Node.js 22 + npm + global packages
+# 4. Node.js 22 + npm + global packages
 # -----------------------------------------------------------------------------
 
 echo "--- Installing Node.js 22 ---"
@@ -96,7 +105,7 @@ sudo npm install -g \
     yarn
 
 # -----------------------------------------------------------------------------
-# 4. Users and directories
+# 5. Users and directories
 # -----------------------------------------------------------------------------
 
 echo "--- Setting up users ---"
@@ -125,7 +134,7 @@ sudo chmod 755 /run/agent
 echo "d /run/agent 0755 root root -" | sudo tee /etc/tmpfiles.d/agent.conf
 
 # -----------------------------------------------------------------------------
-# 5. SSH server configuration
+# 6. SSH server configuration
 # -----------------------------------------------------------------------------
 
 echo "--- Configuring SSH ---"
@@ -148,7 +157,7 @@ SSHEOF
 sudo systemctl enable ssh
 
 # -----------------------------------------------------------------------------
-# 6. Management daemon
+# 7. Management daemon
 # -----------------------------------------------------------------------------
 
 echo "--- Installing management daemon ---"
@@ -170,7 +179,7 @@ JOB_ID=
 EOF
 
 # -----------------------------------------------------------------------------
-# 7. Sudo approval gate
+# 8. Sudo approval gate
 # -----------------------------------------------------------------------------
 #
 # The sudo approval gate intercepts every sudo invocation and forwards it
@@ -239,7 +248,7 @@ VM_ID=
 SGEOF
 
 # -----------------------------------------------------------------------------
-# 8. tmux configuration
+# 9. tmux configuration
 # -----------------------------------------------------------------------------
 
 echo "--- Configuring tmux ---"
@@ -254,7 +263,7 @@ TMUXEOF
 sudo chown agent-host:agent-host /home/agent-host/.tmux.conf
 
 # -----------------------------------------------------------------------------
-# 9. Git configuration
+# 10. Git configuration
 # -----------------------------------------------------------------------------
 
 echo "--- Configuring git ---"
