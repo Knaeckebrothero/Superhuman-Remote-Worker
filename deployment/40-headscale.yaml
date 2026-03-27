@@ -8,9 +8,11 @@
 # cause database corruption.
 #
 # Prerequisites:
-#   - Vault secret at homelab/superhuman-remote-worker/srw-secrets must
-#     contain HEADSCALE_API_KEY and TAILSCALE_AUTH_KEY
-#   - DNS record for headscale.superhuman-remote-worker.com
+#   - DNS record for headscale.superhuman-remote-worker.com (Cloudflare tunnel)
+#
+# After deployment, run the bootstrap job to create user + keys:
+#   kubectl apply -f deployment/41-headscale-bootstrap.yaml
+# Then store the generated keys in Vault (see bootstrap job comments).
 #
 # See docs/features/headscale_mesh.md for the full design.
 

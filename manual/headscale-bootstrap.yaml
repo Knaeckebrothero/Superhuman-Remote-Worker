@@ -1,0 +1,105 @@
+# Headscale Bootstrap Job
+#
+# One-time job that creates the initial user, API key, and agent pre-auth key.
+# Stores the generated keys in a Secret for manual retrieval.
+#
+# Run after Headscale StatefulSet is ready:
+#   kubectl apply -f deployment/41-headscale-bootstrap.yaml
+#
+# Then retrieve the keys:
+#   kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.api-key}' | base64 -d
+#   kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.agent-auth-key}' | base64 -d
+#
+# Then store them:
+#   1. API key     -> Vault at homelab/superhuman-remote-worker/srw-secrets (HEADSCALE_API_KEY)
+#                  -> kubectl --context vms -n agent-vms create secret generic headscale-api-key --from-literal=api-key=<key>
+#   2. Auth key    -> Vault at homelab/superhuman-remote-worker/srw-secrets (TAILSCALE_AUTH_KEY)
+#
+# This job is idempotent — safe to re-run (user creation tolerates "already exists").
+# Keep this out of Fleet (manual/ directory pattern) to avoid re-running on every sync.
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: headscale-bootstrap
+  namespace: headscale
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-bootstrap
+  namespace: headscale
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-bootstrap
+  namespace: headscale
+subjects:
+  - kind: ServiceAccount
+    name: headscale-bootstrap
+    namespace: headscale
+roleRef:
+  kind: Role
+  name: headscale-bootstrap
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: headscale-bootstrap
+  namespace: headscale
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      serviceAccountName: headscale-bootstrap
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap
+          image: bitnami/kubectl:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "Waiting for headscale-0 to be ready..."
+              kubectl wait --for=condition=ready pod/headscale-0 -n headscale --timeout=120s
+
+              echo "Creating user 'srw'..."
+              kubectl exec headscale-0 -n headscale -- headscale users create srw 2>&1 || echo "(user may already exist)"
+
+              echo "Creating API key..."
+              API_KEY=$(kubectl exec headscale-0 -n headscale -- headscale apikeys create --expiration 365d 2>&1)
+              echo "API key created."
+
+              echo "Creating agent pre-auth key (reusable, tag:agent)..."
+              AUTH_KEY=$(kubectl exec headscale-0 -n headscale -- headscale preauthkeys create --user srw --reusable --expiration 365d --tags tag:agent 2>&1)
+              echo "Auth key created."
+
+              echo "Storing keys in Secret headscale-bootstrap-keys..."
+              kubectl create secret generic headscale-bootstrap-keys \
+                -n headscale \
+                --from-literal=api-key="$API_KEY" \
+                --from-literal=agent-auth-key="$AUTH_KEY" \
+                --dry-run=client -o yaml | kubectl apply -f -
+
+              echo ""
+              echo "=== Bootstrap complete ==="
+              echo "Retrieve keys with:"
+              echo "  kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.api-key}' | base64 -d"
+              echo "  kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.agent-auth-key}' | base64 -d"
