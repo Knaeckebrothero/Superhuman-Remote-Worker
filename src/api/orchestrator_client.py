@@ -493,6 +493,40 @@ class OrchestratorClient:
             logger.error(f"Unexpected error triggering subjob merge: {e}")
             return False
 
+    async def report_pause(self, job_id: str) -> bool:
+        """Report that the agent is releasing a job (e.g. during graceful shutdown).
+
+        Tells the orchestrator to set the job to 'paused' and clear its agent
+        assignment so the dispatcher can reassign it.  Uses the agent-initiated
+        pause endpoint which skips the agent-callback loop (since we *are* the
+        agent).
+
+        Args:
+            job_id: UUID of the job to pause
+
+        Returns:
+            True if the orchestrator accepted the pause, False otherwise.
+        """
+        if not self._client:
+            await self.connect()
+
+        url = f"{self.orchestrator_url}/api/jobs/{job_id}/agent-release"
+
+        try:
+            response = await self._client.put(url, timeout=10.0)
+            if response.status_code == 200:
+                logger.info(f"Orchestrator accepted agent-release for job {job_id}")
+                return True
+            else:
+                logger.warning(
+                    f"Agent-release failed for job {job_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to report agent-release for job {job_id}: {e}")
+            return False
+
     async def report_completion(
         self,
         job_id: str,

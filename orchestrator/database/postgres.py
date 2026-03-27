@@ -1271,6 +1271,23 @@ class PostgresDB:
                     hostname,
                 )
                 if existing:
+                    agent_id = existing["id"]
+
+                    # Pause any processing jobs still assigned to this agent.
+                    # The new instance won't know about them, so they'd be
+                    # stuck in 'processing' forever without this.
+                    await conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'paused',
+                            assigned_agent_id = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE assigned_agent_id = $1
+                          AND status = 'processing'
+                        """,
+                        agent_id,
+                    )
+
                     # Update existing agent's IP and reset status
                     await conn.execute(
                         """
@@ -1280,6 +1297,7 @@ class PostgresDB:
                             pid = $3,
                             config_name = $4,
                             status = 'booting',
+                            current_job_id = NULL,
                             last_heartbeat = CURRENT_TIMESTAMP,
                             registered_at = CURRENT_TIMESTAMP
                         WHERE id = $5
@@ -1288,10 +1306,10 @@ class PostgresDB:
                         pod_port,
                         pid,
                         config_name,
-                        existing["id"],
+                        agent_id,
                     )
                     return {
-                        "agent_id": str(existing["id"]),
+                        "agent_id": str(agent_id),
                         "heartbeat_interval_seconds": 60,
                     }
 
@@ -1518,10 +1536,15 @@ class PostgresDB:
         return 0
 
     async def recover_orphaned_jobs(self) -> int:
-        """Pause jobs still assigned to offline or deleted agents.
+        """Pause jobs still assigned to offline, deleted, or non-working agents.
 
-        Finds jobs in 'processing' status whose assigned agent is offline
-        (or NULL, e.g. after agent row deletion via ON DELETE SET NULL).
+        Finds jobs in 'processing' status that are orphaned because:
+        - assigned_agent_id is NULL (agent row deleted via ON DELETE SET NULL)
+        - assigned agent is offline (stale heartbeat)
+        - assigned agent is online but NOT working on this job (e.g. the agent
+          restarted and re-registered with the same hostname, or deregistered
+          and a new agent took the same id)
+
         Sets them to 'paused' with cleared assigned_agent_id so the
         dispatcher can reassign them.
 
@@ -1540,6 +1563,10 @@ class PostgresDB:
                       assigned_agent_id IS NULL
                       OR assigned_agent_id IN (
                           SELECT id FROM agents WHERE status = 'offline'
+                      )
+                      OR assigned_agent_id IN (
+                          SELECT id FROM agents
+                          WHERE status IN ('ready', 'booting')
                       )
                   )
                 """

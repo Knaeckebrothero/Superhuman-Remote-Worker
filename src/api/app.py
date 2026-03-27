@@ -143,10 +143,11 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass  # Best-effort; stale detector will catch us if this fails
 
-    # Phase 2: If a job is running, use cooperative stop (same as pause).
-    # The job stays resumable from its checkpoint; the orchestrator's
-    # stale detector + recover_orphaned_jobs() will reassign it.
+    # Phase 2: If a job is running, use cooperative stop and notify
+    # the orchestrator to pause it (so it re-enters the dispatch queue).
+    releasing_job_id = None
     if _current_job_task and not _current_job_task.done():
+        releasing_job_id = _current_job_id
         logger.info("Requesting cooperative stop for graceful shutdown...")
         _request_stop("pause")
 
@@ -160,6 +161,19 @@ async def lifespan(app: FastAPI):
                 await _current_job_task
             except asyncio.CancelledError:
                 pass
+
+    # Phase 2b: Tell the orchestrator to pause the job we just released.
+    # This is essential — without it the job stays in 'processing' and
+    # relies on the deregister → ON DELETE SET NULL → recover_orphaned_jobs
+    # chain which can fail if the orchestrator is also restarting.
+    if releasing_job_id and _orchestrator_client:
+        try:
+            await _orchestrator_client.report_pause(releasing_job_id)
+        except Exception:
+            logger.warning(
+                f"Could not notify orchestrator to pause job {releasing_job_id} — "
+                "stale detector will recover it"
+            )
 
     # Phase 3: Stop heartbeat loop and deregister
     if _orchestrator_client:
