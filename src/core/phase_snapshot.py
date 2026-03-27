@@ -240,8 +240,7 @@ class PhaseSnapshotManager:
                     wal_conn.close()
                 except Exception as e:
                     logger.warning(
-                        f"[{self.job_id}] WAL checkpoint failed, "
-                        f"copying anyway: {e}"
+                        f"[{self.job_id}] WAL checkpoint failed, copying anyway: {e}"
                     )
                 shutil.copy2(checkpoint_path, snapshot_dir / "checkpoint.db")
                 logger.debug(f"[{self.job_id}] Snapshot: copied checkpoint.db")
