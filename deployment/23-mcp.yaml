@@ -39,6 +39,23 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: MCP_INTERNAL_KEY
+            # OAuth bridge (optional — set MCP_OAUTH_ENABLED=true to activate)
+            - name: MCP_OAUTH_ENABLED
+              value: "false"
+            - name: MCP_OIDC_CLIENT_ID
+              value: "mcp-server"
+            - name: MCP_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: MCP_OIDC_CLIENT_SECRET
+                  optional: true
+            - name: MCP_OIDC_CONFIG_URL
+              value: "http://srw-keycloak:8080/realms/srw/.well-known/openid-configuration"
+            - name: MCP_OIDC_ISSUER
+              value: "https://auth.superhuman-remote-worker.com/realms/srw"
+            - name: MCP_BASE_URL
+              value: "https://mcp.superhuman-remote-worker.com"
           livenessProbe:
             httpGet:
               path: /health

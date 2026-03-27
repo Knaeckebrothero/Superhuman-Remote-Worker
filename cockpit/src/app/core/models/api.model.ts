@@ -252,6 +252,7 @@ export interface McpToken {
   name: string;
   token_prefix: string;
   scope: string;
+  origin: string | null;
   expires_at: string | null;
   revoked_at: string | null;
   last_used_at: string | null;

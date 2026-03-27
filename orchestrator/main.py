@@ -1368,6 +1368,19 @@ class McpTokenVerifyRequest(BaseModel):
     token_hash: str
 
 
+class McpTokenCreateInternal(BaseModel):
+    """Internal request from OAuth bridge to create an srw_* token."""
+
+    user_sub: str = Field(..., description="Keycloak subject ID")
+    user_email: str = Field(default="", description="User email for JIT user creation")
+    name: str = Field(..., min_length=1, max_length=200)
+    token_hash: str
+    token_prefix: str
+    scope: str = Field(default="user")
+    origin: str | None = None
+    expires_at: str | None = Field(None, description="ISO 8601 datetime")
+
+
 VALID_API_KEY_PROVIDERS = {
     "openai",
     "anthropic",
@@ -4130,7 +4143,9 @@ async def _handle_scholar_completion(
         actions.append(f"scholar {job_id} completed, parent {target_id} unblocked")
 
     await postgres_db.update_job_context(target_id, parent_ctx)
-    await postgres_db.update_job_status(target_id, status="created")
+    await postgres_db.update_job_status(
+        target_id, status="created", assigned_agent_id=""
+    )
     _trigger_dispatch()
 
 
@@ -4222,19 +4237,22 @@ async def _handle_delegation_child_completion(
 
     await postgres_db.update_job_context(target_id, parent_ctx)
 
-    # Unblock parent: waiting → created (dispatcher picks it up for resume)
-    await postgres_db.update_job_status(target_id, status="created")
+    # Unblock parent: waiting → paused (dispatcher picks it up via /job/resume,
+    # preserving checkpoint state from before delegation).
+    await postgres_db.update_job_status(
+        target_id, status="paused", assigned_agent_id=""
+    )
     _trigger_dispatch()
 
     completed_count = sum(1 for c in child_results if c["status"] == "completed")
     total_count = len(child_results)
     logger.info(
         f"All {total_count} delegation children done for parent {target_id} "
-        f"({completed_count} completed) — parent unblocked"
+        f"({completed_count} completed) — parent re-queued for resume"
     )
     actions.append(
         f"delegation: all {total_count} children done, "
-        f"parent {target_id} unblocked ({completed_count} completed)"
+        f"parent {target_id} re-queued ({completed_count} completed)"
     )
 
 
@@ -7468,6 +7486,53 @@ async def internal_mcp_token_verify(
         "scope": token_data["scope"],
         "display_name": token_data["display_name"],
     }
+
+
+@app.post("/api/internal/mcp-token-create")
+async def internal_mcp_token_create(
+    request: Request, body: McpTokenCreateInternal
+) -> dict[str, Any]:
+    """Internal endpoint for OAuth bridge to create an srw_* token.
+
+    Looks up the user by Keycloak subject (JIT-creates if needed),
+    then creates a token with the given hash, scope, and origin.
+    Protected by X-Internal-Key header.
+    """
+    internal_key = request.headers.get("X-Internal-Key", "")
+    if not _MCP_INTERNAL_KEY or internal_key != _MCP_INTERNAL_KEY:
+        raise HTTPException(status_code=401, detail="Invalid internal key")
+
+    # Look up or JIT-create user by Keycloak sub
+    user = await postgres_db.get_user_by_keycloak_sub(body.user_sub)
+    if not user:
+        # JIT-create via upsert (same as cockpit OIDC login)
+        user = await postgres_db.upsert_user_from_oidc(
+            sub=body.user_sub,
+            email=body.user_email,
+            display_name=body.user_email.split("@")[0] if body.user_email else "OAuth User",
+        )
+    if not user:
+        raise HTTPException(status_code=400, detail="Could not resolve user")
+
+    # Parse expiry
+    expires_at = None
+    if body.expires_at:
+        expires_at = datetime.fromisoformat(body.expires_at)
+
+    row = await postgres_db.create_mcp_token(
+        user_id=str(user["id"]),
+        name=body.name,
+        token_hash=body.token_hash,
+        token_prefix=body.token_prefix,
+        scope=body.scope,
+        expires_at=expires_at,
+        origin=body.origin,
+    )
+
+    result = {
+        k: str(v) if isinstance(v, (UUID, datetime)) else v for k, v in row.items()
+    }
+    return result
 
 
 # =============================================================================

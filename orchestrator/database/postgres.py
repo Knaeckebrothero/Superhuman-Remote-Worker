@@ -11,14 +11,14 @@ This is the canonical database layer for the orchestrator.
 """
 
 import json
+import logging
 import math
 import os
-import logging
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Any, List, Dict
-from contextlib import asynccontextmanager
 from uuid import UUID
 
 try:
@@ -1545,9 +1545,28 @@ class PostgresDB:
                 """
             )
 
+            # Also clear stale agent assignments on waiting jobs.
+            # Don't change status — the job must stay in 'waiting' until its
+            # children complete and the unblock handler fires.
+            result2 = await conn.execute(
+                """
+                UPDATE jobs
+                SET assigned_agent_id = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'waiting'
+                  AND assigned_agent_id IS NOT NULL
+                  AND assigned_agent_id IN (
+                      SELECT id FROM agents WHERE status = 'offline'
+                  )
+                """
+            )
+
+        count = 0
         if result.startswith("UPDATE "):
-            return int(result.split()[1])
-        return 0
+            count += int(result.split()[1])
+        if result2.startswith("UPDATE "):
+            count += int(result2.split()[1])
+        return count
 
     async def get_ready_agents(self) -> List[Dict[str, Any]]:
         """Get all agents with 'ready' status.
@@ -2272,14 +2291,15 @@ class PostgresDB:
         token_prefix: str,
         scope: str = "user",
         expires_at=None,
+        origin: str | None = None,
     ) -> Dict[str, Any]:
         """Create a new MCP API token."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, scope, expires_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                RETURNING id, user_id, name, token_prefix, scope,
+                INSERT INTO mcp_tokens (user_id, name, token_hash, token_prefix, scope, expires_at, origin)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id, user_id, name, token_prefix, scope, origin,
                           expires_at, revoked_at, last_used_at, created_at
                 """,
                 user_id,
@@ -2288,6 +2308,7 @@ class PostgresDB:
                 token_prefix,
                 scope,
                 expires_at,
+                origin,
             )
             return dict(row)
 
@@ -2314,7 +2335,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, user_id, name, token_prefix, scope,
+                SELECT id, user_id, name, token_prefix, scope, origin,
                        expires_at, revoked_at, last_used_at, created_at
                 FROM mcp_tokens
                 WHERE user_id = $1

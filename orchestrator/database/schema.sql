@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
     token_hash TEXT NOT NULL UNIQUE,
     token_prefix VARCHAR(12) NOT NULL,
     scope TEXT NOT NULL DEFAULT 'user',
+    origin TEXT,  -- NULL='manual', 'oauth:Claude', 'oauth:ChatGPT', etc.
     expires_at TIMESTAMP WITH TIME ZONE,
     revoked_at TIMESTAMP WITH TIME ZONE,
     last_used_at TIMESTAMP WITH TIME ZONE,

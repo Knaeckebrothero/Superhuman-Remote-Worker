@@ -35,7 +35,34 @@ if _transport == "http":
         from .auth import McpTokenVerifier
     except ImportError:
         from auth import McpTokenVerifier  # type: ignore[no-redef]
-    _auth = McpTokenVerifier()
+
+    _token_verifier = McpTokenVerifier()
+
+    if os.environ.get("MCP_OAUTH_ENABLED", "").lower() == "true":
+        try:
+            from .oauth_bridge import SRWOAuthProxy
+        except ImportError:
+            from oauth_bridge import SRWOAuthProxy  # type: ignore[no-redef]
+
+        _auth = SRWOAuthProxy(
+            config_url=os.environ.get(
+                "MCP_OIDC_CONFIG_URL",
+                "http://keycloak:8080/realms/srw/.well-known/openid-configuration",
+            ),
+            client_id=os.environ["MCP_OIDC_CLIENT_ID"],
+            client_secret=os.environ["MCP_OIDC_CLIENT_SECRET"],
+            base_url=os.environ.get(
+                "MCP_BASE_URL", "https://mcp.superhuman-remote-worker.com"
+            ),
+            issuer_url=os.environ.get(
+                "MCP_OIDC_ISSUER",
+                "https://auth.superhuman-remote-worker.com/realms/srw",
+            ),
+            mcp_verifier=_token_verifier,
+            verify_id_token=True,  # Keycloak access tokens may be opaque
+        )
+    else:
+        _auth = _token_verifier
 
 # Create the MCP server instance
 mcp = FastMCP("cockpit-debug", auth=_auth)
