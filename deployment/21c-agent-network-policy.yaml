@@ -86,13 +86,6 @@ spec:
       ports:
         - protocol: TCP
           port: 3000
-    # Kubernetes API (Tailscale sidecar state persistence)
-    - to:
-        - ipBlock:
-            cidr: 10.43.0.1/32
-      ports:
-        - protocol: TCP
-          port: 443
     # Headscale coordination server (Tailscale sidecar)
     - to:
         - namespaceSelector:
