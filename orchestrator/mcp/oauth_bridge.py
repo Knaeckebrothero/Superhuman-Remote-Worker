@@ -434,9 +434,7 @@ class SRWOAuthProxy(OIDCProxy):
         # Decode Keycloak ID token for user identity
         id_token_str = code_model.idp_tokens.get("id_token", "")
         try:
-            user_info = pyjwt.decode(
-                id_token_str, options={"verify_signature": False}
-            )
+            user_info = pyjwt.decode(id_token_str, options={"verify_signature": False})
         except Exception:
             logger.error("Failed to decode Keycloak ID token")
             raise TokenError("server_error", "Failed to decode identity token")
@@ -550,8 +548,6 @@ class SRWOAuthProxy(OIDCProxy):
 
     def _cleanup_pending(self) -> None:
         """Remove expired pending authorizations."""
-        expired = [
-            sid for sid, p in self._pending_auths.items() if p.expired
-        ]
+        expired = [sid for sid, p in self._pending_auths.items() if p.expired]
         for sid in expired:
             del self._pending_auths[sid]
