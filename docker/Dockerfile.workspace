@@ -3,6 +3,7 @@
 # =============================================================================
 #
 # Provides: SSH server, tmux, git, code-server, dev tools.
+# Initial build: 2026-03-27
 # The agent connects via RemoteBackend (SSH/SFTP) — identical to VM workspaces.
 #
 # Does NOT include: Python agent code, LLM libraries, playwright, PyTorch.
