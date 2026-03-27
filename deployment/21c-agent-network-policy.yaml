@@ -99,6 +99,8 @@ spec:
         - protocol: TCP
           port: 8080
     # Headscale via Traefik Ingress (Noise protocol requires TLS)
+    # Port 8443 is Traefik's actual container port (Service maps 443→8443,
+    # and NetworkPolicy evaluates after kube-proxy DNAT to the pod port)
     - to:
         - namespaceSelector:
             matchLabels:
@@ -108,7 +110,7 @@ spec:
               app.kubernetes.io/name: traefik
       ports:
         - protocol: TCP
-          port: 443
+          port: 8443
     # WireGuard direct peer connections (Tailscale mesh VPN to VMs)
     - ports:
         - protocol: UDP
