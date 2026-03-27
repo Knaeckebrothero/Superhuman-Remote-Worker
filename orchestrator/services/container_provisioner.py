@@ -155,9 +155,7 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 body=pod_manifest,
             )
-            logger.info(
-                "Workspace container created: %s (job %s)", pod_name, job_id
-            )
+            logger.info("Workspace container created: %s (job %s)", pod_name, job_id)
             await self._set_context(
                 job_id,
                 {
@@ -217,9 +215,7 @@ class ContainerProvisioner:
                 namespace=self._namespace,
                 grace_period_seconds=10,
             )
-            logger.info(
-                "Workspace container deleted: %s (job %s)", pod_name, job_id
-            )
+            logger.info("Workspace container deleted: %s (job %s)", pod_name, job_id)
             await self._set_context(job_id, {"status": "deleted"})
             return True
         except Exception as e:
@@ -258,9 +254,7 @@ class ContainerProvisioner:
 
             ready = False
             if pod.status.container_statuses:
-                ready = all(
-                    cs.ready for cs in pod.status.container_statuses
-                )
+                ready = all(cs.ready for cs in pod.status.container_statuses)
 
             return {
                 "job_id": job_id,
@@ -272,9 +266,7 @@ class ContainerProvisioner:
         except Exception as e:
             if hasattr(e, "status") and e.status == 404:
                 return None
-            logger.debug(
-                "Workspace status query failed for job %s: %s", job_id, e
-            )
+            logger.debug("Workspace status query failed for job %s: %s", job_id, e)
             return None
 
     # =========================================================================
@@ -368,9 +360,7 @@ class ContainerProvisioner:
             },
         }
 
-    async def _wait_for_ready(
-        self, pod_name: str, timeout: int = 120
-    ) -> Optional[str]:
+    async def _wait_for_ready(self, pod_name: str, timeout: int = 120) -> Optional[str]:
         """Poll until the workspace pod is Running and has an IP.
 
         Returns:

@@ -11,9 +11,7 @@ class TestContainerProvisionerInit:
 
     def test_not_available_without_k8s(self):
         """Provisioner reports unavailable when kubernetes is not installed."""
-        with patch.dict(
-            "sys.modules", {"kubernetes": None, "kubernetes.client": None}
-        ):
+        with patch.dict("sys.modules", {"kubernetes": None, "kubernetes.client": None}):
             # Re-import to pick up mocked modules
             import importlib
             from orchestrator.services import container_provisioner as mod
@@ -203,7 +201,9 @@ class TestPodManifest:
         mounts = {m["name"]: m for m in container["volumeMounts"]}
 
         assert mounts["workspace-data"]["mountPath"] == "/home/agent-host/workspace"
-        assert mounts["ssh-pubkey"]["mountPath"] == "/home/agent-host/.ssh/authorized_keys"
+        assert (
+            mounts["ssh-pubkey"]["mountPath"] == "/home/agent-host/.ssh/authorized_keys"
+        )
         assert mounts["ssh-pubkey"]["readOnly"] is True
 
 
@@ -220,9 +220,7 @@ class TestCreateWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(
-            return_value=True
-        )
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
 
         mock_core_api = MagicMock()
         mock_core_api.create_namespaced_pod = MagicMock()
@@ -263,9 +261,7 @@ class TestCreateWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(
-            return_value=True
-        )
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
 
         mock_core_api = MagicMock()
         mock_core_api.create_namespaced_pod = MagicMock()
@@ -292,9 +288,7 @@ class TestCreateWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(
-            return_value=True
-        )
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
 
         captured_body = {}
 
@@ -333,9 +327,7 @@ class TestCreateWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(
-            return_value=True
-        )
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
 
         mock_core_api = MagicMock()
         mock_core_api.create_namespaced_pod = MagicMock(
@@ -366,9 +358,7 @@ class TestDeleteWorkspace:
         provisioner = ContainerProvisioner()
         provisioner._k8s_available = True
         provisioner._db = MagicMock()
-        provisioner._db.merge_workspace_container_context = AsyncMock(
-            return_value=True
-        )
+        provisioner._db.merge_workspace_container_context = AsyncMock(return_value=True)
 
         mock_core_api = MagicMock()
         mock_core_api.delete_namespaced_pod = MagicMock()
@@ -547,9 +537,7 @@ class TestDispatchHelpers:
         import json
 
         job = {
-            "config_override": json.dumps(
-                {"workspace": {"backend": "container"}}
-            ),
+            "config_override": json.dumps({"workspace": {"backend": "container"}}),
         }
         assert self._get_backend(job) == "container"
 
@@ -558,9 +546,7 @@ class TestDispatchHelpers:
         import json
 
         job = {
-            "config_override": json.dumps(
-                {"workspace": {"backend": "local"}}
-            ),
+            "config_override": json.dumps({"workspace": {"backend": "local"}}),
         }
         assert self._get_backend(job) == "local"
 
@@ -569,9 +555,7 @@ class TestDispatchHelpers:
         import json
 
         job = {
-            "config_override": json.dumps(
-                {"workspace": {"backend": "remote"}}
-            ),
+            "config_override": json.dumps({"workspace": {"backend": "remote"}}),
         }
         assert self._get_backend(job) == "remote"
 
