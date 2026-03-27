@@ -44,6 +44,7 @@ data:
     derp:
       server:
         enabled: true
+        private_key_path: /var/lib/headscale/derp_server_private.key
         stun_listen_addr: 0.0.0.0:3478
     ephemeral_node_inactivity_timeout: 30m
     database:
