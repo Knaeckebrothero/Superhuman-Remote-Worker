@@ -317,7 +317,7 @@ spec:
             - name: TS_AUTHKEY
               valueFrom:
                 secretKeyRef:
-                  name: tailscale-auth
+                  name: srw-secrets
                   key: TAILSCALE_AUTH_KEY
                   optional: true
             - name: TS_EXTRA_ARGS
