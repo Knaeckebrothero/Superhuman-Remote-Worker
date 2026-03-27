@@ -2432,6 +2432,32 @@ async def pause_job(job_id: str) -> dict[str, str]:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.put("/api/jobs/{job_id}/agent-release")
+async def agent_release_job(job_id: str) -> dict[str, str]:
+    """Agent-initiated job release (no agent callback).
+
+    Called by an agent that is shutting down or otherwise releasing a job
+    it was working on.  Unlike the regular pause endpoint, this does NOT
+    try to contact the agent pod (since the caller *is* the agent).
+    It simply sets the job to 'paused' and clears the agent assignment
+    so the dispatcher can reassign it.
+    """
+    try:
+        success = await postgres_db.pause_job(job_id)
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail="Job cannot be paused (not found or status changed)",
+            )
+        logger.info(f"Agent released job {job_id} — paused for reassignment")
+        _trigger_dispatch()
+        return {"status": "paused", "job_id": job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 # =============================================================================
 # Agent Messaging Endpoints (Live Communication)
 # =============================================================================
