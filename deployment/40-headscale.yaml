@@ -52,6 +52,7 @@ data:
         path: /var/lib/headscale/db.sqlite
     dns:
       magic_dns: false
+      override_local_dns: false
     policy:
       path: /etc/headscale/acl.hujson
 

@@ -361,6 +361,7 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: TAILSCALE_AUTH_KEY
+                  optional: true
             - name: TS_EXTRA_ARGS
               value: "--login-server=https://headscale.superhuman-remote-worker.com"
             - name: TS_KUBE_SECRET
