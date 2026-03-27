@@ -6,9 +6,12 @@
 
 set -e
 
-# If authorized_keys was mounted read-only by K8s, fix ownership
-if [ -f /home/agent-host/.ssh/authorized_keys ]; then
-    chmod 600 /home/agent-host/.ssh/authorized_keys 2>/dev/null || true
+# Copy SSH public key from K8s secret mount (root-owned) to user-owned location.
+# OpenSSH StrictModes requires authorized_keys to be owned by the target user.
+if [ -f /tmp/ssh-pubkey/ssh-publickey ]; then
+    cp /tmp/ssh-pubkey/ssh-publickey /home/agent-host/.ssh/authorized_keys
+    chown agent-host:agent-host /home/agent-host/.ssh/authorized_keys
+    chmod 600 /home/agent-host/.ssh/authorized_keys
 fi
 
 # Start code-server as agent-host (background)
