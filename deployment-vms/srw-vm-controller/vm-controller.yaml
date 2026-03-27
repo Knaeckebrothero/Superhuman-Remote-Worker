@@ -183,7 +183,7 @@ spec:
             - name: VM_NAMESPACE
               value: "agent-vms"
             - name: DEFAULT_VM_IMAGE
-              value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-bb0a4d2"
+              value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-e4282e8"
             - name: DEFAULT_CPU
               value: "2"
             - name: DEFAULT_MEMORY
