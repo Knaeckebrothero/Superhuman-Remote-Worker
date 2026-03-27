@@ -1,0 +1,88 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: srw-workspace-policy
+  namespace: superhuman-remote-worker
+spec:
+  podSelector:
+    matchLabels:
+      app: srw-workspace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # SSH from agent pods (RemoteBackend)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: srw-agent
+      ports:
+        - protocol: TCP
+          port: 22
+    # code-server from orchestrator (IDE session proxying)
+    - from:
+        - podSelector:
+            matchLabels:
+              app: srw-orchestrator
+      ports:
+        - protocol: TCP
+          port: 8080
+    # code-server via Traefik ingress (direct IDE access)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: traefik
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS resolution
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Gitea (workspace git repos)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: srw-gitea
+      ports:
+        - protocol: TCP
+          port: 3000
+    # PostgreSQL (App DB — for datasource shell tools like psql)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: srw-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # PostgreSQL (Vector DB)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: srw-postgres-vector
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Neo4j (for datasource shell tools)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: srw-neo4j
+      ports:
+        - protocol: TCP
+          port: 7687
+    # MongoDB (for datasource shell tools)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: srw-mongodb
+      ports:
+        - protocol: TCP
+          port: 27017
+    # No external internet — workspace containers are sandboxed

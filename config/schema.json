@@ -189,9 +189,39 @@
         },
         "backend": {
           "type": "string",
-          "enum": ["local", "remote"],
+          "enum": ["local", "remote", "container"],
           "default": "local",
-          "description": "Workspace backend type. 'local' uses the local filesystem (default). 'remote' uses SSH/SFTP to a VM."
+          "description": "Workspace backend type. 'local' uses the local filesystem (default). 'remote' uses SSH/SFTP to a VM. 'container' uses a per-job workspace container (default for production when provisioner is available)."
+        },
+        "container": {
+          "type": "object",
+          "description": "Workspace container settings (only used when backend: container). The orchestrator provisions the container and injects SSH connection details automatically.",
+          "properties": {
+            "image": {
+              "type": "string",
+              "description": "Workspace container image override (defaults to WORKSPACE_IMAGE env var)"
+            },
+            "cpu": {
+              "type": "string",
+              "default": "500m",
+              "description": "CPU request for workspace container"
+            },
+            "memory": {
+              "type": "string",
+              "default": "1Gi",
+              "description": "Memory request for workspace container"
+            },
+            "cpu_limit": {
+              "type": "string",
+              "default": "2000m",
+              "description": "CPU limit for workspace container"
+            },
+            "memory_limit": {
+              "type": "string",
+              "default": "4Gi",
+              "description": "Memory limit for workspace container"
+            }
+          }
         },
         "remote": {
           "type": "object",
