@@ -86,3 +86,25 @@ spec:
       ports:
         - protocol: TCP
           port: 3000
+    # Kubernetes API (Tailscale sidecar state persistence)
+    - to:
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+    # Headscale coordination server (Tailscale sidecar)
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: headscale
+          podSelector:
+            matchLabels:
+              app: headscale
+      ports:
+        - protocol: TCP
+          port: 8080
+    # WireGuard direct peer connections (Tailscale mesh VPN to VMs)
+    - ports:
+        - protocol: UDP
+          port: 41641
