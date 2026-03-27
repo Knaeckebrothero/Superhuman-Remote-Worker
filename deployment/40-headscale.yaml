@@ -48,6 +48,11 @@ data:
         enabled: true
         private_key_path: /var/lib/headscale/derp_server_private.key
         stun_listen_addr: 0.0.0.0:3478
+      # Disable global DERP map (clients can't reach derp*.tailscale.com)
+      # Only the embedded DERP server above will be used
+      urls: []
+      paths: []
+      auto_update_enabled: false
     ephemeral_node_inactivity_timeout: 30m
     database:
       type: sqlite
