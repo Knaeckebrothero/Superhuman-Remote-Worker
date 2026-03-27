@@ -321,9 +321,13 @@ spec:
                   key: TAILSCALE_AUTH_KEY
                   optional: true
             - name: TS_EXTRA_ARGS
-              value: "--login-server=https://headscale.superhuman-remote-worker.com"
+              value: "--login-server=http://headscale.headscale.svc.cluster.local:8080"
             - name: TS_STATE_DIR
               value: "/var/lib/tailscale"
+            # Prevent Tailscale from detecting Kubernetes and trying to
+            # reach the API server (blocked by NetworkPolicy)
+            - name: KUBERNETES_SERVICE_HOST
+              value: ""
             - name: TS_ACCEPT_DNS
               value: "false"
             - name: TS_HOSTNAME

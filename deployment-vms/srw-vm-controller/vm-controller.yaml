@@ -152,23 +152,6 @@ data:
                     - systemctl restart sudo-gated.socket
 
 ---
-# Headscale API key — used by the VM controller to generate pre-auth keys.
-# Create this secret manually on the agent cluster:
-#   kubectl --context vms -n agent-vms create secret generic headscale-api-key \
-#     --from-literal=api-key=<your-headscale-api-key>
-# Or manage via ExternalSecrets/Vault if ESO is deployed on this cluster.
-apiVersion: v1
-kind: Secret
-metadata:
-  name: headscale-api-key
-  namespace: agent-vms
-  labels:
-    app: srw-vm-controller
-type: Opaque
-stringData:
-  api-key: "REPLACE_ME"
-
----
 # Deployment
 apiVersion: apps/v1
 kind: Deployment
