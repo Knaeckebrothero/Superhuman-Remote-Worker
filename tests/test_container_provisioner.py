@@ -201,9 +201,8 @@ class TestPodManifest:
         mounts = {m["name"]: m for m in container["volumeMounts"]}
 
         assert mounts["workspace-data"]["mountPath"] == "/home/agent-host/workspace"
-        assert (
-            mounts["ssh-pubkey"]["mountPath"] == "/home/agent-host/.ssh/authorized_keys"
-        )
+        # SSH pubkey mounted to staging path — entrypoint copies to authorized_keys
+        assert mounts["ssh-pubkey"]["mountPath"] == "/tmp/ssh-pubkey"
         assert mounts["ssh-pubkey"]["readOnly"] is True
 
 
