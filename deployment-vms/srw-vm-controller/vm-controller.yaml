@@ -173,7 +173,8 @@ spec:
       serviceAccountName: vm-controller
       containers:
         - name: vm-controller
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-bb0a4d2
+          # Image tag managed by CI/CD — do not edit manually
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vm-controller:sha-a63027b
           imagePullPolicy: Always
           env:
             - name: NATS_URL
@@ -182,6 +183,7 @@ spec:
               value: "/config/vm-template.yaml"
             - name: VM_NAMESPACE
               value: "agent-vms"
+            # Image tag managed by CI/CD — do not edit manually
             - name: DEFAULT_VM_IMAGE
               value: "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:sha-e4282e8"
             - name: DEFAULT_CPU
