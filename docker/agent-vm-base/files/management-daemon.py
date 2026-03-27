@@ -47,6 +47,8 @@ JOB_CONFIG_FILE = Path("/run/agent/job-config.json")
 HEARTBEAT_INTERVAL = 30  # seconds
 AGENT_POLL_INTERVAL = 10  # seconds
 NATS_RETRY_INTERVAL = 5  # seconds
+TAILSCALE_WAIT_TIMEOUT = 60  # seconds to wait for Tailscale before registering
+IP_RECHECK_INTERVAL = 15  # seconds between IP re-checks
 
 
 def load_config() -> dict:
@@ -202,6 +204,7 @@ class ManagementDaemon:
     async def register(self):
         """Announce this VM to the orchestrator."""
         ip = detect_ip()
+        self._registered_ip = ip
         hostname = socket.gethostname()
 
         payload = {
@@ -331,38 +334,99 @@ class ManagementDaemon:
                 pass
 
     # =========================================================================
+    # IP re-registration (Tailscale comes up after initial registration)
+    # =========================================================================
+
+    async def ip_update_loop(self):
+        """Periodically re-check IP and re-register if it changes.
+
+        Tailscale runs in the background (cloud-init runcmd). The daemon
+        may register before Tailscale connects, using the QEMU NAT IP.
+        Once Tailscale gets a 100.64.x.y address, re-register so the
+        orchestrator can route SSH through the mesh VPN.
+        """
+        while not self._shutdown.is_set():
+            try:
+                current_ip = detect_ip()
+                if current_ip != self._registered_ip:
+                    log.info("IP changed: %s -> %s, re-registering", self._registered_ip, current_ip)
+                    await self.register()
+            except Exception:
+                log.exception("IP update check error")
+
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=IP_RECHECK_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # =========================================================================
     # Main
     # =========================================================================
 
-    async def _wait_for_cloud_init(self, timeout: int = 120):
-        """Wait for cloud-init to finish before registering.
+    async def _wait_for_cloud_init(self, timeout: int = 30):
+        """Wait for cloud-init to finish writing job config.
 
-        Cloud-init writes SSH authorized_keys and job config. The daemon
-        service may start before cloud-init completes (enabled in image),
-        so we wait for the cloud-init sentinel or SSH key to appear.
+        Checks for the job config file (written by cloud-init write_files)
+        rather than SSH keys (which are injected by the orchestrator after
+        registration). Short timeout since write_files runs early.
         """
-        ssh_key_path = Path("/home/agent-host/.ssh/authorized_keys")
         for i in range(timeout):
-            if ssh_key_path.exists() and ssh_key_path.stat().st_size > 0:
-                log.info("Cloud-init ready (SSH key present after %ds)", i)
+            if JOB_CONFIG_FILE.exists() and JOB_CONFIG_FILE.stat().st_size > 0:
+                log.info("Cloud-init ready (job config present after %ds)", i)
                 return
             if self._shutdown.is_set():
                 return
             await asyncio.sleep(1)
         log.warning("Cloud-init wait timed out after %ds — registering anyway", timeout)
 
+    async def _wait_for_tailscale(self):
+        """Wait for Tailscale to obtain a mesh VPN IP before registering.
+
+        Polls `tailscale ip -4` for up to TAILSCALE_WAIT_TIMEOUT seconds.
+        If Tailscale connects in time, the daemon registers with the
+        100.64.x.y IP (reachable from agent pods). If not, falls through
+        and the ip_update_loop will re-register when Tailscale comes up.
+        """
+        import subprocess
+
+        for i in range(TAILSCALE_WAIT_TIMEOUT):
+            try:
+                result = subprocess.run(
+                    ["tailscale", "ip", "-4"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    log.info("Tailscale ready after %ds: %s", i, result.stdout.strip())
+                    return
+            except FileNotFoundError:
+                log.info("Tailscale not installed — skipping wait")
+                return
+            except Exception:
+                pass
+
+            if self._shutdown.is_set():
+                return
+            await asyncio.sleep(1)
+
+        log.warning("Tailscale not ready after %ds — registering with fallback IP", TAILSCALE_WAIT_TIMEOUT)
+
     async def run(self):
         """Main entry point."""
         log.info("Management daemon starting (job_id=%s)", self.job_id)
 
-        # Wait for cloud-init to write SSH keys before registering
+        # Wait for cloud-init to write job config
         await self._wait_for_cloud_init()
+
+        # Wait for Tailscale mesh VPN (runs in background via cloud-init)
+        await self._wait_for_tailscale()
 
         await self.connect_nats()
         if self._shutdown.is_set() or not self.nc:
             return
 
         # Register with orchestrator
+        self._registered_ip = None
         await self.register()
 
         # Subscribe to control commands
@@ -374,6 +438,7 @@ class ManagementDaemon:
         tasks = [
             asyncio.create_task(self.heartbeat_loop()),
             asyncio.create_task(self.agent_monitor_loop()),
+            asyncio.create_task(self.ip_update_loop()),
         ]
 
         # Wait for shutdown signal
