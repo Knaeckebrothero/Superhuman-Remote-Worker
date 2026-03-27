@@ -633,6 +633,7 @@ class OrchestratorClient:
         config_name: str,
         project_id: Optional[str] = None,
         max_rounds: int = 3,
+        parent_llm_override: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         """Create a critic verification job for a completed job.
 
@@ -692,18 +693,7 @@ class OrchestratorClient:
                 "tools": {
                     "evaluation": ["approve_job", "return_job_with_feedback"],
                 },
-                "llm": {
-                    "model": "openrouter/minimax/minimax-m2.7",
-                    "reasoning_level": "xhigh",
-                    "strategic": {
-                        "model": "openrouter/minimax/minimax-m2.7",
-                        "reasoning_level": "xhigh",
-                    },
-                    "tactical": {
-                        "model": "openrouter/minimax/minimax-m2.7",
-                        "reasoning_level": "xhigh",
-                    },
-                },
+                **({"llm": parent_llm_override} if parent_llm_override else {}),
             },
             "instructions": instructions,
             "context": context,
