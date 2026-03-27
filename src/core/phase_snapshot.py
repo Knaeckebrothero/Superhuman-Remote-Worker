@@ -230,8 +230,19 @@ class PhaseSnapshotManager:
             snapshot_dir = self._snapshots_dir / f"phase_{phase_number}"
             snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-            # 1. Copy checkpoint database
+            # 1. Copy checkpoint database (flush WAL first to avoid corruption)
             if checkpoint_path.exists():
+                import sqlite3
+
+                try:
+                    wal_conn = sqlite3.connect(str(checkpoint_path))
+                    wal_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    wal_conn.close()
+                except Exception as e:
+                    logger.warning(
+                        f"[{self.job_id}] WAL checkpoint failed, "
+                        f"copying anyway: {e}"
+                    )
                 shutil.copy2(checkpoint_path, snapshot_dir / "checkpoint.db")
                 logger.debug(f"[{self.job_id}] Snapshot: copied checkpoint.db")
             else:
@@ -417,6 +428,11 @@ class PhaseSnapshotManager:
 
                 # Ensure checkpoints directory exists
                 checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                # Remove stale WAL/SHM files to avoid journal conflicts
+                for suffix in ("-wal", "-shm"):
+                    stale = checkpoint_path.parent / (checkpoint_path.name + suffix)
+                    if stale.exists():
+                        stale.unlink()
                 shutil.copy2(snapshot_checkpoint, checkpoint_path)
                 logger.info(
                     f"[{self.job_id}] Restored checkpoint.db from phase {phase_number}"

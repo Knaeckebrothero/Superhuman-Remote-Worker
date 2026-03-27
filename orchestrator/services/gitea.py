@@ -537,7 +537,8 @@ class GiteaClient:
             if branch:
                 delete_payload["branch"] = branch
 
-            resp = await client.delete(
+            resp = await client.request(
+                "DELETE",
                 f"{self._url}/api/v1/repos/{self._user}/{repo_name}/contents/{file_path}",
                 json=delete_payload,
             )

@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'">
+<title>Authorize Access</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --bg-base:#0a0c10;
+  --bg-panel:#11141b;
+  --bg-input:#0d1017;
+  --border:#1e2333;
+  --border-focus:#3d6bff;
+  --text-primary:#e2e4ea;
+  --text-secondary:#7a8098;
+  --text-dim:#464d66;
+  --accent:#3d6bff;
+  --accent-glow:rgba(61,107,255,.12);
+  --deny:#ff4d5e;
+  --deny-glow:rgba(255,77,94,.08);
+  --radius:6px;
+  --font-body:'Segoe UI',system-ui,-apple-system,sans-serif;
+  --font-mono:'SF Mono','Cascadia Code','Consolas',monospace;
+}
+
+html{
+  background:var(--bg-base);
+  color:var(--text-primary);
+  font-family:var(--font-body);
+  font-size:15px;
+  line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+}
+
+body{
+  min-height:100vh;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px 16px;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(255,255,255,.008) 2px,
+      rgba(255,255,255,.008) 4px
+    ),
+    radial-gradient(ellipse at 50% 0%,rgba(61,107,255,.04) 0%,transparent 60%),
+    var(--bg-base);
+}
+
+.card{
+  width:100%;
+  max-width:420px;
+  background:var(--bg-panel);
+  border:1px solid var(--border);
+  border-radius:10px;
+  overflow:hidden;
+  box-shadow:
+    0 1px 2px rgba(0,0,0,.3),
+    0 8px 32px rgba(0,0,0,.25),
+    inset 0 1px 0 rgba(255,255,255,.03);
+}
+
+/* ---- header bar ---- */
+.header{
+  padding:20px 24px 16px;
+  border-bottom:1px solid var(--border);
+  display:flex;
+  align-items:center;
+  gap:12px;
+}
+
+.header-icon{
+  width:36px;height:36px;
+  border-radius:8px;
+  background:var(--accent-glow);
+  border:1px solid rgba(61,107,255,.2);
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+}
+
+.header-icon svg{width:18px;height:18px;stroke:var(--accent);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+.header-text h1{
+  font-size:15px;
+  font-weight:600;
+  letter-spacing:-.01em;
+  color:var(--text-primary);
+}
+
+.header-text p{
+  font-size:12px;
+  color:var(--text-secondary);
+  margin-top:1px;
+}
+
+/* ---- body ---- */
+.body{padding:20px 24px 24px}
+
+.identity{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  padding:12px 14px;
+  background:var(--bg-input);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  margin-bottom:20px;
+}
+
+.identity-badge{
+  width:30px;height:30px;
+  border-radius:50%;
+  background:linear-gradient(135deg,#2a3a6e,#1e2b52);
+  display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:600;color:var(--accent);
+  text-transform:uppercase;
+  flex-shrink:0;
+}
+
+.identity-info{min-width:0}
+
+.identity-label{
+  font-size:10px;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--text-dim);
+  line-height:1;
+  margin-bottom:3px;
+}
+
+.identity-email{
+  font-size:13px;
+  font-family:var(--font-mono);
+  color:var(--text-primary);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+
+/* ---- fields ---- */
+.field{margin-bottom:16px}
+
+.field:last-of-type{margin-bottom:20px}
+
+.field label{
+  display:block;
+  font-size:11px;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  color:var(--text-secondary);
+  margin-bottom:6px;
+}
+
+.field select{
+  width:100%;
+  padding:10px 36px 10px 12px;
+  font-size:14px;
+  font-family:var(--font-body);
+  color:var(--text-primary);
+  background:var(--bg-input);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  outline:none;
+  cursor:pointer;
+  appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%237a8098' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;
+  background-position:right 12px center;
+  transition:border-color .15s;
+}
+
+.field select:focus{border-color:var(--border-focus)}
+
+.field select option{
+  background:var(--bg-panel);
+  color:var(--text-primary);
+}
+
+/* ---- actions ---- */
+.actions{
+  display:flex;
+  gap:10px;
+}
+
+.btn{
+  flex:1;
+  padding:10px 16px;
+  font-size:14px;
+  font-weight:600;
+  font-family:var(--font-body);
+  border:none;
+  border-radius:var(--radius);
+  cursor:pointer;
+  transition:all .15s;
+  letter-spacing:-.005em;
+}
+
+.btn-allow{
+  background:var(--accent);
+  color:#fff;
+  box-shadow:0 1px 3px rgba(61,107,255,.3);
+}
+
+.btn-allow:hover{
+  background:#4d78ff;
+  box-shadow:0 2px 8px rgba(61,107,255,.35);
+}
+
+.btn-allow:active{
+  background:#3360e6;
+  transform:translateY(1px);
+}
+
+.btn-deny{
+  background:transparent;
+  color:var(--text-secondary);
+  border:1px solid var(--border);
+}
+
+.btn-deny:hover{
+  color:var(--deny);
+  border-color:rgba(255,77,94,.3);
+  background:var(--deny-glow);
+}
+
+.btn-deny:active{transform:translateY(1px)}
+
+/* ---- footer ---- */
+.footer{
+  padding:12px 24px;
+  border-top:1px solid var(--border);
+  text-align:center;
+}
+
+.footer p{
+  font-size:11px;
+  color:var(--text-dim);
+  font-family:var(--font-mono);
+  letter-spacing:.02em;
+}
+
+/* ---- responsive ---- */
+@media(max-width:480px){
+  .card{border-radius:0;border-left:none;border-right:none}
+  .header,.body,.footer{padding-left:20px;padding-right:20px}
+}
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="header">
+    <div class="header-icon">
+      <svg viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+    </div>
+    <div class="header-text">
+      <h1>{{client_name}}</h1>
+      <p>is requesting access to your account</p>
+    </div>
+  </div>
+
+  <form method="POST" action="/oauth/scope-select" class="body">
+    <input type="hidden" name="session_id" value="{{session_id}}">
+    <input type="hidden" name="csrf_token" value="{{csrf_token}}">
+    <input type="hidden" name="action" id="form-action" value="approve">
+
+    <div class="identity">
+      <div class="identity-badge">{{user_email}}</div>
+      <div class="identity-info">
+        <div class="identity-label">Signed in as</div>
+        <div class="identity-email">{{user_email}}</div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label for="scope">Access Scope</label>
+      <select id="scope" name="scope">
+        <option value="user" selected>My Data Only</option>
+        {{admin_option}}
+      </select>
+    </div>
+
+    <div class="field">
+      <label for="expiry_days">Token Lifetime</label>
+      <select id="expiry_days" name="expiry_days">
+        <option value="30">30 days</option>
+        <option value="90" selected>90 days</option>
+        <option value="365">1 year</option>
+        <option value="0">Never expires</option>
+      </select>
+    </div>
+
+    <div class="actions">
+      <button type="button" class="btn btn-deny" onclick="submitDeny()">Deny</button>
+      <button type="submit" class="btn btn-allow">Allow</button>
+    </div>
+  </form>
+
+  <div class="footer">
+    <p>SRW MCP OAuth Bridge</p>
+  </div>
+</div>
+
+<script>
+function submitDeny(){
+  document.getElementById('form-action').value='deny';
+  document.querySelector('form').submit();
+}
+// Set avatar initial from email
+(function(){
+  var b=document.querySelector('.identity-badge');
+  var e='{{user_email}}';
+  b.textContent=e?e.charAt(0).toUpperCase():'?';
+})();
+</script>
+
+</body>
+</html>

@@ -1,11 +1,17 @@
-import { Component, effect, inject, signal, OnInit } from '@angular/core';
-import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
-import { McpTokenService } from '../../core/services/mcp-token.service';
-import { UserService } from '../../core/services/user.service';
-import { ApiService } from '../../core/services/api.service';
-import { SettingsService } from '../../core/services/settings.service';
-import { McpTokenCreateResponse, Project, ApiKeyProvider, CommunicationSettings, CodexStatus } from '../../core/models/api.model';
+import {Component, effect, inject, OnInit, signal} from '@angular/core';
+import {FormsModule} from '@angular/forms';
+import {Router} from '@angular/router';
+import {McpTokenService} from '../../core/services/mcp-token.service';
+import {UserService} from '../../core/services/user.service';
+import {ApiService} from '../../core/services/api.service';
+import {SettingsService} from '../../core/services/settings.service';
+import {
+    ApiKeyProvider,
+    CodexStatus,
+    CommunicationSettings,
+    McpTokenCreateResponse,
+    Project
+} from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'openai', label: 'OpenAI' },
@@ -255,6 +261,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                 <span class="col-name">Name</span>
                 <span class="col-prefix">Token</span>
                 <span class="col-scope">Scope</span>
+                <span class="col-origin">Origin</span>
                 <span class="col-used">Last Used</span>
                 <span class="col-expires">Expires</span>
                 <span class="col-action"></span>
@@ -264,6 +271,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
                   <span class="col-name">{{ token.name }}</span>
                   <span class="col-prefix mono">{{ token.token_prefix }}...</span>
                   <span class="col-scope">{{ formatScope(token.scope) }}</span>
+                  <span class="col-origin">{{ formatOrigin(token.origin) }}</span>
                   <span class="col-used">{{ token.last_used_at ? formatDate(token.last_used_at) : 'Never' }}</span>
                   <span class="col-expires">{{ token.expires_at ? formatDate(token.expires_at) : 'Never' }}</span>
                   <span class="col-action">
@@ -479,7 +487,7 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
 
     .token-header, .token-row {
       display: grid;
-      grid-template-columns: 2fr 1.2fr 1.2fr 1fr 1fr 80px;
+      grid-template-columns: 2fr 1.2fr 1fr 0.8fr 1fr 1fr 80px;
       padding: 10px 14px;
       gap: 8px;
       align-items: center;
@@ -908,6 +916,15 @@ export class SettingsComponent implements OnInit {
       return p ? `Project: ${p.name}` : `Project`;
     }
     return scope;
+  }
+
+  formatOrigin(origin: string | null): string {
+    if (!origin) return 'Manual';
+    if (origin.startsWith('oauth:')) {
+      const name = origin.slice(6).replace(/:refresh$/, '');
+      return name.charAt(0).toUpperCase() + name.slice(1);
+    }
+    return origin;
   }
 
   formatDate(iso: string): string {
