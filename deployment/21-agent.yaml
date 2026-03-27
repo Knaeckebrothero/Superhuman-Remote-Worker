@@ -313,6 +313,36 @@ spec:
           securityContext:
             capabilities:
               add: ["NET_ADMIN", "NET_RAW"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Create TUN device (containerboot normally does this)
+              mkdir -p /dev/net
+              [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+              # Start tailscaled with in-memory state (no cached noise preference)
+              tailscaled --state=mem: --tun=tailscale0 --no-logs-no-support &
+              TSPID=$!
+              # Wait for tailscaled socket
+              for i in $(seq 1 30); do
+                [ -S /var/run/tailscale/tailscaled.sock ] && break
+                sleep 1
+              done
+              # Auth loop — keeps retrying without killing tailscaled
+              while true; do
+                if tailscale up \
+                  --auth-key="${TS_AUTHKEY}" \
+                  --login-server=http://headscale.headscale.svc.cluster.local:8080 \
+                  --hostname="${POD_NAME}" \
+                  --accept-dns=false \
+                  --timeout=60s 2>&1; then
+                  echo "Tailscale authenticated"
+                  break
+                fi
+                echo "Auth retry in 15s..."
+                sleep 15
+              done
+              # Keep running — tailscaled handles reconnections internally
+              wait $TSPID
           env:
             - name: TS_AUTHKEY
               valueFrom:
@@ -320,17 +350,7 @@ spec:
                   name: srw-secrets
                   key: TAILSCALE_AUTH_KEY
                   optional: true
-            - name: TS_EXTRA_ARGS
-              value: "--login-server=http://headscale.headscale.svc.cluster.local:8080"
-            - name: TS_STATE_DIR
-              value: "/var/lib/tailscale"
-            # Prevent Tailscale from detecting Kubernetes and trying to
-            # reach the API server (blocked by NetworkPolicy)
-            - name: KUBERNETES_SERVICE_HOST
-              value: ""
-            - name: TS_ACCEPT_DNS
-              value: "false"
-            - name: TS_HOSTNAME
+            - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
