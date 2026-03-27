@@ -4526,19 +4526,17 @@ async def _trigger_verification_on_complete(
             "tools": {
                 "evaluation": ["approve_job", "return_job_with_feedback"],
             },
-            "llm": {
-                "model": "openrouter/minimax/minimax-m2.7",
-                "reasoning_level": "xhigh",
-                "strategic": {
-                    "model": "openrouter/minimax/minimax-m2.7",
-                    "reasoning_level": "xhigh",
-                },
-                "tactical": {
-                    "model": "openrouter/minimax/minimax-m2.7",
-                    "reasoning_level": "xhigh",
-                },
-            },
         }
+
+        # Propagate parent's LLM override so the critic uses the same model
+        parent_override = job.get("config_override")
+        if isinstance(parent_override, str):
+            try:
+                parent_override = json.loads(parent_override)
+            except (json.JSONDecodeError, ValueError):
+                parent_override = None
+        if parent_override and isinstance(parent_override.get("llm"), dict):
+            config_override["llm"] = parent_override["llm"]
 
         project_id = str(job["project_id"]) if job.get("project_id") else None
 
