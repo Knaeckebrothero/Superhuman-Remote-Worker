@@ -7509,7 +7509,9 @@ async def internal_mcp_token_create(
         user = await postgres_db.upsert_user_from_oidc(
             sub=body.user_sub,
             email=body.user_email,
-            display_name=body.user_email.split("@")[0] if body.user_email else "OAuth User",
+            display_name=body.user_email.split("@")[0]
+            if body.user_email
+            else "OAuth User",
         )
     if not user:
         raise HTTPException(status_code=400, detail="Could not resolve user")
