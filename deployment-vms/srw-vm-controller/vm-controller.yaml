@@ -145,11 +145,11 @@ data:
                   runcmd:
                     - mkdir -p /run/agent
                     - chmod 755 /run/agent
-                    - 'if [ -n "${TAILSCALE_AUTH_KEY}" ]; then tailscale up --auth-key=${TAILSCALE_AUTH_KEY} --login-server=${HEADSCALE_URL} --hostname=vm-${JOB_ID} --accept-routes=false --ssh; fi'
                     - systemctl daemon-reload
                     - systemctl enable management-daemon.service
                     - systemctl start management-daemon.service
                     - systemctl restart sudo-gated.socket
+                    - 'if [ -n "${TAILSCALE_AUTH_KEY}" ]; then tailscale up --auth-key=${TAILSCALE_AUTH_KEY} --login-server=${HEADSCALE_URL} --hostname=vm-${JOB_ID} --accept-routes=false --ssh --timeout=120s & fi'
 
 ---
 # Deployment

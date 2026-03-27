@@ -328,10 +328,11 @@ spec:
                 sleep 1
               done
               # Auth loop — keeps retrying without killing tailscaled
+              # Uses external HTTPS URL because Tailscale's Noise protocol requires TLS
               while true; do
                 if tailscale up \
                   --auth-key="${TS_AUTHKEY}" \
-                  --login-server=http://headscale.headscale.svc.cluster.local:8080 \
+                  --login-server=https://headscale.superhuman-remote-worker.com \
                   --hostname="${POD_NAME}" \
                   --accept-dns=false \
                   --timeout=60s 2>&1; then
