@@ -92,6 +92,7 @@ from services.builder_config import resolve_builder_settings  # noqa: E402
 from services.builder_dispatch import execute_server_tool as _dispatch_server_tool  # noqa: E402
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
+from services.container_provisioner import container_provisioner  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.email import email_service  # noqa: E402
@@ -611,6 +612,23 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 f"(host={vm_ctx['ssh_host']}:{vm_ctx.get('ssh_port', 22)})"
             )
 
+        # Inject workspace container config if job has a ready container
+        container_ctx = _get_container_context(job)
+        if container_ctx.get("status") == "ready" and container_ctx.get("pod_ip"):
+            config_override = config_override or {}
+            ws = config_override.setdefault("workspace", {})
+            ws["backend"] = "remote"
+            remote = ws.setdefault("remote", {})
+            remote.setdefault("host", container_ctx["pod_ip"])
+            remote.setdefault("port", 22)
+            remote.setdefault("username", "agent-host")
+            remote.setdefault("key_path", "/run/secrets/vm-ssh-key")
+            remote.setdefault("workspace_path", "/home/agent-host/workspace")
+            logger.info(
+                f"Dispatch: injected workspace container config for job {job_id} "
+                f"(host={container_ctx['pod_ip']}:22)"
+            )
+
         # Resolve user/project API keys (user > project > env var fallback)
         resolved_keys = await postgres_db.resolve_api_keys_for_job(
             user_id=str(job["user_id"]) if job.get("user_id") else None,
@@ -941,6 +959,40 @@ def _get_vm_context(job: dict) -> dict:
     return ctx.get("vm", {})
 
 
+def _job_needs_container(job: dict) -> bool:
+    """Check if a job needs a workspace container.
+
+    Returns True if:
+    - config_override.workspace.backend == "container", OR
+    - backend is not explicitly set to "local" or "remote" AND container
+      provisioner is available (container is the default for production).
+    """
+    co = job.get("config_override") or {}
+    if isinstance(co, str):
+        try:
+            co = json.loads(co)
+        except (json.JSONDecodeError, TypeError):
+            co = {}
+    backend = co.get("workspace", {}).get("backend")
+    if backend == "container":
+        return True
+    if backend in ("local", "remote"):
+        return False
+    # No explicit backend — default to container if provisioner is available
+    return container_provisioner.is_available
+
+
+def _get_container_context(job: dict) -> dict:
+    """Extract the workspace_container sub-dict from job context."""
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    return ctx.get("workspace_container", {})
+
+
 def _detect_llm_provider_for_dispatch(
     job: dict, config_override: dict | None
 ) -> str | None:
@@ -1044,6 +1096,37 @@ async def _try_dispatch_pending_jobs() -> None:
                         # VM is provisioning/creating — skip, wait
                         continue
                     # else: VM is ready, proceed with dispatch
+                elif _job_needs_container(job):
+                    container_ctx = _get_container_context(job)
+                    if not container_ctx.get("status"):
+                        # Container needed but not provisioned — provision now
+                        config_override = job.get("config_override") or {}
+                        if isinstance(config_override, str):
+                            config_override = json.loads(config_override)
+                        ws_cfg = config_override.get("workspace", {}).get(
+                            "container", {}
+                        )
+                        ok = await container_provisioner.create_workspace(
+                            job_id=job_id,
+                            cpu=ws_cfg.get("cpu", "500m"),
+                            memory=ws_cfg.get("memory", "1Gi"),
+                            cpu_limit=ws_cfg.get("cpu_limit", "2000m"),
+                            memory_limit=ws_cfg.get("memory_limit", "4Gi"),
+                            image=ws_cfg.get("image"),
+                        )
+                        if ok:
+                            logger.info(
+                                f"Dispatcher: auto-provisioned workspace container for job {job_id}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Dispatcher: workspace container provisioning failed for job {job_id}"
+                            )
+                        continue  # Skip — wait for container to become ready
+                    elif container_ctx.get("status") not in ("ready",):
+                        # Container is creating — skip, wait
+                        continue
+                    # else: container is ready, proceed with dispatch
                 dispatchable_jobs.append(job)
 
             if not dispatchable_jobs:
@@ -1583,6 +1666,9 @@ async def lifespan(app: FastAPI):
 
     # Initialize VM provisioner (uses NATS if available, else direct K8s)
     vm_provisioner.connect(db=postgres_db)
+
+    # Initialize container provisioner for workspace containers (direct K8s)
+    container_provisioner.connect(db=postgres_db)
 
     # Initialize S3 snapshot service (graceful if S3 not configured)
     await snapshot_service.connect(db=postgres_db)
@@ -2331,6 +2417,15 @@ async def cancel_job(job_id: str) -> dict[str, str]:
             await vm_provisioner.send_control(job_id, "terminate")
             if vm_ctx.get("status") not in ("deleted", "deleting"):
                 await vm_provisioner.delete_vm(job_id)
+
+        # If job has a workspace container, delete it
+        ws_container_ctx = _get_container_context(job)
+        if ws_container_ctx and ws_container_ctx.get("status") not in (
+            "deleted",
+            "deleting",
+            None,
+        ):
+            await container_provisioner.delete_workspace(job_id)
 
         success = await postgres_db.cancel_job(job_id)
         if not success:
@@ -4898,6 +4993,17 @@ async def complete_job(job_id: str, request: JobCompleteRequest) -> dict[str, An
             if vm_ctx and vm_ctx.get("status") not in ("deleted", "deleting"):
                 await vm_provisioner.delete_vm(job_id)
                 actions.append("vm deletion requested")
+
+        # 9. If job had a workspace container, request teardown
+        if job.get("status") in ("completed", "failed"):
+            ws_container_ctx = _get_container_context(job)
+            if ws_container_ctx and ws_container_ctx.get("status") not in (
+                "deleted",
+                "deleting",
+                None,
+            ):
+                await container_provisioner.delete_workspace(job_id)
+                actions.append("workspace container deletion requested")
 
         return {
             "status": "handled",
