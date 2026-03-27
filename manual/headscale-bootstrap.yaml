@@ -1,22 +1,25 @@
 # Headscale Bootstrap Job
 #
 # One-time job that creates the initial user, API key, and agent pre-auth key.
-# Stores the generated keys in a Secret for manual retrieval.
 #
 # Run after Headscale StatefulSet is ready:
-#   kubectl apply -f deployment/41-headscale-bootstrap.yaml
+#   kubectl apply -f manual/headscale-bootstrap.yaml
 #
-# Then retrieve the keys:
-#   kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.api-key}' | base64 -d
-#   kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.agent-auth-key}' | base64 -d
+# The job automatically:
+#   - Creates the 'srw' user in Headscale
+#   - Generates an API key (365-day expiry)
+#   - Generates a reusable agent pre-auth key (365-day, tag:agent)
+#   - Stores the agent auth key directly in superhuman-remote-worker namespace
+#     (where agent pods read it — no Vault round-trip needed)
+#   - Stores the API key in headscale namespace for retrieval
 #
-# Then store them:
-#   1. API key     -> Vault at homelab/superhuman-remote-worker/srw-secrets (HEADSCALE_API_KEY)
-#                  -> kubectl --context vms -n agent-vms create secret generic headscale-api-key --from-literal=api-key=<key>
-#   2. Auth key    -> Vault at homelab/superhuman-remote-worker/srw-secrets (TAILSCALE_AUTH_KEY)
+# After the job completes, ONE manual step remains:
+#   Copy the API key to the vms cluster (different cluster, can't automate):
+#
+#   API_KEY=$(kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.api-key}' | base64 -d)
+#   kubectl --context vms -n agent-vms create secret generic headscale-api-key --from-literal=api-key="$API_KEY"
 #
 # This job is idempotent — safe to re-run (user creation tolerates "already exists").
-# Keep this out of Fleet (manual/ directory pattern) to avoid re-running on every sync.
 
 ---
 apiVersion: v1
@@ -26,6 +29,7 @@ metadata:
   namespace: headscale
 
 ---
+# RBAC for headscale namespace (exec into pod, store API key)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -48,6 +52,33 @@ kind: RoleBinding
 metadata:
   name: headscale-bootstrap
   namespace: headscale
+subjects:
+  - kind: ServiceAccount
+    name: headscale-bootstrap
+    namespace: headscale
+roleRef:
+  kind: Role
+  name: headscale-bootstrap
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# RBAC for superhuman-remote-worker namespace (write agent auth key Secret)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: headscale-bootstrap
+  namespace: superhuman-remote-worker
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: headscale-bootstrap
+  namespace: superhuman-remote-worker
 subjects:
   - kind: ServiceAccount
     name: headscale-bootstrap
@@ -91,15 +122,22 @@ spec:
               AUTH_KEY=$(kubectl exec headscale-0 -n headscale -- headscale preauthkeys create --user srw --reusable --expiration 365d --tags tag:agent 2>&1)
               echo "Auth key created."
 
-              echo "Storing keys in Secret headscale-bootstrap-keys..."
+              echo "Storing API key in headscale namespace..."
               kubectl create secret generic headscale-bootstrap-keys \
                 -n headscale \
                 --from-literal=api-key="$API_KEY" \
-                --from-literal=agent-auth-key="$AUTH_KEY" \
+                --dry-run=client -o yaml | kubectl apply -f -
+
+              echo "Storing agent auth key in superhuman-remote-worker namespace..."
+              kubectl create secret generic tailscale-auth \
+                -n superhuman-remote-worker \
+                --from-literal=TAILSCALE_AUTH_KEY="$AUTH_KEY" \
                 --dry-run=client -o yaml | kubectl apply -f -
 
               echo ""
               echo "=== Bootstrap complete ==="
-              echo "Retrieve keys with:"
-              echo "  kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.api-key}' | base64 -d"
-              echo "  kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.agent-auth-key}' | base64 -d"
+              echo "Agent auth key written to secret tailscale-auth in superhuman-remote-worker namespace."
+              echo ""
+              echo "One manual step: copy the API key to the vms cluster:"
+              echo "  API_KEY=\$(kubectl -n headscale get secret headscale-bootstrap-keys -o jsonpath='{.data.api-key}' | base64 -d)"
+              echo "  kubectl --context vms -n agent-vms create secret generic headscale-api-key --from-literal=api-key=\"\$API_KEY\""
