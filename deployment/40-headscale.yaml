@@ -180,6 +180,9 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
+    - name: noise
+      port: 443
+      targetPort: 8080
     - name: metrics
       port: 9090
       targetPort: 9090
