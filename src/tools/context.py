@@ -326,12 +326,11 @@ class ToolContext:
         relative_path = f"documents/external/{filename}"
 
         # Skip if file already exists (first save wins)
-        full_path = self.workspace_manager.get_path(relative_path)
-        if full_path.exists():
+        if self.workspace_manager.exists(relative_path):
             return relative_path
 
-        # Ensure directory exists
-        full_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure directory exists (use backend, not local mkdir)
+        self.workspace_manager.backend.mkdir("documents/external")
 
         # Build YAML front-matter
         front_matter_lines = [

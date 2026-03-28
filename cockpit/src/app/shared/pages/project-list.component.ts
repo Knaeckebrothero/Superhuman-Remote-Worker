@@ -1,9 +1,9 @@
-import { Component, inject, signal, OnInit } from '@angular/core';
-import { Router } from '@angular/router';
-import { ApiService } from '../../core/services/api.service';
-import { UserService } from '../../core/services/user.service';
-import { Project } from '../../core/models/api.model';
-import { SidebarToggleComponent } from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
+import {Component, effect, inject, OnInit, signal} from '@angular/core';
+import {Router} from '@angular/router';
+import {ApiService} from '../../core/services/api.service';
+import {UserService} from '../../core/services/user.service';
+import {Project} from '../../core/models/api.model';
+import {SidebarToggleComponent} from '../../simple/layout/sidebar-toggle/sidebar-toggle.component';
 
 @Component({
   selector: 'app-project-list-page',
@@ -304,14 +304,30 @@ export class ProjectListPageComponent implements OnInit {
   readonly formDescription = signal('');
   readonly formGoal = signal('');
 
+    constructor() {
+        // Load projects reactively — waits for currentUserId on F5 refresh
+        effect(() => {
+            const userId = this.userService.currentUserId();
+            if (userId) {
+                this.fetchProjects(userId);
+            }
+        });
+    }
+
   ngOnInit(): void {
-    this.refresh();
+      // Projects are loaded via effect() in the constructor (waits for currentUserId)
   }
 
   refresh(): void {
+      const userId = this.userService.currentUserId();
+      if (userId) {
+          this.fetchProjects(userId);
+      }
+  }
+
+    private fetchProjects(userId: string): void {
     this.isLoading.set(true);
-    const userId = this.userService.currentUserId();
-    this.api.getProjects(userId ?? undefined).subscribe((projects) => {
+        this.api.getProjects(userId).subscribe((projects) => {
       this.projects.set(projects);
       this.isLoading.set(false);
     });
