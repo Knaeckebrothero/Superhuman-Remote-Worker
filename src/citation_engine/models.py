@@ -376,7 +376,9 @@ class SearchResult:
             "source_id": self.source_id,
             "source_name": self.source_name,
             "source_type": self.source_type,
-            "chunk_text": self.chunk_text[:500] + "..." if len(self.chunk_text) > 500 else self.chunk_text,
+            "chunk_text": self.chunk_text[:500] + "..."
+            if len(self.chunk_text) > 500
+            else self.chunk_text,
             "page_reference": self.page_reference,
             "evidence_label": self.evidence_label,
             "evidence_reason": self.evidence_reason,

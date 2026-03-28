@@ -4,7 +4,6 @@ import os
 import tempfile
 
 import pytest
-
 from citation_engine import CitationContext, CitationEngine, SearchResult, SearchResults
 from citation_engine.search import (
     _RankedHit,
@@ -12,6 +11,7 @@ from citation_engine.search import (
     overall_label,
     rrf_merge,
 )
+
 
 # =============================================================================
 # RRF Merge Tests
@@ -260,16 +260,16 @@ class TestSearchLibraryIntegration:
         engine.tag_source(source_id=1, tags=["compliance"])
 
         # Search with tag filter — only tagged source should match
-        results = engine.search_library(query="Aufbewahrungsfrist", mode="keyword", tags=["compliance"])
+        results = engine.search_library(
+            query="Aufbewahrungsfrist", mode="keyword", tags=["compliance"]
+        )
         assert len(results.results) >= 1
         for r in results.results:
             assert r.source_id == 1
 
     def test_search_with_source_type_filter(self, engine):
         """Source type filter works."""
-        results = engine.search_library(
-            query="retention", mode="keyword", source_type="custom"
-        )
+        results = engine.search_library(query="retention", mode="keyword", source_type="custom")
         assert len(results.results) >= 1
 
     def test_search_scope_annotations(self, engine):
@@ -294,9 +294,7 @@ class TestSearchLibraryIntegration:
             annotation_type="note",
         )
 
-        results = engine.search_library(
-            query="xylophone", mode="keyword", scope="all"
-        )
+        results = engine.search_library(query="xylophone", mode="keyword", scope="all")
         assert len(results.results) >= 1
 
     def test_empty_query_raises(self, engine):
