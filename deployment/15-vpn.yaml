@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: vpn
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:latest
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:sha-036ce2d
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -116,7 +116,7 @@ spec:
     spec:
       containers:
         - name: vpn
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:latest
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:sha-036ce2d
           imagePullPolicy: Always
           securityContext:
             privileged: true
@@ -205,7 +205,7 @@ spec:
     spec:
       containers:
         - name: vpn
-          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:latest
+          image: ghcr.io/knaeckebrothero/superhuman-remote-worker-vpn:sha-036ce2d
           imagePullPolicy: Always
           securityContext:
             privileged: true
