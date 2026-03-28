@@ -32,6 +32,7 @@ class IdeSessionService:
         self._db: Any = None
         self._snapshot_service: Any = None
         self._vm_provisioner: Any = None
+        self._container_provisioner: Any = None
         self._gitea_client: Any = None
 
     @property
@@ -56,6 +57,7 @@ class IdeSessionService:
         snapshot_service: Any,
         vm_provisioner: Any,
         gitea_client: Any = None,
+        container_provisioner: Any = None,
     ) -> None:
         """Initialize with dependencies.
 
@@ -64,10 +66,12 @@ class IdeSessionService:
             snapshot_service: SnapshotService singleton.
             vm_provisioner: VMProvisioner singleton.
             gitea_client: GiteaClient (optional, for Gitea fallback).
+            container_provisioner: ContainerProvisioner (optional, for K8s IDE pods).
         """
         self._db = db
         self._snapshot_service = snapshot_service
         self._vm_provisioner = vm_provisioner
+        self._container_provisioner = container_provisioner
         self._gitea_client = gitea_client
         logger.info("IDE session service initialized")
 
@@ -93,7 +97,7 @@ class IdeSessionService:
         session_ctx = ctx.get("ide_session", {})
         snapshot_ctx = ctx.get("snapshot", {})
 
-        # 1. Check for live VM (job is still processing)
+        # 1a. Check for live VM (job is still processing)
         if vm_ctx.get("status") == "ready":
             ssh_host = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
             if ssh_host:
@@ -102,6 +106,15 @@ class IdeSessionService:
                     "code_server_url": f"http://{ssh_host}:8080/?folder=/home/agent-host/workspace",
                     "source": "live_vm",
                 }
+
+        # 1b. Check for live workspace container (job processing on container)
+        ws_ctx = ctx.get("workspace_container", {})
+        if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
+            return {
+                "status": "active",
+                "code_server_url": f"http://{ws_ctx['pod_ip']}:8080/?folder=/home/agent-host/workspace",
+                "source": "live_workspace",
+            }
 
         # 2. Check for active IDE session
         session_status = session_ctx.get("status")
@@ -260,10 +273,10 @@ class IdeSessionService:
 
         restore_type = session_ctx.get("restore_type", "vm")
 
-        if restore_type == "container":
+        if restore_type in ("container", "k8s_container"):
             container_name = session_ctx.get("container_name")
             if container_name:
-                await self._delete_ide_container(job_id, container_name)
+                await self._delete_ide_container(job_id, container_name, restore_type)
         else:
             vm_name = session_ctx.get("vm_name")
             if vm_name and self._vm_provisioner:
@@ -488,11 +501,9 @@ class IdeSessionService:
         vs ~45s) but provides only the workspace files, not the full
         agent environment.
 
-        For local dev (podman/docker): uses subprocess to run the container.
-        For production (K8s): creates a Pod via Kubernetes API.
+        For production (K8s): creates a Pod via ContainerProvisioner.
+        For local dev: falls back to podman/docker subprocess.
         """
-        import asyncio
-
         repo_name = job.get("repo_name")
         branch = job.get("branch_name") or "main"
         if not repo_name:
@@ -504,6 +515,115 @@ class IdeSessionService:
                 },
             )
             return
+
+        # Route to K8s or local container path
+        if self._container_provisioner and self._container_provisioner.is_available:
+            await self._restore_k8s_ide_container(job_id, job, repo_name, branch)
+        else:
+            await self._restore_local_ide_container(job_id, repo_name, branch)
+
+    async def _restore_k8s_ide_container(
+        self, job_id: str, job: dict, repo_name: str, branch: str
+    ) -> None:
+        """Create an IDE pod on Kubernetes, clone the repo, return code-server URL."""
+        import asyncio
+
+        clone_url = self._build_gitea_clone_url(repo_name)
+        pod_name = f"ide-{job_id[:12]}"
+
+        await self._set_session_context(
+            job_id,
+            {
+                "container_name": pod_name,
+                "restore_type": "k8s_container",
+            },
+        )
+
+        # Create IDE pod via ContainerProvisioner
+        pod_ip = await self._container_provisioner.create_ide_pod(job_id)
+        if not pod_ip:
+            await self._set_session_context(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": "IDE pod did not become ready within timeout",
+                },
+            )
+            return
+
+        # Clone the Gitea repo into the workspace via SSH
+        clone_cmd = (
+            f"git clone --branch {branch} {clone_url} /home/agent-host/workspace "
+            f"2>/dev/null || "
+            f"(cd /home/agent-host/workspace && git init && "
+            f"git remote add origin {clone_url} && "
+            f"git fetch origin {branch} && "
+            f"git checkout FETCH_HEAD)"
+        )
+
+        ssh_cmd = [
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=10",
+            f"agent-host@{pod_ip}",
+            clone_cmd,
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *ssh_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                logger.warning(
+                    "Git clone for IDE session had errors (job %s, rc=%d): %s",
+                    job_id,
+                    proc.returncode,
+                    stderr.decode(errors="replace")[:300],
+                )
+        except Exception as e:
+            logger.warning("SSH git clone failed for IDE session job %s: %s", job_id, e)
+
+        # code-server is already running from the workspace entrypoint
+        code_server_url = f"http://{pod_ip}:8080/?folder=/home/agent-host/workspace"
+
+        # Verify code-server is responding
+        ready = await self._wait_for_code_server(f"http://{pod_ip}:8080", timeout=15)
+        if not ready:
+            logger.warning(
+                "code-server not responding on IDE pod %s — setting active anyway",
+                pod_name,
+            )
+
+        await self._set_session_context(
+            job_id,
+            {
+                "status": "active",
+                "code_server_url": code_server_url,
+                "restore_type": "k8s_container",
+                "pod_ip": pod_ip,
+                "last_activity": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+        logger.info(
+            "IDE session active (K8s container) for job %s: %s",
+            job_id,
+            code_server_url,
+        )
+
+    async def _restore_local_ide_container(
+        self, job_id: str, repo_name: str, branch: str
+    ) -> None:
+        """Fallback: run code-server via local podman/docker (dev environments)."""
+        import asyncio
 
         container_name = f"srw-ide-{job_id[:12]}"
         clone_url = self._build_gitea_clone_url(repo_name)
@@ -522,11 +642,8 @@ class IdeSessionService:
         )
 
         try:
-            # Determine container runtime (podman preferred, fallback to docker)
             runtime = await self._detect_container_runtime()
 
-            # Run code-server container with git clone as entrypoint
-            # The container clones the repo, then starts code-server
             entrypoint_script = (
                 f"git clone --branch {branch} {clone_url} /home/coder/workspace && "
                 f"exec code-server --bind-addr 0.0.0.0:{host_port} --auth none /home/coder/workspace"
@@ -576,7 +693,6 @@ class IdeSessionService:
                 )
                 return
 
-            # Wait for code-server to become ready
             ready = await self._wait_for_code_server(
                 f"http://localhost:{host_port}", timeout=30
             )
@@ -588,7 +704,6 @@ class IdeSessionService:
                         "error": "Code-server did not start within timeout",
                     },
                 )
-                # Clean up the container
                 await self._remove_container(runtime, container_name)
                 return
 
@@ -622,7 +737,6 @@ class IdeSessionService:
                     "error": str(e),
                 },
             )
-            # Best-effort cleanup
             try:
                 runtime = await self._detect_container_runtime()
                 await self._remove_container(runtime, container_name)
@@ -757,8 +871,16 @@ class IdeSessionService:
         if self._vm_provisioner and self._vm_provisioner.is_available:
             await self._vm_provisioner.delete_vm(job_id)
 
-    async def _delete_ide_container(self, job_id: str, container_name: str) -> None:
-        """Stop and remove an IDE session container."""
+    async def _delete_ide_container(
+        self, job_id: str, container_name: str, restore_type: str = "container"
+    ) -> None:
+        """Stop and remove an IDE session container (K8s pod or local container)."""
+        if restore_type == "k8s_container":
+            if self._container_provisioner:
+                await self._container_provisioner.delete_ide_pod(job_id)
+            return
+
+        # Local dev path (podman/docker)
         try:
             runtime = await self._detect_container_runtime()
             await self._remove_container(runtime, container_name)

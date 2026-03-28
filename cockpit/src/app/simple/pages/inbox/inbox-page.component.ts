@@ -1,26 +1,22 @@
 import {
-  Component,
-  inject,
-  signal,
-  computed,
-  OnInit,
-  OnDestroy,
-  HostListener,
-  ElementRef,
-  ViewChild,
-  NgZone,
+    Component,
+    computed,
+    ElementRef,
+    HostListener,
+    inject,
+    NgZone,
+    OnDestroy,
+    OnInit,
+    signal,
+    ViewChild,
 } from '@angular/core';
-import { ActivatedRoute } from '@angular/router';
-import { FormsModule } from '@angular/forms';
-import { MarkdownComponent } from 'ngx-markdown';
-import { ActionCenterService } from '../../../core/services/action-center.service';
-import { SudoService, SudoRequest } from '../../../core/services/sudo.service';
-import { ApiService } from '../../../core/services/api.service';
-import {
-  ActionItem,
-  ActionItemType,
-  ThreadDetail,
-} from '../../../core/models/action.model';
+import {ActivatedRoute} from '@angular/router';
+import {FormsModule} from '@angular/forms';
+import {MarkdownComponent} from 'ngx-markdown';
+import {ActionCenterService} from '../../../core/services/action-center.service';
+import {SudoRequest, SudoService} from '../../../core/services/sudo.service';
+import {ApiService} from '../../../core/services/api.service';
+import {ActionItem, ActionItemType, ThreadDetail,} from '../../../core/models/action.model';
 
 interface FrozenJobData {
   freeze_type?: string;
@@ -31,6 +27,8 @@ interface FrozenJobData {
   notes?: string;
   phase_number?: number;
   frozen_at?: string;
+  command?: string;
+  reason?: string;
 }
 
 /** Risk level for sudo visual badging. */
@@ -402,8 +400,12 @@ function relativeTime(iso: string): string {
                   <span class="icon">rate_review</span>
                   Job Review
                 </span>
-                <span class="freeze-badge" [class]="frozenData()?.freeze_type === 'phase_boundary' ? 'phase' : 'complete'">
-                  {{ frozenData()?.freeze_type === 'phase_boundary' ? 'Phase Boundary' : 'Job Complete' }}
+                <span class="freeze-badge" [class]="
+                  frozenData()?.freeze_type === 'phase_boundary' ? 'phase' :
+                  frozenData()?.freeze_type === 'vm_upgrade_required' ? 'upgrade' : 'complete'
+                ">
+                  {{ frozenData()?.freeze_type === 'phase_boundary' ? 'Phase Boundary' :
+                     frozenData()?.freeze_type === 'vm_upgrade_required' ? 'Sudo Required' : 'Job Complete' }}
                 </span>
               </div>
 
@@ -462,7 +464,32 @@ function relativeTime(iso: string): string {
 
               <!-- Actions -->
               <div class="action-bar">
-                @if (frozenData()?.freeze_type === 'job_complete') {
+                @if (frozenData()?.freeze_type === 'vm_upgrade_required') {
+                  <div class="review-action-group upgrade-group">
+                    @if (frozenData()!.command) {
+                      <code class="upgrade-command">{{ frozenData()!.command }}</code>
+                    }
+                    <div class="upgrade-hint">
+                      Upgrade to a VM for sudo access, or resume without a VM.
+                    </div>
+                    <div class="upgrade-buttons">
+                      <button
+                        class="btn btn-upgrade"
+                        [disabled]="reviewActing()"
+                        (click)="upgradeToVm()"
+                      >
+                        <span class="icon">cloud_upload</span> Upgrade to VM
+                      </button>
+                      <button
+                        class="btn btn-resume"
+                        [disabled]="reviewActing()"
+                        (click)="resumeWithoutVm()"
+                      >
+                        <span class="icon">play_arrow</span> Resume without VM
+                      </button>
+                    </div>
+                  </div>
+                } @else if (frozenData()?.freeze_type === 'job_complete') {
                   <div class="review-action-group">
                     <textarea
                       class="input review-notes"
@@ -1245,6 +1272,38 @@ function relativeTime(iso: string): string {
     }
     .freeze-badge.complete { background: #a6e3a1; }
     .freeze-badge.phase { background: var(--accent-color, #cba6f7); }
+    .freeze-badge.upgrade { background: #f9e2af; }
+
+    .upgrade-command {
+      display: block;
+      padding: 6px 10px;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.85em;
+      color: var(--text-primary, #cdd6f4);
+      word-break: break-all;
+    }
+
+    .upgrade-hint {
+      font-size: 0.8em;
+      color: var(--text-secondary, #a6adc8);
+      font-style: italic;
+    }
+
+    .upgrade-buttons {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn-upgrade {
+      background: rgba(249, 226, 175, 0.2);
+      color: #f9e2af;
+    }
+
+    .btn-upgrade:hover:not(:disabled) {
+      background: rgba(249, 226, 175, 0.3);
+    }
 
     .review-job-info {
       background: var(--panel-bg, #181825);
@@ -1732,6 +1791,32 @@ export class InboxPageComponent implements OnInit, OnDestroy {
       next: () => {
         this.reviewActing.set(false);
         this.reviewFeedback = '';
+        this.actionCenter.loadReviewJobs();
+      },
+      error: () => this.reviewActing.set(false),
+    });
+  }
+
+  upgradeToVm(): void {
+    const item = this.selectedItem();
+    if (!item?.review) return;
+    this.reviewActing.set(true);
+    this.actionCenter.upgradeJobToVm(item.review.jobId).subscribe({
+      next: () => {
+        this.reviewActing.set(false);
+        this.actionCenter.loadReviewJobs();
+      },
+      error: () => this.reviewActing.set(false),
+    });
+  }
+
+  resumeWithoutVm(): void {
+    const item = this.selectedItem();
+    if (!item?.review) return;
+    this.reviewActing.set(true);
+    this.actionCenter.approveJob(item.review.jobId).subscribe({
+      next: () => {
+        this.reviewActing.set(false);
         this.actionCenter.loadReviewJobs();
       },
       error: () => this.reviewActing.set(false),

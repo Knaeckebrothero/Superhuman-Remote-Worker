@@ -1679,6 +1679,7 @@ async def lifespan(app: FastAPI):
         snapshot_service=snapshot_service,
         vm_provisioner=vm_provisioner,
         gitea_client=gitea_client,
+        container_provisioner=container_provisioner,
     )
 
     # Initialize notification feed (SSE broadcast for cockpit)
@@ -3884,8 +3885,10 @@ async def approve_job(
         # 3. Determine freeze type (backward compat: missing = job_complete)
         freeze_type = frozen_data.get("freeze_type", "job_complete")
 
-        if freeze_type == "phase_boundary":
-            # Phase boundary freeze: approve to continue execution (not complete)
+        if freeze_type in ("phase_boundary", "vm_upgrade_required"):
+            # Phase boundary or VM upgrade freeze: approve to continue execution
+            # (not complete). For vm_upgrade_required, this is the "resume without
+            # VM" path — the agent continues in the container and adapts.
             # Remove job_frozen.json from local workspace
             local_frozen = (
                 workspace_service.base_path
@@ -3904,7 +3907,12 @@ async def approve_job(
                     job_id,
                 )
 
-            logger.info(f"Job {job_id} phase boundary approved (resume execution)")
+            msg = (
+                f"Job {job_id} phase boundary approved (resume execution)"
+                if freeze_type == "phase_boundary"
+                else f"Job {job_id} vm_upgrade_required approved without VM (resume in container)"
+            )
+            logger.info(msg)
 
             return {
                 "status": "approved_continue",
@@ -3912,6 +3920,7 @@ async def approve_job(
                 "freeze_type": freeze_type,
                 "phase_type": frozen_data.get("phase_type"),
                 "phase_number": frozen_data.get("phase_number"),
+                "command": frozen_data.get("command"),
             }
 
         # job_complete freeze (or backward compat): mark as truly completed
@@ -3986,6 +3995,138 @@ async def approve_job(
         raise
     except Exception as e:
         logger.exception(f"Failed to approve job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/jobs/{job_id}/upgrade-to-vm")
+async def upgrade_job_to_vm(job_id: str) -> dict[str, Any]:
+    """Upgrade a frozen job from container workspace to a VM.
+
+    This endpoint is used when a job freezes with ``freeze_type: vm_upgrade_required``
+    (i.e. the agent attempted a sudo command in a hardened container). It:
+
+    1. Validates the job is frozen with the correct freeze type
+    2. Sets ``context.vm.requested = true`` so the dispatcher provisions a VM
+    3. Clears the freeze data
+    4. Sets status to ``paused`` (dispatchable)
+    5. Triggers the auto-dispatcher
+
+    The dispatcher then provisions a VM via ``vm_provisioner``, waits for it to
+    become ready, and dispatches the job to an agent with ``RemoteBackend`` pointed
+    at the VM. The agent resumes from its checkpoint with full sudo access (gated
+    by the VM's sudo approval system).
+
+    The original workspace container is NOT deleted immediately — it is cleaned up
+    when the job eventually completes or is cancelled (existing cleanup logic).
+    """
+    try:
+        # 1. Validate job
+        job = await postgres_db.get_job(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+
+        if job["status"] not in ("pending_review", "reviewing"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job cannot be upgraded (status: {job['status']}). "
+                f"Only frozen jobs can be upgraded to VMs.",
+            )
+
+        # 2. Read freeze data to validate freeze type
+        frozen_data = None
+        if job.get("freeze_data"):
+            frozen_data = job["freeze_data"]
+            if isinstance(frozen_data, str):
+                frozen_data = json.loads(frozen_data)
+
+        if frozen_data is None:
+            repo_name, job_branch = await resolve_job_repo(job_id)
+            if gitea_client.is_initialized:
+                frozen_data = await gitea_client.get_file(
+                    repo_name, "output/job_frozen.json", ref=job_branch
+                )
+            if frozen_data is None:
+                workspace_path = (
+                    workspace_service.base_path
+                    / f"job_{job_id}"
+                    / "output"
+                    / "job_frozen.json"
+                )
+                if workspace_path.exists():
+                    frozen_data = json.loads(workspace_path.read_text())
+
+        if frozen_data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No freeze data found for job '{job_id}'",
+            )
+
+        freeze_type = frozen_data.get("freeze_type")
+        if freeze_type != "vm_upgrade_required":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Job freeze type is '{freeze_type}', not 'vm_upgrade_required'. "
+                f"Use POST /api/jobs/{job_id}/approve instead.",
+            )
+
+        # 3. Check VM provisioner is available
+        if not vm_provisioner.is_available:
+            raise HTTPException(
+                status_code=503,
+                detail="VM provisioner is not available. Cannot upgrade to VM.",
+            )
+
+        # 4. Set context.vm.requested = true
+        job_context = job.get("context") or {}
+        if isinstance(job_context, str):
+            try:
+                job_context = json.loads(job_context)
+            except json.JSONDecodeError:
+                job_context = {}
+
+        vm_ctx = job_context.setdefault("vm", {})
+        vm_ctx["requested"] = True
+        vm_ctx["upgrade_from"] = "container"
+        vm_ctx["upgrade_command"] = frozen_data.get("command", "")
+
+        # 5. Remove freeze file from local workspace
+        local_frozen = (
+            workspace_service.base_path / f"job_{job_id}" / "output" / "job_frozen.json"
+        )
+        if local_frozen.exists():
+            local_frozen.unlink()
+
+        # 6. Update DB: clear freeze, set status to paused (dispatchable),
+        #    unassign agent so dispatcher can re-dispatch
+        async with postgres_db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET context = $1::jsonb, status = 'paused', "
+                "freeze_data = NULL, assigned_agent_id = NULL, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = $2::uuid",
+                json.dumps(job_context),
+                job_id,
+            )
+
+        logger.info(
+            f"Job {job_id} approved for VM upgrade "
+            f"(command={frozen_data.get('command', 'N/A')!r})"
+        )
+
+        # 7. Trigger dispatcher — it will provision a VM and dispatch
+        _trigger_dispatch()
+
+        return {
+            "status": "approved_vm_upgrade",
+            "job_id": job_id,
+            "freeze_type": freeze_type,
+            "command": frozen_data.get("command"),
+            "vm_provisioner_mode": vm_provisioner.mode,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Failed to upgrade job {job_id} to VM: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

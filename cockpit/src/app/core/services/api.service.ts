@@ -1,56 +1,51 @@
-import { Injectable, inject } from '@angular/core';
-import { HttpClient, HttpParams } from '@angular/common/http';
-import { Observable, catchError, of, tap } from 'rxjs';
-import { ToastService } from './toast.service';
+import {inject, Injectable} from '@angular/core';
+import {HttpClient, HttpParams} from '@angular/common/http';
+import {catchError, Observable, of, tap} from 'rxjs';
+import {ToastService} from './toast.service';
 import {
-  TableInfo,
-  TableDataResponse,
-  ColumnDef,
-  User,
-  Expert,
-  ExpertDetail,
-  Agent,
-  Job,
-  JobCreateRequest,
-  JobProgress,
-  JobStatistics,
-  DailyStatistics,
-  AgentStatistics,
-  StuckJob,
-  WorkspaceOverview,
-  Datasource,
-  DatasourceCreateRequest,
-  DatasourceUpdateRequest,
-  DatasourceTestResult,
-  Project,
-  ProjectCreateRequest,
-  ProjectUpdateRequest,
-  ProjectMember,
-  ProjectMemberAddRequest,
-  ProjectMemberUpdateRequest,
-  ProjectRepository,
-  ProjectRepositoryCreateRequest,
-  ProjectRepositoryUpdateRequest,
-  PromoteRequest,
-  KnowledgeSummary,
-  KnowledgeListResponse,
-  KnowledgeNoteDetail,
-  KnowledgeSearchResponse,
-  MemoryStats,
-  MemoryListResponse,
+    Agent,
+    AgentStatistics,
+    ColumnDef,
+    DailyStatistics,
+    Datasource,
+    DatasourceCreateRequest,
+    DatasourceTestResult,
+    DatasourceUpdateRequest,
+    Expert,
+    ExpertDetail,
+    Job,
+    JobCreateRequest,
+    JobProgress,
+    JobStatistics,
+    KnowledgeListResponse,
+    KnowledgeNoteDetail,
+    KnowledgeSearchResponse,
+    KnowledgeSummary,
+    MemoryListResponse,
+    MemoryStats,
+    Project,
+    ProjectCreateRequest,
+    ProjectMember,
+    ProjectMemberAddRequest,
+    ProjectMemberUpdateRequest,
+    ProjectRepository,
+    ProjectRepositoryCreateRequest,
+    ProjectRepositoryUpdateRequest,
+    ProjectUpdateRequest,
+    PromoteRequest,
+    StuckJob,
+    TableDataResponse,
+    TableInfo,
+    User,
+    WorkspaceOverview,
 } from '../models/api.model';
-import { UploadResponse, UploadInfo } from '../models/file.model';
-import {
-  JobSummary,
-  AuditEntry,
-  AuditResponse,
-  AuditFilterCategory,
-} from '../models/audit.model';
-import { LLMRequest } from '../../debug/request.model';
-import { GraphChangeResponse, GraphDelta } from '../../debug/graph.model';
-import { ChatEntry, ChatHistoryResponse } from '../models/chat.model';
-import { ThreadDetail, PendingActionCounts } from '../models/action.model';
-import { environment } from '../environment';
+import {UploadInfo, UploadResponse} from '../models/file.model';
+import {AuditEntry, AuditFilterCategory, AuditResponse, JobSummary,} from '../models/audit.model';
+import {LLMRequest} from '../../debug/request.model';
+import {GraphChangeResponse, GraphDelta} from '../../debug/graph.model';
+import {ChatEntry, ChatHistoryResponse} from '../models/chat.model';
+import {PendingActionCounts, ThreadDetail} from '../models/action.model';
+import {environment} from '../environment';
 
 /**
  * Response for bulk audit endpoint.
@@ -899,6 +894,28 @@ export class ApiService {
         catchError((error) => {
           console.error(`Failed to approve job ${jobId}:`, error);
           this.toast.error('Failed to approve job');
+          return of(null);
+        }),
+      );
+  }
+
+  /**
+   * Upgrade a frozen job from container workspace to a VM.
+   * Called when a job freezes with freeze_type: vm_upgrade_required.
+   */
+  upgradeJobToVm(
+    jobId: string,
+  ): Observable<{ status: string; job_id: string; vm_provisioner_mode: string } | null> {
+    return this.http
+      .post<{ status: string; job_id: string; vm_provisioner_mode: string }>(
+        `${this.baseUrl}/jobs/${jobId}/upgrade-to-vm`,
+        {},
+      )
+      .pipe(
+        tap(() => this.toast.success('VM upgrade initiated')),
+        catchError((error) => {
+          console.error(`Failed to upgrade job ${jobId} to VM:`, error);
+          this.toast.error('Failed to upgrade to VM');
           return of(null);
         }),
       );

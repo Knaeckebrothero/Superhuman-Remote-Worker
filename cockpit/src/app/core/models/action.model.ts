@@ -1,4 +1,4 @@
-import { SudoRequest } from '../services/sudo.service';
+import {SudoRequest} from '../services/sudo.service';
 
 export type ActionItemType = 'sudo' | 'message' | 'review';
 export type ActionItemStatus = 'pending' | 'resolved';
@@ -36,13 +36,14 @@ export interface ReviewActionData {
   jobId: string;
   jobDescription: string;
   configName: string | null;
-  freezeType: 'job_complete' | 'phase_boundary';
+  freezeType: 'job_complete' | 'phase_boundary' | 'vm_upgrade_required';
   phaseType: string | null;
   phaseNumber: number | null;
   summary: string | null;
   confidence: number | null;
   deliverables: string[];
   frozenAt: string | null;
+  command: string | null;
 }
 
 export interface ThreadMessage {
