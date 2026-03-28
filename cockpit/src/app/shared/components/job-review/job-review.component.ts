@@ -1,12 +1,12 @@
-import { Component, inject, signal, effect } from '@angular/core';
-import { FormsModule } from '@angular/forms';
-import { ApiService } from '../../../core/services/api.service';
-import { DataService } from '../../../core/services/data.service';
-import { Job } from '../../../core/models/api.model';
-import { environment } from '../../../core/environment';
+import {Component, effect, inject, signal} from '@angular/core';
+import {FormsModule} from '@angular/forms';
+import {ApiService} from '../../../core/services/api.service';
+import {DataService} from '../../../core/services/data.service';
+import {Job} from '../../../core/models/api.model';
+import {environment} from '../../../core/environment';
 
 interface FrozenJobData {
-  freeze_type?: string;    // "phase_boundary" | "job_complete"
+  freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
   phase_type?: string;     // "strategic" | "tactical"
   summary?: string;
   deliverables?: string[];
@@ -14,6 +14,8 @@ interface FrozenJobData {
   notes?: string;
   phase_number?: number;
   frozen_at?: string;
+  command?: string;        // sudo command that triggered vm_upgrade_required freeze
+  reason?: string;         // why the freeze happened
 }
 
 /**
@@ -150,44 +152,79 @@ interface FrozenJobData {
 
           <!-- Actions -->
           <div class="actions-section">
-            <!-- Approve / Continue (depends on freeze type) -->
-            <div class="action-group">
-              @if (frozenData()?.freeze_type === 'phase_boundary') {
-                <button
-                  class="btn continue-btn"
-                  (click)="continueJob()"
-                  [disabled]="isResuming()"
-                >
-                  @if (isResuming()) {
-                    Continuing...
-                  } @else {
-                    Continue
+            @if (frozenData()?.freeze_type === 'vm_upgrade_required') {
+              <!-- VM Upgrade Required -->
+              <div class="vm-upgrade-section">
+                <div class="upgrade-info">
+                  <div class="upgrade-title">Sudo Required</div>
+                  <div class="upgrade-reason">
+                    The agent attempted a privileged command in a hardened container:
+                  </div>
+                  @if (frozenData()!.command) {
+                    <code class="upgrade-command">{{ frozenData()!.command }}</code>
                   }
-                </button>
-              } @else {
-                @if (confirmingApprove()) {
+                  <div class="upgrade-hint">
+                    Upgrade to a VM for full sudo access (gated by the approval system),
+                    or resume without a VM (the agent will adapt).
+                  </div>
+                </div>
+                <div class="action-group">
                   <button
-                    class="btn approve-btn confirming"
-                    (click)="approveJob()"
-                    [disabled]="isApproving()"
+                    class="btn upgrade-btn"
+                    (click)="upgradeToVm()"
+                    [disabled]="isUpgrading()"
                   >
-                    Confirm Approve?
+                    @if (isUpgrading()) { Upgrading... } @else { Upgrade to VM }
                   </button>
-                } @else {
                   <button
-                    class="btn approve-btn"
-                    (click)="confirmApprove()"
-                    [disabled]="isApproving()"
+                    class="btn continue-btn"
+                    (click)="continueJob()"
+                    [disabled]="isResuming()"
                   >
-                    @if (isApproving()) {
-                      Approving...
+                    @if (isResuming()) { Resuming... } @else { Resume without VM }
+                  </button>
+                </div>
+              </div>
+            } @else {
+              <!-- Approve / Continue (depends on freeze type) -->
+              <div class="action-group">
+                @if (frozenData()?.freeze_type === 'phase_boundary') {
+                  <button
+                    class="btn continue-btn"
+                    (click)="continueJob()"
+                    [disabled]="isResuming()"
+                  >
+                    @if (isResuming()) {
+                      Continuing...
                     } @else {
-                      Approve
+                      Continue
                     }
                   </button>
+                } @else {
+                  @if (confirmingApprove()) {
+                    <button
+                      class="btn approve-btn confirming"
+                      (click)="approveJob()"
+                      [disabled]="isApproving()"
+                    >
+                      Confirm Approve?
+                    </button>
+                  } @else {
+                    <button
+                      class="btn approve-btn"
+                      (click)="confirmApprove()"
+                      [disabled]="isApproving()"
+                    >
+                      @if (isApproving()) {
+                        Approving...
+                      } @else {
+                        Approve
+                      }
+                    </button>
+                  }
                 }
-              }
-            </div>
+              </div>
+            }
 
             <!-- Divider -->
             <div class="divider">
@@ -608,6 +645,57 @@ interface FrozenJobData {
         color: #f38ba8;
         border-color: rgba(243, 139, 168, 0.3);
       }
+
+      /* VM Upgrade Section */
+      .vm-upgrade-section {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .upgrade-info {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+
+      .upgrade-title {
+        font-weight: 600;
+        color: #f9e2af;
+      }
+
+      .upgrade-reason {
+        color: var(--text-secondary, #a6adc8);
+        font-size: 0.85em;
+      }
+
+      .upgrade-command {
+        display: block;
+        padding: 8px 12px;
+        background: var(--code-bg, #11111b);
+        border: 1px solid var(--border-color, #313244);
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 0.9em;
+        color: var(--text-primary, #cdd6f4);
+        word-break: break-all;
+      }
+
+      .upgrade-hint {
+        color: var(--text-secondary, #a6adc8);
+        font-size: 0.8em;
+        font-style: italic;
+      }
+
+      .upgrade-btn {
+        background: rgba(249, 226, 175, 0.2) !important;
+        color: #f9e2af !important;
+        border: 1px solid #f9e2af !important;
+      }
+
+      .upgrade-btn:hover:not(:disabled) {
+        background: rgba(249, 226, 175, 0.3) !important;
+      }
     `,
   ],
 })
@@ -621,6 +709,7 @@ export class JobReviewComponent {
   readonly isLoading = signal(false);
   readonly isApproving = signal(false);
   readonly isResuming = signal(false);
+  readonly isUpgrading = signal(false);
   readonly resultMessage = signal<string | null>(null);
   readonly resultIsError = signal(false);
   readonly confirmingApprove = signal(false);
@@ -793,6 +882,26 @@ export class JobReviewComponent {
         this.loadJob();
       } else {
         this.resultMessage.set('Failed to approve job. Check console for details.');
+        this.resultIsError.set(true);
+      }
+    });
+  }
+
+  upgradeToVm(): void {
+    const jobId = this.currentJobId();
+    if (!jobId) return;
+
+    this.isUpgrading.set(true);
+    this.resultMessage.set(null);
+
+    this.api.upgradeJobToVm(jobId).subscribe((result) => {
+      this.isUpgrading.set(false);
+      if (result) {
+        this.resultMessage.set('VM upgrade initiated. The job will resume once the VM is ready.');
+        this.resultIsError.set(false);
+        this.loadJob();
+      } else {
+        this.resultMessage.set('Failed to upgrade to VM. Check console for details.');
         this.resultIsError.set(true);
       }
     });

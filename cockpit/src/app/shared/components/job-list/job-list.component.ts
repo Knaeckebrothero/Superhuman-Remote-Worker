@@ -231,6 +231,34 @@ interface JobRow {
                         Resume
                       </button>
                     }
+                    @if (row.job.status !== 'processing' && row.job.status !== 'completed' && row.job.status !== 'cancelled') {
+                      @if (cancelingJobIds().has(row.job.id)) {
+                        <button
+                          class="action-btn canceling"
+                          disabled
+                          title="Canceling job..."
+                        >
+                          <span class="btn-spinner"></span>
+                          Canceling
+                        </button>
+                      } @else if (confirmingCancelId() === row.job.id) {
+                        <button
+                          class="action-btn cancel confirming"
+                          (click)="cancelJob(row.job.id); $event.stopPropagation()"
+                          title="Click again to confirm cancellation"
+                        >
+                          Sure?
+                        </button>
+                      } @else {
+                        <button
+                          class="action-btn cancel"
+                          (click)="confirmCancel(row.job.id); $event.stopPropagation()"
+                          title="Cancel job"
+                        >
+                          Cancel
+                        </button>
+                      }
+                    }
                     @if (row.job.status === 'completed' && !row.job.project_id) {
                       <button
                         class="action-btn promote"

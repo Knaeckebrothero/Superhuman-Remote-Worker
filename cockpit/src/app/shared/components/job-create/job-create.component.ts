@@ -1,14 +1,21 @@
-import { Component, computed, inject, signal, effect, ElementRef, ViewChild, OnInit } from '@angular/core';
-import { FormsModule } from '@angular/forms';
-import { ActivatedRoute } from '@angular/router';
-import { ApiService } from '../../../core/services/api.service';
-import { FileHandlingService } from '../../../core/services/file-handling.service';
-import { JobArtifactService } from '../../../core/services/job-artifact.service';
-import { UserService } from '../../../core/services/user.service';
-import { JobCreateRequest, Expert, ExpertDetail, Datasource, DatasourceType, Project } from '../../../core/models/api.model';
-import { FilePreview, FileType, UploadStatus } from '../../../core/models/file.model';
-import { environment } from '../../../core/environment';
-import { ConfigEditorComponent } from '../config-editor/config-editor.component';
+import {Component, computed, effect, ElementRef, inject, OnInit, signal, ViewChild} from '@angular/core';
+import {FormsModule} from '@angular/forms';
+import {ActivatedRoute} from '@angular/router';
+import {ApiService} from '../../../core/services/api.service';
+import {FileHandlingService} from '../../../core/services/file-handling.service';
+import {JobArtifactService} from '../../../core/services/job-artifact.service';
+import {UserService} from '../../../core/services/user.service';
+import {
+    Datasource,
+    DatasourceType,
+    Expert,
+    ExpertDetail,
+    JobCreateRequest,
+    Project
+} from '../../../core/models/api.model';
+import {FilePreview, UploadStatus} from '../../../core/models/file.model';
+import {environment} from '../../../core/environment';
+import {ConfigEditorComponent} from '../config-editor/config-editor.component';
 
 /**
  * Job Create component for submitting new jobs with file upload support.
@@ -1655,6 +1662,17 @@ export class JobCreateComponent implements OnInit {
       }
     });
 
+    // Load projects reactively — waits for currentUserId to be available.
+    // On F5 refresh, the /api/auth/me call may not have completed by the time
+    // ngOnInit runs, so currentUserId() is null. This effect re-fires once the
+    // user is loaded, ensuring we always pass user_id to the backend.
+    effect(() => {
+      const userId = this.userService.currentUserId();
+      if (userId) {
+        this.loadProjects(userId);
+      }
+    });
+
     // Reset reasoning level when model changes to one that doesn't support it
     effect(() => {
       const options = this.strategicReasoningOptions();
@@ -1809,7 +1827,7 @@ export class JobCreateComponent implements OnInit {
   ngOnInit(): void {
     this.loadExperts();
     this.loadDatasources();
-    this.loadProjects();
+    // Projects are loaded via effect() in the constructor (waits for currentUserId)
     // Load framework defaults so toggles reflect the actual base config
     this.api.getExpertDetail('defaults').subscribe((d) => {
       if (d?.config) this.frameworkDefaults.set(d.config);
@@ -2223,9 +2241,8 @@ export class JobCreateComponent implements OnInit {
     });
   }
 
-  private loadProjects(): void {
-    const userId = this.userService.currentUserId();
-    this.api.getProjects(userId ?? undefined).subscribe((projects) => {
+  private loadProjects(userId: string): void {
+    this.api.getProjects(userId).subscribe((projects) => {
       this.projects.set(projects);
       // Check for ?project= query param (from "New Job" button on project detail)
       const qp = this.route.snapshot.queryParamMap.get('project');
