@@ -115,7 +115,9 @@ class TestResolvePodIp:
         )
 
         result = await service.resolve_pod_ip("job-1")
-        assert result == "10.0.2.1"  # pod_ip preferred (cluster-internal, not Tailscale)
+        assert (
+            result == "10.0.2.1"
+        )  # pod_ip preferred (cluster-internal, not Tailscale)
 
     @pytest.mark.asyncio
     async def test_cache_miss_vm_fallback_ssh_host(self, service):

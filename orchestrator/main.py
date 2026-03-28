@@ -420,9 +420,7 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
             if workspace_suspension_service.is_enabled:
                 count = await workspace_suspension_service.check_idle_all()
                 if count:
-                    logger.info(
-                        "Workspace sweeper: suspended %d containers", count
-                    )
+                    logger.info("Workspace sweeper: suspended %d containers", count)
         except Exception as e:
             logger.error("Error in workspace idle sweeper: %s", e)
 
@@ -1198,7 +1196,9 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         continue
                     elif container_ctx.get("status") in (
-                        "restoring", "suspending", "creating",
+                        "restoring",
+                        "suspending",
+                        "creating",
                     ):
                         # In-progress lifecycle operation — wait
                         continue
@@ -4427,7 +4427,9 @@ async def _spawn_scholar_subjob(
             # Set worktree_path if subjob inherits a workspace backend
             worktree_path = None
             if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-                worktree_path = f"/home/agent-host/worktrees/{short_id}-{scholar_config_name}"
+                worktree_path = (
+                    f"/home/agent-host/worktrees/{short_id}-{scholar_config_name}"
+                )
 
             async with postgres_db.acquire() as conn:
                 await conn.execute(
@@ -4950,7 +4952,9 @@ async def _trigger_verification_on_complete(
                 # Set worktree_path if subjob inherits a workspace backend
                 worktree_path = None
                 if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
-                    worktree_path = f"/home/agent-host/worktrees/{short_id}-{critic_config}"
+                    worktree_path = (
+                        f"/home/agent-host/worktrees/{short_id}-{critic_config}"
+                    )
 
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
