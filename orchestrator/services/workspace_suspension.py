@@ -80,7 +80,7 @@ class WorkspaceSuspensionService:
         if not job:
             return False
 
-        ctx = (job.get("context") or {})
+        ctx = job.get("context") or {}
         ws_ctx = ctx.get("workspace_container", {})
         pod_ip = ws_ctx.get("pod_ip")
 
@@ -158,7 +158,8 @@ class WorkspaceSuspensionService:
             if not ok:
                 logger.error("Failed to create pod for restore of job %s", job_id)
                 await self._db.merge_workspace_container_context(
-                    job_id, {"status": "failed", "error": "pod creation failed on restore"}
+                    job_id,
+                    {"status": "failed", "error": "pod creation failed on restore"},
                 )
                 return False
 
@@ -185,7 +186,9 @@ class WorkspaceSuspensionService:
                     "restored_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-            logger.info("Workspace restored from S3 for job %s (pod_ip=%s)", job_id, pod_ip)
+            logger.info(
+                "Workspace restored from S3 for job %s (pod_ip=%s)", job_id, pod_ip
+            )
             return True
 
         except Exception:
@@ -212,10 +215,14 @@ class WorkspaceSuspensionService:
 
             ssh_cmd = [
                 "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=10",
-                "-p", "22",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                "22",
                 f"agent-host@{ssh_host}",
                 "zstd -d | tar -xf - -C /",
             ]

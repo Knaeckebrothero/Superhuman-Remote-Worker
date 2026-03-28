@@ -53,7 +53,11 @@ class TestJobNeedsContainerInherited:
         """Job with inherited ready VM does not need a container."""
         job = {
             "context": {
-                "vm": {"status": "ready", "ssh_host": "100.64.0.1", "pod_ip": "10.0.2.1"}
+                "vm": {
+                    "status": "ready",
+                    "ssh_host": "100.64.0.1",
+                    "pod_ip": "10.0.2.1",
+                }
             },
             "config_override": {},
         }
@@ -230,13 +234,17 @@ class TestWorktreePathComputation:
 
         # With VM
         worktree_path = None
-        if parent_ctx_with_vm.get("vm") or parent_ctx_with_vm.get("workspace_container"):
+        if parent_ctx_with_vm.get("vm") or parent_ctx_with_vm.get(
+            "workspace_container"
+        ):
             worktree_path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
         assert worktree_path is not None
 
         # Without backend
         worktree_path = None
-        if parent_ctx_without.get("vm") or parent_ctx_without.get("workspace_container"):
+        if parent_ctx_without.get("vm") or parent_ctx_without.get(
+            "workspace_container"
+        ):
             worktree_path = f"/home/agent-host/worktrees/{short_id}-{config_name}"
         assert worktree_path is None
 
@@ -256,8 +264,11 @@ class TestDispatchWorktreePath:
             "git_remote_url": "http://git/repo",
         }
         extracted_keys = {
-            "upload_id", "config_upload_id", "instructions_upload_id",
-            "instructions", "git_remote_url",
+            "upload_id",
+            "config_upload_id",
+            "instructions_upload_id",
+            "instructions",
+            "git_remote_url",
         }
         remaining_context = {
             k: v for k, v in job_context.items() if k not in extracted_keys
@@ -335,7 +346,8 @@ class TestGitManagerFromWorktree:
 
             subprocess.run(
                 ["git", "init", str(worktree_path)],
-                capture_output=True, check=True,
+                capture_output=True,
+                check=True,
             )
 
             mgr = GitManager.from_worktree(worktree_path)
@@ -351,18 +363,37 @@ class TestGitManagerFromWorktree:
             parent_repo.mkdir()
             subprocess.run(
                 ["git", "init", str(parent_repo)],
-                capture_output=True, check=True,
+                capture_output=True,
+                check=True,
             )
             subprocess.run(
-                ["git", "-C", str(parent_repo), "commit", "--allow-empty", "-m", "init"],
-                capture_output=True, check=True,
+                [
+                    "git",
+                    "-C",
+                    str(parent_repo),
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+                capture_output=True,
+                check=True,
             )
 
             wt_path = Path(tmpdir) / "worktree"
             subprocess.run(
-                ["git", "-C", str(parent_repo), "worktree", "add",
-                 str(wt_path), "-b", "test-branch"],
-                capture_output=True, check=True,
+                [
+                    "git",
+                    "-C",
+                    str(parent_repo),
+                    "worktree",
+                    "add",
+                    str(wt_path),
+                    "-b",
+                    "test-branch",
+                ],
+                capture_output=True,
+                check=True,
             )
 
             # .git should be a file, not directory
@@ -532,7 +563,11 @@ class TestJobNeedsVmInherited:
         """Inherited VM (status=ready, no requested=True) must return False."""
         job = {
             "context": {
-                "vm": {"status": "ready", "ssh_host": "100.64.0.1", "pod_ip": "10.0.2.1"}
+                "vm": {
+                    "status": "ready",
+                    "ssh_host": "100.64.0.1",
+                    "pod_ip": "10.0.2.1",
+                }
             },
             "config_override": {},
         }
@@ -557,9 +592,9 @@ class TestJobNeedsVmInherited:
     def test_inherited_vm_context_as_json_string(self):
         """Inherited VM in JSON string context does not need new VM."""
         job = {
-            "context": json.dumps({
-                "vm": {"status": "ready", "ssh_host": "100.64.0.1"}
-            }),
+            "context": json.dumps(
+                {"vm": {"status": "ready", "ssh_host": "100.64.0.1"}}
+            ),
             "config_override": {},
         }
         assert _job_needs_vm_logic(job) is False
@@ -578,7 +613,11 @@ class TestJobNeedsVmInherited:
         """
         job = {
             "context": {
-                "vm": {"status": "ready", "ssh_host": "100.64.0.1", "pod_ip": "10.0.2.1"}
+                "vm": {
+                    "status": "ready",
+                    "ssh_host": "100.64.0.1",
+                    "pod_ip": "10.0.2.1",
+                }
             },
             "config_override": {},
         }
@@ -650,7 +689,10 @@ class TestDispatchParentJobUnaffected:
             if remote:
                 remote["workspace_path"] = worktree_path
 
-        assert config_override["workspace"]["remote"]["workspace_path"] == "/home/agent-host/workspace"
+        assert (
+            config_override["workspace"]["remote"]["workspace_path"]
+            == "/home/agent-host/workspace"
+        )
 
     def test_parent_job_no_worktree_in_context(self):
         """Parent job's remaining_context has no worktree_path."""

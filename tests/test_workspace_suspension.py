@@ -83,7 +83,11 @@ def make_job(
     last_activity=None,
 ):
     """Create a minimal job dict."""
-    ws_ctx = {"status": ws_status, "pod_ip": pod_ip, "pod_name": f"workspace-{job_id[:12]}"}
+    ws_ctx = {
+        "status": ws_status,
+        "pod_ip": pod_ip,
+        "pod_name": f"workspace-{job_id[:12]}",
+    }
     if last_activity:
         ws_ctx["last_activity"] = last_activity
     return {
@@ -218,7 +222,9 @@ class TestSuspendWorkspace:
         svc = make_service()
         job = make_job()
         svc._db.get_job.return_value = job
-        svc._snapshot_service.capture_vm_snapshot.side_effect = RuntimeError("ssh failed")
+        svc._snapshot_service.capture_vm_snapshot.side_effect = RuntimeError(
+            "ssh failed"
+        )
 
         result = await svc.suspend_workspace(job["id"])
 
@@ -242,7 +248,9 @@ class TestRestoreWorkspace:
             ws_status="restoring", pod_ip="10.0.0.99"
         )
 
-        with patch.object(svc, "_extract_snapshot", new_callable=AsyncMock) as mock_extract:
+        with patch.object(
+            svc, "_extract_snapshot", new_callable=AsyncMock
+        ) as mock_extract:
             result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
         assert result is True
@@ -252,7 +260,10 @@ class TestRestoreWorkspace:
         )
         # Status transitions: restoring → ready
         calls = svc._db.merge_workspace_container_context.call_args_list
-        assert calls[0][0] == ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", {"status": "restoring"})
+        assert calls[0][0] == (
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            {"status": "restoring"},
+        )
         last_call = calls[-1][0]
         assert last_call[1]["status"] == "ready"
         assert "restored_at" in last_call[1]
@@ -433,6 +444,7 @@ class TestIdleTimeout:
         with patch.dict("os.environ", {}, clear=False):
             # Remove WORKSPACE_IDLE_TIMEOUT if it exists
             import os
+
             os.environ.pop("WORKSPACE_IDLE_TIMEOUT", None)
             assert svc.idle_timeout_minutes == 30
 
@@ -464,7 +476,9 @@ class TestStatusTransitions:
     async def test_restore_transitions(self):
         """Verify the exact status transition sequence during restore."""
         svc = make_service()
-        svc._db.get_job.return_value = make_job(ws_status="restoring", pod_ip="10.0.0.99")
+        svc._db.get_job.return_value = make_job(
+            ws_status="restoring", pod_ip="10.0.0.99"
+        )
 
         with patch.object(svc, "_extract_snapshot", new_callable=AsyncMock):
             await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -537,7 +551,9 @@ class TestRestoreExtractionFailure:
         from Gitea).
         """
         svc = make_service()
-        svc._db.get_job.return_value = make_job(ws_status="restoring", pod_ip="10.0.0.99")
+        svc._db.get_job.return_value = make_job(
+            ws_status="restoring", pod_ip="10.0.0.99"
+        )
         svc._snapshot_service.download_snapshot.return_value = False
 
         result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -551,10 +567,16 @@ class TestRestoreExtractionFailure:
     async def test_restore_exception_during_extract(self):
         """If extraction throws, restore fails and status is set to failed."""
         svc = make_service()
-        svc._db.get_job.return_value = make_job(ws_status="restoring", pod_ip="10.0.0.99")
+        svc._db.get_job.return_value = make_job(
+            ws_status="restoring", pod_ip="10.0.0.99"
+        )
 
-        with patch.object(svc, "_extract_snapshot", new_callable=AsyncMock,
-                          side_effect=RuntimeError("SSH connection refused")):
+        with patch.object(
+            svc,
+            "_extract_snapshot",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("SSH connection refused"),
+        ):
             result = await svc.restore_workspace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 
         assert result is False
@@ -601,10 +623,16 @@ class TestMultipleContainerSweep:
 
         # Mock get_job for each job
         svc._db.get_job.side_effect = [
-            make_job(job_id="aaaaaaaa-1111-1111-1111-111111111111", pod_ip="10.0.0.1",
-                     last_activity=old_time),
-            make_job(job_id="bbbbbbbb-2222-2222-2222-222222222222", pod_ip="10.0.0.2",
-                     last_activity=old_time),
+            make_job(
+                job_id="aaaaaaaa-1111-1111-1111-111111111111",
+                pod_ip="10.0.0.1",
+                last_activity=old_time,
+            ),
+            make_job(
+                job_id="bbbbbbbb-2222-2222-2222-222222222222",
+                pod_ip="10.0.0.2",
+                last_activity=old_time,
+            ),
         ]
 
         count = await svc.check_idle_all()
@@ -648,10 +676,16 @@ class TestMultipleContainerSweep:
         svc._snapshot_service.capture_vm_snapshot.side_effect = [False, True]
 
         svc._db.get_job.side_effect = [
-            make_job(job_id="aaaaaaaa-1111-1111-1111-111111111111", pod_ip="10.0.0.1",
-                     last_activity=old_time),
-            make_job(job_id="bbbbbbbb-2222-2222-2222-222222222222", pod_ip="10.0.0.2",
-                     last_activity=old_time),
+            make_job(
+                job_id="aaaaaaaa-1111-1111-1111-111111111111",
+                pod_ip="10.0.0.1",
+                last_activity=old_time,
+            ),
+            make_job(
+                job_id="bbbbbbbb-2222-2222-2222-222222222222",
+                pod_ip="10.0.0.2",
+                last_activity=old_time,
+            ),
         ]
 
         count = await svc.check_idle_all()
@@ -699,10 +733,14 @@ class TestSuspendRestoreRoundTrip:
 
         # Phase 2: Restore
         svc._db.get_job.return_value = make_job(
-            job_id=job_id, ws_status="restoring", pod_ip="10.0.0.99"  # new IP
+            job_id=job_id,
+            ws_status="restoring",
+            pod_ip="10.0.0.99",  # new IP
         )
 
-        with patch.object(svc, "_extract_snapshot", new_callable=AsyncMock) as mock_extract:
+        with patch.object(
+            svc, "_extract_snapshot", new_callable=AsyncMock
+        ) as mock_extract:
             ok = await svc.restore_workspace(job_id)
 
         assert ok is True
