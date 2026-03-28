@@ -54,7 +54,9 @@ def make_job(
     }
 
 
-def make_vm_upgrade_freeze(command: str = "sudo apt-get install -y libxml2-dev") -> dict:
+def make_vm_upgrade_freeze(
+    command: str = "sudo apt-get install -y libxml2-dev",
+) -> dict:
     """Create freeze_data for a vm_upgrade_required freeze."""
     return {
         "freeze_type": "vm_upgrade_required",
@@ -89,9 +91,7 @@ def _job_needs_vm(job: dict) -> bool:
     return co.get("workspace", {}).get("backend") == "remote"
 
 
-def _simulate_approve(
-    job: dict, workspace_base: Path
-) -> tuple[dict, str | None]:
+def _simulate_approve(job: dict, workspace_base: Path) -> tuple[dict, str | None]:
     """Simulate the approve_job endpoint logic for vm_upgrade_required.
 
     Returns (result_dict, sql_executed) tuple.
@@ -105,9 +105,7 @@ def _simulate_approve(
 
     if freeze_type in ("phase_boundary", "vm_upgrade_required"):
         # Remove local freeze file
-        local_frozen = (
-            workspace_base / f"job_{job_id}" / "output" / "job_frozen.json"
-        )
+        local_frozen = workspace_base / f"job_{job_id}" / "output" / "job_frozen.json"
         if local_frozen.exists():
             local_frozen.unlink()
 
@@ -141,9 +139,7 @@ def _simulate_upgrade(
 
     # Validate status
     if job["status"] not in ("pending_review", "reviewing"):
-        raise ValueError(
-            f"Job cannot be upgraded (status: {job['status']})"
-        )
+        raise ValueError(f"Job cannot be upgraded (status: {job['status']})")
 
     # Validate freeze data
     frozen_data = job.get("freeze_data")
@@ -169,9 +165,7 @@ def _simulate_upgrade(
     vm_ctx["upgrade_command"] = frozen_data.get("command", "")
 
     # Remove local freeze file
-    local_frozen = (
-        workspace_base / f"job_{job_id}" / "output" / "job_frozen.json"
-    )
+    local_frozen = workspace_base / f"job_{job_id}" / "output" / "job_frozen.json"
     if local_frozen.exists():
         local_frozen.unlink()
 
@@ -436,7 +430,9 @@ class TestUpgradeContextFlow:
     def test_full_upgrade_flow(self, tmp_path):
         """Simulate the complete flow from freeze to dispatch-ready state."""
         # Step 1: Job freezes with vm_upgrade_required
-        freeze_data = make_vm_upgrade_freeze(command="sudo apt-get install -y libjpeg-dev")
+        freeze_data = make_vm_upgrade_freeze(
+            command="sudo apt-get install -y libjpeg-dev"
+        )
         job = make_job(
             status="pending_review",
             freeze_data=freeze_data,
@@ -455,7 +451,10 @@ class TestUpgradeContextFlow:
         assert result["status"] == "approved_vm_upgrade"
         assert updated_ctx["vm"]["requested"] is True
         assert updated_ctx["vm"]["upgrade_from"] == "container"
-        assert updated_ctx["vm"]["upgrade_command"] == "sudo apt-get install -y libjpeg-dev"
+        assert (
+            updated_ctx["vm"]["upgrade_command"]
+            == "sudo apt-get install -y libjpeg-dev"
+        )
 
         # Step 3: Dispatcher picks up the job — _job_needs_vm detects the request
         simulated_job = make_job(

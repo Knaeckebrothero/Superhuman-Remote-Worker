@@ -89,7 +89,9 @@ def mock_nats_bridge():
     bridge.is_available = False
     bridge.request_vm_create = AsyncMock(return_value=True)
     bridge.request_vm_delete = AsyncMock(return_value=True)
-    bridge.query_vm_status = AsyncMock(return_value={"job_id": "test", "status": "running"})
+    bridge.query_vm_status = AsyncMock(
+        return_value={"job_id": "test", "status": "running"}
+    )
     bridge.send_control = AsyncMock(return_value=True)
     return bridge
 
@@ -106,18 +108,22 @@ def mock_db():
 def mock_k8s_api():
     """Create a mock Kubernetes CustomObjectsApi."""
     api = MagicMock()
-    api.create_namespaced_custom_object = MagicMock(return_value={"metadata": {"name": "agent-vm-test"}})
+    api.create_namespaced_custom_object = MagicMock(
+        return_value={"metadata": {"name": "agent-vm-test"}}
+    )
     api.delete_namespaced_custom_object = MagicMock(return_value={"status": "Success"})
-    api.get_namespaced_custom_object = MagicMock(return_value={
-        "metadata": {"name": "agent-vm-test-job-123"},
-        "status": {
-            "printableStatus": "Running",
-            "created": True,
-            "conditions": [
-                {"type": "Ready", "status": "True"},
-            ],
-        },
-    })
+    api.get_namespaced_custom_object = MagicMock(
+        return_value={
+            "metadata": {"name": "agent-vm-test-job-123"},
+            "status": {
+                "printableStatus": "Running",
+                "created": True,
+                "conditions": [
+                    {"type": "Ready", "status": "True"},
+                ],
+            },
+        }
+    )
     return api
 
 
@@ -132,11 +138,14 @@ def template_file(tmp_path):
 @pytest.fixture
 def provisioner_with_k8s(mock_k8s_api, template_file, mock_db):
     """Create a VMProvisioner configured for direct K8s mode."""
-    with patch.dict(os.environ, {"VM_TEMPLATE_PATH": template_file, "VM_NAMESPACE": "test-ns"}):
+    with patch.dict(
+        os.environ, {"VM_TEMPLATE_PATH": template_file, "VM_NAMESPACE": "test-ns"}
+    ):
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             # Import fresh to get clean singleton behavior
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._k8s = mock_k8s_api
             prov._k8s_available = True
@@ -153,6 +162,7 @@ def provisioner_with_nats(mock_nats_bridge, mock_db):
     with patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge):
         mock_nats_bridge.is_available = True
         from orchestrator.services.vm_provisioner import VMProvisioner
+
         prov = VMProvisioner()
         prov._db = mock_db
         yield prov
@@ -164,6 +174,7 @@ def provisioner_disabled():
     with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
         nb.is_available = False
         from orchestrator.services.vm_provisioner import VMProvisioner
+
         prov = VMProvisioner()
         prov._k8s_available = False
         prov._k8s = None
@@ -181,9 +192,12 @@ class TestBackendSelection:
 
     def test_mode_nats_when_nats_available(self, mock_nats_bridge):
         """Mode returns 'nats' when NATS bridge is available."""
-        with patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge):
+        with patch(
+            "orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge
+        ):
             mock_nats_bridge.is_available = True
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             assert prov.mode == "nats"
             assert prov.is_available is True
@@ -193,6 +207,7 @@ class TestBackendSelection:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._k8s_available = True
             assert prov.mode == "direct"
@@ -205,9 +220,12 @@ class TestBackendSelection:
 
     def test_nats_takes_priority_over_k8s(self, mock_nats_bridge):
         """NATS is preferred when both backends are available."""
-        with patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge):
+        with patch(
+            "orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge
+        ):
             mock_nats_bridge.is_available = True
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._k8s_available = True
             assert prov.mode == "nats"
@@ -217,6 +235,7 @@ class TestBackendSelection:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             assert prov.is_available is False
 
@@ -234,6 +253,7 @@ class TestConnect:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             with patch.object(prov, "_init_k8s"):
                 prov.connect(mock_db)
@@ -244,6 +264,7 @@ class TestConnect:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             with patch.object(prov, "_init_k8s") as mock_init:
                 prov.connect(mock_db)
@@ -255,6 +276,7 @@ class TestConnect:
             nb.is_available = False
             with patch("orchestrator.services.vm_provisioner.K8S_AVAILABLE", False):
                 from orchestrator.services.vm_provisioner import VMProvisioner
+
                 prov = VMProvisioner()
                 prov._init_k8s()
                 assert prov._k8s is None
@@ -267,10 +289,19 @@ class TestConnect:
             with patch("orchestrator.services.vm_provisioner.K8S_AVAILABLE", True):
                 mock_k8s_config = MagicMock()
                 mock_k8s_client = MagicMock()
-                with patch("orchestrator.services.vm_provisioner.k8s_config", mock_k8s_config), \
-                     patch("orchestrator.services.vm_provisioner.k8s_client", mock_k8s_client), \
-                     patch.dict(os.environ, {"VM_TEMPLATE_PATH": template_file}):
+                with (
+                    patch(
+                        "orchestrator.services.vm_provisioner.k8s_config",
+                        mock_k8s_config,
+                    ),
+                    patch(
+                        "orchestrator.services.vm_provisioner.k8s_client",
+                        mock_k8s_client,
+                    ),
+                    patch.dict(os.environ, {"VM_TEMPLATE_PATH": template_file}),
+                ):
                     from orchestrator.services.vm_provisioner import VMProvisioner
+
                     prov = VMProvisioner()
                     prov._init_k8s()
                     mock_k8s_config.load_incluster_config.assert_called_once()
@@ -282,13 +313,26 @@ class TestConnect:
             nb.is_available = False
             with patch("orchestrator.services.vm_provisioner.K8S_AVAILABLE", True):
                 mock_k8s_config = MagicMock()
-                mock_k8s_config.ConfigException = type("ConfigException", (Exception,), {})
-                mock_k8s_config.load_incluster_config.side_effect = mock_k8s_config.ConfigException("no cluster")
+                mock_k8s_config.ConfigException = type(
+                    "ConfigException", (Exception,), {}
+                )
+                mock_k8s_config.load_incluster_config.side_effect = (
+                    mock_k8s_config.ConfigException("no cluster")
+                )
                 mock_k8s_client = MagicMock()
-                with patch("orchestrator.services.vm_provisioner.k8s_config", mock_k8s_config), \
-                     patch("orchestrator.services.vm_provisioner.k8s_client", mock_k8s_client), \
-                     patch.dict(os.environ, {"VM_TEMPLATE_PATH": template_file}):
+                with (
+                    patch(
+                        "orchestrator.services.vm_provisioner.k8s_config",
+                        mock_k8s_config,
+                    ),
+                    patch(
+                        "orchestrator.services.vm_provisioner.k8s_client",
+                        mock_k8s_client,
+                    ),
+                    patch.dict(os.environ, {"VM_TEMPLATE_PATH": template_file}),
+                ):
                     from orchestrator.services.vm_provisioner import VMProvisioner
+
                     prov = VMProvisioner()
                     prov._init_k8s()
                     mock_k8s_config.load_kube_config.assert_called_once()
@@ -300,13 +344,28 @@ class TestConnect:
             nb.is_available = False
             with patch("orchestrator.services.vm_provisioner.K8S_AVAILABLE", True):
                 mock_k8s_config = MagicMock()
-                mock_k8s_config.ConfigException = type("ConfigException", (Exception,), {})
-                mock_k8s_config.load_incluster_config.side_effect = mock_k8s_config.ConfigException("no cluster")
-                mock_k8s_config.load_kube_config.side_effect = mock_k8s_config.ConfigException("no kubeconfig")
+                mock_k8s_config.ConfigException = type(
+                    "ConfigException", (Exception,), {}
+                )
+                mock_k8s_config.load_incluster_config.side_effect = (
+                    mock_k8s_config.ConfigException("no cluster")
+                )
+                mock_k8s_config.load_kube_config.side_effect = (
+                    mock_k8s_config.ConfigException("no kubeconfig")
+                )
                 mock_k8s_client = MagicMock()
-                with patch("orchestrator.services.vm_provisioner.k8s_config", mock_k8s_config), \
-                     patch("orchestrator.services.vm_provisioner.k8s_client", mock_k8s_client):
+                with (
+                    patch(
+                        "orchestrator.services.vm_provisioner.k8s_config",
+                        mock_k8s_config,
+                    ),
+                    patch(
+                        "orchestrator.services.vm_provisioner.k8s_client",
+                        mock_k8s_client,
+                    ),
+                ):
                     from orchestrator.services.vm_provisioner import VMProvisioner
+
                     prov = VMProvisioner()
                     prov._init_k8s()
                     assert prov._k8s is None
@@ -318,9 +377,14 @@ class TestConnect:
             nb.is_available = False
             with patch("orchestrator.services.vm_provisioner.K8S_AVAILABLE", True):
                 mock_k8s_config = MagicMock()
-                mock_k8s_config.load_incluster_config.side_effect = RuntimeError("unexpected")
-                with patch("orchestrator.services.vm_provisioner.k8s_config", mock_k8s_config):
+                mock_k8s_config.load_incluster_config.side_effect = RuntimeError(
+                    "unexpected"
+                )
+                with patch(
+                    "orchestrator.services.vm_provisioner.k8s_config", mock_k8s_config
+                ):
                     from orchestrator.services.vm_provisioner import VMProvisioner
+
                     prov = VMProvisioner()
                     prov._init_k8s()
                     assert prov._k8s is None
@@ -341,6 +405,7 @@ class TestTemplateLoading:
             nb.is_available = False
             with patch.dict(os.environ, {"VM_TEMPLATE_PATH": template_file}):
                 from orchestrator.services.vm_provisioner import VMProvisioner
+
                 prov = VMProvisioner()
                 prov._k8s = MagicMock()  # Pretend K8s is initialized
                 prov._load_template()
@@ -351,8 +416,11 @@ class TestTemplateLoading:
         """K8s is disabled when template file does not exist."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
-            with patch.dict(os.environ, {"VM_TEMPLATE_PATH": "/nonexistent/template.yaml"}):
+            with patch.dict(
+                os.environ, {"VM_TEMPLATE_PATH": "/nonexistent/template.yaml"}
+            ):
                 from orchestrator.services.vm_provisioner import VMProvisioner
+
                 prov = VMProvisioner()
                 prov._k8s = MagicMock()
                 prov._load_template()
@@ -365,9 +433,12 @@ class TestTemplateLoading:
             nb.is_available = False
             env = dict(os.environ)
             env.pop("VM_TEMPLATE_PATH", None)
-            with patch.dict(os.environ, env, clear=True), \
-                 patch("os.path.exists", return_value=False):
+            with (
+                patch.dict(os.environ, env, clear=True),
+                patch("os.path.exists", return_value=False),
+            ):
                 from orchestrator.services.vm_provisioner import VMProvisioner
+
                 prov = VMProvisioner()
                 prov._k8s = MagicMock()
                 prov._load_template()
@@ -386,6 +457,7 @@ class TestTemplateLoading:
             env.pop("VM_TEMPLATE_PATH", None)
             with patch.dict(os.environ, env, clear=True):
                 from orchestrator.services.vm_provisioner import VMProvisioner
+
                 prov = VMProvisioner()
                 prov._k8s = MagicMock()
 
@@ -397,11 +469,15 @@ class TestTemplateLoading:
                         return True
                     return orig_exists(p)
 
-                with patch("os.path.exists", side_effect=custom_exists), \
-                     patch("builtins.open", create=True) as mock_open:
+                with (
+                    patch("os.path.exists", side_effect=custom_exists),
+                    patch("builtins.open", create=True) as mock_open,
+                ):
                     mock_open.return_value.__enter__ = lambda s: s
                     mock_open.return_value.__exit__ = MagicMock(return_value=False)
-                    mock_open.return_value.read = MagicMock(return_value=SAMPLE_VM_TEMPLATE)
+                    mock_open.return_value.read = MagicMock(
+                        return_value=SAMPLE_VM_TEMPLATE
+                    )
                     prov._load_template()
                     assert prov._k8s_available is True
 
@@ -430,8 +506,16 @@ class TestTemplateRendering:
         assert result["metadata"]["name"] == "agent-vm-abc-123"
         assert result["metadata"]["labels"]["job-id"] == "abc-123"
         assert result["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 4
-        assert result["spec"]["template"]["spec"]["domain"]["resources"]["requests"]["memory"] == "8Gi"
-        assert result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"]["image"] == "ghcr.io/example/vm:v1"
+        assert (
+            result["spec"]["template"]["spec"]["domain"]["resources"]["requests"][
+                "memory"
+            ]
+            == "8Gi"
+        )
+        assert (
+            result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"]["image"]
+            == "ghcr.io/example/vm:v1"
+        )
         assert result["spec"]["config"]["agentConfig"] == "scholar"
         assert result["spec"]["config"]["natsUrl"] == "nats://nats:4222"
         assert result["spec"]["config"]["description"] == "Research task"
@@ -447,7 +531,12 @@ class TestTemplateRendering:
         # Defaults: agent_config=defaults, cpu=2, memory=4Gi
         assert result["spec"]["config"]["agentConfig"] == "defaults"
         assert result["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 2
-        assert result["spec"]["template"]["spec"]["domain"]["resources"]["requests"]["memory"] == "4Gi"
+        assert (
+            result["spec"]["template"]["spec"]["domain"]["resources"]["requests"][
+                "memory"
+            ]
+            == "4Gi"
+        )
 
     def test_render_template_uses_default_vm_image(self, provisioner_with_k8s):
         """Template uses DEFAULT_VM_IMAGE when vm_image is None."""
@@ -458,7 +547,9 @@ class TestTemplateRendering:
         result = provisioner_with_k8s._render_template(job_config)
 
         # Should use the default image from the provisioner
-        image = result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"]["image"]
+        image = result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"][
+            "image"
+        ]
         assert image == provisioner_with_k8s._default_vm_image
 
     def test_render_template_custom_vm_image(self, provisioner_with_k8s):
@@ -470,7 +561,9 @@ class TestTemplateRendering:
         }
         result = provisioner_with_k8s._render_template(job_config)
 
-        image = result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"]["image"]
+        image = result["spec"]["template"]["spec"]["volumes"][0]["containerDisk"][
+            "image"
+        ]
         assert image == custom_image
 
     def test_render_template_cpu_cores_as_int(self, provisioner_with_k8s):
@@ -491,7 +584,9 @@ class TestTemplateRendering:
         result = provisioner_with_k8s._render_template(job_config)
         assert result["spec"]["config"]["description"] == ""
 
-    def test_render_template_special_characters_in_description(self, provisioner_with_k8s):
+    def test_render_template_special_characters_in_description(
+        self, provisioner_with_k8s
+    ):
         """Template handles descriptions with special YAML characters."""
         job_config = {
             "job_id": "test-special",
@@ -511,7 +606,9 @@ class TestCreateVm:
     """Tests for create_vm() across both backends."""
 
     @pytest.mark.asyncio
-    async def test_create_vm_nats_backend(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_create_vm_nats_backend(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """create_vm() delegates to nats_bridge when NATS is available."""
         result = await provisioner_with_nats.create_vm(
             job_id="job-001",
@@ -532,7 +629,9 @@ class TestCreateVm:
         )
 
     @pytest.mark.asyncio
-    async def test_create_vm_direct_backend(self, provisioner_with_k8s, mock_k8s_api, mock_db):
+    async def test_create_vm_direct_backend(
+        self, provisioner_with_k8s, mock_k8s_api, mock_db
+    ):
         """create_vm() calls K8s API directly when NATS is unavailable."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -552,7 +651,9 @@ class TestCreateVm:
         assert call_kwargs[1]["plural"] == "virtualmachines"
 
     @pytest.mark.asyncio
-    async def test_create_vm_direct_updates_context_on_success(self, provisioner_with_k8s, mock_db):
+    async def test_create_vm_direct_updates_context_on_success(
+        self, provisioner_with_k8s, mock_db
+    ):
         """Successful direct create_vm() updates job context with created status."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -570,9 +671,13 @@ class TestCreateVm:
         assert "vm_name" in ctx
 
     @pytest.mark.asyncio
-    async def test_create_vm_direct_updates_context_on_failure(self, provisioner_with_k8s, mock_k8s_api, mock_db):
+    async def test_create_vm_direct_updates_context_on_failure(
+        self, provisioner_with_k8s, mock_k8s_api, mock_db
+    ):
         """Failed direct create_vm() updates job context with failed status."""
-        mock_k8s_api.create_namespaced_custom_object.side_effect = Exception("API server unreachable")
+        mock_k8s_api.create_namespaced_custom_object.side_effect = Exception(
+            "API server unreachable"
+        )
 
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -595,14 +700,18 @@ class TestCreateVm:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_create_vm_nats_failure(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_create_vm_nats_failure(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """create_vm() returns False when NATS publish fails."""
         mock_nats_bridge.request_vm_create = AsyncMock(return_value=False)
         result = await provisioner_with_nats.create_vm(job_id="job-006")
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_create_vm_direct_renders_correct_manifest(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_create_vm_direct_renders_correct_manifest(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct create_vm() renders template with correct job parameters."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -619,14 +728,24 @@ class TestCreateVm:
         assert manifest["metadata"]["name"] == "agent-vm-render-test"
         assert manifest["spec"]["config"]["agentConfig"] == "critic"
         assert manifest["spec"]["template"]["spec"]["domain"]["cpu"]["cores"] == 8
-        assert manifest["spec"]["template"]["spec"]["domain"]["resources"]["requests"]["memory"] == "16Gi"
+        assert (
+            manifest["spec"]["template"]["spec"]["domain"]["resources"]["requests"][
+                "memory"
+            ]
+            == "16Gi"
+        )
 
     @pytest.mark.asyncio
-    async def test_create_vm_prefers_nats_over_direct(self, mock_nats_bridge, mock_db, mock_k8s_api, template_file):
+    async def test_create_vm_prefers_nats_over_direct(
+        self, mock_nats_bridge, mock_db, mock_k8s_api, template_file
+    ):
         """create_vm() prefers NATS over direct K8s when both are available."""
-        with patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge):
+        with patch(
+            "orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge
+        ):
             mock_nats_bridge.is_available = True
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._k8s = mock_k8s_api
             prov._k8s_available = True
@@ -649,14 +768,18 @@ class TestDeleteVm:
     """Tests for delete_vm() across both backends."""
 
     @pytest.mark.asyncio
-    async def test_delete_vm_nats_backend(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_delete_vm_nats_backend(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """delete_vm() delegates to nats_bridge when NATS is available."""
         result = await provisioner_with_nats.delete_vm(job_id="job-del-001")
         assert result is True
         mock_nats_bridge.request_vm_delete.assert_awaited_once_with("job-del-001")
 
     @pytest.mark.asyncio
-    async def test_delete_vm_direct_backend(self, provisioner_with_k8s, mock_k8s_api, mock_db):
+    async def test_delete_vm_direct_backend(
+        self, provisioner_with_k8s, mock_k8s_api, mock_db
+    ):
         """delete_vm() calls K8s delete API directly when NATS is unavailable."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -668,17 +791,23 @@ class TestDeleteVm:
         assert call_kwargs[1]["namespace"] == "test-ns"
 
     @pytest.mark.asyncio
-    async def test_delete_vm_direct_updates_context(self, provisioner_with_k8s, mock_db):
+    async def test_delete_vm_direct_updates_context(
+        self, provisioner_with_k8s, mock_db
+    ):
         """Successful direct delete_vm() updates job context with deleted status."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             await provisioner_with_k8s.delete_vm(job_id="job-del-003")
-        mock_db.merge_vm_context.assert_awaited_once_with("job-del-003", {"status": "deleted"})
+        mock_db.merge_vm_context.assert_awaited_once_with(
+            "job-del-003", {"status": "deleted"}
+        )
 
     @pytest.mark.asyncio
     async def test_delete_vm_direct_failure(self, provisioner_with_k8s, mock_k8s_api):
         """Failed direct delete_vm() returns False."""
-        mock_k8s_api.delete_namespaced_custom_object.side_effect = Exception("404 Not Found")
+        mock_k8s_api.delete_namespaced_custom_object.side_effect = Exception(
+            "404 Not Found"
+        )
 
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -692,14 +821,18 @@ class TestDeleteVm:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_delete_vm_nats_failure(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_delete_vm_nats_failure(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """delete_vm() returns False when NATS publish fails."""
         mock_nats_bridge.request_vm_delete = AsyncMock(return_value=False)
         result = await provisioner_with_nats.delete_vm(job_id="job-del-fail")
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_delete_vm_direct_constructs_correct_vm_name(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_delete_vm_direct_constructs_correct_vm_name(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct delete uses 'agent-vm-{job_id}' naming convention."""
         job_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
@@ -718,17 +851,23 @@ class TestQueryStatus:
     """Tests for query_status() across both backends."""
 
     @pytest.mark.asyncio
-    async def test_query_status_nats_backend(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_query_status_nats_backend(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """query_status() delegates to nats_bridge when NATS is available."""
         expected = {"job_id": "status-001", "status": "running", "ready": True}
         mock_nats_bridge.query_vm_status = AsyncMock(return_value=expected)
 
-        result = await provisioner_with_nats.query_status(job_id="status-001", timeout=3.0)
+        result = await provisioner_with_nats.query_status(
+            job_id="status-001", timeout=3.0
+        )
         assert result == expected
         mock_nats_bridge.query_vm_status.assert_awaited_once_with("status-001", 3.0)
 
     @pytest.mark.asyncio
-    async def test_query_status_direct_backend_ready(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_status_direct_backend_ready(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct query_status() returns correct status when VM is Ready."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -742,7 +881,9 @@ class TestQueryStatus:
         assert result["created"] is True
 
     @pytest.mark.asyncio
-    async def test_query_status_direct_backend_not_ready(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_status_direct_backend_not_ready(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct query_status() detects VM that is not Ready."""
         mock_k8s_api.get_namespaced_custom_object.return_value = {
             "metadata": {"name": "agent-vm-test"},
@@ -764,7 +905,9 @@ class TestQueryStatus:
         assert result["created"] is False
 
     @pytest.mark.asyncio
-    async def test_query_status_direct_no_conditions(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_status_direct_no_conditions(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct query_status() handles missing conditions gracefully."""
         mock_k8s_api.get_namespaced_custom_object.return_value = {
             "metadata": {"name": "agent-vm-test"},
@@ -779,9 +922,13 @@ class TestQueryStatus:
         assert result["phase"] == "Unknown"
 
     @pytest.mark.asyncio
-    async def test_query_status_direct_failure(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_status_direct_failure(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct query_status() returns None on K8s API failure."""
-        mock_k8s_api.get_namespaced_custom_object.side_effect = Exception("connection refused")
+        mock_k8s_api.get_namespaced_custom_object.side_effect = Exception(
+            "connection refused"
+        )
 
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -796,20 +943,30 @@ class TestQueryStatus:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_query_status_nats_timeout(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_query_status_nats_timeout(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """query_status() returns None when NATS request times out."""
         mock_nats_bridge.query_vm_status = AsyncMock(return_value=None)
-        result = await provisioner_with_nats.query_status(job_id="timeout-test", timeout=1.0)
+        result = await provisioner_with_nats.query_status(
+            job_id="timeout-test", timeout=1.0
+        )
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_query_status_default_timeout(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_query_status_default_timeout(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """query_status() uses default 5.0s timeout when not specified."""
         await provisioner_with_nats.query_status(job_id="default-timeout")
-        mock_nats_bridge.query_vm_status.assert_awaited_once_with("default-timeout", 5.0)
+        mock_nats_bridge.query_vm_status.assert_awaited_once_with(
+            "default-timeout", 5.0
+        )
 
     @pytest.mark.asyncio
-    async def test_query_status_direct_multiple_conditions(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_status_direct_multiple_conditions(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct query_status() finds Ready among multiple conditions."""
         mock_k8s_api.get_namespaced_custom_object.return_value = {
             "metadata": {"name": "agent-vm-multi"},
@@ -842,43 +999,61 @@ class TestSendControl:
     @pytest.mark.asyncio
     async def test_send_control_freeze(self, provisioner_with_nats, mock_nats_bridge):
         """send_control() sends freeze command via NATS."""
-        result = await provisioner_with_nats.send_control(job_id="ctrl-001", action="freeze")
+        result = await provisioner_with_nats.send_control(
+            job_id="ctrl-001", action="freeze"
+        )
         assert result is True
         mock_nats_bridge.send_control.assert_awaited_once_with("ctrl-001", "freeze")
 
     @pytest.mark.asyncio
     async def test_send_control_resume(self, provisioner_with_nats, mock_nats_bridge):
         """send_control() sends resume command via NATS."""
-        result = await provisioner_with_nats.send_control(job_id="ctrl-002", action="resume")
+        result = await provisioner_with_nats.send_control(
+            job_id="ctrl-002", action="resume"
+        )
         assert result is True
         mock_nats_bridge.send_control.assert_awaited_once_with("ctrl-002", "resume")
 
     @pytest.mark.asyncio
-    async def test_send_control_terminate(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_send_control_terminate(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """send_control() sends terminate command via NATS."""
-        result = await provisioner_with_nats.send_control(job_id="ctrl-003", action="terminate")
+        result = await provisioner_with_nats.send_control(
+            job_id="ctrl-003", action="terminate"
+        )
         assert result is True
         mock_nats_bridge.send_control.assert_awaited_once_with("ctrl-003", "terminate")
 
     @pytest.mark.asyncio
     async def test_send_control_returns_false_without_nats(self, provisioner_disabled):
         """send_control() returns False when NATS is unavailable."""
-        result = await provisioner_disabled.send_control(job_id="ctrl-no-nats", action="freeze")
+        result = await provisioner_disabled.send_control(
+            job_id="ctrl-no-nats", action="freeze"
+        )
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_send_control_returns_false_with_direct_only(self, provisioner_with_k8s):
+    async def test_send_control_returns_false_with_direct_only(
+        self, provisioner_with_k8s
+    ):
         """send_control() returns False in direct-K8s mode (needs NATS daemon)."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
-            result = await provisioner_with_k8s.send_control(job_id="ctrl-direct", action="freeze")
+            result = await provisioner_with_k8s.send_control(
+                job_id="ctrl-direct", action="freeze"
+            )
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_send_control_nats_failure(self, provisioner_with_nats, mock_nats_bridge):
+    async def test_send_control_nats_failure(
+        self, provisioner_with_nats, mock_nats_bridge
+    ):
         """send_control() returns False when NATS publish fails."""
         mock_nats_bridge.send_control = AsyncMock(return_value=False)
-        result = await provisioner_with_nats.send_control(job_id="ctrl-fail", action="terminate")
+        result = await provisioner_with_nats.send_control(
+            job_id="ctrl-fail", action="terminate"
+        )
         assert result is False
 
 
@@ -903,6 +1078,7 @@ class TestSetVmContext:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._db = None
             # Should not raise
@@ -911,13 +1087,17 @@ class TestSetVmContext:
     @pytest.mark.asyncio
     async def test_set_vm_context_handles_db_error(self, provisioner_with_k8s, mock_db):
         """_set_vm_context() catches and logs db exceptions."""
-        mock_db.merge_vm_context = AsyncMock(side_effect=Exception("DB connection lost"))
+        mock_db.merge_vm_context = AsyncMock(
+            side_effect=Exception("DB connection lost")
+        )
         # Should not raise
         await provisioner_with_k8s._set_vm_context("job-db-err", {"status": "test"})
         mock_db.merge_vm_context.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_set_vm_context_passes_arbitrary_updates(self, provisioner_with_k8s, mock_db):
+    async def test_set_vm_context_passes_arbitrary_updates(
+        self, provisioner_with_k8s, mock_db
+    ):
         """_set_vm_context() passes the exact updates dict to the DB."""
         updates = {
             "status": "ready",
@@ -943,6 +1123,7 @@ class TestEnvironmentConfiguration:
         env.pop("VM_NAMESPACE", None)
         with patch.dict(os.environ, env, clear=True):
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             assert prov._vm_namespace == "agent-vms"
 
@@ -950,6 +1131,7 @@ class TestEnvironmentConfiguration:
         """VM_NAMESPACE env var overrides the default."""
         with patch.dict(os.environ, {"VM_NAMESPACE": "custom-ns"}):
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             assert prov._vm_namespace == "custom-ns"
 
@@ -959,14 +1141,18 @@ class TestEnvironmentConfiguration:
         env.pop("DEFAULT_VM_IMAGE", None)
         with patch.dict(os.environ, env, clear=True):
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             assert "ghcr.io" in prov._default_vm_image
             assert "agent-vm-base" in prov._default_vm_image
 
     def test_custom_vm_image(self):
         """DEFAULT_VM_IMAGE env var overrides the default."""
-        with patch.dict(os.environ, {"DEFAULT_VM_IMAGE": "my-registry.io/custom-vm:v5"}):
+        with patch.dict(
+            os.environ, {"DEFAULT_VM_IMAGE": "my-registry.io/custom-vm:v5"}
+        ):
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             assert prov._default_vm_image == "my-registry.io/custom-vm:v5"
 
@@ -980,7 +1166,9 @@ class TestErrorHandling:
     """Tests for error handling and edge cases."""
 
     @pytest.mark.asyncio
-    async def test_create_direct_k8s_api_error(self, provisioner_with_k8s, mock_k8s_api, mock_db):
+    async def test_create_direct_k8s_api_error(
+        self, provisioner_with_k8s, mock_k8s_api, mock_db
+    ):
         """_create_direct() handles K8s API errors gracefully."""
         mock_k8s_api.create_namespaced_custom_object.side_effect = Exception(
             "forbidden: not authorized"
@@ -1010,7 +1198,9 @@ class TestErrorHandling:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_query_direct_k8s_connection_error(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_direct_k8s_connection_error(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_query_direct() handles connection errors."""
         mock_k8s_api.get_namespaced_custom_object.side_effect = ConnectionError(
             "Connection refused"
@@ -1027,6 +1217,7 @@ class TestErrorHandling:
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._k8s = MagicMock()
             prov._k8s_available = True
@@ -1034,11 +1225,15 @@ class TestErrorHandling:
             # Set malformed template that will cause yaml.safe_load to fail
             prov._template_text = "{{invalid yaml: [[[}"
 
-            result = await prov.create_vm(job_id="bad-template", agent_config="defaults")
+            result = await prov.create_vm(
+                job_id="bad-template", agent_config="defaults"
+            )
             assert result is False
 
     @pytest.mark.asyncio
-    async def test_create_direct_with_nats_url_env(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_create_direct_with_nats_url_env(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_create_direct() includes NATS_URL from environment in template."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1050,9 +1245,13 @@ class TestErrorHandling:
         assert manifest["spec"]["config"]["natsUrl"] == "nats://custom:4222"
 
     @pytest.mark.asyncio
-    async def test_delete_direct_does_not_update_context_on_failure(self, provisioner_with_k8s, mock_k8s_api, mock_db):
+    async def test_delete_direct_does_not_update_context_on_failure(
+        self, provisioner_with_k8s, mock_k8s_api, mock_db
+    ):
         """_delete_direct() does not call _set_vm_context on failure."""
-        mock_k8s_api.delete_namespaced_custom_object.side_effect = Exception("API error")
+        mock_k8s_api.delete_namespaced_custom_object.side_effect = Exception(
+            "API error"
+        )
 
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1062,7 +1261,9 @@ class TestErrorHandling:
         mock_db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_query_status_direct_empty_status(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_status_direct_empty_status(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """Direct query handles VM with completely empty status."""
         mock_k8s_api.get_namespaced_custom_object.return_value = {
             "metadata": {"name": "agent-vm-empty"},
@@ -1089,16 +1290,19 @@ class TestKubeVirtConstants:
     def test_kubevirt_group(self):
         """KubeVirt group is kubevirt.io."""
         from orchestrator.services.vm_provisioner import KUBEVIRT_GROUP
+
         assert KUBEVIRT_GROUP == "kubevirt.io"
 
     def test_kubevirt_version(self):
         """KubeVirt version is v1."""
         from orchestrator.services.vm_provisioner import KUBEVIRT_VERSION
+
         assert KUBEVIRT_VERSION == "v1"
 
     def test_kubevirt_plural(self):
         """KubeVirt plural is virtualmachines."""
         from orchestrator.services.vm_provisioner import KUBEVIRT_PLURAL
+
         assert KUBEVIRT_PLURAL == "virtualmachines"
 
 
@@ -1113,11 +1317,13 @@ class TestSingleton:
     def test_singleton_exists(self):
         """Module exports a vm_provisioner singleton."""
         from orchestrator.services.vm_provisioner import vm_provisioner
+
         assert vm_provisioner is not None
 
     def test_singleton_is_vm_provisioner(self):
         """Singleton is an instance of VMProvisioner."""
         from orchestrator.services.vm_provisioner import VMProvisioner, vm_provisioner
+
         assert isinstance(vm_provisioner, VMProvisioner)
 
 
@@ -1130,7 +1336,9 @@ class TestDirectBackendApiParams:
     """Tests that direct backend passes correct K8s API parameters."""
 
     @pytest.mark.asyncio
-    async def test_create_uses_kubevirt_coordinates(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_create_uses_kubevirt_coordinates(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_create_direct() uses correct KubeVirt API group/version/plural."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1142,7 +1350,9 @@ class TestDirectBackendApiParams:
         assert call_kwargs["plural"] == "virtualmachines"
 
     @pytest.mark.asyncio
-    async def test_delete_uses_kubevirt_coordinates(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_delete_uses_kubevirt_coordinates(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_delete_direct() uses correct KubeVirt API group/version/plural."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1154,7 +1364,9 @@ class TestDirectBackendApiParams:
         assert call_kwargs["plural"] == "virtualmachines"
 
     @pytest.mark.asyncio
-    async def test_query_uses_kubevirt_coordinates(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_uses_kubevirt_coordinates(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_query_direct() uses correct KubeVirt API group/version/plural."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1166,7 +1378,9 @@ class TestDirectBackendApiParams:
         assert call_kwargs["plural"] == "virtualmachines"
 
     @pytest.mark.asyncio
-    async def test_create_uses_configured_namespace(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_create_uses_configured_namespace(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_create_direct() uses the configured VM namespace."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1176,7 +1390,9 @@ class TestDirectBackendApiParams:
         assert call_kwargs["namespace"] == "test-ns"
 
     @pytest.mark.asyncio
-    async def test_delete_uses_configured_namespace(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_delete_uses_configured_namespace(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_delete_direct() uses the configured VM namespace."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1186,7 +1402,9 @@ class TestDirectBackendApiParams:
         assert call_kwargs["namespace"] == "test-ns"
 
     @pytest.mark.asyncio
-    async def test_query_uses_configured_namespace(self, provisioner_with_k8s, mock_k8s_api):
+    async def test_query_uses_configured_namespace(
+        self, provisioner_with_k8s, mock_k8s_api
+    ):
         """_query_direct() uses the configured VM namespace."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
@@ -1207,9 +1425,12 @@ class TestConcurrentOperations:
     @pytest.mark.asyncio
     async def test_multiple_creates_in_parallel(self, mock_nats_bridge, mock_db):
         """Multiple create_vm() calls can run concurrently via NATS."""
-        with patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge):
+        with patch(
+            "orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge
+        ):
             mock_nats_bridge.is_available = True
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._db = mock_db
 
@@ -1225,9 +1446,12 @@ class TestConcurrentOperations:
     @pytest.mark.asyncio
     async def test_create_and_query_in_parallel(self, mock_nats_bridge, mock_db):
         """create_vm() and query_status() can run concurrently."""
-        with patch("orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge):
+        with patch(
+            "orchestrator.services.vm_provisioner.nats_bridge", mock_nats_bridge
+        ):
             mock_nats_bridge.is_available = True
             from orchestrator.services.vm_provisioner import VMProvisioner
+
             prov = VMProvisioner()
             prov._db = mock_db
 
@@ -1253,8 +1477,13 @@ class TestAsyncToThread:
         """_create_direct() uses asyncio.to_thread for K8s API call."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
-            with patch("orchestrator.services.vm_provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
-                mock_to_thread.return_value = {"metadata": {"name": "agent-vm-thread-test"}}
+            with patch(
+                "orchestrator.services.vm_provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
+                mock_to_thread.return_value = {
+                    "metadata": {"name": "agent-vm-thread-test"}
+                }
                 await provisioner_with_k8s.create_vm(job_id="thread-create")
 
         mock_to_thread.assert_awaited_once()
@@ -1267,7 +1496,10 @@ class TestAsyncToThread:
         """_delete_direct() uses asyncio.to_thread for K8s API call."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
-            with patch("orchestrator.services.vm_provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch(
+                "orchestrator.services.vm_provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
                 mock_to_thread.return_value = {}
                 await provisioner_with_k8s.delete_vm(job_id="thread-delete")
 
@@ -1280,9 +1512,16 @@ class TestAsyncToThread:
         """_query_direct() uses asyncio.to_thread for K8s API call."""
         with patch("orchestrator.services.vm_provisioner.nats_bridge") as nb:
             nb.is_available = False
-            with patch("orchestrator.services.vm_provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch(
+                "orchestrator.services.vm_provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
                 mock_to_thread.return_value = {
-                    "status": {"conditions": [], "printableStatus": "Running", "created": True}
+                    "status": {
+                        "conditions": [],
+                        "printableStatus": "Running",
+                        "created": True,
+                    }
                 }
                 await provisioner_with_k8s.query_status(job_id="thread-query")
 
