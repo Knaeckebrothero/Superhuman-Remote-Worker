@@ -133,51 +133,122 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      agent: ${{ steps.filter.outputs.agent }}
-      orchestrator: ${{ steps.filter.outputs.orchestrator }}
-      cockpit: ${{ steps.filter.outputs.cockpit }}
-      mcp: ${{ steps.filter.outputs.mcp }}
-      vpn: ${{ steps.filter.outputs.vpn }}
-      vm-base: ${{ steps.filter.outputs.vm-base }}
-      vm-controller: ${{ steps.filter.outputs.vm-controller }}
-      sudo-gate: ${{ steps.filter.outputs.sudo-gate }}
-      workspace: ${{ steps.filter.outputs.workspace }}
+      agent: ${{ steps.check.outputs.agent }}
+      orchestrator: ${{ steps.check.outputs.orchestrator }}
+      cockpit: ${{ steps.check.outputs.cockpit }}
+      mcp: ${{ steps.check.outputs.mcp }}
+      vpn: ${{ steps.check.outputs.vpn }}
+      vm-base: ${{ steps.check.outputs.vm-base }}
+      vm-controller: ${{ steps.check.outputs.vm-controller }}
+      sudo-gate: ${{ steps.check.outputs.sudo-gate }}
+      workspace: ${{ steps.check.outputs.workspace }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
         with:
-          filters: |
-            agent:
-              - 'src/**'
-              - 'config/**'
-              - 'agent.py'
-              - 'requirements.txt'
-              - 'docker/Dockerfile.agent'
-            orchestrator:
-              - 'orchestrator/**'
-              - 'config/**'
-              - 'docker/Dockerfile.orchestrator'
-            cockpit:
-              - 'cockpit/**'
-              - 'docker/Dockerfile.cockpit'
-            mcp:
-              - 'orchestrator/mcp/**'
-              - 'orchestrator/services/formatters.py'
-              - 'orchestrator/services/__init__.py'
-              - 'docker/Dockerfile.mcp'
-            vpn:
-              - 'docker/vpn/**'
-            vm-base:
-              - 'docker/agent-vm-base/**'
-            vm-controller:
-              - 'vm/controller/**'
-            sudo-gate:
-              - 'vm/sudo-daemon/**'
-              - 'vm/sudo-plugin/**'
-            workspace:
-              - 'docker/Dockerfile.workspace'
-              - 'docker/workspace-entrypoint.sh'
+          fetch-depth: 0
+
+      - name: Detect changes against last deployed SHA per component
+        id: check
+        run: |
+          # Extract the deployed image SHA for a component from its manifest.
+          # Returns the 7-char commit hash or empty string if not found.
+          extract_sha() {
+            local file="$1" component="$2"
+            grep -oP "superhuman-remote-worker-${component}:sha-\K[0-9a-f]{7}" "$file" 2>/dev/null | head -1 || echo ""
+          }
+
+          # Check whether any of the given paths changed between the deployed
+          # SHA and HEAD.  Returns "true" if a rebuild is needed.
+          has_changes() {
+            local sha="$1"
+            shift
+            local paths=("$@")
+
+            # No deployed SHA found (first build or tag is "latest") — rebuild
+            if [ -z "$sha" ]; then
+              echo "true"
+              return
+            fi
+
+            # SHA not in local history (force-push, squash, etc.) — rebuild
+            if ! git cat-file -t "$sha" &>/dev/null; then
+              echo "true"
+              return
+            fi
+
+            # Check each path pattern for changes since last deployment
+            for path in "${paths[@]}"; do
+              if [ -n "$(git diff --name-only "$sha" HEAD -- "$path")" ]; then
+                echo "true"
+                return
+              fi
+            done
+            echo "false"
+          }
+
+          # --- Extract last-deployed SHAs from deployment manifests -----------
+          SHA_AGENT=$(extract_sha deployment/21-agent.yaml agent)
+          SHA_ORCHESTRATOR=$(extract_sha deployment/20-orchestrator.yaml orchestrator)
+          SHA_COCKPIT=$(extract_sha deployment/22-cockpit.yaml cockpit)
+          SHA_MCP=$(extract_sha deployment/23-mcp.yaml mcp)
+          SHA_VPN=$(extract_sha deployment/15-vpn.yaml vpn)
+          SHA_WORKSPACE=$(extract_sha deployment/02-configmap.yaml workspace)
+          SHA_VM_CONTROLLER=$(extract_sha deployment-vms/srw-vm-controller/vm-controller.yaml vm-controller)
+          SHA_VM_BASE=$(extract_sha deployment-vms/srw-vm-controller/vm-controller.yaml agent-vm-base)
+
+          echo "Deployed SHAs:"
+          echo "  agent=$SHA_AGENT  orchestrator=$SHA_ORCHESTRATOR  cockpit=$SHA_COCKPIT"
+          echo "  mcp=$SHA_MCP  vpn=$SHA_VPN  workspace=$SHA_WORKSPACE"
+          echo "  vm-controller=$SHA_VM_CONTROLLER  vm-base=$SHA_VM_BASE"
+
+          # --- Per-component change detection ---------------------------------
+          AGENT=$(has_changes "$SHA_AGENT" \
+            src/ config/ agent.py requirements.txt docker/Dockerfile.agent)
+
+          ORCHESTRATOR=$(has_changes "$SHA_ORCHESTRATOR" \
+            orchestrator/ config/ docker/Dockerfile.orchestrator)
+
+          COCKPIT=$(has_changes "$SHA_COCKPIT" \
+            cockpit/ docker/Dockerfile.cockpit)
+
+          MCP=$(has_changes "$SHA_MCP" \
+            orchestrator/mcp/ orchestrator/services/formatters.py \
+            orchestrator/services/__init__.py docker/Dockerfile.mcp)
+
+          VPN=$(has_changes "$SHA_VPN" \
+            docker/vpn/)
+
+          WORKSPACE=$(has_changes "$SHA_WORKSPACE" \
+            docker/Dockerfile.workspace docker/workspace-entrypoint.sh)
+
+          VM_CONTROLLER=$(has_changes "$SHA_VM_CONTROLLER" \
+            vm/controller/)
+
+          VM_BASE=$(has_changes "$SHA_VM_BASE" \
+            docker/agent-vm-base/)
+
+          # sudo-gate artifacts are baked into the VM base image
+          SUDO_GATE=$(has_changes "$SHA_VM_BASE" \
+            vm/sudo-daemon/ vm/sudo-plugin/)
+
+          echo ""
+          echo "Change detection results:"
+          echo "  agent=$AGENT  orchestrator=$ORCHESTRATOR  cockpit=$COCKPIT"
+          echo "  mcp=$MCP  vpn=$VPN  workspace=$WORKSPACE"
+          echo "  vm-controller=$VM_CONTROLLER  vm-base=$VM_BASE  sudo-gate=$SUDO_GATE"
+
+          # --- Write outputs --------------------------------------------------
+          {
+            echo "agent=$AGENT"
+            echo "orchestrator=$ORCHESTRATOR"
+            echo "cockpit=$COCKPIT"
+            echo "mcp=$MCP"
+            echo "vpn=$VPN"
+            echo "workspace=$WORKSPACE"
+            echo "vm-controller=$VM_CONTROLLER"
+            echo "vm-base=$VM_BASE"
+            echo "sudo-gate=$SUDO_GATE"
+          } >> "$GITHUB_OUTPUT"
 
   build-agent:
     needs: [changes, lint, dependency-audit, test-python, test-cockpit]
