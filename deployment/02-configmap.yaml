@@ -134,7 +134,7 @@ data:
   HEADSCALE_URL: "https://headscale.superhuman-remote-worker.com"
 
   # Workspace containers (per-job sandboxed execution environments)
-  WORKSPACE_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:sha-6b45230"
+  WORKSPACE_IMAGE: "ghcr.io/knaeckebrothero/superhuman-remote-worker-workspace:sha-036ce2d"
   WORKSPACE_NAMESPACE: "superhuman-remote-worker"
 
   # Logging
