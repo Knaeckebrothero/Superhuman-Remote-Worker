@@ -42,13 +42,13 @@ Examples:
     # Recover to a specific phase and resume
     python agent.py --job-id abc123 --recover-phase 2 --resume
 """
+
 import argparse
 import asyncio
 import json
 import logging
 import os
 import sys
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -59,12 +59,13 @@ import uvicorn
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from src import UniversalAgent, create_app
-from src.core.workspace import get_workspace_base_path, get_logs_path
-from src.core.phase_snapshot import PhaseSnapshotManager, format_snapshots_table
-from src.database.postgres_db import PostgresDB
+from src import UniversalAgent, create_app  # noqa: E402
+from src.core.workspace import get_logs_path  # noqa: E402
+from src.core.phase_snapshot import PhaseSnapshotManager, format_snapshots_table  # noqa: E402
+from src.database.postgres_db import PostgresDB  # noqa: E402
 
 
 def setup_logging():
@@ -130,12 +131,14 @@ def setup_job_file_logging(job_id: str) -> Path:
     level = getattr(logging, level_name, logging.INFO)
 
     # Create flushing file handler for crash safety
-    file_handler = FlushingFileHandler(log_file, mode='a')
+    file_handler = FlushingFileHandler(log_file, mode="a")
     file_handler.setLevel(level)
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
 
     # Add to root logger so all logs go to the file
     root_logger = logging.getLogger()
@@ -156,7 +159,8 @@ def parse_args():
 
     # Configuration
     parser.add_argument(
-        "--config", "-c",
+        "--config",
+        "-c",
         default="defaults",
         help=(
             "Agent config name or path. Looks in config/{name}/config.yaml first, "
@@ -166,7 +170,8 @@ def parse_args():
 
     # Server options
     parser.add_argument(
-        "--port", "-p",
+        "--port",
+        "-p",
         type=int,
         default=8001,
         help="Port for API server (default: 8001)",
@@ -184,11 +189,13 @@ def parse_args():
 
     # Job options
     parser.add_argument(
-        "--job-id", "-j",
+        "--job-id",
+        "-j",
         help="Process a specific job ID",
     )
     parser.add_argument(
-        "--document-path", "-d",
+        "--document-path",
+        "-d",
         help="Single document path for Creator agent",
     )
     parser.add_argument(
@@ -201,7 +208,7 @@ def parse_args():
     )
     parser.add_argument(
         "--context",
-        help="Additional context as JSON string (e.g., '{\"domain\": \"car_rental\"}')",
+        help='Additional context as JSON string (e.g., \'{"domain": "car_rental"}\')',
     )
     parser.add_argument(
         "--resume",
@@ -316,6 +323,7 @@ async def run_single_job(
     if resume and job_id:
         try:
             import uuid as _uuid
+
             db = PostgresDB()
             await db.connect()
             job_record = await db.jobs.get(_uuid.UUID(job_id))
@@ -324,7 +332,9 @@ async def run_single_job(
                 logger.info(f"Job {job_id} previous status: {previous_status}")
             await db.close()
         except Exception as e:
-            logger.warning(f"Could not query job status for resume (will use snapshot recovery): {e}")
+            logger.warning(
+                f"Could not query job status for resume (will use snapshot recovery): {e}"
+            )
 
     # Create and initialize agent (it will create its own DB connection)
     agent = UniversalAgent.from_config(config_path)
@@ -336,7 +346,11 @@ async def run_single_job(
         # process_job returns an async generator when stream=True
         # We need to await the coroutine first to get the generator
         streaming_gen = await agent.process_job(
-            job_id, metadata, stream=True, resume=resume, feedback=feedback,
+            job_id,
+            metadata,
+            stream=True,
+            resume=resume,
+            feedback=feedback,
             previous_status=previous_status,
         )
         async for state in streaming_gen:
@@ -361,12 +375,12 @@ async def run_single_job(
         print(f"Log file:     {log_file}")
 
         if result.get("error"):
-            print(f"Status:       FAILED")
+            print("Status:       FAILED")
             print(f"Error:        {result['error']}")
             print("=" * 60)
             sys.exit(1)
         else:
-            print(f"Status:       COMPLETED")
+            print("Status:       COMPLETED")
             print(f"Should stop:  {result.get('should_stop', False)}")
             print("=" * 60)
 
@@ -417,7 +431,9 @@ def list_phase_snapshots(job_id: str):
     print(format_snapshots_table(snapshots))
 
     if snapshots:
-        print(f"To recover: python agent.py --config <cfg> --job-id {job_id} --recover-phase N --resume")
+        print(
+            f"To recover: python agent.py --config <cfg> --job-id {job_id} --recover-phase N --resume"
+        )
         print("")
 
 
@@ -439,8 +455,6 @@ async def recover_and_resume(
         description: Job description (for metadata)
         context: Additional context dictionary
     """
-    logger = logging.getLogger(__name__)
-
     # Get snapshot info first
     snapshot_mgr = PhaseSnapshotManager(job_id)
     snapshot = snapshot_mgr.get_snapshot(phase_number)
@@ -578,27 +592,31 @@ def main():
         if not args.resume:
             logger.error("--recover-phase requires --resume")
             sys.exit(1)
-        asyncio.run(recover_and_resume(
-            config_path=config_path,
-            job_id=args.job_id,
-            phase_number=args.recover_phase,
-            document_paths=document_paths if document_paths else None,
-            description=args.description,
-            context=context,
-        ))
+        asyncio.run(
+            recover_and_resume(
+                config_path=config_path,
+                job_id=args.job_id,
+                phase_number=args.recover_phase,
+                document_paths=document_paths if document_paths else None,
+                description=args.description,
+                context=context,
+            )
+        )
         return
 
     # Single job mode
     if args.job_id or args.description:
-        asyncio.run(run_single_job(
-            config_path=config_path,
-            job_id=args.job_id,
-            document_paths=document_paths if document_paths else None,
-            description=args.description,
-            context=context,
-            resume=args.resume,
-            feedback=args.feedback,
-        ))
+        asyncio.run(
+            run_single_job(
+                config_path=config_path,
+                job_id=args.job_id,
+                document_paths=document_paths if document_paths else None,
+                description=args.description,
+                context=context,
+                resume=args.resume,
+                feedback=args.feedback,
+            )
+        )
         return
 
     # API server mode (default)

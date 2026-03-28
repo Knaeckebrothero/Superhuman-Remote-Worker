@@ -205,6 +205,264 @@ class TestPodManifest:
         assert mounts["ssh-pubkey"]["mountPath"] == "/tmp/ssh-pubkey"
         assert mounts["ssh-pubkey"]["readOnly"] is True
 
+    def test_manifest_security_context(self):
+        """Pod and container security contexts are properly hardened."""
+        from orchestrator.services.container_provisioner import (
+            ContainerProvisioner,
+        )
+
+        provisioner = ContainerProvisioner()
+        manifest = provisioner._build_pod_manifest(
+            pod_name="workspace-abc123",
+            job_id="abc123",
+            image="test:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+        )
+
+        # Pod-level: seccomp profile
+        pod_sc = manifest["spec"]["securityContext"]
+        assert pod_sc["seccompProfile"]["type"] == "RuntimeDefault"
+
+        # Container-level: drop ALL, add back only SSHD essentials
+        container = manifest["spec"]["containers"][0]
+        container_sc = container["securityContext"]
+
+        assert container_sc["capabilities"]["drop"] == ["ALL"]
+        added = set(container_sc["capabilities"]["add"])
+        # SSHD needs these to function
+        assert {"SETUID", "SETGID", "NET_BIND_SERVICE", "SYS_CHROOT"} <= added
+        # Dangerous capabilities must NOT be present
+        assert "NET_RAW" not in added
+        assert "SYS_PTRACE" not in added
+        assert "SYS_ADMIN" not in added
+        assert "MKNOD" not in added
+
+        # allowPrivilegeEscalation must be true (SSHD setuid requirement)
+        # but sudo is not installed, so agent-host cannot escalate
+        assert container_sc["allowPrivilegeEscalation"] is True
+
+
+class TestSecurityHardening:
+    """Tests verifying workspace container security hardening (Phase 1).
+
+    These tests ensure the pod manifest and container image enforce
+    the security posture described in docs/features/hardened_container.md.
+    """
+
+    @staticmethod
+    def _build_manifest():
+        """Helper to build a manifest with default params."""
+        from orchestrator.services.container_provisioner import ContainerProvisioner
+
+        provisioner = ContainerProvisioner()
+        return provisioner._build_pod_manifest(
+            pod_name="workspace-test",
+            job_id="test-job-id",
+            image="test:latest",
+            cpu="500m",
+            memory="1Gi",
+            cpu_limit="2000m",
+            memory_limit="4Gi",
+        )
+
+    def test_no_privileged_container(self):
+        """Container must not run in privileged mode."""
+        manifest = self._build_manifest()
+        container = manifest["spec"]["containers"][0]
+        sc = container.get("securityContext", {})
+        assert sc.get("privileged") is not True
+
+    def test_no_host_namespaces(self):
+        """Pod must not share host namespaces (network, PID, IPC)."""
+        manifest = self._build_manifest()
+        spec = manifest["spec"]
+        assert spec.get("hostNetwork") is not True
+        assert spec.get("hostPID") is not True
+        assert spec.get("hostIPC") is not True
+
+    def test_no_host_path_volumes(self):
+        """No volumes may use hostPath (prevents host filesystem access)."""
+        manifest = self._build_manifest()
+        for vol in manifest["spec"]["volumes"]:
+            assert "hostPath" not in vol, f"Volume {vol['name']} uses hostPath"
+
+    def test_capabilities_drop_all(self):
+        """Container must drop ALL capabilities before adding specific ones."""
+        manifest = self._build_manifest()
+        container_sc = manifest["spec"]["containers"][0]["securityContext"]
+        assert container_sc["capabilities"]["drop"] == ["ALL"]
+
+    def test_only_sshd_capabilities_added(self):
+        """Only the minimum capabilities required for SSHD are added back."""
+        manifest = self._build_manifest()
+        container_sc = manifest["spec"]["containers"][0]["securityContext"]
+        added = set(container_sc["capabilities"]["add"])
+        # Exact expected set — nothing more, nothing less
+        expected = {
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "SETGID",
+            "SETUID",
+            "NET_BIND_SERVICE",
+            "SYS_CHROOT",
+            "KILL",
+            "AUDIT_WRITE",
+        }
+        assert added == expected, f"Unexpected capabilities: {added - expected}"
+
+    def test_dangerous_capabilities_excluded(self):
+        """Explicitly verify dangerous capabilities are never added."""
+        manifest = self._build_manifest()
+        container_sc = manifest["spec"]["containers"][0]["securityContext"]
+        added = set(container_sc["capabilities"]["add"])
+        dangerous = {
+            "NET_RAW",
+            "SYS_PTRACE",
+            "SYS_ADMIN",
+            "MKNOD",
+            "DAC_READ_SEARCH",
+            "SYS_RAWIO",
+            "SYS_MODULE",
+            "SYS_BOOT",
+        }
+        overlap = added & dangerous
+        assert not overlap, f"Dangerous capabilities present: {overlap}"
+
+    def test_seccomp_profile_set(self):
+        """Pod must have RuntimeDefault seccomp profile."""
+        manifest = self._build_manifest()
+        pod_sc = manifest["spec"]["securityContext"]
+        assert pod_sc["seccompProfile"]["type"] == "RuntimeDefault"
+
+    def test_single_container_only(self):
+        """Pod must have exactly one container (no sidecars with elevated privs)."""
+        manifest = self._build_manifest()
+        assert len(manifest["spec"]["containers"]) == 1
+
+    def test_workspace_data_is_emptydir(self):
+        """Workspace storage must be ephemeral (emptyDir), not persistent."""
+        manifest = self._build_manifest()
+        volumes = {v["name"]: v for v in manifest["spec"]["volumes"]}
+        assert "emptyDir" in volumes["workspace-data"]
+
+    def test_ssh_key_volume_is_readonly(self):
+        """SSH key volume mount must be read-only."""
+        manifest = self._build_manifest()
+        container = manifest["spec"]["containers"][0]
+        mounts = {m["name"]: m for m in container["volumeMounts"]}
+        assert mounts["ssh-pubkey"]["readOnly"] is True
+
+    def test_ssh_key_staged_not_direct(self):
+        """SSH key must mount to staging path, not directly to authorized_keys.
+
+        Direct mount results in root-owned authorized_keys which breaks
+        OpenSSH StrictModes. The entrypoint copies with correct ownership.
+        """
+        manifest = self._build_manifest()
+        container = manifest["spec"]["containers"][0]
+        mounts = {m["name"]: m for m in container["volumeMounts"]}
+        mount_path = mounts["ssh-pubkey"]["mountPath"]
+        assert mount_path == "/tmp/ssh-pubkey"
+        assert ".ssh/authorized_keys" not in mount_path
+
+    def test_restart_policy_never(self):
+        """Pod must not restart (ephemeral — created per-job, deleted after)."""
+        manifest = self._build_manifest()
+        assert manifest["spec"]["restartPolicy"] == "Never"
+
+
+class TestDockerfileHardening:
+    """Static analysis tests for workspace Dockerfile and entrypoint.
+
+    These verify the image itself enforces security, independent of K8s.
+    """
+
+    @staticmethod
+    def _read_file(path):
+        import pathlib
+
+        return pathlib.Path(path).read_text()
+
+    def test_dockerfile_no_sudo_package(self):
+        """Dockerfile must not install the sudo package."""
+        content = self._read_file("docker/Dockerfile.workspace")
+        lines = content.splitlines()
+        for line in lines:
+            stripped = line.strip()
+            # Skip comments
+            if stripped.startswith("#"):
+                continue
+            # Check apt-get install lines for 'sudo' as a standalone package
+            if "apt-get install" in stripped or (
+                stripped.endswith("\\") and not stripped.startswith("#")
+            ):
+                # Look for 'sudo' as a standalone word (not 'pseudo' or 'libsudo')
+                tokens = stripped.replace("\\", "").split()
+                assert "sudo" not in tokens, (
+                    "sudo package found in Dockerfile apt-get install"
+                )
+
+    def test_dockerfile_no_sudoers_entry(self):
+        """Dockerfile must not create a sudoers entry."""
+        content = self._read_file("docker/Dockerfile.workspace")
+        assert "NOPASSWD" not in content
+        assert "sudoers.d" not in content
+
+    def test_dockerfile_no_sudo_commands(self):
+        """Dockerfile must not use sudo in RUN commands (uses su -c instead)."""
+        content = self._read_file("docker/Dockerfile.workspace")
+        lines = content.splitlines()
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if stripped.startswith("RUN") or (
+                stripped and not stripped.startswith("#") and "sudo " in stripped
+            ):
+                # Allow the comment about sudo being excluded
+                if "intentionally excluded" in stripped:
+                    continue
+                assert "sudo " not in stripped, (
+                    f"Line {i}: sudo command found in Dockerfile: {stripped}"
+                )
+
+    def test_dockerfile_has_user_writable_pip(self):
+        """Dockerfile must set PIP_TARGET for user-space pip installs."""
+        content = self._read_file("docker/Dockerfile.workspace")
+        assert "PIP_TARGET=" in content
+
+    def test_dockerfile_has_user_writable_npm(self):
+        """Dockerfile must set npm_config_prefix for user-space npm installs."""
+        content = self._read_file("docker/Dockerfile.workspace")
+        assert "npm_config_prefix=" in content
+
+    def test_dockerfile_creates_local_dirs(self):
+        """Dockerfile must pre-create .local, .npm-global, .cache directories."""
+        content = self._read_file("docker/Dockerfile.workspace")
+        assert ".local/bin" in content
+        assert ".npm-global" in content
+        assert ".cache" in content
+
+    def test_entrypoint_copies_ssh_key(self):
+        """Entrypoint must copy SSH key from staging path with correct ownership."""
+        content = self._read_file("docker/workspace-entrypoint.sh")
+        assert "/tmp/ssh-pubkey" in content
+        assert "chown agent-host:agent-host" in content
+        assert "authorized_keys" in content
+
+    def test_entrypoint_does_not_run_as_user(self):
+        """Entrypoint must run SSHD as root (required for port 22 + sessions).
+
+        code-server runs as agent-host via su -c.
+        """
+        content = self._read_file("docker/workspace-entrypoint.sh")
+        assert "exec /usr/sbin/sshd" in content
+        assert "su -c" in content and "agent-host" in content
+
 
 class TestCreateWorkspace:
     """Tests for workspace creation."""

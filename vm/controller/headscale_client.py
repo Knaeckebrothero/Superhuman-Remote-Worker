@@ -67,13 +67,16 @@ class HeadscaleClient:
         if self._user_id:
             log.info(
                 "Headscale client initialized (url=%s, user=%s, id=%s)",
-                HEADSCALE_URL, HEADSCALE_USER, self._user_id,
+                HEADSCALE_URL,
+                HEADSCALE_USER,
+                self._user_id,
             )
         else:
             log.warning(
                 "Headscale user '%s' not found. Create it with: "
                 "headscale users create %s",
-                HEADSCALE_USER, HEADSCALE_USER,
+                HEADSCALE_USER,
+                HEADSCALE_USER,
             )
             self._available = False
 
@@ -115,7 +118,8 @@ class HeadscaleClient:
             if key:
                 log.info(
                     "Created Headscale auth key for job %s (expires %s)",
-                    job_id, expiry,
+                    job_id,
+                    expiry,
                 )
                 return key
             else:
@@ -157,7 +161,12 @@ class HeadscaleClient:
             # Delete the node
             resp = await self._client.delete(f"/api/v1/node/{node_id}")
             resp.raise_for_status()
-            log.info("Deleted Headscale node %s (id=%s) for job %s", hostname, node_id, job_id)
+            log.info(
+                "Deleted Headscale node %s (id=%s) for job %s",
+                hostname,
+                node_id,
+                job_id,
+            )
             return True
         except Exception as e:
             log.warning("Failed to delete Headscale node for job %s: %s", job_id, e)
