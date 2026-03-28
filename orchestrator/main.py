@@ -101,6 +101,7 @@ from services.builder_dispatch import execute_server_tool as _dispatch_server_to
 from services.nats_bridge import nats_bridge  # noqa: E402
 from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
+from services.workspace_suspension import workspace_suspension_service  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
 from services.ide_proxy import ide_proxy_service  # noqa: E402
@@ -406,6 +407,34 @@ async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("IDE session TTL sweeper stopped")
 
 
+async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
+    """Background task that suspends idle workspace containers to S3.
+
+    Runs every 60 seconds. Checks workspace containers for jobs in
+    paused/pending_review/waiting_for_reply statuses against the
+    configured idle timeout (WORKSPACE_IDLE_TIMEOUT, default 30 min).
+    """
+    logger.info("Workspace idle sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            if workspace_suspension_service.is_enabled:
+                count = await workspace_suspension_service.check_idle_all()
+                if count:
+                    logger.info(
+                        "Workspace sweeper: suspended %d containers", count
+                    )
+        except Exception as e:
+            logger.error("Error in workspace idle sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Workspace idle sweeper stopped")
+
+
 async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
     """Background task that runs snapshot garbage collection daily.
 
@@ -559,6 +588,10 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
             k: v for k, v in job_context.items() if k not in extracted_keys
         }
 
+        # Pass worktree_path to agent via context (for git worktree creation)
+        if job.get("worktree_path"):
+            remaining_context["worktree_path"] = job["worktree_path"]
+
         # Resolve project repositories if this is a project job
         repositories_payload = None
         if job.get("project_id"):
@@ -637,6 +670,17 @@ async def _dispatch_job_to_agent(job: dict, agent: dict) -> bool:
                 f"Dispatch: injected workspace container config for job {job_id} "
                 f"(host={container_ctx['pod_ip']}:22)"
             )
+
+        # Override workspace_path with worktree_path for subjobs on shared backends
+        worktree_path = job.get("worktree_path")
+        if worktree_path and config_override:
+            ws = config_override.get("workspace", {})
+            remote = ws.get("remote", {})
+            if remote:
+                remote["workspace_path"] = worktree_path
+                logger.info(
+                    f"Dispatch: using worktree path {worktree_path} for job {job_id}"
+                )
 
         # Resolve user/project API keys (user > project > env var fallback)
         resolved_keys = await postgres_db.resolve_api_keys_for_job(
@@ -975,7 +1019,22 @@ def _job_needs_container(job: dict) -> bool:
     - config_override.workspace.backend == "container", OR
     - backend is not explicitly set to "local" or "remote" AND container
       provisioner is available (container is the default for production).
+
+    Returns False if the job already has a ready VM or container inherited
+    from a parent job (worktree sharing — no new container needed).
     """
+    # If job inherits a ready workspace backend from parent, skip provisioning
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (json.JSONDecodeError, TypeError):
+            ctx = {}
+    if ctx.get("vm", {}).get("status") == "ready":
+        return False
+    if ctx.get("workspace_container", {}).get("status") == "ready":
+        return False
+
     co = job.get("config_override") or {}
     if isinstance(co, str):
         try:
@@ -1132,8 +1191,19 @@ async def _try_dispatch_pending_jobs() -> None:
                                 f"Dispatcher: workspace container provisioning failed for job {job_id}"
                             )
                         continue  # Skip — wait for container to become ready
+                    elif container_ctx.get("status") == "suspended":
+                        # Container was suspended to S3 — restore it
+                        asyncio.create_task(
+                            workspace_suspension_service.restore_workspace(job_id)
+                        )
+                        continue
+                    elif container_ctx.get("status") in (
+                        "restoring", "suspending", "creating",
+                    ):
+                        # In-progress lifecycle operation — wait
+                        continue
                     elif container_ctx.get("status") not in ("ready",):
-                        # Container is creating — skip, wait
+                        # Unknown or failed status — skip
                         continue
                     # else: container is ready, proceed with dispatch
                 dispatchable_jobs.append(job)
@@ -1691,6 +1761,13 @@ async def lifespan(app: FastAPI):
         container_provisioner=container_provisioner,
     )
 
+    # Initialize workspace suspension service (idle timeout → S3 snapshot → pod deletion)
+    workspace_suspension_service.connect(
+        db=postgres_db,
+        snapshot_service=snapshot_service,
+        container_provisioner=container_provisioner,
+    )
+
     # Initialize IDE proxy service (pod IP resolution + cache)
     ide_proxy_service.connect(db=postgres_db)
 
@@ -1733,6 +1810,7 @@ async def lifespan(app: FastAPI):
     dispatcher_task = asyncio.create_task(auto_assign_dispatcher(_shutdown_event))
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     ide_sweeper_task = asyncio.create_task(ide_session_ttl_sweeper(_shutdown_event))
+    ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     imap_task = asyncio.create_task(imap_poll_loop(_shutdown_event))
     digest_task = asyncio.create_task(quiet_hours_digest_loop(_shutdown_event))
@@ -1746,6 +1824,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     await sudo_sweeper_task
     await ide_sweeper_task
+    await ws_sweeper_task
     await gc_sweeper_task
     await imap_task
     await digest_task
@@ -4267,6 +4346,18 @@ async def _spawn_scholar_subjob(
     if parent_instructions:
         scholar_context["parent_instructions"] = parent_instructions
 
+    # Inherit parent's workspace backend so subjob runs on the same VM/container
+    parent_ctx = job.get("context") or {}
+    if isinstance(parent_ctx, str):
+        try:
+            parent_ctx = json.loads(parent_ctx)
+        except (json.JSONDecodeError, ValueError):
+            parent_ctx = {}
+    if parent_ctx.get("vm"):
+        scholar_context["vm"] = parent_ctx["vm"]
+    elif parent_ctx.get("workspace_container"):
+        scholar_context["workspace_container"] = parent_ctx["workspace_container"]
+
     # Disable nested subjob spawning on the scholar
     scholar_override: dict[str, Any] = {
         "scholar": {"enabled": False},
@@ -4333,11 +4424,17 @@ async def _spawn_scholar_subjob(
             scholar_ctx["git_remote_url"] = git_remote_url
             await postgres_db.update_job_context(scholar_job_id, scholar_ctx)
 
+            # Set worktree_path if subjob inherits a workspace backend
+            worktree_path = None
+            if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
+                worktree_path = f"/home/agent-host/worktrees/{short_id}-{scholar_config_name}"
+
             async with postgres_db.acquire() as conn:
                 await conn.execute(
-                    "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3::uuid",
+                    "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
                     branch_name,
                     parent_repo_name,
+                    worktree_path,
                     scholar_job_id,
                 )
         except Exception as e:
@@ -4770,6 +4867,18 @@ async def _trigger_verification_on_complete(
             "max_verification_rounds": max_rounds,
         }
 
+        # Inherit parent's workspace backend so critic runs on the same VM/container
+        parent_ctx = job.get("context") or {}
+        if isinstance(parent_ctx, str):
+            try:
+                parent_ctx = json.loads(parent_ctx)
+            except (json.JSONDecodeError, ValueError):
+                parent_ctx = {}
+        if parent_ctx.get("vm"):
+            context["vm"] = parent_ctx["vm"]
+        elif parent_ctx.get("workspace_container"):
+            context["workspace_container"] = parent_ctx["workspace_container"]
+
         config_override = {
             "autonomy": "full",
             "tools": {
@@ -4838,11 +4947,17 @@ async def _trigger_verification_on_complete(
                 critic_ctx["git_remote_url"] = git_remote_url
                 await postgres_db.update_job_context(critic_job_id, critic_ctx)
 
+                # Set worktree_path if subjob inherits a workspace backend
+                worktree_path = None
+                if parent_ctx.get("vm") or parent_ctx.get("workspace_container"):
+                    worktree_path = f"/home/agent-host/worktrees/{short_id}-{critic_config}"
+
                 async with postgres_db.acquire() as conn:
                     await conn.execute(
-                        "UPDATE jobs SET branch_name = $1, repo_name = $2 WHERE id = $3::uuid",
+                        "UPDATE jobs SET branch_name = $1, repo_name = $2, worktree_path = $3 WHERE id = $4::uuid",
                         branch_name,
                         parent_repo_name,
+                        worktree_path,
                         critic_job_id,
                     )
             except Exception as e:
@@ -7179,6 +7294,16 @@ async def agent_heartbeat(agent_id: str, heartbeat: AgentHeartbeat) -> dict[str,
         ):
             logger.info(f"Agent {agent_id} transitioned {prev_status} → ready")
             _trigger_dispatch()
+
+        # Track workspace container activity for idle suspension
+        if heartbeat.current_job_id and heartbeat.status == "working":
+            try:
+                await postgres_db.merge_workspace_container_context(
+                    heartbeat.current_job_id,
+                    {"last_activity": datetime.now(timezone.utc).isoformat()},
+                )
+            except Exception:
+                pass  # Non-critical — don't fail heartbeat
 
         return {"status": "ok"}
     except HTTPException:
