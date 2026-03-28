@@ -370,9 +370,7 @@ class TestOnSudoRequestAutoApproval:
         # cmd_string = " ".join(argv) when argv is non-empty
         # So argv=["install", "-y", "libxml2-dev"] -> "install -y libxml2-dev"
         conn.fetchrow.return_value = {"id": "req-010"}
-        conn.fetch.return_value = [
-            {"pattern": "install -y *", "action": "approve"}
-        ]
+        conn.fetch.return_value = [{"pattern": "install -y *", "action": "approve"}]
 
         data = make_sudo_request_data(argv=["install", "-y", "libxml2-dev"])
         msg = make_nats_msg(data)
@@ -513,7 +511,9 @@ class TestApproveRequest:
         svc._pending_msgs["req-001"] = pending_msg
 
         q = svc.subscribe_sse()
-        result = await svc.approve_request("req-001", reason="Looks safe", decided_by="admin")
+        result = await svc.approve_request(
+            "req-001", reason="Looks safe", decided_by="admin"
+        )
 
         assert result is not None
         assert result["status"] == "approved"
@@ -670,7 +670,9 @@ class TestDenyRequest:
         svc._pending_msgs["req-001"] = pending_msg
 
         q = svc.subscribe_sse()
-        result = await svc.deny_request("req-001", reason="Too dangerous", decided_by="security")
+        result = await svc.deny_request(
+            "req-001", reason="Too dangerous", decided_by="security"
+        )
 
         assert result["status"] == "denied"
         assert result["id"] == "req-001"
@@ -951,9 +953,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_pipe_blocks_auto_approval(self):
         """Pipe character | prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("cat /etc/passwd | grep root")
@@ -963,9 +963,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_semicolon_blocks(self):
         """Semicolon ; prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("ls; rm -rf /")
@@ -975,9 +973,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_ampersand_blocks(self):
         """Ampersand & prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("sleep 100 &")
@@ -987,9 +983,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_backtick_blocks(self):
         """Backtick ` prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("echo `whoami`")
@@ -999,9 +993,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_dollar_blocks(self):
         """Dollar sign $ prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("echo $HOME")
@@ -1011,9 +1003,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_redirect_blocks(self):
         """Redirect > prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("echo x > /etc/shadow")
@@ -1023,9 +1013,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_subshell_blocks(self):
         """Command substitution $() prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("rm $(find /tmp -name '*.log')")
@@ -1035,9 +1023,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_double_pipe_blocks(self):
         """Double pipe || prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("false || rm -rf /")
@@ -1047,9 +1033,7 @@ class TestEvaluateAutoRules:
     async def test_shell_metachar_double_ampersand_blocks(self):
         """Double ampersand && prevents auto-approval."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "*", "action": "approve"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "*", "action": "approve"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("true && rm -rf /")
@@ -1071,9 +1055,7 @@ class TestEvaluateAutoRules:
     async def test_deny_action_returned(self):
         """Rules with action 'deny' return 'deny'."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetch_return=[{"pattern": "rm *", "action": "deny"}]
-        )
+        pool, conn = make_db_pool(fetch_return=[{"pattern": "rm *", "action": "deny"}])
         svc.connect(pool)
 
         result = await svc._evaluate_auto_rules("rm -rf /important")
@@ -1097,8 +1079,11 @@ class TestEvaluateAutoRules:
         svc = SudoGateService()
         pool, conn = make_db_pool(
             fetch_return=[
-                {"pattern": "apt-get *", "action": "deny"},       # priority 10 (first)
-                {"pattern": "apt-get install *", "action": "approve"},  # priority 20 (second)
+                {"pattern": "apt-get *", "action": "deny"},  # priority 10 (first)
+                {
+                    "pattern": "apt-get install *",
+                    "action": "approve",
+                },  # priority 20 (second)
             ]
         )
         svc.connect(pool)
@@ -1239,9 +1224,7 @@ class TestAutoRuleCRUD:
     async def test_create_rule_db_error(self):
         """DB error during rule creation returns None."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetchrow_side_effect=Exception("unique violation")
-        )
+        pool, conn = make_db_pool(fetchrow_side_effect=Exception("unique violation"))
         svc.connect(pool)
 
         result = await svc.create_rule(pattern="apt-get *", action="approve")
@@ -1279,9 +1262,7 @@ class TestAutoRuleCRUD:
     async def test_delete_rule_db_error(self):
         """DB error during deletion returns False."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            execute_side_effect=Exception("connection lost")
-        )
+        pool, conn = make_db_pool(execute_side_effect=Exception("connection lost"))
         svc.connect(pool)
 
         result = await svc.delete_rule("rule-001")
@@ -1467,9 +1448,7 @@ class TestQueryMethods:
     async def test_get_request_db_error(self):
         """DB error in get_request returns None."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetchrow_side_effect=Exception("timeout")
-        )
+        pool, conn = make_db_pool(fetchrow_side_effect=Exception("timeout"))
         svc.connect(pool)
 
         result = await svc.get_request("req-001")
@@ -1725,9 +1704,7 @@ class TestInsertRequest:
     async def test_insert_db_error_returns_none(self):
         """DB error during insert returns None."""
         svc = SudoGateService()
-        pool, conn = make_db_pool(
-            fetchrow_side_effect=Exception("insert failed")
-        )
+        pool, conn = make_db_pool(fetchrow_side_effect=Exception("insert failed"))
         svc.connect(pool)
 
         result = await svc._insert_request(
@@ -1888,9 +1865,7 @@ class TestFinalizeRequest:
         nc.flush = AsyncMock()
         svc.connect(pool, nc)
 
-        await svc._finalize_request(
-            "req-104", "approved", "ok", "admin", "_INBOX.fin"
-        )
+        await svc._finalize_request("req-104", "approved", "ok", "admin", "_INBOX.fin")
 
         # NATS reply should still be sent despite DB failure
         nc.publish.assert_called_once()
@@ -1904,9 +1879,7 @@ class TestFinalizeRequest:
         nc.publish = AsyncMock()
         svc.connect(pool, nc)
 
-        await svc._finalize_request(
-            "req-105", "approved", "ok", "admin", None
-        )
+        await svc._finalize_request("req-105", "approved", "ok", "admin", None)
 
         nc.publish.assert_not_called()
 
@@ -1919,9 +1892,7 @@ class TestFinalizeRequest:
         nc.flush = AsyncMock()
         svc._nc = nc
 
-        await svc._finalize_request(
-            "req-106", "approved", "ok", "admin", "_INBOX.fin"
-        )
+        await svc._finalize_request("req-106", "approved", "ok", "admin", "_INBOX.fin")
 
         nc.publish.assert_called_once()
 
@@ -2089,9 +2060,7 @@ class TestEndToEndFlows:
 
         conn.fetchrow.return_value = {"id": "flow-req-3"}
         # cmd_string = " ".join(argv) = "install -y libxml2-dev"
-        conn.fetch.return_value = [
-            {"pattern": "install -y *-dev", "action": "approve"}
-        ]
+        conn.fetch.return_value = [{"pattern": "install -y *-dev", "action": "approve"}]
 
         data = make_sudo_request_data(
             command="apt-get",

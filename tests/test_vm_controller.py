@@ -277,7 +277,10 @@ class TestRenderTemplate:
         spec = result["spec"]["template"]["spec"]
         assert spec["domain"]["cpu"]["cores"] == 4
         assert spec["domain"]["memory"]["guest"] == "8Gi"
-        assert spec["volumes"][0]["containerDisk"]["image"] == SAMPLE_JOB_CONFIG["vm_image"]
+        assert (
+            spec["volumes"][0]["containerDisk"]["image"]
+            == SAMPLE_JOB_CONFIG["vm_image"]
+        )
 
         user_data = spec["volumes"][1]["cloudInitNoCloud"]["userData"]
         assert SAMPLE_JOB_CONFIG["job_id"] in user_data
@@ -289,9 +292,11 @@ class TestRenderTemplate:
         """Missing optional keys fall back to module-level defaults."""
         minimal_config = {"job_id": "minimal-job-id"}
 
-        with patch("vm.controller.controller.DEFAULT_VM_IMAGE", "default-image:v1"), \
-             patch("vm.controller.controller.DEFAULT_CPU", 2), \
-             patch("vm.controller.controller.DEFAULT_MEMORY", "4Gi"):
+        with (
+            patch("vm.controller.controller.DEFAULT_VM_IMAGE", "default-image:v1"),
+            patch("vm.controller.controller.DEFAULT_CPU", 2),
+            patch("vm.controller.controller.DEFAULT_MEMORY", "4Gi"),
+        ):
             result = controller.render_template(minimal_config)
 
         assert result["metadata"]["name"] == "agent-vm-minimal-job-id"
@@ -406,11 +411,14 @@ class TestInitK8s:
         mock_api = MagicMock()
         mock_client.CustomObjectsApi.return_value = mock_api
 
-        with patch.dict("sys.modules", {
-            "kubernetes": MagicMock(client=mock_client, config=mock_config),
-            "kubernetes.client": mock_client,
-            "kubernetes.config": mock_config,
-        }):
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes": MagicMock(client=mock_client, config=mock_config),
+                "kubernetes.client": mock_client,
+                "kubernetes.config": mock_config,
+            },
+        ):
             ctrl.init_k8s()
 
         mock_config.load_incluster_config.assert_called_once()
@@ -424,11 +432,14 @@ class TestInitK8s:
         mock_client = MagicMock()
         mock_client.CustomObjectsApi.return_value = mock_api
 
-        with patch.dict("sys.modules", {
-            "kubernetes": MagicMock(client=mock_client, config=MagicMock()),
-            "kubernetes.client": mock_client,
-            "kubernetes.config": MagicMock(),
-        }):
+        with patch.dict(
+            "sys.modules",
+            {
+                "kubernetes": MagicMock(client=mock_client, config=MagicMock()),
+                "kubernetes.client": mock_client,
+                "kubernetes.config": MagicMock(),
+            },
+        ):
             ctrl.init_k8s()
 
         assert ctrl.k8s_client is mock_api
@@ -467,8 +478,10 @@ class TestConnectNats:
         mock_nats_mod = MagicMock()
         mock_nats_mod.connect = AsyncMock(return_value=AsyncMock())
 
-        with patch("vm.controller.controller.NATS_URL", "nats://custom:4222"), \
-             patch.dict("sys.modules", {"nats": mock_nats_mod}):
+        with (
+            patch("vm.controller.controller.NATS_URL", "nats://custom:4222"),
+            patch.dict("sys.modules", {"nats": mock_nats_mod}),
+        ):
             await ctrl.connect_nats()
 
         first_positional = mock_nats_mod.connect.call_args[0][0]
@@ -550,7 +563,9 @@ class TestHandleCreate:
         controller_no_headscale.headscale.create_auth_key.assert_not_awaited()
         controller_no_headscale.k8s_client.create_namespaced_custom_object.assert_called_once()
 
-        payload = json.loads(controller_no_headscale.nc.publish.call_args[0][1].decode())
+        payload = json.loads(
+            controller_no_headscale.nc.publish.call_args[0][1].decode()
+        )
         assert payload["status"] == "created"
 
     @pytest.mark.asyncio
@@ -571,7 +586,9 @@ class TestHandleCreate:
         await controller.handle_create(msg)
 
         kw = controller.k8s_client.create_namespaced_custom_object.call_args[1]
-        assert kw["body"]["metadata"]["name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
+        assert (
+            kw["body"]["metadata"]["name"] == f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}"
+        )
 
     @pytest.mark.asyncio
     async def test_create_vm_uses_correct_namespace(self, controller):
@@ -586,8 +603,9 @@ class TestHandleCreate:
     @pytest.mark.asyncio
     async def test_create_vm_k8s_api_error(self, controller):
         """K8s API error during creation publishes 'failed' status."""
-        controller.k8s_client.create_namespaced_custom_object.side_effect = \
+        controller.k8s_client.create_namespaced_custom_object.side_effect = (
             RuntimeError("Internal Server Error")
+        )
 
         msg = make_nats_msg(SAMPLE_JOB_CONFIG)
         await controller.handle_create(msg)
@@ -600,7 +618,9 @@ class TestHandleCreate:
     @pytest.mark.asyncio
     async def test_create_vm_conflict_retry_succeeds(self, controller):
         """409 Conflict with 'is being deleted' triggers retry, second call succeeds."""
-        conflict = _FakeApiException(status=409, body="vm agent-vm-test is being deleted")
+        conflict = _FakeApiException(
+            status=409, body="vm agent-vm-test is being deleted"
+        )
 
         controller.k8s_client.create_namespaced_custom_object.side_effect = [
             conflict,
@@ -618,6 +638,7 @@ class TestHandleCreate:
     @pytest.mark.asyncio
     async def test_create_vm_conflict_exhausted_retries(self, controller):
         """409 Conflict persisting after all retries publishes 'failed'."""
+
         def make_conflict():
             return _FakeApiException(
                 status=409, body="vm agent-vm-test is being deleted"
@@ -766,8 +787,9 @@ class TestHandleDelete:
     @pytest.mark.asyncio
     async def test_delete_vm_already_gone_404(self, controller):
         """Deleting a non-existent VM (404) is treated as success."""
-        controller.k8s_client.delete_namespaced_custom_object.side_effect = \
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = (
             _FakeApiException(status=404, body="Not Found")
+        )
 
         job_id = "already-gone"
         msg = make_nats_msg({"job_id": job_id})
@@ -780,8 +802,9 @@ class TestHandleDelete:
     @pytest.mark.asyncio
     async def test_delete_vm_k8s_api_error_non_404(self, controller):
         """K8s API error (non-404) during deletion publishes 'delete_failed'."""
-        controller.k8s_client.delete_namespaced_custom_object.side_effect = \
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = (
             _FakeApiException(status=503, body="Service Unavailable")
+        )
 
         job_id = "fail-delete"
         msg = make_nats_msg({"job_id": job_id})
@@ -795,8 +818,9 @@ class TestHandleDelete:
     @pytest.mark.asyncio
     async def test_delete_vm_generic_exception(self, controller):
         """Generic exception during deletion publishes 'delete_failed'."""
-        controller.k8s_client.delete_namespaced_custom_object.side_effect = \
+        controller.k8s_client.delete_namespaced_custom_object.side_effect = (
             RuntimeError("unexpected failure")
+        )
 
         msg = make_nats_msg({"job_id": "err-test"})
         await controller.handle_delete(msg)
@@ -967,8 +991,9 @@ class TestHandleStatusQuery:
     @pytest.mark.asyncio
     async def test_status_query_vm_not_found_error(self, controller):
         """Status query for a non-existent VM returns error via reply."""
-        controller.k8s_client.get_namespaced_custom_object.side_effect = \
-            Exception("Not Found")
+        controller.k8s_client.get_namespaced_custom_object.side_effect = Exception(
+            "Not Found"
+        )
 
         msg = make_nats_msg({"job_id": "missing"}, reply="reply.inbox.err")
         await controller.handle_status_query(msg)
@@ -981,8 +1006,9 @@ class TestHandleStatusQuery:
     @pytest.mark.asyncio
     async def test_status_query_error_without_reply(self, controller):
         """Error without reply subject publishes to vm.lifecycle.status."""
-        controller.k8s_client.get_namespaced_custom_object.side_effect = \
-            Exception("Server Error")
+        controller.k8s_client.get_namespaced_custom_object.side_effect = Exception(
+            "Server Error"
+        )
 
         msg = make_nats_msg({"job_id": "error-no-reply"}, reply=None)
         await controller.handle_status_query(msg)
@@ -995,8 +1021,9 @@ class TestHandleStatusQuery:
     @pytest.mark.asyncio
     async def test_status_query_error_with_reply(self, controller):
         """Error with reply subject sends error to the reply address."""
-        controller.k8s_client.get_namespaced_custom_object.side_effect = \
-            Exception("Timeout")
+        controller.k8s_client.get_namespaced_custom_object.side_effect = Exception(
+            "Timeout"
+        )
 
         msg = make_nats_msg({"job_id": "error-reply"}, reply="reply.inbox.err2")
         await controller.handle_status_query(msg)
@@ -1133,9 +1160,11 @@ class TestRunAndShutdown:
         """run() subscribes to create, delete, and get subjects."""
         controller._shutdown.set()
 
-        with patch.object(controller, "load_template"), \
-             patch.object(controller, "init_k8s"), \
-             patch.object(controller, "connect_nats", new_callable=AsyncMock):
+        with (
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
             await controller.run()
 
         subjects = [call[0][0] for call in controller.nc.subscribe.call_args_list]
@@ -1152,16 +1181,22 @@ class TestRunAndShutdown:
         def track(name):
             def fn(*_a, **_kw):
                 call_order.append(name)
+
             return fn
 
         async def track_async(name):
             async def fn(*_a, **_kw):
                 call_order.append(name)
+
             return fn
 
-        with patch.object(controller, "load_template", side_effect=track("load_template")), \
-             patch.object(controller, "init_k8s", side_effect=track("init_k8s")), \
-             patch.object(controller, "connect_nats", side_effect=track("connect_nats")):
+        with (
+            patch.object(
+                controller, "load_template", side_effect=track("load_template")
+            ),
+            patch.object(controller, "init_k8s", side_effect=track("init_k8s")),
+            patch.object(controller, "connect_nats", side_effect=track("connect_nats")),
+        ):
             controller.headscale.init = AsyncMock(side_effect=track("headscale_init"))
             await controller.run()
 
@@ -1177,9 +1212,11 @@ class TestRunAndShutdown:
         """run() drains NATS connection during shutdown."""
         controller._shutdown.set()
 
-        with patch.object(controller, "load_template"), \
-             patch.object(controller, "init_k8s"), \
-             patch.object(controller, "connect_nats", new_callable=AsyncMock):
+        with (
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
             await controller.run()
 
         controller.nc.drain.assert_awaited_once()
@@ -1189,9 +1226,11 @@ class TestRunAndShutdown:
         """run() closes the Headscale client during shutdown."""
         controller._shutdown.set()
 
-        with patch.object(controller, "load_template"), \
-             patch.object(controller, "init_k8s"), \
-             patch.object(controller, "connect_nats", new_callable=AsyncMock):
+        with (
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
             await controller.run()
 
         controller.headscale.close.assert_awaited_once()
@@ -1202,9 +1241,11 @@ class TestRunAndShutdown:
         controller._shutdown.set()
         controller.nc.is_connected = False
 
-        with patch.object(controller, "load_template"), \
-             patch.object(controller, "init_k8s"), \
-             patch.object(controller, "connect_nats", new_callable=AsyncMock):
+        with (
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
             await controller.run()
 
         controller.nc.drain.assert_not_awaited()
@@ -1224,9 +1265,11 @@ class TestRunAndShutdown:
         async def fake_connect():
             ctrl.nc = mock_nc
 
-        with patch.object(ctrl, "load_template"), \
-             patch.object(ctrl, "init_k8s"), \
-             patch.object(ctrl, "connect_nats", side_effect=fake_connect):
+        with (
+            patch.object(ctrl, "load_template"),
+            patch.object(ctrl, "init_k8s"),
+            patch.object(ctrl, "connect_nats", side_effect=fake_connect),
+        ):
             await ctrl.run()
 
         mock_nc.drain.assert_awaited_once()
@@ -1240,9 +1283,12 @@ class TestRunAndShutdown:
     @pytest.mark.asyncio
     async def test_request_shutdown_unblocks_run(self, controller):
         """request_shutdown() unblocks the run() wait loop."""
-        with patch.object(controller, "load_template"), \
-             patch.object(controller, "init_k8s"), \
-             patch.object(controller, "connect_nats", new_callable=AsyncMock):
+        with (
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
+
             async def delayed_shutdown():
                 await asyncio.sleep(0.05)
                 controller.request_shutdown()
@@ -1258,9 +1304,11 @@ class TestRunAndShutdown:
         """run() wires the correct handler to each subscription."""
         controller._shutdown.set()
 
-        with patch.object(controller, "load_template"), \
-             patch.object(controller, "init_k8s"), \
-             patch.object(controller, "connect_nats", new_callable=AsyncMock):
+        with (
+            patch.object(controller, "load_template"),
+            patch.object(controller, "init_k8s"),
+            patch.object(controller, "connect_nats", new_callable=AsyncMock),
+        ):
             await controller.run()
 
         # Build a map of subject -> callback name
@@ -1268,7 +1316,9 @@ class TestRunAndShutdown:
         for call in controller.nc.subscribe.call_args_list:
             subject = call[0][0]
             cb = call[1].get("cb") or (call[0][1] if len(call[0]) > 1 else None)
-            cb_map[subject] = getattr(cb, "__name__", None) or getattr(cb, "__func__", cb).__name__
+            cb_map[subject] = (
+                getattr(cb, "__name__", None) or getattr(cb, "__func__", cb).__name__
+            )
 
         assert cb_map["vm.lifecycle.create"] == "handle_create"
         assert cb_map["vm.lifecycle.delete"] == "handle_delete"
@@ -1289,9 +1339,14 @@ class TestMain:
         from vm.controller.controller import main
 
         registered = {}
-        with patch("vm.controller.controller.VMController") as mock_cls, \
-             patch("vm.controller.controller.signal.signal", side_effect=lambda s, h: registered.update({s: h})), \
-             patch("vm.controller.controller.asyncio.run"):
+        with (
+            patch("vm.controller.controller.VMController") as mock_cls,
+            patch(
+                "vm.controller.controller.signal.signal",
+                side_effect=lambda s, h: registered.update({s: h}),
+            ),
+            patch("vm.controller.controller.asyncio.run"),
+        ):
             mock_cls.return_value = MagicMock()
             main()
 
@@ -1306,9 +1361,11 @@ class TestMain:
         mock_coro = MagicMock()
         mock_ctrl.run.return_value = mock_coro
 
-        with patch("vm.controller.controller.VMController", return_value=mock_ctrl), \
-             patch("vm.controller.controller.signal.signal"), \
-             patch("vm.controller.controller.asyncio.run") as mock_arun:
+        with (
+            patch("vm.controller.controller.VMController", return_value=mock_ctrl),
+            patch("vm.controller.controller.signal.signal"),
+            patch("vm.controller.controller.asyncio.run") as mock_arun,
+        ):
             main()
 
         mock_arun.assert_called_once_with(mock_coro)
@@ -1319,9 +1376,14 @@ class TestMain:
         from vm.controller.controller import main
 
         handlers = {}
-        with patch("vm.controller.controller.VMController") as mock_cls, \
-             patch("vm.controller.controller.signal.signal", side_effect=lambda s, h: handlers.update({s: h})), \
-             patch("vm.controller.controller.asyncio.run"):
+        with (
+            patch("vm.controller.controller.VMController") as mock_cls,
+            patch(
+                "vm.controller.controller.signal.signal",
+                side_effect=lambda s, h: handlers.update({s: h}),
+            ),
+            patch("vm.controller.controller.asyncio.run"),
+        ):
             mock_ctrl = MagicMock()
             mock_cls.return_value = mock_ctrl
             main()
@@ -1371,9 +1433,14 @@ class TestEdgeCases:
     async def test_create_then_delete_same_job(self, controller):
         """Creating and then deleting a VM for the same job works correctly."""
         job_id = "create-delete-test"
-        await controller.handle_create(make_nats_msg({
-            "job_id": job_id, "agent_config": "developer",
-        }))
+        await controller.handle_create(
+            make_nats_msg(
+                {
+                    "job_id": job_id,
+                    "agent_config": "developer",
+                }
+            )
+        )
         await controller.handle_delete(make_nats_msg({"job_id": job_id}))
 
         controller.k8s_client.create_namespaced_custom_object.assert_called_once()
@@ -1387,8 +1454,7 @@ class TestEdgeCases:
     async def test_concurrent_create_requests(self, controller):
         """Multiple concurrent create requests each produce their own VM."""
         jobs = [
-            {"job_id": f"concurrent-{i}", "agent_config": "developer"}
-            for i in range(3)
+            {"job_id": f"concurrent-{i}", "agent_config": "developer"} for i in range(3)
         ]
         msgs = [make_nats_msg(job) for job in jobs]
 
