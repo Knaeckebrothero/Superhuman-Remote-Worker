@@ -57,7 +57,9 @@ def load_config() -> dict:
     job_id = os.environ.get("JOB_ID")
 
     if not nats_url or not job_id:
-        log.error("NATS_URL and JOB_ID must be set (via /etc/default/management-daemon)")
+        log.error(
+            "NATS_URL and JOB_ID must be set (via /etc/default/management-daemon)"
+        )
         sys.exit(1)
 
     config = {"nats_url": nats_url, "job_id": job_id}
@@ -83,9 +85,12 @@ def detect_ip() -> str:
     # Prefer Tailscale IP — reachable from agent pods via mesh VPN
     try:
         import subprocess
+
         result = subprocess.run(
             ["tailscale", "ip", "-4"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode == 0:
             ip = result.stdout.strip()
@@ -137,6 +142,7 @@ def get_system_metrics() -> dict:
     """Collect CPU, memory, and disk usage."""
     try:
         import psutil
+
         return {
             "cpu_percent": psutil.cpu_percent(interval=0),
             "memory_percent": psutil.virtual_memory().percent,
@@ -181,9 +187,15 @@ class ManagementDaemon:
                 log.info("Connected to NATS at %s", self.nats_url)
                 return
             except Exception as e:
-                log.warning("NATS connection failed (%s), retrying in %ds...", e, NATS_RETRY_INTERVAL)
+                log.warning(
+                    "NATS connection failed (%s), retrying in %ds...",
+                    e,
+                    NATS_RETRY_INTERVAL,
+                )
                 try:
-                    await asyncio.wait_for(self._shutdown.wait(), timeout=NATS_RETRY_INTERVAL)
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=NATS_RETRY_INTERVAL
+                    )
                     return  # Shutdown requested during retry wait
                 except asyncio.TimeoutError:
                     pass
@@ -283,7 +295,9 @@ class ManagementDaemon:
                 log.exception("Heartbeat error")
 
             try:
-                await asyncio.wait_for(self._shutdown.wait(), timeout=HEARTBEAT_INTERVAL)
+                await asyncio.wait_for(
+                    self._shutdown.wait(), timeout=HEARTBEAT_INTERVAL
+                )
                 break
             except asyncio.TimeoutError:
                 pass
@@ -321,14 +335,18 @@ class ManagementDaemon:
 
                     if self.nc and self.nc.is_connected:
                         await self.nc.publish(subject, json.dumps(payload).encode())
-                        log.info("Agent exited: status=%s, exit_code=%d", status, exit_code)
+                        log.info(
+                            "Agent exited: status=%s, exit_code=%d", status, exit_code
+                        )
 
                     self._agent_exit_reported = True
             except Exception:
                 log.exception("Agent monitor error")
 
             try:
-                await asyncio.wait_for(self._shutdown.wait(), timeout=AGENT_POLL_INTERVAL)
+                await asyncio.wait_for(
+                    self._shutdown.wait(), timeout=AGENT_POLL_INTERVAL
+                )
                 break
             except asyncio.TimeoutError:
                 pass
@@ -349,13 +367,19 @@ class ManagementDaemon:
             try:
                 current_ip = detect_ip()
                 if current_ip != self._registered_ip:
-                    log.info("IP changed: %s -> %s, re-registering", self._registered_ip, current_ip)
+                    log.info(
+                        "IP changed: %s -> %s, re-registering",
+                        self._registered_ip,
+                        current_ip,
+                    )
                     await self.register()
             except Exception:
                 log.exception("IP update check error")
 
             try:
-                await asyncio.wait_for(self._shutdown.wait(), timeout=IP_RECHECK_INTERVAL)
+                await asyncio.wait_for(
+                    self._shutdown.wait(), timeout=IP_RECHECK_INTERVAL
+                )
                 break
             except asyncio.TimeoutError:
                 pass
@@ -394,7 +418,9 @@ class ManagementDaemon:
             try:
                 result = subprocess.run(
                     ["tailscale", "ip", "-4"],
-                    capture_output=True, text=True, timeout=3,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     log.info("Tailscale ready after %ds: %s", i, result.stdout.strip())
@@ -409,7 +435,10 @@ class ManagementDaemon:
                 return
             await asyncio.sleep(1)
 
-        log.warning("Tailscale not ready after %ds — registering with fallback IP", TAILSCALE_WAIT_TIMEOUT)
+        log.warning(
+            "Tailscale not ready after %ds — registering with fallback IP",
+            TAILSCALE_WAIT_TIMEOUT,
+        )
 
     async def run(self):
         """Main entry point."""

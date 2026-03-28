@@ -16,7 +16,6 @@ import argparse
 import asyncio
 import json
 import signal
-import sys
 
 import nats
 
@@ -63,10 +62,13 @@ async def run(nats_url: str, mode: str, delay: float, subject: str):
             reason = f"approved after {delay}s delay (mock)"
         elif mode == "interactive":
             try:
-                answer = input(f"  Approve? [y/N] ").strip().lower()
+                answer = input("  Approve? [y/N] ").strip().lower()
                 approved = answer in ("y", "yes")
                 if not approved:
-                    reason = input(f"  Denial reason: ").strip() or "denied by operator (mock)"
+                    reason = (
+                        input("  Denial reason: ").strip()
+                        or "denied by operator (mock)"
+                    )
                 else:
                     reason = "approved by operator (mock)"
             except EOFError:
@@ -106,15 +108,24 @@ async def run(nats_url: str, mode: str, delay: float, subject: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Mock orchestrator for sudo-gated")
-    parser.add_argument("--nats", default="nats://127.0.0.1:4222",
-                        help="NATS URL")
-    parser.add_argument("--mode", choices=["approve", "deny", "interactive", "delay"],
-                        default="approve",
-                        help="Response mode (default: approve)")
-    parser.add_argument("--delay", type=float, default=5.0,
-                        help="Delay in seconds for 'delay' mode (default: 5)")
-    parser.add_argument("--subject", default="sudo.request.>",
-                        help="NATS subject to subscribe to (default: sudo.request.>)")
+    parser.add_argument("--nats", default="nats://127.0.0.1:4222", help="NATS URL")
+    parser.add_argument(
+        "--mode",
+        choices=["approve", "deny", "interactive", "delay"],
+        default="approve",
+        help="Response mode (default: approve)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=5.0,
+        help="Delay in seconds for 'delay' mode (default: 5)",
+    )
+    parser.add_argument(
+        "--subject",
+        default="sudo.request.>",
+        help="NATS subject to subscribe to (default: sudo.request.>)",
+    )
     args = parser.parse_args()
 
     try:

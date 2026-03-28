@@ -154,7 +154,7 @@ data:
                     - systemctl enable management-daemon.service
                     - systemctl start management-daemon.service
                     - systemctl restart sudo-gated.socket
-                    - 'if [ -n "${TAILSCALE_AUTH_KEY}" ]; then tailscale up --auth-key=${TAILSCALE_AUTH_KEY} --login-server=${HEADSCALE_URL} --hostname=vm-${JOB_ID} --accept-routes=false --ssh --timeout=120s & fi'
+                    - 'if [ -n "${TAILSCALE_AUTH_KEY}" ]; then tailscale up --auth-key=${TAILSCALE_AUTH_KEY} --login-server=${HEADSCALE_URL} --hostname=vm-${JOB_ID} --accept-routes=false --timeout=120s & fi'
 
 ---
 # Deployment

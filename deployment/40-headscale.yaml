@@ -34,7 +34,9 @@ metadata:
 data:
   config.yaml: |
     server_url: https://headscale.superhuman-remote-worker.com
-    listen_addr: 0.0.0.0:8080
+    listen_addr: 0.0.0.0:8443
+    tls_cert_path: /etc/headscale/tls/tls.crt
+    tls_key_path: /etc/headscale/tls/tls.key
     metrics_listen_addr: 0.0.0.0:9090
     grpc_listen_addr: 0.0.0.0:50443
     private_key_path: /var/lib/headscale/private.key
@@ -46,6 +48,9 @@ data:
     derp:
       server:
         enabled: true
+        region_id: 999
+        region_code: "hs"
+        region_name: "Headscale"
         private_key_path: /var/lib/headscale/derp_server_private.key
         stun_listen_addr: 0.0.0.0:3478
       # Disable global DERP map (clients can't reach derp*.tailscale.com)
@@ -114,8 +119,8 @@ spec:
           image: headscale/headscale:0.28.0
           command: ["headscale", "serve"]
           ports:
-            - name: http
-              containerPort: 8080
+            - name: https
+              containerPort: 8443
             - name: metrics
               containerPort: 9090
             - name: grpc
@@ -132,16 +137,21 @@ spec:
             - name: acl
               mountPath: /etc/headscale/acl.hujson
               subPath: acl.hujson
+            - name: tls
+              mountPath: /etc/headscale/tls
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 8443
+              scheme: HTTPS
             initialDelaySeconds: 10
             periodSeconds: 30
           readinessProbe:
             httpGet:
               path: /health
-              port: 8080
+              port: 8443
+              scheme: HTTPS
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
@@ -158,6 +168,9 @@ spec:
         - name: acl
           configMap:
             name: headscale-acl
+        - name: tls
+          secret:
+            secretName: headscale-tls
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -182,12 +195,9 @@ spec:
   selector:
     app: headscale
   ports:
-    - name: http
-      port: 8080
-      targetPort: 8080
-    - name: noise
+    - name: https
       port: 443
-      targetPort: 8080
+      targetPort: 8443
     - name: metrics
       port: 9090
       targetPort: 9090
@@ -212,30 +222,38 @@ spec:
       protocol: UDP
 
 ---
-# Ingress — Tailscale clients connect here for coordination
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# TLS certificate (cert-manager) — Headscale terminates TLS directly
+# (not via Traefik) so DERP HTTP Upgrade works (requires HTTP/1.1,
+# which Traefik's HTTP/2 ALPN negotiation breaks).
+apiVersion: cert-manager.io/v1
+kind: Certificate
 metadata:
-  name: headscale-ingress
+  name: headscale-tls
   namespace: headscale
-  annotations:
-    cert-manager.io/cluster-issuer: cloudflare-dns-issuer
-    traefik.ingress.kubernetes.io/router.entrypoints: websecure
-    traefik.ingress.kubernetes.io/router.tls: "true"
 spec:
-  ingressClassName: traefik
+  secretName: headscale-tls
+  issuerRef:
+    name: cloudflare-dns-issuer
+    kind: ClusterIssuer
+  dnsNames:
+    - headscale.superhuman-remote-worker.com
+
+---
+# TCP passthrough — Traefik routes by SNI without terminating TLS.
+# Headscale handles TLS itself, serving HTTP/1.1 so DERP's
+# "Upgrade: DERP" mechanism works for relay connections.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: headscale-passthrough
+  namespace: headscale
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: HostSNI(`headscale.superhuman-remote-worker.com`)
+      services:
+        - name: headscale
+          port: 443
   tls:
-    - hosts:
-        - headscale.superhuman-remote-worker.com
-      secretName: headscale-tls
-  rules:
-    - host: headscale.superhuman-remote-worker.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: headscale
-                port:
-                  number: 8080
+    passthrough: true

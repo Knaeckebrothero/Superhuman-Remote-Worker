@@ -28,6 +28,7 @@ Usage:
 
 Note: The old scripts in scripts/ still work but will show deprecation warnings.
 """
+
 import argparse
 import asyncio
 import json
@@ -45,7 +46,8 @@ PROJECT_ROOT = Path(__file__).parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # noqa: E402
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -118,6 +120,7 @@ def generate_backup_dir_name(name: str | None) -> Path:
 # Initialization Functions
 # =============================================================================
 
+
 async def init_all(
     force_reset: bool = False,
     only_orchestrator: bool = False,
@@ -168,11 +171,13 @@ async def init_all(
             # Reset SSO databases on force-reset (Keycloak re-imports realm-export.json)
             if force_reset:
                 from orchestrator.init import reset_sso_databases
+
                 logger.info("  Resetting SSO databases (Keycloak, Nextcloud)...")
                 await reset_sso_databases()
 
             # Create Keycloak/Nextcloud databases on the same PostgreSQL instance
             from orchestrator.init import ensure_sso_databases
+
             logger.info("  Creating SSO databases (Keycloak, Nextcloud)...")
             await ensure_sso_databases()
 
@@ -258,7 +263,9 @@ async def verify_all(
             if pg_result.get("connected"):
                 logger.info("  PostgreSQL: connected")
             else:
-                logger.warning(f"  PostgreSQL: not connected ({pg_result.get('error', 'unknown')})")
+                logger.warning(
+                    f"  PostgreSQL: not connected ({pg_result.get('error', 'unknown')})"
+                )
 
             vec_result = await verify_vector_db()
             if not vec_result.get("configured"):
@@ -266,7 +273,9 @@ async def verify_all(
             elif vec_result.get("connected"):
                 logger.info("  Vector DB: connected")
             else:
-                logger.warning(f"  Vector DB: not connected ({vec_result.get('error', 'unknown')})")
+                logger.warning(
+                    f"  Vector DB: not connected ({vec_result.get('error', 'unknown')})"
+                )
 
         from orchestrator.init import verify_neo4j
 
@@ -276,7 +285,9 @@ async def verify_all(
         elif neo4j_result.get("connected"):
             logger.info("  Neo4j: connected")
         else:
-            logger.warning(f"  Neo4j: not connected ({neo4j_result.get('error', 'unknown')})")
+            logger.warning(
+                f"  Neo4j: not connected ({neo4j_result.get('error', 'unknown')})"
+            )
 
         if not skip_mongodb:
             mg_result = await verify_mongodb()
@@ -285,14 +296,18 @@ async def verify_all(
             elif mg_result.get("connected"):
                 logger.info("  MongoDB: connected")
             else:
-                logger.warning(f"  MongoDB: not connected ({mg_result.get('error', 'unknown')})")
+                logger.warning(
+                    f"  MongoDB: not connected ({mg_result.get('error', 'unknown')})"
+                )
 
     if not skip_agent:
         from src.init import verify_workspace
 
         ws_result = verify_workspace()
         if ws_result.get("exists"):
-            logger.info(f"  Workspace: {ws_result['job_count']} jobs, {ws_result['checkpoint_count']} checkpoints")
+            logger.info(
+                f"  Workspace: {ws_result['job_count']} jobs, {ws_result['checkpoint_count']} checkpoints"
+            )
         else:
             logger.warning("  Workspace: not initialized")
 
@@ -301,7 +316,9 @@ async def verify_all(
 
         uploads_result = verify_uploads()
         if uploads_result.get("exists"):
-            logger.info(f"  Uploads: {uploads_result['upload_count']} uploads, {uploads_result['total_files']} files")
+            logger.info(
+                f"  Uploads: {uploads_result['upload_count']} uploads, {uploads_result['total_files']} files"
+            )
         else:
             logger.info("  Uploads: not initialized")
 
@@ -309,6 +326,7 @@ async def verify_all(
 # =============================================================================
 # Backup/Restore Functions
 # =============================================================================
+
 
 def create_backup(name: str | None = None) -> bool:
     """Create a backup of the current application state.
@@ -339,7 +357,10 @@ def create_backup(name: str | None = None) -> bool:
     logger.info("[1/5] Backing up PostgreSQL...")
     postgres_file = backup_dir / "postgres.dump"
     if backup_postgres(postgres_file):
-        backup_info["components"]["postgres"] = {"file": "postgres.dump", "success": True}
+        backup_info["components"]["postgres"] = {
+            "file": "postgres.dump",
+            "success": True,
+        }
     else:
         backup_info["components"]["postgres"] = {"success": False}
         success = False
@@ -349,7 +370,10 @@ def create_backup(name: str | None = None) -> bool:
     logger.info("[2/5] Backing up Vector DB...")
     vector_file = backup_dir / "vector.dump"
     if backup_vector_db(vector_file):
-        backup_info["components"]["vector_db"] = {"file": "vector.dump", "success": True}
+        backup_info["components"]["vector_db"] = {
+            "file": "vector.dump",
+            "success": True,
+        }
     else:
         backup_info["components"]["vector_db"] = {"success": False}
     logger.info("")
@@ -368,6 +392,7 @@ def create_backup(name: str | None = None) -> bool:
     logger.info("[4/5] Backing up workspace...")
     if backup_workspace(backup_dir):
         from src.init import verify_workspace
+
         ws = verify_workspace()
         backup_info["components"]["workspace"] = {
             "directory": "workspace",
@@ -382,6 +407,7 @@ def create_backup(name: str | None = None) -> bool:
     # 5. Backup uploads
     logger.info("[5/5] Backing up uploads...")
     from orchestrator.init import backup_uploads, verify_uploads
+
     if backup_uploads(backup_dir):
         uploads_info = verify_uploads()
         backup_info["components"]["uploads"] = {
@@ -474,6 +500,7 @@ def restore_backup(backup_path: str) -> bool:
     # 5. Restore uploads
     logger.info("[5/5] Restoring uploads...")
     from orchestrator.init import restore_uploads
+
     if not restore_uploads(backup_dir):
         logger.warning("  Uploads restore had issues")
     logger.info("")
@@ -484,6 +511,7 @@ def restore_backup(backup_path: str) -> bool:
 # =============================================================================
 # CLI
 # =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -542,7 +570,8 @@ Backup/Restore:
         help="Restore from backup directory",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable verbose output",
     )
@@ -637,6 +666,7 @@ def main() -> int:
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         import traceback
+
         traceback.print_exc()
         return 1
 
