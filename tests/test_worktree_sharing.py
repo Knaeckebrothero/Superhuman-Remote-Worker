@@ -371,6 +371,23 @@ class TestGitManagerFromWorktree:
                     "git",
                     "-C",
                     str(parent_repo),
+                    "config",
+                    "user.email",
+                    "test@test.com",
+                ],
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(parent_repo), "config", "user.name", "Test"],
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(parent_repo),
                     "commit",
                     "--allow-empty",
                     "-m",
