@@ -270,6 +270,104 @@ class ContainerProvisioner:
             return None
 
     # =========================================================================
+    # IDE session pods (on-demand code-server for workspace browsing)
+    # =========================================================================
+
+    async def create_ide_pod(
+        self,
+        job_id: str,
+        cpu: str = "250m",
+        memory: str = "512Mi",
+        cpu_limit: str = "1000m",
+        memory_limit: str = "2Gi",
+    ) -> Optional[str]:
+        """Create a lightweight IDE pod for browsing a job's workspace.
+
+        Unlike ``create_workspace`` (which provisions the agent's execution
+        environment), this creates a short-lived pod purely for code-server
+        access. The Gitea repo is cloned after the pod is ready via SSH.
+
+        Args:
+            job_id: Job UUID.
+            cpu/memory: Resource requests (lower than workspace defaults).
+            cpu_limit/memory_limit: Resource limits.
+
+        Returns:
+            Pod IP if the pod became ready, None on failure.
+        """
+        if not self._k8s_available:
+            return None
+
+        pod_name = f"ide-{job_id[:12]}"
+
+        pod_manifest = self._build_pod_manifest(
+            pod_name=pod_name,
+            job_id=job_id,
+            image=self._workspace_image,
+            cpu=cpu,
+            memory=memory,
+            cpu_limit=cpu_limit,
+            memory_limit=memory_limit,
+        )
+
+        # Override labels to distinguish IDE pods from workspace pods
+        pod_manifest["metadata"]["labels"]["srw/component"] = "ide-session"
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.create_namespaced_pod,
+                namespace=self._namespace,
+                body=pod_manifest,
+            )
+            logger.info("IDE pod created: %s (job %s)", pod_name, job_id)
+
+            pod_ip = await self._wait_for_ready(pod_name, timeout=90)
+            if pod_ip:
+                logger.info("IDE pod ready: %s @ %s (job %s)", pod_name, pod_ip, job_id)
+                return pod_ip
+
+            logger.warning(
+                "IDE pod created but not ready within timeout: %s (job %s)",
+                pod_name,
+                job_id,
+            )
+            return None
+        except Exception as e:
+            # 409 Conflict = pod already exists (idempotent retry)
+            if hasattr(e, "status") and e.status == 409:
+                logger.info("IDE pod already exists: %s (job %s)", pod_name, job_id)
+                pod_ip = await self._wait_for_ready(pod_name, timeout=90)
+                return pod_ip
+            logger.error("Failed to create IDE pod for job %s: %s", job_id, e)
+            return None
+
+    async def delete_ide_pod(self, job_id: str) -> bool:
+        """Delete an IDE session pod.
+
+        Returns:
+            True if deleted (or already gone), False on error.
+        """
+        if not self._k8s_available:
+            return False
+
+        pod_name = f"ide-{job_id[:12]}"
+
+        try:
+            await asyncio.to_thread(
+                self._core_api.delete_namespaced_pod,
+                name=pod_name,
+                namespace=self._namespace,
+                grace_period_seconds=5,
+            )
+            logger.info("IDE pod deleted: %s (job %s)", pod_name, job_id)
+            return True
+        except Exception as e:
+            if hasattr(e, "status") and e.status == 404:
+                return True
+            logger.error("Failed to delete IDE pod for job %s: %s", job_id, e)
+            return False
+
+    # =========================================================================
     # Internal helpers
     # =========================================================================
 

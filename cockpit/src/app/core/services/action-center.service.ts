@@ -1,15 +1,9 @@
-import { Injectable, inject, signal, computed, DestroyRef } from '@angular/core';
-import { SudoService, SudoRequest } from './sudo.service';
-import { NotificationService } from './notification.service';
-import { ApiService } from './api.service';
-import { AppNotification, Job } from '../models/api.model';
-import {
-  ActionItem,
-  ActionItemStatus,
-  MessageActionData,
-  ReviewActionData,
-  ThreadDetail,
-} from '../models/action.model';
+import {computed, DestroyRef, inject, Injectable, signal} from '@angular/core';
+import {SudoRequest, SudoService} from './sudo.service';
+import {NotificationService} from './notification.service';
+import {ApiService} from './api.service';
+import {AppNotification, Job} from '../models/api.model';
+import {ActionItem, ActionItemStatus, MessageActionData, ReviewActionData,} from '../models/action.model';
 
 /** Sort: pending before resolved, then urgency desc, then timestamp desc. */
 function actionItemComparator(a: ActionItem, b: ActionItem): number {
@@ -96,6 +90,10 @@ export class ActionCenterService {
 
   resumeJob(jobId: string, feedback: string) {
     return this.api.resumeJob(jobId, feedback);
+  }
+
+  upgradeJobToVm(jobId: string) {
+    return this.api.upgradeJobToVm(jobId);
   }
 
   // --- Refresh all data ---
@@ -204,6 +202,7 @@ export class ActionCenterService {
         confidence: null,
         deliverables: [],
         frozenAt: null,
+        command: null,
       } as ReviewActionData,
     };
   }
