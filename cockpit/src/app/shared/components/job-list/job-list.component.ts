@@ -1,10 +1,10 @@
-import { Component, inject, signal, computed, OnInit, OnDestroy } from '@angular/core';
-import { ApiService } from '../../../core/services/api.service';
-import { DataService } from '../../../core/services/data.service';
-import { UserService } from '../../../core/services/user.service';
-import { environment } from '../../../core/environment';
-import { JobStatus } from '../../../core/models/api.model';
-import { JobSummary } from '../../../core/models/audit.model';
+import {Component, computed, inject, OnDestroy, OnInit, signal} from '@angular/core';
+import {ApiService} from '../../../core/services/api.service';
+import {DataService} from '../../../core/services/data.service';
+import {UserService} from '../../../core/services/user.service';
+import {environment} from '../../../core/environment';
+import {JobStatus} from '../../../core/models/api.model';
+import {JobSummary} from '../../../core/models/audit.model';
 
 type StatusFilter = 'all' | 'mine' | JobStatus;
 
@@ -96,10 +96,11 @@ interface JobRow {
                       @if (row.hasChildren) {
                         <button
                           class="expand-btn"
+                          [class.expanded]="isExpanded(row.job.id)"
                           (click)="toggleExpand(row.job.id); $event.stopPropagation()"
-                          [title]="isExpanded(row.job.id) ? 'Collapse' : 'Expand'"
+                          [title]="isExpanded(row.job.id) ? 'Collapse sub-jobs' : 'Expand sub-jobs'"
                         >
-                          {{ isExpanded(row.job.id) ? '\u25BE' : '\u25B8' }}
+                          <span class="expand-chevron">&#9206;</span>
                         </button>
                       }
                       @if (row.isChild) {
@@ -564,18 +565,37 @@ interface JobRow {
       }
 
       .expand-btn {
-        background: none;
-        border: none;
-        color: var(--text-muted, #6c7086);
+        background: rgba(127, 132, 156, 0.1);
+        border: 1px solid rgba(127, 132, 156, 0.25);
+        border-radius: 4px;
+        color: var(--text-muted, #7f849c);
         cursor: pointer;
-        padding: 0 2px;
-        font-size: 12px;
-        line-height: 1;
+        padding: 2px;
+        width: 22px;
+        height: 22px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         flex-shrink: 0;
+        transition: all 0.15s ease;
       }
 
       .expand-btn:hover {
         color: var(--text-primary, #cdd6f4);
+        background: rgba(127, 132, 156, 0.2);
+        border-color: rgba(127, 132, 156, 0.4);
+      }
+
+      .expand-chevron {
+        display: inline-block;
+        font-size: 14px;
+        line-height: 1;
+        transition: transform 0.15s ease;
+        transform: rotate(90deg);
+      }
+
+      .expand-btn.expanded .expand-chevron {
+        transform: rotate(180deg);
       }
 
       .child-connector {
