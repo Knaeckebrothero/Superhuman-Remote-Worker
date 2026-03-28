@@ -36,7 +36,7 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends \
     iputils-ping \
     zip \
     unzip \
-    sudo \
+    # NOTE: sudo intentionally excluded — agent-host must not escalate to root
     ca-certificates \
     gnupg \
     lsb-release \
@@ -91,13 +91,22 @@ RUN curl -fsSL "https://github.com/coder/code-server/releases/download/v${CODE_S
 # ---------------------------------------------------------------------------
 RUN userdel -r $(getent passwd 1000 | cut -d: -f1) 2>/dev/null || true \
     && useradd -m -s /bin/bash -u 1000 agent-host \
-    && echo "agent-host ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent-host \
-    && chmod 0440 /etc/sudoers.d/agent-host \
     && mkdir -p /home/agent-host/workspace \
     && chown agent-host:agent-host /home/agent-host/workspace \
     && mkdir -p /home/agent-host/.ssh \
     && chmod 700 /home/agent-host/.ssh \
     && chown agent-host:agent-host /home/agent-host/.ssh
+
+# User-writable package directories (pip/npm without sudo)
+RUN mkdir -p /home/agent-host/.local/bin \
+             /home/agent-host/.local/lib/python3/site-packages \
+             /home/agent-host/.npm-global \
+             /home/agent-host/.cache \
+    && chown -R agent-host:agent-host /home/agent-host
+
+ENV PIP_TARGET=/home/agent-host/.local/lib/python3/site-packages \
+    PATH="/home/agent-host/.local/bin:/home/agent-host/.npm-global/bin:${PATH}" \
+    npm_config_prefix=/home/agent-host/.npm-global
 
 # ---------------------------------------------------------------------------
 # 5. SSH server config (mirrors provision.sh lines 141-155)
@@ -138,10 +147,10 @@ RUN chown agent-host:agent-host /home/agent-host/.tmux.conf
 # ---------------------------------------------------------------------------
 # 7. Git config (mirrors provision.sh lines 270-273)
 # ---------------------------------------------------------------------------
-RUN sudo -u agent-host git config --global init.defaultBranch main \
-    && sudo -u agent-host git config --global user.name "Agent Worker" \
-    && sudo -u agent-host git config --global user.email "agent@srw.local" \
-    && sudo -u agent-host git config --global core.editor vim
+RUN su -c 'git config --global init.defaultBranch main' agent-host \
+    && su -c 'git config --global user.name "Agent Worker"' agent-host \
+    && su -c 'git config --global user.email "agent@srw.local"' agent-host \
+    && su -c 'git config --global core.editor vim' agent-host
 
 # ---------------------------------------------------------------------------
 # 8. code-server config

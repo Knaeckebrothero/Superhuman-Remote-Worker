@@ -298,6 +298,11 @@ class ContainerProvisioner:
             },
             "spec": {
                 "restartPolicy": "Never",
+                # Pod-level security: run SSHD as root (required for port 22
+                # and user session management), but restrict everything else.
+                "securityContext": {
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                },
                 "containers": [
                     {
                         "name": "workspace",
@@ -312,6 +317,33 @@ class ContainerProvisioner:
                                 "cpu": cpu_limit,
                                 "memory": memory_limit,
                             },
+                        },
+                        # Container security hardening:
+                        # - Drop all capabilities, add back only what SSHD needs
+                        # - SETUID/SETGID: user session switching
+                        # - NET_BIND_SERVICE: bind to port 22
+                        # - CHOWN/DAC_OVERRIDE/FOWNER: file ownership for sessions
+                        # - SYS_CHROOT: SSHD privilege separation
+                        # - KILL: signal management
+                        # - AUDIT_WRITE: PAM audit logging
+                        # - allowPrivilegeEscalation: true (required for SSHD setuid)
+                        # - sudo is NOT installed — agent-host cannot escalate
+                        "securityContext": {
+                            "capabilities": {
+                                "drop": ["ALL"],
+                                "add": [
+                                    "CHOWN",
+                                    "DAC_OVERRIDE",
+                                    "FOWNER",
+                                    "SETGID",
+                                    "SETUID",
+                                    "NET_BIND_SERVICE",
+                                    "SYS_CHROOT",
+                                    "KILL",
+                                    "AUDIT_WRITE",
+                                ],
+                            },
+                            "allowPrivilegeEscalation": True,
                         },
                         "volumeMounts": [
                             {

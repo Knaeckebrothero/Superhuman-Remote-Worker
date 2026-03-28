@@ -46,7 +46,7 @@ def send_request(sock_path: str, command: str, argv: list[str] | None = None) ->
         sock.sendall(struct.pack(">I", len(payload)) + payload)
 
         print(f"→ Sent request: {request['command']} {' '.join(argv[1:])}")
-        print(f"  Waiting for response...")
+        print("  Waiting for response...")
 
         # Read 4-byte length prefix.
         length_data = b""
@@ -75,12 +75,23 @@ def send_request(sock_path: str, command: str, argv: list[str] | None = None) ->
 
 def main():
     parser = argparse.ArgumentParser(description="Mock sudo approval plugin")
-    parser.add_argument("command", nargs="?", default="apt-get install -y curl",
-                        help="Command to request approval for")
-    parser.add_argument("--socket", default=DEFAULT_SOCKET,
-                        help=f"Unix socket path (default: {DEFAULT_SOCKET})")
-    parser.add_argument("--flood", type=int, default=0,
-                        help="Send N rapid requests to test rate limiting")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="apt-get install -y curl",
+        help="Command to request approval for",
+    )
+    parser.add_argument(
+        "--socket",
+        default=DEFAULT_SOCKET,
+        help=f"Unix socket path (default: {DEFAULT_SOCKET})",
+    )
+    parser.add_argument(
+        "--flood",
+        type=int,
+        default=0,
+        help="Send N rapid requests to test rate limiting",
+    )
     args = parser.parse_args()
 
     if args.flood > 0:
@@ -90,9 +101,9 @@ def main():
                 resp = send_request(args.socket, args.command)
                 status = "APPROVED" if resp.get("approved") else "DENIED"
                 reason = resp.get("reason", "")
-                print(f"  [{i+1}/{args.flood}] {status} {reason}")
+                print(f"  [{i + 1}/{args.flood}] {status} {reason}")
             except Exception as e:
-                print(f"  [{i+1}/{args.flood}] ERROR: {e}")
+                print(f"  [{i + 1}/{args.flood}] ERROR: {e}")
             time.sleep(0.1)
         return
 
@@ -100,7 +111,7 @@ def main():
         response = send_request(args.socket, args.command)
     except FileNotFoundError:
         print(f"ERROR: Socket not found at {args.socket}", file=sys.stderr)
-        print(f"Is sudo-gated running?", file=sys.stderr)
+        print("Is sudo-gated running?", file=sys.stderr)
         sys.exit(1)
     except ConnectionRefusedError:
         print(f"ERROR: Connection refused at {args.socket}", file=sys.stderr)
@@ -110,7 +121,7 @@ def main():
         sys.exit(1)
 
     if response.get("approved"):
-        print(f"← APPROVED")
+        print("← APPROVED")
     else:
         reason = response.get("reason", "no reason given")
         print(f"← DENIED: {reason}")

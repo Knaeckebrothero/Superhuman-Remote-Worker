@@ -49,7 +49,8 @@ NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4
 VM_TEMPLATE_PATH = os.environ.get("VM_TEMPLATE_PATH", "/config/vm-template.yaml")
 VM_NAMESPACE = os.environ.get("VM_NAMESPACE", "agent-vms")
 DEFAULT_VM_IMAGE = os.environ.get(
-    "DEFAULT_VM_IMAGE", "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest"
+    "DEFAULT_VM_IMAGE",
+    "ghcr.io/knaeckebrothero/superhuman-remote-worker-agent-vm-base:latest",
 )
 DEFAULT_CPU = int(os.environ.get("DEFAULT_CPU", "2"))
 DEFAULT_MEMORY = os.environ.get("DEFAULT_MEMORY", "4Gi")
@@ -205,24 +206,30 @@ class VMController:
                         if attempt < max_retries:
                             log.info(
                                 "VM %s still being deleted, waiting... (attempt %d/%d)",
-                                vm_name, attempt + 1, max_retries,
+                                vm_name,
+                                attempt + 1,
+                                max_retries,
                             )
                             await asyncio.sleep(5)
                             continue
                         log.error(
                             "VM %s still being deleted after %d retries, giving up",
-                            vm_name, max_retries,
+                            vm_name,
+                            max_retries,
                         )
                     raise
 
             log.info("VM created: %s (job %s)", vm_name, job_id)
 
-            await self._publish_status(job_id, {
-                "job_id": job_id,
-                "status": "created",
-                "vm_name": vm_name,
-                "namespace": VM_NAMESPACE,
-            })
+            await self._publish_status(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "created",
+                    "vm_name": vm_name,
+                    "namespace": VM_NAMESPACE,
+                },
+            )
 
         except Exception as e:
             job_id = "unknown"
@@ -232,11 +239,14 @@ class VMController:
                 pass
 
             log.exception("Failed to create VM for job %s", job_id)
-            await self._publish_status(job_id, {
-                "job_id": job_id,
-                "status": "failed",
-                "error": str(e),
-            })
+            await self._publish_status(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": str(e),
+                },
+            )
 
     async def handle_delete(self, msg):
         """Handle vm.lifecycle.delete — delete a KubeVirt VirtualMachine.
@@ -275,11 +285,14 @@ class VMController:
 
             log.info("VM deleted: %s (job %s)", vm_name, job_id)
 
-            await self._publish_status(job_id, {
-                "job_id": job_id,
-                "status": "deleted",
-                "vm_name": vm_name,
-            })
+            await self._publish_status(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "deleted",
+                    "vm_name": vm_name,
+                },
+            )
 
         except Exception as e:
             job_id = "unknown"
@@ -289,11 +302,14 @@ class VMController:
                 pass
 
             log.exception("Failed to delete VM for job %s", job_id)
-            await self._publish_status(job_id, {
-                "job_id": job_id,
-                "status": "delete_failed",
-                "error": str(e),
-            })
+            await self._publish_status(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "delete_failed",
+                    "error": str(e),
+                },
+            )
 
     async def handle_status_query(self, msg):
         """Handle vm.lifecycle.get — query the status of a VM.
