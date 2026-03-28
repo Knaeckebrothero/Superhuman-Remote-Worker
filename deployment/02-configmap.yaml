@@ -76,8 +76,8 @@ data:
   AUTO_ASSIGN_ENABLED: "true"
 
   # Neo4j (local instance in this namespace)
-  NEO4J_URL: "bolt://srw-neo4j:7687"
-  DEFAULT_DS_NEO4J_URL: "bolt://srw-neo4j:7687"
+  NEO4J_URL: "bolt://srw-neo4j:7688"
+  DEFAULT_DS_NEO4J_URL: "bolt://srw-neo4j:7688"
   DEFAULT_DS_NEO4J_NAME: "Default Neo4j"
   DEFAULT_DS_NEO4J_READ_ONLY: "false"
 

@@ -783,6 +783,8 @@ export class JobReviewComponent {
   hasSnapshot(): boolean {
     const currentJob = this.job();
     if (!currentJob) return false;
+    // Hide IDE on subjobs — they share the parent's workspace
+    if (currentJob.parent_job_id) return false;
     // Show IDE button if: live VM, snapshot available, or has Gitea repo
     if (currentJob.status === 'processing') return true;
     const snapshotStatus = currentJob.context?.['snapshot']?.['status'];

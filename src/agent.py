@@ -973,6 +973,40 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                 logger.error(f"Failed to create remote backend: {e}")
                 raise
 
+        # Worktree creation: subjobs on shared VM/container get a git worktree
+        # instead of a full clone. The worktree is created on the remote machine.
+        worktree_path = metadata.get("worktree_path")
+        if worktree_path and workspace_backend and workspace_backend.supports_shell:
+            parent_workspace = "/home/agent-host/workspace"
+            branch_name = metadata.get("branch_name", "main")
+            try:
+                # Fetch the subjob branch (created by orchestrator on Gitea)
+                workspace_backend._exec(
+                    f"git -C {parent_workspace} fetch origin {branch_name}",
+                    timeout=60,
+                )
+                # Create worktree directory parent
+                workspace_backend._exec(
+                    f"mkdir -p $(dirname {worktree_path})",
+                    timeout=10,
+                )
+                # Create worktree for the subjob's branch
+                workspace_backend._exec(
+                    f"git -C {parent_workspace} worktree add {worktree_path} {branch_name}",
+                    timeout=30,
+                )
+                logger.info(
+                    f"Created git worktree at {worktree_path} (branch: {branch_name})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create git worktree at {worktree_path}: {e}. "
+                    "Falling back to standard workspace init."
+                )
+                # Clear worktree_path so we fall through to normal init
+                worktree_path = None
+                metadata.pop("worktree_path", None)
+
         # Create workspace manager
         self._workspace_manager = WorkspaceManager(
             job_id=job_id,
