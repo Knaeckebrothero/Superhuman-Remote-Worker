@@ -1293,9 +1293,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             copied_paths = []
             original_paths = []
 
-            # Ensure documents directory exists
+            # Ensure documents directory exists (use backend for remote compat)
+            self._workspace_manager.backend.mkdir("documents")
             documents_dir = self._workspace_manager.get_path("documents")
-            documents_dir.mkdir(parents=True, exist_ok=True)
 
             upload_source_dir = None
 
@@ -1372,9 +1372,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
             copied_paths = []
             original_paths = []
 
-            # Ensure documents directory exists
+            # Ensure documents directory exists (use backend for remote compat)
+            self._workspace_manager.backend.mkdir("documents")
             documents_dir = self._workspace_manager.get_path("documents")
-            documents_dir.mkdir(parents=True, exist_ok=True)
 
             for doc_path in metadata["document_paths"]:
                 source_path = Path(doc_path)
@@ -1419,9 +1419,9 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
         elif metadata.get("document_path"):
             source_path = Path(metadata["document_path"])
             if source_path.exists():
-                # Ensure documents directory exists
+                # Ensure documents directory exists (use backend for remote compat)
+                self._workspace_manager.backend.mkdir("documents")
                 documents_dir = self._workspace_manager.get_path("documents")
-                documents_dir.mkdir(parents=True, exist_ok=True)
 
                 # Check if zip - extract instead of copy
                 if source_path.suffix.lower() == ".zip":
@@ -1772,9 +1772,10 @@ curl -s -X POST "{gitea_api_base}/repos/{owner_repo}/pulls" \\
                     if not content:
                         content = file_resolver.load(Path(entry.file).name)
                     content = render_instruction_content(content, loaded_tool_names)
-                    # Ensure parent directory exists
-                    target_path = self._workspace_manager.get_path(entry.file)
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    # Ensure parent directory exists (use backend, not local mkdir)
+                    parent_dir = str(Path(entry.file).parent)
+                    if parent_dir and parent_dir != ".":
+                        self._workspace_manager.backend.mkdir(parent_dir)
                     self._workspace_manager.write_file(entry.file, content)
                     logger.debug(
                         f"Deployed instruction file to workspace: {entry.file}"

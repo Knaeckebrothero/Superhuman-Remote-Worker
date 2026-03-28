@@ -5,9 +5,10 @@ instruction enforcement, phase/multimodal config, web content saving,
 and async job status updates.
 """
 
-import pytest
 from dataclasses import dataclass
 from unittest.mock import MagicMock
+
+import pytest
 
 from src.tools.context import ToolContext
 
@@ -495,10 +496,7 @@ class TestSaveWebContent:
     def test_returns_none_on_write_failure(self):
         """Should return None when write_file fails."""
         ws = _make_workspace_manager()
-        path_mock = MagicMock()
-        path_mock.exists.return_value = False
-        path_mock.parent.mkdir = MagicMock()
-        ws.get_path.return_value = path_mock
+        ws.exists.return_value = False
         ws.write_file.side_effect = Exception("disk full")
 
         ctx = ToolContext(workspace_manager=ws)
@@ -508,10 +506,7 @@ class TestSaveWebContent:
     def test_writes_yaml_front_matter(self):
         """Written content should include YAML front-matter."""
         ws = _make_workspace_manager()
-        path_mock = MagicMock()
-        path_mock.exists.return_value = False
-        path_mock.parent.mkdir = MagicMock()
-        ws.get_path.return_value = path_mock
+        ws.exists.return_value = False
         ws.write_file = MagicMock()
 
         ctx = ToolContext(workspace_manager=ws)

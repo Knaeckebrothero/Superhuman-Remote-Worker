@@ -76,7 +76,7 @@ spec:
               app: srw-neo4j
       ports:
         - protocol: TCP
-          port: 7687
+          port: 7688
     # MongoDB (for datasource shell tools)
     - to:
         - podSelector:
