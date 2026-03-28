@@ -46,9 +46,18 @@ log = logging.getLogger(__name__)
 
 # Groq auto-detection: model prefixes served by Groq's OpenAI-compatible API
 GROQ_MODEL_PREFIXES = (
-    "llama-", "meta-llama/", "mixtral-", "gemma-", "gemma2-",
-    "deepseek-", "qwen/", "moonshotai/", "openai/gpt-oss",
-    "groq/", "canopylabs/", "whisper-",
+    "llama-",
+    "meta-llama/",
+    "mixtral-",
+    "gemma-",
+    "gemma2-",
+    "deepseek-",
+    "qwen/",
+    "moonshotai/",
+    "openai/gpt-oss",
+    "groq/",
+    "canopylabs/",
+    "whisper-",
 )
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -865,7 +874,9 @@ class CitationEngine:
         if self._db_type == "sqlite":
             query = "INSERT OR IGNORE INTO job_sources (job_id, source_id) VALUES (?, ?)"
         else:
-            query = "INSERT INTO job_sources (job_id, source_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+            query = (
+                "INSERT INTO job_sources (job_id, source_id) VALUES (%s, %s) ON CONFLICT DO NOTHING"
+            )
 
         self._ensure_connected()
         self._cursor.execute(query, (job_id, source_id))
@@ -998,22 +1009,14 @@ class CitationEngine:
 
         with zipfile.ZipFile(file_path) as zf:
             # Find all word/document*.xml entries
-            doc_entries = sorted(
-                n for n in zf.namelist() if re.match(r"word/document\d*\.xml$", n)
-            )
+            doc_entries = sorted(n for n in zf.namelist() if re.match(r"word/document\d*\.xml$", n))
             if not doc_entries:
-                raise FileNotFoundError(
-                    f"No word/document*.xml found in {file_path}"
-                )
+                raise FileNotFoundError(f"No word/document*.xml found in {file_path}")
 
             for entry in doc_entries:
                 tree = XML(zf.read(entry))
                 for para in tree.iter(f"{nsmap}p"):
-                    texts = [
-                        node.text
-                        for node in para.iter(f"{nsmap}t")
-                        if node.text
-                    ]
+                    texts = [node.text for node in para.iter(f"{nsmap}t") if node.text]
                     if texts:
                         text_parts.append("".join(texts))
 
@@ -2245,8 +2248,7 @@ Respond in JSON format."""
             self._cursor.execute("DROP INDEX IF EXISTS idx_source_embeddings_vector")
             self._cursor.execute("DELETE FROM source_embeddings WHERE embedding IS NOT NULL")
             self._cursor.execute(
-                f"ALTER TABLE source_embeddings "
-                f"ALTER COLUMN embedding TYPE vector({expected_dim})"
+                f"ALTER TABLE source_embeddings ALTER COLUMN embedding TYPE vector({expected_dim})"
             )
             self._conn.commit()
 
@@ -2454,10 +2456,7 @@ Respond in JSON format."""
         job_id = self.context.session_id if self.context else None
 
         # Determine what search modes are available
-        can_semantic = (
-            self._db_type == "postgresql"
-            and self._get_embedding_service() is not None
-        )
+        can_semantic = self._db_type == "postgresql" and self._get_embedding_service() is not None
 
         effective_mode = mode
         if mode == "semantic" and not can_semantic:
@@ -2557,7 +2556,9 @@ Respond in JSON format."""
             ann_type = AnnotationType(annotation_type)
         except ValueError as err:
             valid = ", ".join(t.value for t in AnnotationType)
-            raise ValueError(f"Invalid annotation_type '{annotation_type}'. Valid: {valid}") from err
+            raise ValueError(
+                f"Invalid annotation_type '{annotation_type}'. Valid: {valid}"
+            ) from err
 
         # Validate source exists and belongs to job
         source = self.get_source(source_id, job_id=job_id)
@@ -2658,7 +2659,9 @@ Respond in JSON format."""
             if not tag:
                 continue
             if self._db_type == "sqlite":
-                query = "INSERT OR IGNORE INTO source_tags (source_id, job_id, tag) VALUES (?, ?, ?)"
+                query = (
+                    "INSERT OR IGNORE INTO source_tags (source_id, job_id, tag) VALUES (?, ?, ?)"
+                )
             else:
                 query = "INSERT INTO source_tags (source_id, job_id, tag) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING"
             self._cursor.execute(query, (source_id, job_id, tag))
@@ -2712,9 +2715,13 @@ Respond in JSON format."""
 
         if job_id is not None:
             if self._db_type == "sqlite":
-                query = "SELECT tag FROM source_tags WHERE source_id = ? AND job_id = ? ORDER BY tag"
+                query = (
+                    "SELECT tag FROM source_tags WHERE source_id = ? AND job_id = ? ORDER BY tag"
+                )
             else:
-                query = "SELECT tag FROM source_tags WHERE source_id = %s AND job_id = %s ORDER BY tag"
+                query = (
+                    "SELECT tag FROM source_tags WHERE source_id = %s AND job_id = %s ORDER BY tag"
+                )
             results = self._query(query, (source_id, job_id))
         else:
             if self._db_type == "sqlite":

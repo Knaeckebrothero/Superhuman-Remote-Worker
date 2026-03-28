@@ -32,7 +32,7 @@ def _split_sentences(text: str) -> list[str]:
     # Split on sentence-ending punctuation followed by whitespace and uppercase
     # or on newline boundaries that look like paragraph breaks
     sentences = re.split(
-        r'(?<=[.!?])\s+(?=[A-ZÄÖÜ])|(?<=\n)\s*\n+',
+        r"(?<=[.!?])\s+(?=[A-ZÄÖÜ])|(?<=\n)\s*\n+",
         text.strip(),
     )
     # Filter out empty strings and strip whitespace

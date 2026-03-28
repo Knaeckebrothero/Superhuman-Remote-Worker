@@ -5,13 +5,13 @@ import tempfile
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from citation_engine import CitationContext, CitationEngine
 from citation_engine.chunking import SemanticChunker, _cosine_similarity, _split_sentences
 from citation_engine.embeddings import (
     EmbeddingService,
     EmbeddingServiceNotConfigured,
 )
+
 
 # =============================================================================
 # EmbeddingService Tests
@@ -215,9 +215,7 @@ class TestEmbeddingService:
 
     def test_compute_batches_count_split(self):
         """Low count limit forces multiple batches."""
-        service = EmbeddingService(
-            model="test-model", api_key="test", max_texts_per_batch=2
-        )
+        service = EmbeddingService(model="test-model", api_key="test", max_texts_per_batch=2)
         texts = ["a", "b", "c", "d", "e"]
         batches = service._compute_batches(texts)
         assert len(batches) == 3
@@ -227,9 +225,7 @@ class TestEmbeddingService:
 
     def test_compute_batches_preserves_indices(self):
         """All indices appear exactly once across all batches."""
-        service = EmbeddingService(
-            model="test-model", api_key="test", max_texts_per_batch=3
-        )
+        service = EmbeddingService(model="test-model", api_key="test", max_texts_per_batch=3)
         texts = [f"text {i}" for i in range(10)]
         batches = service._compute_batches(texts)
         all_indices = [idx for batch in batches for idx in batch]
@@ -274,7 +270,7 @@ class TestEmbeddingService:
         call_args = mock_client.post.call_args
         sent_texts = call_args.kwargs.get("json", call_args[1].get("json", {}))["input"]
         assert len(sent_texts[0]) == 200  # truncated to max_tokens * 2
-        assert sent_texts[1] == "short"   # short text unchanged
+        assert sent_texts[1] == "short"  # short text unchanged
 
         # Original list not mutated
         assert len(original_texts[0]) == 30_000
@@ -303,7 +299,9 @@ class TestEmbeddingService:
         )
         assert service._encoding is not None  # tiktoken path
         # Long text that will exceed 10 tokens
-        oversized = "This is a longer sentence that should definitely exceed ten tokens by a wide margin."
+        oversized = (
+            "This is a longer sentence that should definitely exceed ten tokens by a wide margin."
+        )
         original_texts = [oversized]
         service.embed_batch(original_texts)
 
@@ -342,9 +340,7 @@ class TestEmbeddingService:
         mock_client.post.side_effect = [response1, response2]
         MockClient.return_value = mock_client
 
-        service = EmbeddingService(
-            model="test-model", api_key="test", max_texts_per_batch=2
-        )
+        service = EmbeddingService(model="test-model", api_key="test", max_texts_per_batch=2)
         results = service.embed_batch(["aaa", "bbb", "ccc"])
 
         assert mock_client.post.call_count == 2
@@ -435,8 +431,24 @@ class TestSemanticChunker:
         mock_service.embed_batch = fake_embed_batch
 
         # Build text with clear topic boundary — must exceed max_chunk_size
-        topic_a = ". ".join([f"Topic A sentence number {i} with extra content to increase size" for i in range(15)]) + "."
-        topic_b = ". ".join([f"Topic B sentence number {i} with extra content to increase size" for i in range(15)]) + "."
+        topic_a = (
+            ". ".join(
+                [
+                    f"Topic A sentence number {i} with extra content to increase size"
+                    for i in range(15)
+                ]
+            )
+            + "."
+        )
+        topic_b = (
+            ". ".join(
+                [
+                    f"Topic B sentence number {i} with extra content to increase size"
+                    for i in range(15)
+                ]
+            )
+            + "."
+        )
         text = topic_a + " " + topic_b
 
         chunker = SemanticChunker(
@@ -456,7 +468,9 @@ class TestSemanticChunker:
     def test_merge_small_chunks(self):
         """Test that very small chunks get merged."""
         chunker = SemanticChunker(min_chunk_size=50)
-        chunks = chunker._merge_small_chunks(["Hi.", "Also short.", "This is a longer chunk that should stay separate on its own."])
+        chunks = chunker._merge_small_chunks(
+            ["Hi.", "Also short.", "This is a longer chunk that should stay separate on its own."]
+        )
         # First two should be merged
         assert len(chunks) <= 2
 
@@ -490,9 +504,7 @@ class TestAutoEmbed:
         assert source.id > 0
 
         # Verify no embeddings were created (SQLite mode skips)
-        engine_with_context._cursor.execute(
-            "SELECT COUNT(*) as cnt FROM source_embeddings"
-        )
+        engine_with_context._cursor.execute("SELECT COUNT(*) as cnt FROM source_embeddings")
         result = engine_with_context._cursor.fetchone()
         assert result["cnt"] == 0
 
@@ -506,16 +518,12 @@ class TestAutoEmbed:
 
     def test_schema_version_is_3(self, engine_with_context):
         """Verify schema version is 3 after migration."""
-        engine_with_context._cursor.execute(
-            "SELECT MAX(version) as v FROM schema_migrations"
-        )
+        engine_with_context._cursor.execute("SELECT MAX(version) as v FROM schema_migrations")
         result = engine_with_context._cursor.fetchone()
         assert result["v"] == 3
 
     def test_reindex_source_sqlite_raises(self, engine_with_context):
         """reindex_source should raise NotImplementedError in SQLite mode."""
-        source = engine_with_context.add_custom_source(
-            name="Test", content="test content"
-        )
+        source = engine_with_context.add_custom_source(name="Test", content="test content")
         with pytest.raises(NotImplementedError, match="PostgreSQL"):
             engine_with_context.reindex_source(source.id)

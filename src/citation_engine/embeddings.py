@@ -78,16 +78,16 @@ class EmbeddingService:
         max_tokens_per_text: int = 8191,
         timeout: float = 60.0,
     ):
-        base_model = model or os.getenv(
-            "CITATION_EMBEDDING_MODEL", "qwen3-embedding-8b"
-        )
+        base_model = model or os.getenv("CITATION_EMBEDDING_MODEL", "qwen3-embedding-8b")
 
         # Explicit constructor args bypass provider logic (direct instantiation)
         if api_url:
             self.provider = "explicit"
             self.model = base_model
             self.api_url = api_url.rstrip("/")
-            self.api_key = api_key or os.getenv("CITATION_EMBEDDING_KEY") or os.getenv("OPENAI_API_KEY")
+            self.api_key = (
+                api_key or os.getenv("CITATION_EMBEDDING_KEY") or os.getenv("OPENAI_API_KEY")
+            )
         else:
             self.provider = os.getenv("EMBEDDING_PROVIDER", "local").lower()
 
@@ -97,14 +97,9 @@ class EmbeddingService:
                 self.model = f"qwen/{base_model}" if "/" not in base_model else base_model
             else:
                 # "local" provider (default)
-                self.api_url = (
-                    os.getenv("CITATION_EMBEDDING_URL")
-                    or "https://api.openai.com/v1"
-                )
+                self.api_url = os.getenv("CITATION_EMBEDDING_URL") or "https://api.openai.com/v1"
                 self.api_key = (
-                    api_key
-                    or os.getenv("CITATION_EMBEDDING_KEY")
-                    or os.getenv("OPENAI_API_KEY")
+                    api_key or os.getenv("CITATION_EMBEDDING_KEY") or os.getenv("OPENAI_API_KEY")
                 )
                 self.model = base_model
 
@@ -129,6 +124,7 @@ class EmbeddingService:
         self._encoding = None
         try:
             import tiktoken
+
             self._encoding = tiktoken.encoding_for_model(self.model)
             log.debug(f"Using tiktoken encoding for model {self.model}")
         except (ImportError, KeyError):
@@ -254,9 +250,7 @@ class EmbeddingService:
                 f"Embedding API returned {e.response.status_code}: {e.response.text[:500]}"
             ) from e
         except httpx.RequestError as e:
-            raise EmbeddingServiceError(
-                f"Embedding API request failed: {e}"
-            ) from e
+            raise EmbeddingServiceError(f"Embedding API request failed: {e}") from e
 
         embeddings_data = data.get("data", [])
         if len(embeddings_data) != len(texts):
@@ -311,23 +305,19 @@ class EmbeddingService:
                     )
                     if self._encoding is not None:
                         tokens = self._encoding.encode(text)
-                        texts[i] = self._encoding.decode(tokens[:self.max_tokens_per_text])
+                        texts[i] = self._encoding.decode(tokens[: self.max_tokens_per_text])
                     else:
-                        texts[i] = text[:self.max_tokens_per_text * 2]
+                        texts[i] = text[: self.max_tokens_per_text * 2]
 
         batches = self._compute_batches(texts)
-        log.debug(
-            f"Embedding {len(texts)} text(s) in {len(batches)} batch(es) via {url}"
-        )
+        log.debug(f"Embedding {len(texts)} text(s) in {len(batches)} batch(es) via {url}")
 
         results: list[list[float] | None] = [None] * len(texts)
 
         with httpx.Client(timeout=self.timeout) as client:
             for batch_indices in batches:
                 batch_texts = [texts[i] for i in batch_indices]
-                batch_results = self._embed_single_batch(
-                    batch_texts, client, url, headers
-                )
+                batch_results = self._embed_single_batch(batch_texts, client, url, headers)
                 for idx, embedding in zip(batch_indices, batch_results, strict=True):
                     results[idx] = embedding
 
