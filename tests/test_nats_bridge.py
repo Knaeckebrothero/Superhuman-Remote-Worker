@@ -189,7 +189,9 @@ class TestConnect:
         mock_sudo_gate = MagicMock()
         mock_sudo_module = MagicMock()
         mock_sudo_module.sudo_gate = mock_sudo_gate
-        with patch.dict("sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}):
+        with patch.dict(
+            "sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}
+        ):
             await bridge.connect(db=mock_db)
 
         assert bridge._available is True
@@ -219,7 +221,9 @@ class TestConnect:
         callback = MagicMock()
 
         mock_sudo_module = MagicMock()
-        with patch.dict("sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}):
+        with patch.dict(
+            "sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}
+        ):
             await bridge.connect(db=mock_db, on_vm_ready=callback)
 
         assert bridge._on_vm_ready is callback
@@ -255,7 +259,9 @@ class TestConnect:
     async def test_connect_failure_sets_unavailable(self, mock_nats_module, mock_db):
         from orchestrator.services.nats_bridge import NatsBridge
 
-        mock_nats_module.connect = AsyncMock(side_effect=ConnectionRefusedError("refused"))
+        mock_nats_module.connect = AsyncMock(
+            side_effect=ConnectionRefusedError("refused")
+        )
         bridge = NatsBridge(url="nats://test:4222")
 
         await bridge.connect(db=mock_db)
@@ -274,7 +280,9 @@ class TestConnect:
         bridge = NatsBridge(url="nats://test:4222")
 
         mock_sudo_module = MagicMock()
-        with patch.dict("sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}):
+        with patch.dict(
+            "sys.modules", {"orchestrator.services.sudo_gate": mock_sudo_module}
+        ):
             await bridge.connect(db=mock_db)
 
         # Verify nats.connect was called with expected parameters
@@ -336,7 +344,9 @@ class TestRequestVmCreate:
     """Tests for NatsBridge.request_vm_create()."""
 
     @pytest.mark.asyncio
-    async def test_create_publishes_correct_payload(self, bridge_with_db, mock_nc, mock_db):
+    async def test_create_publishes_correct_payload(
+        self, bridge_with_db, mock_nc, mock_db
+    ):
         result = await bridge_with_db.request_vm_create(
             job_id="test-job-123",
             agent_config="scholar",
@@ -361,7 +371,9 @@ class TestRequestVmCreate:
         assert "vm_image" not in payload  # Not provided, should be absent
 
     @pytest.mark.asyncio
-    async def test_create_includes_vm_image_when_provided(self, bridge_with_db, mock_nc):
+    async def test_create_includes_vm_image_when_provided(
+        self, bridge_with_db, mock_nc
+    ):
         await bridge_with_db.request_vm_create(
             job_id="test-job-123",
             vm_image="registry.example.com/vm-base:latest",
@@ -428,7 +440,9 @@ class TestRequestVmDelete:
     """Tests for NatsBridge.request_vm_delete()."""
 
     @pytest.mark.asyncio
-    async def test_delete_publishes_correct_payload(self, bridge_with_db, mock_nc, mock_db):
+    async def test_delete_publishes_correct_payload(
+        self, bridge_with_db, mock_nc, mock_db
+    ):
         result = await bridge_with_db.request_vm_delete(job_id="test-job-456")
 
         assert result is True
@@ -566,7 +580,9 @@ class TestSendControl:
         assert subject == "agent.vm.abc-def-ghi.control"
 
     @pytest.mark.asyncio
-    async def test_send_control_returns_false_when_unavailable(self, disconnected_bridge):
+    async def test_send_control_returns_false_when_unavailable(
+        self, disconnected_bridge
+    ):
         result = await disconnected_bridge.send_control("test-job-123", "freeze")
         assert result is False
 
@@ -588,12 +604,14 @@ class TestOnVmLifecycleStatus:
 
     @pytest.mark.asyncio
     async def test_basic_status_update(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "job_id": "job-001",
-            "status": "running",
-            "vm_name": "vm-job-001",
-            "namespace": "agent-vms",
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-001",
+                "status": "running",
+                "vm_name": "vm-job-001",
+                "namespace": "agent-vms",
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -608,13 +626,15 @@ class TestOnVmLifecycleStatus:
 
     @pytest.mark.asyncio
     async def test_status_with_error(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "job_id": "job-002",
-            "status": "failed",
-            "vm_name": "vm-job-002",
-            "namespace": "agent-vms",
-            "error": "Insufficient resources",
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-002",
+                "status": "failed",
+                "vm_name": "vm-job-002",
+                "namespace": "agent-vms",
+                "error": "Insufficient resources",
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -625,13 +645,15 @@ class TestOnVmLifecycleStatus:
 
     @pytest.mark.asyncio
     async def test_status_with_pod_ip(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "job_id": "job-003",
-            "status": "running",
-            "vm_name": "vm-job-003",
-            "namespace": "agent-vms",
-            "pod_ip": "10.0.0.42",
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-003",
+                "status": "running",
+                "vm_name": "vm-job-003",
+                "namespace": "agent-vms",
+                "pod_ip": "10.0.0.42",
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -640,13 +662,15 @@ class TestOnVmLifecycleStatus:
 
     @pytest.mark.asyncio
     async def test_status_with_ssh_nodeport(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "job_id": "job-004",
-            "status": "running",
-            "vm_name": "vm-job-004",
-            "namespace": "agent-vms",
-            "ssh_nodeport": 30022,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-004",
+                "status": "running",
+                "vm_name": "vm-job-004",
+                "namespace": "agent-vms",
+                "ssh_nodeport": 30022,
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -656,12 +680,14 @@ class TestOnVmLifecycleStatus:
     @pytest.mark.asyncio
     async def test_status_without_optional_fields(self, bridge_with_db, mock_db):
         """Optional fields (error, pod_ip, ssh_nodeport) should not appear if absent."""
-        msg = make_msg({
-            "job_id": "job-005",
-            "status": "creating",
-            "vm_name": "vm-job-005",
-            "namespace": "agent-vms",
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-005",
+                "status": "creating",
+                "vm_name": "vm-job-005",
+                "namespace": "agent-vms",
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -706,12 +732,14 @@ class TestOnDaemonRegister:
 
     @pytest.mark.asyncio
     async def test_register_with_ip(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "job_id": "job-reg-001",
-            "hostname": "vm-agent-001",
-            "ip": "100.64.1.5",
-            "pid": 12345,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-001",
+                "hostname": "vm-agent-001",
+                "ip": "100.64.1.5",
+                "pid": 12345,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -730,11 +758,13 @@ class TestOnDaemonRegister:
     @pytest.mark.asyncio
     async def test_register_falls_back_to_hostname(self, bridge_with_db, mock_db):
         """When ip is missing, hostname is used as ssh_host."""
-        msg = make_msg({
-            "job_id": "job-reg-002",
-            "hostname": "vm-agent-002.local",
-            "pid": 99,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-002",
+                "hostname": "vm-agent-002.local",
+                "pid": 99,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -745,12 +775,14 @@ class TestOnDaemonRegister:
     @pytest.mark.asyncio
     async def test_register_ip_preferred_over_hostname(self, bridge_with_db, mock_db):
         """When both ip and hostname are present, ip is preferred for ssh_host."""
-        msg = make_msg({
-            "job_id": "job-reg-003",
-            "hostname": "vm-agent-003",
-            "ip": "100.64.2.10",
-            "pid": 50,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-003",
+                "hostname": "vm-agent-003",
+                "ip": "100.64.2.10",
+                "pid": 50,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -759,16 +791,20 @@ class TestOnDaemonRegister:
         assert updates["hostname"] == "vm-agent-003"
 
     @pytest.mark.asyncio
-    async def test_register_triggers_on_vm_ready_callback(self, bridge_with_db, mock_db):
+    async def test_register_triggers_on_vm_ready_callback(
+        self, bridge_with_db, mock_db
+    ):
         callback = MagicMock()
         bridge_with_db._on_vm_ready = callback
 
-        msg = make_msg({
-            "job_id": "job-reg-004",
-            "hostname": "vm-agent-004",
-            "ip": "100.64.3.1",
-            "pid": 1,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-004",
+                "hostname": "vm-agent-004",
+                "ip": "100.64.3.1",
+                "pid": 1,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -780,12 +816,14 @@ class TestOnDaemonRegister:
         callback = MagicMock(side_effect=RuntimeError("callback boom"))
         bridge_with_db._on_vm_ready = callback
 
-        msg = make_msg({
-            "job_id": "job-reg-005",
-            "hostname": "vm-agent-005",
-            "ip": "100.64.4.1",
-            "pid": 2,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-005",
+                "hostname": "vm-agent-005",
+                "ip": "100.64.4.1",
+                "pid": 2,
+            }
+        )
 
         # Should not raise
         await bridge_with_db._on_daemon_register(msg)
@@ -798,12 +836,14 @@ class TestOnDaemonRegister:
         """Register works fine when no on_vm_ready callback is set."""
         bridge_with_db._on_vm_ready = None
 
-        msg = make_msg({
-            "job_id": "job-reg-006",
-            "hostname": "vm-agent-006",
-            "ip": "100.64.5.1",
-            "pid": 3,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-006",
+                "hostname": "vm-agent-006",
+                "ip": "100.64.5.1",
+                "pid": 3,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -828,12 +868,14 @@ class TestOnDaemonRegister:
     @pytest.mark.asyncio
     async def test_register_clears_recovering_flag(self, bridge_with_db, mock_db):
         """Registration should set recovering=False to clear any recovery guard."""
-        msg = make_msg({
-            "job_id": "job-reg-007",
-            "hostname": "vm-agent-007",
-            "ip": "100.64.7.1",
-            "pid": 7,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-007",
+                "hostname": "vm-agent-007",
+                "ip": "100.64.7.1",
+                "pid": 7,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -843,10 +885,12 @@ class TestOnDaemonRegister:
     @pytest.mark.asyncio
     async def test_register_neither_ip_nor_hostname(self, bridge_with_db, mock_db):
         """When both ip and hostname are missing, ssh_host should be None."""
-        msg = make_msg({
-            "job_id": "job-reg-008",
-            "pid": 8,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-reg-008",
+                "pid": 8,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -864,14 +908,16 @@ class TestOnDaemonHeartbeat:
 
     @pytest.mark.asyncio
     async def test_heartbeat_updates_last_heartbeat(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "job_id": "job-hb-001",
-            "agent_pid": 5555,
-            "agent_running": True,
-            "cpu_percent": 45.2,
-            "memory_percent": 62.1,
-            "disk_percent": 30.0,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-hb-001",
+                "agent_pid": 5555,
+                "agent_running": True,
+                "cpu_percent": 45.2,
+                "memory_percent": 62.1,
+                "disk_percent": 30.0,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
@@ -884,14 +930,18 @@ class TestOnDaemonHeartbeat:
         assert "T" in updates["last_heartbeat"]
 
     @pytest.mark.asyncio
-    async def test_heartbeat_with_code_server_connections(self, bridge_with_db, mock_db):
+    async def test_heartbeat_with_code_server_connections(
+        self, bridge_with_db, mock_db
+    ):
         """Heartbeat with code_server_connections triggers IDE session update."""
-        msg = make_msg({
-            "job_id": "job-hb-002",
-            "agent_pid": 6666,
-            "agent_running": True,
-            "code_server_connections": 2,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-hb-002",
+                "agent_pid": 6666,
+                "agent_running": True,
+                "code_server_connections": 2,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
@@ -907,14 +957,18 @@ class TestOnDaemonHeartbeat:
         assert "last_activity" in ide_updates
 
     @pytest.mark.asyncio
-    async def test_heartbeat_zero_code_server_connections(self, bridge_with_db, mock_db):
+    async def test_heartbeat_zero_code_server_connections(
+        self, bridge_with_db, mock_db
+    ):
         """Zero connections marks IDE session as idle."""
-        msg = make_msg({
-            "job_id": "job-hb-003",
-            "agent_pid": 7777,
-            "agent_running": True,
-            "code_server_connections": 0,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-hb-003",
+                "agent_pid": 7777,
+                "agent_running": True,
+                "code_server_connections": 0,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
@@ -928,11 +982,13 @@ class TestOnDaemonHeartbeat:
     @pytest.mark.asyncio
     async def test_heartbeat_no_code_server_field(self, bridge_with_db, mock_db):
         """When code_server_connections is absent, IDE session is not updated."""
-        msg = make_msg({
-            "job_id": "job-hb-004",
-            "agent_pid": 8888,
-            "agent_running": True,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-hb-004",
+                "agent_pid": 8888,
+                "agent_running": True,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
@@ -946,12 +1002,14 @@ class TestOnDaemonHeartbeat:
             side_effect=RuntimeError("db error")
         )
 
-        msg = make_msg({
-            "job_id": "job-hb-005",
-            "agent_pid": 9999,
-            "agent_running": True,
-            "code_server_connections": 1,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-hb-005",
+                "agent_pid": 9999,
+                "agent_running": True,
+                "code_server_connections": 1,
+            }
+        )
 
         # Should not raise
         await bridge_with_db._on_daemon_heartbeat(msg)
@@ -961,10 +1019,12 @@ class TestOnDaemonHeartbeat:
 
     @pytest.mark.asyncio
     async def test_heartbeat_missing_job_id(self, bridge_with_db, mock_db):
-        msg = make_msg({
-            "agent_pid": 1111,
-            "agent_running": True,
-        })
+        msg = make_msg(
+            {
+                "agent_pid": 1111,
+                "agent_running": True,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
@@ -983,12 +1043,14 @@ class TestOnDaemonHeartbeat:
         """When _db is None, IDE session update is skipped (code_server_connections path)."""
         bridge._db = None
 
-        msg = make_msg({
-            "job_id": "job-hb-006",
-            "agent_pid": 2222,
-            "agent_running": True,
-            "code_server_connections": 3,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-hb-006",
+                "agent_pid": 2222,
+                "agent_running": True,
+                "code_server_connections": 3,
+            }
+        )
 
         # Should not raise despite _db being None
         await bridge._on_daemon_heartbeat(msg)
@@ -1005,11 +1067,13 @@ class TestOnDaemonStatus:
     @pytest.mark.asyncio
     async def test_status_completed(self, bridge_with_db):
         """Completed status is logged without error."""
-        msg = make_msg({
-            "job_id": "job-st-001",
-            "status": "completed",
-            "exit_code": 0,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-st-001",
+                "status": "completed",
+                "exit_code": 0,
+            }
+        )
 
         # Should not raise
         await bridge_with_db._on_daemon_status(msg)
@@ -1017,11 +1081,13 @@ class TestOnDaemonStatus:
     @pytest.mark.asyncio
     async def test_status_failed(self, bridge_with_db):
         """Failed status is logged without error."""
-        msg = make_msg({
-            "job_id": "job-st-002",
-            "status": "failed",
-            "exit_code": 1,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-st-002",
+                "status": "failed",
+                "exit_code": 1,
+            }
+        )
 
         await bridge_with_db._on_daemon_status(msg)
 
@@ -1165,17 +1231,21 @@ class TestEdgeCases:
     """Edge cases and robustness tests."""
 
     @pytest.mark.asyncio
-    async def test_lifecycle_status_with_all_optional_fields(self, bridge_with_db, mock_db):
+    async def test_lifecycle_status_with_all_optional_fields(
+        self, bridge_with_db, mock_db
+    ):
         """Status message with every optional field populated."""
-        msg = make_msg({
-            "job_id": "job-edge-001",
-            "status": "running",
-            "vm_name": "vm-job-edge-001",
-            "namespace": "agent-vms",
-            "error": "some warning",
-            "pod_ip": "10.0.0.100",
-            "ssh_nodeport": 31022,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-001",
+                "status": "running",
+                "vm_name": "vm-job-edge-001",
+                "namespace": "agent-vms",
+                "error": "some warning",
+                "pod_ip": "10.0.0.100",
+                "ssh_nodeport": 31022,
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -1190,12 +1260,14 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_register_with_unicode_hostname(self, bridge_with_db, mock_db):
         """Hostnames with unusual characters should be handled."""
-        msg = make_msg({
-            "job_id": "job-edge-002",
-            "hostname": "vm-agent-\u00e4\u00f6\u00fc",
-            "ip": "100.64.10.1",
-            "pid": 42,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-002",
+                "hostname": "vm-agent-\u00e4\u00f6\u00fc",
+                "ip": "100.64.10.1",
+                "pid": 42,
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -1203,7 +1275,9 @@ class TestEdgeCases:
         assert updates["hostname"] == "vm-agent-\u00e4\u00f6\u00fc"
 
     @pytest.mark.asyncio
-    async def test_create_with_special_chars_in_description(self, bridge_with_db, mock_nc):
+    async def test_create_with_special_chars_in_description(
+        self, bridge_with_db, mock_nc
+    ):
         """Description with JSON-special characters must be encoded properly."""
         desc = 'Process "file.pdf" with keys: {a: 1, b: 2}\nnewline'
         await bridge_with_db.request_vm_create(
@@ -1215,17 +1289,21 @@ class TestEdgeCases:
         assert payload["description"] == desc
 
     @pytest.mark.asyncio
-    async def test_heartbeat_with_none_code_server_connections(self, bridge_with_db, mock_db):
+    async def test_heartbeat_with_none_code_server_connections(
+        self, bridge_with_db, mock_db
+    ):
         """Explicit null for code_server_connections should not update IDE session.
 
         The code checks `if cs_connections is not None`, so None should skip.
         """
-        msg = make_msg({
-            "job_id": "job-edge-004",
-            "agent_pid": 100,
-            "agent_running": True,
-            "code_server_connections": None,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-004",
+                "agent_pid": 100,
+                "agent_running": True,
+                "code_server_connections": None,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 
@@ -1233,16 +1311,20 @@ class TestEdgeCases:
         mock_db.merge_ide_session_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_db_merge_vm_context_error_in_lifecycle_status(self, bridge_with_db, mock_db):
+    async def test_db_merge_vm_context_error_in_lifecycle_status(
+        self, bridge_with_db, mock_db
+    ):
         """DB errors in lifecycle status handler should be caught."""
         mock_db.merge_vm_context = AsyncMock(side_effect=RuntimeError("db gone"))
 
-        msg = make_msg({
-            "job_id": "job-edge-005",
-            "status": "running",
-            "vm_name": "vm-edge",
-            "namespace": "ns",
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-005",
+                "status": "running",
+                "vm_name": "vm-edge",
+                "namespace": "ns",
+            }
+        )
 
         # Should not raise — the handler has its own try/except
         await bridge_with_db._on_vm_lifecycle_status(msg)
@@ -1252,12 +1334,14 @@ class TestEdgeCases:
         """DB errors in daemon register handler should be caught."""
         mock_db.merge_vm_context = AsyncMock(side_effect=RuntimeError("db gone"))
 
-        msg = make_msg({
-            "job_id": "job-edge-006",
-            "hostname": "vm-edge",
-            "ip": "100.64.99.1",
-            "pid": 1,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-006",
+                "hostname": "vm-edge",
+                "ip": "100.64.99.1",
+                "pid": 1,
+            }
+        )
 
         # The outer try/except in _on_daemon_register catches this
         await bridge_with_db._on_daemon_register(msg)
@@ -1265,15 +1349,17 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_large_payload_in_status(self, bridge_with_db, mock_db):
         """Handle a status message with extra unknown fields gracefully."""
-        msg = make_msg({
-            "job_id": "job-edge-007",
-            "status": "running",
-            "vm_name": "vm-edge",
-            "namespace": "ns",
-            "extra_field_1": "ignored",
-            "extra_field_2": {"nested": True},
-            "extra_field_3": [1, 2, 3],
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-007",
+                "status": "running",
+                "vm_name": "vm-edge",
+                "namespace": "ns",
+                "extra_field_1": "ignored",
+                "extra_field_2": {"nested": True},
+                "extra_field_3": [1, 2, 3],
+            }
+        )
 
         await bridge_with_db._on_vm_lifecycle_status(msg)
 
@@ -1300,11 +1386,13 @@ class TestEdgeCases:
     @pytest.mark.asyncio
     async def test_empty_string_job_id_in_register(self, bridge_with_db, mock_db):
         """Empty string job_id is falsy, should be treated as missing."""
-        msg = make_msg({
-            "job_id": "",
-            "hostname": "vm-agent",
-            "ip": "100.64.1.1",
-        })
+        msg = make_msg(
+            {
+                "job_id": "",
+                "hostname": "vm-agent",
+                "ip": "100.64.1.1",
+            }
+        )
 
         await bridge_with_db._on_daemon_register(msg)
 
@@ -1312,17 +1400,21 @@ class TestEdgeCases:
         mock_db.merge_vm_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_heartbeat_negative_code_server_connections(self, bridge_with_db, mock_db):
+    async def test_heartbeat_negative_code_server_connections(
+        self, bridge_with_db, mock_db
+    ):
         """Negative connection count (edge case) should still be processed.
 
         The code does `if cs_connections > 0` so negative should go to idle.
         """
-        msg = make_msg({
-            "job_id": "job-edge-008",
-            "agent_pid": 200,
-            "agent_running": True,
-            "code_server_connections": -1,
-        })
+        msg = make_msg(
+            {
+                "job_id": "job-edge-008",
+                "agent_pid": 200,
+                "agent_running": True,
+                "code_server_connections": -1,
+            }
+        )
 
         await bridge_with_db._on_daemon_heartbeat(msg)
 

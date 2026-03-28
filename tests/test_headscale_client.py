@@ -137,13 +137,13 @@ class TestInit:
 
         client = HeadscaleClient()
 
-        mock_resp = _mock_response(
-            _make_user_list_response(_make_user("srw", 42))
-        )
+        mock_resp = _mock_response(_make_user_list_response(_make_user("srw", 42)))
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=mock_resp)
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         assert client._user_id == "42"
@@ -165,7 +165,9 @@ class TestInit:
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=mock_resp)
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         assert client._user_id is None
@@ -198,7 +200,9 @@ class TestInit:
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=mock_resp)
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         assert client._user_id is None
@@ -215,9 +219,13 @@ class TestInit:
         client = HeadscaleClient()
 
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        mock_http.get = AsyncMock(side_effect=httpx.TimeoutException("Connection timed out"))
+        mock_http.get = AsyncMock(
+            side_effect=httpx.TimeoutException("Connection timed out")
+        )
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         assert client._user_id is None
@@ -237,7 +245,9 @@ class TestInit:
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         mock_http.get = AsyncMock(return_value=mock_resp)
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         assert client._user_id is None
@@ -256,15 +266,16 @@ class TestInit:
         def capture_constructor(**kwargs):
             captured_kwargs.update(kwargs)
             mock_http = AsyncMock()
-            mock_resp = _mock_response(
-                _make_user_list_response(_make_user("srw", 1))
-            )
+            mock_resp = _mock_response(_make_user_list_response(_make_user("srw", 1)))
             mock_http.get = AsyncMock(return_value=mock_resp)
             return mock_http
 
         client = HeadscaleClient()
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", side_effect=capture_constructor):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient",
+            side_effect=capture_constructor,
+        ):
             await client.init()
 
         assert captured_kwargs["headers"]["Authorization"] == "Bearer test-api-key"
@@ -332,14 +343,16 @@ class TestCreateAuthKey:
         client._client = mock_http
         client._user_id = "42"
 
-        mock_resp = _mock_response({
-            "preAuthKey": {
-                "key": "hskey-auth-abc123",
-                "user": "srw",
-                "ephemeral": True,
-                "reusable": False,
+        mock_resp = _mock_response(
+            {
+                "preAuthKey": {
+                    "key": "hskey-auth-abc123",
+                    "user": "srw",
+                    "ephemeral": True,
+                    "reusable": False,
+                }
             }
-        })
+        )
         mock_http.post = AsyncMock(return_value=mock_resp)
 
         key = await client.create_auth_key("job-uuid-111")
@@ -359,9 +372,7 @@ class TestCreateAuthKey:
         client._client = mock_http
         client._user_id = "42"
 
-        mock_resp = _mock_response({
-            "preAuthKey": {"key": "hskey-auth-xyz"}
-        })
+        mock_resp = _mock_response({"preAuthKey": {"key": "hskey-auth-xyz"}})
         mock_http.post = AsyncMock(return_value=mock_resp)
 
         await client.create_auth_key("test-job-id")
@@ -456,9 +467,7 @@ class TestCreateAuthKey:
         client._client = mock_http
         client._user_id = "42"
 
-        mock_http.post = AsyncMock(
-            side_effect=httpx.TimeoutException("read timed out")
-        )
+        mock_http.post = AsyncMock(side_effect=httpx.TimeoutException("read timed out"))
 
         result = await client.create_auth_key("job-id")
         assert result is None
@@ -512,9 +521,7 @@ class TestCreateAuthKey:
         client._client = mock_http
         client._user_id = "42"
 
-        mock_http.post = AsyncMock(
-            side_effect=httpx.ConnectError("Connection refused")
-        )
+        mock_http.post = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
 
         result = await client.create_auth_key("job-id")
         assert result is None
@@ -541,12 +548,14 @@ class TestDeleteNode:
         client._user_id = "42"
 
         job_id = "aaaa-bbbb-cccc"
-        list_resp = _mock_response({
-            "nodes": [
-                _make_node(10, "vm-other-job"),
-                _make_node(99, f"vm-{job_id}"),
-            ]
-        })
+        list_resp = _mock_response(
+            {
+                "nodes": [
+                    _make_node(10, "vm-other-job"),
+                    _make_node(99, f"vm-{job_id}"),
+                ]
+            }
+        )
         delete_resp = _mock_response({})
         mock_http.get = AsyncMock(return_value=list_resp)
         mock_http.delete = AsyncMock(return_value=delete_resp)
@@ -570,11 +579,13 @@ class TestDeleteNode:
 
         job_id = "1111-2222-3333"
         # givenName is different, but name matches
-        list_resp = _mock_response({
-            "nodes": [
-                _make_node(55, "some-other-name", f"vm-{job_id}"),
-            ]
-        })
+        list_resp = _mock_response(
+            {
+                "nodes": [
+                    _make_node(55, "some-other-name", f"vm-{job_id}"),
+                ]
+            }
+        )
         delete_resp = _mock_response({})
         mock_http.get = AsyncMock(return_value=list_resp)
         mock_http.delete = AsyncMock(return_value=delete_resp)
@@ -596,12 +607,14 @@ class TestDeleteNode:
         client._client = mock_http
         client._user_id = "42"
 
-        list_resp = _mock_response({
-            "nodes": [
-                _make_node(1, "vm-other-job-1"),
-                _make_node(2, "vm-other-job-2"),
-            ]
-        })
+        list_resp = _mock_response(
+            {
+                "nodes": [
+                    _make_node(1, "vm-other-job-1"),
+                    _make_node(2, "vm-other-job-2"),
+                ]
+            }
+        )
         mock_http.get = AsyncMock(return_value=list_resp)
 
         result = await client.delete_node("nonexistent-job")
@@ -685,9 +698,7 @@ class TestDeleteNode:
         client._user_id = "42"
 
         job_id = "delete-fail-job"
-        list_resp = _mock_response({
-            "nodes": [_make_node(77, f"vm-{job_id}")]
-        })
+        list_resp = _mock_response({"nodes": [_make_node(77, f"vm-{job_id}")]})
         delete_resp = _mock_response({}, status_code=500)
         mock_http.get = AsyncMock(return_value=list_resp)
         mock_http.delete = AsyncMock(return_value=delete_resp)
@@ -707,9 +718,7 @@ class TestDeleteNode:
         client._client = mock_http
         client._user_id = "42"
 
-        mock_http.get = AsyncMock(
-            side_effect=httpx.TimeoutException("read timed out")
-        )
+        mock_http.get = AsyncMock(side_effect=httpx.TimeoutException("read timed out"))
 
         result = await client.delete_node("job-id")
         assert result is False
@@ -728,9 +737,7 @@ class TestDeleteNode:
 
         job_id = "test-uuid-value"
         # Return a node with matching givenName
-        list_resp = _mock_response({
-            "nodes": [_make_node(1, f"vm-{job_id}")]
-        })
+        list_resp = _mock_response({"nodes": [_make_node(1, f"vm-{job_id}")]})
         delete_resp = _mock_response({})
         mock_http.get = AsyncMock(return_value=list_resp)
         mock_http.delete = AsyncMock(return_value=delete_resp)
@@ -754,12 +761,14 @@ class TestDeleteNode:
 
         job_id = "dup-job"
         # Two nodes with the same hostname (shouldn't happen, but edge case)
-        list_resp = _mock_response({
-            "nodes": [
-                _make_node(10, f"vm-{job_id}"),
-                _make_node(20, f"vm-{job_id}"),
-            ]
-        })
+        list_resp = _mock_response(
+            {
+                "nodes": [
+                    _make_node(10, f"vm-{job_id}"),
+                    _make_node(20, f"vm-{job_id}"),
+                ]
+            }
+        )
         delete_resp = _mock_response({})
         mock_http.get = AsyncMock(return_value=list_resp)
         mock_http.delete = AsyncMock(return_value=delete_resp)
@@ -801,9 +810,7 @@ class TestDeleteNode:
         client._client = mock_http
         client._user_id = "42"
 
-        mock_http.get = AsyncMock(
-            side_effect=httpx.ConnectError("Connection refused")
-        )
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
 
         result = await client.delete_node("job-id")
         assert result is False
@@ -919,9 +926,7 @@ class TestResolveUserId:
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         client._client = mock_http
 
-        mock_http.get = AsyncMock(
-            side_effect=httpx.TimeoutException("read timed out")
-        )
+        mock_http.get = AsyncMock(side_effect=httpx.TimeoutException("read timed out"))
 
         result = await client._resolve_user_id("srw")
         assert result is None
@@ -976,9 +981,7 @@ class TestResolveUserId:
         mock_http = AsyncMock(spec=httpx.AsyncClient)
         client._client = mock_http
 
-        mock_resp = _mock_response(
-            _make_user_list_response(_make_user("SRW", 1))
-        )
+        mock_resp = _mock_response(_make_user_list_response(_make_user("SRW", 1)))
         mock_http.get = AsyncMock(return_value=mock_resp)
 
         result = await client._resolve_user_id("srw")
@@ -1055,21 +1058,15 @@ class TestLifecycleIntegration:
         mock_http = AsyncMock(spec=httpx.AsyncClient)
 
         # init() will call GET /api/v1/user
-        user_resp = _mock_response(
-            _make_user_list_response(_make_user("srw", 5))
-        )
+        user_resp = _mock_response(_make_user_list_response(_make_user("srw", 5)))
 
         # create_auth_key() will call POST /api/v1/preauthkey
-        key_resp = _mock_response({
-            "preAuthKey": {"key": "hskey-auth-lifecycle-test"}
-        })
+        key_resp = _mock_response({"preAuthKey": {"key": "hskey-auth-lifecycle-test"}})
 
         job_id = "lifecycle-test-job"
 
         # delete_node() will call GET /api/v1/node then DELETE /api/v1/node/{id}
-        node_resp = _mock_response({
-            "nodes": [_make_node(88, f"vm-{job_id}")]
-        })
+        node_resp = _mock_response({"nodes": [_make_node(88, f"vm-{job_id}")]})
         delete_resp = _mock_response({})
 
         # Configure mock to return different responses per call
@@ -1077,7 +1074,9 @@ class TestLifecycleIntegration:
         mock_http.post = AsyncMock(return_value=key_resp)
         mock_http.delete = AsyncMock(return_value=delete_resp)
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         assert client.is_available is True
@@ -1108,12 +1107,12 @@ class TestLifecycleIntegration:
 
         # init() — user not found
         mock_http = AsyncMock(spec=httpx.AsyncClient)
-        user_resp = _mock_response(
-            _make_user_list_response(_make_user("other", 1))
-        )
+        user_resp = _mock_response(_make_user_list_response(_make_user("other", 1)))
         mock_http.get = AsyncMock(return_value=user_resp)
 
-        with patch("vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http):
+        with patch(
+            "vm.controller.headscale_client.httpx.AsyncClient", return_value=mock_http
+        ):
             await client.init()
 
         # Now unavailable

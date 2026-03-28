@@ -52,11 +52,7 @@ if "nats" not in sys.modules:
 # ---------------------------------------------------------------------------
 
 DAEMON_PATH = (
-    project_root
-    / "docker"
-    / "agent-vm-base"
-    / "files"
-    / "management-daemon.py"
+    project_root / "docker" / "agent-vm-base" / "files" / "management-daemon.py"
 )
 
 
@@ -374,7 +370,9 @@ class TestDetectIp:
         mock_socket.getsockname.return_value = ("10.0.0.77", 0)
 
         with (
-            patch("subprocess.run", side_effect=subprocess.TimeoutExpired("tailscale", 5)),
+            patch(
+                "subprocess.run", side_effect=subprocess.TimeoutExpired("tailscale", 5)
+            ),
             patch("socket.socket", return_value=mock_socket),
         ):
             ip = detect_ip()
@@ -505,7 +503,11 @@ class TestGetSystemMetrics:
             # When sys.modules has None, import raises ImportError.
             metrics = get_system_metrics()
 
-        assert metrics == {"cpu_percent": 0.0, "memory_percent": 0.0, "disk_percent": 0.0}
+        assert metrics == {
+            "cpu_percent": 0.0,
+            "memory_percent": 0.0,
+            "disk_percent": 0.0,
+        }
 
     def test_returns_zeros_on_psutil_exception(self):
         """get_system_metrics returns zero metrics when psutil raises."""
@@ -515,7 +517,11 @@ class TestGetSystemMetrics:
         with patch.dict("sys.modules", {"psutil": mock_psutil}):
             metrics = get_system_metrics()
 
-        assert metrics == {"cpu_percent": 0.0, "memory_percent": 0.0, "disk_percent": 0.0}
+        assert metrics == {
+            "cpu_percent": 0.0,
+            "memory_percent": 0.0,
+            "disk_percent": 0.0,
+        }
 
 
 # =============================================================================
@@ -612,7 +618,9 @@ class TestConnectNats:
         """connect_nats passes the configured NATS URL to nats.connect."""
         mock_nc = AsyncMock()
 
-        with patch("nats.connect", new_callable=AsyncMock, return_value=mock_nc) as mock_connect:
+        with patch(
+            "nats.connect", new_callable=AsyncMock, return_value=mock_nc
+        ) as mock_connect:
             await daemon.connect_nats()
 
         mock_connect.assert_called_once()
@@ -624,7 +632,9 @@ class TestConnectNats:
         """connect_nats passes error/disconnect/reconnect callbacks."""
         mock_nc = AsyncMock()
 
-        with patch("nats.connect", new_callable=AsyncMock, return_value=mock_nc) as mock_connect:
+        with patch(
+            "nats.connect", new_callable=AsyncMock, return_value=mock_nc
+        ) as mock_connect:
             await daemon.connect_nats()
 
         _, kwargs = mock_connect.call_args
@@ -756,7 +766,9 @@ class TestOnControl:
         assert signal.SIGKILL in signals_sent
 
     @pytest.mark.asyncio
-    async def test_terminate_skips_sigkill_if_process_already_dead(self, connected_daemon):
+    async def test_terminate_skips_sigkill_if_process_already_dead(
+        self, connected_daemon
+    ):
         """_on_control with action=terminate skips SIGKILL if process exited."""
         msg = self._make_msg("terminate")
         kill_calls = []
@@ -830,7 +842,11 @@ class TestHeartbeatLoop:
             patch.object(
                 daemon_mod,
                 "get_system_metrics",
-                return_value={"cpu_percent": 10.0, "memory_percent": 20.0, "disk_percent": 30.0},
+                return_value={
+                    "cpu_percent": 10.0,
+                    "memory_percent": 20.0,
+                    "disk_percent": 30.0,
+                },
             ),
         ):
             # Let it run one iteration then shutdown
@@ -864,9 +880,14 @@ class TestHeartbeatLoop:
             patch.object(
                 daemon_mod,
                 "get_system_metrics",
-                return_value={"cpu_percent": 0.0, "memory_percent": 0.0, "disk_percent": 0.0},
+                return_value={
+                    "cpu_percent": 0.0,
+                    "memory_percent": 0.0,
+                    "disk_percent": 0.0,
+                },
             ),
         ):
+
             async def shutdown_after_publish():
                 while not connected_daemon.nc.publish.called:
                     await asyncio.sleep(0.01)
@@ -902,6 +923,7 @@ class TestHeartbeatLoop:
             patch.object(daemon_mod, "read_agent_pid", return_value=100),
             patch.object(daemon_mod, "get_system_metrics", return_value={}),
         ):
+
             async def shutdown_shortly():
                 await asyncio.sleep(0.05)
                 connected_daemon.request_shutdown()
@@ -926,13 +948,20 @@ class TestHeartbeatLoop:
             return 123
 
         with (
-            patch.object(daemon_mod, "read_agent_pid", side_effect=side_effect_read_pid),
+            patch.object(
+                daemon_mod, "read_agent_pid", side_effect=side_effect_read_pid
+            ),
             patch.object(
                 daemon_mod,
                 "get_system_metrics",
-                return_value={"cpu_percent": 0.0, "memory_percent": 0.0, "disk_percent": 0.0},
+                return_value={
+                    "cpu_percent": 0.0,
+                    "memory_percent": 0.0,
+                    "disk_percent": 0.0,
+                },
             ),
         ):
+
             async def shutdown_after_second_call():
                 while call_count < 2:
                     await asyncio.sleep(0.01)
@@ -956,7 +985,9 @@ class TestAgentMonitorLoop:
     """Tests for agent_monitor_loop() — exit detection, status reporting."""
 
     @pytest.mark.asyncio
-    async def test_reports_completed_on_exit_code_zero(self, connected_daemon, tmp_path):
+    async def test_reports_completed_on_exit_code_zero(
+        self, connected_daemon, tmp_path
+    ):
         """agent_monitor_loop reports status=completed when exit code is 0."""
         exit_code_file = tmp_path / "agent.exit_code"
         exit_code_file.write_text("0\n")
@@ -974,6 +1005,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", exit_code_file),
         ):
+
             async def shutdown_after_report():
                 while not connected_daemon.nc.publish.called:
                     await asyncio.sleep(0.01)
@@ -990,7 +1022,9 @@ class TestAgentMonitorLoop:
         assert payload["job_id"] == "test-job-001"
 
     @pytest.mark.asyncio
-    async def test_reports_failed_on_nonzero_exit_code(self, connected_daemon, tmp_path):
+    async def test_reports_failed_on_nonzero_exit_code(
+        self, connected_daemon, tmp_path
+    ):
         """agent_monitor_loop reports status=failed when exit code != 0."""
         exit_code_file = tmp_path / "agent.exit_code"
         exit_code_file.write_text("1\n")
@@ -1008,6 +1042,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", exit_code_file),
         ):
+
             async def shutdown_after_report():
                 while not connected_daemon.nc.publish.called:
                     await asyncio.sleep(0.01)
@@ -1023,7 +1058,9 @@ class TestAgentMonitorLoop:
         assert payload["exit_code"] == 1
 
     @pytest.mark.asyncio
-    async def test_defaults_to_failure_when_no_exit_code_file(self, connected_daemon, tmp_path):
+    async def test_defaults_to_failure_when_no_exit_code_file(
+        self, connected_daemon, tmp_path
+    ):
         """agent_monitor_loop defaults exit_code=1 when exit code file missing."""
         non_existent = tmp_path / "no-such-file"
 
@@ -1040,6 +1077,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", non_existent),
         ):
+
             async def shutdown_after_report():
                 while not connected_daemon.nc.publish.called:
                     await asyncio.sleep(0.01)
@@ -1073,6 +1111,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", exit_code_file),
         ):
+
             async def shutdown_after_multiple_polls():
                 while call_count < 4:
                     await asyncio.sleep(0.01)
@@ -1098,6 +1137,7 @@ class TestAgentMonitorLoop:
             return None
 
         with patch.object(daemon_mod, "read_agent_pid", side_effect=always_none):
+
             async def shutdown_shortly():
                 while call_count < 3:
                     await asyncio.sleep(0.01)
@@ -1111,7 +1151,9 @@ class TestAgentMonitorLoop:
         connected_daemon.nc.publish.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_publish_when_nats_disconnected(self, connected_daemon, tmp_path):
+    async def test_skips_publish_when_nats_disconnected(
+        self, connected_daemon, tmp_path
+    ):
         """agent_monitor_loop skips publish when NATS is disconnected."""
         exit_code_file = tmp_path / "agent.exit_code"
         exit_code_file.write_text("0\n")
@@ -1131,6 +1173,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", exit_code_file),
         ):
+
             async def shutdown_shortly():
                 while call_count < 3:
                     await asyncio.sleep(0.01)
@@ -1162,6 +1205,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", exit_code_file),
         ):
+
             async def shutdown_after_report():
                 while not connected_daemon.nc.publish.called:
                     await asyncio.sleep(0.01)
@@ -1194,6 +1238,7 @@ class TestAgentMonitorLoop:
             patch.object(daemon_mod, "read_agent_pid", side_effect=pid_sequence),
             patch.object(daemon_mod, "AGENT_EXIT_CODE_FILE", exit_code_file),
         ):
+
             async def shutdown_after_report():
                 while not connected_daemon.nc.publish.called:
                     await asyncio.sleep(0.01)
@@ -1232,8 +1277,11 @@ class TestIpUpdateLoop:
 
         with (
             patch.object(daemon_mod, "detect_ip", side_effect=changing_ip),
-            patch.object(connected_daemon, "register", new_callable=AsyncMock) as mock_register,
+            patch.object(
+                connected_daemon, "register", new_callable=AsyncMock
+            ) as mock_register,
         ):
+
             async def shutdown_after_reregister():
                 while not mock_register.called:
                     await asyncio.sleep(0.01)
@@ -1259,8 +1307,11 @@ class TestIpUpdateLoop:
 
         with (
             patch.object(daemon_mod, "detect_ip", side_effect=same_ip),
-            patch.object(connected_daemon, "register", new_callable=AsyncMock) as mock_register,
+            patch.object(
+                connected_daemon, "register", new_callable=AsyncMock
+            ) as mock_register,
         ):
+
             async def shutdown_after_checks():
                 while check_count < 3:
                     await asyncio.sleep(0.01)
@@ -1297,8 +1348,11 @@ class TestIpUpdateLoop:
 
         with (
             patch.object(daemon_mod, "detect_ip", side_effect=flaky_detect),
-            patch.object(connected_daemon, "register", new_callable=AsyncMock) as mock_register,
+            patch.object(
+                connected_daemon, "register", new_callable=AsyncMock
+            ) as mock_register,
         ):
+
             async def shutdown_after_recovery():
                 while call_count < 2:
                     await asyncio.sleep(0.01)
@@ -1532,9 +1586,15 @@ class TestDaemonRun:
         mock_nc.drain = AsyncMock()
 
         with (
-            patch.object(daemon, "_wait_for_cloud_init", new_callable=AsyncMock) as mock_cloud,
-            patch.object(daemon, "_wait_for_tailscale", new_callable=AsyncMock) as mock_ts,
-            patch.object(daemon, "connect_nats", new_callable=AsyncMock) as mock_connect,
+            patch.object(
+                daemon, "_wait_for_cloud_init", new_callable=AsyncMock
+            ) as mock_cloud,
+            patch.object(
+                daemon, "_wait_for_tailscale", new_callable=AsyncMock
+            ) as mock_ts,
+            patch.object(
+                daemon, "connect_nats", new_callable=AsyncMock
+            ) as mock_connect,
             patch.object(daemon, "register", new_callable=AsyncMock) as mock_register,
             patch.object(daemon, "heartbeat_loop", new_callable=AsyncMock),
             patch.object(daemon, "agent_monitor_loop", new_callable=AsyncMock),
@@ -1568,9 +1628,12 @@ class TestDaemonRun:
         with (
             patch.object(daemon, "_wait_for_cloud_init", new_callable=AsyncMock),
             patch.object(daemon, "_wait_for_tailscale", new_callable=AsyncMock),
-            patch.object(daemon, "connect_nats", new_callable=AsyncMock) as mock_connect,
+            patch.object(
+                daemon, "connect_nats", new_callable=AsyncMock
+            ) as mock_connect,
             patch.object(daemon, "register", new_callable=AsyncMock) as mock_register,
         ):
+
             async def fake_connect():
                 daemon.request_shutdown()
 
@@ -1592,12 +1655,15 @@ class TestDaemonRun:
         with (
             patch.object(daemon, "_wait_for_cloud_init", new_callable=AsyncMock),
             patch.object(daemon, "_wait_for_tailscale", new_callable=AsyncMock),
-            patch.object(daemon, "connect_nats", new_callable=AsyncMock) as mock_connect,
+            patch.object(
+                daemon, "connect_nats", new_callable=AsyncMock
+            ) as mock_connect,
             patch.object(daemon, "register", new_callable=AsyncMock),
             patch.object(daemon, "heartbeat_loop", new_callable=AsyncMock),
             patch.object(daemon, "agent_monitor_loop", new_callable=AsyncMock),
             patch.object(daemon, "ip_update_loop", new_callable=AsyncMock),
         ):
+
             async def fake_connect():
                 daemon.nc = mock_nc
 
@@ -1626,12 +1692,15 @@ class TestDaemonRun:
         with (
             patch.object(daemon, "_wait_for_cloud_init", new_callable=AsyncMock),
             patch.object(daemon, "_wait_for_tailscale", new_callable=AsyncMock),
-            patch.object(daemon, "connect_nats", new_callable=AsyncMock) as mock_connect,
+            patch.object(
+                daemon, "connect_nats", new_callable=AsyncMock
+            ) as mock_connect,
             patch.object(daemon, "register", new_callable=AsyncMock),
             patch.object(daemon, "heartbeat_loop", new_callable=AsyncMock),
             patch.object(daemon, "agent_monitor_loop", new_callable=AsyncMock),
             patch.object(daemon, "ip_update_loop", new_callable=AsyncMock),
         ):
+
             async def fake_connect():
                 daemon.nc = mock_nc
 

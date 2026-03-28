@@ -43,7 +43,9 @@ def _make_sftp_attr(*, is_dir: bool = False, size: int = 0) -> MagicMock:
     return attr
 
 
-def _make_sftp_entry(filename: str, *, is_dir: bool = False, size: int = 0) -> MagicMock:
+def _make_sftp_entry(
+    filename: str, *, is_dir: bool = False, size: int = 0
+) -> MagicMock:
     """Create a mock SFTP directory entry (listdir_attr result)."""
     entry = _make_sftp_attr(is_dir=is_dir, size=size)
     entry.filename = filename
@@ -696,9 +698,7 @@ class TestRemoteBackendInit:
         assert backend._session_name == "agent_abcdef123456"
 
     def test_session_name_without_job_id(self):
-        backend = RemoteBackend(
-            host="host", workspace_path="/ws", job_id=""
-        )
+        backend = RemoteBackend(host="host", workspace_path="/ws", job_id="")
         assert backend._session_name == "agent_remote"
 
 
@@ -936,9 +936,7 @@ class TestRemoteBackendReadFile:
 
         content = backend.read_file("hello.txt")
         assert content == "Hello, remote world!"
-        mock_sftp.open.assert_called_with(
-            "/home/agent-host/workspace/hello.txt", "rb"
-        )
+        mock_sftp.open.assert_called_with("/home/agent-host/workspace/hello.txt", "rb")
 
     def test_read_binary_file(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -992,9 +990,7 @@ class TestRemoteBackendWriteFile:
         mock_sftp.open.return_value.__exit__ = MagicMock(return_value=False)
 
         backend.write_file("output.txt", "Hello!")
-        mock_sftp.open.assert_called_with(
-            "/home/agent-host/workspace/output.txt", "wb"
-        )
+        mock_sftp.open.assert_called_with("/home/agent-host/workspace/output.txt", "wb")
 
     def test_write_binary_content(self, remote_backend):
         backend, mock_ssh, mock_sftp = remote_backend
@@ -1035,9 +1031,7 @@ class TestRemoteBackendAppendFile:
         mock_sftp.open.return_value.__exit__ = MagicMock(return_value=False)
 
         backend.append_file("log.txt", "new line\n")
-        mock_sftp.open.assert_called_with(
-            "/home/agent-host/workspace/log.txt", "ab"
-        )
+        mock_sftp.open.assert_called_with("/home/agent-host/workspace/log.txt", "ab")
         file_obj.write.assert_called_once_with(b"new line\n")
 
 
@@ -1989,10 +1983,25 @@ class TestBackendInterfaceCompliance:
     def test_local_backend_has_all_abstract_methods(self, tmp_path):
         backend = LocalBackend(tmp_path)
         abstract_methods = [
-            "read_file", "write_file", "append_file", "exists", "is_file",
-            "is_dir", "list_dir", "search_files", "mkdir", "delete_file",
-            "delete_directory", "move", "copy", "stat", "resolve_path",
-            "connect", "disconnect", "is_connected", "root",
+            "read_file",
+            "write_file",
+            "append_file",
+            "exists",
+            "is_file",
+            "is_dir",
+            "list_dir",
+            "search_files",
+            "mkdir",
+            "delete_file",
+            "delete_directory",
+            "move",
+            "copy",
+            "stat",
+            "resolve_path",
+            "connect",
+            "disconnect",
+            "is_connected",
+            "root",
         ]
         for method in abstract_methods:
             assert hasattr(backend, method), f"LocalBackend missing {method}"
@@ -2000,10 +2009,25 @@ class TestBackendInterfaceCompliance:
     def test_remote_backend_has_all_abstract_methods(self):
         backend = RemoteBackend(host="host", workspace_path="/ws")
         abstract_methods = [
-            "read_file", "write_file", "append_file", "exists", "is_file",
-            "is_dir", "list_dir", "search_files", "mkdir", "delete_file",
-            "delete_directory", "move", "copy", "stat", "resolve_path",
-            "connect", "disconnect", "is_connected", "root",
+            "read_file",
+            "write_file",
+            "append_file",
+            "exists",
+            "is_file",
+            "is_dir",
+            "list_dir",
+            "search_files",
+            "mkdir",
+            "delete_file",
+            "delete_directory",
+            "move",
+            "copy",
+            "stat",
+            "resolve_path",
+            "connect",
+            "disconnect",
+            "is_connected",
+            "root",
         ]
         for method in abstract_methods:
             assert hasattr(backend, method), f"RemoteBackend missing {method}"
@@ -2011,9 +2035,16 @@ class TestBackendInterfaceCompliance:
     def test_remote_backend_has_shell_methods(self):
         backend = RemoteBackend(host="host", workspace_path="/ws")
         shell_methods = [
-            "shell_run", "shell_send", "shell_read", "shell_read_with_offset",
-            "shell_ensure_tab", "shell_open_tab", "shell_close_tab",
-            "shell_list_tabs", "shell_format_tab_header", "shell_cleanup",
+            "shell_run",
+            "shell_send",
+            "shell_read",
+            "shell_read_with_offset",
+            "shell_ensure_tab",
+            "shell_open_tab",
+            "shell_close_tab",
+            "shell_list_tabs",
+            "shell_format_tab_header",
+            "shell_cleanup",
             "shell_is_alive",
         ]
         for method in shell_methods:
