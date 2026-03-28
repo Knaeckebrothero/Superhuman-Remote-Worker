@@ -18,7 +18,7 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
+from orchestrator.services.workspace_suspension import WorkspaceSuspensionService  # noqa: E402
 
 
 # =============================================================================
