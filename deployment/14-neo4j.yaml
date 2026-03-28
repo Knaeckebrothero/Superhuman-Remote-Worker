@@ -11,6 +11,32 @@ spec:
     requests:
       storage: 10Gi
 ---
+# TLS certificate for Neo4j Bolt (cert-manager + Cloudflare DNS)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: srw-neo4j-bolt-tls
+  namespace: superhuman-remote-worker
+spec:
+  secretName: srw-neo4j-bolt-tls
+  issuerRef:
+    name: cloudflare-dns-issuer
+    kind: ClusterIssuer
+  dnsNames:
+    - bolt-neo4j.superhuman-remote-worker.com
+  duration: 2160h    # 90 days
+  renewBefore: 720h  # Renew 30 days before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    encoding: PKCS8
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+    - client auth
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -49,9 +75,25 @@ spec:
               value: ":7688"
             - name: NEO4J_server_bolt_advertised__address
               value: "bolt-neo4j.superhuman-remote-worker.com:7688"
+            # TLS for Bolt — OPTIONAL allows both encrypted (browser) and unencrypted (internal)
+            - name: NEO4J_server_bolt_tls__level
+              value: "OPTIONAL"
+            - name: NEO4J_dbms_ssl_policy_bolt_enabled
+              value: "true"
+            - name: NEO4J_dbms_ssl_policy_bolt_base__directory
+              value: "/ssl/bolt"
+            - name: NEO4J_dbms_ssl_policy_bolt_private__key
+              value: "tls.key"
+            - name: NEO4J_dbms_ssl_policy_bolt_public__certificate
+              value: "tls.crt"
+            - name: NEO4J_dbms_ssl_policy_bolt_client__auth
+              value: "NONE"
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: bolt-tls
+              mountPath: /ssl/bolt
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /
@@ -75,6 +117,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: srw-neo4j-data
+        - name: bolt-tls
+          secret:
+            secretName: srw-neo4j-bolt-tls
 ---
 # ClusterIP for internal access (orchestrator, agents)
 apiVersion: v1
@@ -95,7 +140,7 @@ spec:
     app: srw-neo4j
 ---
 # MetalLB LoadBalancer for Bolt access from home network
-# Point internal DNS: bolt-neo4j.superhuman-remote-worker.com -> auto-assigned MetalLB IP
+# DNS: bolt-neo4j.superhuman-remote-worker.com -> 10.0.51.32
 apiVersion: v1
 kind: Service
 metadata:
