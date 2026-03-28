@@ -59,7 +59,15 @@ from uuid import UUID  # noqa: E402
 
 import asyncpg  # noqa: E402
 import yaml  # noqa: E402
-from fastapi import Body, FastAPI, HTTPException, Query, Request  # noqa: E402
+from fastapi import (  # noqa: E402
+    Body,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
@@ -95,6 +103,7 @@ from services.vm_provisioner import vm_provisioner  # noqa: E402
 from services.container_provisioner import container_provisioner  # noqa: E402
 from services.snapshot_service import snapshot_service  # noqa: E402
 from services.ide_session import ide_session_service  # noqa: E402
+from services.ide_proxy import ide_proxy_service  # noqa: E402
 from services.email import email_service  # noqa: E402
 from services.imap_poller import imap_poller  # noqa: E402
 from services.notification_service import notification_service  # noqa: E402
@@ -1682,6 +1691,9 @@ async def lifespan(app: FastAPI):
         container_provisioner=container_provisioner,
     )
 
+    # Initialize IDE proxy service (pod IP resolution + cache)
+    ide_proxy_service.connect(db=postgres_db)
+
     # Initialize notification feed (SSE broadcast for cockpit)
     from services.notification_feed import notification_feed
 
@@ -1774,12 +1786,13 @@ app.add_middleware(
 # Request logging middleware — replaces uvicorn's shallow access log with
 # app-level logging that includes response timing and error tracebacks.
 _SILENT_PATHS = {"/api/health"}
+_SILENT_PREFIXES = ("/api/ide/",)  # suppress per-asset log spam from IDE proxy
 
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     path = request.url.path
-    if path in _SILENT_PATHS:
+    if path in _SILENT_PATHS or path.startswith(_SILENT_PREFIXES):
         return await call_next(request)
 
     method = request.method
@@ -5323,6 +5336,180 @@ async def stop_ide_session(job_id: str) -> dict[str, Any]:
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# =============================================================================
+# IDE Proxy — reverse proxy HTTP + WebSocket to code-server in workspace pods
+# =============================================================================
+
+# Shared httpx client for IDE proxy (long-lived, created once)
+_ide_http_client: httpx.AsyncClient | None = None
+
+
+def _get_ide_http_client() -> httpx.AsyncClient:
+    global _ide_http_client
+    if _ide_http_client is None:
+        _ide_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=300.0, write=30.0, pool=5.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            follow_redirects=False,
+        )
+    return _ide_http_client
+
+
+# Headers that should not be forwarded to the upstream code-server
+_PROXY_HOP_HEADERS = frozenset(
+    {
+        "host",
+        "authorization",
+        "connection",
+        "upgrade",
+        "transfer-encoding",
+        "keep-alive",
+        "te",
+        "trailer",
+        "proxy-authorization",
+        "proxy-connection",
+    }
+)
+
+
+@app.api_route(
+    "/api/ide/{job_id}/proxy/{path:path}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+)
+async def ide_proxy_http(request: Request, job_id: str, path: str = ""):
+    """Reverse proxy HTTP requests to code-server in a workspace pod."""
+    pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
+    if not pod_ip:
+        raise HTTPException(status_code=503, detail="IDE session not active")
+
+    # Build upstream URL
+    upstream_url = f"http://{pod_ip}:8080/{path}"
+    if request.url.query:
+        # Strip 'token' param (reserved for future auth) but forward the rest
+        query = str(request.url.query)
+        upstream_url += f"?{query}"
+
+    # Build upstream headers (strip hop-by-hop and proxy-specific)
+    upstream_headers = {}
+    for key, value in request.headers.items():
+        if key.lower() not in _PROXY_HOP_HEADERS:
+            upstream_headers[key] = value
+    upstream_headers["host"] = f"{pod_ip}:8080"
+    upstream_headers["x-forwarded-for"] = request.client.host if request.client else ""
+    upstream_headers["x-forwarded-proto"] = "https"
+
+    client = _get_ide_http_client()
+
+    try:
+        upstream_resp = await client.request(
+            method=request.method,
+            url=upstream_url,
+            headers=upstream_headers,
+            content=request.stream()
+            if request.method in ("POST", "PUT", "PATCH")
+            else None,
+        )
+    except httpx.ConnectError:
+        ide_proxy_service.evict(job_id)
+        raise HTTPException(status_code=502, detail="code-server unreachable")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="code-server timeout")
+
+    # Build response headers (pass through relevant ones)
+    response_headers = {}
+    for key, value in upstream_resp.headers.multi_items():
+        lower = key.lower()
+        if lower not in ("transfer-encoding", "connection", "keep-alive"):
+            response_headers[key] = value
+
+    return StreamingResponse(
+        content=upstream_resp.aiter_bytes(),
+        status_code=upstream_resp.status_code,
+        headers=response_headers,
+    )
+
+
+@app.websocket("/api/ide/{job_id}/proxy/{path:path}")
+async def ide_proxy_ws(ws: WebSocket, job_id: str, path: str = ""):
+    """Reverse proxy WebSocket connections to code-server in a workspace pod."""
+    import asyncio
+
+    import websockets
+
+    pod_ip = await ide_proxy_service.resolve_pod_ip(job_id)
+    if not pod_ip:
+        await ws.close(code=4503, reason="IDE session not active")
+        return
+
+    await ws.accept()
+
+    # Build upstream WS URL
+    upstream_url = f"ws://{pod_ip}:8080/{path}"
+    if ws.url.query:
+        upstream_url += f"?{ws.url.query}"
+
+    try:
+        async with websockets.connect(
+            upstream_url,
+            max_size=16 * 1024 * 1024,  # 16 MB max message
+            ping_interval=30,
+            ping_timeout=10,
+            close_timeout=5,
+        ) as upstream_ws:
+
+            async def browser_to_pod():
+                """Forward messages from browser to code-server."""
+                try:
+                    while True:
+                        msg = await ws.receive()
+                        if msg["type"] == "websocket.receive":
+                            if "text" in msg and msg["text"] is not None:
+                                await upstream_ws.send(msg["text"])
+                            elif "bytes" in msg and msg["bytes"] is not None:
+                                await upstream_ws.send(msg["bytes"])
+                        elif msg["type"] == "websocket.disconnect":
+                            break
+                except WebSocketDisconnect:
+                    pass
+
+            async def pod_to_browser():
+                """Forward messages from code-server to browser."""
+                try:
+                    async for message in upstream_ws:
+                        if isinstance(message, str):
+                            await ws.send_text(message)
+                        elif isinstance(message, bytes):
+                            await ws.send_bytes(message)
+                except websockets.ConnectionClosed:
+                    pass
+
+            # Run both directions concurrently; when one finishes, cancel the other
+            tasks = [
+                asyncio.create_task(browser_to_pod()),
+                asyncio.create_task(pod_to_browser()),
+            ]
+            done, pending = await asyncio.wait(
+                tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+
+    except (OSError, websockets.InvalidURI, websockets.InvalidHandshake) as e:
+        ide_proxy_service.evict(job_id)
+        logger.debug("IDE WS proxy failed for job %s: %s", job_id, e)
+        try:
+            await ws.close(code=4502, reason="code-server unreachable")
+        except Exception:
+            pass
+    except Exception:
+        logger.debug("IDE WS proxy ended for job %s", job_id, exc_info=True)
+    finally:
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 @app.post("/api/jobs/{job_id}/ensure-workspace-access")

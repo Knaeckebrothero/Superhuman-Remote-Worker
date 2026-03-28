@@ -93,6 +93,7 @@ data:
   IDE_SESSION_MAX_LIFETIME: "240"
   IDE_MAX_CONCURRENT_PER_USER: "2"
   CODE_SERVER_IMAGE: "codercom/code-server:latest"
+  IDE_PROXY_BASE_URL: "https://api.superhuman-remote-worker.com"
 
   # Notification — SMTP (via shared Proton Bridge in protonmail-bridge namespace)
   SMTP_HOST: "protonmail-bridge.protonmail-bridge.svc"
