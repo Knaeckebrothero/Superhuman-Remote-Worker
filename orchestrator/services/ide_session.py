@@ -21,6 +21,14 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def _build_code_server_url(
+    job_id: str, folder: str = "/home/agent-host/workspace"
+) -> str:
+    """Build the proxy-routed code-server URL for a job."""
+    proxy_base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085")
+    return f"{proxy_base}/api/ide/{job_id}/proxy/?folder={folder}"
+
+
 class IdeSessionService:
     """Manages on-demand IDE sessions backed by S3 environment snapshots.
 
@@ -103,7 +111,7 @@ class IdeSessionService:
             if ssh_host:
                 return {
                     "status": "active",
-                    "code_server_url": f"http://{ssh_host}:8080/?folder=/home/agent-host/workspace",
+                    "code_server_url": _build_code_server_url(job_id),
                     "source": "live_vm",
                 }
 
@@ -112,7 +120,7 @@ class IdeSessionService:
         if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
             return {
                 "status": "active",
-                "code_server_url": f"http://{ws_ctx['pod_ip']}:8080/?folder=/home/agent-host/workspace",
+                "code_server_url": _build_code_server_url(job_id),
                 "source": "live_workspace",
             }
 
@@ -479,7 +487,7 @@ class IdeSessionService:
             await self._clone_gitea_to_vm(job_id, job, ssh_host, ssh_port)
 
         # Code-server should already be running from base image
-        code_server_url = f"http://{ssh_host}:8080/?folder=/home/agent-host/workspace"
+        code_server_url = _build_code_server_url(job_id)
 
         await self._set_session_context(
             job_id,
@@ -592,7 +600,7 @@ class IdeSessionService:
             logger.warning("SSH git clone failed for IDE session job %s: %s", job_id, e)
 
         # code-server is already running from the workspace entrypoint
-        code_server_url = f"http://{pod_ip}:8080/?folder=/home/agent-host/workspace"
+        code_server_url = _build_code_server_url(job_id)
 
         # Verify code-server is responding
         ready = await self._wait_for_code_server(f"http://{pod_ip}:8080", timeout=15)

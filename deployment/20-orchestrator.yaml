@@ -258,6 +258,11 @@ spec:
                 configMapKeyRef:
                   name: srw-config
                   key: CODE_SERVER_IMAGE
+            - name: IDE_PROXY_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: IDE_PROXY_BASE_URL
             # Notification — SMTP
             - name: SMTP_HOST
               valueFrom:

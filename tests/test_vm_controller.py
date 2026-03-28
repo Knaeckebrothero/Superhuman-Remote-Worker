@@ -68,10 +68,10 @@ _mock_k8s_client.CustomObjectsApi = MagicMock  # type: ignore[attr-defined]
 _mock_k8s.client = _mock_k8s_client  # type: ignore[attr-defined]
 _mock_k8s.config = _mock_k8s_config  # type: ignore[attr-defined]
 _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-defined]
-sys.modules.setdefault("kubernetes", _mock_k8s)
-sys.modules.setdefault("kubernetes.client", _mock_k8s_client)
-sys.modules.setdefault("kubernetes.config", _mock_k8s_config)
-sys.modules.setdefault("kubernetes.client.exceptions", _mock_k8s_exc)
+sys.modules["kubernetes"] = _mock_k8s
+sys.modules["kubernetes.client"] = _mock_k8s_client
+sys.modules["kubernetes.config"] = _mock_k8s_config
+sys.modules["kubernetes.client.exceptions"] = _mock_k8s_exc
 
 # --- nats -------------------------------------------------------------------
 _mock_nats = types.ModuleType("nats")
