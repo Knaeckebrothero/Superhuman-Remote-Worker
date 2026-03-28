@@ -101,7 +101,7 @@ class TestResolvePodIp:
 
     @pytest.mark.asyncio
     async def test_cache_miss_vm(self, service):
-        """Resolves pod_ip from vm context (ssh_host preferred over pod_ip)."""
+        """Resolves pod_ip from vm context (pod_ip preferred — cluster-internal, reachable from proxy)."""
         service._db.get_job = AsyncMock(
             return_value={
                 "context": {
@@ -115,11 +115,11 @@ class TestResolvePodIp:
         )
 
         result = await service.resolve_pod_ip("job-1")
-        assert result == "100.64.0.1"  # ssh_host takes priority
+        assert result == "10.0.2.1"  # pod_ip preferred (cluster-internal, not Tailscale)
 
     @pytest.mark.asyncio
-    async def test_cache_miss_vm_fallback_pod_ip(self, service):
-        """Falls back to vm.pod_ip when ssh_host is absent."""
+    async def test_cache_miss_vm_fallback_ssh_host(self, service):
+        """Falls back to vm.ssh_host when pod_ip is absent."""
         service._db.get_job = AsyncMock(
             return_value={"context": {"vm": {"status": "ready", "pod_ip": "10.0.2.1"}}}
         )

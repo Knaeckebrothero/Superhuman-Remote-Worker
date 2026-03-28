@@ -75,11 +75,12 @@ class IdeProxyService:
             if ws_ctx.get("status") == "ready" and ws_ctx.get("pod_ip"):
                 pod_ip = ws_ctx["pod_ip"]
 
-        # 3. Live VM
+        # 3. Live VM — prefer pod_ip (cluster-internal, reachable from orchestrator)
+        #    over ssh_host (Tailscale IP, only reachable from mesh nodes)
         if not pod_ip:
             vm_ctx = ctx.get("vm", {})
             if vm_ctx.get("status") == "ready":
-                pod_ip = vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip")
+                pod_ip = vm_ctx.get("pod_ip") or vm_ctx.get("ssh_host")
 
         if pod_ip:
             self._pod_ip_cache[job_id] = (pod_ip, time.monotonic() + self._cache_ttl)

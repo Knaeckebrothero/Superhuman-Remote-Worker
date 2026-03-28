@@ -1109,7 +1109,9 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   canOpenIde(job: JobSummary): boolean {
-    // Show IDE button if: live VM, snapshot available, or has Gitea repo
+    // Show IDE button only on root jobs (subjobs share the parent's workspace)
+    if (job.parent_job_id) return false;
+    // Show if: live VM, snapshot available, or has Gitea repo
     return this.hasLiveVm(job) || job.snapshot_status === 'available' || !!job.repo_name;
   }
 

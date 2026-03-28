@@ -707,6 +707,37 @@ class GitManager:
             logger.warning(f"Failed to clone {masked}: {e}")
             return None
 
+    @classmethod
+    def from_worktree(cls, worktree_path: Path) -> Optional["GitManager"]:
+        """Create a GitManager for an existing git worktree.
+
+        Git worktrees have a `.git` file (not directory) that points to the
+        parent repo's `.git` directory. This method validates the worktree
+        exists and configures local user identity.
+
+        Args:
+            worktree_path: Path to the worktree directory
+
+        Returns:
+            GitManager instance, or None if path is not a valid git worktree
+        """
+        worktree_path = Path(worktree_path)
+        git_marker = worktree_path / ".git"
+        if not git_marker.exists():
+            logger.warning(f"Not a git worktree (no .git): {worktree_path}")
+            return None
+
+        mgr = cls(worktree_path)
+        if not mgr._git_available:
+            return None
+
+        # Configure local user for the worktree
+        mgr._run_git(["config", "user.email", "agent@workspace.local"])
+        mgr._run_git(["config", "user.name", "Agent"])
+
+        logger.info(f"GitManager initialized from worktree at {worktree_path}")
+        return mgr
+
     @staticmethod
     def _mask_url_static(url: str) -> str:
         """Mask credentials in a URL for safe logging."""
