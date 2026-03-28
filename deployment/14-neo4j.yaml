@@ -64,7 +64,10 @@ spec:
               name: bolt
           env:
             - name: NEO4J_AUTH
-              value: "neo4j/CHANGE_ME"
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: NEO4J_AUTH
             - name: NEO4J_PLUGINS
               value: '["apoc"]'
             - name: NEO4J_dbms_security_procedures_unrestricted
