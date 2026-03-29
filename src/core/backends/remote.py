@@ -146,7 +146,7 @@ class RemoteBackend(WorkspaceBackend):
         # SSH/SFTP handles
         self._ssh: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
-        self._sftp_lock = threading.Lock()  # Guards all SFTP operations (not thread-safe)
+        self._sftp_lock = threading.RLock()  # Guards all SFTP operations (not thread-safe)
 
         # Shell state
         self._session_name = f"agent_{job_id[:12]}" if job_id else "agent_remote"
@@ -493,7 +493,7 @@ class RemoteBackend(WorkspaceBackend):
     def mkdir(self, path: str) -> None:
         self._ensure_connected()
         remote_path = self._resolve(path)
-        self._ensure_remote_dir(remote_path)
+        self._ensure_remote_dir(remote_path)  # Already holds _sftp_lock internally
         logger.debug(f"Created remote directory: {path}")
 
     def delete_file(self, path: str) -> bool:
@@ -503,19 +503,20 @@ class RemoteBackend(WorkspaceBackend):
         if st is None:
             return False
 
-        if stat_module.S_ISREG(st.st_mode):
-            self._sftp.remove(remote_path)
-            logger.debug(f"Deleted remote file: {path}")
-            return True
+        with self._sftp_lock:
+            if stat_module.S_ISREG(st.st_mode):
+                self._sftp.remove(remote_path)
+                logger.debug(f"Deleted remote file: {path}")
+                return True
 
-        if stat_module.S_ISDIR(st.st_mode):
-            # Check if empty
-            entries = self._sftp.listdir(remote_path)
-            if entries:
-                raise ValueError(f"Cannot delete non-empty directory: {path}")
-            self._sftp.rmdir(remote_path)
-            logger.debug(f"Deleted remote directory: {path}")
-            return True
+            if stat_module.S_ISDIR(st.st_mode):
+                # Check if empty
+                entries = self._sftp.listdir(remote_path)
+                if entries:
+                    raise ValueError(f"Cannot delete non-empty directory: {path}")
+                self._sftp.rmdir(remote_path)
+                logger.debug(f"Deleted remote directory: {path}")
+                return True
 
         return False
 
