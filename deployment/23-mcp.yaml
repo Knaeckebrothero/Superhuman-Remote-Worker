@@ -28,6 +28,8 @@ spec:
           env:
             - name: COCKPIT_API_URL
               value: "http://srw-orchestrator:8085"
+            - name: XDG_DATA_HOME
+              value: "/tmp/.local/share"
             - name: MCP_TRANSPORT
               value: "http"
             - name: MCP_HOST
