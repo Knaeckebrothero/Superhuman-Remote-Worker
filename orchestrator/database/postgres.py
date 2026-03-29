@@ -3965,31 +3965,37 @@ class PostgresDB:
         finally:
             await conn.close()
 
-    async def ensure_schema(self) -> bool:
-        """Apply schema.sql to initialize database tables.
+    async def ensure_schema(self, schema_file: Path | None = None) -> bool:
+        """Apply a schema file to initialize database tables.
 
         This is idempotent - uses IF NOT EXISTS clauses.
         Requires an active connection pool (call connect() first).
+
+        Args:
+            schema_file: Path to the SQL schema file. Defaults to schema.sql
+                         (app DB). Pass vector_schema.sql for the vector DB.
 
         Returns:
             True if schema was applied successfully.
 
         Raises:
             RuntimeError: If not connected to database.
-            FileNotFoundError: If schema.sql doesn't exist.
+            FileNotFoundError: If schema file doesn't exist.
         """
-        if not SCHEMA_FILE.exists():
-            raise FileNotFoundError(f"Schema file not found: {SCHEMA_FILE}")
+        target = schema_file or SCHEMA_FILE
+        if not target.exists():
+            raise FileNotFoundError(f"Schema file not found: {target}")
 
-        schema_sql = SCHEMA_FILE.read_text()
+        schema_sql = target.read_text()
 
         async with self.acquire() as conn:
             await conn.execute(schema_sql)
 
-        logger.info(f"Applied schema from {SCHEMA_FILE}")
+        logger.info(f"Applied schema from {target}")
 
-        # Migration: mark existing dev-mode users (no password) as verified
-        await self.migrate_existing_users_verified()
+        # Migration only applies to the app DB schema
+        if target == SCHEMA_FILE:
+            await self.migrate_existing_users_verified()
 
         return True
 
