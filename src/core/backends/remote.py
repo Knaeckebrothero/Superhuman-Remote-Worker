@@ -146,7 +146,9 @@ class RemoteBackend(WorkspaceBackend):
         # SSH/SFTP handles
         self._ssh: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
-        self._sftp_lock = threading.RLock()  # Guards all SFTP operations (not thread-safe)
+        self._sftp_lock = (
+            threading.RLock()
+        )  # Guards all SFTP operations (not thread-safe)
 
         # Shell state
         self._session_name = f"agent_{job_id[:12]}" if job_id else "agent_remote"
