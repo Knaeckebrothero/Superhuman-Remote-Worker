@@ -41,7 +41,7 @@ spec:
                   key: MCP_INTERNAL_KEY
             # OAuth bridge (optional — set MCP_OAUTH_ENABLED=true to activate)
             - name: MCP_OAUTH_ENABLED
-              value: "false"
+              value: "true"
             - name: MCP_OIDC_CLIENT_ID
               value: "mcp-server"
             - name: MCP_OIDC_CLIENT_SECRET
