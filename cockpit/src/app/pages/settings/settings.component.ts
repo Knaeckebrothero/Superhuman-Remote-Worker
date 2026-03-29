@@ -6,11 +6,11 @@ import {UserService} from '../../core/services/user.service';
 import {ApiService} from '../../core/services/api.service';
 import {SettingsService} from '../../core/services/settings.service';
 import {
-    ApiKeyProvider,
-    CodexStatus,
-    CommunicationSettings,
-    McpTokenCreateResponse,
-    Project
+  ApiKeyProvider,
+  CodexStatus,
+  CommunicationSettings,
+  McpTokenCreateResponse,
+  Project
 } from '../../core/models/api.model';
 
 const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
@@ -883,6 +883,16 @@ export class SettingsComponent implements OnInit {
         }
       }
     });
+
+    // Load projects reactively — waits for currentUserId on F5 refresh
+    effect(() => {
+      const userId = this.userService.currentUserId();
+      if (userId) {
+        this.apiService
+            .getProjects(userId)
+            .subscribe((p) => this.projects.set(p));
+      }
+    });
   }
 
   /** Only show active (non-revoked) tokens. */
@@ -893,9 +903,6 @@ export class SettingsComponent implements OnInit {
     this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
-    this.apiService
-      .getProjects(this.userService.currentUserId() ?? undefined)
-      .subscribe((p) => this.projects.set(p));
 
     // Load Codex proxy status for admins
     if (this.userService.currentUser()?.is_admin) {

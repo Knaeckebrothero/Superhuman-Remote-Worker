@@ -1725,7 +1725,10 @@ async def lifespan(app: FastAPI):
 
     # Ensure database schemas exist (idempotent — safe on every restart)
     await postgres_db.ensure_schema()
-    await vector_db.ensure_schema()
+    from pathlib import Path as _Path
+
+    _vector_schema = _Path(__file__).parent / "database" / "vector_schema.sql"
+    await vector_db.ensure_schema(schema_file=_vector_schema)
     logger.info("Database schemas verified")
 
     # Share MongoDB instance with graph_routes
