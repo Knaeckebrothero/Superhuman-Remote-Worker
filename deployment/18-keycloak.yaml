@@ -2,7 +2,7 @@
 #
 # Secrets injected via env vars (Vault → ESO → srw-secrets):
 #   GITEA_OIDC_CLIENT_SECRET, NEXTCLOUD_OIDC_CLIENT_SECRET,
-#   PGADMIN_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
+#   PGADMIN_OIDC_CLIENT_SECRET, MCP_OIDC_CLIENT_SECRET, KC_REALM_ADMIN_PASSWORD, SMTP_PASSWORD
 #
 # The realm-export.json uses ${env.VAR} placeholders — Keycloak resolves
 # them at import time from the container's environment.
@@ -555,6 +555,12 @@ spec:
                 secretKeyRef:
                   name: srw-secrets
                   key: PGADMIN_OIDC_CLIENT_SECRET
+            - name: MCP_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: srw-secrets
+                  key: MCP_OIDC_CLIENT_SECRET
+                  optional: true
             - name: SMTP_HOST
               valueFrom:
                 configMapKeyRef:
@@ -589,7 +595,8 @@ spec:
                     # --- Sync client secrets ---
                     for pair in "gitea:$GITEA_OIDC_CLIENT_SECRET" \
                                 "nextcloud:$NEXTCLOUD_OIDC_CLIENT_SECRET" \
-                                "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET"; do
+                                "pgadmin:$PGADMIN_OIDC_CLIENT_SECRET" \
+                                "mcp-server:$MCP_OIDC_CLIENT_SECRET"; do
                       CID="${pair%%:*}"; SEC="${pair#*:}"
                       [ -z "$SEC" ] && continue
                       ID=$($KC get clients -r srw -q "clientId=$CID" --fields id --format csv --noquotes 2>/dev/null | tail -1)

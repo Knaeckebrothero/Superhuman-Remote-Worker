@@ -146,6 +146,7 @@ class RemoteBackend(WorkspaceBackend):
         # SSH/SFTP handles
         self._ssh: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
+        self._sftp_lock = threading.Lock()  # Guards all SFTP operations (not thread-safe)
 
         # Shell state
         self._session_name = f"agent_{job_id[:12]}" if job_id else "agent_remote"
@@ -315,12 +316,13 @@ class RemoteBackend(WorkspaceBackend):
     def _remote_stat(self, remote_path: str) -> Optional[paramiko.SFTPAttributes]:
         """Get SFTP stat, returning None if path doesn't exist."""
         self._ensure_connected()
-        try:
-            return self._sftp.stat(remote_path)
-        except FileNotFoundError:
-            return None
-        except IOError:
-            return None
+        with self._sftp_lock:
+            try:
+                return self._sftp.stat(remote_path)
+            except FileNotFoundError:
+                return None
+            except IOError:
+                return None
 
     def _ensure_remote_dir(self, remote_path: str) -> None:
         """Recursively create directories on the remote."""
@@ -334,12 +336,13 @@ class RemoteBackend(WorkspaceBackend):
             parts_to_create.append(current)
             current = posixpath.dirname(current)
 
-        for d in reversed(parts_to_create):
-            try:
-                self._sftp.mkdir(d)
-            except IOError:
-                # Race condition or already exists
-                pass
+        with self._sftp_lock:
+            for d in reversed(parts_to_create):
+                try:
+                    self._sftp.mkdir(d)
+                except IOError:
+                    # Race condition or already exists
+                    pass
 
     # =========================================================================
     # File operations
@@ -348,13 +351,14 @@ class RemoteBackend(WorkspaceBackend):
     def read_file(self, path: str, binary: bool = False) -> str | bytes:
         self._ensure_connected()
         remote_path = self._resolve(path)
-        try:
-            with self._sftp.open(remote_path, "rb") as f:
-                data = f.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"File not found: {path}")
-        except IOError as e:
-            raise FileNotFoundError(f"Cannot read {path}: {e}") from e
+        with self._sftp_lock:
+            try:
+                with self._sftp.open(remote_path, "rb") as f:
+                    data = f.read()
+            except FileNotFoundError:
+                raise FileNotFoundError(f"File not found: {path}")
+            except IOError as e:
+                raise FileNotFoundError(f"Cannot read {path}: {e}") from e
 
         if binary:
             return data
@@ -367,8 +371,9 @@ class RemoteBackend(WorkspaceBackend):
         self._ensure_remote_dir(parent)
 
         data = content if isinstance(content, bytes) else content.encode("utf-8")
-        with self._sftp.open(remote_path, "wb") as f:
-            f.write(data)
+        with self._sftp_lock:
+            with self._sftp.open(remote_path, "wb") as f:
+                f.write(data)
         logger.debug(f"Wrote remote file: {path}")
 
     def append_file(self, path: str, content: str) -> None:
@@ -377,8 +382,9 @@ class RemoteBackend(WorkspaceBackend):
         parent = posixpath.dirname(remote_path)
         self._ensure_remote_dir(parent)
 
-        with self._sftp.open(remote_path, "ab") as f:
-            f.write(content.encode("utf-8"))
+        with self._sftp_lock:
+            with self._sftp.open(remote_path, "ab") as f:
+                f.write(content.encode("utf-8"))
 
     def exists(self, path: str) -> bool:
         return self._remote_stat(self._resolve(path)) is not None
@@ -405,10 +411,11 @@ class RemoteBackend(WorkspaceBackend):
         if not stat_module.S_ISDIR(st.st_mode):
             return [path]
 
-        try:
-            entries = self._sftp.listdir_attr(remote_path)
-        except IOError:
-            return []
+        with self._sftp_lock:
+            try:
+                entries = self._sftp.listdir_attr(remote_path)
+            except IOError:
+                return []
 
         results = []
         for entry in entries:
