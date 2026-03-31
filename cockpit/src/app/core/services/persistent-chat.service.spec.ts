@@ -1,8 +1,8 @@
-import {describe, it, expect, beforeEach, vi, afterEach} from 'vitest';
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {Injector, runInInjectionContext} from '@angular/core';
 import {HttpClient} from '@angular/common/http';
 import {of, throwError} from 'rxjs';
-import {PersistentChatService, ChatMessage, ToolCallInfo} from './persistent-chat.service';
+import {PersistentChatService} from './persistent-chat.service';
 
 /**
  * Create a mock WebSocket that captures handlers and allows triggering events.
@@ -61,6 +61,11 @@ async function connectService(service: PersistentChatService, opts?: { directUrl
 
     // Trigger onopen
     if (ws.onopen) ws.onopen({});
+
+    // Simulate agent ready so sendMessage() sends immediately (not queued)
+    fireWsMessage(ws, {method: 'ready'});
+    // Clear the send spy so tests only see their own calls
+    ws.send.mockClear();
 
     return {ws, WsSpy};
 }
@@ -412,11 +417,14 @@ describe('PersistentChatService', () => {
             expect(ws.send).not.toHaveBeenCalled();
         });
 
-        it('should not send when WS is null', () => {
-            // Not connected — ws is null
+        it('should queue message when WS is null', () => {
+            // Not connected — ws is null; message is queued (shown in UI) but not sent
             service.sendMessage('test');
-            // Should not throw
-            expect(service.messages()).toEqual([]);
+            // Should not throw, message is added locally for display
+            expect(service.messages().length).toBe(1);
+            expect(service.messages()[0].content).toBe('test');
+            // Queued for later delivery
+            expect(service.pendingMessage()).toBe('test');
         });
 
         it('should set isWaitingForInput to false', async () => {
