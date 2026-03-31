@@ -580,7 +580,7 @@ services:
       - workspace_data:/workspace:z
       - agent_persistent_home:/home/srw
     deploy:
-      replicas: 1
+      replicas: 0  # On-demand: pods provisioned dynamically by orchestrator. Run manually for local dev.
       resources:
         limits:
           pids: 256

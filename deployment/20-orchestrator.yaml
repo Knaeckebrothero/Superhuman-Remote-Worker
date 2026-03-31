@@ -405,6 +405,13 @@ spec:
                   optional: true
             - name: WORKSPACE_SSH_SECRET
               value: "vm-ssh-key"
+            # Persistent agent pods (on-demand provisioning)
+            - name: PERSISTENT_AGENT_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: srw-config
+                  key: PERSISTENT_AGENT_IMAGE
+                  optional: true
             # Orchestrator settings
             - name: AUTO_ASSIGN_ENABLED
               valueFrom:
