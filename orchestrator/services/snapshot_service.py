@@ -129,7 +129,7 @@ class SnapshotService:
         tar_path: str,
         manifest: dict[str, Any],
         phase_number: Optional[int] = None,
-            entity_type: str = "jobs",
+        entity_type: str = "jobs",
     ) -> bool:
         """Upload a snapshot tarball + manifest to S3.
 
@@ -241,7 +241,7 @@ class SnapshotService:
         phase_number: Optional[int] = None,
         source_type: str = "vm",
         agent_config: str = "defaults",
-            entity_type: str = "jobs",
+        entity_type: str = "jobs",
     ) -> bool:
         """Capture a VM environment snapshot via SSH tar and upload to S3.
 
@@ -476,10 +476,10 @@ class SnapshotService:
     # =========================================================================
 
     async def get_manifest(
-            self,
-            job_id: str,
-            phase_number: Optional[int] = None,
-            entity_type: str = "jobs",
+        self,
+        job_id: str,
+        phase_number: Optional[int] = None,
+        entity_type: str = "jobs",
     ) -> Optional[dict[str, Any]]:
         """Retrieve the manifest for a snapshot.
 
@@ -514,11 +514,11 @@ class SnapshotService:
             return None
 
     async def download_snapshot(
-            self,
-            job_id: str,
-            dest_path: str,
-            phase_number: Optional[int] = None,
-            entity_type: str = "jobs",
+        self,
+        job_id: str,
+        dest_path: str,
+        phase_number: Optional[int] = None,
+        entity_type: str = "jobs",
     ) -> bool:
         """Download a snapshot tarball from S3.
 
@@ -955,7 +955,7 @@ class SnapshotService:
     # =========================================================================
 
     async def _set_snapshot_context(
-            self, entity_id: str, updates: dict, entity_type: str = "jobs"
+        self, entity_id: str, updates: dict, entity_type: str = "jobs"
     ) -> None:
         """Atomically merge updates into the entity's snapshot context key."""
         if not self._db:

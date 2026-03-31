@@ -313,13 +313,13 @@ class KnowledgeStore:
 
     async def hybrid_search(
         self,
-            project_id: Optional[uuid.UUID] = None,
-            query: str = "",
+        project_id: Optional[uuid.UUID] = None,
+        query: str = "",
         match_count: int = 10,
         dense_weight: float = 0.6,
         sparse_weight: float = 0.3,
         recency_weight: float = 0.1,
-            project_ids: Optional[List[uuid.UUID]] = None,
+        project_ids: Optional[List[uuid.UUID]] = None,
     ) -> List[KnowledgeRecord]:
         """Execute hybrid search (RRF over dense + sparse + recency).
 
@@ -367,9 +367,9 @@ class KnowledgeStore:
         return [KnowledgeRecord.from_row(dict(row)) for row in rows]
 
     async def get_summary(
-            self,
-            project_id: Optional[uuid.UUID] = None,
-            project_ids: Optional[List[uuid.UUID]] = None,
+        self,
+        project_id: Optional[uuid.UUID] = None,
+        project_ids: Optional[List[uuid.UUID]] = None,
     ) -> Dict[str, Any]:
         """Get knowledge base summary for context injection.
 

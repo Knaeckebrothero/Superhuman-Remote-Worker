@@ -390,13 +390,13 @@ class VMProvisioner:
     # =========================================================================
 
     async def create_thread_vm(
-            self,
-            thread_id: str,
-            agent_config: str = "defaults",
-            vm_image: Optional[str] = None,
-            cpu_cores: int = 2,
-            memory: str = "4Gi",
-            description: str = "",
+        self,
+        thread_id: str,
+        agent_config: str = "defaults",
+        vm_image: Optional[str] = None,
+        cpu_cores: int = 2,
+        memory: str = "4Gi",
+        description: str = "",
     ) -> bool:
         """Create a VM for a persistent thread.
 
@@ -444,13 +444,13 @@ class VMProvisioner:
         return False
 
     async def _create_thread_vm_direct(
-            self,
-            thread_id: str,
-            agent_config: str,
-            vm_image: Optional[str],
-            cpu_cores: int,
-            memory: str,
-            description: str,
+        self,
+        thread_id: str,
+        agent_config: str,
+        vm_image: Optional[str],
+        cpu_cores: int,
+        memory: str,
+        description: str,
     ) -> bool:
         """Create a thread VM via direct Kubernetes API call."""
         job_config = {

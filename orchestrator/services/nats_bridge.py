@@ -163,7 +163,7 @@ class NatsBridge:
         cpu_cores: int = 2,
         memory: str = "4Gi",
         description: str = "",
-            entity_type: str = "job",
+        entity_type: str = "job",
     ) -> bool:
         """Publish a VM creation request.
 

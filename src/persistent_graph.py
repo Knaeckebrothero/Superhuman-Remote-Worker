@@ -93,21 +93,21 @@ class PersistentLoopCallbacks:
 
 
 async def run_persistent_loop(
-        llm_with_tools: BaseChatModel,
-        tools: List[Any],
-        context_manager: ContextManager,
-        config: Any,
-        system_prompt: str,
-        callbacks: PersistentLoopCallbacks,
-        messages: List[BaseMessage],
-        auxiliary_llm: Optional[Any] = None,
-        workspace_content: Optional[Callable[[], str]] = None,
-        recall_store: Optional[Any] = None,
-        knowledge_store: Optional[Any] = None,
-        project_id: Optional[str] = None,
-        project_ids: Optional[List[str]] = None,
-        tool_context: Optional[Any] = None,
-        initial_turn_count: int = 0,
+    llm_with_tools: BaseChatModel,
+    tools: List[Any],
+    context_manager: ContextManager,
+    config: Any,
+    system_prompt: str,
+    callbacks: PersistentLoopCallbacks,
+    messages: List[BaseMessage],
+    auxiliary_llm: Optional[Any] = None,
+    workspace_content: Optional[Callable[[], str]] = None,
+    recall_store: Optional[Any] = None,
+    knowledge_store: Optional[Any] = None,
+    project_id: Optional[str] = None,
+    project_ids: Optional[List[str]] = None,
+    tool_context: Optional[Any] = None,
+    initial_turn_count: int = 0,
 ) -> None:
     """Run the persistent interactive agent loop.
 
@@ -203,10 +203,10 @@ async def run_persistent_loop(
 
         # Memory extraction every N turns (fire-and-forget)
         if (
-                recall_store
-                and auxiliary_llm
-                and extraction_interval > 0
-                and (turn_count - _last_extraction_turn) >= extraction_interval
+            recall_store
+            and auxiliary_llm
+            and extraction_interval > 0
+            and (turn_count - _last_extraction_turn) >= extraction_interval
         ):
             _last_extraction_turn = turn_count
             try:
@@ -249,20 +249,20 @@ async def run_persistent_loop(
 
 
 async def _execute_turn(
-        llm_with_tools: BaseChatModel,
-        tool_map: Dict[str, Any],
-        context_manager: ContextManager,
-        messages: List[BaseMessage],
-        callbacks: PersistentLoopCallbacks,
-        llm_timeout: float,
-        auxiliary_llm: Optional[Any],
-        workspace_content: Optional[Callable[[], str]],
-        config: Any,
-        recall_store: Optional[Any] = None,
-        knowledge_store: Optional[Any] = None,
-        project_id: Optional[str] = None,
-        project_ids: Optional[List[str]] = None,
-        tool_context: Optional[Any] = None,
+    llm_with_tools: BaseChatModel,
+    tool_map: Dict[str, Any],
+    context_manager: ContextManager,
+    messages: List[BaseMessage],
+    callbacks: PersistentLoopCallbacks,
+    llm_timeout: float,
+    auxiliary_llm: Optional[Any],
+    workspace_content: Optional[Callable[[], str]],
+    config: Any,
+    recall_store: Optional[Any] = None,
+    knowledge_store: Optional[Any] = None,
+    project_id: Optional[str] = None,
+    project_ids: Optional[List[str]] = None,
+    tool_context: Optional[Any] = None,
 ) -> TurnResult:
     """Execute a single turn: LLM call -> tool calls -> repeat until done.
 
@@ -379,9 +379,9 @@ async def _execute_turn(
                 inject_idx = (
                     2
                     if workspace_content
-                       and prepared
-                       and len(prepared) > 1
-                       and isinstance(prepared[1], SystemMessage)
+                    and prepared
+                    and len(prepared) > 1
+                    and isinstance(prepared[1], SystemMessage)
                     else 1
                 )
                 prepared.insert(inject_idx, mem_ai)
@@ -398,9 +398,9 @@ async def _execute_turn(
                 kb_ai, kb_tool = create_knowledge_injection_messages(knowledge_block)
                 # Insert after memory injection
                 inject_idx = (
-                        len(prepared)
-                        - len(messages)
-                        + (1 if prepared and isinstance(prepared[0], SystemMessage) else 0)
+                    len(prepared)
+                    - len(messages)
+                    + (1 if prepared and isinstance(prepared[0], SystemMessage) else 0)
                 )
                 prepared.insert(inject_idx, kb_ai)
                 prepared.insert(inject_idx + 1, kb_tool)
@@ -450,8 +450,8 @@ async def _execute_turn(
                         if isinstance(content, list):
                             for block in content:
                                 if (
-                                        isinstance(block, dict)
-                                        and block.get("type") == "text"
+                                    isinstance(block, dict)
+                                    and block.get("type") == "text"
                                 ):
                                     text = block.get("text", "")
                                     if text:
@@ -508,8 +508,8 @@ async def _execute_turn(
                         if isinstance(content, list):
                             for block in content:
                                 if (
-                                        isinstance(block, dict)
-                                        and block.get("type") == "text"
+                                    isinstance(block, dict)
+                                    and block.get("type") == "text"
                                 ):
                                     text = block.get("text", "")
                                     if text:
@@ -539,17 +539,17 @@ async def _execute_turn(
         llm_latency_ms = int((time.monotonic() - llm_start) * 1000)
         turn_metrics: Optional[dict] = None
         if (
-                response
-                and hasattr(response, "response_metadata")
-                and response.response_metadata
+            response
+            and hasattr(response, "response_metadata")
+            and response.response_metadata
         ):
             meta = response.response_metadata
             token_usage = meta.get("token_usage", {})
             turn_metrics = {
                 "input_tokens": token_usage.get("input_tokens")
-                                or token_usage.get("prompt_tokens"),
+                or token_usage.get("prompt_tokens"),
                 "output_tokens": token_usage.get("output_tokens")
-                                 or token_usage.get("completion_tokens"),
+                or token_usage.get("completion_tokens"),
                 "reasoning_tokens": token_usage.get("reasoning_tokens"),
                 "latency_ms": llm_latency_ms,
                 "model": meta.get("model_name"),
@@ -639,8 +639,8 @@ async def _execute_turn(
             if tool_context and callbacks.on_vm_upgrade_needed:
                 freeze_req = tool_context.consume_freeze_request()
                 if (
-                        freeze_req
-                        and freeze_req.get("freeze_type") == "vm_upgrade_required"
+                    freeze_req
+                    and freeze_req.get("freeze_type") == "vm_upgrade_required"
                 ):
                     await callbacks.on_vm_upgrade_needed(freeze_req)
 

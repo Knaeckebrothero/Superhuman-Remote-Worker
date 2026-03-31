@@ -117,10 +117,10 @@ class TestIdleTimeoutCallback:
 
 
 async def _handle_idle_archive(
-        session,
-        orchestrator_client,
-        thread_id,
-        generate_title_fn=None,
+    session,
+    orchestrator_client,
+    thread_id,
+    generate_title_fn=None,
 ):
     """Replicated idle archive logic from persistent_app.py."""
     if not session:
@@ -165,12 +165,12 @@ async def _handle_idle_archive(
 
 
 def _mock_session(
-        has_recall=False,
-        has_messages=True,
-        has_postgres=True,
-        has_workspace=True,
-        has_git=True,
-        thread_title="Untitled Session",
+    has_recall=False,
+    has_messages=True,
+    has_postgres=True,
+    has_workspace=True,
+    has_git=True,
+    thread_title="Untitled Session",
 ):
     session = MagicMock()
     session.messages = [MagicMock()] if has_messages else []
@@ -275,10 +275,10 @@ class TestHandleIdleArchive:
 
 
 async def _update_thread_status(
-        orchestrator_client,
-        session,
-        thread_id,
-        status,
+    orchestrator_client,
+    session,
+    thread_id,
+    status,
 ):
     """Replicated from persistent_app.py."""
     if orchestrator_client and thread_id:

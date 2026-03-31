@@ -405,7 +405,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_returns_early_with_zeros_when_no_memories(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         mock_db.fetch.return_value = []
         stats = await migrate_memories(
@@ -447,7 +447,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_importance_high_confidence(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(importance=0.9)
         mock_db.fetch.return_value = [row]
@@ -463,7 +463,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_importance_medium_confidence(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(importance=0.6)
         mock_db.fetch.return_value = [row]
@@ -479,7 +479,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_importance_low_confidence(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(importance=0.3)
         mock_db.fetch.return_value = [row]
@@ -495,7 +495,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_importance_none_confidence(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(importance=None)
         mock_db.fetch.return_value = [row]
@@ -511,7 +511,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_duplicate_increments_count(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(content="duplicate content here more words")
         mock_db.fetch.return_value = [row]
@@ -531,7 +531,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_duplicate_check_exception_nonfatal(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(content="test content here")
         mock_db.fetch.return_value = [row]
@@ -579,7 +579,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_writes_through_to_pgvector(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(content="Test memory content")
         mock_db.fetch.return_value = [row]
@@ -594,7 +594,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_pgvector_failure_nonfatal(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(content="Test memory content")
         mock_db.fetch.return_value = [row]
@@ -610,7 +610,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_neo4j_failure_increments_errors(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         row = _make_memory(content="Test memory content")
         mock_db.fetch.return_value = [row]
@@ -689,7 +689,7 @@ class TestMigrateMemories:
 
     @pytest.mark.asyncio
     async def test_fetch_failure_returns_errors(
-            self, mock_db, mock_kg, mock_ks, mock_embed
+        self, mock_db, mock_kg, mock_ks, mock_embed
     ):
         mock_db.fetch.side_effect = Exception("DB connection failed")
         stats = await migrate_memories(

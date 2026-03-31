@@ -100,9 +100,9 @@ def _reset_kg_cache():
 
 
 async def get_knowledge_summary(
-        project_id: str,
-        postgres_db,
-        vector_db,
+    project_id: str,
+    postgres_db,
+    vector_db,
 ) -> dict[str, Any]:
     """16.4: GET /api/projects/{project_id}/knowledge/summary"""
     project = await postgres_db.get_project(project_id)
@@ -148,16 +148,16 @@ async def get_knowledge_summary(
 
 
 async def list_knowledge_notes(
-        project_id: str,
-        postgres_db,
-        vector_db,
-        *,
-        note_type: str | None = None,
-        status: str | None = None,
-        tag: str | None = None,
-        job_id: str | None = None,
-        limit: int = 50,
-        offset: int = 0,
+    project_id: str,
+    postgres_db,
+    vector_db,
+    *,
+    note_type: str | None = None,
+    status: str | None = None,
+    tag: str | None = None,
+    job_id: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """16.5: GET /api/projects/{project_id}/knowledge"""
     project = await postgres_db.get_project(project_id)
@@ -216,10 +216,10 @@ async def list_knowledge_notes(
 
 
 async def get_knowledge_note(
-        project_id: str,
-        note_id: str,
-        vector_db,
-        kg_func=None,
+    project_id: str,
+    note_id: str,
+    vector_db,
+    kg_func=None,
 ) -> dict[str, Any]:
     """16.6: GET /api/projects/{project_id}/knowledge/{note_id}"""
     try:
@@ -255,11 +255,11 @@ async def get_knowledge_note(
 
 
 async def search_knowledge(
-        project_id: str,
-        body: KnowledgeSearchRequest,
-        postgres_db,
-        vector_db,
-        embedding_func=None,
+    project_id: str,
+    body: KnowledgeSearchRequest,
+    postgres_db,
+    vector_db,
+    embedding_func=None,
 ) -> dict[str, Any]:
     """16.7: POST /api/projects/{project_id}/knowledge/search"""
     project = await postgres_db.get_project(project_id)
@@ -310,11 +310,11 @@ async def search_knowledge(
 
 
 async def update_knowledge_note(
-        project_id: str,
-        note_id: str,
-        body: KnowledgeNoteUpdate,
-        vector_db,
-        kg_func=None,
+    project_id: str,
+    note_id: str,
+    body: KnowledgeNoteUpdate,
+    vector_db,
+    kg_func=None,
 ) -> dict[str, str]:
     """16.8: PATCH /api/projects/{project_id}/knowledge/{note_id}"""
     valid_statuses = {"active", "resolved", "superseded", "archived"}
@@ -386,10 +386,10 @@ async def update_knowledge_note(
 
 
 async def delete_knowledge_note(
-        project_id: str,
-        note_id: str,
-        vector_db,
-        kg_func=None,
+    project_id: str,
+    note_id: str,
+    vector_db,
+    kg_func=None,
 ) -> dict[str, str]:
     """16.9: DELETE /api/projects/{project_id}/knowledge/{note_id}"""
     try:

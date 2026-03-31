@@ -535,13 +535,13 @@ class ContainerProvisioner:
     # =========================================================================
 
     async def create_thread_workspace(
-            self,
-            thread_id: str,
-            cpu: str = "500m",
-            memory: str = "1Gi",
-            cpu_limit: str = "2000m",
-            memory_limit: str = "4Gi",
-            image: Optional[str] = None,
+        self,
+        thread_id: str,
+        cpu: str = "500m",
+        memory: str = "1Gi",
+        cpu_limit: str = "2000m",
+        memory_limit: str = "4Gi",
+        image: Optional[str] = None,
     ) -> bool:
         """Create a workspace container for a persistent thread.
 

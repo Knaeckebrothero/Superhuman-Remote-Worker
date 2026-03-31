@@ -2334,7 +2334,7 @@ def get_phase_system_prompt(
     phase_number: int = 0,
     model: str = "",
     tool_names: Optional[List[str]] = None,
-        prompt_type: Optional[str] = None,
+    prompt_type: Optional[str] = None,
 ) -> str:
     """Get the complete system prompt for the current phase.
 
