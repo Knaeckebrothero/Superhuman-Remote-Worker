@@ -374,6 +374,12 @@ class PersistentProvisioner:
                                 "name": "workspace",
                                 "mountPath": "/workspace",
                             },
+                            {
+                                "name": "vm-ssh-key",
+                                "mountPath": "/run/secrets/vm-ssh-key",
+                                "subPath": "ssh-privatekey",
+                                "readOnly": True,
+                            },
                             {"name": "tmp", "mountPath": "/tmp"},
                             {"name": "run", "mountPath": "/run"},
                             {
@@ -421,6 +427,13 @@ class PersistentProvisioner:
                     {
                         "name": "workspace",
                         "emptyDir": {"sizeLimit": "10Gi"},
+                    },
+                    {
+                        "name": "vm-ssh-key",
+                        "secret": {
+                            "secretName": "vm-ssh-key",
+                            "defaultMode": 0o444,
+                        },
                     },
                     {
                         "name": "tmp",
